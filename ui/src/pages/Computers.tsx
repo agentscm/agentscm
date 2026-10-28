@@ -308,7 +308,7 @@ export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; p
         <p className="answer-text">
           {v ? (
             <>
-              <b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected · {v.refusals.length === 0 ? 'nobody turned away' : <b className="tone-warn">{plural(v.refusals.reduce((n, r) => n + r.count, 0), 'refusal')}</b>} in the last 30 days.
+              <b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected.
             </>
           ) : (
             'Connected repositories, refusals and every signed-in computer.'

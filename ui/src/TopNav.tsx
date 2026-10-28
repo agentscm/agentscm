@@ -92,12 +92,22 @@ function useHash(): string {
 export function SectionTabs({ label }: { label?: string }) {
   const chrome = useContext(ChromeContext)
   const hash = useHash()
+  const strip = useRef<HTMLElement>(null)
+  // On a phone the strip scrolls sideways: keep the open tab in view instead of cut off at the edge.
+  useLayoutEffect(() => {
+    const s = strip.current
+    const on = s?.querySelector('[aria-current="page"]')
+    if (!s || !on) return
+    const a = s.getBoundingClientRect()
+    const b = on.getBoundingClientRect()
+    s.scrollLeft += b.left - a.left - (a.width - b.width) / 2
+  }, [chrome?.section, hash])
   if (!chrome || chrome.hubSignedOut) return null
   const tabs = tabsFor(chrome.sections, chrome.section, hash)
   if (tabs.length === 0) return null
   const nav = chrome.sections.find((s) => s.key === chrome.section)?.nav
   return (
-    <nav className="htabs" data-tour="tabs" aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
+    <nav ref={strip} className="htabs" data-tour="tabs" aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
       {tabs.map((t) => {
         const st = chrome.statuses[t.key]
         return (
@@ -626,7 +636,7 @@ function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer
           </div>
         </nav>
         <div className="side-foot">
-          <p className="side-foot-note"><Icon name="eye" /> Read-only. Opening a page never changes anything for your agents.</p>
+          <p className="side-foot-note"><Icon name="eye" /> Opening a page never changes anything for your agents.</p>
           <Tip text={collapsed ? 'Expand the sidebar' : 'Show icons only'} placement="right">
             <button type="button" className="side-collapse" onClick={onCollapse} aria-pressed={collapsed} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
               <Icon name={collapsed ? 'layout-sidebar-inset' : 'layout-sidebar'} />
@@ -781,6 +791,24 @@ export function AppChrome({ logo, token, repo, web, hubSignedOut = false, nav, s
       return
     }
     document.getElementById('main')?.focus({ preventScroll: true })
+  }, [section])
+  // A box anchor (#box-contested) scrolls to its box once it renders: the page's data may still be loading.
+  useEffect(() => {
+    const id = /^#(box-[a-z-]+)$/.exec(window.location.hash)?.[1]
+    if (!id) return
+    const go = () => {
+      const el = document.getElementById(id)
+      el?.scrollIntoView({ block: 'start' })
+      return !!el
+    }
+    if (go()) return
+    const watch = new MutationObserver(() => go() && watch.disconnect())
+    watch.observe(document.body, { childList: true, subtree: true })
+    const stop = window.setTimeout(() => watch.disconnect(), 10_000)
+    return () => {
+      watch.disconnect()
+      window.clearTimeout(stop)
+    }
   }, [section])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

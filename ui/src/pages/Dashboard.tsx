@@ -19,30 +19,8 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 /** An agent counts as awake while it reported activity in the last five minutes. */
 export const AWAKE_SECONDS = 300
 
-/** A count in the answer that brings its evidence box into view and rings it; elsewhere a plain link to its tab. */
-function Jump({ to, href, children, tone = 'brand' }: { to: string; href: string; children: ReactNode; tone?: string }) {
-  return (
-    <a
-      href={href}
-      className={`jump tone-${tone}`}
-      onClick={(e) => {
-        const el = document.getElementById(to)
-        if (!el) return
-        e.preventDefault()
-        el.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' })
-        el.classList.remove('ring')
-        void el.offsetWidth
-        el.classList.add('ring')
-      }}
-    >
-      {children}
-    </a>
-  )
-}
-
 /** One sentence that stays on top of every dashboard tab: who is working, what needs you, where things cross. */
 function Answer({ question, repo, d, ov, failing, needs }: { question: string; repo: string; d: Derived | null; ov: WorkOverview | null; failing: boolean; needs: Need[] }) {
-  const x = crossings(ov, d)
   return (
     <div className="answer" data-tour="answer">
       <h1 className="page-question">{question}</h1>
@@ -61,18 +39,7 @@ function Answer({ question, repo, d, ov, failing, needs }: { question: string; r
               <b>{plural(d.agents.length, 'agent')}</b> {d.agents.length === 1 ? 'is' : 'are'} working on <b>{plural(ov.current.length, 'task')}</b>.{' '}
             </>
           )}
-          {needs.length > 0 ? (
-            <Jump to="box-needs" href="#home" tone="bad">
-              {needs.length === 1 ? '1 thing needs you' : `${needs.length} things need you`}.
-            </Jump>
-          ) : (
-            <>Nothing needs you.</>
-          )}{' '}
-          {x > 0 && (
-            <Jump to="box-map" href="#now" tone="bad">
-              {plural(x, 'crossing')}.
-            </Jump>
-          )}
+          {needs.length === 0 && <>Nothing needs you.</>}
         </p>
       )}
     </div>
@@ -151,9 +118,8 @@ const MAX_NEEDS = 6
 /** `needs` includes the ones hidden in this browser; they stay out of the list until asked for. */
 function NeedsYou({ needs: all, ov, d, me }: { needs: Need[]; ov: WorkOverview; d: Derived; me: string | null }) {
   const { rows: needs, count: hidden, show, setShow, isHidden } = useHideable(all, needHideKey)
-  const open = all.length - hidden
   return (
-    <Box id="box-needs" tour="needs" icon="bell" title="Needs you" count={open} tone={all.some((n) => n.tone === 'bad' && !isHidden(n)) ? 'bad' : 'brand'} explain="Only things a person should decide: a blocker, a task whose agent went quiet, a handover, or two agents or tasks crossing. Reading this page answers none of them. Anything untouched for a day can be hidden in this browser.">
+    <Box id="box-needs" tour="needs" icon="bell" title="Needs you" tone={all.some((n) => n.tone === 'bad' && !isHidden(n)) ? 'bad' : 'brand'} explain="Blocked tasks, quiet agents, handovers and files two agents want. Each waits until someone decides. You can hide an item once it’s a day old.">
       {needs.length === 0 ? (
         <div className="all-clear">
           <Icon name="check2-circle" />
@@ -193,7 +159,7 @@ function Track({ ov }: { ov: WorkOverview }) {
   }
   const changed = seen.changed
   return (
-    <Box id="box-track" tour="work-lanes" icon="signpost-split" title="The track" count={ov.current.length} explain="Every unfinished task, left to right. The wide part is where it is now, with the face of the agent that holds it; then its next step. Reports are the agents’ own words: they don’t prove review or landing.">
+    <Box id="box-track" tour="work-lanes" icon="signpost-split" title="The track" count={ov.current.length} explain="Every unfinished task, left to right. The wide part shows where it is now and which agent holds it, then its next step. Status comes from the agents themselves, so it isn’t proof of review or landing.">
       {!ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
       {ov.current.length === 0 ? (
         <Empty icon="signpost" title="No unfinished work">

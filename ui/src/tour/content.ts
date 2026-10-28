@@ -146,9 +146,9 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('answer'),
         title: 'The answer comes first',
-        what: 'One sentence: how many agents are working on how many tasks, how many things need you, and how many crossings there are.',
-        why: 'You should know in two seconds whether anything needs you.',
-        how: 'Click a coral count to jump to the list behind it. The sentence stays on top of every dashboard tab.',
+        what: 'One sentence: how many agents are working on how many tasks.',
+        why: 'You should know in two seconds how busy the repository is. The tabs below count what needs you and where agents cross.',
+        how: 'The sentence stays on top of every dashboard tab.',
         tip: (c) => (c.d && c.overview ? `${plural(c.d.agents.length, 'agent')} on ${plural(c.overview.current.length, 'task')} right now.` : null),
       },
       {
@@ -161,8 +161,8 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('needs'),
         title: 'Needs you',
-        what: 'Only things a person should decide: a blocker, a task whose agent went quiet but still holds it, a handover, two agents holding one file, two tasks planning the same files, or a pull request under an agent’s feet.',
-        why: 'Each one stays stuck until someone decides. Reading this page answers none of them.',
+        what: 'Blocked tasks, agents that went quiet but still hold their task, handovers, files two agents both hold, tasks planning the same files, and pull requests that touch files an agent holds.',
+        why: 'Each one stays stuck until someone decides.',
         how: 'Each row ends with what to do next. Follow its link to the task, the file or the Inbox.',
         empty: 'When nothing needs you, this box says so in green.',
       },

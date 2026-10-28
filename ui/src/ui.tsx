@@ -31,7 +31,7 @@ export function Explain({ text }: { text: string }) {
   )
 }
 
-/** An evidence box: icon-badged header strip, optional count and explainer, then content. */
+/** An evidence box: icon-badged header strip, an (i) explainer beside the title, optional count, then content. */
 export function Box({ id, tour, icon, title, explain, count, tone = 'brand', actions, children, className = '', flush = false }: { id?: string; /** Stable walkthrough anchor (`data-tour`). */ tour?: string; icon: string; title: string; explain?: string; count?: number | string; tone?: Tone; actions?: ReactNode; children: ReactNode; className?: string; flush?: boolean }) {
   return (
     <section id={id} data-tour={tour} className={`box box-tone-${tone} ${className}`} aria-labelledby={id ? `${id}-title` : undefined}>
@@ -42,9 +42,9 @@ export function Box({ id, tour, icon, title, explain, count, tone = 'brand', act
         <h2 id={id ? `${id}-title` : undefined} className="box-title">
           {title}
         </h2>
+        {explain && <Explain text={explain} />}
         {count !== undefined && <span className="box-count">{count}</span>}
         {actions && <div className="box-actions">{actions}</div>}
-        {explain && <p className="box-explain">{explain}</p>}
       </header>
       <div className={flush ? 'box-body flush' : 'box-body'}>{children}</div>
     </section>

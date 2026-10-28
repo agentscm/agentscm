@@ -77,6 +77,9 @@ describe('live or preview', () => {
     expect((await inspectTemplate('c', 'p', signal)).source).toBe('preview')
     vi.stubGlobal('fetch', async () => json(405, { error: 'method_not_allowed' }))
     expect((await fetchTimeline(signal)).source).toBe('preview')
+    // A host that answers every path with its own page (200, HTML) is not the read API either.
+    vi.stubGlobal('fetch', async () => new Response('<!doctype html><title>Hub</title>', { status: 200, headers: { 'content-type': 'text/html' } }))
+    expect((await fetchTimeline(signal)).source).toBe('preview')
   })
 
   it('shows the local server’s own errors as advice, never as sample data', async () => {
