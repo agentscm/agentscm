@@ -1391,13 +1391,13 @@ impl GitExplorer {
         )?;
         self.ensure_pinned()?;
         match capture.stop {
-            Some(Stop::Output) => Ok(GitOutput {
+            Some(Stop::Output) if !capture.incomplete => Ok(GitOutput {
                 code: capture.code,
                 stdout: capture.stdout,
                 output_limited: true,
             }),
             Some(Stop::Timeout) => Err(Error::Limit("Git explorer request timed out".into())),
-            Some(Stop::Cancelled) | Some(Stop::Io) => Err(Error::Invalid(
+            Some(Stop::Output) | Some(Stop::Cancelled) | Some(Stop::Io) => Err(Error::Invalid(
                 "Git explorer subprocess did not complete".into(),
             )),
             None if capture

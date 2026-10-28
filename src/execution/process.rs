@@ -16,6 +16,8 @@ pub(crate) struct Capture {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stop: Option<Stop>,
+    /// Set when output collection did not finish or ownership of the child was lost.
+    pub incomplete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +207,7 @@ fn capture_with_input_inner(
             stdout: Vec::new(),
             stderr: Vec::new(),
             stop: Some(Stop::Cancelled),
+            incomplete: false,
         });
     }
     let (out_reader, out_writer) = UnixStream::pair()?;
@@ -478,11 +481,15 @@ fn capture_with_input_inner(
         &mut wait_error,
         &mut group_signalled,
     );
-    let terminal_stop = matches!(stop, Some(Stop::Timeout | Stop::Cancelled | Stop::Output));
+    let terminal_stop = primary_stop(stop);
     let non_tee_reader_failed = (!out_ok && !out_tee_failed) || (!err_ok && !err_tee_failed);
-    if non_tee_reader_failed
-        || wait_error.is_some()
-        || (!terminal_stop && (out_tee_failed || err_tee_failed))
+    // A reader that failed for any reason, including a tee sink, left collection
+    // incomplete; a wait error means ownership of the child is uncertain.
+    let mut incomplete = !out_ok || !err_ok || wait_error.is_some();
+    // An already observed timeout, cancellation or output limit stays the primary
+    // cause; `incomplete` carries the missing-data evidence alongside it.
+    if !terminal_stop
+        && (non_tee_reader_failed || wait_error.is_some() || out_tee_failed || err_tee_failed)
     {
         stop = Some(Stop::Io);
     }
@@ -516,7 +523,10 @@ fn capture_with_input_inner(
         child.wait()
     };
     if status.is_err() {
-        stop = Some(Stop::Io);
+        incomplete = true;
+        if !primary_stop(stop) {
+            stop = Some(Stop::Io);
+        }
     }
     let (code, signal) = match status {
         Ok(status) => (status.code(), status.signal()),
@@ -528,7 +538,12 @@ fn capture_with_input_inner(
         stdout,
         stderr,
         stop,
+        incomplete,
     })
+}
+
+fn primary_stop(stop: Option<Stop>) -> bool {
+    matches!(stop, Some(Stop::Timeout | Stop::Cancelled | Stop::Output))
 }
 
 // Observe terminal status without consuming it. si_signo is a portable POSIX
@@ -997,6 +1012,106 @@ os._exit(0)
         );
     }
 
+    // A setsid grandchild escapes the leader's process group, so it keeps the
+    // output pipes open after that group is killed and the drain cannot complete
+    // (it ends at the post-exit deadline).
+    // The leader continues only after the holder has detached, so no stop can
+    // kill the holder before it leaves the process group. It then touches the
+    // marker named by argv[1].
+    const DETACHED_HOLDER: &str = "import os,sys,time\nr,w=os.pipe()\nif os.fork()==0:\n os.setsid(); os.write(w,b'x'); time.sleep(5); os._exit(0)\nos.read(r,1)\nopen(sys.argv[1],'w').close()\n";
+
+    fn capture_with_detached_holder(
+        leader: &str,
+        timeout: Duration,
+        limit: u64,
+        cancel: &Cancellation,
+        cancel_when_detached: bool,
+    ) -> Capture {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("detached");
+        let script = format!("{DETACHED_HOLDER}{leader}");
+        let mut command = Command::new("/usr/bin/python3");
+        command.args(["-c", script.as_str()]).arg(&marker);
+        let cancel_in_hook = cancel.clone();
+        capture_with_input_inner(
+            &mut command,
+            None,
+            timeout,
+            limit,
+            cancel,
+            CaptureSettings::new(INPUT_CHUNK),
+            |_, _| {},
+            move |_, _| {
+                if cancel_when_detached {
+                    thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !marker.exists() && Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        cancel_in_hook.cancel();
+                    });
+                }
+                Ok(())
+            },
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn output_limit_stays_primary_when_drain_is_incomplete() {
+        let result = capture_with_detached_holder(
+            "try:\n while True: os.write(1, b'abcdefghijklmnop')\nexcept OSError: time.sleep(30)\n",
+            Duration::from_secs(10),
+            64,
+            &Cancellation::default(),
+            false,
+        );
+        assert_eq!(result.stop, Some(Stop::Output));
+        assert!(result.incomplete);
+        assert!(result.stdout.len() + result.stderr.len() <= 64);
+    }
+
+    #[test]
+    fn timeout_stays_primary_when_drain_is_incomplete() {
+        let result = capture_with_detached_holder(
+            "time.sleep(30)\n",
+            Duration::from_secs(1),
+            256,
+            &Cancellation::default(),
+            false,
+        );
+        assert_eq!(result.stop, Some(Stop::Timeout));
+        assert!(result.incomplete);
+    }
+
+    #[test]
+    fn cancellation_stays_primary_when_drain_is_incomplete() {
+        let result = capture_with_detached_holder(
+            "time.sleep(30)\n",
+            Duration::from_secs(10),
+            256,
+            &Cancellation::default(),
+            true,
+        );
+        assert_eq!(result.stop, Some(Stop::Cancelled));
+        assert!(result.incomplete);
+    }
+
+    #[test]
+    fn primary_stop_is_complete_when_collection_finishes() {
+        let result = capture(
+            Command::new("/bin/sh").args(["-c", "exec /bin/sleep 5"]),
+            Duration::from_millis(25),
+            256,
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(result.stop, Some(Stop::Timeout));
+        assert!(!result.incomplete);
+    }
+
     #[test]
     fn aggregate_output_is_bounded_and_cannot_report_success() {
         let result = capture(
@@ -1417,12 +1532,13 @@ os._exit(0)
     fn inherited_output_writer_cannot_claim_complete_capture() {
         let result = capture(
             Command::new("/bin/sh").args(["-c", "(/bin/sleep 4; printf late) & exit 0"]),
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             256,
             &Cancellation::default(),
         )
         .unwrap();
         assert_eq!(result.stop, Some(Stop::Io));
+        assert!(result.incomplete);
     }
 
     #[test]
@@ -1437,6 +1553,7 @@ os._exit(0)
         )
         .unwrap();
         assert_eq!(result.stop, None);
+        assert!(!result.incomplete);
         assert_eq!(result.code, Some(0));
         assert_eq!(result.stdout, b"ok");
     }
@@ -1472,8 +1589,9 @@ os._exit(0)
 
     #[test]
     fn continuous_trickle_has_an_absolute_drain_deadline_and_retains_partial_bytes() {
-        let result = capture(Command::new("/usr/bin/python3").args(["-c", "import os,time; child=os.fork();\nif child: os._exit(0)\nfor _ in range(400):\n os.write(1,b'x'); time.sleep(0.01)\n"]), Duration::from_secs(2), 1024, &Cancellation::default()).unwrap();
+        let result = capture(Command::new("/usr/bin/python3").args(["-c", "import os,time; child=os.fork();\nif child: os._exit(0)\nfor _ in range(400):\n os.write(1,b'x'); time.sleep(0.01)\n"]), Duration::from_secs(10), 1024, &Cancellation::default()).unwrap();
         assert_eq!(result.stop, Some(Stop::Io));
+        assert!(result.incomplete);
         assert!(!result.stdout.is_empty());
         // The writer needs at least four seconds for all 400 bytes; the deadline ends the
         // capture first. Counting bytes keeps interpreter startup out of the measurement.

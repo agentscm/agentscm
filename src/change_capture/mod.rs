@@ -1545,6 +1545,8 @@ where
     let (exit_code, signal, stdout, stderr, stop, outcome) = match captured {
         Ok(captured) => {
             let (stop, outcome) = match (captured.stop, captured.code, captured.signal) {
+                // Incomplete collection keeps today's Io mapping whatever the primary stop.
+                _ if captured.incomplete => (ObservedStop::Io, ActionOutcomeV1::Unknown),
                 (None, Some(0), None) => (ObservedStop::Exited, ActionOutcomeV1::Succeeded),
                 (None, Some(_), None) => (ObservedStop::Exited, ActionOutcomeV1::Failed),
                 (None, None, Some(_)) => (ObservedStop::Signalled, ActionOutcomeV1::Incomplete),
