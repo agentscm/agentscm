@@ -1996,7 +1996,10 @@ mod tests {
             .filter_map(|arg| arg.get_long())
             .collect();
         shown.sort_unstable();
+        #[cfg(unix)]
         assert_eq!(shown, ["dry-run", "hub-url", "json", "only", "yes"]);
+        #[cfg(not(unix))]
+        assert_eq!(shown, ["dry-run", "hub-url", "json", "yes"]);
         // The agent flags exist only on Unix.
         #[cfg(unix)]
         let argv = [
