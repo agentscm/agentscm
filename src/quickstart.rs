@@ -1380,6 +1380,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             left.agents.push(name.clone());
         }
     }
+    #[cfg(unix)]
     if m.claude_allow
         && let Err(error) = crate::client_plugin::disallow_claude_tools()
     {
