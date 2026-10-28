@@ -37,7 +37,7 @@ ENTRYPOINT ["hub-seed"]
 # trixie, not bookworm: `agentscm collisions` needs Git 2.43 or newer.
 FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS runtime
 LABEL org.opencontainers.image.licenses="FSL-1.1-ALv2" \
-      org.opencontainers.image.source="https://github.com/counterbranch/agentscm" \
+      org.opencontainers.image.source="https://github.com/agentscm/agentscm" \
       org.opencontainers.image.vendor="DUVATL, Inc."
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \

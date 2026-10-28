@@ -154,14 +154,13 @@ pub(crate) fn capture(
 const QUICK: Duration = Duration::from_secs(10);
 
 pub(crate) struct Detected {
-    pub(crate) git: Option<(PathBuf, String)>,
     pub(crate) repo_root: Option<PathBuf>,
     /// The origin URL as Git reports it, parsed.
     pub(crate) remote: Option<Remote>,
-    /// More than one registered Git worktree (including the current checkout).
-    pub(crate) worktrees: bool,
     pub(crate) docker: bool,
-    pub(crate) claude: bool,
+    /// Coding agents installed on this computer, in setup order.
+    #[cfg(unix)]
+    pub(crate) agents: Vec<crate::client_setup::Agent>,
 }
 
 pub(crate) fn detect(cwd: &Path) -> Detected {
@@ -179,38 +178,68 @@ pub(crate) fn detect(cwd: &Path) -> Detected {
             let url = capture(git, &["remote", "get-url", "origin"], Some(root), QUICK)?;
             parse_remote(&url)
         });
-    let worktrees = git
-        .as_ref()
-        .zip(repo_root.as_ref())
-        .is_some_and(|((git, _), root)| {
-            capture(git, &["worktree", "list", "--porcelain"], Some(root), QUICK).is_some_and(
-                |text| {
-                    text.lines()
-                        .filter(|line| line.starts_with("worktree "))
-                        .count()
-                        > 1
-                },
-            )
-        });
     let docker = which("docker").is_some_and(|docker| {
         capture(&docker, &["version"], None, QUICK).is_some()
             && capture(&docker, &["compose", "version"], None, QUICK).is_some()
     });
-    // Setup installs Claude Code's plugin through its CLI, so the app alone does not count.
-    let claude = which("claude").is_some();
     Detected {
-        git,
         repo_root,
         remote,
-        worktrees,
         docker,
-        claude,
+        #[cfg(unix)]
+        agents: installed_agents(&|name| which(name).is_some(), &|path| path.is_dir()),
     }
+}
+
+/// Each agent found by its program on PATH or its user configuration directory. Claude Code and
+/// Codex are set up through their own CLI's plugin commands, so only the program counts for them.
+#[cfg(unix)]
+fn installed_agents(
+    on_path: &dyn Fn(&str) -> bool,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Vec<crate::client_setup::Agent> {
+    use crate::client_setup::Agent;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dir = |variable: Option<&str>, default: &str| {
+        variable
+            .and_then(std::env::var_os)
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(default)))
+            .is_some_and(|path| exists(&path))
+    };
+    [
+        (Agent::Claude, on_path("claude")),
+        (Agent::Codex, on_path("codex")),
+        (
+            Agent::Cursor,
+            on_path("cursor") || on_path("cursor-agent") || dir(None, ".cursor"),
+        ),
+        (
+            Agent::Copilot,
+            on_path("copilot") || dir(Some("COPILOT_HOME"), ".copilot"),
+        ),
+        (Agent::Gemini, on_path("gemini") || dir(None, ".gemini")),
+    ]
+    .into_iter()
+    .filter_map(|(agent, found)| found.then_some(agent))
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_are_found_by_program_or_config_directory() {
+        use crate::client_setup::Agent;
+        assert!(installed_agents(&|_| false, &|_| false).is_empty());
+        // A config directory alone is not enough for agents set up through their CLI.
+        let dirs = installed_agents(&|_| false, &|_| true);
+        assert_eq!(dirs, [Agent::Cursor, Agent::Copilot, Agent::Gemini]);
+        let programs = installed_agents(&|name| matches!(name, "claude" | "codex"), &|_| false);
+        assert_eq!(programs, [Agent::Claude, Agent::Codex]);
+    }
 
     fn remote(url: &str) -> Option<(Forge, String, String)> {
         parse_remote(url).map(|r| (r.forge, r.host, r.repo))

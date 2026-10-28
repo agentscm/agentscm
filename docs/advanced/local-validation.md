@@ -128,7 +128,7 @@ permissions:
 
 jobs:
   reconcile:
-    uses: counterbranch/agentscm/.github/workflows/local-validation-reconcile.yml@<FULL_COMMIT_SHA_CONTAINING_WORKFLOW>
+    uses: agentscm/agentscm/.github/workflows/local-validation-reconcile.yml@<FULL_COMMIT_SHA_CONTAINING_WORKFLOW>
     with:
       release-version: <EXACT_PUBLISHED_SEMVER>
       config-dir: .github/local-validation
@@ -196,7 +196,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: counterbranch/agentscm
+          repository: agentscm/agentscm
           ref: 24cf76705bcbbac284fbcb18646d225f911b39a2
           path: agentscm-src
           persist-credentials: false

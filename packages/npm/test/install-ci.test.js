@@ -17,7 +17,7 @@ const target = {
 const skip = !target && 'reconcile full-process fixtures require a supported POSIX host';
 const version = '0.0.0-ci-test';
 const asset = `agentscm-${target}`;
-const releaseUrl = `https://github.com/counterbranch/agentscm/releases/download/v${version}`;
+const releaseUrl = `https://github.com/agentscm/agentscm/releases/download/v${version}`;
 const reconcileArgs = [
   'local-validation', 'reconcile', '--github-repo', 'example/project', '--base', 'main',
   '--repo', 'checkout with spaces', '--verifier-workflow', '.github/workflows/local-validation.yml',
@@ -58,14 +58,17 @@ if (args[0] === '--version') {
   record({ kind: 'gh-auth' });
   process.exit(config.signedOut ? 1 : 0);
 } else {
+  assert.equal(process.env.GH_HOST, 'github.com');
   assert.deepEqual(args, [
-    'attestation', 'verify', args[2], '--repo', 'counterbranch/agentscm',
-    '--signer-workflow', 'counterbranch/agentscm/.github/workflows/release.yml',
+    'attestation', 'verify', args[2], '--repo', config.repository,
+    '--signer-workflow', config.repository + '/.github/workflows/release.yml',
     '--source-ref', 'refs/tags/v' + config.version, '--deny-self-hosted-runners',
   ]);
   const hash = crypto.createHash('sha256').update(fs.readFileSync(args[2])).digest('hex');
   record({ kind: 'verify', args, hash });
-  if (config.provenanceMismatch) {
+  if (config.provenanceMismatch || config.attestedRepository !== config.repository ||
+      config.attestedWorkflow !== config.repository + '/.github/workflows/release.yml' ||
+      config.attestedRef !== 'refs/tags/v' + config.version) {
     console.error('synthetic attestation mismatch');
     process.exit(1);
   }
@@ -112,6 +115,10 @@ function fixture(t, options = {}) {
   for (const file of ['lib/install.js', 'bin/agentscm.js']) {
     fs.copyFileSync(path.join(__dirname, '..', file), path.join(pkg, file));
   }
+  const repository = options.repository ?? 'agentscm/agentscm';
+  const fixtureReleaseUrl = `https://github.com/${repository}/releases/download/v${version}`;
+  const wrapper = path.join(pkg, 'lib/install.js');
+  fs.writeFileSync(wrapper, fs.readFileSync(wrapper, 'utf8').replace(/^const REPO = '[^']+';$/m, `const REPO = '${repository}';`));
   fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ version }));
   fs.symlinkSync(process.execPath, path.join(bin, 'node'));
   if (!options.missingGh) fs.writeFileSync(path.join(bin, 'gh'), ghSource, { mode: 0o755 });
@@ -123,9 +130,11 @@ function fixture(t, options = {}) {
   fs.writeFileSync(releaseSums, sums);
   if (!options.downloadSums) fs.writeFileSync(path.join(pkg, 'SHA256SUMS'), options.sums ?? sums);
   const config = {
-    version, signedOut: Boolean(options.signedOut), provenanceMismatch: Boolean(options.provenanceMismatch),
-    unavailable: options.unavailable && `${releaseUrl}/${options.unavailable}`,
-    downloads: { [`${releaseUrl}/${asset}`]: releaseBinary, [`${releaseUrl}/SHA256SUMS`]: releaseSums },
+    version, repository, attestedRepository: options.attestedRepository ?? repository,
+    attestedWorkflow: options.attestedWorkflow ?? `${repository}/.github/workflows/release.yml`,
+    attestedRef: options.attestedRef ?? `refs/tags/v${version}`, signedOut: Boolean(options.signedOut), provenanceMismatch: Boolean(options.provenanceMismatch),
+    unavailable: options.unavailable && `${fixtureReleaseUrl}/${options.unavailable}`,
+    downloads: { [`${fixtureReleaseUrl}/${asset}`]: releaseBinary, [`${fixtureReleaseUrl}/SHA256SUMS`]: releaseSums },
   };
   const saveConfig = () => fs.writeFileSync(configFile, JSON.stringify(config));
   saveConfig();
@@ -138,7 +147,7 @@ function fixture(t, options = {}) {
         // Never inherit ambient credentials, NODE_OPTIONS, configuration, or executable search paths.
         env: {
           HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), GH_CONFIG_DIR: path.join(home, '.gh'),
-          TMPDIR: root, PATH: bin, CI: 'true', AGENTSCM_REQUIRE_PROVENANCE: '1',
+          TMPDIR: root, PATH: bin, GH_HOST: 'untrusted.invalid', CI: 'true', AGENTSCM_REQUIRE_PROVENANCE: '1',
           AGENTSCM_TELEMETRY: 'off', DO_NOT_TRACK: '1', FIXTURE_CONFIG: configFile,
           FIXTURE_EVENTS: eventsFile, ...extraEnv,
         },
@@ -264,3 +273,26 @@ test('CI reconcile propagates the launched binary exit code', { skip }, (t) => {
   assert.match(r.stdout, /synthetic reconcile stdout/);
   assert.match(r.stderr, /synthetic reconcile stderr/);
 });
+
+for (const repository of ['counterbranch/agentscm', 'agentscm/agentscm']) {
+  test(`CI reconcile installs and rechecks cached provenance for ${repository}`, { skip }, (t) => {
+    const f = fixture(t, { repository });
+    assert.equal(f.run().status, 0);
+    const cached = f.run();
+    assert.equal(cached.status, 0, cached.stderr);
+    assert.deepEqual(cached.events.map((event) => event.kind), ['gh-version', 'gh-auth', 'verify', 'launch']);
+  });
+  for (const [name, mismatch] of [
+    ['owner', { attestedRepository: 'untrusted/agentscm' }],
+    ['workflow', { attestedWorkflow: `${repository}/.github/workflows/other.yml` }],
+    ['tag', { attestedRef: 'refs/tags/v9.9.9' }],
+    ['opposite migration identity', { attestedRepository: repository === 'counterbranch/agentscm' ? 'agentscm/agentscm' : 'counterbranch/agentscm' }],
+  ]) {
+    test(`CI reconcile rejects wrong ${name} for ${repository}`, { skip }, (t) => {
+      const f = fixture(t, { repository, ...mismatch });
+      const result = f.run();
+      assertRejected(f, result, /build provenance verification failed/);
+      assert.equal(result.events.at(-1).kind, 'verify');
+    });
+  }
+}

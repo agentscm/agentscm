@@ -46,6 +46,11 @@ pub(crate) struct Manifest {
     pub(crate) bin_parent_created: bool,
     /// The person said no to keeping the menu bar app, so quickstart does not ask again.
     pub(crate) tray_declined: bool,
+    /// Agents quickstart set up for all projects (`client_setup::Agent` names); `uninstall`
+    /// takes their user-scope entries out.
+    pub(crate) agents: Vec<String>,
+    /// Quickstart added the rule allowing AgentSCM's MCP tools to Claude Code's user settings.
+    pub(crate) claude_allow: bool,
 }
 
 pub(crate) fn path() -> Result<PathBuf> {
@@ -178,6 +183,8 @@ impl Manifest {
             && self.local_hub.is_none()
             && self.native_hub.is_none()
             && self.bin_dir.is_none()
+            && self.agents.is_empty()
+            && !self.claude_allow
     }
 }
 

@@ -1,0 +1,24 @@
+'use strict';
+// Freeze the publishing identity into each release; historical packages keep their original signer.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const repository = process.env.GITHUB_REPOSITORY;
+const version = process.env.VERSION;
+assert.equal(process.env.GITHUB_REPOSITORY_ID, '1423506417', 'unexpected publishing repository ID');
+assert.equal(process.env.GITHUB_REPOSITORY_OWNER_ID, '326639785', 'unexpected publishing organization ID');
+assert.ok(['counterbranch/agentscm', 'agentscm/agentscm'].includes(repository), 'unexpected publishing repository name');
+assert.match(version ?? '', /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'invalid release version');
+const pkg = JSON.parse(fs.readFileSync('packages/npm/package.json', 'utf8'));
+assert.equal(pkg.version, version, 'npm version differs from release');
+const shell = fs.readFileSync('install.sh', 'utf8');
+const wrapper = fs.readFileSync('packages/npm/lib/install.js', 'utf8');
+const shellRepo = /^REPO="(?:counterbranch|agentscm)\/agentscm"$/m;
+const wrapperRepo = /^const REPO = '(?:counterbranch|agentscm)\/agentscm';$/m;
+assert.ok(shell.includes('AGENTSCM_DEFAULT_VERSION=""'), 'missing shell version marker');
+assert.match(shell, shellRepo, 'missing shell repository marker');
+assert.match(wrapper, wrapperRepo, 'missing npm repository marker');
+pkg.repository.url = `git+https://github.com/${repository}.git`;
+pkg.homepage = `https://github.com/${repository}`;
+fs.writeFileSync('dist/install.sh', shell.replace('AGENTSCM_DEFAULT_VERSION=""', `AGENTSCM_DEFAULT_VERSION="${version}"`).replace(shellRepo, `REPO="${repository}"`));
+fs.writeFileSync('packages/npm/lib/install.js', wrapper.replace(wrapperRepo, `const REPO = '${repository}';`));
+fs.writeFileSync('packages/npm/package.json', `${JSON.stringify(pkg, null, 2)}\n`);

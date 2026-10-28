@@ -4,12 +4,16 @@ on:
   pull_request:
     paths:
       - "install.sh"
+      - ".github/pin-release-installers.js"
+      - ".github/workflows/release.yml"
       - "packages/npm/**"
       - ".github/workflows/installer.yml"
   push:
     branches: [main]
     paths:
       - "install.sh"
+      - ".github/pin-release-installers.js"
+      - ".github/workflows/release.yml"
       - "packages/npm/**"
       - ".github/workflows/installer.yml"
 

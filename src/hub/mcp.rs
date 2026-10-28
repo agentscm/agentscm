@@ -521,6 +521,13 @@ fn initialize(
     })
 }
 
+/// The tools an agent's checkout can see before its connection is known: what the Hub lists a
+/// read-write agent by default, skill tools included. The checkout's MCP server lists these
+/// first so a session that connects mid-start still has every tool.
+pub fn agent_tools() -> Value {
+    tools(false, &ViewSettings::default(), false, true)
+}
+
 fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> Value {
     let session = json!({"type": "string", "description": "Session id; omit to use this agent's current session."});
     let paths = |description: &str| json!({"type": "array", "items": {"type": "string"}, "description": description});

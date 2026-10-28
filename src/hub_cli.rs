@@ -492,6 +492,21 @@ pub(crate) async fn sign_in(hub: &str, provider: &str, open_host: Option<&str>) 
     Ok(who)
 }
 
+/// Quickstart's sign-in: with the Hub's only provider unless one is given, and no question
+/// afterwards. Says who signed in; returns `provider:login`.
+pub(crate) async fn sign_in_for_setup(hub: &str, provider: Option<Provider>) -> Result<String> {
+    let name = match provider {
+        Some(provider) => provider
+            .to_possible_value()
+            .map(|v| v.get_name().to_owned())
+            .unwrap_or_default(),
+        None => only_provider(hub).await?,
+    };
+    let who = sign_in_with(hub, &name, None, SignIn::Auto).await?;
+    eprintln!("{}", signed_in_line(hub, &who));
+    Ok(who)
+}
+
 /// How a sign-in reaches the forge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignIn {
@@ -506,7 +521,7 @@ pub(crate) enum SignIn {
 
 /// Whether a browser can open on this computer: not over SSH, and with a display on Linux.
 /// `AGENTSCM_NO_BROWSER` set to anything says no.
-fn browser_available() -> bool {
+pub(crate) fn browser_available() -> bool {
     let set = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
     !set("AGENTSCM_NO_BROWSER")
         && !set("SSH_CONNECTION")

@@ -61,14 +61,14 @@ test('checksum verification', () => {
 test('release URL', () => {
   assert.equal(
     urlFor('1.2.3', 'agentscm-aarch64-apple-darwin'),
-    'https://github.com/counterbranch/agentscm/releases/download/v1.2.3/agentscm-aarch64-apple-darwin',
+    'https://github.com/agentscm/agentscm/releases/download/v1.2.3/agentscm-aarch64-apple-darwin',
   );
 });
 
 test('release URL for the Windows asset', () => {
   assert.equal(
     urlFor('1.2.3', assetNameFor('x86_64-pc-windows-msvc')),
-    'https://github.com/counterbranch/agentscm/releases/download/v1.2.3/agentscm-x86_64-pc-windows-msvc.exe',
+    'https://github.com/agentscm/agentscm/releases/download/v1.2.3/agentscm-x86_64-pc-windows-msvc.exe',
   );
 });
 
@@ -110,8 +110,8 @@ test('checksum source selection', () => {
 
 test('attestation verification is pinned to the release workflow and tag', () => {
   assert.deepEqual(ghVerifyArgs('/x/agentscm-1', '1.2.3'), [
-    'attestation', 'verify', '/x/agentscm-1', '--repo', 'counterbranch/agentscm',
-    '--signer-workflow', 'counterbranch/agentscm/.github/workflows/release.yml',
+    'attestation', 'verify', '/x/agentscm-1', '--repo', 'agentscm/agentscm',
+    '--signer-workflow', 'agentscm/agentscm/.github/workflows/release.yml',
     '--source-ref', 'refs/tags/v1.2.3', '--deny-self-hosted-runners',
   ]);
 });
@@ -121,6 +121,24 @@ test('provenance needs gh installed and signed in', () => {
   assert.match(provenanceGap(ran({ '--version': { error: new Error('ENOENT') } })), /not installed/);
   assert.match(provenanceGap(ran({ '--version': { status: 0 }, auth: { status: 1 } })), /not signed in/);
   assert.equal(provenanceGap(ran({ '--version': { status: 0 }, auth: { status: 0 } })), null);
+});
+
+test('provenance auth probes GitHub.com despite a different GH_HOST', () => {
+  const saved = process.env.GH_HOST;
+  process.env.GH_HOST = 'untrusted.invalid';
+  try {
+    assert.equal(provenanceGap((_cmd, args) => {
+      if (args[0] === '--version') return { status: 0 };
+      assert.deepEqual(args, ['auth', 'status', '--hostname', 'github.com']);
+      return { status: 0 };
+    }), null);
+    assert.equal(checkProvenance(sample, '1.2.3', null, (_cmd, _args, options) => {
+      assert.equal(options.env.GH_HOST, 'github.com');
+      return { status: 0 };
+    }), true);
+  } finally {
+    if (saved === undefined) delete process.env.GH_HOST; else process.env.GH_HOST = saved;
+  }
 });
 
 test('without gh, provenance is reported to the caller unless required', () => {
