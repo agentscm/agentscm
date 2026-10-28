@@ -16,7 +16,8 @@ pub(crate) struct Capture {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stop: Option<Stop>,
-    /// Set when output collection did not finish or ownership of the child was lost.
+    /// Set when a stream drain failed outside its tee sink or ownership of the child
+    /// was lost; tee sink failures are reported through `stop`.
     pub incomplete: bool,
 }
 
@@ -483,9 +484,11 @@ fn capture_with_input_inner(
     );
     let terminal_stop = primary_stop(stop);
     let non_tee_reader_failed = (!out_ok && !out_tee_failed) || (!err_ok && !err_tee_failed);
-    // A reader that failed for any reason, including a tee sink, left collection
-    // incomplete; a wait error means ownership of the child is uncertain.
-    let mut incomplete = !out_ok || !err_ok || wait_error.is_some();
+    // A drain that failed outside its tee sink left collection incomplete, and a
+    // wait error means ownership of the child is uncertain. A tee sink failure is
+    // not incomplete capture: it stops the child as `Io` only when no primary stop
+    // was already observed.
+    let mut incomplete = non_tee_reader_failed || wait_error.is_some();
     // An already observed timeout, cancellation or output limit stays the primary
     // cause; `incomplete` carries the missing-data evidence alongside it.
     if !terminal_stop
@@ -1012,13 +1015,13 @@ os._exit(0)
         );
     }
 
-    // A setsid grandchild escapes the leader's process group, so it keeps the
-    // output pipes open after that group is killed and the drain cannot complete
-    // (it ends at the post-exit deadline).
+    // A setsid grandchild leaves the leader's session and process group, so it
+    // keeps the output pipes open after the leader is killed and the drain cannot
+    // complete (it ends at the post-exit deadline).
     // The leader continues only after the holder has detached, so no stop can
     // kill the holder before it leaves the process group. It then touches the
     // marker named by argv[1].
-    const DETACHED_HOLDER: &str = "import os,sys,time\nr,w=os.pipe()\nif os.fork()==0:\n os.setsid(); os.write(w,b'x'); time.sleep(5); os._exit(0)\nos.read(r,1)\nopen(sys.argv[1],'w').close()\n";
+    const DETACHED_HOLDER: &str = "import os,sys,time\nr,w=os.pipe()\nif os.fork()==0:\n os.setsid(); os.write(w,b'x'); time.sleep(10); os._exit(0)\nos.read(r,1)\nopen(sys.argv[1],'w').close()\n";
 
     fn capture_with_detached_holder(
         leader: &str,
@@ -1077,7 +1080,7 @@ os._exit(0)
     fn timeout_stays_primary_when_drain_is_incomplete() {
         let result = capture_with_detached_holder(
             "time.sleep(30)\n",
-            Duration::from_secs(1),
+            Duration::from_secs(3),
             256,
             &Cancellation::default(),
             false,
@@ -1449,6 +1452,7 @@ os._exit(0)
         )
         .unwrap();
         assert_eq!(result.stop, Some(Stop::Io));
+        assert!(!result.incomplete);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -1471,6 +1475,7 @@ os._exit(0)
         .unwrap();
         sink.release();
         assert_eq!(result.stop, Some(Stop::Timeout));
+        assert!(!result.incomplete);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
