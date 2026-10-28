@@ -59,9 +59,9 @@ test('install.sh hides successful gh details and offers verbose diagnostics', { 
 for a; do [ "$prev" = -o ] && out=$a; prev=$a; url=$a; done
 case "$url" in */SHA256SUMS) cp "$SUMS" "$out" ;; *) printf '#!/bin/sh\\nexit 0\\n' >"$out" ;; esac
 `;
-  const gh = '#!/bin/sh\n[ "$1" = auth ] && exit 0\necho "verified attestation"\necho "upgrade gh now" >&2\n';
+  const gh = '#!/bin/sh\nif [ "$1" = auth ]; then [ "$2" = status ] && [ "$3" = --hostname ] && [ "$4" = github.com ]; exit $?; fi\n[ "$GH_HOST" = github.com ] || exit 1\necho "verified attestation"\necho "upgrade gh now" >&2\n';
 
-  const quiet = run(validSums, {}, { curl, gh });
+  const quiet = run(validSums, { GH_HOST: 'untrusted.invalid' }, { curl, gh });
   assert.equal(quiet.status, 0, quiet.stderr);
   assert.match(quiet.stdout, /Verified provenance with GitHub attestations\. Set AGENTSCM_INSTALL_VERBOSE=1 for details\./);
   assert.doesNotMatch(`${quiet.stdout}${quiet.stderr}`, /verified attestation|upgrade gh now/);

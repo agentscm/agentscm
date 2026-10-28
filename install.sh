@@ -54,7 +54,7 @@ provenance_gap() {
 # Without a usable gh the checksum comes from the same release as the binary: that catches corruption, not forgery.
 provenance() { # provenance <file>; uses $gap from main
   if [ -z "$gap" ]; then
-    if gh attestation verify "$1" --repo "$REPO" \
+    if GH_HOST=github.com gh attestation verify "$1" --repo "$REPO" \
       --signer-workflow "$REPO/.github/workflows/release.yml" \
       --source-ref "refs/tags/v$VERSION" --deny-self-hosted-runners \
       >"$tmp/gh-verify.log" 2>&1; then
@@ -91,6 +91,9 @@ TEXT
   case "$VERSION" in
     *[!A-Za-z0-9._-]*) die "invalid version" ;;
   esac
+  # A release script trusts only its own release's signing identity.
+  [ -z "$AGENTSCM_DEFAULT_VERSION" ] || [ "$VERSION" = "$AGENTSCM_DEFAULT_VERSION" ] ||
+    die "this script is pinned to $AGENTSCM_DEFAULT_VERSION; download install.sh from the requested release"
 
   case "$(uname -s)/$(uname -m)" in
     Linux/x86_64) target=x86_64-unknown-linux-musl ;;

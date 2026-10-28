@@ -604,6 +604,7 @@ const MANAGED_QUICKSTART_TIMEOUT: Duration = Duration::from_secs(120);
 struct BoundedOutput {
     output: Output,
     timed_out: bool,
+    timeout_elapsed: Option<Duration>,
     stdout_truncated: bool,
     stderr_truncated: bool,
 }
@@ -690,13 +691,14 @@ fn capture_until_cancelled(
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> std::io::Result<BoundedOutput> {
-    capture_with_cleanup(command, timeout, cancelled, || Ok(()))
+    capture_with_cleanup(command, timeout, cancelled, None, || Ok(()))
 }
 
 fn capture_with_cleanup(
     command: &mut Command,
     timeout: Duration,
     cancelled: &AtomicBool,
+    ready: Option<(&Path, Duration)>,
     cleanup: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<BoundedOutput> {
     command
@@ -716,8 +718,15 @@ fn capture_with_cleanup(
         let _ = send.send((false, read_capped(stderr)));
     });
 
-    let deadline = Instant::now() + timeout;
+    // A readiness-gated fixture bounds startup separately so the short timeout
+    // exercises running nested work rather than CLI/launcher startup latency.
+    let startup_deadline = Instant::now() + ready.map_or(timeout, |(_, limit)| limit);
+    let mut timeout_started = ready.is_none().then(Instant::now);
     let timed_out = loop {
+        if timeout_started.is_none() && ready.is_some_and(|(path, _)| path.exists()) {
+            timeout_started = Some(Instant::now());
+        }
+        let deadline = timeout_started.map_or(startup_deadline, |started| started + timeout);
         let exited = child_exited_without_reaping(&child)?;
         if exited || Instant::now() >= deadline || cancelled.load(Ordering::Acquire) {
             kill_owned_process_group(&child)?;
@@ -759,6 +768,7 @@ fn capture_with_cleanup(
             stderr,
         },
         timed_out,
+        timeout_elapsed: timeout_started.map(|started| started.elapsed()),
         stdout_truncated,
         stderr_truncated,
     })
@@ -895,9 +905,12 @@ fn managed_quickstart(
     endpoint: &std::ffi::OsStr,
     command: &mut Command,
     timeout: Duration,
+    ready: Option<(&Path, Duration)>,
 ) -> std::io::Result<BoundedOutput> {
     let mut proxy = ManagedDockerProxy::start(machine, docker, endpoint);
-    let captured = capture_with_cleanup(command, timeout, &AtomicBool::new(false), || proxy.stop());
+    let captured = capture_with_cleanup(command, timeout, &AtomicBool::new(false), ready, || {
+        proxy.stop()
+    });
     // Always cancel and join the command owner before returning, even on capture
     // failure. The caller's Compose cleanup must not race a surviving `up`.
     proxy.stop()?;
@@ -1008,8 +1021,10 @@ fn managed_quickstart_timeout_stops_nested_docker_before_cleanup() {
     std::fs::write(
         &docker,
         r#"#!/bin/sh
-printf '%s\n' "$*" > "$HOME/docker-started"
+# Startup must exceed the active timeout to exercise readiness gating without host load.
+/bin/sleep 2.1
 (/bin/sleep 3; printf survived > "$HOME/docker-late-marker") &
+printf '%s\n' "$*" > "$HOME/docker-started"
 wait
 "#,
     )
@@ -1030,25 +1045,68 @@ wait
             "--no-collisions",
         ],
     );
-    let started = Instant::now();
+    let ready = machine.home.path().join("docker-started");
     let captured = managed_quickstart(
         &machine,
         &docker,
         std::ffi::OsStr::new("unix:///synthetic-unused"),
         &mut command,
         Duration::from_secs(2),
+        Some((&ready, MANAGED_COMMAND_TIMEOUT)),
     )
     .unwrap();
     assert!(captured.timed_out, "{:?}", captured.output);
-    assert!(started.elapsed() < Duration::from_secs(5));
     assert!(
-        machine.home.path().join("docker-started").exists(),
-        "real quickstart never reached Docker"
+        captured.timeout_elapsed.is_some(),
+        "real quickstart never reached Docker before the startup deadline: {:?}",
+        captured.output
     );
+    assert!(captured.timeout_elapsed.unwrap() < Duration::from_secs(5));
     // This is the boundary where the real fixture may begin `compose down`.
     // Waiting past the synthetic command's write deadline detects surviving work.
     std::thread::sleep(Duration::from_millis(3200));
     assert!(!machine.home.path().join("docker-late-marker").exists());
+}
+
+#[test]
+fn managed_missing_readiness_still_stops_nested_work_before_cleanup() {
+    for (script, startup_limit, late_wait, timed_out) in [
+        (
+            "(/bin/sleep 0.3; printf survived > \"$MARKER\") & wait",
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+            true,
+        ),
+        (
+            "(/bin/sleep 3; printf survived > \"$MARKER\") & exit 0",
+            Duration::from_secs(2),
+            Duration::from_millis(3200),
+            false,
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("late-marker");
+        let ready = dir.path().join("never-ready");
+        let mut command = Command::new("/bin/sh");
+        command.env("MARKER", &marker).args(["-c", script]);
+        let cleaned = AtomicBool::new(false);
+        let captured = capture_with_cleanup(
+            &mut command,
+            Duration::from_secs(2),
+            &AtomicBool::new(false),
+            Some((&ready, startup_limit)),
+            || {
+                cleaned.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(captured.timed_out, timed_out, "{:?}", captured.output);
+        assert!(captured.timeout_elapsed.is_none());
+        assert!(cleaned.load(Ordering::Acquire));
+        std::thread::sleep(late_wait);
+        assert!(!marker.exists(), "a descendant survived missing readiness");
+    }
 }
 
 #[test]
@@ -1182,6 +1240,7 @@ fn managed_docker_generated_compose_accepts_empty_slack_setting() {
         &endpoint,
         &mut quickstart,
         MANAGED_QUICKSTART_TIMEOUT,
+        None,
     )
     .unwrap();
     let output = checked_managed_output(

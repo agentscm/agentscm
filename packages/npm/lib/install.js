@@ -134,6 +134,7 @@ function checkProvenance(file, version, gap = provenanceGap(), run = spawnSync) 
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: VERIFY_OUTPUT_MAX,
+    env: { ...process.env, GH_HOST: 'github.com' },
   });
   if (result.error || result.status !== 0) {
     showVerifyOutput(result);
