@@ -55,7 +55,8 @@ pub(crate) fn github_login(given: Option<&str>, ui: &Ui) -> Result<String, Strin
     let verified = which("gh")
         .and_then(|gh| capture(&gh, &["api", "user", "-q", ".login"], None, QUICK))
         .filter(|login| login_ok(login));
-    let login = if ui.yes {
+    // A login `gh` vouches for is used without asking.
+    let login = if ui.yes || verified.is_some() {
         verified.unwrap_or_default()
     } else {
         let guess = verified
@@ -101,12 +102,11 @@ pub(crate) async fn finish(
         println!(
             "Create the app on GitHub, then on the success page click Install and choose your repository."
         );
-        if tty && !ui.yes {
-            open_url(&link);
-        }
-        if ui.yes {
+        // A run without a terminal (an agent, say) waits too when a browser can open here.
+        let attended = tty && !ui.yes;
+        if !attended && !crate::hub_cli::browser_available() {
             println!(
-                "Non-interactive setup will not wait for the browser. Finish creating and installing the app, then run quickstart again."
+                "No browser can open from here. Run quickstart once in your own terminal to finish creating the app."
             );
             return Ok(Started {
                 install_url: None,
@@ -114,6 +114,8 @@ pub(crate) async fn finish(
                 url,
             });
         }
+        open_url(&link);
+        println!("Waiting for the app to be created (up to 10 minutes)…");
         let deadline = Instant::now() + Duration::from_secs(600);
         while connection.is_empty() {
             if Instant::now() >= deadline {
@@ -122,10 +124,15 @@ pub(crate) async fn finish(
             tokio::time::sleep(Duration::from_secs(2)).await;
             connection = runtime.connection_ids()?;
         }
-        ui.pause(&format!(
-            "On the GitHub page, click Install and pick {}, then press Enter.",
-            repo.unwrap_or("your repository")
-        ));
+        let install = format!(
+            "On the GitHub page, click Install and pick {}",
+            repo.unwrap_or("the repositories your agents work in")
+        );
+        if ui.yes || !tty {
+            println!("{install}.");
+        } else {
+            ui.pause(&format!("{install}, then press Enter."));
+        }
     }
     let Some(connection) = connection.first() else {
         return Ok(Started {

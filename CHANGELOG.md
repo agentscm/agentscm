@@ -2,6 +2,15 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## Unreleased
+
+- `npx agentscm` asks nothing once the Hub is known (`--hub-url`, the checkout's connection, or the computer's only sign-in); the "Where should AgentSCM run?" choice remains only without one. It sets up every coding agent it finds, by program on PATH or by configuration directory (Claude Code and Codex by program, since their plugins install through their CLIs; Cursor, GitHub Copilot and Gemini CLI by either), for all projects, also from a directory that is not a repository; `--agent` narrows the list. The "all your projects?" question and its No path, which dropped Claude Code and Codex, are gone (#188), as are "Go ahead?", the auto-connect question (auto-connect is always on), the collision check (`--no-collisions` is accepted and does nothing), the menu bar question (a closing line names `agentscm tray`) and the native Hub install confirmation. The closing lines say what was set up, to fully quit and reopen the agents, to trust Codex's hooks with `/hooks` when Codex was set up, and the undo command, which no longer names a program in a temporary directory.
+- Claude Code runs AgentSCM's MCP tools without asking: setup adds `mcp__plugin_agentscm_agentscm__*` to `permissions.allow` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`), keeping the old file as `settings.json.bak`, and `agentscm uninstall` takes out exactly that rule when setup added it. Gemini CLI's AgentSCM server gets `"trust": true`. Other agents have no documented per-server setting, so they still ask.
+- `--yes` and runs without a terminal sign in: the link is printed on stderr, the browser opens when it can, and quickstart waits; a sign-in that cannot finish there says to run quickstart once in your own terminal (#187). A new local Hub waits the same way for the GitHub App to be created when a browser can open, and exits 3 as before when none can. A GitHub login that `gh` reports is used without asking.
+- Joining a Hub, quickstart says which Hub it joins instead of local-Hub platform and Docker details (#189).
+- `client setup` points the user-wide plugin and hooks at `agentscm` on PATH or at the stable copy in `~/.agentscm/bin`, never at a build directory or npm cache (#190).
+- The user-wide hooks no longer add a "coordination unknown" note when an edited file is in no connected checkout (#199). A repository with no connection still gets the one-line hint at session start.
+
 ## 0.1.0-alpha.8 (2026-10-27)
 
 - Fixed: the Hub in a quickstart-managed Docker container never became healthy, because quickstart sets `AGENTSCM_SLACK_FILE` to an empty value and the Hub tried to load Slack settings from that empty path. An empty value now means no Slack file (#181).

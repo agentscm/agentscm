@@ -735,6 +735,8 @@ fn user_plan(agent: Agent, program: &Path) -> Result<Vec<UserEdit>> {
             Some("config.toml") => codex_block(old.unwrap_or_default(), &name, args, program)?,
             Some("settings.json") => json(edited_json(old, |v| {
                 add_mcp(v, "mcpServers", args, program)?;
+                // Gemini CLI's documented switch for running this server's tools without asking.
+                v["mcpServers"]["agentscm"]["trust"] = json!(true);
                 add_hooks(v, agent, program)
             }))?,
             Some("mcp.json") => json(edited_json(old, |v| {
@@ -981,11 +983,13 @@ fn write_user_plan(edits: Vec<UserEdit>, announce: bool) -> Result<()> {
 
 /// After a user-scope setup, takes AgentSCM's checkout files for `agent` out of this checkout
 /// and every other connected one that has them, so no hook or MCP server runs twice.
-fn migrate_checkouts(agent: Agent, root: &Path) -> Result<()> {
-    remove_files(agent, root)?;
+fn migrate_checkouts(agent: Agent, root: Option<&Path>) -> Result<()> {
+    if let Some(root) = root {
+        remove_files(agent, root)?;
+    }
     let others = crate::client_config::load()?
         .into_iter()
-        .filter(|connection| connection.root != root && connection.root.is_dir())
+        .filter(|connection| Some(connection.root.as_path()) != root && connection.root.is_dir())
         .filter(|connection| connection.agents.iter().any(|name| name == agent.name()));
     for connection in others {
         if let Err(error) = remove_files(agent, &connection.root) {
@@ -1005,10 +1009,32 @@ pub(crate) fn install(agent: Agent, root: &Path, program: &Path, scope: Scope) -
     install_locked(agent, root, program, scope, true)
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn install_quiet(agent: Agent, root: &Path, program: &Path, scope: Scope) -> Result<()> {
     let _lock = installation_lock()?;
     install_locked(agent, root, program, scope, false)
+}
+
+/// A user-scope setup with no checkout, for quickstart outside a repository: checkouts that
+/// connect later use these entries. The plugin CLIs run from the home directory.
+pub(crate) fn install_user(agent: Agent, program: &Path) -> Result<()> {
+    let _lock = installation_lock()?;
+    let home = home()?;
+    // Checked before the plugin step, planned after it: `codex plugin add` edits config.toml.
+    user_plan(agent, program)?;
+    if agent == Agent::Codex {
+        crate::client_plugin::install_for_root(&home, program, false)?;
+    }
+    if agent == Agent::Claude {
+        crate::client_plugin::install_claude_for_root(&home, program)?;
+    }
+    write_user_plan(user_plan(agent, program)?, false)?;
+    migrate_checkouts(agent, None)
+}
+
+/// Takes out what [`install_user`] wrote for `agent`.
+pub(crate) fn remove_user(agent: Agent) -> Result<()> {
+    let _lock = installation_lock()?;
+    remove_locked(agent, Path::new(""), true)
 }
 
 fn install_locked(
@@ -1033,8 +1059,14 @@ fn install_locked(
     }
     write_plan(root, edits, announce)?;
     if user {
+        // `codex plugin add` has just edited config.toml, so plan the user files again.
+        let user_edits = if agent == Agent::Codex {
+            user_plan(agent, program)?
+        } else {
+            user_edits
+        };
         write_user_plan(user_edits, announce)?;
-        migrate_checkouts(agent, root)?;
+        migrate_checkouts(agent, Some(root))?;
     }
     if announce {
         println!(
@@ -1049,9 +1081,11 @@ fn install_locked(
         println!(
             "Review the client's own project, hook and MCP approvals, then start a fresh session and verify it reaches the expected repository. Setup does not grant trust."
         );
-        println!(
-            "New local settings are Git-excluded. Review changes to any settings your repository already tracks; do not commit machine-specific configuration."
-        );
+        if !user {
+            println!(
+                "New local settings are Git-excluded. Review changes to any settings your repository already tracks; do not commit machine-specific configuration."
+            );
+        }
         #[cfg(unix)]
         println!(
             "Run `agentscm open` here to see this checkout's files, saved conversations and your team's work in your browser."

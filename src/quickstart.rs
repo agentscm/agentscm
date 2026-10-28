@@ -8,14 +8,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use agentscm::git_collisions::{self, Request};
 use agentscm::hub::forge_http::{self, check_base_url};
 use agentscm::hub::slack::setup as slack_setup;
 use agentscm::{Error, Result};
 use clap::{Args, ValueEnum};
 use reqwest::Method;
-use serde_json::Value;
 
 use crate::hub_cli::{self, Provider, call, clean};
 
@@ -76,7 +73,7 @@ pub struct QuickstartArgs {
     /// Set from `--hub` once parsed.
     #[arg(skip)]
     hub: Option<HubChoice>,
-    /// The hub to connect to (with --hub existing).
+    /// The Hub to join, such as https://hub.example.com.
     #[arg(long)]
     hub_url: Option<String>,
     /// Local hub runtime; native is recommended on qualified macOS ARM64 hosts.
@@ -100,16 +97,15 @@ pub struct QuickstartArgs {
     /// Which forge to sign in with (default: the one in origin's URL).
     #[arg(long, value_enum)]
     provider: Option<Provider>,
-    /// Coding agent to set up through `agentscm client setup` (repeatable; default: Claude
-    /// Code when it is installed).
+    /// Coding agent to set up (repeatable; default: every one installed on this computer).
     #[cfg(unix)]
     #[arg(long, value_enum, conflicts_with = "no_agents")]
     agent: Vec<crate::client_setup::Agent>,
     /// Set up no coding agent.
     #[arg(long)]
     no_agents: bool,
-    /// Skip the check for colliding branches.
-    #[arg(long)]
+    /// Accepted for older scripts: setup no longer checks for colliding branches.
+    #[arg(long, hide = true)]
     no_collisions: bool,
     /// Also write the repository's agent instructions (agentscm init-repo). Without it, setup
     /// writes nothing to the repository.
@@ -177,7 +173,7 @@ To run it without one, pass --yes and choose with flags: --local (recommended) o
 --hub local|existing|skip|URL, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
---slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --no-collisions, --init, --tray";
+--slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --init, --tray";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
@@ -325,11 +321,14 @@ struct Live {
     repo: Option<String>,
     /// Agents set up in this checkout.
     agents: Vec<String>,
+    /// Agents set up for all projects, connected or not.
+    #[cfg(unix)]
+    installed: Vec<crate::client_setup::Agent>,
+    /// Agents that could not be set up, with the reason.
+    #[cfg(unix)]
+    failed: Vec<(crate::client_setup::Agent, String)>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
-    /// The user answered no to "Go ahead?", or no to installing for all projects when every
-    /// chosen agent needs that.
-    declined: bool,
     /// Why setting up the coding agents failed.
     agent_error: Option<String>,
     /// Why a requested local hub isn't running.
@@ -353,12 +352,6 @@ impl Live {
                 &format!("fix that, then run `{cli} quickstart` again"),
             );
         }
-        if self.declined {
-            return off(
-                "you chose not to set up a coding agent; nothing was changed for it",
-                &format!("run `{cli} quickstart` again when you want it"),
-            );
-        }
         match (&self.hub, &self.repo) {
             (None, _) if self.hub_error.is_some() => off(
                 &format!(
@@ -376,6 +369,10 @@ impl Live {
             (Some(url), _) if !self.hub_up => off(
                 &format!("the hub at {url} isn't answering"),
                 &format!("start it, then run `{cli} quickstart` again"),
+            ),
+            #[cfg(unix)]
+            (Some(url), None) if !self.installed.is_empty() => format!(
+                "Live warnings: on for repositories on {url}; each connects when an agent starts in it"
             ),
             (Some(_), None) if !self.wanted_agents => off(
                 "no coding agent was set up",
@@ -461,8 +458,7 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
     if let Some((binary::Program::InstallDir(_), _)) = program_plan(&cx.home) {
         cx.manifest.bin_dir = Some(binary::bin_dir(&cx.home));
     }
-    status(&cx).await;
-    // Local or hosted is the first question; the collision check does not depend on it.
+    status(&cx);
     if let Some(url) = choose_hub(&mut cx).await {
         cx.live.hub_up = healthy(&cx.client, &url).await;
         cx.live.hub = Some(url.clone());
@@ -472,26 +468,25 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
             );
         }
     }
-    collisions_step(&cx);
     agents_stage(&mut cx).await;
     init_stage(&mut cx);
     let command = cli_command(&cx);
     // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
+    #[cfg(unix)]
+    let nothing_installed = cx.live.installed.is_empty();
+    #[cfg(not(unix))]
+    let nothing_installed = true;
     let requested_hub_incomplete = (args.local
         || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
         || args.hub_url.is_some())
-        && !cx.live.declined
-        && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents));
+        && (!cx.live.hub_up
+            || (cx.live.repo.is_none() && cx.live.wanted_agents && nothing_installed));
     let ready = cx.failure.is_none()
         && cx.live.pending_local.is_none()
         && cx.live.agent_error.is_none()
         && !requested_hub_incomplete;
-    // Asked before the summary, so a remembered answer counts as a change.
-    let offered = ready && !args.tray && offers_tray(&cx);
     let tray_result = if ready && args.tray {
         launch_tray(&cx)
-    } else if offered {
-        tray_offer(&mut cx, &command)
     } else {
         Ok(())
     };
@@ -503,25 +498,10 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         || program_fingerprint(&cx.home) != original_program
         || sessions_file.as_deref().map(file_hash) != original_sessions
         || !cx.init_written.is_empty();
-    summary(&cx, changed);
-    println!("Run AgentSCM commands with: {command}");
-    if let Some(dir) = &cx.manifest.bin_dir {
-        println!(
-            r#"To use `agentscm` in this shell: export PATH={}:"$PATH""#,
-            binary::quote(dir)
-        );
-    }
-    if let (Some(url), Some(repo), true) = (&cx.live.hub, &cx.live.repo, cx.live.hub_up) {
-        println!("Hub status page: {url}/ui/");
-        println!(
-            "Sign in there with a read-only token: {command} hub token create --read-only --name status-page --repo {repo} --ttl 30d"
-        );
-    }
+    summary(&cx, changed, &command);
     #[cfg(target_os = "macos")]
-    if !(offered || ready && args.tray) {
-        println!(
-            "Optional status-bar companion: {command} tray (Start at Login is off until you enable it in the menu)."
-        );
+    if !(ready && args.tray) {
+        println!("Menu bar app: {command} tray");
     }
     println!("{}", cx.live.line(&command));
     if let Some(failure) = cx.failure {
@@ -530,10 +510,10 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
     if cx.live.pending_local.is_some() {
         return Ok(3);
     }
-    if cx.live.agent_error.is_some() {
-        return Err(invalid(
-            "setting up the coding agent failed; see the status and recovery instructions above",
-        ));
+    if let Some(error) = &cx.live.agent_error {
+        return Err(invalid(&format!(
+            "setting up the coding agents failed: {error}"
+        )));
     }
     if requested_hub_incomplete {
         return Err(invalid(
@@ -598,161 +578,30 @@ fn program_fingerprint(home: &Path) -> (Option<u32>, Vec<ProgramFileFingerprint>
     (directory_mode, files)
 }
 
-async fn status(cx: &Cx<'_>) {
-    println!("What I found:");
-    let found = &cx.found;
-    println!(
-        "  Executable platform: {}/{}; managed native hub {}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        if native_hub_supported() {
-            "available"
+/// One line on what setup will cover, before anything happens.
+fn status(cx: &Cx<'_>) {
+    if let Some(url) = &cx.args.hub_url {
+        println!("Joining the Hub at {}.", clean(url));
+    }
+    #[cfg(unix)]
+    if !cx.args.no_agents {
+        let found = &cx.found.agents;
+        if found.is_empty() {
+            println!("No coding agent found on this computer.");
         } else {
-            "unavailable (explicit Docker fallback or existing hub)"
+            println!("Found {}.", labels(found));
         }
-    );
-    match (&found.repo_root, &found.remote) {
-        (Some(root), Some(remote)) => {
-            let forge = match remote.forge {
-                Forge::Github => "GitHub",
-                Forge::Gitlab => "GitLab",
-                Forge::Other => "another forge",
-            };
-            println!(
-                "  Git repository: {} (origin: {forge}, {})",
-                root.display(),
-                clean(&remote.repo)
-            );
-        }
-        (Some(root), None) => {
-            println!(
-                "  Git repository: {} (no usable origin remote)",
-                root.display()
-            );
-        }
-        _ => println!("  Git repository: not inside one"),
-    }
-    match &found.git {
-        Some((_, version)) => println!("  git: {}", clean(version)),
-        None => println!("  git: not found on PATH"),
-    }
-    println!(
-        "  Docker: {}",
-        if found.docker {
-            "available (with compose)"
-        } else {
-            "not available"
-        }
-    );
-    match checkout_connection(found) {
-        Some(connection) => {
-            let reach = if healthy(&cx.client, &connection.hub).await {
-                "answering"
-            } else {
-                "not answering"
-            };
-            println!(
-                "  Hub: {} ({reach}); this checkout is connected for {}{}",
-                connection.hub,
-                clean(&connection.repo),
-                if connection.agents.is_empty() {
-                    String::new()
-                } else {
-                    format!(" with {}", connection.agents.join(", "))
-                }
-            );
-        }
-        None => println!("  Hub: this checkout isn't connected to one"),
-    }
-    println!(
-        "  Claude Code: {}\n",
-        if found.claude { "found" } else { "not found" }
-    );
-}
-
-/// The friendly summary of a collisions report.
-fn summarize(report: &Value) -> String {
-    let checked = report["items"].as_array().map_or(0, Vec::len);
-    let list = report["collisions"].as_array().cloned().unwrap_or_default();
-    if checked < 2 && !report["truncated"].is_string() {
-        return "No other branches or worktrees to compare yet.".into();
-    }
-    let conflicts = list.iter().filter(|c| c["level"] == "conflict").count();
-    let noun = if checked == 1 {
-        "branch/worktree"
-    } else {
-        "branches/worktrees"
-    };
-    let mut text = format!(
-        "{checked} {noun} checked: {conflicts} would conflict, {} touch the same files.",
-        list.len() - conflicts
-    );
-    for c in list.iter().take(3) {
-        let name = |i: usize| clean(c["items"][i].as_str().unwrap_or("?"));
-        let paths: Vec<String> = c["shared_paths"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(3)
-            .filter_map(|p| p.as_str().map(clean))
-            .collect();
-        let total = c["shared_paths_total"].as_u64().unwrap_or(0) as usize;
-        let more = total.saturating_sub(paths.len());
-        text.push_str(&format!(
-            "\n  {} and {}: {}{}{}",
-            name(0),
-            name(1),
-            paths.join(", "),
-            if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            },
-            if c["level"] == "conflict" {
-                " (would conflict)"
-            } else {
-                ""
-            }
-        ));
-    }
-    if report["truncated"].is_string() {
-        text.push_str("\n  (Stopped early; this is a partial result.)");
-    }
-    text
-}
-
-#[cfg(not(unix))]
-fn collisions_step(cx: &Cx<'_>) {
-    if !cx.args.no_collisions {
-        println!("Skipping the collision check: it isn't available on Windows yet.\n");
     }
 }
 
+/// `Claude Code, Codex and Cursor`.
 #[cfg(unix)]
-fn collisions_step(cx: &Cx<'_>) {
-    if cx.args.no_collisions {
-        return;
-    }
-    let (Some((git, _)), Some(root)) = (&cx.found.git, &cx.found.repo_root) else {
-        println!("Skipping the collision check: this isn't inside a Git repository.\n");
-        return;
-    };
-    // Read-only and the reason AgentSCM was installed, so it runs without asking; --no-collisions skips it.
-    println!("Checking for branches and worktrees that change the same files…");
-    let request = Request {
-        git: git.canonicalize().unwrap_or_else(|_| git.clone()),
-        repository: root.clone(),
-        base: None,
-        refs: Vec::new(),
-        worktrees: true,
-        active_days: Some(14),
-        include_merged: false,
-        deadline: Some(Instant::now() + Duration::from_secs(30)),
-        max_bytes: None,
-    };
-    match git_collisions::collisions(&request) {
-        Ok(report) => println!("{}\n", summarize(&report)),
-        Err(error) => println!("Couldn't check for collisions: {}.\n", short(&error)),
+fn labels(agents: &[crate::client_setup::Agent]) -> String {
+    let names: Vec<&str> = agents.iter().map(|agent| agent.label()).collect();
+    match names.split_last() {
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
     }
 }
 
@@ -772,14 +621,14 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
         choice = Some(HubChoice::Local);
     }
     if choice.is_none() {
-        if let Some(url) = &current
-            && (cx.ui.yes
-                || cx.ui.confirm(
-                    &format!("This checkout is already connected to a hub ({url}). Keep using it?"),
-                    true,
-                ))
-        {
-            return Some(url.clone());
+        // A Hub this checkout or this computer already uses needs no question.
+        let signed_in = || match hub_cli::sign_in_summaries().as_slice() {
+            [only] => Some(only.hub.clone()),
+            _ => None,
+        };
+        if let Some(url) = current.clone().or_else(signed_in) {
+            println!("Using the Hub at {url}; pass --hub-url or --local to choose another.");
+            return Some(url);
         }
         choice = Some(if cx.ui.yes {
             HubChoice::Skip
@@ -1031,12 +880,6 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
             println!(
                 "Will write the LaunchAgent in ~/Library/LaunchAgents and private Hub configuration/data in ~/.agentscm/hub-native/{project}, bound to 127.0.0.1:{port}."
             );
-            if !cx.ui.confirm(
-                "Install the native hub executable and managed user service?",
-                true,
-            ) {
-                return Ok(None);
-            }
             let stable = binary::install(&dir, &executable, binary::VERSION)?;
             cx.manifest.bin_dir = Some(dir);
             cx.manifest.save().map_err(|e| e.to_string())?;
@@ -1105,20 +948,42 @@ fn stable_program(
     exe: PathBuf,
 ) -> std::result::Result<PathBuf, String> {
     let dir = binary::bin_dir(&cx.home);
+    let parent_new = dir.parent().is_some_and(|parent| !parent.exists());
+    let recorded = !matches!(plan, binary::Program::Bare);
+    let program = place_program(&cx.home, plan, exe)?;
+    if recorded {
+        cx.manifest.bin_parent_created |= parent_new;
+        cx.manifest.bin_dir = Some(dir);
+    }
+    Ok(program)
+}
+
+#[cfg(unix)]
+fn place_program(
+    home: &Path,
+    plan: binary::Program,
+    exe: PathBuf,
+) -> std::result::Result<PathBuf, String> {
     match plan {
         binary::Program::Bare => Ok(exe),
-        binary::Program::InstallDir(link) => {
-            cx.manifest.bin_dir = Some(dir);
-            Ok(link)
-        }
+        binary::Program::InstallDir(link) => Ok(link),
         binary::Program::Copy => {
-            let parent_new = dir.parent().is_some_and(|parent| !parent.exists());
+            let dir = binary::bin_dir(home);
             binary::install(&dir, &exe, binary::VERSION)?;
-            cx.manifest.bin_parent_created |= parent_new;
-            cx.manifest.bin_dir = Some(dir.clone());
             Ok(dir.join(binary::LINK))
         }
     }
+}
+
+/// The program `client setup` points the agents at: `agentscm` on PATH when that is this
+/// program, else its copy in `~/.agentscm/bin`, so a build directory or npm cache can go away.
+#[cfg(unix)]
+pub(crate) fn setup_program() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let (plan, exe) =
+        program_plan(&home).ok_or_else(|| invalid("can't tell where this program is"))?;
+    place_program(&home, plan, exe)
+        .map_err(|why| invalid(&format!("couldn't copy the program: {why}")))
 }
 
 #[cfg(unix)]
@@ -1127,86 +992,8 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
         Vec::new()
     } else if !cx.args.agent.is_empty() {
         cx.args.agent.clone()
-    } else if cx.found.claude {
-        vec![crate::client_setup::Agent::Claude]
-    } else if cx.ui.yes {
-        println!("Claude Code wasn't found, so I'm not setting up a coding agent.");
-        Vec::new()
     } else {
-        use clap::ValueEnum;
-        let agents = crate::client_setup::Agent::value_variants();
-        let mut options: Vec<&str> = agents.iter().map(|agent| agent.name()).collect();
-        options.push("none for now");
-        let none = options.len() - 1;
-        let pick = cx.ui.choose(
-            "Claude Code wasn't found. Which coding agent should I set up?",
-            &options,
-            none,
-            none,
-        );
-        agents
-            .get(pick)
-            .map(|agent| vec![*agent])
-            .unwrap_or_default()
-    }
-}
-
-/// Where each agent is set up. For all projects is the default, so agents connect in any repo,
-/// but it reaches beyond this checkout, so say so and ask first, once: agents already set up
-/// that way are not asked about again. `--yes` answers yes, after the notice. A No sets up
-/// Cursor, Copilot and Gemini in this checkout only, and drops Claude Code and Codex, whose
-/// hooks come only from a user-scope plugin.
-#[cfg(unix)]
-fn agent_scopes(
-    cx: &Cx<'_>,
-    root: &Path,
-    agents: &[crate::client_setup::Agent],
-) -> Vec<(crate::client_setup::Agent, crate::client_setup::Scope)> {
-    use crate::client_setup::{Agent, Scope, user_scope_installed};
-    let (installed, new): (Vec<Agent>, Vec<Agent>) = agents
-        .iter()
-        .partition(|agent| user_scope_installed(**agent, root));
-    let user = |agents: &[Agent]| agents.iter().map(|agent| (*agent, Scope::User)).collect();
-    if new.is_empty() {
-        return user(&installed);
-    }
-    let names = new
-        .iter()
-        .map(|agent| agent.label())
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!(
-        "AgentSCM for {names} is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
-        cli_command(cx)
-    );
-    if cx.ui.confirm(
-        &format!(
-            "Install AgentSCM for {names} in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it."
-        ),
-        true,
-    ) {
-        return user(agents);
-    }
-    let mut scopes: Vec<(Agent, Scope)> = user(&installed);
-    scopes.extend(
-        new.into_iter()
-            .filter(|agent| !matches!(agent, Agent::Claude | Agent::Codex))
-            .map(|agent| (agent, Scope::Checkout)),
-    );
-    scopes
-}
-
-/// The `client setup` line for every supported agent, for setting one up later.
-#[cfg(unix)]
-fn print_agent_setup_hints(cx: &Cx<'_>, hub: &str) {
-    use clap::ValueEnum;
-    println!("To set up a coding agent later, run one of these in this checkout:");
-    for agent in crate::client_setup::Agent::value_variants() {
-        println!(
-            "  {} client setup --agent {} --hub {hub}",
-            cli_command(cx),
-            agent.name()
-        );
+        cx.found.agents.clone()
     }
 }
 
@@ -1215,99 +1002,64 @@ async fn agents_stage(_cx: &mut Cx<'_>) {
     println!("Setting up coding agents isn't available on Windows yet.");
 }
 
-/// Connects this checkout and sets up its coding agents with `client setup`, the one path that
-/// writes agent hooks and MCP configuration and gives the hub's Connect agents page its proof.
+/// Sets up every chosen agent for all projects, asking nothing: signs in when needed, turns
+/// auto-connect on, and inside a checkout connects it with `client setup`, the path that gives
+/// the hub's Connect agents page its proof. Outside one, checkouts connect when an agent starts.
 #[cfg(unix)]
 async fn agents_stage(cx: &mut Cx<'_>) {
+    use crate::client_setup::{Agent, Scope};
     let agents = chosen_agents(cx);
     if agents.is_empty() {
-        if let (false, Some(hub), true) = (cx.args.no_agents, &cx.live.hub, cx.live.hub_up) {
-            print_agent_setup_hints(cx, hub);
-        }
         return;
     }
     cx.live.wanted_agents = true;
-    let names = agents
-        .iter()
-        .map(|agent| agent.name())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let names = labels(&agents);
     let (Some(hub), true) = (cx.live.hub.clone(), cx.live.hub_up) else {
         println!("Not setting up {names}: agents need a hub that answers.");
         return;
     };
-    let Some(root) = cx
+    let root = cx
         .found
         .repo_root
         .as_deref()
-        .and_then(|root| crate::client_config::canonical_root(root).ok())
-    else {
-        println!(
-            "Not setting up {names}: run quickstart inside the Git repository the agents work in."
-        );
-        return;
-    };
+        .and_then(|root| crate::client_config::canonical_root(root).ok());
     let signed_in = hub_cli::has_session(Some(&hub)).unwrap_or(false);
-    // With --yes or no terminal nobody can finish a browser or device sign-in.
-    let no_sign_in = cx.ui.yes || !cx.tty;
-    if cx.args.agent_token_file.is_none() && no_sign_in && !signed_in {
-        println!(
-            "Not setting up {names}: this run can't sign in to the hub (no terminal, or --yes). Run quickstart at a terminal, or pass --agent-token-file."
-        );
-        return;
+    if cx.args.agent_token_file.is_none() && !signed_in {
+        let provider = cx
+            .args
+            .provider
+            .or(match cx.found.remote.as_ref().map(|r| r.forge) {
+                Some(Forge::Github) => Some(Provider::Github),
+                Some(Forge::Gitlab) => Some(Provider::Gitlab),
+                _ => None,
+            });
+        if let Err(error) = hub_cli::sign_in_for_setup(&hub, provider).await {
+            let why = short(&error);
+            println!("Couldn't sign in to {hub}: {why}.");
+            if !cx.tty || cx.ui.yes {
+                println!(
+                    "Run this once in your own terminal: {} quickstart --hub-url {hub}",
+                    cli_command(cx)
+                );
+            }
+            cx.live.agent_error = Some(format!("couldn't sign in: {why}"));
+            return;
+        }
+        cx.manifest.session = Some(SessionRecord { hub: hub.clone() });
+    }
+    // An older sign-in gets this computer's credential, which auto-connect mints through.
+    crate::client_cli::enroll(&hub).await;
+    // Auto-connect is how checkouts other than this one connect, so it is always on. It needs a
+    // sign-in, which a run with only --agent-token-file doesn't have.
+    if hub_cli::has_session(Some(&hub)).unwrap_or(false)
+        && let Err(error) = hub_cli::set_auto_connect(Some(&hub), true)
+    {
+        println!("Couldn't turn on auto-connect: {}.", short(&error));
     }
     let Some((plan, exe)) = program_plan(&cx.home) else {
         println!("I can't tell where this program is, so I didn't set up {names}.");
         return;
     };
-    // Asked only once nothing else stops the setup, so a No is a real choice.
-    let agents = agent_scopes(cx, &root, &agents);
-    if agents.is_empty() {
-        cx.live.declined = true;
-        return;
-    }
-    let names = agents
-        .iter()
-        .map(|(agent, _)| agent.name())
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
-    // and anything else (another hub, another token file) is replaced after this notice.
-    let existing = checkout_connection(&cx.found);
-    let replace = existing.is_some();
-    if let Some(saved) = existing.as_ref().filter(|saved| saved.hub != hub) {
-        println!(
-            "This checkout is connected to another hub ({}); setting it up for {hub} replaces that connection.",
-            saved.hub
-        );
-    }
-    println!(
-        "Will connect {} to {hub} with {}, then set up {names}: hooks, MCP and the coordination skill. Undo it with `{} uninstall`.",
-        root.display(),
-        if cx.args.agent_token_file.is_some() {
-            "your agent token"
-        } else {
-            // This computer's Hub credential mints a short-lived token and renews it; a sign-in without one falls back to 30 days.
-            "an agent token for this one repository, renewed automatically"
-        },
-        cli_command(cx)
-    );
-    if matches!(plan, binary::Program::Copy) {
-        println!(
-            "Will also copy this program to {0}/agentscm-{1} and point {0}/agentscm at it (0755), so the hooks keep working after this copy goes away.",
-            shown(&binary::bin_dir(&cx.home), &cx.home),
-            binary::VERSION
-        );
-    }
-    #[cfg(target_os = "macos")]
-    println!(
-        "On macOS this also adds {}, which reopens the menu bar app.",
-        shown(&launcher::app(&cx.home), &cx.home)
-    );
-    if !cx.ui.confirm("Go ahead?", true) {
-        cx.live.declined = true;
-        return;
-    }
     let program = match stable_program(cx, plan, exe) {
         Ok(program) => program,
         Err(why) => {
@@ -1316,23 +1068,88 @@ async fn agents_stage(cx: &mut Cx<'_>) {
             return;
         }
     };
+    let _ = cx.manifest.save();
+    println!("Setting up {names} for all your projects…");
+    if let Some(root) = &root {
+        connect_checkout(cx, &agents, &hub, root.clone(), &program).await;
+    }
+    for agent in &agents {
+        if cx.live.agents.iter().any(|name| name == agent.name()) {
+            cx.live.installed.push(*agent);
+            continue;
+        }
+        // Inside a checkout its own files are checked too, so no hook runs twice there.
+        let here = root.as_deref().unwrap_or(&cx.home);
+        // Uninstall takes out only what this run added, never a setup that was already there.
+        let existed = crate::client_setup::user_scope_installed(*agent, here);
+        let installed = match &root {
+            Some(root) => crate::client_setup::install_quiet(*agent, root, &program, Scope::User),
+            None => crate::client_setup::install_user(*agent, &program),
+        };
+        match installed {
+            Ok(()) => {
+                cx.live.installed.push(*agent);
+                if !existed && !cx.manifest.agents.iter().any(|name| name == agent.name()) {
+                    cx.manifest.agents.push(agent.name().to_owned());
+                }
+            }
+            Err(error) => cx.live.failed.push((*agent, short(&error))),
+        }
+    }
+    if cx.live.installed.contains(&Agent::Claude) {
+        match crate::client_plugin::allow_claude_tools() {
+            Ok(added) => cx.manifest.claude_allow |= added,
+            Err(error) => println!(
+                "Claude Code will ask before each AgentSCM tool: {}.",
+                short(&error)
+            ),
+        }
+    }
+    let _ = cx.manifest.save();
+    // Some agents set up is a success; the summary names each one that failed and why.
+    if cx.live.installed.is_empty() && !cx.live.failed.is_empty() {
+        cx.live.agent_error = Some("no agent could be set up".into());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = &cx.manifest.bin_dir
+        && let Err(error) = launcher::ensure(&launcher::app(&cx.home), &dir.join(binary::LINK))
+    {
+        println!("Didn't add the AgentSCM app launcher: {error}.");
+    }
+}
+
+/// Connects the checkout quickstart runs in and sets its agents up there. A checkout the Hub
+/// doesn't have yet is only reported: the agents are still set up for all projects.
+#[cfg(unix)]
+async fn connect_checkout(
+    cx: &mut Cx<'_>,
+    agents: &[crate::client_setup::Agent],
+    hub: &str,
+    root: PathBuf,
+    program: &Path,
+) {
+    // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
+    // and anything else (another hub, another token file) is replaced.
+    let existing = checkout_connection(&cx.found);
     let args = crate::client_cli::ConnectArgs {
-        hub: Some(hub.clone()),
+        hub: Some(hub.to_owned()),
         token_file: cx.args.agent_token_file.clone(),
         provider: cx.args.provider,
         root: Some(root.clone()),
-        replace,
-        no_sign_in,
+        replace: existing.is_some(),
+        // A saved sign-in the Hub no longer accepts is renewed by signing in again.
+        no_sign_in: false,
         ..Default::default()
     };
     let wait = crate::client_cli::AppWait {
         ui: cx.ui,
         install_url: cx.install_url.clone(),
     };
-    let result = crate::client_cli::setup(&agents, args, root.clone(), &program, Some(&wait)).await;
-    if !signed_in && hub_cli::has_session(Some(&hub)).unwrap_or(false) {
-        cx.manifest.session = Some(SessionRecord { hub: hub.clone() });
-    }
+    let scoped: Vec<_> = agents
+        .iter()
+        .map(|agent| (*agent, crate::client_setup::Scope::User))
+        .collect();
+    let result = crate::client_cli::setup(&scoped, args, root, program, Some(&wait)).await;
     // Uninstall undoes only a connection this run made (also when a later step failed), not one
     // it found and kept, such as a manual `client setup`.
     if let Some(connection) = checkout_connection(&cx.found) {
@@ -1341,37 +1158,13 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         });
         if created && !cx.manifest.clients.contains(&connection.root) {
             cx.manifest.clients.push(connection.root.clone());
-        } else if !cx.manifest.clients.contains(&connection.root) {
-            println!(
-                "This checkout's connection existed before quickstart, so `uninstall` leaves it; `{} client remove` takes it out.",
-                cli_command(cx)
-            );
         }
         cx.live.repo = Some(connection.repo.clone());
         cx.live.agents = connection.agents.clone();
     }
-    let _ = cx.manifest.save();
     if let Err(error) = result {
-        println!("Couldn't finish setting up {names}: {}.", short(&error));
-        cx.live.agent_error = Some(short(&error));
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(dir) = &cx.manifest.bin_dir {
-        match launcher::ensure(&launcher::app(&cx.home), &dir.join(binary::LINK)) {
-            Ok(true) => println!(
-                "Added {}: open it from Spotlight or Launchpad to bring back the menu bar app.",
-                shown(&launcher::app(&cx.home), &cx.home)
-            ),
-            Ok(false) => {}
-            Err(error) => println!("Didn't add the AgentSCM app launcher: {error}."),
-        }
-    }
-    if cx.found.worktrees {
-        println!(
-            "Git worktrees of this checkout use its connection; a separate clone needs its own `{} client setup --agent AGENT --hub {hub}`.",
-            cli_command(cx)
-        );
+        println!("This checkout isn't connected yet: {}.", short(&error));
+        cx.live.agents.clear();
     }
 }
 
@@ -1398,9 +1191,20 @@ fn cli_command(cx: &Cx<'_>) -> String {
     if let Some(dir) = &cx.manifest.bin_dir {
         return binary::quote(&dir.join(binary::LINK));
     }
-    std::env::current_exe()
-        .map(|path| binary::quote(&path))
-        .unwrap_or_else(|_| "npx agentscm".to_owned())
+    // A program in a cache or temp directory is gone by the time anyone runs the hint.
+    match program_plan(&cx.home) {
+        Some((binary::Program::Bare, _)) => "agentscm".to_owned(),
+        Some((binary::Program::InstallDir(link), _)) => binary::quote(&link),
+        Some((binary::Program::Copy, exe))
+            if !binary::is_cache_path(
+                &exe,
+                &std::env::temp_dir().canonicalize().unwrap_or_default(),
+            ) =>
+        {
+            binary::quote(&exe)
+        }
+        _ => "npx agentscm".to_owned(),
+    }
 }
 
 fn launch_tray(cx: &Cx<'_>) -> Result<()> {
@@ -1421,140 +1225,49 @@ fn launch_tray(cx: &Cx<'_>) -> Result<()> {
     }
 }
 
-/// Asked once, on macOS at a terminal, after this checkout's agents were connected from the
-/// installed program; `--yes` and scripted runs keep the tray off unless `--tray` is passed.
-fn offers_tray(cx: &Cx<'_>) -> bool {
-    cfg!(target_os = "macos")
-        && cx.tty
-        && !cx.ui.yes
-        && cx.live.repo.is_some()
-        && cx
-            .manifest
-            .bin_dir
-            .as_ref()
-            .is_some_and(|dir| dir.join(binary::LINK).exists())
-        && !cx.manifest.tray_declined
-        && !tray_login_enabled()
-}
-
-/// A Yes is remembered by Start at Login itself.
-fn tray_login_enabled() -> bool {
-    #[cfg(target_os = "macos")]
-    return crate::tray::login_enabled();
-    #[cfg(not(target_os = "macos"))]
-    false
-}
-
-fn tray_offer(cx: &mut Cx<'_>, command: &str) -> Result<()> {
-    match cx.ui.answer(
-        "Keep AgentSCM in the menu bar, and start it when you log in?",
-        true,
-    ) {
-        Some(true) => {
-            #[cfg(target_os = "macos")]
-            if let Some(dir) = &cx.manifest.bin_dir
-                && let Err(error) = crate::tray::set_login_enabled(true, &dir.join(binary::LINK))
-            {
-                println!(
-                    "Couldn't turn on Start at Login: {}. You can turn it on in the menu.",
-                    short(&error)
-                );
-            }
-            launch_tray(cx)
-        }
-        Some(false) => {
-            cx.manifest.tray_declined = true;
-            cx.manifest.save()?;
-            println!("OK. Open it any time with `{command} tray`.");
-            Ok(())
-        }
-        None => Ok(()),
-    }
-}
-
-fn summary(cx: &Cx<'_>, changed: bool) {
-    let m = &cx.manifest;
-    let home = &cx.home;
+/// The closing lines: what is set up, what the person does next, and how to undo it.
+fn summary(cx: &Cx<'_>, changed: bool, command: &str) {
     if !changed {
         println!("\nNo changes made.");
     }
-    println!("\nQuickstart's recorded setup:");
-    let mut any = false;
-    let mut line = |text: String| {
-        any = true;
-        println!("  {text}");
-    };
-    if let Some(local) = &m.local_hub {
-        line(format!(
-            "{}/compose.yaml and .env: the local hub's Docker files (project {})",
-            shown(&local.dir, home),
-            local.project
-        ));
-    }
-    if let Some(native) = &m.native_hub {
-        line(format!(
-            "{}: native hub LaunchAgent {} (port {})",
-            shown(&native.plist, home),
-            native.label,
-            native.port
-        ));
-    }
-    if m.session.is_some()
-        && let Ok(path) = hub_cli::sessions_path()
-    {
-        line(format!("{}: your hub sign-in", shown(&path, home)));
-    }
-    let connections = crate::client_config::load().unwrap_or_default();
-    for root in &m.clients {
-        match connections
-            .iter()
-            .find(|connection| &connection.root == root)
+    #[cfg(unix)]
+    if !cx.live.installed.is_empty() {
+        let hub = cx.live.hub.as_deref().unwrap_or_default();
+        println!(
+            "\nDone: {} set up for all your projects with {hub}.",
+            labels(&cx.live.installed)
+        );
+        println!(
+            "Fully quit and reopen your agents, then ask one in a repository: \"Get started with AgentSCM\"."
+        );
+        if cx
+            .live
+            .installed
+            .contains(&crate::client_setup::Agent::Codex)
         {
-            Some(connection) => line(format!(
-                "{}: connected to {} for {}{}; token {}",
-                root.display(),
-                connection.hub,
-                clean(&connection.repo),
-                if connection.agents.is_empty() {
-                    String::new()
-                } else {
-                    format!(", agents set up: {}", connection.agents.join(", "))
-                },
-                shown(&connection.token_file, home)
-            )),
-            None => line(format!("{}: no longer connected", root.display())),
+            println!("Codex: run /hooks once and trust the AgentSCM hooks.");
         }
     }
-    if let Some(dir) = &m.bin_dir {
-        line(format!(
-            "{}: the agentscm program{}",
-            shown(dir, home),
-            if m.clients.is_empty() {
-                ""
-            } else {
-                " the agents' hooks call"
-            }
-        ));
-    }
-    if !any && cx.init_written.is_empty() {
-        println!("  nothing recorded.");
-    } else if !any {
-        println!("  nothing that `agentscm uninstall` undoes.");
-    } else {
-        if let Ok(path) = manifest::path() {
-            println!("  {}: a record of the above", shown(&path, home));
-        }
-        println!("Undo all of this with `{} uninstall`.", cli_command(cx));
+    #[cfg(unix)]
+    for (agent, why) in &cx.live.failed {
+        println!(
+            "{} wasn't set up: {why}. Fix that, then run `{command} quickstart` again.",
+            agent.label()
+        );
     }
     if !cx.init_written.is_empty() {
         println!(
-            "\nRepository files to review and commit (not in quickstart's record; `agentscm uninstall` does not remove them):"
+            "Repository files to review and commit (`uninstall` leaves them): {}",
+            cx.init_written
+                .iter()
+                .map(|file| file.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        for file in &cx.init_written {
-            println!("  {}", file.display());
-        }
     }
-    println!();
+    if !cx.manifest.is_empty() {
+        println!("Undo: {command} uninstall");
+    }
 }
 
 // ---- uninstall ----
@@ -1582,6 +1295,15 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             "  - disconnect {} with `client remove`: take out its agents' hooks, MCP entries and skills, and delete and revoke the agent token setup created",
             root.display()
         );
+    }
+    if !m.agents.is_empty() {
+        println!(
+            "  - take AgentSCM out of {} for all your projects",
+            m.agents.join(", ")
+        );
+    }
+    if m.claude_allow {
+        println!("  - take the rule allowing AgentSCM's tools out of Claude Code's settings");
     }
     if m.session.is_some() {
         println!("  - sign out of the hub (end the sign-in quickstart created)");
@@ -1652,6 +1374,31 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             ));
             left.clients.push(root.clone());
         }
+    }
+    #[cfg(unix)]
+    for name in &m.agents {
+        let agent = <crate::client_setup::Agent as ValueEnum>::from_str(name, false);
+        if let Err(error) = agent
+            .map_err(|_| invalid("unknown agent"))
+            .and_then(crate::client_setup::remove_user)
+        {
+            println!("Couldn't take AgentSCM out of {name}: {}.", short(&error));
+            manual.push(format!(
+                "run `agentscm uninstall` again to take AgentSCM out of {name}"
+            ));
+            left.agents.push(name.clone());
+        }
+    }
+    #[cfg(unix)]
+    if m.claude_allow
+        && let Err(error) = crate::client_plugin::disallow_claude_tools()
+    {
+        println!(
+            "Couldn't take {} out of Claude Code's settings: {}.",
+            crate::client_plugin::CLAUDE_ALLOW,
+            short(&error)
+        );
+        left.claude_allow = true;
     }
     let _client_lifecycle = match crate::client_cli::lifecycle_lock() {
         Ok(lease) => lease,
@@ -1855,7 +1602,6 @@ fn safe_hub_data_dir(dir: &Path, home: &Path, project: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn created_root_goes_only_when_empty() {
@@ -1884,26 +1630,6 @@ mod tests {
     }
 
     #[test]
-    fn collisions_summary_reads_plainly() {
-        let report = json!({
-            "items": [{}, {}, {}, {}],
-            "truncated": null,
-            "collisions": [
-                {"level": "conflict", "items": ["feat-a", "feat-b"], "shared_paths_total": 5, "shared_paths": ["a", "b", "c", "d", "e"]},
-                {"level": "same-file", "items": ["feat-a", "worktree:/w"], "shared_paths_total": 1, "shared_paths": ["x"]},
-            ],
-        });
-        assert_eq!(
-            summarize(&report),
-            "4 branches/worktrees checked: 1 would conflict, 1 touch the same files.\n  feat-a and feat-b: a, b, c and 2 more (would conflict)\n  feat-a and worktree:/w: x"
-        );
-        assert_eq!(
-            summarize(&json!({"items": [{}], "collisions": [], "truncated": "deadline"})),
-            "1 branch/worktree checked: 0 would conflict, 0 touch the same files.\n  (Stopped early; this is a partial result.)"
-        );
-    }
-
-    #[test]
     fn terminal_refusal_lists_the_flags() {
         for flag in [
             "--yes",
@@ -1915,7 +1641,6 @@ mod tests {
             "--agent",
             "--no-agents",
             "--slack-config-file",
-            "--no-collisions",
             "--init",
             "--tray",
         ] {
@@ -1994,20 +1719,6 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("no hub chosen"), "{line}");
-    }
-
-    #[test]
-    fn declining_the_agent_setup_says_nothing_was_changed_and_suggests_no_flag() {
-        let live = Live {
-            hub: Some("http://h".into()),
-            hub_up: true,
-            wanted_agents: true,
-            declined: true,
-            ..Live::default()
-        };
-        let line = live.line("agentscm");
-        assert!(line.contains("nothing was changed"), "{line}");
-        assert!(!line.contains("--agent-token-file"), "{line}");
     }
 
     #[test]
