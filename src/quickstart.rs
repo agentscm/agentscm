@@ -60,15 +60,15 @@ pub struct QuickstartArgs {
     #[arg(long)]
     yes: bool,
     /// Run everything on this machine (recommended for the alpha); same as --hub local.
-    #[arg(long, conflicts_with_all = ["hub", "hosted"])]
+    #[arg(hide = true, long, conflicts_with_all = ["hub", "hosted"])]
     local: bool,
     /// Use a shared hub on a server: prints the agent-guided hosted guide (unsupported in
     /// the alpha), then connects only when --hub-url is given.
-    #[arg(long, conflicts_with = "hub")]
+    #[arg(hide = true, long, conflicts_with = "hub")]
     hosted: bool,
     /// How to get live warnings: local, existing or skip, or the hub's URL (the same as
     /// --hub-url), so `--hub URL` means one thing in every command.
-    #[arg(id = "hub", long = "hub", value_name = "local|existing|skip|URL", value_parser = parse_hub)]
+    #[arg(hide = true, id = "hub", long = "hub", value_name = "local|existing|skip|URL", value_parser = parse_hub)]
     hub_arg: Option<HubArg>,
     /// Set from `--hub` once parsed.
     #[arg(skip)]
@@ -77,43 +77,55 @@ pub struct QuickstartArgs {
     #[arg(long)]
     hub_url: Option<String>,
     /// Local hub runtime; native is recommended on qualified macOS ARM64 hosts.
-    #[arg(long, value_enum)]
+    #[arg(hide = true, long, value_enum)]
     hub_runtime: Option<HubRuntime>,
     /// Loopback port for the local hub; reuse the recorded port on resume.
-    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(hide = true, long, value_parser = clap::value_parser!(u16).range(1..))]
     hub_port: Option<u16>,
     /// Instance name for an isolated local service or Docker Compose project.
-    #[arg(long)]
+    #[arg(hide = true, long)]
     hub_project: Option<String>,
     /// Your GitHub login, to make you the local hub's administrator.
-    #[arg(long)]
+    #[arg(hide = true, long)]
     github_login: Option<String>,
     /// An agent token you already have; it is checked and used instead of signing in.
-    #[arg(long)]
+    #[arg(hide = true, long)]
     agent_token_file: Option<PathBuf>,
     /// Prepared private Slack adapter configuration for a managed local Hub.
-    #[arg(long)]
+    #[arg(hide = true, long)]
     slack_config_file: Option<PathBuf>,
     /// Which forge to sign in with (default: the one in origin's URL).
-    #[arg(long, value_enum)]
+    #[arg(hide = true, long, value_enum)]
     provider: Option<Provider>,
     /// Coding agent to set up (repeatable; default: every one installed on this computer).
     #[cfg(unix)]
-    #[arg(long, value_enum, conflicts_with = "no_agents")]
+    #[arg(
+        long = "only",
+        alias = "agent",
+        value_name = "AGENT",
+        value_enum,
+        conflicts_with = "no_agents"
+    )]
     agent: Vec<crate::client_setup::Agent>,
     /// Set up no coding agent.
-    #[arg(long)]
+    #[arg(hide = true, long)]
     no_agents: bool,
     /// Accepted for older scripts: setup no longer checks for colliding branches.
-    #[arg(long, hide = true)]
+    #[arg(hide = true, long)]
     no_collisions: bool,
     /// Also write the repository's agent instructions (agentscm init-repo). Without it, setup
     /// writes nothing to the repository.
-    #[arg(long)]
+    #[arg(hide = true, long)]
     init: bool,
     /// Open the optional native status-bar companion after setup succeeds (macOS only).
-    #[arg(long)]
+    #[arg(hide = true, long)]
     tray: bool,
+    /// Print every file and setting this would write, then stop without writing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Print one JSON object on stdout when done; the progress text goes to stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 /// `--hub` is a choice or, when it looks like a URL, the hub itself.
@@ -147,14 +159,6 @@ impl QuickstartArgs {
             None => {}
         }
         Ok(())
-    }
-
-    pub(crate) fn noninteractive(&self) -> bool {
-        self.yes || !std::io::stdin().is_terminal()
-    }
-
-    pub(crate) fn can_start(&self) -> bool {
-        self.yes || std::io::stdin().is_terminal()
     }
 }
 
@@ -406,8 +410,127 @@ struct Cx<'a> {
     failure: Option<String>,
 }
 
+/// `--dry-run`: what quickstart would write, from the same plans it follows, without writing.
+fn dry_run(args: &QuickstartArgs) -> Result<()> {
+    let home = home_dir()?;
+    let found = detect::detect(&std::env::current_dir()?);
+    println!("Dry run: nothing is written. Quickstart would:");
+    match program_plan(&home) {
+        Some((binary::Program::Copy, _)) => println!(
+            "  copy this program to {}",
+            binary::bin_dir(&home).join(binary::LINK).display()
+        ),
+        Some((binary::Program::InstallDir(link), _)) => {
+            println!("  keep using {} (the install directory)", link.display());
+        }
+        _ => println!("  keep using this program as it is"),
+    }
+    let hub = if args.local || matches!(args.hub, Some(HubChoice::Local)) {
+        "start a managed local hub (service files under ~/.agentscm/hub)".to_owned()
+    } else if let Some(url) = &args.hub_url {
+        format!("connect to the hub at {url}")
+    } else {
+        "ask which hub to use, or skip live warnings".to_owned()
+    };
+    println!("  {hub}");
+    #[cfg(unix)]
+    {
+        let agents: Vec<&str> = if args.no_agents {
+            Vec::new()
+        } else if !args.agent.is_empty() {
+            args.agent.iter().map(|agent| agent.name()).collect()
+        } else {
+            found.agents.iter().map(|agent| agent.name()).collect()
+        };
+        for agent in agents {
+            println!(
+                "  set up {agent}: its hooks and MCP entry, and this checkout's connection (agentscm client setup)"
+            );
+        }
+    }
+    if args.init {
+        println!("  write the repository's agent instructions (agentscm init-repo)");
+    }
+    println!(
+        "  record every change in {} for `uninstall`",
+        manifest::path()?.display()
+    );
+    if found.repo_root.is_none() {
+        println!("Run it inside a Git repository to connect agents.");
+    }
+    Ok(())
+}
+
+/// With `--json`, stdout carries only the final object: the progress text moves to stderr and
+/// the original stdout is kept for the object.
+#[cfg(unix)]
+fn json_stdout() -> Result<std::fs::File> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    std::io::stdout().flush()?;
+    // SAFETY: dup and dup2 take only descriptors this process owns; the new descriptor is
+    // wrapped once, in the File this returns.
+    unsafe {
+        let saved = libc::dup(1);
+        if saved < 0 || libc::dup2(2, 1) < 0 {
+            return Err(invalid("--json could not redirect progress text to stderr"));
+        }
+        Ok(std::fs::File::from_raw_fd(saved))
+    }
+}
+
+fn requested_agents(args: &QuickstartArgs) -> Vec<String> {
+    #[cfg(unix)]
+    return args
+        .agent
+        .iter()
+        .map(|agent| agent.name().to_owned())
+        .collect();
+    #[cfg(not(unix))]
+    return {
+        let _ = args;
+        Vec::new()
+    };
+}
+
+fn json_report(cx: &Cx<'_>) -> serde_json::Value {
+    let installed = &cx.live.agents;
+    let skipped: Vec<String> = requested_agents(cx.args)
+        .into_iter()
+        .filter(|agent| !installed.contains(agent))
+        .collect();
+    let needs_user: Vec<&str> = [
+        cx.live.pending_local.as_deref(),
+        cx.live.agent_error.as_deref(),
+        cx.live.hub_error.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    serde_json::json!({
+        "agents": { "installed": installed, "skipped": skipped, "needs_user": needs_user },
+        "hub": cx.live.hub,
+        "hub_up": cx.live.hub_up,
+        "signed_in": cx.live.hub.as_deref().is_some_and(|hub| hub_cli::has_session(Some(hub)).unwrap_or(false)),
+    })
+}
+
 pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
     args.resolve_hub()?;
+    if args.dry_run {
+        dry_run(&args)?;
+        return Ok(0);
+    }
+    #[cfg(unix)]
+    let json_out = if args.json {
+        Some(json_stdout()?)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    if args.json {
+        return Err(invalid("--json is not available on Windows yet"));
+    }
     let tty = std::io::stdin().is_terminal();
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
@@ -504,6 +627,11 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
         println!("Menu bar app: {command} tray");
     }
     println!("{}", cx.live.line(&command));
+    #[cfg(unix)]
+    if let Some(mut out) = json_out {
+        use std::io::Write;
+        writeln!(out, "{}", json_report(&cx))?;
+    }
     if let Some(failure) = cx.failure {
         return Err(invalid(&failure));
     }
@@ -1604,6 +1732,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn help_shows_five_flags_and_hidden_ones_still_parse() {
+        use clap::{Args, FromArgMatches};
+        let command = QuickstartArgs::augment_args(clap::Command::new("quickstart"));
+        let mut shown: Vec<&str> = command
+            .get_arguments()
+            .filter(|arg| !arg.is_hide_set())
+            .filter_map(|arg| arg.get_long())
+            .collect();
+        shown.sort_unstable();
+        #[cfg(unix)]
+        assert_eq!(shown, ["dry-run", "hub-url", "json", "only", "yes"]);
+        #[cfg(not(unix))]
+        assert_eq!(shown, ["dry-run", "hub-url", "json", "yes"]);
+        // The agent flags exist only on Unix.
+        #[cfg(unix)]
+        let argv = [
+            "quickstart",
+            "--local",
+            "--agent",
+            "codex",
+            "--only",
+            "claude",
+        ];
+        #[cfg(not(unix))]
+        let argv = ["quickstart", "--local"];
+        let matches = command.try_get_matches_from(argv).unwrap();
+        let args = QuickstartArgs::from_arg_matches(&matches).unwrap();
+        assert!(args.local);
+        #[cfg(unix)]
+        assert_eq!(args.agent.len(), 2);
+    }
+
+    #[test]
     fn created_root_goes_only_when_empty() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".agentscm");
@@ -1702,6 +1863,8 @@ mod tests {
             no_collisions: false,
             init: false,
             tray: false,
+            dry_run: false,
+            json: false,
         };
         let error = preflight_slack(&args).unwrap_err().to_string();
         assert!(error.contains("requires a managed local Hub"));

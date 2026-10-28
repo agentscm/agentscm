@@ -11,16 +11,7 @@ const BINARY_MAX = 200 * 1024 * 1024;
 const VERIFY_OUTPUT_MAX = 1024 * 1024;
 const BUDGET_MS = 600_000; // overall, for both downloads
 
-const NOTICE_TEXT = `npx agentscm downloads the AgentSCM release binary for your platform from
-GitHub Releases, verifies its SHA-256 checksum and build provenance, and then
-starts the setup guide. It does not run install scripts. After verification it
-marks that binary invocation as a verified install; the binary records one
-installation indicator only after setup explains pseudonymous product telemetry
-and the configured choice permits it. Disable this before any send with
-\`--no-telemetry\`, \`AGENTSCM_TELEMETRY=off\`, or \`DO_NOT_TRACK=1\`.
-The setup guide previews repository, hook and Hub changes; \`agentscm uninstall\`
-reverses setup. Manage usage reporting with \`agentscm telemetry status\` and
-\`agentscm telemetry off\`.`;
+const NOTICE_TEXT = `npx agentscm downloads the release binary from GitHub Releases and checks its SHA-256 checksum before it runs; no install scripts. Usage reporting is off until you run \`agentscm telemetry on\`.`;
 
 const TARGETS = {
   'linux/x64': 'x86_64-unknown-linux-musl',
@@ -171,7 +162,7 @@ async function main(args) {
   const dir = path.join(os.homedir(), '.agentscm', 'bin');
   const binary = path.join(dir, names.versioned);
   const announce = announces(args, !fs.existsSync(binary), verboseInstall());
-  if (announce) console.log(`${NOTICE_TEXT}\n`);
+  if (announce) console.log(NOTICE_TEXT);
   const signal = AbortSignal.timeout(BUDGET_MS);
   const gap = provenanceGap(); // checked once: `gh auth status` goes over the network
   if (gap && process.env.AGENTSCM_REQUIRE_PROVENANCE === '1') throw new Error(`AGENTSCM_REQUIRE_PROVENANCE=1 but ${gap}`);

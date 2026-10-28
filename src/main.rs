@@ -122,7 +122,7 @@ const MAX_DIFF_LIMIT: usize = 10_000;
 #[derive(Debug, Parser)]
 #[command(
     name = "agentscm",
-    version,
+    version = env!("AGENTSCM_INSTALL_VERSION"),
     about = "Coordination for many coding agents on one Git repository (alpha)"
 )]
 struct Cli {
@@ -145,41 +145,48 @@ enum Command {
     #[cfg(unix)]
     Open(open_cli::OpenArgs),
     /// [experimental] Capture local agent events and observed command receipts.
+    #[command(hide = true)]
     #[cfg(unix)]
     ChangeCapture {
         #[command(subcommand)]
         command: change_capture_cli::ChangeCaptureCommand,
     },
     /// [experimental] Bind an existing Git worktree to native source qualification.
+    #[command(hide = true)]
     #[cfg(unix)]
     AttachedWorktree {
         #[command(subcommand)]
         command: attached_worktree_cli::AttachedWorktreeCommand,
     },
     /// [experimental] Operate or consume agent-owned workflow tasks.
+    #[command(hide = true)]
     #[cfg(unix)]
     AgentTask {
         #[command(subcommand)]
         command: agent_task_cli::AgentTaskCommand,
     },
     /// [experimental] Produce, show and verify Git-bound local validation attestations.
+    #[command(hide = true)]
     #[cfg(unix)]
     LocalValidation {
         #[command(subcommand)]
         command: local_validation_cli::LocalValidationCommand,
     },
     /// [experimental] Browse, adopt and follow the supported skills (self-reported evidence).
+    #[command(hide = true)]
     #[cfg(unix)]
     Skill {
         #[command(subcommand)]
         command: skill_cli::SkillCommand,
     },
     /// [experimental] Run bounded repository skill workflows on immutable local source.
+    #[command(hide = true)]
     SkillWorkflow {
         #[command(subcommand)]
         command: skill_workflow_cli::SkillWorkflowCommand,
     },
     /// [experimental] Install repository rules and run local productive pipelines.
+    #[command(hide = true)]
     #[cfg(unix)]
     Pipeline {
         #[command(subcommand)]
@@ -205,12 +212,14 @@ enum Command {
         command: guided_cli::WorkflowCommand,
     },
     /// [experimental] Export an integrated snapshot to a separately owned local Git mirror.
+    #[command(hide = true)]
     #[cfg(unix)]
     GitExport {
         #[command(subcommand)]
         command: git_export_cli::GitExportCommand,
     },
     /// [experimental] Observe an explicit local Git/native pair without changing branch authority.
+    #[command(hide = true)]
     #[cfg(unix)]
     GitReconcile {
         #[command(subcommand)]
@@ -285,12 +294,14 @@ enum Command {
         command: promise_cli::PromiseCommand,
     },
     /// [experimental] Capture a clean committed Git tree as a native revision.
+    #[command(hide = true)]
     #[cfg(unix)]
     GitSnapshot {
         #[command(subcommand)]
         command: git_snapshot_cli::GitSnapshotCommand,
     },
     /// [experimental] Create the native source store in --data-dir (not the hub or agent wiring).
+    #[command(hide = true)]
     Init,
     /// Package this executable and its compiled notices into a new local bundle.
     #[command(hide = true)]
@@ -301,17 +312,20 @@ enum Command {
         portable_verifier: Option<PathBuf>,
     },
     /// [experimental] Manage durable trusted-local divergent source merge sessions.
+    #[command(hide = true)]
     #[cfg(unix)]
     Merge {
         #[command(subcommand)]
         command: merge_cli::MergeCommand,
     },
     /// [experimental] Start a stable change from an immutable review context.
+    #[command(hide = true)]
     Start {
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] Explicit Git fetch and recoverable ref publication.
+    #[command(hide = true)]
     #[cfg(unix)]
     GitRemote(git_remote_cli::GitRemoteArgs),
     /// Internal scoped credential helper; never used for interactive sign-in.
@@ -319,61 +333,73 @@ enum Command {
     #[cfg(unix)]
     GitRemoteCredential { operation: String },
     /// [experimental] Show a change and its exact current review context.
+    #[command(hide = true)]
     Show { repository: String, change: String },
     /// [experimental] Replace a change's context only at the expected generation.
+    #[command(hide = true)]
     Context {
         expected_version: u64,
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] Inspect an immutable historical review context by digest.
+    #[command(hide = true)]
     ReviewContext { digest: String },
     /// [experimental] Manage a native local working directory.
+    #[command(hide = true)]
     #[cfg(unix)]
     Workspace {
         #[command(subcommand)]
         command: workflow_cli::WorkspaceCommand,
     },
     /// [experimental] Connect local agents to a pinned workspace timeline.
+    #[command(hide = true)]
     #[cfg(unix)]
     WorkspaceClient {
         #[command(subcommand)]
         command: workspace_client::WorkspaceClientCommand,
     },
     /// [experimental] Exchange source objects through offline files.
+    #[command(hide = true)]
     #[cfg(unix)]
     Sync {
         #[command(subcommand)]
         command: workflow_cli::SyncCommand,
     },
     /// [experimental] Compute the canonical digest of a source-path check recipe.
+    #[command(hide = true)]
     CheckRecipe {
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] Register an exact-context controller check attempt.
+    #[command(hide = true)]
     CheckSourcePaths {
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] Execute a pending built-in source-path check.
+    #[command(hide = true)]
     CheckRun {
         attempt_id: String,
         expected_generation: u64,
     },
     /// [experimental] Cancel an attempt at its expected run generation.
+    #[command(hide = true)]
     CheckCancel {
         attempt_id: String,
         expected_generation: u64,
         reason: String,
     },
     /// [experimental] Mark an interrupted attempt incomplete at its expected generation.
+    #[command(hide = true)]
     CheckRecover {
         attempt_id: String,
         expected_generation: u64,
         reason: String,
     },
     /// [experimental] Compute the environment and canonical digests of a command check recipe.
+    #[command(hide = true)]
     #[cfg(unix)]
     #[command(name = "check-command-recipe")]
     IsolatedCheckRecipe {
@@ -381,6 +407,7 @@ enum Command {
         input: PathBuf,
     },
     /// [experimental] Register an exact-context isolated command check attempt.
+    #[command(hide = true)]
     #[cfg(unix)]
     #[command(name = "check-command")]
     IsolatedCheckCreate {
@@ -388,6 +415,7 @@ enum Command {
         input: PathBuf,
     },
     /// [experimental] Run a pending command check in an isolated container.
+    #[command(hide = true)]
     #[cfg(unix)]
     #[command(name = "check-run-command")]
     IsolatedCheckRun {
@@ -401,6 +429,7 @@ enum Command {
         docker_socket: PathBuf,
     },
     /// [experimental] Cancel a pending or running command check, reconciling any container it owns.
+    #[command(hide = true)]
     #[cfg(unix)]
     #[command(name = "check-cancel-command")]
     IsolatedCheckCancel {
@@ -415,6 +444,7 @@ enum Command {
         docker_socket: Option<PathBuf>,
     },
     /// [experimental] Mark an interrupted running command check incomplete once its container is confirmed gone.
+    #[command(hide = true)]
     #[cfg(unix)]
     #[command(name = "check-recover-command")]
     IsolatedCheckRecover {
@@ -432,24 +462,30 @@ enum Command {
         abandon_unconfirmed: bool,
     },
     /// [experimental] Inspect a retained command check attempt and its record.
+    #[command(hide = true)]
     #[cfg(unix)]
     #[command(name = "check-command-show")]
     IsolatedCheckShow { attempt_id: String },
     /// [experimental] Derive the candidate revision from a successful agent run's stdout.
+    #[command(hide = true)]
     #[cfg(unix)]
     #[command(name = "check-command-candidate")]
     IsolatedCheckCandidate { attempt_id: String },
     /// [experimental] Inspect a retained controller check attempt.
+    #[command(hide = true)]
     CheckShow { attempt_id: String },
     /// [experimental] Inspect immutable controller evidence.
+    #[command(hide = true)]
     CheckEvidence { digest: String },
     /// [experimental] Create an immutable revision from a JSON request.
+    #[command(hide = true)]
     Checkpoint {
         /// JSON file, or - for standard input.
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] List or find paths in one bounded manifest page, without file contents.
+    #[command(hide = true)]
     Files {
         revision: String,
         /// JSON cursor string from a previous page, saved in a file.
@@ -466,10 +502,13 @@ enum Command {
         contains: Option<String>,
     },
     /// [experimental] Resolve one path's manifest membership without reading its blob.
+    #[command(hide = true)]
     Stat { revision: String, path: String },
     /// [experimental] Read one file from an immutable revision.
+    #[command(hide = true)]
     Read { revision: String, path: String },
     /// [experimental] Compare two immutable revisions.
+    #[command(hide = true)]
     Diff {
         left: String,
         right: String,
@@ -477,6 +516,7 @@ enum Command {
         limit: usize,
     },
     /// [experimental] Resume a bounded source diff. Cursor files contain a JSON string.
+    #[command(hide = true)]
     DiffPage {
         left: String,
         right: String,
@@ -486,6 +526,7 @@ enum Command {
         limit: usize,
     },
     /// [experimental] Inspect a bounded history page. Cursor files contain a JSON string.
+    #[command(hide = true)]
     History {
         revision: String,
         #[arg(long)]
@@ -494,6 +535,7 @@ enum Command {
         limit: usize,
     },
     /// [experimental] Inspect head relation with bounded resumable graph traversal.
+    #[command(hide = true)]
     Relation {
         left: String,
         right: String,
@@ -503,40 +545,48 @@ enum Command {
         limit: usize,
     },
     /// [experimental] Record a local human approval from JSON.
+    #[command(hide = true)]
     Approve {
         /// JSON file, or - for standard input.
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] Revoke a local approval.
+    #[command(hide = true)]
     Revoke { approval_id: String },
     /// [experimental] Show or conditionally advance the policy epoch.
+    #[command(hide = true)]
     Policy {
         /// Expected current epoch. When present, advances it by one.
         #[arg(long)]
         advance: Option<u64>,
     },
     /// [experimental] Show a protected target, or null when it does not exist.
+    #[command(hide = true)]
     Target { name: String },
     /// [experimental] Conditionally integrate a revision from a JSON request.
+    #[command(hide = true)]
     Integrate {
         /// JSON file, or - for standard input.
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] Initialize an absent protected target from a JSON request.
+    #[command(hide = true)]
     InitializeTarget {
         /// JSON file, or - for standard input.
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] Publish an exact landing revision and rebind a change to it, from a JSON request.
+    #[command(hide = true)]
     PrepareLanding {
         /// JSON file, or - for standard input.
         #[arg(default_value = "-")]
         input: PathBuf,
     },
     /// [experimental] List integration events after a sequence number.
+    #[command(hide = true)]
     Events {
         #[arg(long, default_value_t = 0)]
         after: u64,
@@ -685,7 +735,26 @@ fn is_help_all(argv: &[OsString]) -> bool {
     argv.get(1).is_some_and(|arg| arg == "help") && argv.iter().skip(2).any(|arg| arg == "--all")
 }
 
+/// A leading option that is not the program's own (`agentscm --hub-url URL`) starts quickstart.
+fn with_default_quickstart(mut argv: Vec<OsString>) -> Vec<OsString> {
+    let own = |arg: &str| {
+        matches!(
+            arg,
+            "--version" | "-V" | "--help" | "-h" | "--data-dir" | "--no-telemetry"
+        ) || arg.starts_with("--data-dir=")
+    };
+    if argv
+        .get(1)
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| arg.starts_with('-') && !own(arg))
+    {
+        argv.insert(1, "quickstart".into());
+    }
+    argv
+}
+
 fn parse_cli(argv: Vec<OsString>, terminal: bool) -> ParsedCli {
+    let argv = with_default_quickstart(argv);
     if is_help_all(&argv) {
         let _ = <Cli as clap::CommandFactory>::command().print_help();
         return ParsedCli::Return;
@@ -763,11 +832,6 @@ async fn main() {
             command: telemetry_cli::TelemetryCommand::On
         }
     );
-    if let Command::Quickstart(args) = &cli.command
-        && args.can_start()
-    {
-        let _ = telemetry::onboard(args.noninteractive(), invocation_off);
-    }
     if verified_install && !install_after_command {
         telemetry::record_installation(invocation_off);
     }
@@ -1629,8 +1693,18 @@ mod tests {
             }
         }
         assert!(!core.contains("check-run-command") && core.contains("help --all"));
-        // Nothing moved out of the short list is hard to find.
-        assert!(listed.len() > 40);
+        // Experimental commands keep working by name but are not listed.
+        for shown in [
+            "quickstart",
+            "uninstall",
+            "hub",
+            "client",
+            "demo",
+            "collisions",
+        ] {
+            assert!(listed.iter().any(|name| name == shown), "{shown} hidden");
+        }
+        assert!(!all.contains("  skill-workflow ") && !all.contains("[experimental]"));
         for name in &listed {
             assert!(
                 all.contains(&format!("  {name} ")),
@@ -1640,6 +1714,21 @@ mod tests {
         let argv = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
         assert!(is_help_all(&argv(&["agentscm", "help", "--all"])));
         assert!(!is_help_all(&argv(&["agentscm", "hub", "--all"])));
+    }
+
+    #[test]
+    fn leading_quickstart_flags_start_quickstart() {
+        let argv = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        let out = with_default_quickstart(argv(&["agentscm", "--hub-url", "https://h"]));
+        assert_eq!(out[1], "quickstart");
+        for same in [
+            &["agentscm", "--version"][..],
+            &["agentscm", "--no-telemetry", "hub"],
+            &["agentscm", "hub"],
+            &["agentscm"],
+        ] {
+            assert_eq!(with_default_quickstart(argv(same)), argv(same));
+        }
     }
 
     #[test]

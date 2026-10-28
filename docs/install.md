@@ -20,6 +20,18 @@ The first question the setup guide asks is where AgentSCM should run:
 
 `install.sh` passes the same flags: `curl -fsSL .../install.sh | sh -s -- --local`.
 
+Flags shown by `npx agentscm --help`:
+
+| Flag | What it does |
+|---|---|
+| `--hub-url URL` | Connect to the hub that already runs at URL. |
+| `--yes` | Answer every question with the recommended choice (needed without a terminal). |
+| `--only AGENT` | Set up this coding agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`); repeat for more. Default: Claude Code when it is installed. |
+| `--dry-run` | Print what would be written and stop without writing. |
+| `--json` | Print one JSON object on stdout when done (`agents.installed`, `agents.skipped`, `agents.needs_user`, `hub`, `hub_up`, `signed_in`); the progress text goes to stderr. Not on Windows. |
+
+These flags still work but are hidden from help, and will go in a later release: `--local`, `--hosted`, `--hub`, `--agent` (the same as `--only`), `--hub-runtime`, `--hub-port`, `--hub-project`, `--github-login`, `--agent-token-file`, `--slack-config-file`, `--provider`, `--no-agents`, `--no-collisions`, `--init` and `--tray`. The rest of this page still uses them.
+
 ### If you are an agent installing AgentSCM for someone
 
 1. Ask the person: "Do you want to run AgentSCM locally on this machine (recommended for the alpha), join your team's existing hosted hub, or operate a new hosted hub for a team (unsupported in the alpha)?"
@@ -28,7 +40,7 @@ The first question the setup guide asks is where AgentSCM should run:
 
 Three ways to get AgentSCM. The first two download the release binary, check it, keep it in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows) and start the setup guide (`agentscm quickstart`).
 
-The download and verification steps do not send product telemetry. After verification, the installers invoke the binary to record one installation indicator only when telemetry was already configured and permitted for this user. Pass `--no-telemetry`, set `AGENTSCM_TELEMETRY=off`, or set `DO_NOT_TRACK=1` before installing to suppress it. On first use, a build containing the staged capability follows the [setup choice and telemetry controls](telemetry.md). No event can be sent until an HTTPS endpoint and data-handling profile are configured.
+The download and verification steps do not send product telemetry. After verification, the installers invoke the binary to record one installation indicator only when telemetry was already configured and permitted for this user. Pass `--no-telemetry`, set `AGENTSCM_TELEMETRY=off`, or set `DO_NOT_TRACK=1` before installing to suppress it. The [telemetry controls](telemetry.md) say how to turn it on. No event can be sent until an HTTPS endpoint and data-handling profile are configured.
 
 ## npx
 
