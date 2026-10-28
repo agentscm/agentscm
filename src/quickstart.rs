@@ -324,6 +324,9 @@ struct Live {
     /// Agents set up for all projects, connected or not.
     #[cfg(unix)]
     installed: Vec<crate::client_setup::Agent>,
+    /// Agents that could not be set up, with the reason.
+    #[cfg(unix)]
+    failed: Vec<(crate::client_setup::Agent, String)>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
     /// Why setting up the coding agents failed.
@@ -507,10 +510,10 @@ pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
     if cx.live.pending_local.is_some() {
         return Ok(3);
     }
-    if cx.live.agent_error.is_some() {
-        return Err(invalid(
-            "setting up the coding agent failed; see the status and recovery instructions above",
-        ));
+    if let Some(error) = &cx.live.agent_error {
+        return Err(invalid(&format!(
+            "setting up the coding agents failed: {error}"
+        )));
     }
     if requested_hub_incomplete {
         return Err(invalid(
@@ -1046,8 +1049,11 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     }
     // An older sign-in gets this computer's credential, which auto-connect mints through.
     crate::client_cli::enroll(&hub).await;
-    // Auto-connect is how checkouts other than this one connect, so it is always on.
-    if let Err(error) = hub_cli::set_auto_connect(Some(&hub), true) {
+    // Auto-connect is how checkouts other than this one connect, so it is always on. It needs a
+    // sign-in, which a run with only --agent-token-file doesn't have.
+    if hub_cli::has_session(Some(&hub)).unwrap_or(false)
+        && let Err(error) = hub_cli::set_auto_connect(Some(&hub), true)
+    {
         println!("Couldn't turn on auto-connect: {}.", short(&error));
     }
     let Some((plan, exe)) = program_plan(&cx.home) else {
@@ -1087,7 +1093,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
                     cx.manifest.agents.push(agent.name().to_owned());
                 }
             }
-            Err(error) => println!("Couldn't set up {}: {}.", agent.label(), short(&error)),
+            Err(error) => cx.live.failed.push((*agent, short(&error))),
         }
     }
     if cx.live.installed.contains(&Agent::Claude) {
@@ -1100,13 +1106,9 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         }
     }
     let _ = cx.manifest.save();
-    if cx.live.installed.len() < agents.len() && cx.live.agent_error.is_none() {
-        let failed: Vec<Agent> = agents
-            .iter()
-            .copied()
-            .filter(|agent| !cx.live.installed.contains(agent))
-            .collect();
-        cx.live.agent_error = Some(format!("{} could not be set up", labels(&failed)));
+    // Some agents set up is a success; the summary names each one that failed and why.
+    if cx.live.installed.is_empty() && !cx.live.failed.is_empty() {
+        cx.live.agent_error = Some("no agent could be set up".into());
     }
     #[cfg(target_os = "macos")]
     if let Some(dir) = &cx.manifest.bin_dir
@@ -1245,6 +1247,13 @@ fn summary(cx: &Cx<'_>, changed: bool, command: &str) {
         {
             println!("Codex: run /hooks once and trust the AgentSCM hooks.");
         }
+    }
+    #[cfg(unix)]
+    for (agent, why) in &cx.live.failed {
+        println!(
+            "{} wasn't set up: {why}. Fix that, then run `{command} quickstart` again.",
+            agent.label()
+        );
     }
     if !cx.init_written.is_empty() {
         println!(

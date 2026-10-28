@@ -4692,7 +4692,7 @@ fn a_foreign_agentscm_hook_makes_setup_refuse_before_anything_is_written() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let said = out(&output);
     assert!(
-        said.contains("Couldn't set up Claude Code: ")
+        said.contains("Claude Code wasn't set up: ")
             && said.contains("that the plugin would duplicate"),
         "{said}"
     );
@@ -4773,15 +4773,41 @@ fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
     assert_eq!(machine.connections().len(), 1);
 }
 
+// Like the real CLI, adding the plugin records it in Codex's own config.toml, and removing it
+// takes out only those lines.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "__STATE__/codex-log"
-[ "$*" = "plugin list --json" ] && printf '{"installed":[]}\n'
+config="__STATE__/.codex/config.toml"
+plugin='[plugins."agentscm@agentscm-client"]'
+if [ "$*" = "plugin list --json" ]; then
+  if grep -qF "$plugin" "$config" 2>/dev/null; then
+    printf '{"installed":[{"name":"agentscm","pluginId":"agentscm@agentscm-client","enabled":true}]}\n'
+  else
+    printf '{"installed":[]}\n'
+  fi
+fi
+if [ "$*" = "plugin add agentscm@agentscm-client" ] && ! grep -qF "$plugin" "$config" 2>/dev/null; then
+  mkdir -p "__STATE__/.codex"
+  printf '\n%s\nenabled = true\n' "$plugin" >> "$config"
+fi
+if [ "$*" = "plugin remove agentscm@agentscm-client" ] && [ -f "$config" ]; then
+  # Drops the header, the line after it and the blank line `plugin add` put before it.
+  awk -v p="$plugin" '
+    $0 == "" { if (blank) print ""; blank = 1; next }
+    $0 == p { blank = 0; skip = 1; next }
+    skip { skip = 0; next }
+    { if (blank) print ""; blank = 0; print }
+    END { if (blank) print "" }' "$config" > "$config.new"
+  mv "$config.new" "$config"
+fi
 exit 0
 "#;
 
 impl Machine {
     /// Puts a fake `codex` next to the fake `claude`.
-    fn with_codex(self) -> Self {
+    fn with_codex(mut self) -> Self {
+        // The fake CLI uses mkdir and cp.
+        self.system_path = true;
         let script = self.bin.path().join("codex");
         std::fs::write(
             &script,

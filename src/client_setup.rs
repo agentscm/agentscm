@@ -1019,14 +1019,15 @@ pub(crate) fn install_quiet(agent: Agent, root: &Path, program: &Path, scope: Sc
 pub(crate) fn install_user(agent: Agent, program: &Path) -> Result<()> {
     let _lock = installation_lock()?;
     let home = home()?;
-    let edits = user_plan(agent, program)?;
+    // Checked before the plugin step, planned after it: `codex plugin add` edits config.toml.
+    user_plan(agent, program)?;
     if agent == Agent::Codex {
         crate::client_plugin::install_for_root(&home, program, false)?;
     }
     if agent == Agent::Claude {
         crate::client_plugin::install_claude_for_root(&home, program)?;
     }
-    write_user_plan(edits, false)?;
+    write_user_plan(user_plan(agent, program)?, false)?;
     migrate_checkouts(agent, None)
 }
 
@@ -1058,6 +1059,12 @@ fn install_locked(
     }
     write_plan(root, edits, announce)?;
     if user {
+        // `codex plugin add` has just edited config.toml, so plan the user files again.
+        let user_edits = if agent == Agent::Codex {
+            user_plan(agent, program)?
+        } else {
+            user_edits
+        };
         write_user_plan(user_edits, announce)?;
         migrate_checkouts(agent, Some(root))?;
     }
