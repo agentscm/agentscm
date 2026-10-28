@@ -2,6 +2,8 @@
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
@@ -164,63 +166,114 @@ fn write_json(writer: &mut impl Write, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Answers locally, with no tools, until `find` sees a connection; then announces the tools
-/// changed and returns it with the request that found it, for `serve` to forward. A user-scope
-/// MCP entry starts in every project, and most are not connected; an agent's start-up hook may
-/// connect this one while it runs.
+const NOT_SIGNED_IN: &str = "AgentSCM is not signed in on this computer, so this checkout cannot connect yet. Run `agentscm hub login`, then try again.";
+const STILL_CONNECTING: &str = "AgentSCM is still connecting this checkout to its Hub. Try again in a few seconds. If this keeps happening, the repository may not be on your Hub; ask a Hub admin to connect it.";
+const POLL: Duration = Duration::from_secs(2);
+
+/// Why this checkout has no connection yet, in words for the person or agent reading it. A
+/// refusal the auto-connect hook recorded (repository not on the Hub, computer revoked or
+/// signed out) wins; otherwise a computer with no sign-in cannot connect at all.
+fn why_not_connected(root: Option<&Path>) -> String {
+    let recorded = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| canonical_root(root.unwrap_or(&cwd)).ok())
+        .and_then(|checkout| crate::client_cli::attention(&checkout));
+    match (recorded, crate::hub_cli::auto_connect_hubs()) {
+        (Some(message), _) => format!("AgentSCM cannot connect this checkout: {message}."),
+        (None, Ok(hubs)) if hubs.is_empty() => NOT_SIGNED_IN.to_owned(),
+        _ => STILL_CONNECTING.to_owned(),
+    }
+}
+
+/// Answers locally until `find` sees a connection. `tools/list` already names every tool, so an
+/// agent's first session can see them; a call explains why it cannot run yet. When a connection
+/// appears, from a request or from the `poll` timer, announces the tools changed and returns it
+/// with the request to forward. A user-scope MCP entry starts in every project, and most are not
+/// connected; an agent's start-up hook may connect this one while it runs.
 fn unconnected<T>(
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + Send),
     writer: &mut impl Write,
-    mut find: impl FnMut() -> Option<T>,
+    mut find: impl FnMut() -> std::result::Result<T, String>,
+    poll: Duration,
 ) -> Result<Option<(T, Vec<u8>)>> {
-    loop {
-        let line = match read_line(reader) {
-            Ok(Some(line)) => line,
-            Ok(None) => return Ok(None),
-            Err(error) => {
-                write_json(
-                    writer,
-                    &rpc_error(&Value::Null, -32700, "request too large"),
-                )?;
-                return Err(error);
-            }
-        };
-        if let Some(found) = find() {
+    let changed = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+    std::thread::scope(|scope| {
+        // The reader thread reads one line per request, so none is pending once a connection is found
+        // from a request, and the reader is free for `serve` when the scope ends.
+        let (want, wanted) = mpsc::channel::<()>();
+        let (send, lines) = mpsc::channel();
+        let reader = &mut *reader;
+        scope.spawn(
+            move || {
+                while wanted.recv().is_ok() && send.send(read_line(reader)).is_ok() {}
+            },
+        );
+        let _ = want.send(());
+        loop {
+            let line = match lines.recv_timeout(poll) {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+                Ok(Err(error)) => {
+                    write_json(
+                        writer,
+                        &rpc_error(&Value::Null, -32700, "request too large"),
+                    )?;
+                    return Err(error);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok(found) = find() {
+                        write_json(writer, &changed)?;
+                        // The read already under way is the first request to forward.
+                        return match lines.recv() {
+                            Ok(Ok(Some(line))) => Ok(Some((found, line))),
+                            Ok(Err(error)) => Err(error),
+                            Ok(Ok(None)) | Err(_) => Ok(None),
+                        };
+                    }
+                    continue;
+                }
+            };
+            let reason = match find() {
+                Ok(found) => {
+                    write_json(writer, &changed)?;
+                    return Ok(Some((found, line)));
+                }
+                Err(why) => why,
+            };
+            let _ = want.send(());
+            let Ok(message) = serde_json::from_slice::<Value>(&line) else {
+                write_json(writer, &rpc_error(&Value::Null, -32700, "parse error"))?;
+                continue;
+            };
+            let Some(id) = response_id(&message) else {
+                continue;
+            };
+            let result = match message["method"].as_str() {
+                Some("initialize") => json!({
+                    "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": "This checkout is not connected to an AgentSCM Hub yet. The tools are listed, and work once it connects; until then a call says why it cannot run.",
+                }),
+                Some("ping") => json!({}),
+                Some("tools/list") => json!({"tools": agentscm::hub::mcp::agent_tools()}),
+                Some("tools/call") => {
+                    json!({"content": [{"type": "text", "text": reason}], "isError": true})
+                }
+                _ => {
+                    write_json(
+                        writer,
+                        &rpc_error(&id, -32601, "this checkout is not connected to AgentSCM"),
+                    )?;
+                    continue;
+                }
+            };
             write_json(
                 writer,
-                &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+                &json!({"jsonrpc": "2.0", "id": id, "result": result}),
             )?;
-            return Ok(Some((found, line)));
         }
-        let Ok(message) = serde_json::from_slice::<Value>(&line) else {
-            write_json(writer, &rpc_error(&Value::Null, -32700, "parse error"))?;
-            continue;
-        };
-        let Some(id) = response_id(&message) else {
-            continue;
-        };
-        let result = match message["method"].as_str() {
-            Some("initialize") => json!({
-                "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-                "capabilities": {"tools": {"listChanged": true}},
-                "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "This checkout is not connected to an AgentSCM Hub, so AgentSCM has no tools here.",
-            }),
-            Some("ping") => json!({}),
-            Some("tools/list") => json!({"tools": []}),
-            _ => {
-                write_json(
-                    writer,
-                    &rpc_error(&id, -32601, "this checkout is not connected to AgentSCM"),
-                )?;
-                continue;
-            }
-        };
-        write_json(
-            writer,
-            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        )?;
-    }
+    })
 }
 
 async fn serve(
@@ -375,14 +428,16 @@ fn report_activity(binding: &str, outcome: crate::client_activity::ActivityOutco
 }
 
 pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
-    let stdin = std::io::stdin();
+    // Not `stdin().lock()`: the unconnected loop reads from a second thread.
+    let mut reader = std::io::BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
-    let (mut reader, mut writer) = (stdin.lock(), stdout.lock());
+    let mut writer = stdout.lock();
     let ((connection, checkout, token), first) = match connection(root) {
         Ok(found) => (found, None),
         Err(why) => {
-            eprintln!("AgentSCM MCP: {why}; no tools until this checkout is connected");
-            match unconnected(&mut reader, &mut writer, || connection(root).ok())? {
+            eprintln!("AgentSCM MCP: {why}; tool calls fail until this checkout is connected");
+            let find = || connection(root).map_err(|_| why_not_connected(root));
+            match unconnected(&mut reader, &mut writer, find, POLL)? {
                 Some((found, line)) => (found, Some(line)),
                 None => return Ok(()),
             }
@@ -655,46 +710,124 @@ mod tests {
         }
     }
 
+    fn replies(output: Vec<u8>) -> Vec<Value> {
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     #[test]
-    fn an_unconnected_checkout_serves_no_tools_until_it_is_connected() {
+    fn an_unconnected_checkout_lists_its_tools_and_explains_a_call_until_connected() {
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\"}}\n",
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
-            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\"}\n",
-            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"agentscm_setup_status\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\"}\n",
         );
         let mut reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
         let mut calls = 0;
-        let found = unconnected(&mut reader, &mut output, || {
-            calls += 1;
-            (calls == 5).then_some("connection")
-        })
+        let found = unconnected(
+            &mut reader,
+            &mut output,
+            || {
+                calls += 1;
+                if calls == 6 {
+                    Ok("connection")
+                } else {
+                    Err("still connecting".to_owned())
+                }
+            },
+            Duration::from_secs(60),
+        )
         .unwrap();
         let (connection, line) = found.unwrap();
         assert_eq!(connection, "connection");
         assert!(String::from_utf8(line).unwrap().contains("\"id\":4"));
-        let replies: Vec<Value> = String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(replies.len(), 4);
+        let replies = replies(output);
+        assert_eq!(replies.len(), 5);
         assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(
             replies[0]["result"]["capabilities"]["tools"]["listChanged"],
             true
         );
-        assert_eq!(replies[1]["result"]["tools"], json!([]));
+        assert_eq!(
+            replies[1]["result"]["tools"],
+            agentscm::hub::mcp::agent_tools()
+        );
         assert_eq!(replies[2]["id"], 3);
-        assert_eq!(replies[2]["error"]["code"], -32601);
-        assert_eq!(replies[3]["method"], "notifications/tools/list_changed");
+        assert_eq!(replies[2]["result"]["isError"], true);
+        assert_eq!(
+            replies[2]["result"]["content"][0]["text"],
+            "still connecting"
+        );
+        assert_eq!(replies[3]["error"]["code"], -32601);
+        assert_eq!(replies[4]["method"], "notifications/tools/list_changed");
         let mut ended = Cursor::new(&b""[..]);
         assert!(
-            unconnected(&mut ended, &mut Vec::new(), || None::<()>)
-                .unwrap()
-                .is_none()
+            unconnected(
+                &mut ended,
+                &mut Vec::new(),
+                || Err::<(), _>(String::new()),
+                Duration::from_secs(60)
+            )
+            .unwrap()
+            .is_none()
         );
+    }
+
+    /// A reader that stays silent until released, like a client waiting for list_changed.
+    struct Silent(mpsc::Receiver<Vec<u8>>, Cursor<Vec<u8>>);
+
+    impl Read for Silent {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.1.position() == self.1.get_ref().len() as u64
+                && let Ok(more) = self.0.recv()
+            {
+                self.1 = Cursor::new(more);
+            }
+            self.1.read(buf)
+        }
+    }
+
+    #[test]
+    fn a_connection_that_appears_is_announced_without_waiting_for_a_request() {
+        let (release, released) = mpsc::channel();
+        let mut reader = std::io::BufReader::new(Silent(released, Cursor::new(Vec::new())));
+        let mut output = Vec::new();
+        let mut polls = 0;
+        let found = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                unconnected(
+                    &mut reader,
+                    &mut output,
+                    || {
+                        polls += 1;
+                        if polls >= 2 {
+                            Ok(7)
+                        } else {
+                            Err("connecting".into())
+                        }
+                    },
+                    Duration::from_millis(20),
+                )
+            });
+            // The announcement is written while the client is still silent.
+            std::thread::sleep(Duration::from_millis(300));
+            release
+                .send(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n".to_vec())
+                .unwrap();
+            handle.join().unwrap()
+        });
+        let (value, line) = found.unwrap().unwrap();
+        assert_eq!(value, 7);
+        assert!(String::from_utf8(line).unwrap().contains("tools/list"));
+        let replies = replies(output);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["method"], "notifications/tools/list_changed");
     }
 }
