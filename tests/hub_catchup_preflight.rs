@@ -1376,3 +1376,26 @@ fn checked_merge_identity_rejects_hidden_characters_before_lookup() {
             .is_empty()
     );
 }
+
+/// The checkout's MCP server lists `agent_tools()` before it is connected; a connected agent must
+/// see the same definitions, less the skill tools a repository that adopted no skills does not list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_unconnected_tool_list_matches_what_the_hub_serves_an_agent() {
+    let hub = Hub::start().await;
+    let writer = hub.token(false).await;
+    let served = hub.mcp(&writer, 1, "tools/list", json!({})).await["tools"].clone();
+    let compiled = agentscm::hub::mcp::agent_tools();
+    let (served, compiled) = (served.as_array().unwrap(), compiled.as_array().unwrap());
+    for tool in served {
+        assert!(compiled.contains(tool), "compiled list drifted: {tool}");
+    }
+    for tool in compiled.iter().filter(|tool| !served.contains(tool)) {
+        let name = tool["name"].as_str().unwrap();
+        assert!(name.starts_with("agentscm_skill_"), "{name} is not served");
+    }
+    assert!(
+        compiled
+            .iter()
+            .any(|tool| tool["name"] == "agentscm_setup_status")
+    );
+}
