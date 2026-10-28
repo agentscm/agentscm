@@ -16,8 +16,8 @@ pub(crate) struct Capture {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stop: Option<Stop>,
-    /// Set when a stream drain failed outside its tee sink or ownership of the child
-    /// was lost; tee sink failures are reported through `stop`.
+    /// Set when a stream drain failed outside its tee sink or waiting on the child
+    /// failed, so ownership may be lost; tee sink failures are reported through `stop`.
     pub incomplete: bool,
 }
 
@@ -1016,7 +1016,7 @@ os._exit(0)
     }
 
     // A setsid grandchild leaves the leader's session and process group, so it
-    // keeps the output pipes open after the leader is killed and the drain cannot
+    // keeps the output pipes open after the leader's group is killed and the drain cannot
     // complete (it ends at the post-exit deadline).
     // The leader continues only after the holder has detached, so no stop can
     // kill the holder before it leaves the process group. It then touches the
@@ -1034,7 +1034,10 @@ os._exit(0)
         let marker = root.path().join("detached");
         let script = format!("{DETACHED_HOLDER}{leader}");
         let mut command = Command::new("/usr/bin/python3");
-        command.args(["-c", script.as_str()]).arg(&marker);
+        command
+            .process_group(0)
+            .args(["-c", script.as_str()])
+            .arg(&marker);
         let cancel_in_hook = cancel.clone();
         capture_with_input_inner(
             &mut command,
