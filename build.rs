@@ -11,7 +11,30 @@ fn main() {
     }
 }
 
+/// The version `--version` shows: the package version, plus `+<commit>` unless the commit is
+/// exactly the release tag, so a build from a branch says which commit it is.
+fn install_version() {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let package = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let released = git(&["describe", "--exact-match", "--tags", "HEAD"])
+        .is_some_and(|tag| tag == format!("v{package}"));
+    let version = match git(&["rev-parse", "--short=9", "HEAD"]) {
+        Some(sha) if !released && !sha.is_empty() => format!("{package}+{sha}"),
+        _ => package,
+    };
+    println!("cargo:rustc-env=AGENTSCM_INSTALL_VERSION={version}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+}
+
 fn generate() -> Result<(), String> {
+    install_version();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
     let directory = manifest.join("src/hub/migrations/named");
     println!("cargo:rerun-if-changed={}", directory.display());

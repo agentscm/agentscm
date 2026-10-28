@@ -165,9 +165,14 @@ fn native_bundle_is_self_contained_and_matches_its_inventory() {
         .output()
         .unwrap();
     assert!(installed.status.success());
-    assert_eq!(
-        String::from_utf8(installed.stdout).unwrap().trim(),
-        concat!("agentscm ", env!("CARGO_PKG_VERSION"))
+    // A build from a branch also names its commit: `0.1.0+<commit>`.
+    let printed = String::from_utf8(installed.stdout).unwrap();
+    assert!(
+        printed
+            .trim()
+            .strip_prefix(concat!("agentscm ", env!("CARGO_PKG_VERSION")))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('+')),
+        "{printed}"
     );
     assert!(!directory.path().join(".agentscm").exists());
     assert!(!directory.path().join("not-a-repository").exists());
