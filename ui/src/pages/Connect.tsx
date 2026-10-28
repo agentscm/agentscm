@@ -26,7 +26,7 @@ export function InstallCommand({ lead = 'Run this in a checkout of a repository 
 const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini' }
 
 const STEPS = [
-  { icon: 'clipboard-check', title: 'Paste into your agent', body: 'Open your repository in your coding agent and paste the instructions.' },
+  { icon: 'clipboard-check', title: 'Paste into your agent', body: 'Open any coding agent and paste the instructions.' },
   { icon: 'person-check', title: 'Sign in with your forge', body: 'Complete the GitHub or GitLab browser sign-in when asked.' },
   { icon: 'shield-check', title: 'Approve AgentSCM access', body: 'Approve the AgentSCM hooks and MCP server inside your agent yourself.' },
   { icon: 'patch-check', title: 'Verify a real edit', body: 'Your agent checks MCP and its edit hook in the same session. Blockers come with the next step.' },

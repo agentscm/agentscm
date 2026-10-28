@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
-import { CLIENT_AGENTS, agentSetupPrompt, clientSetupCommand, safeHubOrigin } from '../src/connectAgent.ts'
+import { CLIENT_AGENTS, agentSetupPrompt, clientSetupCommand, installCommand, safeHubOrigin } from '../src/connectAgent.ts'
 import { decodeSetup, setupState } from '../src/onboarding.ts'
 
 assert.equal(safeHubOrigin('https://hub.example.com'), 'https://hub.example.com')
@@ -27,14 +27,11 @@ for (const agent of CLIENT_AGENTS) {
 }
 
 const prompt = agentSetupPrompt('https://hub.example.com')
-assert.ok(prompt?.includes('AgentSCM at https://hub.example.com'))
-assert.ok(prompt?.includes('Never configure or deploy a Hub'))
-assert.ok(prompt?.includes("client setup --agent NAME --hub 'https://hub.example.com'"))
-for (const agent of CLIENT_AGENTS) assert.ok(prompt?.includes(agent))
-assert.ok(prompt?.includes('Run npx agentscm client check'))
-assert.ok(prompt?.includes('both mcp_verified and native_verified true'))
-assert.ok(prompt?.includes('diagnostic-stdin'))
-assert.ok(prompt?.includes('do not invent a session ID or simulate hooks'))
+assert.ok(prompt?.includes('Hub at https://hub.example.com'))
+assert.ok(prompt?.includes("npx agentscm --yes --json --hub-url 'https://hub.example.com'"))
+assert.ok(prompt?.includes('deploy a Hub'))
+assert.ok(prompt?.includes('/hooks'))
+assert.ok(prompt && prompt.length < 800)
 assert.ok(!prompt?.toLowerCase().includes('token='))
 assert.equal(agentSetupPrompt('https://hub.example.com/?token=secret'), null)
 
@@ -59,4 +56,4 @@ assert.ok(unusualCommand)
 const shell = spawnSync('/bin/sh', ['-c', 'npx() { printf "%s\\n" "$@"; }; ' + unusualCommand], { encoding: 'utf8' })
 assert.equal(shell.status, 0, shell.stderr)
 assert.deepEqual(shell.stdout.trimEnd().split('\n'), ['agentscm', 'client', 'setup', '--agent', 'codex', '--hub', unusualOrigin])
-assert.ok(agentSetupPrompt(unusualOrigin)?.includes(unusualCommand.replace("--agent 'codex'", '--agent NAME')))
+assert.ok(agentSetupPrompt(unusualOrigin)?.includes(installCommand(unusualOrigin).replace('npx agentscm ', '')))
