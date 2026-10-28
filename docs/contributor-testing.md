@@ -15,6 +15,16 @@ Install the version required by `.config/nextest.toml` so local and CI behavior 
 cargo install cargo-nextest --version 0.9.148 --locked
 ```
 
+On macOS or Linux, also compile the Windows build before pushing a change that touches `#[cfg(unix)]` code or calls into a Unix-only module (`client_plugin`, `client_setup`, `tray` and others). The gate above only compiles the host platform, so these mistakes otherwise surface only in the `windows` CI job. `tools/windows-check.sh` compiles what that job compiles, with warnings as errors, and reads its test list from `.github/workflows/windows.yml`. It needs the target and a MinGW C compiler once:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+brew install mingw-w64   # Debian/Ubuntu: apt install mingw-w64
+tools/windows-check.sh
+```
+
+It checks compilation only; Windows test behaviour is still CI's job. It builds into `target/x86_64-pc-windows-gnu`, which takes several GB; delete it with the rest of `target` when space is tight.
+
 The nextest profile disables fail-fast and retries. It writes JUnit output to `target/nextest/default/junit.xml`, including ignored tests as skipped rather than treating them as executed. The `backend_s3` test binary is limited to one process because its tests share an in-process `CreateBucket` mutex. PostgreSQL fixture tests are also limited to one process because independently named schemas still share fixed database-wide migration and event advisory locks; the store's five-second lock timeout can otherwise expire while another test holds one of those locks. These limits do not serialize unrelated tests, internal concurrency within one test or separate nextest invocations; do not run multiple suites against the same bucket or PostgreSQL database concurrently.
 
 The `two_git_worktrees_*` cases in `hub_workspace_execution` share a test group
