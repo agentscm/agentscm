@@ -280,6 +280,7 @@ async fn workspace_settings_persist_bootstrap_once_and_agent_management_denied()
                 host: env.host.clone(),
                 user_id: 999,
             },
+            forge_repositories: vec![],
         },
         env.store.clone(),
     )

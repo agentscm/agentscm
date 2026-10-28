@@ -1,10 +1,10 @@
 # Hosted hub setup (agent-guided)
 
-> **Not supported in the alpha. It will likely break and is not for production.** APIs, CLI, storage and schemas may change without migration, and the authority database cannot be downgraded. Nobody is on call for a hosted hub. See the [changelog](../CHANGELOG.md) for known limits.
+> **Operating a hosted hub is not supported in the alpha. It will likely break and is not for production.** APIs, CLI, storage and schemas may change without migration, and the authority database cannot be downgraded. Nobody is on call for a hosted hub. See the [changelog](../CHANGELOG.md) for known limits.
 
 This guide is for a coding agent working through a hosted hub setup with a person. A hosted hub is one shared `agentscm hub serve` process on a server, which a team's agents connect to over HTTPS.
 
-**First, confirm with the person that they really want hosted.** If they only want live collision warnings for their own machine, stop and have them run:
+**First, confirm with the person that they really want to operate a hosted hub.** If their team's hub already runs, they do not need this guide: have them run `npx agentscm --hub-url URL` in their terminal, which signs them in through the browser. If they only want live collision warnings for their own machine, stop and have them run:
 
 ```sh
 npx agentscm --local

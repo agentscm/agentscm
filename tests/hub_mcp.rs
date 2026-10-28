@@ -503,6 +503,7 @@ async fn protocol_basics() {
     let default_init = hub.rpc(&key, &init("2025-11-25")).await.json();
     let instructions = default_init["result"]["instructions"].as_str().unwrap();
     assert!(instructions.contains("agentscm_start") && !instructions.contains("workflow_status"));
+    assert!(instructions.contains("agentscm_promises_list"));
 
     let ping = hub
         .rpc(&key, &json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}))
@@ -565,6 +566,11 @@ async fn protocol_basics() {
             "agentscm_skill_list",
             "agentscm_skill_status",
             "agentscm_skill_evidence",
+            "agentscm_promises_list",
+            "agentscm_promise_show",
+            "agentscm_promise_history",
+            "agentscm_promise_propose",
+            "agentscm_promise_report",
             "agentscm_view_settings",
             "agentscm_coordination_ack",
             "agentscm_coordination_reply",
@@ -598,6 +604,70 @@ async fn protocol_basics() {
             .map(|name| (*name).to_owned())
             .collect::<Vec<_>>()
     );
+    for name in [
+        "agentscm_promises_list",
+        "agentscm_promise_show",
+        "agentscm_promise_history",
+        "agentscm_promise_propose",
+        "agentscm_promise_report",
+    ] {
+        assert!(default_names.iter().any(|listed| listed == name), "{name}");
+    }
+    let reader_owner = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 2,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (_, reader, _) = mint_bound_agent_token(
+        &*hub.store,
+        &reader_owner.id,
+        "promise-reader",
+        REPO,
+        1,
+        600,
+        true,
+    )
+    .unwrap();
+    let read_only_init = hub.rpc(reader.expose(), &init("2025-11-25")).await.json();
+    assert!(
+        read_only_init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("agentscm_promises_list")
+    );
+    let read_only = hub.rpc(reader.expose(), &list).await.json();
+    let read_only_names: Vec<&str> = read_only["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    for name in [
+        "agentscm_promises_list",
+        "agentscm_promise_show",
+        "agentscm_promise_history",
+    ] {
+        assert!(read_only_names.contains(&name), "{name}");
+    }
+    for name in ["agentscm_promise_propose", "agentscm_promise_report"] {
+        assert!(!read_only_names.contains(&name), "{name}");
+        let refusal = hub
+            .rpc(
+                reader.expose(),
+                &json!({
+                    "jsonrpc":"2.0","id":3,"method":"tools/call",
+                    "params":{"name":name,"arguments":{}}
+                }),
+            )
+            .await;
+        assert_eq!(refusal.status, 403, "{name}");
+    }
     // Listed or not, an opt-in tool stays callable.
     let called = hub
         .rpc(
@@ -2170,7 +2240,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (28, 31, 36));
+    assert_eq!((before.len(), listed.len(), all.len()), (33, 36, 41));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});

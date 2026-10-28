@@ -386,7 +386,7 @@ async fn pass(
             }
             Ok(None) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => {
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
                 eprintln!(
                     "hub: external runs for {}#{number}: {detail}",
                     repo.full_name
@@ -427,7 +427,7 @@ async fn pass(
                 .await?;
             }
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => {
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
                 eprintln!("hub: external runs for {} {sha}: {detail}", repo.full_name);
             }
         }
@@ -493,7 +493,7 @@ async fn commit_runs(
                 None => complete = false,
             },
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(_)) => complete = false,
+            Err(GhError::Failed(_) | GhError::TooLarge(_)) => complete = false,
         }
     }
     // Runs of other branches, events or repositories are not this commit's outcome; anything

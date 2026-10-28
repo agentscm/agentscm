@@ -169,6 +169,16 @@ test('requires an explicit discard before leaving a dirty workflow', async ({ pa
   await expect(main.getByLabel('Name')).toHaveValue('Unsaved protected draft')
   expect(crossSectionDialogs).toBe(1)
 
+  for (const section of ['workspace', 'promises']) {
+    page.once('dialog', async (dialog) => {
+      expect(dialog.message()).toBe('Discard unsaved workflow edits?')
+      await dialog.dismiss()
+    })
+    await page.evaluate((next) => { window.location.hash = next }, section)
+    await expect(page).toHaveURL(/#templates\?view=workflows$/)
+    await expect(main.getByLabel('Name')).toHaveValue('Unsaved protected draft')
+  }
+
   await page.getByRole('button', { name: /acme\/widgets on Test Mac/ }).click()
   page.once('dialog', async (dialog) => {
     expect(dialog.message()).toBe('Discard unsaved workflow edits?')

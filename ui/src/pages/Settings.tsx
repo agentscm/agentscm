@@ -116,7 +116,7 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
         {onFrontDoor() && isLocalCredential(token) ? <CaptureSharingBox token={token} /> : <CaptureSharingElsewhere />}
 
         {!isLocalCredential(token) && (
-        <Box tour="settings-token" icon="key" title="Your token" explain="The token decides which repository you see. A read-only token can look but never change coordination.">
+        <Box tour="settings-token" icon="key" title="Your token" explain="Your token decides which repository you see. A read-only token can look but can’t change anything.">
           {!whoami ? (
             <Skeleton rows={2} />
           ) : (
@@ -142,7 +142,7 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
 
         <ViewSettingsBox token={token} />
 
-        <Box icon="arrow-repeat" title="Refresh" explain="Refreshing pauses while this tab is hidden and slows down after errors. A failed refresh keeps the last data and labels it.">
+        <Box icon="arrow-repeat" title="Refresh" explain="Refreshing pauses while this tab is hidden and slows down after errors. If a refresh fails, you keep the last data, marked as such.">
           <ul className="cadence">
             {CADENCE.map(([icon, what, when]) => (
               <li key={what}>
@@ -221,7 +221,7 @@ function Walkthrough() {
   const welcomeOn = !tour.prefs.welcomeSeen && !tour.prefs.welcomeOff
   const pages = SECTIONS.filter((s) => tourFor(s.key))
   return (
-    <Box id="feature-walkthrough" tour="settings-walkthrough" icon="signpost-split" title="Feature walkthrough" explain="Short guided tours that point at the real numbers on each page. Saved in this browser only.">
+    <Box id="feature-walkthrough" tour="settings-walkthrough" icon="signpost-split" title="Feature walkthrough" explain="Short tours that point at the real numbers on each page. Saved in this browser.">
       {!tour.remember && (
         <p className="muted small">This browser is not keeping site data, so tours will not start by themselves. You can still run any of them below.</p>
       )}

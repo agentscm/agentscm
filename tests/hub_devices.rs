@@ -7,8 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use agentscm::backend::LocalBackend;
 use agentscm::hub::login::{Login, LoginConfig};
-use agentscm::hub::store::{self, Store, unix_now};
+use agentscm::hub::promise::{
+    PromiseCreateV1, PromiseForgeAdmissionV1, PromiseRepositoryAdmissionV1, admissions_digest,
+};
+use agentscm::hub::store::{self, Store, mint_bound_agent_token, unix_now};
 use agentscm::hub::sync::{self, Sync, SyncConfig};
+use agentscm::hub::workspace::{Identity, Workspace, WorkspaceConfig, WorkspaceForgeRepositoryV1};
 use agentscm::hub::{HubState, router};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -226,6 +230,7 @@ struct Env {
     provider: &'static str,
     fake: Shared,
     store: Arc<dyn Store>,
+    workspace: Option<Arc<Workspace>>,
     http: reqwest::Client,
     dir: TempDir,
 }
@@ -244,6 +249,7 @@ impl Env {
                 dir.path().join("hub.sqlite").display()
             ))
             .unwrap(),
+            workspace: None,
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
             dir,
         };
@@ -303,6 +309,10 @@ impl Env {
         )
         .with_login(Login::new(login).unwrap())
         .with_sync(Sync::new(sync_config).unwrap());
+        let state = match &self.workspace {
+            Some(workspace) => state.with_workspace(workspace.clone()),
+            None => state,
+        };
         sync::start(&state).await.unwrap();
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, app).await });
@@ -456,6 +466,185 @@ fn token(minted: &Value) -> (String, String) {
         minted["id"].as_str().unwrap().into(),
         minted["token"].as_str().unwrap().into(),
     )
+}
+
+fn device_promise_workspace(env: &Env, forge_repository_id: i64) -> Arc<Workspace> {
+    Arc::new(
+        Workspace::open(
+            WorkspaceConfig {
+                workspace_id: "device-promise-workspace".into(),
+                name: "Device promise workspace".into(),
+                database: env.dir.path().join("device-promise-workspace.sqlite"),
+                initial_owner: Identity {
+                    provider: "github".into(),
+                    host: env.base.trim_start_matches("http://").into(),
+                    user_id: ALICE,
+                },
+                forge_repositories: vec![WorkspaceForgeRepositoryV1 {
+                    repository_id: REPO.into(),
+                    provider: "github".into(),
+                    host: env.base.trim_start_matches("http://").into(),
+                    forge_repository_id,
+                }],
+            },
+            env.store.clone(),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn device_minted_token_obeys_promise_scope_and_revocation() {
+    let mut env = Env::start("github").await;
+    let (_, device, _) = env.sign_in(ALICE, "promise laptop").await;
+    env.workspace = Some(device_promise_workspace(&env, REPO_ID));
+    env.hub = env.serve("").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    assert_eq!(minted["repository"], REPO);
+    assert_eq!(minted["repository_id"], REPO_ID);
+    let (token_id, secret) = token(&minted);
+
+    let owner = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == ALICE)
+        .unwrap();
+    let admission = PromiseRepositoryAdmissionV1 {
+        repository_id: REPO.into(),
+        forge: Some(PromiseForgeAdmissionV1 {
+            provider: "github".into(),
+            host: env.base.trim_start_matches("http://").into(),
+            forge_repository_id: REPO_ID,
+        }),
+        native_repository_ids: vec![],
+    };
+    let create = PromiseCreateV1 {
+        operation_id: "device_promise_create".into(),
+        expected_admissions_digest: admissions_digest(
+            "device-promise-workspace",
+            std::slice::from_ref(&admission),
+        )
+        .unwrap(),
+        definition: serde_json::from_value(json!({
+            "original_request":"Keep customer settings.",
+            "commitment":"Existing settings persist.",
+            "criteria":[{"id":"settings","text":"Settings persist.","evidence_requirements":[]}],
+            "constraints":[],
+            "repositories":[{"repository_id":REPO,"relevance":"Settings source."}]
+        }))
+        .unwrap(),
+    };
+    let created = env
+        .store
+        .promise_create(
+            "device-promise-workspace",
+            &owner.id,
+            &create,
+            &[admission],
+            unix_now(),
+        )
+        .unwrap();
+    let show = format!(
+        "/v1/hub/workspace/promises/{}",
+        created.reference.promise_id
+    );
+    let proposal = json!({"kind":"proposal","operation_id":"device_proposal",
+        "repository_id":REPO,"original_request":"Keep settings.",
+        "commitment":"Settings persist.",
+        "criteria":[{"id":"settings","text":"Settings persist.","evidence_requirements":[]}],
+        "constraints":[]});
+    let report = json!({"kind":"report","operation_id":"device_report",
+        "promise_id":created.reference.promise_id,
+        "promise_version":created.reference.version,
+        "promise_digest":created.reference.digest,
+        "repository_id":REPO,"summary":"Caller-observed concern; not verified evidence."});
+    assert_eq!(env.get(&show, &secret).await.0, 200);
+    for body in [&proposal, &report] {
+        assert_eq!(
+            env.call(
+                &env.hub,
+                Method::POST,
+                "/v1/hub/workspace/promises/inputs",
+                Some(&secret),
+                Some(body.clone()),
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    let mut wrong_key = proposal.clone();
+    wrong_key["operation_id"] = json!("device_wrong_key");
+    wrong_key["repository_id"] = json!("acme/other");
+    assert_eq!(
+        env.call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/workspace/promises/inputs",
+            Some(&secret),
+            Some(wrong_key),
+        )
+        .await
+        .0,
+        404
+    );
+
+    env.connect_repo("acme/rebound", REPO_ID + 1, ALICE);
+    env.workspace = Some(device_promise_workspace(&env, REPO_ID + 1));
+    env.hub = env.serve("").await;
+    assert_eq!(env.get(&show, &secret).await.0, 404);
+    for body in [&proposal, &report] {
+        assert_eq!(
+            env.call(
+                &env.hub,
+                Method::POST,
+                "/v1/hub/workspace/promises/inputs",
+                Some(&secret),
+                Some(body.clone()),
+            )
+            .await
+            .0,
+            404
+        );
+    }
+
+    env.workspace = Some(device_promise_workspace(&env, REPO_ID));
+    env.hub = env.serve("").await;
+    assert_eq!(env.get(&show, &secret).await.0, 200);
+    let database = env.dir.path().join("hub.sqlite");
+    let input_count = || {
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM hub_promise_inputs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let before_revoke = input_count();
+    assert_eq!(
+        env.delete(&format!("/v1/hub/device/tokens/{token_id}"), &device)
+            .await,
+        204
+    );
+    assert_eq!(env.get(&show, &secret).await.0, 401);
+    for body in [&proposal, &report] {
+        assert_eq!(
+            env.call(
+                &env.hub,
+                Method::POST,
+                "/v1/hub/workspace/promises/inputs",
+                Some(&secret),
+                Some(body.clone()),
+            )
+            .await
+            .0,
+            401
+        );
+    }
+    assert_eq!(input_count(), before_revoke);
 }
 
 async fn renewal_rechecks_the_role(provider: &'static str) {
@@ -1017,6 +1206,51 @@ fn context(reply: &Value) -> String {
         .to_owned()
 }
 
+/// Connecting before any sign-in signs in on the way; the token still comes through the computer,
+/// so revoking the computer stops this agent too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let (hub, root) = (env.hub.clone(), machine.root());
+    let (ok, _, stderr) = machine.run(&[
+        "--no-telemetry",
+        "client",
+        "connect",
+        "--hub",
+        &hub,
+        "--provider",
+        "github",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    let expires = machine.connection()["owned_token_expires_at"]
+        .as_i64()
+        .unwrap();
+    assert!(expires <= unix_now() + 24 * 60 * 60 + 60, "{expires}");
+    let agent = machine.token();
+    assert_eq!(env.whoami(&agent).await, 200);
+    let (session, _, desktop) = env.sign_in(ALICE, "desktop").await;
+    let (_, list) = env.get("/v1/hub/devices", &session).await;
+    let laptop = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] != json!(desktop))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        env.delete(&format!("/v1/hub/devices/{laptop}"), &session)
+            .await,
+        204
+    );
+    assert_eq!(env.whoami(&agent).await, 401);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     let env = Env::start("github").await;
@@ -1445,11 +1679,11 @@ fn set_cookie(response: &reqwest::Response, name: &str) -> Option<String> {
 }
 
 /// Runs a web-page sign-in for `user` up to the Hub's answer to the forge's callback.
-async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
+async fn callback_for(env: &Env, user: i64, purpose: &str) -> reqwest::Response {
     env.fake.lock().unwrap().approve = user;
     let http = browser();
     let start = http
-        .get(format!("{}/v1/hub/login/github?web=1", env.hub))
+        .get(format!("{}/v1/hub/login/github?{purpose}=1", env.hub))
         .send()
         .await
         .unwrap();
@@ -1469,6 +1703,10 @@ async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
         .send()
         .await
         .unwrap()
+}
+
+async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
+    callback_for(env, user, "web").await
 }
 
 /// Signs `user` in to the Hub's web pages; returns the session cookie's value.
@@ -1753,5 +1991,163 @@ async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
         refusals
             .iter()
             .any(|r| (r.reason.as_str(), r.via.as_str()) == ("insufficient_role", "web_read_token"))
+    );
+}
+
+#[tokio::test]
+async fn web_read_tokens_cannot_cross_workspace_authentication_and_hub_sign_out_keeps_workspace() {
+    let mut env = Env::start("github").await;
+    env.workspace = Some(device_promise_workspace(&env, REPO_ID));
+    env.hub = env.serve("").await;
+    let hub_cookie = web_sign_in(&env, ALICE).await;
+    let (_, hub_session) =
+        with_cookie(&env.hub, Method::GET, "/v1/hub/session", &hub_cookie, None).await;
+    let hub_csrf = hub_session["csrf_token"].as_str().unwrap();
+    let (status, minted) = web_read_token(&env, &hub_cookie, Some(hub_csrf), REPO).await;
+    assert_eq!(status, 201, "{minted}");
+    let web_token = minted["token"].as_str().unwrap();
+
+    let workspace_done = callback_for(&env, ALICE, "workspace").await;
+    assert_eq!(workspace_done.status(), 302);
+    let workspace_cookie = set_cookie(&workspace_done, "__Host-agentscm_workspace").unwrap();
+    let workspace_get = |path: &str, bearer: Option<&str>| {
+        let mut request = env.http.get(format!("{}{path}", env.hub));
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        } else {
+            request = request.header(
+                header::COOKIE,
+                format!("__Host-agentscm_workspace={workspace_cookie}"),
+            );
+        }
+        request
+    };
+    let owner = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == ALICE)
+        .unwrap();
+    let admission = PromiseRepositoryAdmissionV1 {
+        repository_id: REPO.into(),
+        forge: Some(PromiseForgeAdmissionV1 {
+            provider: "github".into(),
+            host: env.base.trim_start_matches("http://").into(),
+            forge_repository_id: REPO_ID,
+        }),
+        native_repository_ids: vec![],
+    };
+    let created = env.store.promise_create(
+        "device-promise-workspace", &owner.id,
+        &PromiseCreateV1 {
+            operation_id: "web_auth_boundary".into(),
+            expected_admissions_digest: admissions_digest("device-promise-workspace", std::slice::from_ref(&admission)).unwrap(),
+            definition: serde_json::from_value(json!({
+                "original_request":"Keep customer settings.",
+                "commitment":"Existing settings persist.",
+                "criteria":[{"id":"settings","text":"Settings persist.","evidence_requirements":[]}],
+                "constraints":[],
+                "repositories":[{"repository_id":REPO,"relevance":"Settings source."}]
+            })).unwrap(),
+        }, &[admission], unix_now(),
+    ).unwrap();
+    let id = created.reference.promise_id;
+    let paths = [
+        "/v1/hub/workspace/promises".to_owned(),
+        format!("/v1/hub/workspace/promises/{id}"),
+        format!("/v1/hub/workspace/promises/{id}/history"),
+    ];
+    let (_, ordinary, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 1800, true)
+            .unwrap();
+    let (_, legacy, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "hub-web", REPO, REPO_ID, 1800, true)
+            .unwrap();
+    for path in &paths {
+        assert_eq!(
+            workspace_get(path, Some(web_token))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "{path}"
+        );
+        assert_eq!(
+            workspace_get(path, Some(legacy.expose()))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "{path}"
+        );
+        assert_eq!(
+            workspace_get(path, Some(ordinary.expose()))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200,
+            "{path}"
+        );
+        assert_eq!(
+            workspace_get(path, None).send().await.unwrap().status(),
+            200,
+            "{path}"
+        );
+    }
+    assert_eq!(env.get("/v1/hub/whoami", web_token).await.0, 200);
+    for token in [web_token, legacy.expose()] {
+        let (status, reply) = env
+            .call(
+                &env.hub,
+                Method::POST,
+                "/mcp",
+                Some(token),
+                Some(json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"agentscm_promises_list","arguments":{}}
+                })),
+            )
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+    }
+
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::DELETE,
+            "/v1/hub/session",
+            &hub_cookie,
+            Some(hub_csrf)
+        )
+        .await
+        .0,
+        204
+    );
+    assert_eq!(
+        with_cookie(&env.hub, Method::GET, "/v1/hub/session", &hub_cookie, None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        workspace_get("/v1/hub/workspace/session", None)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        workspace_get(&paths[0], None)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
     );
 }

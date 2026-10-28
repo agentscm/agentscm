@@ -12,6 +12,7 @@ import { changeRecordHref, changeRecordIdFromHash } from './pages/ChangeRecord.t
 import { routeFromHash as workflowRouteFromHash, runHref as workflowRunHref } from './pages/Workflows.tsx'
 import { workspaceRoute, workspaceRunHref } from './pages/Workspace.tsx'
 import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
+import { promiseHref, promiseIdFromHash } from './promises.ts'
 import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
 import { Icon, Tip, agentLabel, relative } from './ui.tsx'
 import type { Refusal } from './refusal.ts'
@@ -70,6 +71,7 @@ interface ChromeState {
   sections: SectionDef[]
   section: Section
   statuses: TabStatuses
+  hubSignedOut: boolean
 }
 const ChromeContext = createContext<ChromeState | null>(null)
 
@@ -90,12 +92,22 @@ function useHash(): string {
 export function SectionTabs({ label }: { label?: string }) {
   const chrome = useContext(ChromeContext)
   const hash = useHash()
-  if (!chrome) return null
+  const strip = useRef<HTMLElement>(null)
+  // On a phone the strip scrolls sideways: keep the open tab in view instead of cut off at the edge.
+  useLayoutEffect(() => {
+    const s = strip.current
+    const on = s?.querySelector('[aria-current="page"]')
+    if (!s || !on) return
+    const a = s.getBoundingClientRect()
+    const b = on.getBoundingClientRect()
+    s.scrollLeft += b.left - a.left - (a.width - b.width) / 2
+  }, [chrome?.section, hash])
+  if (!chrome || chrome.hubSignedOut) return null
   const tabs = tabsFor(chrome.sections, chrome.section, hash)
   if (tabs.length === 0) return null
   const nav = chrome.sections.find((s) => s.key === chrome.section)?.nav
   return (
-    <nav className="htabs" data-tour="tabs" aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
+    <nav ref={strip} className="htabs" data-tour="tabs" aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
       {tabs.map((t) => {
         const st = chrome.statuses[t.key]
         return (
@@ -224,7 +236,7 @@ function WebRepoSwitcher({ repo, web, onSignOut }: { repo: string; web: WebChoic
           <div className="pop-sep" />
           <button type="button" role="menuitem" className="pop-item" onClick={onSignOut}>
             <Icon name="box-arrow-right" />
-            <span className="pop-main">Sign out of this browser<span className="pop-sub">Your computers stay signed in</span></span>
+            <span className="pop-main">Sign out of Hub pages<span className="pop-sub">Workspace access and computers stay signed in</span></span>
           </button>
         </div>
       )}
@@ -400,7 +412,7 @@ function AccountMenu({ data, onForget, web }: { data: HubData; onForget: () => v
           <button type="button" role="menuitem" className="pop-item pop-danger" onClick={onForget}>
             <Icon name="box-arrow-right" />
             {web ? (
-              <span className="pop-main">Sign out of this browser<span className="pop-sub">Your computers stay signed in.</span></span>
+              <span className="pop-main">Sign out of Hub pages<span className="pop-sub">Workspace access and computers stay signed in.</span></span>
             ) : (
               <span className="pop-main">Forget token<span className="pop-sub">The hub still accepts it until it expires or is revoked.</span></span>
             )}
@@ -624,7 +636,7 @@ function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer
           </div>
         </nav>
         <div className="side-foot">
-          <p className="side-foot-note"><Icon name="eye" /> Read-only. Opening a page never changes anything for your agents.</p>
+          <p className="side-foot-note"><Icon name="eye" /> Opening a page never changes anything for your agents.</p>
           <Tip text={collapsed ? 'Expand the sidebar' : 'Show icons only'} placement="right">
             <button type="button" className="side-collapse" onClick={onCollapse} aria-pressed={collapsed} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
               <Icon name={collapsed ? 'layout-sidebar-inset' : 'layout-sidebar'} />
@@ -684,6 +696,9 @@ export function crumbsFor(hash: string, section: SectionDef, overview: WorkOverv
   } else if (section.key === 'landed') {
     const id = landedIdFromHash(hash)
     if (id) out.push({ label: `Change ${id.slice(0, 12)}…`, href: landedHref(id), mono: true })
+  } else if (section.key === 'promises') {
+    const id = promiseIdFromHash(hash)
+    if (id) out.push({ label: `Promise ${id.slice(0, 12)}…`, href: promiseHref(id), mono: true })
   } else if (section.key === 'skills') {
     const route = skillsRoute(hash)
     if (route.kind !== 'library') out.push({ label: 'Runs', href: skillRunsHref })
@@ -725,13 +740,14 @@ function Breadcrumbs({ section, overview }: { section: SectionDef; overview: Wor
   )
 }
 
-export function AppChrome({ logo, token, repo, web, nav, sections, section, badges, statuses, data, d, overview, pref, onPref, density, onDensity, onForget, navigationBlocked = false, collapsed, onCollapsed, children }: {
+export function AppChrome({ logo, token, repo, web, hubSignedOut = false, nav, sections, section, badges, statuses, data, d, overview, pref, onPref, density, onDensity, onForget, navigationBlocked = false, collapsed, onCollapsed, children }: {
   logo: ReactNode
   /** The Hub sign-in; on this computer's own page, its connection credential. */
   token: string
   repo: string
   /** Set when the page was opened on a web sign-in rather than a pasted token. */
   web?: WebChoice
+  hubSignedOut?: boolean
   nav: NavDef[]
   sections: SectionDef[]
   section: Section
@@ -776,6 +792,24 @@ export function AppChrome({ logo, token, repo, web, nav, sections, section, badg
     }
     document.getElementById('main')?.focus({ preventScroll: true })
   }, [section])
+  // A box anchor (#box-contested) scrolls to its box once it renders: the page's data may still be loading.
+  useEffect(() => {
+    const id = /^#(box-[a-z-]+)$/.exec(window.location.hash)?.[1]
+    if (!id) return
+    const go = () => {
+      const el = document.getElementById(id)
+      el?.scrollIntoView({ block: 'start' })
+      return !!el
+    }
+    if (go()) return
+    const watch = new MutationObserver(() => go() && watch.disconnect())
+    watch.observe(document.body, { childList: true, subtree: true })
+    const stop = window.setTimeout(() => watch.disconnect(), 10_000)
+    return () => {
+      watch.disconnect()
+      window.clearTimeout(stop)
+    }
+  }, [section])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const typing = e.target instanceof HTMLElement && (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) || !loadSingleKeys()
@@ -805,11 +839,11 @@ export function AppChrome({ logo, token, repo, web, nav, sections, section, badg
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform)
   const current = sections.find((s) => s.key === section) ?? sections[0]!
   const inbox = badges.inbox
-  const chrome = useMemo(() => ({ sections, section, statuses }), [sections, section, statuses])
+  const chrome = useMemo(() => ({ sections, section, statuses, hubSignedOut }), [sections, section, statuses, hubSignedOut])
 
   return (
     <ChromeContext.Provider value={chrome}>
-      <div className={`app-shell${collapsed ? ' rail-compact' : ''}`}>
+      <div className={`app-shell${collapsed ? ' rail-compact' : ''}${hubSignedOut ? ' hub-signed-out' : ''}`}>
         <a href="#main" className="skip-link" onClick={(e) => {
           e.preventDefault()
           document.getElementById('main')?.focus()
@@ -817,21 +851,21 @@ export function AppChrome({ logo, token, repo, web, nav, sections, section, badg
           Skip to content
         </a>
         <header className="topbar" data-tour="topbar">
-          <button ref={burger} type="button" data-tour="menu" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
+          {!hubSignedOut && <button ref={burger} type="button" data-tour="menu" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
             <Icon name={drawer ? 'x-lg' : 'list'} />
-          </button>
+          </button>}
           <a href="#home" className="topbar-logo" aria-label="AgentSCM Hub home">
             {logo}
           </a>
-          {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} navigationBlocked={navigationBlocked} /> : web ? <WebRepoSwitcher repo={repo} web={web} onSignOut={onForget} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
+          {hubSignedOut ? <a href="#home" className="btn btn-link">Back to Hub</a> : isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} navigationBlocked={navigationBlocked} /> : web ? <WebRepoSwitcher repo={repo} web={web} onSignOut={onForget} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
 
-          <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
+          {!hubSignedOut && <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
             <Icon name="search" />
             <span className="search-text">Search agents, files, work…</span>
             <kbd>{isMac ? '⌘' : 'Ctrl'} K</kbd>
-          </button>
+          </button>}
 
-          <div className="topbar-right">
+          {!hubSignedOut && <div className="topbar-right">
             <Tip text={healthTip} placement="bottom">
               <a href="#health" data-tour="live" className={`health-chip${healthOk ? '' : ' is-bad'}`} aria-label={healthTip}>
                 <span className="live-dot" aria-hidden="true" />
@@ -847,16 +881,16 @@ export function AppChrome({ logo, token, repo, web, nav, sections, section, badg
             </Tip>
             <ViewMenu pref={pref} onPref={onPref} density={density} onDensity={onDensity} />
             <AccountMenu data={data} onForget={onForget} web={!!web} />
-          </div>
+          </div>}
         </header>
-        <SideNav nav={nav} sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} />
+        <div hidden={hubSignedOut}><SideNav nav={nav} sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} /></div>
         <div className="content">
           <Breadcrumbs section={current} overview={overview} />
           <main className="main" id="main" tabIndex={-1} data-tour="main" data-section={current.key}>
             {children}
           </main>
         </div>
-        {palette && <CommandPalette onClose={() => setPalette(false)} sections={sections} section={section} d={d} overview={overview} />}
+        {palette && !hubSignedOut && <CommandPalette onClose={() => setPalette(false)} sections={sections} section={section} d={d} overview={overview} />}
       </div>
     </ChromeContext.Provider>
   )

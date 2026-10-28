@@ -756,7 +756,8 @@ pub(crate) fn when(epoch: i64, now: i64) -> String {
 fn civil(epoch: i64) -> (i64, i64, i64, i64) {
     #[cfg(unix)]
     {
-        let time = epoch as libc::time_t;
+        // Inferred from localtime_r: naming `libc::time_t` is deprecated on musl, a deny-level warning.
+        let time = epoch as _;
         // SAFETY: `tm` is plain integers plus a `tm_zone` pointer that localtime_r sets, so
         // all-zero is a valid value; localtime_r writes only that `tm` and returns null on failure.
         let local = unsafe {
@@ -945,6 +946,32 @@ async fn whoami(hub: Option<&str>) -> Result<()> {
         println!("{}", row.hub);
         println!("  login: {}", login.as_deref().unwrap_or("not signed in"));
         println!("  computer: {}", row.state());
+        let health = match call(
+            &client,
+            Method::GET,
+            &format!("{}/v1/hub/health", row.hub),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok((200, health)) => health,
+            _ => json!({}),
+        };
+        let hub_version = health["version"].as_str().map(clean);
+        let mine = build_label(env!("CARGO_PKG_VERSION"), agentscm::BUILD_COMMIT);
+        match &hub_version {
+            Some(version) => println!(
+                "  versions: Hub {}, this agentscm {mine}",
+                build_label(version, &clean(health["commit"].as_str().unwrap_or("")))
+            ),
+            None => {
+                println!("  versions: Hub unknown (it does not report one), this agentscm {mine}")
+            }
+        }
+        if let Some(note) = hub_version.as_deref().and_then(version_note) {
+            println!("  {note}");
+        }
         let repos: Vec<_> = connections
             .iter()
             .filter(|connection| connection.hub == row.hub)
@@ -960,6 +987,29 @@ async fn whoami(hub: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// "0.1.0-alpha.7 (3f9c2a1b4d5e)", or the version alone when the commit is unknown.
+fn build_label(version: &str, commit: &str) -> String {
+    match commit.get(..12) {
+        Some(short) => format!("{version} ({short})"),
+        None => version.to_owned(),
+    }
+}
+
+/// What to do when this program's version differs from the Hub's; nothing for equal or
+/// unparsable versions.
+fn version_note(hub: &str) -> Option<&'static str> {
+    let mine = semver::Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+    match semver::Version::parse(hub).ok()?.cmp(&mine) {
+        std::cmp::Ordering::Greater => Some(
+            "This agentscm is older than the Hub, so commands its docs describe may be missing: update with npx agentscm@latest.",
+        ),
+        std::cmp::Ordering::Less => Some(
+            "The Hub is older than this agentscm, so it may refuse newer requests until its operator updates it.",
+        ),
+        std::cmp::Ordering::Equal => None,
+    }
 }
 
 /// A computer credential the Hub no longer accepts is forgotten, so this computer shows as
@@ -2393,6 +2443,34 @@ mod tests {
         ] {
             assert!(!opens_page(bad, "github.com"), "{bad}");
         }
+    }
+
+    #[test]
+    fn versions_are_compared_with_the_hubs() {
+        assert_eq!(build_label("1.2.3", ""), "1.2.3");
+        assert_eq!(
+            build_label("1.2.3", &"a".repeat(40)),
+            "1.2.3 (aaaaaaaaaaaa)"
+        );
+        assert_eq!(version_note(env!("CARGO_PKG_VERSION")), None);
+        assert!(
+            version_note("999.0.0")
+                .unwrap()
+                .contains("older than the Hub")
+        );
+        assert!(
+            version_note("0.0.1")
+                .unwrap()
+                .starts_with("The Hub is older")
+        );
+        // Pre-releases order numerically, and a Hub that sends junk gets no advice.
+        let mine = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        if !mine.pre.is_empty() {
+            assert!(
+                version_note(&format!("{}.{}.{}", mine.major, mine.minor, mine.patch)).is_some()
+            );
+        }
+        assert_eq!(version_note("not a version"), None);
     }
 
     #[test]

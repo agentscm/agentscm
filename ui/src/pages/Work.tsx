@@ -137,7 +137,7 @@ export function LaneBar({ item, fresh }: { item: WorkItem; fresh: boolean }) {
           </Tip>
         </li>
         <li className="lb-seg">
-          <Tip text="Not reported finished yet. A finished report still doesn’t prove review or landing." className="lb-tip">
+          <Tip text="Not reported finished yet. Even a finished report doesn’t mean it was reviewed or merged." className="lb-tip">
             <a className="lb-hit" href={href}>
               <Icon name="flag" />
               <span className="lb-label">Finished</span>
@@ -434,7 +434,7 @@ function RequestQueue({ token, search }: { token: string; search: string }) {
       id="box-requests"
       icon="chat-left-dots"
       title="Directed requests"
-      explain="When two tasks declare overlapping scope, an agent can send the other lead a request: split the scope, join, or hand over. Agents receive and answer these through MCP or HTTP; this page only reads them."
+      explain="When two tasks plan to touch the same files, one agent can ask the other to split the work, join, or hand over. Agents send and answer these themselves; this page only shows them."
       count={load.kind === 'ready' ? load.value.requests.filter((r) => !hidden.has(requestHideKey(r))).length : undefined}
       actions={
         <>
@@ -533,7 +533,7 @@ export function Coordination({ token, overview, search }: { token: string; overv
         tone={overlaps.length ? 'bad' : 'ok'}
         title="Detected scope overlaps"
         count={overlaps.length}
-        explain="The hub compares the paths each task declared. An overlap is a signal to talk, not proof the code conflicts, and detecting it does not send a request."
+        explain="The hub compares the files each task said it would touch. An overlap means talk first. It doesn’t mean the code conflicts, and no request is sent."
       >
         {!overview.overlaps_complete && <Notice title="Overlap list is incomplete">The current-work limit was reached, so more overlaps may exist. An empty list is not an all-clear.</Notice>}
         {overlaps.length === 0 ? (
@@ -547,7 +547,7 @@ export function Coordination({ token, overview, search }: { token: string; overv
         )}
       </Box>
       <div className="grid-2">
-        <Box icon="exclamation-triangle" tone={attention.some((i) => !signals.isHidden(i)) ? 'warn' : 'muted'} title="Other attention signals" count={attention.length - (signals.show ? signals.count : 0)} explain="Tasks whose lead has not checked in recently, or that declared no scope. These limit how confident any overlap check can be. Anything untouched for a day can be hidden in this browser.">
+        <Box icon="exclamation-triangle" tone={attention.some((i) => !signals.isHidden(i)) ? 'warn' : 'muted'} title="Other attention signals" count={attention.length - (signals.show ? signals.count : 0)} explain="Tasks whose agent hasn’t checked in lately, or that never said which files they’d touch. Overlap checks can’t see these. You can hide an item once it’s a day old.">
           {attention.length === 0 ? (
             <Empty icon="check2" title="Nothing else needs attention" />
           ) : (
@@ -604,7 +604,7 @@ function Finished({ overview, search }: { overview: WorkOverview; search: string
             <strong>last {spanText(overview.until - overview.recent_since)}</strong>
           </Tip>
         </span>
-        <Explain text="Finished means the agent reported it finished. It does not confirm verification, review, or merge." />
+        <Explain text="Finished means the agent said so. It may not be verified, reviewed or merged yet." />
       </div>
       {!overview.recent_complete && <Notice title="This window is incomplete">{overview.history_retention_gap ? 'Some outcomes in this window were compacted from retained history.' : 'The overview limit was reached; more completions exist.'}</Notice>}
       {visible.length === 0 ? (
@@ -942,7 +942,6 @@ export function InboxPage({ token, overview }: { token: string; overview: Poll<W
   const requests = usePoll((signal) => fetchCoordination(token, signal, { limit: 10, activeOnly: true }), 15_000, `inbox|${token}`)
   const hidden = useHidden()
   const open = requests.kind === 'ready' ? requests.value.requests.filter((r) => pending(r) && !hidden.has(requestHideKey(r))) : []
-  const quiet = ov?.current.filter((i) => (i.claim_status !== 'active' || i.scope.length === 0) && !hidden.has(signalHideKey(i))).length ?? 0
   return (
     <div className="page">
       <div className="answer" data-tour="answer">
@@ -953,7 +952,7 @@ export function InboxPage({ token, overview }: { token: string; overview: Poll<W
               ov.overlaps_complete ? 'No two tasks plan to touch the same files, and no request is waiting.' : 'No overlap in this partial snapshot. An empty list is not an all-clear.'
             ) : (
               <>
-                {ov.overlaps.length > 0 && <><a className="jump tone-bad" href="#box-overlaps">{plural(ov.overlaps.length, 'overlap')}</a> {ov.overlaps.length === 1 ? 'needs' : 'need'} a conversation. </>}
+                {ov.overlaps.length > 0 && <><b>{plural(ov.overlaps.length, 'overlap')}</b> {ov.overlaps.length === 1 ? 'needs' : 'need'} a conversation. </>}
                 {open.length > 0 && <><b>{plural(open.length, 'request')}</b> {open.length === 1 ? 'is' : 'are'} waiting on another lead.</>}
               </>
             )}
@@ -962,19 +961,6 @@ export function InboxPage({ token, overview }: { token: string; overview: Poll<W
           <Skeleton rows={1} />
         )}
       </div>
-      {ov && (requests.kind === 'ready' || quiet > 0) && (
-        <div className="ib-progress" aria-label="Where the conversations stand">
-          <ul className="ib-bar" aria-hidden="true">
-            {ov.overlaps.map((o) => <li key={`${o.left.id}-${o.right.id}`} className="ib-seg ib-bad" />)}
-            {open.map((r) => <li key={r.id} className="ib-seg ib-wait" />)}
-            {Array.from({ length: quiet }, (_, i) => <li key={`q${i}`} className="ib-seg ib-team" />)}
-            {requests.kind === 'ready' && requests.value.requests.filter((r) => !pending(r)).map((r) => <li key={r.id} className="ib-seg ib-done" />)}
-          </ul>
-          <p>
-            {plural(ov.overlaps.length, 'overlap')} · {plural(open.length, 'open request')} · {plural(quiet, 'other signal')}
-          </p>
-        </div>
-      )}
       {overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
           {overview.message}

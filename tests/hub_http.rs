@@ -1,6 +1,8 @@
 #[path = "common/hub_pg.rs"]
 mod hub_pg;
 
+#[cfg(unix)]
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -107,6 +109,12 @@ async fn health_reports_storage() {
     assert_eq!(
         (&health["status"], &health["storage"]),
         (&json!("ok"), &json!("sqlite"))
+    );
+    // Which build answers, so a client can tell it is older than the Hub.
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        health["commit"].as_str().unwrap_or(""),
+        env!("AGENTSCM_BUILD_COMMIT")
     );
     // Counters of this process: numbers only.
     let counters = health["coordination"].as_object().unwrap();
@@ -234,6 +242,335 @@ fn wait_for(deadline: Duration, mut done: impl FnMut() -> bool) {
         assert!(start.elapsed() < deadline, "timed out");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(unix)]
+fn slack_hub_command(dir: &TempDir, slack_file: Option<&OsStr>) -> Command {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+    command
+        .process_group(0)
+        .env_clear()
+        .env(
+            "AGENTSCM_DATABASE_URL",
+            format!("sqlite://{}", dir.path().join("hub.sqlite").display()),
+        )
+        .args(["hub", "serve", "--bind", "127.0.0.1:0", "--objects"])
+        .arg(dir.path().join("objects"))
+        .arg("--secrets")
+        .arg(dir.path().join("secrets"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(value) = slack_file {
+        command.env("AGENTSCM_SLACK_FILE", value);
+    }
+    command
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: waitid initializes this writable siginfo_t. WNOWAIT retains
+        // the child's PID reservation until all group signals are complete.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(info.si_signo == libc::SIGCHLD);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_owned_process_group(child: &mut Child) -> std::io::Result<()> {
+    // Refuse ECHILD before signalling: a reaped PID may have been reused.
+    child_exited_without_reaping(child)?;
+    loop {
+        // SAFETY: this unreaped child leads the fresh group created at spawn.
+        if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) && child_exited_without_reaping(child)? {
+            // Darwin reports EPERM for a group containing only its zombie leader.
+            let mut members = [0 as libc::pid_t; 2];
+            // SAFETY: two writable slots distinguish the sole owned leader from
+            // a group with descendants; no unrelated PIDs are scanned.
+            let count = unsafe {
+                libc::proc_listpgrppids(
+                    child.id() as libc::pid_t,
+                    members.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&members) as libc::c_int,
+                )
+            };
+            if count == 1 && members[0] == child.id() as libc::pid_t {
+                break;
+            }
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    child.wait()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bound_address(
+    server: &mut Server,
+    stderr: std::process::ChildStderr,
+    timeout: Duration,
+) -> Result<
+    (
+        SocketAddr,
+        BufReader<std::io::Take<std::process::ChildStderr>>,
+        String,
+    ),
+    String,
+> {
+    const OUTPUT_LIMIT: usize = 64 * 1024;
+
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut stderr = BufReader::new(stderr.take((OUTPUT_LIMIT + 1) as u64));
+        let mut seen = String::new();
+        let result = loop {
+            let mut line = String::new();
+            match stderr.read_line(&mut line) {
+                Ok(0) => break Err(format!("hub exited before binding: {seen}")),
+                Ok(_) if seen.len() + line.len() > OUTPUT_LIMIT => {
+                    break Err(format!(
+                        "hub startup output exceeded {OUTPUT_LIMIT} bytes: {seen}"
+                    ));
+                }
+                Ok(_) => {
+                    seen.push_str(&line);
+                    if let Some(rest) = line.strip_prefix("hub listening on ") {
+                        break rest
+                            .split(' ')
+                            .next()
+                            .ok_or_else(|| format!("hub printed an empty address: {seen}"))
+                            .and_then(|address| {
+                                address.parse().map_err(|error| {
+                                    format!("invalid hub address: {error}: {seen}")
+                                })
+                            })
+                            .map(|address| (address, stderr, seen));
+                    }
+                }
+                Err(error) => break Err(format!("reading hub startup output failed: {error}")),
+            }
+        };
+        let _ = send.send(result);
+    });
+
+    let result = match receive.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_owned_process_group(&mut server.0).map_err(|error| error.to_string())?;
+            let _ = reader.join();
+            return Err(format!(
+                "hub did not print its bound address within {timeout:?}"
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            kill_owned_process_group(&mut server.0).map_err(|error| error.to_string())?;
+            let _ = reader.join();
+            return Err("hub startup output reader stopped unexpectedly".into());
+        }
+    };
+    reader
+        .join()
+        .map_err(|_| "hub startup output reader panicked".to_owned())?;
+    if result.is_err() {
+        kill_owned_process_group(&mut server.0).map_err(|error| error.to_string())?;
+    }
+    result
+}
+
+#[cfg(unix)]
+fn try_http_status(address: SocketAddr, path: &str) -> Option<u16> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    raw.split_once("\r\n")?.0.split(' ').nth(1)?.parse().ok()
+}
+
+#[cfg(unix)]
+fn assert_slack_setting_reaches_health(slack_file: Option<&OsStr>) {
+    let dir = TempDir::new().unwrap();
+    let mut server = Server(slack_hub_command(&dir, slack_file).spawn().unwrap());
+    let stderr = server.0.stderr.take().unwrap();
+    let (address, _stderr, seen) = bound_address(&mut server, stderr, Duration::from_secs(10))
+        .unwrap_or_else(|error| {
+            panic!("{error}");
+        });
+    wait_for(Duration::from_secs(10), || {
+        assert!(
+            !child_exited_without_reaping(&server.0).unwrap(),
+            "hub exited before health: {seen}"
+        );
+        try_http_status(address, "/v1/hub/health") == Some(200)
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_address_deadline_kills_and_reaps_a_silent_child() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("/bin/sh");
+    command
+        .process_group(0)
+        .args(["-c", "exec /bin/sleep 120"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = Server(command.spawn().unwrap());
+    let stderr = server.0.stderr.take().unwrap();
+    let error = bound_address(&mut server, stderr, Duration::from_millis(100)).unwrap_err();
+    assert!(error.contains("within 100ms"), "{error}");
+    assert!(server.0.try_wait().unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_address_exited_leader_cleans_up_inherited_pipe() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("late-marker");
+    let mut child = Command::new("/bin/sh");
+    child
+        .process_group(0)
+        .env("MARKER", &marker)
+        .args([
+            "-c",
+            "(/bin/sleep 0.3; printf survived > \"$MARKER\") & exit 0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = Server(child.spawn().unwrap());
+    let stderr = server.0.stderr.take().unwrap();
+    let error = bound_address(&mut server, stderr, Duration::from_millis(100)).unwrap_err();
+    assert!(error.contains("within 100ms"), "{error}");
+    assert!(server.0.wait().unwrap().success());
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hub_reaped_leader_refuses_group_signal() {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        kill_owned_process_group(&mut child)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[cfg(unix)]
+fn assert_slack_setting_fails(slack_file: &OsStr) {
+    let dir = TempDir::new().unwrap();
+    let mut server = Server(slack_hub_command(&dir, Some(slack_file)).spawn().unwrap());
+    wait_for(Duration::from_secs(10), || {
+        child_exited_without_reaping(&server.0).unwrap()
+    });
+    kill_owned_process_group(&mut server.0).unwrap();
+    let status = server.0.wait().unwrap();
+    let mut stderr = String::new();
+    server
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .take(64 * 1024)
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.success(), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn absent_and_empty_slack_settings_start_the_hub() {
+    assert_slack_setting_reaches_health(None);
+    assert_slack_setting_reaches_health(Some(OsStr::new("")));
+}
+
+#[cfg(unix)]
+#[test]
+fn nonempty_invalid_slack_settings_still_fail_startup() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let files = TempDir::new().unwrap();
+    let missing = files.path().join("missing.json");
+    assert_slack_setting_fails(missing.as_os_str());
+
+    let malformed = files.path().join("malformed.json");
+    std::fs::write(&malformed, b"not json").unwrap();
+    std::fs::set_permissions(&malformed, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_slack_setting_fails(malformed.as_os_str());
+
+    for value in [OsStr::new("relative.json"), OsStr::new(" ")] {
+        assert_slack_setting_fails(value);
+    }
+
+    let unsafe_permissions = files.path().join("unsafe.json");
+    std::fs::write(&unsafe_permissions, b"{}").unwrap();
+    std::fs::set_permissions(&unsafe_permissions, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_slack_setting_fails(unsafe_permissions.as_os_str());
+
+    let symlink_path = files.path().join("symlink.json");
+    symlink(&malformed, &symlink_path).unwrap();
+    assert_slack_setting_fails(symlink_path.as_os_str());
+
+    // SAFETY: geteuid has no arguments, pointers, or mutable state requirements.
+    if unsafe { libc::geteuid() } != 0 {
+        let unreadable = files.path().join("unreadable.json");
+        std::fs::write(&unreadable, b"{}").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o200)).unwrap();
+        assert_slack_setting_fails(unreadable.as_os_str());
+    }
+
+    let mut non_unicode = files.path().as_os_str().as_encoded_bytes().to_vec();
+    non_unicode.extend_from_slice(b"/non-unicode-");
+    non_unicode.push(0xff);
+    assert_slack_setting_fails(&OsString::from_vec(non_unicode));
 }
 
 /// Serve `url` in a child process, check health and whoami, SIGTERM it and expect a clean exit.

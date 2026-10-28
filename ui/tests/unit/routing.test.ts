@@ -22,6 +22,8 @@ describe('sectionFromHash', () => {
     [`#work/${ID}`, 'work'],
     ['#work/finished', 'work'],
     ['#work/history', 'work'],
+    ['#promises', 'promises'],
+    ['#promises/prm_01', 'promises'],
     ['#work/coordination', 'inbox'],
     // History's other tabs by name, not the Finished tab.
     ['#work/files', 'explorer'],
@@ -37,6 +39,15 @@ describe('sectionFromHash', () => {
     // The current status page's links keep working.
     ['#coordination', 'home'],
     [`#coordination/work/${ID}`, 'work'],
+    // A box anchor opens the page that holds the box.
+    ['#box-needs', 'home'],
+    ['#box-contested', 'now'],
+    ['#box-prs', 'now'],
+    ['#box-map', 'now'],
+    ['#box-agents', 'team'],
+    ['#box-log', 'activity'],
+    ['#box-overlaps', 'inbox'],
+    ['#box-requests', 'inbox'],
     // Unknown or hostile hashes fall back to the dashboard.
     ['#nope', 'home'],
     ['#__proto__', 'home'],
@@ -93,6 +104,12 @@ describe('crumbsFor', () => {
   })
   it('other sections are a single crumb', () => {
     expect(crumbsFor('#health', section('health'), null)).toEqual([{ label: 'Hub', href: '#health', icon: 'heart-pulse' }])
+  })
+  it('promise detail keeps its opaque id in the breadcrumb', () => {
+    expect(crumbsFor('#promises/prm_01', section('promises'), null)).toEqual([
+      { label: 'Promises', href: '#promises', icon: 'journal-check' },
+      { label: 'Promise prm_01…', href: '#promises/prm_01', mono: true },
+    ])
   })
 })
 

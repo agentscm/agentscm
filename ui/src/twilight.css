@@ -327,6 +327,10 @@ kbd {
   border-color: var(--hub-rule-strong);
   padding-inline: 14px;
 }
+/* Keep Bootstrap's right padding for the caret, or a long value runs under it. */
+.form-select {
+  padding-inline-end: 2.25rem;
+}
 textarea.form-control {
   border-radius: 16px;
 }
@@ -397,6 +401,9 @@ textarea.form-control {
 }
 .app-shell.rail-compact {
   --side-w: 72px;
+}
+.app-shell.hub-signed-out {
+  --side-w: 0px;
 }
 .topbar {
   background: var(--frame);
@@ -732,17 +739,7 @@ textarea.form-control {
   max-width: 70ch;
   margin-top: 14px;
 }
-/* Links in the answer are its primary action: coral when they point at trouble, violet otherwise. */
-.jump {
-  font-weight: 500;
-  color: var(--hub-brand-ink);
-  text-decoration-thickness: 1.5px;
-  text-underline-offset: 6px;
-}
-.jump.tone-bad,
-.jump.tone-warn {
-  color: var(--coral);
-}
+
 .answer-next {
   border-radius: 999px;
   background: transparent;
@@ -801,20 +798,13 @@ textarea.form-control {
 .box-head .box-count ~ .box-actions {
   margin-left: 12px;
 }
+/* Narrow boxes put the actions on their own row (styles.css); they line up with the title there. */
+@container main (max-width: 600px) {
+  .box-head .box-count ~ .box-actions { margin-left: 0; }
+}
 .box-tone-bad .box-count {
   color: var(--coral);
   font-weight: 700;
-}
-.box-explain {
-  flex-basis: 100%;
-  margin: 2px 0 0;
-  font-size: 13px;
-  line-height: 1.45;
-  color: var(--hub-text-3);
-  max-width: 80ch;
-}
-:root[data-density='condensed'] .box-explain {
-  font-size: 12px;
 }
 .box-body {
   padding: var(--hub-pad-box);
@@ -1644,8 +1634,9 @@ textarea.form-control {
 .tile-people .avatar {
   box-shadow: 0 0 0 2px var(--hub-sunken);
 }
+/* A small overlap: any more and the next face covers two-letter initials like "CC". */
 .tile-people .avatar + .avatar {
-  margin-left: -6px;
+  margin-left: -3px;
 }
 :root[data-density='condensed'] .tile-people .avatar {
   width: 22px !important;
@@ -1844,42 +1835,6 @@ textarea.form-control {
 }
 .tally li.is-zero {
   color: var(--hub-text-3);
-}
-
-/* ---------- inbox: where the conversations stand, at a glance ---------- */
-.ib-progress {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 16px;
-  margin-top: calc(var(--hub-gap) * -0.4);
-}
-.ib-bar {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  gap: 3px;
-  flex: 0 1 260px;
-  min-width: 120px;
-}
-.ib-seg {
-  flex: 1;
-  height: 10px;
-  border-radius: 3px;
-  background: var(--hub-sunken);
-}
-.ib-seg:first-child { border-radius: 999px 3px 3px 999px; }
-.ib-seg:last-child { border-radius: 3px 999px 999px 3px; }
-.ib-seg:only-child { border-radius: 999px; }
-.ib-bad { background: var(--coral); }
-.ib-wait { background: var(--hub-warn-fill); }
-.ib-team { background: var(--hub-rule-strong); }
-.ib-done { background: var(--hub-brand-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hub-brand) 35%, transparent); }
-.ib-progress p {
-  margin: 0;
-  font-size: 13.5px;
-  color: var(--hub-text-2);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2475,6 +2430,11 @@ textarea.form-control {
   min-height: 100dvh;
   background: var(--frame);
 }
+.opening-inline {
+  min-height: 0;
+  gap: 12px;
+  padding: 24px 16px;
+}
 
 /* ---------- signed in: the one browser moment of setup, told on the frame ---------- */
 .done {
@@ -2623,6 +2583,10 @@ textarea.form-control {
 :root[data-density='condensed'] .brief {
   padding: 12px 16px 10px;
   gap: 8px;
+}
+/* Window and generation notices stack above the briefing text, each separated from the next. */
+.brief-body > .notice {
+  margin-bottom: 10px;
 }
 .brief-head {
   display: flex;
@@ -3020,4 +2984,14 @@ a.brief-cite:hover {
 .wl-sim-steps li,
 .wl-guidance li {
   align-items: baseline;
+}
+
+/* ---------- icon-only boxes: centre the glyph itself ----------
+   Bootstrap Icons nudge each glyph down 0.125em to sit on a text baseline, and the icon inherits the
+   text's line height. In a box that only holds an icon, both push the glyph off centre. */
+:is(.burger, .search-pill, .top-icon, .tour-trigger, .side-icon, .repo-mark, .attn-icon, .event-icon, .run-icon, .step-mark, .track-dot, .box-badge, .snap-dot, .lb-hit, .empty-icon) > .bi {
+  line-height: 1;
+}
+:is(.burger, .search-pill, .top-icon, .tour-trigger, .side-icon, .repo-mark, .attn-icon, .event-icon, .run-icon, .step-mark, .track-dot, .box-badge, .snap-dot, .lb-hit, .empty-icon) > .bi::before {
+  vertical-align: top;
 }

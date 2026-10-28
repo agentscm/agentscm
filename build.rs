@@ -1,6 +1,9 @@
 //! Discovers `src/hub/migrations/named/*.sqlite.sql` and the matching
 //! `*.pg.sql` pair. Adding a file is enough; the integer migration list stays
 //! untouched. A `-- requires: <name>` comment records a dependency.
+//!
+//! Also sets `AGENTSCM_BUILD_COMMIT`, the commit built (empty when unknown), and
+//! `AGENTSCM_INSTALL_VERSION`, the version in the file name quickstart installs.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,32 +12,57 @@ fn main() {
         eprintln!("hub named migrations: {error}");
         std::process::exit(1);
     }
+    install_version();
 }
 
-/// The version `--version` shows: the package version, plus `+<commit>` unless the commit is
-/// exactly the release tag, so a build from a branch says which commit it is.
+/// The commit is `AGENTSCM_BUILD_COMMIT` from the build environment (the Docker build has no
+/// `.git`), else Git's HEAD. The install version is the package version for a release build (the
+/// release workflow runs on the tag `v<version>`), else `<version>+<commit>`: every build from main
+/// carries the release's version, and a dev build must not take, or be refused, the release's
+/// file name. Without a commit, the plain version.
 fn install_version() {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    println!("cargo:rerun-if-env-changed=AGENTSCM_BUILD_COMMIT");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
             .output()
             .ok()
             .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
     };
-    let package = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let released = git(&["describe", "--exact-match", "--tags", "HEAD"])
-        .is_some_and(|tag| tag == format!("v{package}"));
-    let version = match git(&["rev-parse", "--short=9", "HEAD"]) {
-        Some(sha) if !released && !sha.is_empty() => format!("{package}+{sha}"),
-        _ => package,
+    // Rebuild when HEAD moves: HEAD itself, the branch it names, and packed refs.
+    let mut watched = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+    watched.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+    for name in watched {
+        if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", &name])
+            && Path::new(&path).exists()
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let release = std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag")
+        && std::env::var("GITHUB_REF_NAME").ok() == Some(format!("v{version}"));
+    let commit = std::env::var("AGENTSCM_BUILD_COMMIT")
+        .ok()
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .filter(|commit| commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|commit| commit.to_ascii_lowercase())
+        .unwrap_or_default();
+    let name = if commit.is_empty() || release {
+        version
+    } else {
+        format!("{version}+{}", &commit[..12])
     };
-    println!("cargo:rustc-env=AGENTSCM_INSTALL_VERSION={version}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rustc-env=AGENTSCM_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=AGENTSCM_INSTALL_VERSION={name}");
 }
 
 fn generate() -> Result<(), String> {
-    install_version();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
     let directory = manifest.join("src/hub/migrations/named");
     println!("cargo:rerun-if-changed={}", directory.display());

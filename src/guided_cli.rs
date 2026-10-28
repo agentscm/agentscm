@@ -379,6 +379,26 @@ pub fn run(data: &Path, command: WorkflowCommand) -> Result<Value> {
             expected_generation,
         } => {
             require_current(&authority, &s)?;
+            // Refuse before recording, so a checkpoint that cannot start never leaves the
+            // session pending and never discards an approval.
+            let status = Workspace::open(&s.workspace)?.status(&engine, 1)?;
+            if let Some(pending) = status.pending {
+                return Err(Error::Conflict(format!(
+                    "workspace operation {} needs workspace recover first",
+                    pending.operation_id
+                )));
+            }
+            if status.generation != expected_generation {
+                return Err(Error::Conflict(format!(
+                    "workspace generation is {}, expected {expected_generation}",
+                    status.generation
+                )));
+            }
+            if status.complete && status.changes.is_empty() {
+                return Err(Error::Invalid(
+                    "workspace has no changes to checkpoint".into(),
+                ));
+            }
             invalidate(&mut s);
             s.prepared_tip = None;
             s.pending = Some(Pending::Checkpoint {
@@ -740,7 +760,17 @@ fn finish(
             operation_id,
             generation,
         } => {
-            Workspace::open(&s.workspace)?.checkpoint(e, &operation_id, generation)?;
+            let mut w = Workspace::open(&s.workspace)?;
+            if let Err(error) = w.checkpoint(e, &operation_id, generation) {
+                // With no workspace operation in progress this checkpoint was refused before
+                // writing anything (a completed one replays successfully), so drop it rather
+                // than leave the session pending. A started one stays for resume.
+                if w.state()?.pending.is_none() {
+                    s.pending = None;
+                    journal.save(s)?;
+                }
+                return Err(error);
+            }
         }
         Pending::Update { expected, context } => {
             let current = a.change(&context.change)?;

@@ -26,6 +26,8 @@ pub mod narrative;
 pub mod onboarding;
 #[cfg(unix)]
 pub mod pipeline_rules;
+pub mod promise;
+mod promise_http;
 pub mod publish;
 pub mod session;
 pub mod skill_workflow;
@@ -350,6 +352,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(promise_http::routes())
         .merge(skills::routes())
         .merge(work_http::routes())
         .merge(intent::routes())

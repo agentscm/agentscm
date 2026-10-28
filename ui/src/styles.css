@@ -441,7 +441,10 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 .pop-item.is-current { align-items: center; background: var(--hub-brand-soft); }
 .pop-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .pop-main code { font-size: 0.82rem; color: var(--hub-text); }
-.pop-sub { font-size: 0.75rem; font-weight: 400; color: var(--hub-text-3); display: inline-flex; gap: 4px; align-items: center; }
+/* Block, not flex: a flex line would split text and a <code> into side-by-side columns. */
+.pop-sub { font-size: 0.75rem; font-weight: 400; color: var(--hub-text-3); display: block; }
+.pop-sub > .bi { margin-right: 4px; }
+.pop-sub code { white-space: nowrap; }
 .pop-check { color: var(--hub-brand); }
 .pop-note { margin: 6px 4px 4px; padding: 10px; display: flex; gap: 8px; font-size: 0.78rem; line-height: 1.45; color: var(--hub-text-2); background: var(--hub-sunken); border: 1px solid var(--hub-rule); border-radius: 10px; }
 .pop-note .bi { color: var(--hub-brand); margin-top: 1px; }
@@ -759,7 +762,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 
 /* The answer: question asked plainly, answered in one sentence */
 /* The answer: the page's question as a quiet heading, then one readable sentence. Weight, not size,
-   carries the facts (the .jump links); the sentence itself stays at reading weight. */
+   carries the facts; the sentence itself stays at reading weight. */
 .answer {
   padding: 0 2px var(--hub-answer-pad, 28px);
   margin-bottom: var(--hub-answer-gap, 8px);
@@ -842,23 +845,6 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   font-family: var(--bs-font-monospace);
   font-size: 0.86em;
   font-weight: 600;
-}
-.jump {
-  font-weight: 700;
-  text-decoration: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 4px;
-  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
-  color: var(--hub-brand-ink);
-}
-.jump:hover {
-  text-decoration-color: currentColor;
-}
-.jump.tone-bad {
-  color: var(--hub-bad);
-}
-.jump.tone-warn {
-  color: var(--hub-warn);
 }
 
 
@@ -1864,6 +1850,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 /* Workflows */
 .run-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   align-items: center;
   padding: var(--hub-row-y, 12px) 12px;
@@ -1887,8 +1874,9 @@ a.run-row:hover {
   place-items: center;
   flex: none;
 }
+/* A real basis, so a narrow row wraps its pills and actions below the text instead of squeezing it to a sliver. */
 .run-main {
-  flex: 1;
+  flex: 1 1 14rem;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -2029,9 +2017,19 @@ a.run-row:hover {
   grid-template-columns: minmax(0, 1.1fr) minmax(360px, 480px);
   gap: clamp(28px, 6vw, 96px);
   align-items: center;
-  padding: clamp(24px, 6vw, 88px);
+  --signin-pad: clamp(24px, 6vw, 88px);
+  padding: var(--signin-pad);
   max-width: 1280px;
   margin: 0 auto;
+}
+/* Centre the intro in the first screen, not the row, so a growing panel does not move it. */
+.signin-intro {
+  align-self: start;
+  min-height: calc(100dvh - 2 * var(--signin-pad));
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
 }
 .signin-intro h1 {
   font-size: clamp(2rem, 4vw, 3rem);
@@ -2095,6 +2093,7 @@ a.run-row:hover {
   max-width: 980px;
   margin: 0 auto;
   padding: 32px 16px;
+  container: main / inline-size;
 }
 
 /* Responsive */
@@ -2144,6 +2143,9 @@ a.run-row:hover {
   .side-foot { display: none; }
   .signin {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .signin-intro {
+    min-height: 0;
   }
 }
 @media (max-width: 640px) {
@@ -2323,7 +2325,6 @@ a.run-row:hover {
 
 /* Workspace: execution, admission, members, recovery */
 .confirm-inline { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 10px; background: var(--hub-warn-soft); }
-.ws-run { flex-wrap: wrap; }
 .ws-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .ws-grid { display: flex; flex-direction: column; gap: 4px; }
 .ws-form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
@@ -2513,8 +2514,8 @@ a.run-row:hover {
   .track-step { flex-direction: row; text-align: left; gap: 12px; padding: 4px 0; }
   .track-step + .track-step::before { top: auto; bottom: calc(100% - 4px); right: auto; left: 19px; width: 2px; height: 12px; }
   .lookup-2 { grid-template-columns: minmax(0, 1fr); }
-  .landed-row { flex-wrap: wrap; }
-  .landed-row .track.is-compact { order: 3; }
+  /* The whole row is the link; its trailing chevron would only wrap onto a line of its own. */
+  .landed-row > :last-child { display: none; }
 }
 
 /* Run ids, change ids and paths are long unbroken strings: let them wrap instead of widening the page. */

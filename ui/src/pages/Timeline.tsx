@@ -61,13 +61,9 @@ function List() {
   if (load.kind === 'error') return <Notice tone="bad" title="Could not read the timeline">{load.message}</Notice>
   const { value, source, reason } = load.value
   const toggle = (id: number) => setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p.slice(-1), id]))
-  const newest = value.entries[0]
   return (
     <>
       {source === 'preview' && <PreviewBanner reason={reason} />}
-      <p className="answer-text">
-        {value.entries.length === 0 ? 'No snapshots yet. They appear after the first save.' : <>{value.entries.length} saved moment{value.entries.length === 1 ? '' : 's'} on this page; the newest was saved {newest ? <Ago at={newest.recorded_at} /> : null}.</>}
-      </p>
       <Box
         icon="clock-history"
         tour="timeline-list"
@@ -233,7 +229,7 @@ export function TimelinePage() {
           {route.kind === 'compare' && <Compare key={`${route.left}|${route.right}`} left={route.left} right={route.right} />}
         </>
       )}
-      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer (the workspace it was started with), not the hub. Saving and forking happen in the CLI or your agent; this page only reads. <Explain text="Paging shows what was saved since the timeline was turned on. It isn't proof of everything that happened before." /></p>
+      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer (the workspace it was started with), not the hub. Saving and forking happen in the CLI or your agent; this page only reads. <Explain text="Shows what was saved since the timeline was turned on. Anything earlier isn’t here." /></p>
     </div>
   )
 }

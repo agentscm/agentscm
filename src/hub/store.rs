@@ -29,6 +29,11 @@ use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
+use super::promise::{
+    PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1, PromiseHistoryPageV1,
+    PromiseInputPageV1, PromiseInputReceiptV1, PromiseInputV1, PromiseInputViewV1, PromisePageV1,
+    PromiseReceiptV1, PromiseViewV1,
+};
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
@@ -44,6 +49,7 @@ use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
 
 const AGENT_TOKEN_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.agent-token.v1\0";
+const WEB_READ_TOKEN_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.web-read-token.v1\0";
 const DEVICE_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.device.v1\0";
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LOGIN_BYTES: usize = 255;
@@ -175,6 +181,13 @@ pub struct ActivityEvent {
 pub(super) const ACTIVITY_KINDS: &str = "'session_started', 'session_connected', 'session_ended',
     'edit_denied', 'edit_repeated', 'hold_expired', 'intent_announced', 'intent_released',
     'intent_notice', 'pr_notice', 'handoff_request', 'handoff_grant', 'handoff_decline', 'task_overlap'";
+
+/// The single namespace a promise input page belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromiseInputScope<'a> {
+    Proposal(&'a str),
+    Report(&'a str),
+}
 
 /// Methods block; async callers use `spawn_blocking`. Every mutation appends
 /// its event in the same transaction as the state change; a no-op appends nothing.
@@ -875,6 +888,100 @@ pub trait Store: Send + Sync {
         apply: bool,
         now: i64,
     ) -> Result<WorkCompaction>;
+    /// Trusted workspace calls only: authorization is held across this transaction.
+    fn promise_create(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        request: &PromiseCreateV1,
+        admissions: &[super::promise::PromiseRepositoryAdmissionV1],
+        now: i64,
+    ) -> Result<PromiseReceiptV1>;
+    fn promise_adopt(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        request: &PromiseAdoptV1,
+        admissions: &[super::promise::PromiseRepositoryAdmissionV1],
+        now: i64,
+    ) -> Result<PromiseReceiptV1>;
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the trusted write carries independent actor, authority, expected state and source admission fencing"
+    )]
+    fn promise_change(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        promise_id: &str,
+        authority: PromiseChangeAuthority,
+        request: &PromiseChangeV1,
+        admissions: &[super::promise::PromiseRepositoryAdmissionV1],
+        current: &super::promise::PromiseCurrentAdmissionsV1,
+        now: i64,
+    ) -> Result<PromiseReceiptV1>;
+    /// Recovery of an immutable, exact actor/target/body-bound receipt. The caller must hold
+    /// live workspace read authorization; this grants no authority for a new transition.
+    fn promise_change_replay(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        promise_id: &str,
+        request: &PromiseChangeV1,
+        current: &super::promise::PromiseCurrentAdmissionsV1,
+        now: i64,
+    ) -> Result<Option<PromiseReceiptV1>>;
+    fn promise_input(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        actor_token: Option<&str>,
+        request: &PromiseInputV1,
+        admission: &super::promise::PromiseRepositoryAdmissionV1,
+        now: i64,
+    ) -> Result<PromiseInputReceiptV1>;
+    fn promise_get(
+        &self,
+        workspace_id: &str,
+        promise_id: &str,
+        permitted_repositories: Option<&[String]>,
+        current: &super::promise::PromiseCurrentAdmissionsV1,
+    ) -> Result<Option<PromiseViewV1>>;
+    fn promise_input_get(
+        &self,
+        workspace_id: &str,
+        input_id: &str,
+        permitted_repositories: Option<&[String]>,
+        current: &super::promise::PromiseCurrentAdmissionsV1,
+    ) -> Result<Option<PromiseInputViewV1>>;
+    /// Proposal pages use a repository key; report pages use a promise id.
+    fn promise_inputs(
+        &self,
+        workspace_id: &str,
+        scope: PromiseInputScope<'_>,
+        permitted_repositories: Option<&[String]>,
+        after: Option<&str>,
+        limit: usize,
+        current: &super::promise::PromiseCurrentAdmissionsV1,
+    ) -> Result<PromiseInputPageV1>;
+    fn promise_history(
+        &self,
+        workspace_id: &str,
+        promise_id: &str,
+        permitted_repositories: Option<&[String]>,
+        before_version: Option<u64>,
+        limit: usize,
+        current: &super::promise::PromiseCurrentAdmissionsV1,
+    ) -> Result<Option<PromiseHistoryPageV1>>;
+    /// `None` is an authorized wildcard; `Some` is the complete current grant set.
+    fn promise_list(
+        &self,
+        workspace_id: &str,
+        permitted_repositories: Option<&[String]>,
+        after: Option<&str>,
+        limit: usize,
+        current: &super::promise::PromiseCurrentAdmissionsV1,
+    ) -> Result<PromisePageV1>;
 }
 
 /// On Windows the database path may be a drive path: `C:\x`, `C:/x`, or `/C:/x` in URL form.
@@ -920,6 +1027,14 @@ pub fn agent_token_digest(raw: &str) -> Result<TokenDigest> {
         .map_err(|_| HubError::Unauthorized)
 }
 
+/// Web-page read tokens use a separate credential domain. Agent and Workspace
+/// authentication cannot resolve them as agent credentials.
+pub fn web_read_token_digest(raw: &str) -> Result<TokenDigest> {
+    token_digest(WEB_READ_TOKEN_DIGEST_DOMAIN, raw)
+        .map(TokenDigest)
+        .map_err(|_| HubError::Unauthorized)
+}
+
 const BROWSER_SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.browser-session.v1\0";
 
 /// A person keeps at most this many web-page sign-ins.
@@ -953,8 +1068,17 @@ pub fn mint_agent_token(
     repository: &str,
     ttl_seconds: i64,
 ) -> Result<(String, Secret)> {
-    mint(store, owner, name, repository, None, ttl_seconds, false)
-        .map(|(id, secret, _)| (id, secret))
+    mint(
+        store,
+        owner,
+        name,
+        repository,
+        None,
+        ttl_seconds,
+        false,
+        agent_token_digest,
+    )
+    .map(|(id, secret, _)| (id, secret))
 }
 
 /// Like [`mint_agent_token`], recording the forge's repository id; also
@@ -976,9 +1100,31 @@ pub fn mint_bound_agent_token(
         Some(repository_id),
         ttl_seconds,
         read_only,
+        agent_token_digest,
     )
 }
 
+/// Mint a Hub web-page token that cannot authenticate as a Workspace agent.
+pub fn mint_web_read_token(
+    store: &dyn Store,
+    owner: &str,
+    repository: &str,
+    repository_id: i64,
+    ttl_seconds: i64,
+) -> Result<(String, Secret, i64)> {
+    mint(
+        store,
+        owner,
+        "hub-web",
+        repository,
+        Some(repository_id),
+        ttl_seconds,
+        true,
+        web_read_token_digest,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // private helper with three named wrappers; a parameter struct would only rename them
 fn mint(
     store: &dyn Store,
     owner: &str,
@@ -987,6 +1133,7 @@ fn mint(
     repository_id: Option<i64>,
     ttl_seconds: i64,
     read_only: bool,
+    digest: fn(&str) -> Result<TokenDigest>,
 ) -> Result<(String, Secret, i64)> {
     if !(1..=MAX_AGENT_TOKEN_TTL_SECONDS).contains(&ttl_seconds) {
         return Err(invalid("token lifetime must be 1 second to 30 days"));
@@ -997,7 +1144,7 @@ fn mint(
         owner: owner.to_owned(),
         name: name.to_owned(),
         repository: repository.to_owned(),
-        digest: agent_token_digest(secret.expose())?,
+        digest: digest(secret.expose())?,
         expires_at,
         repository_id,
         read_only,

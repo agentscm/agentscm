@@ -152,7 +152,7 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
               <Box icon="gear-wide-connected" title="CI after landing" count={x.ci.length} explain="GitHub Actions runs for the exact merge commit on the base branch. Runs for pull requests or other branches are left out.">
                 <RunList runs={x.ci} deployment={false} state={x.state} />
               </Box>
-              <Box icon="cloud-upload" title="Deployments" count={x.deployments.length} explain="Each deployment of the merge commit with its newest status. One environment can have several.">
+              <Box icon="cloud-upload" title="Deployments" count={x.deployments.length} explain="Each deployment of the merge commit and its latest status. An environment can have more than one.">
                 <RunList runs={x.deployments} deployment state={x.state} />
               </Box>
             </div>
@@ -174,7 +174,7 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
               <dd>{p.pr.url ? <a href={p.pr.url} target="_blank" rel="noreferrer noopener">#{p.pr.number} <Icon name="box-arrow-up-right" /></a> : `#${p.pr.number}`}</dd>
             </>
           )}
-          <dt>Recorded locally as landed</dt><dd>{p.nativeLanded ? 'Yes, by the publishing agent' : 'No'} <Explain text="The publishing client's own claim. The hub has no native data to check it against." /></dd>
+          <dt>Recorded locally as landed</dt><dd>{p.nativeLanded ? 'Yes, by the publishing agent' : 'No'} <Explain text="The publishing agent says so. The hub has nothing to check it against." /></dd>
           {p.historical && <><dt>Kind</dt><dd>Historical candidate, not re-qualified</dd></>}
         </dl>
       </details>
@@ -184,7 +184,7 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
 
 function Lookup({ repo, token, recent, onOpen }: { repo: string; token: string; recent: string[]; onOpen: (id: string) => void }) {
   return (
-    <Box icon="search" title="Find a change" explain="Search by branch, title, pull request number or ID. A change's ID starts with pub_; the publishing agent prints it, and it appears in pull request comments the hub posts.">
+    <Box icon="search" title="Find a change" explain="Search by branch, title, PR number or change ID. Change IDs start with pub_; the publishing agent prints them and the hub posts them on the PR.">
       <div className="lookup">
         <Combobox
           id="landed-id"

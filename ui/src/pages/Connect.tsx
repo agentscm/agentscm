@@ -18,7 +18,7 @@ export function InstallCommand({ lead = 'Run this in a checkout of a repository 
         <code>{command}</code>
         <CopyButton text={command} />
       </div>
-      <p className="install-after">It asks before it changes anything, then signs you in with a one-time code from GitHub or GitLab. macOS and Linux.</p>
+      <p className="install-after">It asks before it changes anything, then opens your browser to sign in with GitHub or GitLab. Over SSH it shows a one-time code instead, where this Hub allows one. macOS and Linux.</p>
     </div>
   )
 }

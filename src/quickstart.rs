@@ -116,8 +116,8 @@ pub struct QuickstartArgs {
     /// Skip the check for colliding branches.
     #[arg(hide = true, long)]
     no_collisions: bool,
-    /// Also write the repository's agent instructions (agentscm init-repo); with --yes it is
-    /// skipped unless this is passed.
+    /// Also write the repository's agent instructions (agentscm init-repo). Without it, setup
+    /// writes nothing to the repository.
     #[arg(hide = true, long)]
     init: bool,
     /// Open the optional native status-bar companion after setup succeeds (macOS only).
@@ -698,7 +698,7 @@ fn program_fingerprint(home: &Path) -> (Option<u32>, Vec<ProgramFileFingerprint>
         directory.join(binary::LINK),
         directory.join(format!(
             "agentscm-{}{}",
-            env!("CARGO_PKG_VERSION"),
+            binary::VERSION,
             std::env::consts::EXE_SUFFIX
         )),
     ]
@@ -1166,7 +1166,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
             ) {
                 return Ok(None);
             }
-            let stable = binary::install(&dir, &executable, env!("CARGO_PKG_VERSION"))?;
+            let stable = binary::install(&dir, &executable, binary::VERSION)?;
             cx.manifest.bin_dir = Some(dir);
             cx.manifest.save().map_err(|e| e.to_string())?;
             hub_native::start(
@@ -1242,7 +1242,7 @@ fn stable_program(
         }
         binary::Program::Copy => {
             let parent_new = dir.parent().is_some_and(|parent| !parent.exists());
-            binary::install(&dir, &exe, env!("CARGO_PKG_VERSION"))?;
+            binary::install(&dir, &exe, binary::VERSION)?;
             cx.manifest.bin_parent_created |= parent_new;
             cx.manifest.bin_dir = Some(dir.clone());
             Ok(dir.join(binary::LINK))
@@ -1425,7 +1425,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         println!(
             "Will also copy this program to {0}/agentscm-{1} and point {0}/agentscm at it (0755), so the hooks keep working after this copy goes away.",
             shown(&binary::bin_dir(&cx.home), &cx.home),
-            env!("CARGO_PKG_VERSION")
+            binary::VERSION
         );
     }
     #[cfg(target_os = "macos")]
@@ -1441,6 +1441,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         Ok(program) => program,
         Err(why) => {
             println!("Couldn't copy the program: {why}. I didn't set up {names}.");
+            cx.live.agent_error = Some(format!("couldn't copy the program: {why}"));
             return;
         }
     };
@@ -1503,45 +1504,22 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     }
 }
 
-/// Offers `agentscm init-repo`'s instruction files once a hub is chosen. Failure is reported, not fatal.
+/// With `--init` only, writes `agentscm init-repo`'s instruction files: setup itself never writes
+/// to the repository. Failure is reported, not fatal.
 fn init_stage(cx: &mut Cx<'_>) {
-    let (Some(root), Some(hub)) = (cx.found.repo_root.clone(), cx.live.hub.clone()) else {
-        if cx.args.init {
-            println!(
-                "--init needs a Git repository and a hub, so I didn't add the agent instructions."
-            );
-        }
-        return;
-    };
-    if cx.ui.yes && !cx.args.init {
+    if !cx.args.init {
         return;
     }
-    // Instructions that point agents at a hub they can't reach would be committed broken.
-    let why = if !cx.live.hub_up {
-        Some("The hub isn't answering")
-    } else if cx.live.agent_error.is_some() {
-        Some("Connecting the agents to the hub failed")
-    } else {
-        None
-    };
-    if let Some(why) = why {
-        if cx.args.init {
-            println!(
-                "{why}, so I didn't add the agent instructions; fix that and run quickstart again."
-            );
-        }
+    let Some(root) = cx.found.repo_root.clone() else {
+        println!("--init needs a Git repository, so I didn't add the agent instructions.");
         return;
-    }
-    // One question: init-repo shows the files and their diffs, then asks before writing.
-    println!(
-        "AgentSCM can also add this repository's agent instructions (AGENTS.md and the files that point Claude Code, Cursor, Copilot and Gemini at it), as files you can commit:"
-    );
-    match crate::init_cli::run_in(&root, None, Some(&hub), cx.ui) {
+    };
+    match crate::init_cli::run_in(&root, None, cx.ui) {
         Ok(outcome) => cx.init_written = outcome.written,
         Err(error) => println!("Couldn't add the agent instructions: {}.", short(&error)),
     }
     if !cx.init_written.is_empty() {
-        crate::init_cli::print_next_steps(&crate::init_cli::ALL, Some(&hub), &cx.init_written);
+        crate::init_cli::print_next_steps(cx.live.hub.as_deref(), &cx.init_written);
     }
 }
 

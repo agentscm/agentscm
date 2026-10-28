@@ -2,6 +2,7 @@
 //!
 //! Forge identities remain in the Hub identity store. This store contains only
 //! workspace grants and session digests. Roles grant independent capabilities.
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -19,6 +20,23 @@ use sha2::{Digest, Sha256};
 
 use super::http::{ApiError, JsonBody, bearer, blocking};
 use super::login::random_hex;
+use super::promise::{
+    PromiseChangeActionV1, PromiseChangeV1, PromiseCurrentAdmissionsV1, PromiseForgeAdmissionV1,
+    PromiseRepositoryAdmissionV1, PromiseVersionV1,
+};
+#[cfg(unix)]
+pub(crate) use super::workspace_execution::ExecutionService as PromiseExecution;
+#[cfg(not(unix))]
+pub(crate) struct PromiseExecution;
+#[cfg(not(unix))]
+impl PromiseExecution {
+    fn promise_native_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn promise_native_repository_ids(&self, _: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
 use super::store::{ForgeIdentity, Store, TokenDigest, User, agent_token_digest, unix_now};
 use super::{HubError, HubState, Result};
 use crate::team::auth::{Role, token_digest};
@@ -70,6 +88,18 @@ pub struct WorkspaceConfig {
     pub name: String,
     pub database: PathBuf,
     pub initial_owner: Identity,
+    /// Optional operator-controlled grant-key to stable forge repository mapping.
+    #[serde(default)]
+    pub forge_repositories: Vec<WorkspaceForgeRepositoryV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceForgeRepositoryV1 {
+    pub repository_id: String,
+    pub provider: String,
+    pub host: String,
+    pub forge_repository_id: i64,
 }
 
 impl WorkspaceConfig {
@@ -119,6 +149,8 @@ enum Credential {
     },
     Agent {
         digest: String,
+        #[serde(default)]
+        token_id: Option<String>,
         repository: String,
         read_only: bool,
     },
@@ -136,6 +168,13 @@ impl WorkspaceActor {
     }
     pub fn is_browser(&self) -> bool {
         matches!(self.credential, Credential::Browser { .. })
+    }
+
+    pub(crate) fn token_id(&self) -> Option<&str> {
+        match &self.credential {
+            Credential::Browser { .. } => None,
+            Credential::Agent { token_id, .. } => token_id.as_deref(),
+        }
     }
 
     pub(crate) fn agent_identity(
@@ -185,6 +224,7 @@ pub struct Workspace {
     conn: Mutex<Connection>,
     store: Arc<dyn Store>,
     id: String,
+    forge_repositories: BTreeMap<String, PromiseForgeAdmissionV1>,
 }
 
 fn invalid(message: &str) -> HubError {
@@ -263,6 +303,42 @@ impl Workspace {
                 "workspace requires an id, name and absolute database path",
             ));
         }
+        if config.forge_repositories.len() > 100 {
+            return Err(invalid("too many workspace forge repositories"));
+        }
+        let mut forge_repositories = BTreeMap::new();
+        let mut forge_identities = BTreeSet::new();
+        for entry in &config.forge_repositories {
+            if !valid_id(&entry.repository_id) || entry.forge_repository_id <= 0 {
+                return Err(invalid("invalid workspace forge repository binding"));
+            }
+            let admission = PromiseForgeAdmissionV1 {
+                provider: entry.provider.clone(),
+                host: entry.host.clone(),
+                forge_repository_id: entry.forge_repository_id,
+            };
+            if !forge_identities.insert((
+                admission.provider.clone(),
+                admission.host.clone(),
+                admission.forge_repository_id,
+            )) || forge_repositories
+                .insert(entry.repository_id.clone(), admission.clone())
+                .is_some()
+            {
+                return Err(invalid("duplicate workspace forge repository binding"));
+            }
+            let repository = store
+                .repository_by_id(&admission.host, admission.forge_repository_id)?
+                .ok_or_else(|| invalid("workspace forge repository is not connected"))?;
+            let connection = store
+                .connection(&repository.connection)?
+                .ok_or_else(|| invalid("workspace forge connection is unavailable"))?;
+            if connection.provider != admission.provider || connection.host != admission.host {
+                return Err(invalid(
+                    "workspace forge repository provider differs from binding",
+                ));
+            }
+        }
         let owner = config.initial_owner.key()?;
         #[cfg(unix)]
         {
@@ -322,7 +398,109 @@ impl Workspace {
             conn: Mutex::new(conn),
             store,
             id: config.workspace_id,
+            forge_repositories,
         })
+    }
+
+    /// The current operator config is the sole mapping authority. Revalidate the connected
+    /// repository by stable forge identity on every use; names never authorize a promise.
+    pub(crate) fn promise_forge_admission(
+        &self,
+        repository_id: &str,
+    ) -> Result<Option<PromiseForgeAdmissionV1>> {
+        let Some(admission) = self.forge_repositories.get(repository_id) else {
+            return Ok(None);
+        };
+        let repository = self
+            .store
+            .repository_by_id(&admission.host, admission.forge_repository_id)?
+            .ok_or_else(forbidden)?;
+        let connection = self
+            .store
+            .connection(&repository.connection)?
+            .ok_or_else(forbidden)?;
+        if connection.provider != admission.provider || connection.host != admission.host {
+            return Err(forbidden());
+        }
+        Ok(Some(admission.clone()))
+    }
+
+    pub(crate) fn promise_forge_repository_ids(&self) -> impl Iterator<Item = &String> {
+        self.forge_repositories.keys()
+    }
+
+    /// A snapshot of current operator-admitted identities. Only configured keys are stored;
+    /// absent keys resolve to explicit unbound admissions in the promise domain.
+    pub(crate) fn promise_current_admissions(
+        &self,
+        execution: Option<&PromiseExecution>,
+    ) -> Result<PromiseCurrentAdmissionsV1> {
+        let mut keys = self
+            .promise_forge_repository_ids()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(execution) = execution {
+            keys.extend(execution.promise_native_keys());
+        }
+        let mut current = PromiseCurrentAdmissionsV1::new();
+        for key in keys {
+            let admission = PromiseRepositoryAdmissionV1 {
+                repository_id: key.clone(),
+                forge: self.promise_forge_admission(&key)?,
+                native_repository_ids: execution
+                    .map(|service| service.promise_native_repository_ids(&key))
+                    .transpose()?
+                    .unwrap_or_default(),
+            };
+            admission.validate()?;
+            current.insert(key, admission);
+        }
+        Ok(current)
+    }
+
+    pub(crate) fn promise_admissions_for(
+        &self,
+        repositories: &[String],
+        execution: Option<&PromiseExecution>,
+    ) -> Result<Vec<PromiseRepositoryAdmissionV1>> {
+        let current = self.promise_current_admissions(execution)?;
+        let mut admitted = repositories
+            .iter()
+            .map(|key| super::promise::current_admission(&current, key))
+            .collect::<Vec<_>>();
+        admitted.sort_by(|a, b| a.repository_id.cmp(&b.repository_id));
+        Ok(admitted)
+    }
+
+    /// An agent can attest a forge scope only when its live token has the same numeric binding.
+    pub(crate) fn promise_agent_forge_scope(
+        &self,
+        actor: &WorkspaceActor,
+        repository_id: &str,
+        admission: &Option<PromiseForgeAdmissionV1>,
+    ) -> Result<()> {
+        let Credential::Agent { digest, .. } = &actor.credential else {
+            return Ok(());
+        };
+        let principal = self
+            .store
+            .authenticate(&TokenDigest::from_persisted(digest)?, unix_now())?
+            .ok_or_else(forbidden)?;
+        let source_matches = match admission {
+            Some(forge) => {
+                principal.owner.identity.provider == forge.provider
+                    && principal.owner.identity.host == forge.host
+                    && principal.repository_id == Some(forge.forge_repository_id)
+            }
+            None => principal.repository_id.is_none(),
+        };
+        if principal.owner.id != actor.user_id
+            || principal.repository != repository_id
+            || !source_matches
+        {
+            return Err(forbidden());
+        }
+        Ok(())
     }
 
     fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
@@ -360,6 +538,7 @@ impl Workspace {
             }
             Credential::Agent {
                 digest,
+                token_id,
                 repository,
                 read_only,
             } => {
@@ -368,6 +547,9 @@ impl Workspace {
                     .authenticate(&TokenDigest::from_persisted(digest)?, unix_now())?
                     .ok_or(HubError::Unauthorized)?;
                 if principal.owner.id != user.id
+                    || token_id
+                        .as_deref()
+                        .is_some_and(|token_id| principal.token_id != token_id)
                     || principal.repository != *repository
                     || principal.read_only != *read_only
                 {
@@ -442,6 +624,262 @@ impl Workspace {
         let conn = self.conn()?;
         self.authorized(&conn, actor, repository, action)?;
         operation().map_err(HubError::from)
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        &self.id
+    }
+
+    fn promise_authorized(
+        &self,
+        conn: &Connection,
+        actor: &WorkspaceActor,
+        repositories: &[String],
+        reader: bool,
+        contributor: bool,
+        browser: bool,
+    ) -> Result<(User, Member)> {
+        let (user, member) = self.current(conn, actor)?;
+        if browser && !actor.is_browser() {
+            return Err(forbidden());
+        }
+        if repositories.is_empty()
+            || repositories.iter().any(|repository| {
+                !valid_id(repository)
+                    || !member
+                        .repository_ids
+                        .iter()
+                        .any(|grant| grant == repository || grant == "*")
+            })
+            || (reader && !member.roles.contains(&Role::Reader))
+            || (contributor && !member.roles.contains(&Role::Contributor))
+        {
+            return Err(forbidden());
+        }
+        if let Credential::Agent {
+            repository,
+            read_only,
+            ..
+        } = &actor.credential
+            && (repositories.iter().any(|scope| scope != repository) || (contributor && *read_only))
+        {
+            return Err(forbidden());
+        }
+        if matches!(&actor.credential, Credential::Agent { .. }) {
+            for repository in repositories {
+                let forge = self.promise_forge_admission(repository)?;
+                self.promise_agent_forge_scope(actor, repository, &forge)?;
+            }
+        }
+        Ok((user, member))
+    }
+
+    pub(crate) fn with_promise_list<T>(
+        &self,
+        actor: &WorkspaceActor,
+        operation: impl FnOnce(Option<&[String]>) -> Result<T>,
+    ) -> Result<T> {
+        let conn = self.conn()?;
+        let (_, member) = self.current(&conn, actor)?;
+        if !member.roles.contains(&Role::Reader) {
+            return Err(forbidden());
+        }
+        match &actor.credential {
+            Credential::Agent { repository, .. } => {
+                if !member
+                    .repository_ids
+                    .iter()
+                    .any(|grant| grant == repository || grant == "*")
+                {
+                    return Err(forbidden());
+                }
+                let forge = self.promise_forge_admission(repository)?;
+                self.promise_agent_forge_scope(actor, repository, &forge)?;
+                let repositories = [repository.clone()];
+                operation(Some(&repositories))
+            }
+            Credential::Browser { .. } if member.repository_ids.iter().any(|id| id == "*") => {
+                operation(None)
+            }
+            Credential::Browser { .. } => operation(Some(&member.repository_ids)),
+        }
+    }
+
+    pub(crate) fn with_promise_create<T>(
+        &self,
+        actor: &WorkspaceActor,
+        repositories: &[String],
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.promise_authorized(&tx, actor, repositories, true, true, true)?;
+        let result = operation()?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn promise_change_capabilities(
+        &self,
+        actor: &WorkspaceActor,
+        version: &crate::hub::promise::PromiseVersionV1,
+    ) -> Result<crate::hub::promise::PromiseChangeCapabilitiesV1> {
+        let conn = self.conn()?;
+        let repositories = version
+            .definition
+            .repositories
+            .iter()
+            .map(|repository| repository.repository_id.clone())
+            .collect::<Vec<_>>();
+        let (user, member) =
+            self.promise_authorized(&conn, actor, &repositories, true, false, true)?;
+        let active = version.state == crate::hub::promise::PromiseStateV1::Active;
+        let contributor = member.roles.contains(&Role::Contributor);
+        let owner = active && contributor && user.id == version.steward_user;
+        let recovery = active
+            && contributor
+            && user.id != version.steward_user
+            && member.roles.contains(&Role::Administrator)
+            && !self.promise_user_eligible(&conn, &version.steward_user, &repositories)?;
+        Ok(crate::hub::promise::PromiseChangeCapabilitiesV1 {
+            amend: owner,
+            correct: owner,
+            retire: owner,
+            transfer: owner,
+            recovery_transfer: recovery,
+        })
+    }
+
+    pub(crate) fn with_promise_proposal<T>(
+        &self,
+        actor: &WorkspaceActor,
+        repository: &str,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.promise_authorized(&tx, actor, &[repository.to_owned()], false, true, false)?;
+        let result = operation()?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn with_promise_report<T>(
+        &self,
+        actor: &WorkspaceActor,
+        promise_repositories: &[String],
+        repository: &str,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.promise_authorized(&tx, actor, promise_repositories, true, true, false)?;
+        if !promise_repositories.iter().any(|scope| scope == repository) {
+            return Err(forbidden());
+        }
+        let result = operation()?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn promise_user_eligible(
+        &self,
+        conn: &Connection,
+        user_id: &str,
+        repositories: &[String],
+    ) -> Result<bool> {
+        let Some(user) = self
+            .store
+            .user_by_id(user_id)?
+            .filter(|user| !user.disabled)
+        else {
+            return Ok(false);
+        };
+        let Some(member) =
+            member(conn, &Identity::from(&user.identity).key()?)?.filter(|member| member.enabled)
+        else {
+            return Ok(false);
+        };
+        Ok(member.roles.contains(&Role::Reader)
+            && member.roles.contains(&Role::Contributor)
+            && repositories.iter().all(|repository| {
+                member
+                    .repository_ids
+                    .iter()
+                    .any(|grant| grant == repository || grant == "*")
+            }))
+    }
+
+    pub(crate) fn with_promise_change<T>(
+        &self,
+        actor: &WorkspaceActor,
+        current: &PromiseVersionV1,
+        request: &PromiseChangeV1,
+        replay: impl FnOnce() -> Result<Option<T>>,
+        operation: impl FnOnce(crate::hub::promise::PromiseChangeAuthority, &[String]) -> Result<T>,
+    ) -> Result<T> {
+        let old_repositories = current
+            .definition
+            .repositories
+            .iter()
+            .map(|repository| repository.repository_id.clone())
+            .collect::<Vec<_>>();
+        let new_repositories = match &request.action {
+            PromiseChangeActionV1::Amend { content }
+            | PromiseChangeActionV1::Correct { content } => content
+                .repositories
+                .iter()
+                .map(|repository| repository.repository_id.clone())
+                .collect::<Vec<_>>(),
+            _ => old_repositories.clone(),
+        };
+        let target_user = match &request.action {
+            PromiseChangeActionV1::Transfer { to_user }
+            | PromiseChangeActionV1::RecoveryTransfer { to_user } => Some(to_user.as_str()),
+            _ => None,
+        };
+        let recovery = matches!(
+            &request.action,
+            PromiseChangeActionV1::RecoveryTransfer { .. }
+        );
+        let current_steward = current.steward_user.as_str();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Receipt recovery is narrower than a new owner action. Current read access and a
+        // live browser session are required even if the original steward has transferred.
+        self.promise_authorized(&tx, actor, &old_repositories, true, false, true)?;
+        if let Some(receipt) = replay()? {
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        let mut repositories = old_repositories.to_vec();
+        repositories.extend_from_slice(&new_repositories);
+        repositories.sort();
+        repositories.dedup();
+        let (user, member) =
+            self.promise_authorized(&tx, actor, &repositories, true, true, true)?;
+        let authority = if recovery {
+            if user.id == current_steward
+                || !member.roles.contains(&Role::Administrator)
+                || self.promise_user_eligible(&tx, current_steward, &old_repositories)?
+            {
+                return Err(forbidden());
+            }
+            crate::hub::promise::PromiseChangeAuthority::RecoveryAdministrator
+        } else {
+            if user.id != current_steward {
+                return Err(forbidden());
+            }
+            crate::hub::promise::PromiseChangeAuthority::Steward
+        };
+        if let Some(target) = target_user
+            && !self.promise_user_eligible(&tx, target, &new_repositories)?
+        {
+            return Err(forbidden());
+        }
+        let result = operation(authority, &new_repositories)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Hold one workspace lock while checking the initiating credential/action and every
@@ -743,6 +1181,12 @@ impl Workspace {
             .store
             .authenticate(&digest, unix_now())?
             .ok_or(HubError::Unauthorized)?;
+        // Web-page tokens minted before the separate digest domain used this
+        // reserved name. Deny them here until their 30-minute lifetime ends.
+        // An agent choosing this name is denied Workspace access, never granted it.
+        if principal.name == "hub-web" {
+            return Err(HubError::Unauthorized);
+        }
         if mutation && principal.read_only {
             return Err(forbidden());
         }
@@ -758,12 +1202,22 @@ impl Workspace {
             generation: member.generation,
             credential: Credential::Agent {
                 digest: digest.as_str().to_owned(),
+                token_id: Some(principal.token_id),
                 repository: principal.repository,
                 read_only: principal.read_only,
             },
         };
         self.current(&conn, &actor)?;
         Ok(actor)
+    }
+
+    /// Resolve the MCP bearer through the same live workspace actor check as HTTP.
+    pub(crate) fn actor_for_promise_agent(
+        &self,
+        raw: &str,
+        mutation: bool,
+    ) -> Result<WorkspaceActor> {
+        self.actor_for_agent(raw, mutation)
     }
 
     fn require_admin(&self, conn: &Connection, actor: &WorkspaceActor) -> Result<Member> {
@@ -1225,9 +1679,148 @@ async fn update_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::promise::{PromiseCriterionV1, PromiseInputV1, PromiseRepositoryAdmissionV1};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn promise_write_holds_cross_connection_grant_until_store_commit() {
+        let dir = TempDir::new().unwrap();
+        let store = super::super::store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let identity = |user_id| ForgeIdentity {
+            provider: "github".into(),
+            host: "forge.example".into(),
+            user_id,
+        };
+        let owner = store.upsert_user(&identity(101), "owner").unwrap();
+        let member_user = store.upsert_user(&identity(202), "contributor").unwrap();
+        let config = || WorkspaceConfig {
+            workspace_id: "synthetic".into(),
+            name: "Synthetic workspace".into(),
+            database: dir.path().join("workspace.sqlite"),
+            initial_owner: Identity::from(&owner.identity),
+            forge_repositories: vec![],
+        };
+        let writer = Arc::new(Workspace::open(config(), store.clone()).unwrap());
+        let revoker = Arc::new(Workspace::open(config(), store.clone()).unwrap());
+        let actor_for = |workspace: &Workspace, user: &User| {
+            let cookie = workspace.issue_session(user).unwrap();
+            let raw = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+            workspace.actor_for_cookie(raw, None, false).unwrap()
+        };
+        let owner_actor = actor_for(&writer, &owner);
+        writer
+            .put_member(
+                &owner_actor,
+                MemberChange {
+                    request_id: "grant-contributor".into(),
+                    expected_generation: 1,
+                    identity: Identity::from(&member_user.identity),
+                    roles: vec![Role::Reader, Role::Contributor],
+                    repository_ids: vec!["synthetic/project".into()],
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        let member_actor = actor_for(&writer, &member_user);
+        let input = |operation_id: &str| PromiseInputV1::Proposal {
+            operation_id: operation_id.into(),
+            repository_id: "synthetic/project".into(),
+            original_request: "Keep settings.".into(),
+            commitment: "Settings persist.".into(),
+            criteria: vec![PromiseCriterionV1 {
+                id: "settings".into(),
+                text: "Settings persist.".into(),
+                evidence_requirements: vec![],
+            }],
+            constraints: vec![],
+        };
+        let admission = PromiseRepositoryAdmissionV1::unbound("synthetic/project");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writing = writer.clone();
+        let write_store = store.clone();
+        let member_id = member_user.id.clone();
+        let first_input = input("before-revocation");
+        let first_admission = admission.clone();
+        let first_actor = member_actor.clone();
+        let write = std::thread::spawn(move || {
+            writing.with_promise_proposal(&first_actor, "synthetic/project", || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                write_store.promise_input(
+                    "synthetic",
+                    &member_id,
+                    None,
+                    &first_input,
+                    &first_admission,
+                    unix_now(),
+                )
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let contender = rusqlite::Connection::open(dir.path().join("workspace.sqlite")).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        let busy = contender.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert!(matches!(
+            busy,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        drop(contender);
+        let changing = revoker.clone();
+        let revoked_identity = Identity::from(&member_user.identity);
+        let (revoking_tx, revoking_rx) = std::sync::mpsc::channel();
+        let revoke = std::thread::spawn(move || {
+            revoking_tx.send(()).unwrap();
+            changing.put_member(
+                &owner_actor,
+                MemberChange {
+                    request_id: "revoke-contributor".into(),
+                    expected_generation: 2,
+                    identity: revoked_identity,
+                    roles: vec![Role::Reader, Role::Contributor],
+                    repository_ids: vec!["synthetic/project".into()],
+                    enabled: false,
+                },
+            )
+        });
+        revoking_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+        let receipt = write.join().unwrap().unwrap();
+        revoke.join().unwrap().unwrap();
+        let hub_db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        let count = || {
+            hub_db
+                .query_row("SELECT COUNT(*) FROM hub_promise_inputs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(), 1);
+        assert!(!receipt.input_id.is_empty());
+        let later_input = input("after-revocation");
+        assert!(
+            writer
+                .with_promise_proposal(&member_actor, "synthetic/project", || {
+                    store.promise_input(
+                        "synthetic",
+                        &member_user.id,
+                        None,
+                        &later_input,
+                        &admission,
+                        unix_now(),
+                    )
+                })
+                .is_err()
+        );
+        assert_eq!(count(), 1);
+    }
 
     #[test]
     fn agent_task_origin_grants_and_token_revocation_share_one_workspace_lock() {
@@ -1250,6 +1843,7 @@ mod tests {
                     name: "Synthetic workspace".into(),
                     database: dir.path().join("workspace.sqlite"),
                     initial_owner: Identity::from(&identity),
+                    forge_repositories: vec![],
                 },
                 store.clone(),
             )
@@ -1332,6 +1926,7 @@ mod tests {
                 name: "Synthetic workspace".into(),
                 database: dir.path().join("workspace.sqlite"),
                 initial_owner: Identity::from(&identity),
+                forge_repositories: vec![],
             },
             store,
         )
@@ -1395,6 +1990,7 @@ mod tests {
                 name: "Synthetic workspace".into(),
                 database: dir.path().join("workspace.sqlite"),
                 initial_owner: Identity::from(&owner.identity),
+                forge_repositories: vec![],
             },
             store.clone(),
         )

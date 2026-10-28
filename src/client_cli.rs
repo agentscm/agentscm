@@ -668,6 +668,21 @@ struct Verified {
     expires_at: i64,
 }
 
+impl Verified {
+    /// "as jhawlwut (GitHub); token expires Oct 28, 14:00 (in 1 day)", as `hub login` says it.
+    fn as_who(&self) -> String {
+        let who = match self.provider.as_str() {
+            "github" => format!("{} (GitHub)", self.login),
+            "gitlab" => format!("{} (GitLab)", self.login),
+            _ => format!("{}:{}@{}", self.provider, self.login, self.host),
+        };
+        format!(
+            "as {who}; token expires {}",
+            crate::hub_cli::when(self.expires_at, unix_now())
+        )
+    }
+}
+
 fn identity_hostname(host: &str) -> Option<String> {
     reqwest::Url::parse(&format!("https://{host}"))
         .ok()?
@@ -925,6 +940,12 @@ async fn mint_agent_token(
         no_sign_in,
     )
     .await?;
+    // Signing in just now also signed this computer in: mint through it, so revoking the computer
+    // stops this agent too. The session path below is only for a Hub without computers.
+    computer::enroll(&connection.hub).await;
+    if let Some(minted) = computer::mint(connection, Some(provider), false).await? {
+        return Ok(minted);
+    }
     let (mut status, mut reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
     if status == 401 && no_sign_in {
         return Err(cannot_sign_in());
@@ -1308,13 +1329,10 @@ async fn connect_inner(
             }
             if !quiet {
                 println!(
-                    "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
+                    "Connection is already valid for {} at {} {} and permits coordination.",
                     saved.repo,
                     saved.hub,
-                    verified.provider,
-                    verified.login,
-                    verified.host,
-                    verified.expires_at
+                    verified.as_who()
                 );
             }
             return Ok(());
@@ -1330,13 +1348,10 @@ async fn connect_inner(
             }
             if !quiet {
                 println!(
-                    "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
+                    "Connection is already valid for {} at {} {} and permits coordination.",
                     corrected.repo,
                     corrected.hub,
-                    verified.provider,
-                    verified.login,
-                    verified.host,
-                    verified.expires_at
+                    verified.as_who()
                 );
             }
             return Ok(());
@@ -1484,14 +1499,11 @@ async fn connect_inner(
         return Ok(());
     }
     println!(
-        "Connected {} to {} for {} as {}:{}@{}; token expires at {} and permits coordination.",
+        "Connected {} to {} for {} {} and permits coordination.",
         connection.root.display(),
         connection.hub,
         connection.repo,
-        verified.provider,
-        verified.login,
-        verified.host,
-        verified.expires_at
+        verified.as_who()
     );
     Ok(())
 }
@@ -1659,13 +1671,10 @@ async fn check(args: RootArgs) -> Result<()> {
     }
     let verified = verify(&connection).await?;
     println!(
-        "Connection is valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
+        "Connection is valid for {} at {} {} and permits coordination.",
         connection.repo,
         connection.hub,
-        verified.provider,
-        verified.login,
-        verified.host,
-        verified.expires_at
+        verified.as_who()
     );
     println!(
         "This checks only the Hub binding. Use client doctor and agentscm_setup_status in your native MCP client to verify hooks and MCP."

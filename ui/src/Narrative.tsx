@@ -129,7 +129,7 @@ function NarrativeBox({ state, by, controls, children }: { state: 'ready' | 'wai
         </div>
         <TaskRequest controls={controls} />
       </header>
-      <div className="text-break">{children}</div>
+      <div className="text-break brief-body">{children}</div>
     </section>
   )
 }
