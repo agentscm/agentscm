@@ -1997,18 +1997,15 @@ mod tests {
             .collect();
         shown.sort_unstable();
         assert_eq!(shown, ["dry-run", "hub-url", "json", "only", "yes"]);
-        let matches = command
-            .try_get_matches_from([
-                "quickstart",
-                "--local",
-                "--agent",
-                "codex",
-                "--only",
-                "claude",
-            ])
-            .unwrap();
+        let mut argv = vec!["quickstart", "--local"];
+        // The agent flags exist only on Unix.
+        #[cfg(unix)]
+        argv.extend(["--agent", "codex", "--only", "claude"]);
+        let matches = command.try_get_matches_from(argv).unwrap();
         let args = QuickstartArgs::from_arg_matches(&matches).unwrap();
-        assert!(args.local && args.agent.len() == 2);
+        assert!(args.local);
+        #[cfg(unix)]
+        assert_eq!(args.agent.len(), 2);
     }
 
     #[test]
