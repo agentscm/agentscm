@@ -1,8 +1,8 @@
 # Releasing
 
-For maintainers. Releases are alpha prereleases. Nothing is published except by pushing a `v*` tag, and only from the public `counterbranch/agentscm` repository (the workflow skips any other repository, and build-provenance attestations need a public one).
+For maintainers. Releases are alpha prereleases. Nothing is published except by pushing a `v*` tag, and only from the public `agentscm/agentscm` repository (the workflow skips any other repository, and build-provenance attestations need a public one).
 
-1. One time, before the first tag: add a tag ruleset so only maintainers can create `v*` tags (the workflow cannot tell who pushed a tag); create the `npm` environment with required reviewers; on npmjs.com, add `counterbranch/agentscm`, workflow `release.yml` and environment `npm` as the package's trusted publisher, with `npm publish` allowed (no token is stored); turn on immutable releases in the repository settings, so a published release's assets cannot be replaced while the `npm` job waits for approval.
+1. One time, before the first tag: add a tag ruleset so only maintainers can create `v*` tags (the workflow cannot tell who pushed a tag); create the `npm` environment with required reviewers; on npmjs.com, add `agentscm/agentscm`, workflow `release.yml` and environment `npm` as the package's trusted publisher, with `npm publish` allowed (no token is stored); turn on immutable releases in the repository settings, so a published release's assets cannot be replaced while the `npm` job waits for approval.
 2. On a branch, set `version` in `Cargo.toml`, the root package entry in `Cargo.lock`, `packages/npm/package.json` and the root path-dependency entry in `ui/dev-seed/mint/Cargo.lock`, and give `CHANGELOG.md` an entry headed `## <version> (<date>)` with its known limits. Do not update unrelated dependencies while preparing the version. Open a pull request and add the `ci-extended` label so every `ci-extended` suite (hosted tests, Windows, container, end-to-end and live execution) runs on the candidate; wait for those workflow runs, not only the pull request's checks list.
 3. Before merging or tagging, qualify the candidate on clean native hardware. Run the CLI and container tests on Linux amd64 and arm64. On a clean Apple Silicon Mac with isolated ports, container names and volumes, test the staged native macOS binary and locally built `linux/arm64` image through install, first quickstart, Hub health/UI, login/token/hooks, restart, no-op rerun, uninstall and reinstall with retained data. Use the installer-produced paths and checksums; do not disable provenance or checksum enforcement. Record this as local candidate qualification: public npm/GHCR acquisition and GitHub attestations can be checked only after publication. Preserve any existing Hub and its data throughout. After it merges, check `main` is green and that Dependabot and `cargo deny` have nothing open for the release.
 4. Tag the merge commit: `git tag -s v<version> -m v<version> && git push origin v<version>`. The tag must equal the `Cargo.toml` version, be on `main`, and have a CHANGELOG entry, or the workflow stops before pushing anything.
@@ -49,7 +49,7 @@ Source code for the Debian packages in the image is available from Debian at
 https://sources.debian.org/ and https://snapshot.debian.org/ for the exact
 package versions. To list them, run:
 
-    docker run --rm --entrypoint dpkg-query ghcr.io/counterbranch/agentscm:<version> -W
+    docker run --rm --entrypoint dpkg-query ghcr.io/agentscm/agentscm:<version> -W
 
 On request, for three years after we publish an image, we will provide the
 corresponding source for its GPL-licensed components. Email

@@ -4,7 +4,7 @@ AgentSCM is alpha software (`0.1.0-alpha.x`), not for production, and has had no
 
 ## Reporting a vulnerability
 
-Report privately through [GitHub private vulnerability reporting](https://github.com/counterbranch/agentscm/security/advisories/new). If you cannot use GitHub, email support@counterbranch.com with the subject "AgentSCM security". Please do not open a public issue or pull request for a suspected vulnerability.
+Report privately through [GitHub private vulnerability reporting](https://github.com/agentscm/agentscm/security/advisories/new). If you cannot use GitHub, email support@counterbranch.com with the subject "AgentSCM security". Please do not open a public issue or pull request for a suspected vulnerability.
 
 Include the version or commit, how to reproduce it, and the impact you expect. We aim to acknowledge a report within 7 days and to agree a fix and disclosure date with you. We follow a 90-day coordinated disclosure window, shorter if a fix ships sooner and longer only by agreement. This is a small team and the project is alpha; these are goals, not a service-level commitment.
 
@@ -26,11 +26,11 @@ Out of scope: vulnerabilities in third-party dependencies with no AgentSCM-speci
 
 ## Verifying images
 
-Release images are published to `ghcr.io/counterbranch/agentscm` with build-provenance attestations. Verify an image by digest before you run it:
+Release images are published to `ghcr.io/agentscm/agentscm` with build-provenance attestations. Verify an image by digest before you run it:
 
 ```sh
-gh attestation verify oci://ghcr.io/counterbranch/agentscm@sha256:<digest> --repo counterbranch/agentscm \
-  --signer-workflow counterbranch/agentscm/.github/workflows/release.yml \
+gh attestation verify oci://ghcr.io/agentscm/agentscm@sha256:<digest> --repo agentscm/agentscm \
+  --signer-workflow agentscm/agentscm/.github/workflows/release.yml \
   --source-ref refs/tags/v<version> --deny-self-hosted-runners
 ```
 

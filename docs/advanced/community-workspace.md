@@ -245,4 +245,4 @@ Workspace APIs use `/v1/hub/workspace`: `login`, `session`, `members`,
 `runs`, `runs/{run}/cancel`, `runs/{run}/workflow`, `profiles/{profile}/approve`
 and `profiles/{profile}/integrate`. Lists are bounded and cursor-paged. The
 broader Community Edition management work is tracked in
-[issue #20](https://github.com/counterbranch/agentscm/issues/20).
+[issue #20](https://github.com/agentscm/agentscm/issues/20).

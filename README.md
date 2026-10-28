@@ -203,7 +203,7 @@ workflow runs; they do not grant execution or landing authority. See the
 [Deployment](docs/deployment.md) · [CLI reference](docs/reference/cli.md) ·
 [Architecture](docs/architecture.md) · [Roadmap](docs/roadmap.md)
 
-Packaged versions and notes are in [Releases](https://github.com/counterbranch/agentscm/releases).
+Packaged versions and notes are in [Releases](https://github.com/agentscm/agentscm/releases).
 These docs describe the branch/tag you are viewing; newer `main` features may require a
 source build. Use your release tag's documentation for packaged binaries.
 

@@ -186,7 +186,7 @@ const HOSTED_GUIDE: &str = "\
 Hosted (a shared hub on a server) is not supported in the alpha: it will likely break and is not \
 for production. Quickstart does not set up a server. Hand this guide to your coding agent and work \
 through it together:
-  https://github.com/counterbranch/agentscm/blob/main/docs/hosted.md
+  https://github.com/agentscm/agentscm/blob/main/docs/hosted.md
 If your team's hub already runs, give its URL to connect this machine to it.";
 
 fn invalid(message: &str) -> Error {
