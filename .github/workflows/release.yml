@@ -25,7 +25,7 @@ env:
 jobs:
   image-platform:
     # Each runnable child is built and fully exercised on matching native hardware before it is pushed.
-    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,7 +70,7 @@ jobs:
           tags: type=raw,value=sha-${{ github.sha }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.licenses=FSL-1.1-ALv2
-            org.opencontainers.image.source=https://github.com/counterbranch/agentscm
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.vendor=DUVATL, Inc.
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
       - name: Build the native image once and load it for qualification
@@ -144,7 +144,7 @@ jobs:
   image:
     # Assemble and verify the public version tag only after both native children pass.
     needs: image-platform
-    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -216,7 +216,7 @@ jobs:
 
   ui:
     # The status page, built once and embedded into every binary below with `--features ui`.
-    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -244,7 +244,7 @@ jobs:
     # Builds only: no OIDC token or attestation rights here, so build-time code cannot sign anything.
     # Runs in parallel with the image once the UI is built; `attest` waits for both.
     needs: ui
-    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     strategy:
       fail-fast: true
       matrix:
@@ -305,7 +305,7 @@ jobs:
   attest:
     # Waits for `image` so the tag has been checked against Cargo.toml and main before anything is attested.
     needs: [image, binaries]
-    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -325,8 +325,7 @@ jobs:
         env:
           VERSION: ${{ needs.image.outputs.version }}
         run: |
-          sed "s/^AGENTSCM_DEFAULT_VERSION=\"\"/AGENTSCM_DEFAULT_VERSION=\"$VERSION\"/" install.sh > dist/install.sh
-          grep -q "^AGENTSCM_DEFAULT_VERSION=\"$VERSION\"" dist/install.sh || { echo "install.sh version marker not found" >&2; exit 1; }
+          node .github/pin-release-installers.js
       # Made here, before the attestation, so SHA256SUMS is attested with the binaries and the
       # release and npm jobs both take it from this artifact, never from the release assets.
       - name: Write SHA256SUMS
@@ -343,7 +342,7 @@ jobs:
   release:
     needs: [image, attest]
     # Only the public repository publishes: the image name, the attestation and the docs assume it.
-    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -378,7 +377,7 @@ jobs:
   npm:
     needs: release
     # Only the public repository publishes: the image name, the attestation and the docs assume it.
-    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     # The maintainer configures required reviewers on the `npm` environment. npm trusts this
     # workflow and environment (trusted publishing), so the job publishes with an OIDC token, not a secret.
     environment: npm
@@ -413,6 +412,10 @@ jobs:
         with:
           name: release-dist
           path: dist
+      - name: Pin the npm package to its publishing repository
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: VERSION="${VERSION#v}" node .github/pin-release-installers.js
       - name: Stage checksums and license files
         run: |
           cp dist/SHA256SUMS packages/npm/

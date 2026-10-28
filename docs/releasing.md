@@ -12,6 +12,23 @@ For maintainers. Releases are alpha prereleases. Nothing is published except by 
 8. A dry run is a tag containing `-dry` (for example `v0.2.0-dry1`) whose version in `Cargo.toml` matches (`0.2.0-dry1`). It runs the whole workflow, including pushing the image and creating the prerelease, but skips the npm publish. Use it to exercise the workflow before a real tag, then delete the tag, the release and the image tag. The Windows binary build is first exercised by such a tag, so run a dry run before a real release that changes the Windows build. The Windows and macOS binaries are not code-signed or notarized; see [install](install.md).
 9. A bad release is superseded by a new version, never edited: delete the tag and release only if nothing has pulled the image.
 
+## Publishing identity
+
+The release jobs require the immutable public repository ID, so a namespace rename does not
+admit a fork or a repository created later under the former name. Before attesting `install.sh`
+and publishing npm, `.github/pin-release-installers.js` embeds the current publishing repository,
+exact version and signing workflow identity into the installers and npm repository metadata.
+The current and planned organization names are allowlisted as well as the repository ID.
+Historical releases, attestations and npm packages retain their original identities.
+
+An organization rename also requires the operator to configure the exact new npm trusted
+publisher (organization, repository, `release.yml`, `npm` environment and direct publish
+permission) before any new release. Keep the previous publisher during qualification, then
+remove it only after validating the new path. Updating source does not update npm settings,
+publish a release, or prove historical attestation lookup works after a rename. Qualify an
+old exact npm version with required provenance and an uncached binary after cutover; do not
+turn off verification to work around a failure.
+
 ## Activating the reusable local-validation workflow
 
 The reusable `.github/workflows/local-validation-reconcile.yml` interface must not be adopted before its exact npm release exists. The current source-build verifier remains active until a release contains `reconcile`, path-scoped recipes and exempt paths, the opt-in authenticated GitHub fetch boundary, and the reusable workflow itself.

@@ -123,6 +123,24 @@ test('provenance needs gh installed and signed in', () => {
   assert.equal(provenanceGap(ran({ '--version': { status: 0 }, auth: { status: 0 } })), null);
 });
 
+test('provenance auth probes GitHub.com despite a different GH_HOST', () => {
+  const saved = process.env.GH_HOST;
+  process.env.GH_HOST = 'untrusted.invalid';
+  try {
+    assert.equal(provenanceGap((_cmd, args) => {
+      if (args[0] === '--version') return { status: 0 };
+      assert.deepEqual(args, ['auth', 'status', '--hostname', 'github.com']);
+      return { status: 0 };
+    }), null);
+    assert.equal(checkProvenance(sample, '1.2.3', null, (_cmd, _args, options) => {
+      assert.equal(options.env.GH_HOST, 'github.com');
+      return { status: 0 };
+    }), true);
+  } finally {
+    if (saved === undefined) delete process.env.GH_HOST; else process.env.GH_HOST = saved;
+  }
+});
+
 test('without gh, provenance is reported to the caller unless required', () => {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'agentscm-test-'));
   const saved = { PATH: process.env.PATH, req: process.env.AGENTSCM_REQUIRE_PROVENANCE };
