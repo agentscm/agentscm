@@ -2,7 +2,7 @@
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
 
-Choose a version from [Releases](https://github.com/counterbranch/agentscm/releases). In the examples
+Choose a version from [Releases](https://github.com/agentscm/agentscm/releases). In the examples
 below, replace `<version>` with that version without its leading `v`. Container images are
 versioned; alpha releases do not publish a `latest` image tag. For reproducible installs, keep the
 selected version or image digest in your deployment configuration.
@@ -49,7 +49,7 @@ See [Windows](#windows) for what the Windows build supports.
 ## Shell script
 
 ```sh
-curl -fsSL https://github.com/counterbranch/agentscm/releases/download/v<version>/install.sh | sh
+curl -fsSL https://github.com/agentscm/agentscm/releases/download/v<version>/install.sh | sh
 ```
 
 `install.sh` is POSIX shell only (Linux and macOS); on Windows use `npx agentscm`. The `install.sh` attached to each release is pinned to that release. Run from a clone, it needs `AGENTSCM_VERSION=<version>`. When piped, it reads prompts from `/dev/tty`. New release scripts reject an `AGENTSCM_VERSION` override that selects another version; use the `install.sh` attached to the requested release so it checks that release's signing identity. Previously published scripts are unchanged. For a historical version, use its own release script or matching source tag; the current source trusts only its configured publishing namespace.
@@ -57,7 +57,7 @@ curl -fsSL https://github.com/counterbranch/agentscm/releases/download/v<version
 ## Docker
 
 ```sh
-docker run --rm -it ghcr.io/counterbranch/agentscm:<version> --help
+docker run --rm -it ghcr.io/agentscm/agentscm:<version> --help
 ```
 
 Use this as an explicit fallback on a supported Linux AMD64 or ARM64 Docker daemon. A macOS or Windows host needs a Linux VM, such as Docker Desktop. The release workflow builds both image architectures; use a release that publishes the matching architecture. An unsupported host architecture still needs a supported Docker daemon or an existing remote hub. The image's default command serves on all interfaces inside the container, so when you publish a port, bind it to loopback: `-p 127.0.0.1:7331:7331` (`7332` for the hub). See [deployment](deployment.md) for running the hub.
@@ -262,16 +262,31 @@ If you download a binary from the release page instead of using `npx agentscm` o
 
 ## Verify by hand
 
+The examples below apply to releases originally published by `agentscm/agentscm`.
+Historical releases keep the signer recorded when they were published, even if their download
+URLs redirect after the organization rename. For `0.1.0-alpha.8`, the binary's verification command is:
+
+```sh
+GH_HOST=github.com gh attestation verify agentscm-<target> --repo counterbranch/agentscm \
+  --signer-workflow counterbranch/agentscm/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0-alpha.8 --deny-self-hosted-runners
+```
+
+Use the matching release's documentation or installer for other historical versions. Select its
+recorded identity before verifying; do not guess the signer from a redirect or retry another
+identity after failure. Historical attestation API lookup after rename requires operator
+qualification; a lookup failure is not permission to omit provenance.
+
 On Linux and macOS:
 
 ```sh
 export GH_HOST=github.com
 cd "$(mktemp -d)"
-base=https://github.com/counterbranch/agentscm/releases/download/v<version>
+base=https://github.com/agentscm/agentscm/releases/download/v<version>
 curl -fsSLO "$base/SHA256SUMS" -O "$base/agentscm-<target>"
 shasum -a 256 -c --ignore-missing SHA256SUMS   # on Linux: sha256sum -c --ignore-missing
-GH_HOST=github.com gh attestation verify agentscm-<target> --repo counterbranch/agentscm \
-  --signer-workflow counterbranch/agentscm/.github/workflows/release.yml \
+gh attestation verify agentscm-<target> --repo agentscm/agentscm \
+  --signer-workflow agentscm/agentscm/.github/workflows/release.yml \
   --source-ref refs/tags/v<version> --deny-self-hosted-runners
 ```
 
@@ -279,12 +294,12 @@ On Windows (PowerShell):
 
 ```powershell
 $env:GH_HOST = "github.com"
-$base = "https://github.com/counterbranch/agentscm/releases/download/v<version>"
+$base = "https://github.com/agentscm/agentscm/releases/download/v<version>"
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
 Invoke-WebRequest "$base/agentscm-x86_64-pc-windows-msvc.exe" -OutFile agentscm-x86_64-pc-windows-msvc.exe
 Get-FileHash -Algorithm SHA256 agentscm-x86_64-pc-windows-msvc.exe   # compare with its line in SHA256SUMS
-gh attestation verify agentscm-x86_64-pc-windows-msvc.exe --repo counterbranch/agentscm `
-  --signer-workflow counterbranch/agentscm/.github/workflows/release.yml `
+gh attestation verify agentscm-x86_64-pc-windows-msvc.exe --repo agentscm/agentscm `
+  --signer-workflow agentscm/agentscm/.github/workflows/release.yml `
   --source-ref refs/tags/v<version> --deny-self-hosted-runners
 ```
 

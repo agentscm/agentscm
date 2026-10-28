@@ -125,4 +125,4 @@ Full list: [changelog known limits](../CHANGELOG.md), [hub limits](hub.md#limits
 
 ## 8. Reporting problems
 
-Open an issue at <https://github.com/counterbranch/agentscm/issues> with the version, the step that failed and the exact error. Remove tokens, URLs with setup links, and private repository names first. Report suspected vulnerabilities privately, not in an issue; see [SECURITY.md](../SECURITY.md).
+Open an issue at <https://github.com/agentscm/agentscm/issues> with the version, the step that failed and the exact error. Remove tokens, URLs with setup links, and private repository names first. Report suspected vulnerabilities privately, not in an issue; see [SECURITY.md](../SECURITY.md).

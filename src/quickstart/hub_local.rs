@@ -34,10 +34,7 @@ pub(crate) struct Options {
 
 /// The published image for this build: the bare Cargo version, never `latest`.
 pub(crate) fn default_image() -> String {
-    format!(
-        "ghcr.io/counterbranch/agentscm:{}",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("ghcr.io/agentscm/agentscm:{}", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -2237,10 +2234,7 @@ mod tests {
     fn default_image_is_the_bare_cargo_version() {
         assert_eq!(
             default_image(),
-            format!(
-                "ghcr.io/counterbranch/agentscm:{}",
-                env!("CARGO_PKG_VERSION")
-            )
+            format!("ghcr.io/agentscm/agentscm:{}", env!("CARGO_PKG_VERSION"))
         );
         assert!(!default_image().contains(":v") && !default_image().ends_with("latest"));
         assert!(compose_text().contains(&format!("${{AGENTSCM_HUB_IMAGE:-{}}}", default_image())));

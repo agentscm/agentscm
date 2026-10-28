@@ -75,8 +75,8 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
     let common = json!({"name":"agentscm", "version":env!("CARGO_PKG_VERSION"),
         "description":"Coordination hooks for configured AgentSCM checkouts.",
         "author":{"name":"DUVATL, Inc."},
-        "homepage":"https://github.com/counterbranch/agentscm",
-        "repository":"https://github.com/counterbranch/agentscm"});
+        "homepage":"https://github.com/agentscm/agentscm",
+        "repository":"https://github.com/agentscm/agentscm"});
     // This compatibility format is understood by installed Codex desktop versions.
     // A full portable manifest can shadow the compatibility hook declaration there.
     let portable = json!({"name":"agentscm"});
@@ -136,8 +136,8 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
         "name":"agentscm", "displayName":"AgentSCM", "version":version,
         "description":"Coordinate agent edits in checkouts connected to AgentSCM Hub.",
         "author":{"name":"DUVATL, Inc."},
-        "homepage":"https://github.com/counterbranch/agentscm",
-        "repository":"https://github.com/counterbranch/agentscm",
+        "homepage":"https://github.com/agentscm/agentscm",
+        "repository":"https://github.com/agentscm/agentscm",
         "icon":"./assets/icon.png"
     });
     let json_file = |path, value| {

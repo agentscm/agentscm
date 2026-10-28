@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        For security issues, do not file here. Use [private vulnerability reporting](https://github.com/counterbranch/agentscm/security/advisories/new).
+        For security issues, do not file here. Use [private vulnerability reporting](https://github.com/agentscm/agentscm/security/advisories/new).
   - type: input
     id: version
     attributes:

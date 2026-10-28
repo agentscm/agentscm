@@ -2483,7 +2483,7 @@ fn failed_hub_pull_leaves_no_setup_files_or_record_and_honors_platform() {
         let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
         assert!(
             commands.contains(&format!(
-                "pull --platform {} ghcr.io/counterbranch/agentscm:",
+                "pull --platform {} ghcr.io/agentscm/agentscm:",
                 platform.unwrap_or("linux/amd64")
             )),
             "{commands}"
