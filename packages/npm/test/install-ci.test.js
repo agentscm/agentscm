@@ -17,7 +17,7 @@ const target = {
 const skip = !target && 'reconcile full-process fixtures require a supported POSIX host';
 const version = '0.0.0-ci-test';
 const asset = `agentscm-${target}`;
-const releaseUrl = `https://github.com/counterbranch/agentscm/releases/download/v${version}`;
+const releaseUrl = `https://github.com/agentscm/agentscm/releases/download/v${version}`;
 const reconcileArgs = [
   'local-validation', 'reconcile', '--github-repo', 'example/project', '--base', 'main',
   '--repo', 'checkout with spaces', '--verifier-workflow', '.github/workflows/local-validation.yml',
@@ -115,7 +115,7 @@ function fixture(t, options = {}) {
   for (const file of ['lib/install.js', 'bin/agentscm.js']) {
     fs.copyFileSync(path.join(__dirname, '..', file), path.join(pkg, file));
   }
-  const repository = options.repository ?? 'counterbranch/agentscm';
+  const repository = options.repository ?? 'agentscm/agentscm';
   const fixtureReleaseUrl = `https://github.com/${repository}/releases/download/v${version}`;
   const wrapper = path.join(pkg, 'lib/install.js');
   fs.writeFileSync(wrapper, fs.readFileSync(wrapper, 'utf8').replace(/^const REPO = '[^']+';$/m, `const REPO = '${repository}';`));

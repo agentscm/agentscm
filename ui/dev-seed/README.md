@@ -10,6 +10,7 @@ ui/dev-seed/start.sh
 - Port: `AGENTSCM_DEV_HUB_PORT=7372 ui/dev-seed/start.sh` serves on another port (default 7332); `.hub.env`
   records it. Each worktree has its own `.data/`, so two worktrees only need different ports. The UI tests
   and `npm run dev` read `AGENTSCM_HUB` (see `ui/README.md`).
+- The old namespace below is deliberately retained as a synthetic fixture identity, not a live product connection after the organization rename. Use only a disposable scratch checkout with that fixture origin; do not attach these synthetic tokens to a real renamed checkout.
 - Repository: the tokens are for `counterbranch/agentscm`. A scratch checkout used with them must have an
   `origin` naming that repository, or `agentscm intent check` silently does nothing (wrong repository, no output).
 - `mint/` is a separate crate, built by `start.sh` with an absolute `CARGO_TARGET_DIR` (a relative one silently

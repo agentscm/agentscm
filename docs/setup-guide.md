@@ -109,7 +109,19 @@ It reads `quickstart.json`, shows exactly what it will remove, and asks (or `--y
 ## Limits
 
 - The release workflow builds and tests native `linux/amd64` and `linux/arm64` children before assembling the versioned image index. Older published images may contain only AMD64. Quickstart does not silently enable emulation: an operator can explicitly choose `DOCKER_DEFAULT_PLATFORM=linux/amd64`, subject to the Docker runtime supporting it. Emulation is slower and is not universal. Remote Docker contexts are refused because their loopback port would not reach this machine.
-- The Docker fallback needs Docker Engine, Compose and the published image `ghcr.io/counterbranch/agentscm:<version>` (the version of this binary, without a `v`). Images are published with each release from 0.1.0-alpha.1. To use another image, set `AGENTSCM_HUB_IMAGE`; quickstart saves it in the hub's `.env`. If the image can't be pulled, quickstart says so and offers an existing hub or skipping.
+- The Docker fallback needs Docker Engine, Compose and the published image `ghcr.io/agentscm/agentscm:<version>` (the version of this binary, without a `v`). Images are published with each release from 0.1.0-alpha.1. To use another image, set `AGENTSCM_HUB_IMAGE`; quickstart saves it in the hub's `.env`. If the image can't be pulled, quickstart says so and offers an existing hub or skipping.
+
+Existing npm packages and installed binaries retain their original Docker image defaults. During
+the organization-rename window, a successful old-package download/provenance check does not
+prove that its binary can create or recreate a Docker Hub. After the operator verifies the moved
+image's version and digest, use the existing override with that exact reference, for example
+`AGENTSCM_HUB_IMAGE='ghcr.io/agentscm/agentscm:<version>@sha256:<verified-digest>'`
+when running `agentscm quickstart --hub local --hub-runtime docker`. Quickstart prefers this
+explicit override and saves it in `~/.agentscm/hub/.env`; inspect its preview and retained `.env`
+so a previous old-namespace override does not survive unnoticed. Keep the same project, volumes
+and Hub data. Fresh Docker setup after the rename remains unqualified until this override or a
+new release is verified on the intended host.
+
 - The local hub's first-run setup is GitHub only today. For a GitLab repository connect to an existing hub.
 - Platform selection and generated Docker files have unit coverage; fake-Docker integration tests verify failed pulls write no setup files and uninstall keeps data by default. Matching-image acquisition, runtime lifecycle, GitHub App setup and sign-in require live qualification before release. Emulation needs its own runtime-specific qualification.
 - The agent setup step reuses `client setup`, which has unit and stub-hub coverage but no live qualification through quickstart. Other hosts and clients need their own live qualification. The hooks are advisory: a hub problem is reported as "coordination unknown" and never blocks the agent.

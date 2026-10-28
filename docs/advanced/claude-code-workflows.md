@@ -218,7 +218,7 @@ The opt-in [Community workspace](community-workspace.md) adds members, permissio
 settings and shared execution. Its [laptop-to-hosted flow](hosted-laptop-workflows.md)
 synchronizes source/context and runs this loop remotely. Skill/workflow editing
 and broader management remain tracked in
-[issue #20](https://github.com/counterbranch/agentscm/issues/20).
+[issue #20](https://github.com/agentscm/agentscm/issues/20).
 
 Unknown external outcomes retain their reservation. Inspect/cancel an interrupted run, then
 explicitly refresh its context before trying again; the controller does not replay uncertain

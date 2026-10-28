@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const REPO = 'counterbranch/agentscm';
+const REPO = 'agentscm/agentscm';
 const SUMS_MAX = 64 * 1024;
 const BINARY_MAX = 200 * 1024 * 1024;
 const VERIFY_OUTPUT_MAX = 1024 * 1024;

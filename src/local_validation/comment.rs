@@ -15,7 +15,7 @@ pub const MAX_COMMENT_BYTES: usize = 60 * 1024;
 pub const MARKER_PREFIX: &str = "<!-- agentscm-local-validation:v1 ";
 const ENVELOPE_FENCE: &str = "```agentscm-envelope-v1";
 const RECORD_FENCE: &str = "```agentscm-record-v1";
-const LOGO_URL: &str = "https://raw.githubusercontent.com/counterbranch/agentscm/24b70c0796e8288d1560adda36a1590e613d0ffc/docs/assets/agentscm-icon.png";
+const LOGO_URL: &str = "https://raw.githubusercontent.com/agentscm/agentscm/24b70c0796e8288d1560adda36a1590e613d0ffc/docs/assets/agentscm-icon.png";
 
 pub fn envelope_sha256(envelope: &[u8]) -> String {
     format!("{:x}", Sha256::digest(envelope))
