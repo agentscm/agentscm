@@ -1,3 +1,7 @@
+---
+title: "Hosted hub setup (agent-guided)"
+---
+
 # Hosted hub setup (agent-guided)
 
 > **Operating a hosted hub is not supported in the alpha. It will likely break and is not for production.** APIs, CLI, storage and schemas may change without migration, and the authority database cannot be downgraded. Nobody is on call for a hosted hub. See the [changelog](../CHANGELOG.md) for known limits.

@@ -1,69 +1,47 @@
+---
+title: "Documentation"
+---
+
 # Documentation
 
-> **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
+> **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See
+> the [project README](../README.md) for product status
+> and the [changelog](../CHANGELOG.md) for known limits.
 
 ## Start here
 
-- [README](../README.md): what AgentSCM is, a local demo and the quickstart (a team hub takes about fifteen minutes to set up)
-- [Install options](install.md): npx, a release binary, `install.sh` or the container
-- [Two agents, one warning](two-agent-demo.md): run a hub and see an agent warned about another's edit
-- [Concepts in plain English](concepts.md): the glossary
+- [Try the scripted demo](scripted-demo.md): no account or Docker, no repository changes.
+- [Install and connect agents](install.md): run a local Hub or join one that already runs; review platform limits first.
+- [Guided setup](setup-guide.md): what quickstart detects, changes and leaves for you to confirm.
+- [Concepts](concepts.md): the Hub, intents, hooks and native workflows in plain English.
 
-## Guides
+## Coordinate work
 
-- [Agent source selection](advanced/agent-source-workflow.md) — inspect before checkout, expand dependencies, and report measured working-file savings in native or Git tasks.
+- [Supported agents](agents.md): client support levels, setup and hook behavior.
+- [Collision warnings](collisions.md) and [work intents](intents.md): announce work and see where agents overlap.
+- [Join an existing Hub](team-member-onboarding.md) or read the [Hub operator guide](hub.md).
+- [Two-container Hub walkthrough](two-agent-demo.md): Docker, GitHub App and a repository you can connect are required.
+- [Deployment](deployment.md): local and single-server operating choices. [Hosted setup](hosted.md) is an unsupported alpha path.
 
-- [Guided setup: `agentscm quickstart`](setup-guide.md)
-- [Join an existing team Hub](team-member-onboarding.md): connect a developer's local agent without administering the server
-- [Usage telemetry: data, activation and controls](telemetry.md)
-- [Early collision warnings](collisions.md)
-- [Autopsy: how often your own sessions collided](autopsy.md)
-- [Work intents](intents.md) and the Claude Code hook
-- [Local workspace snapshot timeline](workspace-timeline.md): capture and inspect bounded native-workspace observations, or fork an earlier observation into another Change
-- [Asynchronous agent stand-up](standup.md): durable work claims, checkpoint handovers and bounded catch-up
-- [Local change capture](change-capture.md): configure-once Claude hooks, source-bound action receipts and concise transcript-free handoff
-- [Open the Hub from this computer](connect-this-computer.md): `agentscm open` shows your files, saved conversations and your team's work in one page
-- [Repository explorer](repository-explorer.md): browse committed Git files, history and diffs alongside private local conversation and source-bound evidence
-- [Work insights](work-insights.md): bounded timing, coordination, usage reports and stored publication observations
-- [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
-- [Slack adapter](slack.md) and [capability map](slack-capabilities.md): optional direct messages for coordination moments that need a person, with handoff buttons.
-- [Multi-user coordination hub](hub.md), including [what the hub stores](hub.md#data-the-hub-stores)
-- [Deployment](deployment.md)
-- [Hosted hub setup (agent-guided, unsupported in the alpha)](hosted.md)
+## Native workflow alpha
 
-## Reference
+- [Architecture and trust boundaries](architecture.md)
+- [Claude Code workflow loop](advanced/claude-code-workflows.md)
+- [Community workspace pilot](advanced/community-workspace.md)
+- [Usage telemetry: data and controls](telemetry.md)
+- [Roadmap and proposed work](roadmap.md)
 
-- [HTTP API](api.md)
-- [Native CLI reference](reference/cli.md)
-- [Specification (draft)](spec/agentic-scm.md) and [architecture](architecture.md)
-- [Roadmap](roadmap.md)
-- [Design: supported skills](design/supported-skills.md) (`pr-gate` v1 is built and experimental; the rest is proposed)
-- [Design: sign in once per computer](design/computer-sign-in.md) (experimental)
+These native workflow features are opt-in experiments for trusted teams. They do not provide a
+production service, a hostile-code security boundary or a qualified scale claim.
 
-## Advanced and experimental
+## Reference and help
 
-The immutable ledger, Git bridges, isolated command checks and
-[source-bound skill workflows](advanced/skill-workflows.md): see the [advanced index](advanced/README.md).
-The [reusable workflow library](advanced/reusable-workflows.md) binds one explicit, versioned
-native manifest to existing Changes without adding a mutable catalog or remote executor.
-Experimental [productive workflow actions](advanced/productive-workflow-actions.md) compose
-bounded prompt-generated text and deterministic artifact commands in that same graph,
-separately from verification and native admission. [Operator-local repository rules](advanced/pipeline-rules.md)
-can enqueue those workflows after a provider-confirmed merge.
-The [local workflow and skill library](advanced/workflow-library.md) adds durable authoring,
-bounded pinned imports, side-effect-free simulation and an explicit export bridge to those rules.
-The local [intent-review workflow](advanced/intent-review.md) lets an existing coding agent execute
-a pinned standalone skill, retain criterion findings and track bounded corrections for Git Work.
-The [Claude Code workflow loop](advanced/claude-code-workflows.md) adds an opt-in local trigger,
-isolated tests, bounded model review and exact-revision native requirements. The opt-in
-[Community workspace pilot](advanced/community-workspace.md) adds persistent membership,
-settings, a shared execution queue and explicit approval/native landing controls. The legacy
-token dashboard and MCP inspect retained runs.
-[Living Promises](advanced/living-promises.md) records owner-authorized commitments and their
-version history in the Workspace Hub, with advisory agent proposals and reports.
+- [CLI reference](reference/cli.md) and [HTTP API](api.md)
+- For setup, sign-in and connection problems, start with [install](install.md), [guided setup](setup-guide.md)
+  or [team member onboarding](team-member-onboarding.md#verify-trust-and-behavior).
+- [Contributor testing](contributor-testing.md), [releasing](releasing.md) and the
+  [contribution guide](../CONTRIBUTING.md)
+- [Security policy](../SECURITY.md)
 
-## For contributors and maintainers
-
-- [Contributing](../CONTRIBUTING.md), [security policy](../SECURITY.md) and [code of conduct](../CODE_OF_CONDUCT.md)
-- [Contributor testing](contributor-testing.md): the nextest gate, focused iteration, coverage comparison and reproducible timing
-- [Releasing](releasing.md)
+The [full documentation source](https://github.com/agentscm/agentscm/tree/main/docs) includes advanced
+workflow, integration and implementation details beyond this guided set.

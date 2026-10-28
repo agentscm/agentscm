@@ -1,3 +1,7 @@
+---
+title: "Releasing"
+---
+
 # Releasing
 
 For maintainers. Releases are alpha prereleases. Nothing is published except by pushing a `v*` tag, and only from the public `agentscm/agentscm` repository (the workflow skips any other repository, and build-provenance attestations need a public one).

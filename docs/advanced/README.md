@@ -1,3 +1,7 @@
+---
+title: "Advanced and experimental"
+---
+
 # Advanced and experimental
 
 > **Experimental (alpha).** Everything in this section is outside the main path (collision warnings, work intents and the hub), may change without migration, and has had limited testing. See the [README](../../README.md) for status and the [changelog](../../CHANGELOG.md) for known limits.

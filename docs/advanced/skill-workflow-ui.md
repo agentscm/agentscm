@@ -1,3 +1,7 @@
+---
+title: "Skill workflow dashboard lookup"
+---
+
 # Skill workflow dashboard lookup
 
 > **Experimental (alpha).** This authenticated read surface displays retained local workflow state. It does not execute a workflow or assess admission.

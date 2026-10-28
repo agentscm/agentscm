@@ -1,3 +1,7 @@
+---
+title: "Local validation attestations"
+---
+
 # Local validation attestations
 
 > **Experimental (alpha).** Unix only, GitHub only, trusted-local. One maintainer key is enrolled. The verifier workflow was qualified before merge by running it under `act` against live GitHub on pull request #86: a signed failure (`failure` on that head), then a fix and a signed pass (`success` on the new head). Tampered, wrong-repository and other-head attestations were checked with `local-validation verify` against the same live comment bodies and gave `pending`. That workflow has since been replaced by `agentscm local-validation reconcile`, which is tested against a fake GitHub and real local bare Git transports; the authenticated GitHub command boundary is inspected with a test-only local transport reroute. It has not run against live GitHub or a private repository. Contributors without an enrolled key or local PostgreSQL and S3 request `ci-extended` for hosted test coverage.

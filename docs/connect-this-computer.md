@@ -1,3 +1,7 @@
+---
+title: "Open the Hub from this computer"
+---
+
 # Open the Hub from this computer
 
 Your team's Hub shows shared coordination: who owns which task, overlaps and handovers. Your

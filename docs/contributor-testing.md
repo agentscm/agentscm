@@ -1,3 +1,7 @@
+---
+title: "Contributor testing"
+---
+
 # Contributor testing
 
 The preferred full test gate uses nextest for unit and integration tests, followed by Cargo's doctest runner because nextest does not run doctests:

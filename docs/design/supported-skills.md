@@ -1,3 +1,7 @@
+---
+title: "Design: AgentSCM supported skills"
+---
+
 # Design: AgentSCM supported skills
 
 > **Status: design, with phase 2 built.** The phase 2 slice in section 6 (`pr-gate` v1, the lock

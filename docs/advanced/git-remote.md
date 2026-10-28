@@ -1,3 +1,7 @@
+---
+title: "Explicit local Git remote exchange"
+---
+
 # Explicit local Git remote exchange
 
 > **Experimental (alpha).** This transport supports one operator-trusted local bare

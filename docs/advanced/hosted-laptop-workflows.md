@@ -1,3 +1,7 @@
+---
+title: "Hosted laptop workflows"
+---
+
 # Hosted laptop workflows
 
 > **Experimental (alpha).** This profile connects a laptop workspace to one

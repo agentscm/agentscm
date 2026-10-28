@@ -1,3 +1,7 @@
+---
+title: "Guided setup: `agentscm quickstart`"
+---
+
 # Guided setup: `agentscm quickstart`
 
 > **Alpha: not for production.** The CLI and the files it writes may change without migration.

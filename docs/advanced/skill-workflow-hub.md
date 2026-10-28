@@ -1,3 +1,7 @@
+---
+title: "Authenticated hub reads for skill workflows"
+---
+
 # Authenticated hub reads for skill workflows
 
 > **Experimental (alpha).** The hub can expose retained native skill workflow status only when

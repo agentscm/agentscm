@@ -41,24 +41,36 @@ AgentSCM connects three parts of that process:
 
 | Your starting point | Use AgentSCM for | Start here |
 |---|---|---|
-| Existing Git repository | Local collision checks; no Hub or account required | Demo below, then [collision checks](docs/collisions.md) |
-| Agents on several machines | Shared work intents, contested-file notices and handoffs | [Two agents, one warning](docs/two-agent-demo.md) |
+| Existing Git repository | Local collision checks; no shared Hub or account required | [Scripted demo](docs/scripted-demo.md), then [collision checks](docs/collisions.md) |
+| Team using an existing Hub | Connect a local coding agent to shared coordination | [Join a Hub](docs/team-member-onboarding.md) |
 | Native workflow pilot | Revision-bound tests/review, explicit approval and native landing | [Claude Code workflow loop](docs/advanced/claude-code-workflows.md) |
 
 For packaged binaries or containers, see [install options](docs/install.md).
 
-**Install.** Run one command, once per computer (not per repository):
+**Try it first.** From a Git repository, run the local demo:
+
+```sh
+npx agentscm demo
+```
+
+It simulates three agents against a temporary Hub. No account, Docker or forge is needed, and it
+writes nothing to your repository. See the [scripted demo guide](docs/scripted-demo.md) for its
+prerequisites and limits.
+
+**Connect your agents.** On macOS or Linux, run one command once per computer (not per repository):
 
 ```sh
 npx agentscm                                    # run a Hub on this computer
 npx agentscm --hub-url https://hub.example.com  # join a Hub that already runs
 ```
 
-It signs you in and sets up every coding agent it finds (Claude Code, Codex, Cursor, GitHub
-Copilot and Gemini CLI) for all your projects, and writes nothing to your repositories. Then fully
-quit and reopen your agents and ask one, in a repository, "Get started with AgentSCM". In Codex,
-run `/hooks` once and trust the AgentSCM hooks. Undo it with `npx agentscm uninstall`. Running a
-local Hub takes two clicks the first time, to create its GitHub App. To share it, see
+Quickstart signs you in and sets up detected coding agents (Claude Code, Codex, Cursor, GitHub
+Copilot and Gemini CLI) for your projects, without writing to your repositories. Then fully quit
+and reopen your agents and ask one, in a repository, "Get started with AgentSCM". In Codex, run
+`/hooks` once and trust the AgentSCM hooks. Undo it with `npx agentscm uninstall`. Windows has an
+alpha CLI, but quickstart does not set up agent integrations there. A managed local Hub runs
+natively only on Apple Silicon macOS; other hosts need Docker or an existing Hub. Creating a new
+local Hub opens a page to create and install its GitHub App, then asks you to sign in. To share it, see
 [Tailscale](docs/install.md#share-your-local-hub-over-tailscale); to deploy a Hub for a team, ask
 your agent to follow [hosted setup](docs/hosted.md). Details: [install](docs/install.md).
 Building from source? Without the `ui` feature the hub serves only a notice page at `/ui/`; for the
@@ -68,17 +80,7 @@ Joining an existing Hub? Use **Connect an agent** in its status page. Your agent
 native approvals and verification; readiness requires recent MCP and native edit-hook observations.
 See [member onboarding](docs/team-member-onboarding.md#verify-trust-and-behavior).
 
-## Try it
-
-From a Git repository:
-
-```sh
-npx agentscm demo
-```
-
-This starts a temporary local Hub, simulates three agents through its real hook endpoint,
-and opens the status page. No account, Docker or forge is required; nothing is written
-to your repository. The agents and their decisions are scripted. Press Ctrl-C to stop.
+## Set up real agents
 
 For your own agents, run `npx agentscm`, or read the [setup guide](docs/setup-guide.md). Existing configuration changes are shown before
 confirmation. The [agent guide](docs/agents.md) distinguishes native hooks, advisory MCP

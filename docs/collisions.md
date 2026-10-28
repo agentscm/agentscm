@@ -1,3 +1,7 @@
+---
+title: "Early collision warnings (Git only)"
+---
+
 # Early collision warnings (Git only)
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.

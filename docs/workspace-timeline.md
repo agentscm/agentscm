@@ -1,3 +1,7 @@
+---
+title: "Local workspace snapshot timeline"
+---
+
 # Local workspace snapshot timeline
 
 > **Experimental (alpha).** This local native-workspace feature may change without migration.

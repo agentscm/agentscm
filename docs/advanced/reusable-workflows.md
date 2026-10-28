@@ -1,3 +1,7 @@
+---
+title: "Reusable skill workflow templates"
+---
+
 # Reusable skill workflow templates
 
 > **Experimental (alpha).** This is a trusted-local, single-writer workflow library for an

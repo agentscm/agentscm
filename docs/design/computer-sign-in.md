@@ -1,3 +1,7 @@
+---
+title: "Design: sign in once per computer"
+---
+
 # Design: sign in once per computer
 
 > **Status: experimental.** Built as described below; see [the roadmap](../roadmap.md) for what

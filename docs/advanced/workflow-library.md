@@ -1,3 +1,7 @@
+---
+title: "Local workflow and skill library"
+---
+
 # Local workflow and skill library
 
 `agentscm open` exposes a durable workflow library in the Hub page through the loopback front door. Library mutations require the existing same-origin browser grant and a currently selected connected checkout. A standalone `agentscm serve` read token cannot write the library, and the front door's read-only Hub token is never accepted as local write authority.

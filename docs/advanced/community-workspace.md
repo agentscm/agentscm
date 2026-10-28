@@ -1,3 +1,7 @@
+---
+title: "Community workspace pilot"
+---
+
 # Community workspace pilot
 
 > **Experimental, single-server alpha.** This opt-in workspace adds member and settings management and shared execution of existing native workflows. It is intended for a small trusted team. It does not provide managed hosting, automatic failover or a workflow marketplace. Laptop source/context sync and a remote Claude Code Stop hook are separately opt-in; see the [laptop-to-hosted guide](hosted-laptop-workflows.md).
