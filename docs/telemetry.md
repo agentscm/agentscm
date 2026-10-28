@@ -1,3 +1,7 @@
+---
+title: "Usage telemetry"
+---
+
 # Usage telemetry
 
 > **Staged and inactive by default in this source checkout.** Published alpha releases before this change do not contain product telemetry. This capability cannot transmit until an operator configures an HTTPS endpoint and a data-handling profile and the user-facing notice and choice are completed. AgentSCM has no production telemetry endpoint configured or deployed today.

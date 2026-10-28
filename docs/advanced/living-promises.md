@@ -1,3 +1,7 @@
+---
+title: "Living Promises (experimental authority foundation)"
+---
+
 # Living Promises (experimental authority foundation)
 
 Living Promises retain an owner's original request, commitment, criteria, constraints and relevant Workspace repository keys as immutable versions in the Hub. A signed-in Workspace human with Reader and Contributor roles and grants for every declared key can create a promise or adopt an agent proposal. The creator becomes steward. Agent tokens are scoped to one repository key: they can read promises confined to that key and submit proposals or reports. Multi-repository promises are hidden from those tokens, and agents cannot report on them. Agent inputs are advisory and cannot create, amend or retire an owner promise. The Workspace **Promises** page exposes creation, proposal review and adoption, current versions, history, reports and available owner actions.

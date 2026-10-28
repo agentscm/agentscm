@@ -1,3 +1,7 @@
+---
+title: "Productive workflow actions"
+---
+
 # Productive workflow actions
 
 > Experimental, trusted-local Unix profile. These actions produce bounded text

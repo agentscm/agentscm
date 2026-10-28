@@ -1,3 +1,7 @@
+---
+title: "Slack capability matrix"
+---
+
 # Slack capability matrix
 
 This maps the optional Slack adapter to the AgentSCM capabilities it uses. The implemented surface is exercised locally with signed synthetic requests and a fake Slack API; Slack API access, workspace installation, scopes and rollout status are unverified here.

@@ -1,3 +1,7 @@
+---
+title: "Repository explorer"
+---
+
 # Repository explorer
 
 The repository explorer connects committed Git source with its history and locally retained

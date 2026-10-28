@@ -1,3 +1,7 @@
+---
+title: "Skill workflow read service"
+---
+
 # Skill workflow read service
 
 > **Experimental and trusted-local.** This surface projects retained local workflow state. It does not authenticate an executor or assess admission.

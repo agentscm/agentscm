@@ -1,3 +1,7 @@
+---
+title: "Intent review"
+---
+
 # Intent review
 
 The existing coding agent runs a selected library skill with its normal authorized tools. AgentSCM retains the contract, task leases, findings, correction budget and candidate identities in its workflow journal. Reports are advisory: they do not qualify native admission or approve a merge.

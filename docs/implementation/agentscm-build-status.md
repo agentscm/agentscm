@@ -1,3 +1,7 @@
+---
+title: "Change record implementation status"
+---
+
 # Change record implementation status
 
 > **Local validation recorded 24 October 2026:** M0 and the M1 capture/receipt/handoff slice are implemented and locally validated within the limits below. A first M6 slice (opt-in shared conversations) is implemented and tested locally; the remainder of M6 and M2–M5 and M7–M8 remain separate work.

@@ -1,3 +1,7 @@
+---
+title: "Local change capture"
+---
+
 # Local change capture
 
 AgentSCM can retain a bounded local account of an agent session and bind an observed command to

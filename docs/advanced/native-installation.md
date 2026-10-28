@@ -1,3 +1,7 @@
+---
+title: "Native installation helper (`agentscm setup`)"
+---
+
 # Native installation helper (`agentscm setup`)
 
 > **Contributors only.** `agentscm setup` prepares an explicitly owned local native installation

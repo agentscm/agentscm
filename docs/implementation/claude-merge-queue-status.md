@@ -1,3 +1,7 @@
+---
+title: "GitHub merge queue lane status (Claude)"
+---
+
 # GitHub merge queue lane status (Claude)
 
 Owner: Claude. Integration owner for shared files: Codex. Codex's ledger: `docs/implementation/agentscm-build-status.md` on `feat/change-record-capture-v1`.

@@ -1,3 +1,7 @@
+---
+title: "Work intents: warn agents before they collide"
+---
+
 # Work intents: warn agents before they collide
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.

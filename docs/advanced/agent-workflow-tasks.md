@@ -1,3 +1,7 @@
+---
+title: "Agent-owned workflow task contract"
+---
+
 # Agent-owned workflow task contract
 
 > **Experimental workspace adapter.** The shared task service is exposed through an authenticated workspace HTTP facade, a separate workspace MCP endpoint and the Unix `agent-task` CLI. The CLI drives operator enrollment, typed task calls, exact local collection and bounded signed upload. Existing server-executed skill workflows and the legacy read-only MCP endpoint remain available unchanged.

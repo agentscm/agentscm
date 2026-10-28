@@ -1,3 +1,7 @@
+---
+title: "Attached Git worktrees"
+---
+
 # Attached Git worktrees
 
 Experimental Unix-only local capture, exact native qualification and deliberate Git branch/PR publication. The existing clone is authoritative: attachment operations never write its index, working files or refs. Publication builds a fixed commit in a separately owned bare mirror and never moves the native target or the Git default branch.

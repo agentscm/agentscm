@@ -1,3 +1,7 @@
+---
+title: "Durable local native merges"
+---
+
 # Durable local native merges
 
 > **Experimental (alpha).** This part of AgentSCM is not part of the main path, may change without migration, and has had limited testing. See the [advanced index](README.md).

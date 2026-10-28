@@ -1,3 +1,7 @@
+---
+title: "Agentic SCM specification, v0.2 (draft)"
+---
+
 # Agentic SCM specification, v0.2 (draft)
 
 **Status of this document:** draft for discussion. It describes a protocol and

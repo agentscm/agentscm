@@ -1,6 +1,6 @@
 # Contributing
 
-AgentSCM is alpha software. Small, focused pull requests are welcome; for anything large, open an issue first so we can agree on the shape. Maintainers merge.
+AgentSCM is alpha software. Start with the [documentation index](docs/README.md) for user and contributor guides. Small, focused pull requests are welcome; for anything large, open an issue first so we can agree on the shape. Maintainers merge.
 
 ## Set up
 

@@ -1,3 +1,7 @@
+---
+title: "Operator-local repository pipeline rules"
+---
+
 # Operator-local repository pipeline rules
 
 This experimental Unix CLI installs repository merge rules and feeds the existing

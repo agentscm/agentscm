@@ -1,3 +1,7 @@
+---
+title: "Task-scoped source and workspaces"
+---
+
 # Task-scoped source and workspaces
 
 > **Experimental, trusted-local alpha.** This profile uses one local native source store and workspace journal. It does not add a remote task API, a virtual filesystem, directory IAM or a hostile-code boundary.

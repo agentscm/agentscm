@@ -1,3 +1,7 @@
+---
+title: "GitHub merge queues"
+---
+
 # GitHub merge queues
 
 > **Experimental (alpha).** Unix only, GitHub App connections only. Tested only against the in-process fake GitHub and synthetic fixtures; never run against a live merge queue. The `merge_group` payload field names and whether GitHub accepts a commit status on a group commit as a required check are taken from GitHub's documentation and its published webhook schema, not from a live capture. Do not require the context on a queue-protected branch until the [live qualification](#live-qualification) below has passed.

@@ -1,3 +1,7 @@
+---
+title: "Connect a team member to an existing Hub"
+---
+
 # Connect a team member to an existing Hub
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration.

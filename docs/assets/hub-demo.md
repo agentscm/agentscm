@@ -1,3 +1,7 @@
+---
+title: "Hub walkthrough media"
+---
+
 # Hub walkthrough media
 
 `hub-tour.gif` cycles through four screenshots of the running AgentSCM Hub. The

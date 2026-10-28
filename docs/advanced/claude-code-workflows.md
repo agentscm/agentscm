@@ -1,3 +1,7 @@
+---
+title: "Claude Code workflow loop"
+---
+
 # Claude Code workflow loop
 
 > Experimental, trusted-local alpha. Use synthetic or approved source first. The local

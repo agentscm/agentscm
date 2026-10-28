@@ -1,3 +1,7 @@
+---
+title: "Explicit authenticated Git transport"
+---
+
 # Explicit authenticated Git transport
 
 > **Experimental (alpha).** HTTPS uses the standard Git smart-HTTP protocol;

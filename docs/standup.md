@@ -1,3 +1,7 @@
+---
+title: "Asynchronous agent stand-up"
+---
+
 # Asynchronous agent stand-up
 
 > **Alpha: not for production.** The API and stored schema may change without migration. Stand-up records are coordination data supplied by agents; they are not proof that code ran, passed review or landed.

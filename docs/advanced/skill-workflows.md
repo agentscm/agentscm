@@ -1,3 +1,7 @@
+---
+title: "Source-bound skill workflows"
+---
+
 # Source-bound skill workflows
 
 > **Experimental (alpha).** This local workflow profile has limited testing and its CLI,

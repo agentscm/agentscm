@@ -1,3 +1,7 @@
+---
+title: "Agent source selection: start small, expand when needed"
+---
+
 # Agent source selection: start small, expand when needed
 
 > **Experimental, trusted-local alpha.** This is agent-followed guidance over existing CLI

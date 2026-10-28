@@ -1,3 +1,7 @@
+---
+title: "Slack adapter"
+---
+
 # Slack adapter
 
 The Slack adapter is an optional Core Edition integration for a single-server Unix Hub. It tells people, by direct message as it happens, about the coordination moments that need a person, and lets a file's holder answer a handoff with a button. It accepts only signed Slack lifecycle events and button clicks at `POST /v1/hub/slack` (`src/hub/slack.rs`). A successful installation is separate from verified Slack delivery.

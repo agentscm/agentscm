@@ -1,3 +1,7 @@
+---
+title: "Work insights"
+---
+
 # Work insights
 
 > **Alpha: not for production.** The API and storage schema may change without migration.

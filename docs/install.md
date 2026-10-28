@@ -1,3 +1,7 @@
+---
+title: "Install"
+---
+
 # Install
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
@@ -11,6 +15,14 @@ These docs describe the branch or tag you are viewing. A command present on `mai
 a published binary yet. Use the documentation at the matching release tag, or
 [build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
 
+Want to try AgentSCM before configuring an agent or Hub? From a Git repository, follow the
+[scripted demo](scripted-demo.md). It needs no account, Docker or forge and writes nothing to the
+repository.
+
+The full quickstart agent setup runs on macOS and Linux. The Windows CLI is an alpha port and does
+not configure agent integrations. A managed Hub runs natively only on Apple Silicon macOS; other
+hosts need Docker or a Hub that already runs. See the [platform details](#platforms).
+
 ## Set up this computer
 
 Run one command, once per computer. It is not per repository.
@@ -21,8 +33,10 @@ npx agentscm
 
 This runs a Hub on this computer for you and your agents, signs you in and sets up every coding
 agent it finds. On the first run it opens a page on your machine where you create a GitHub App for
-your Hub (two clicks: **Create**, then **Install** on the repository you want). After that nothing
-else is asked.
+your Hub (two clicks: **Create**, then **Install** on the repositories you want). It then asks for
+your GitHub login to make you the Hub administrator and signs you in through your browser. Quickstart
+does not ask more questions while it configures agents, though each agent host may show its own
+trust prompts. See the [guided setup](setup-guide.md) for the full flow.
 
 To join a Hub that already runs, give its URL. The command signs you in through your browser:
 
