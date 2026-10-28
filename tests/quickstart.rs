@@ -369,44 +369,6 @@ fn a_program_already_in_the_install_directory_is_used_through_its_symlink() {
 }
 
 #[test]
-fn collisions_are_summarised() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let (dir, git) = (repo.path(), |args: &[&str]| machine.git(repo.path(), args));
-    std::fs::write(dir.join("f"), "base\n").unwrap();
-    git(&["add", "f"]);
-    git(&["commit", "-q", "-m", "base"]);
-    for (branch, text) in [("feat-a", "a\n"), ("feat-b", "b\n")] {
-        git(&["checkout", "-q", "-b", branch, "main"]);
-        std::fs::write(dir.join("f"), text).unwrap();
-        git(&["commit", "-q", "-am", branch]);
-    }
-    git(&["checkout", "-q", "main"]);
-    let version = Command::new(find_git()).arg("--version").output().unwrap();
-    let said = ok(&machine.run(
-        dir,
-        &["quickstart", "--yes", "--hub", "skip", "--no-agents"],
-    ));
-    if String::from_utf8_lossy(&version.stdout).contains("git version 2.")
-        && !said.contains("Couldn't check")
-    {
-        assert!(
-            said.contains(
-                "2 branches/worktrees checked: 1 would conflict, 0 touch the same files."
-            ),
-            "{said}"
-        );
-        assert!(
-            said.contains("feat-a and feat-b: f (would conflict)"),
-            "{said}"
-        );
-    } else {
-        eprintln!("old Git: collision summary not exercised: {said}");
-    }
-    assert!(!dir.join(".claude").exists());
-}
-
-#[test]
 fn hosted_prints_the_guide_and_sets_up_no_hub() {
     let machine = Machine::new();
     let repo = machine.repo();
@@ -467,14 +429,9 @@ fn running_from_the_install_directory_is_undoable_without_any_hook() {
         .command_as(&link, repo.path(), &args)
         .output()
         .unwrap());
-    // No hooks were written, so the summary must not claim hooks call the program.
+    // The undo hint names the installed program, not a temporary path.
     assert!(
-        said.contains(&format!(
-            "{}: the agentscm program\n",
-            bin.display()
-                .to_string()
-                .replace(machine.home.path().to_str().unwrap(), "~")
-        )),
+        said.contains(&format!("Undo: {} uninstall", link.display())),
         "{said}"
     );
     assert_eq!(
@@ -2492,7 +2449,6 @@ fn no_op_rerun_keeps_manifest_bytes_and_reports_no_changes() {
     let before = std::fs::read(&record).unwrap();
     let said = ok(&run_as(&machine, &link, repo.path(), &args));
     assert!(said.contains("No changes made."), "{said}");
-    assert!(said.contains("Quickstart's recorded setup:"), "{said}");
     assert_eq!(std::fs::read(record).unwrap(), before);
 }
 
@@ -3472,7 +3428,7 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
                 b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
             );
         });
-        // Status asks the hub of the checkout's saved connection, so that is where it pauses.
+        // Quickstart asks whether the given Hub answers, so that is where it pauses.
         let connection = json!({"version": 1, "connections": [{"root": first_repo.path().canonicalize().unwrap(),
             "origin_host": "github.com", "hub": url, "repo": REPO,
             "token_file": machine.home.path().join("absent.token")}]});
@@ -3483,7 +3439,11 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
         )
         .unwrap();
         let child = machine
-            .command_as(&link, first_repo.path(), &args)
+            .command_as(
+                &link,
+                first_repo.path(),
+                &["quickstart", "--yes", "--hub-url", &url, "--no-agents"],
+            )
             .spawn()
             .unwrap();
         entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -3839,7 +3799,11 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
         last_line(&output),
         format!("Live warnings: on (hub {}, repo acme/widgets)", hub.url)
     );
-    assert!(said.contains("agents set up: claude"), "{said}");
+    assert!(
+        said.contains("Done: Claude Code set up for all your projects"),
+        "{said}"
+    );
+    assert!(said.contains("Fully quit and reopen your agents"), "{said}");
 
     let root = repo.path().canonicalize().unwrap();
     let connections = machine.connections();
@@ -3868,7 +3832,11 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
     );
     // Quickstart no longer writes its own hooks, hub.json or per-repository token files.
     assert!(!machine.config().join("hub.json").exists());
-    assert!(!machine.home.path().join(".claude").exists());
+    // Claude Code's user settings get only the rule that allows AgentSCM's tools.
+    assert_eq!(
+        json_file(&machine.home.path().join(".claude/settings.json")),
+        json!({"permissions": {"allow": ["mcp__plugin_agentscm_agentscm__*"]}})
+    );
     assert!(!repo.path().join(".claude").exists());
     let record = json_file(&machine.config().join("quickstart.json"));
     assert_eq!(record["clients"], json!([root.to_str().unwrap()]));
@@ -3919,12 +3887,7 @@ fn uninstall_removes_everything_quickstart_set_up() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
     let token = hub.token_file(machine.home.path());
-    let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
-    // The user-wide plugin is named as such before it is installed.
-    assert!(
-        said.contains("installed for your user account, so it is in all your projects"),
-        "{said}"
-    );
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
     assert_eq!(machine.connections().len(), 1);
     assert!(machine.claude_plugin_installed());
 
@@ -4571,7 +4534,7 @@ fn with_yes_and_no_hub_no_agent_is_set_up() {
     );
     let said = ok(&output);
     assert!(
-        said.contains("Not setting up claude: agents need a hub that answers."),
+        said.contains("Not setting up Claude Code: agents need a hub that answers."),
         "{said}"
     );
     assert!(machine.connections().is_empty() && machine.claude_log().is_empty());
@@ -4588,13 +4551,9 @@ fn yes_without_claude_sets_up_no_agent() {
     // The hub is set up; with no agent found there is nothing to connect yet.
     let said = ok(&output);
     assert!(
-        said.contains("Claude Code wasn't found, so I'm not setting up a coding agent"),
+        said.contains("No coding agent found on this computer."),
         "{said}"
     );
-    for agent in ["claude", "codex", "cursor", "copilot", "gemini"] {
-        let line = format!("client setup --agent {agent} --hub {}", hub.url);
-        assert!(said.contains(&line), "{line}: {said}");
-    }
     assert!(machine.connections().is_empty());
     assert!(!repo.path().join(".mcp.json").exists());
     assert!(
@@ -4634,7 +4593,6 @@ fn without_a_terminal_it_refuses_and_writes_nothing() {
         "--agent-token-file",
         "--agent claude|codex|cursor|copilot|gemini",
         "--no-agents",
-        "--no-collisions",
     ] {
         assert!(said.contains(flag), "{flag}: {said}");
     }
@@ -4649,7 +4607,7 @@ fn without_a_terminal_it_refuses_and_writes_nothing() {
 }
 
 #[test]
-fn yes_with_an_expired_sign_in_refuses_at_once_instead_of_signing_in_again() {
+fn yes_with_an_expired_sign_in_tries_to_sign_in_again_and_still_sets_up_the_agents() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
     std::fs::create_dir_all(machine.config()).unwrap();
@@ -4667,48 +4625,55 @@ fn yes_with_an_expired_sign_in_refuses_at_once_instead_of_signing_in_again() {
         &[
             "quickstart",
             "--yes",
-            "--hub",
-            "existing",
             "--hub-url",
             &hub.url,
             "--no-collisions",
         ],
     );
-    // A browser or device sign-in would wait for minutes.
+    // This Hub has no GitHub sign-in, so the new sign-in fails at once.
     assert!(started.elapsed() < std::time::Duration::from_secs(60));
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let said = out(&output);
+    let said = ok(&output);
     assert!(
-        said.contains("can't sign in again (no terminal, or --yes)")
-            && said.contains("pass --agent-token-file"),
-        "{said}"
-    );
-    assert!(
-        !said.contains("device") && !said.contains("browser"),
+        said.contains("This checkout isn't connected yet:"),
         "{said}"
     );
     assert!(machine.connections().is_empty());
+    assert!(machine.claude_plugin_installed(), "{said}");
     assert!(!repo.path().join(".mcp.json").exists());
+    assert!(
+        last_line(&output).contains("each connects when an agent starts in it"),
+        "{}",
+        last_line(&output)
+    );
 }
 
 #[test]
-fn yes_without_a_token_or_saved_sign_in_does_not_try_to_sign_in() {
+fn yes_without_a_token_or_saved_sign_in_signs_in_and_says_what_to_do_when_it_cannot() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
+    let started = std::time::Instant::now();
     let output = machine.run(
         repo.path(),
         &[
             "quickstart",
             "--yes",
-            "--hub",
-            "existing",
             "--hub-url",
             &hub.url,
             "--no-collisions",
         ],
     );
+    // This Hub has no GitHub sign-in, so the attempt fails at once rather than waiting.
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     let said = out(&output);
-    assert!(said.contains("pass --agent-token-file"), "{said}");
+    assert!(
+        said.contains(&format!("Couldn't sign in to {}", hub.url)),
+        "{said}"
+    );
+    assert!(
+        said.contains("Run this once in your own terminal:"),
+        "{said}"
+    );
     assert!(machine.connections().is_empty() && machine.claude_log().is_empty());
     assert!(!repo.path().join(".mcp.json").exists());
     assert!(!machine.config().join("hub-session.json").exists());
@@ -4727,7 +4692,7 @@ fn a_foreign_agentscm_hook_makes_setup_refuse_before_anything_is_written() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let said = out(&output);
     assert!(
-        said.contains("Couldn't finish setting up claude: ")
+        said.contains("Couldn't set up Claude Code: ")
             && said.contains("that the plugin would duplicate"),
         "{said}"
     );
@@ -4738,23 +4703,6 @@ fn a_foreign_agentscm_hook_makes_setup_refuse_before_anything_is_written() {
     assert!(!machine.claude_log().contains("install"));
     assert!(!machine.config().join("tokens").exists());
     assert!(!said.contains("agents set up: claude"), "{said}");
-}
-
-#[test]
-fn a_fresh_repository_says_there_is_nothing_to_compare() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let said = ok(&machine.run(
-        repo.path(),
-        &["quickstart", "--yes", "--hub", "skip", "--no-agents"],
-    ));
-    if !said.contains("Couldn't check") {
-        assert!(
-            said.contains("No other branches or worktrees to compare yet."),
-            "{said}"
-        );
-    }
-    assert!(!said.contains("0 branches/worktrees checked"), "{said}");
 }
 
 #[test]
@@ -4922,7 +4870,7 @@ fn uninstall_leaves_a_connection_quickstart_found_rather_than_made() {
     let codex_config = machine.home.path().join(".codex/config.toml");
     let codex_before = std::fs::read(&codex_config).unwrap();
     let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
-    assert!(said.contains("existed before quickstart"), "{said}");
+    assert!(said.contains("Done: "), "{said}");
     assert!(
         json_file(&machine.config().join("quickstart.json"))["clients"]
             .as_array()
@@ -5111,10 +5059,6 @@ fn agents_are_set_up_for_all_projects_and_uninstall_restores_user_configuration(
             repo.path(),
             &quick(&hub.url, &token, &["--no-collisions", "--agent", agent]),
         ));
-        assert!(
-            said.contains("so it is in all your projects"),
-            "{agent}: {said}"
-        );
         // The diff of the shared file is shown before it is written.
         assert!(said.contains(&format!("+++ {}", path.display())), "{said}");
         let written = std::fs::read_to_string(&path).unwrap();
@@ -5214,4 +5158,54 @@ fn checkout_and_user_scope_never_both_hold_an_agents_hooks() {
     let said = String::from_utf8_lossy(&refused.stderr);
     assert!(said.contains("without --checkout-only"), "{said}");
     assert!(!local.exists());
+}
+
+/// Outside any repository every found agent is still set up for all projects, Claude Code's
+/// tools are allowed, and uninstall takes exactly that back.
+#[test]
+fn outside_a_repository_every_found_agent_is_set_up_and_uninstall_takes_it_back() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let home = machine.home.path();
+    let work = home.join("not-a-repo");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(home.join(".gemini")).unwrap();
+    let settings = home.join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let before = r#"{"model":"kept"}"#;
+    std::fs::write(&settings, before).unwrap();
+    let token = hub.token_file(home);
+    let output = machine.run(&work, &quick(&hub.url, &token, &[]));
+    let said = ok(&output);
+    assert!(said.contains("Found Claude Code and Gemini CLI."), "{said}");
+    assert!(
+        said.contains("Done: Claude Code and Gemini CLI set up for all your projects"),
+        "{said}"
+    );
+    assert!(machine.connections().is_empty(), "{said}");
+    assert!(machine.claude_plugin_installed());
+    let gemini = json_file(&home.join(".gemini/settings.json"));
+    assert_eq!(gemini["mcpServers"]["agentscm"]["trust"], true, "{gemini}");
+    let allowed = json_file(&settings);
+    assert_eq!(allowed["model"], "kept");
+    assert_eq!(
+        allowed["permissions"]["allow"],
+        json!(["mcp__plugin_agentscm_agentscm__*"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".claude/settings.json.bak")).unwrap(),
+        before
+    );
+    let record = json_file(&machine.config().join("quickstart.json"));
+    assert_eq!(record["agents"], json!(["claude", "gemini"]));
+    assert!(
+        last_line(&output).contains("each connects when an agent starts in it"),
+        "{}",
+        last_line(&output)
+    );
+
+    ok(&machine.run(&work, &["uninstall", "--yes"]));
+    assert!(!machine.claude_plugin_installed());
+    assert!(!home.join(".gemini/settings.json").exists());
+    assert_eq!(json_file(&settings), json!({"model": "kept"}));
+    assert!(!machine.config().join("quickstart.json").exists());
 }

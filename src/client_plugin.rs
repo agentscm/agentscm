@@ -627,6 +627,82 @@ pub(crate) fn claude_plugin_installed(root: &Path) -> bool {
     claude_plugins(root).is_ok_and(|plugins| matches!(claude_plugin(&plugins), Ok(Some(_))))
 }
 
+/// Claude Code's rule allowing every tool of the plugin's MCP server. A plugin cannot ship
+/// permission rules, so setup adds this one to the user's settings.
+pub(crate) const CLAUDE_ALLOW: &str = "mcp__plugin_agentscm_agentscm__*";
+
+fn claude_user_settings() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("HOME is not set"))?;
+    let path = claude_config_dir(&home)?.join("settings.json");
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// Edits `permissions.allow` in the user's Claude Code settings, keeping every other key.
+/// `add` puts [`CLAUDE_ALLOW`] in, keeping the old file as `settings.json.bak`; otherwise it is
+/// taken out. Returns whether the file changed.
+fn edit_claude_allow(path: &Path, add: bool) -> Result<bool> {
+    let before = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut value: Value = match &before {
+        Some(text) => serde_json::from_str(text).map_err(|_| {
+            invalid(&format!(
+                "{} is not strict JSON, so AgentSCM's tools were not allowed there",
+                path.display()
+            ))
+        })?,
+        None => json!({}),
+    };
+    let top = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("Claude Code settings must be a JSON object"))?;
+    let permissions = top
+        .entry("permissions")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| invalid("Claude Code settings have an unexpected permissions shape"))?;
+    let allow = permissions
+        .entry("allow")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid("Claude Code settings have an unexpected permissions.allow"))?;
+    if allow.iter().any(|rule| rule == CLAUDE_ALLOW) == add {
+        return Ok(false);
+    }
+    if add {
+        allow.push(json!(CLAUDE_ALLOW));
+    } else {
+        allow.retain(|rule| rule != CLAUDE_ALLOW);
+        if allow.is_empty() {
+            permissions.remove("allow");
+        }
+        if permissions.is_empty() {
+            top.remove("permissions");
+        }
+    }
+    if add && let Some(text) = &before {
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(".bak");
+        crate::hub_cli::write_private(Path::new(&backup), text)?;
+    }
+    crate::hub_cli::write_private(path, &(serde_json::to_string_pretty(&value)? + "\n"))?;
+    Ok(true)
+}
+
+/// Allows every AgentSCM MCP tool in Claude Code; `true` when this call added the rule, so
+/// uninstall takes out only a rule setup added.
+pub(crate) fn allow_claude_tools() -> Result<bool> {
+    edit_claude_allow(&claude_user_settings()?, true)
+}
+
+pub(crate) fn disallow_claude_tools() -> Result<()> {
+    edit_claude_allow(&claude_user_settings()?, false).map(|_| ())
+}
+
 fn check_installed_claude_plugins(root: &Path) -> Result<()> {
     let plugins = claude_plugins(root)?;
     claude_plugin(&plugins).map(|_| ())
@@ -988,6 +1064,35 @@ fn run_for_root(args: PluginArgs, root: &Path, program: &Path, announce: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_claude_allow_rule_is_added_once_with_a_backup_and_removed_exactly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let before = r#"{"model":"opus","permissions":{"allow":["Bash(ls)"]}}"#;
+        std::fs::write(&path, before).unwrap();
+        assert!(edit_claude_allow(&path, true).unwrap());
+        assert!(!edit_claude_allow(&path, true).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("settings.json.bak")).unwrap(),
+            before
+        );
+        let added: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(added["model"], "opus");
+        assert_eq!(
+            added["permissions"]["allow"],
+            json!(["Bash(ls)", CLAUDE_ALLOW])
+        );
+        assert!(edit_claude_allow(&path, false).unwrap());
+        let removed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed, serde_json::from_str::<Value>(before).unwrap());
+        // A new file gets only the rule, and taking it out leaves an empty object.
+        let fresh = dir.path().join("new.json");
+        assert!(edit_claude_allow(&fresh, true).unwrap());
+        assert!(edit_claude_allow(&fresh, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "{}\n");
+    }
 
     fn version_root(output: &Path) -> PathBuf {
         let manifest: Value = serde_json::from_slice(

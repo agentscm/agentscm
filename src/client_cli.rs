@@ -22,7 +22,7 @@ mod computer;
 use crate::intent_cli::valid_repo;
 use crate::prompt::Ui;
 pub(crate) use computer::{attention, auto_connect_command, due, renew_command};
-// Only the local Hub page (Unix) and the macOS tray enroll from outside the client.
+// The local Hub page, quickstart and the macOS tray enroll from outside the client.
 #[cfg(unix)]
 pub(crate) use computer::enroll;
 
@@ -201,7 +201,8 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
         ClientCommand::Setup(args) => {
             let root = selected_root(args.connect.root.as_deref())?;
             let ui = Ui { yes: false };
-            let program = std::env::current_exe()?;
+            // Never a build directory or npm cache: the user-wide plugin outlives this run.
+            let program = crate::quickstart::setup_program()?;
             let scope = if args.checkout_only {
                 crate::client_setup::Scope::Checkout
             } else {

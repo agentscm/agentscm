@@ -1259,6 +1259,10 @@ fn resolve(
 /// What the agent gets when the hub cannot be consulted: valid JSON that never blocks. The note
 /// is printed once per (agent, session); later calls in that session get the silent no-op.
 fn unknown_output(agent: &str, payload: &Value, reason: &str) -> Value {
+    // The user-wide hooks run in every project; an edit no connected checkout covers stays quiet.
+    if reason == NO_EDIT_CONNECTION {
+        return fail_open(agent, payload, None);
+    }
     let note = match (session_of(payload), config_dir()) {
         (Some(session), Ok(dir)) => first_note(&dir, agent, session),
         _ => true,
@@ -2299,6 +2303,14 @@ mod tests {
                 assert_eq!(unknown_output(agent, &other, "no token"), json!({}));
             }
         }
+    }
+
+    #[test]
+    fn edits_no_connection_covers_get_no_note() {
+        let out = unknown_output("claude", &event("PreToolUse"), NO_EDIT_CONNECTION);
+        assert!(!out.to_string().contains("coordination unknown"), "{out}");
+        let out = unknown_output("claude", &event("SessionStart"), NO_CONNECTION);
+        assert!(out.to_string().contains("quickstart"), "{out}");
     }
 
     #[test]

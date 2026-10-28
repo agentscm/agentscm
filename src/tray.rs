@@ -38,12 +38,6 @@ pub(crate) fn set_login_enabled(enable: bool, current: &std::path::Path) -> Resu
     })
 }
 
-/// Whether Start at Login is already on, so quickstart need not offer it again.
-#[cfg(target_os = "macos")]
-pub(crate) fn login_enabled() -> bool {
-    login::enabled()
-}
-
 #[cfg(target_os = "macos")]
 fn with_client_lifecycle_using<T>(
     acquire: impl FnOnce() -> Result<std::fs::File>,
