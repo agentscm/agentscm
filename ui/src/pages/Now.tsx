@@ -133,7 +133,7 @@ export function NowPage({ data, d, overview }: { data: HubData; d: Derived | nul
           tone={d && d.contested.length > 0 ? 'bad' : 'ok'}
           title="Contested files"
           count={d ? d.contested.length : undefined}
-          explain="Two agents hold overlapping paths. The hub refuses the second agent’s first edit and lets a repeated edit through."
+          explain="Both agents hold this file. The hub refuses the second agent’s first edit, then lets a repeat through."
         >
           {!d ? (
             <Skeleton rows={3} />
@@ -157,7 +157,7 @@ export function NowPage({ data, d, overview }: { data: HubData; d: Derived | nul
           tone={d && d.prOverlaps.length > 0 ? 'warn' : 'brand'}
           title="Pull requests touching held files"
           count={d ? d.prOverlaps.length : undefined}
-          explain="Open pull or merge requests mirrored from your forge whose changed files overlap paths a live agent holds."
+          explain="Open pull requests whose changed files overlap files an agent holds."
         >
           {!d || !work ? (
             <Skeleton rows={2} />
@@ -223,7 +223,7 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
       title="The repository"
       count={d ? `${plural(all.length, 'area')}` : undefined}
       tone={shown.some((a) => a.crossings > 0) ? 'bad' : 'brand'}
-      explain="One tile per top-level folder an agent holds files in or a task declared it will touch. Deeper colour means more people there. Pick a tile to see who and why."
+      explain="One tile per top-level folder where agents hold files or plan to work. Darker means more people. Pick a tile to see who and why."
     >
       {!d ? (
         <Skeleton rows={4} />

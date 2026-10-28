@@ -39,6 +39,15 @@ describe('sectionFromHash', () => {
     // The current status page's links keep working.
     ['#coordination', 'home'],
     [`#coordination/work/${ID}`, 'work'],
+    // A box anchor opens the page that holds the box.
+    ['#box-needs', 'home'],
+    ['#box-contested', 'now'],
+    ['#box-prs', 'now'],
+    ['#box-map', 'now'],
+    ['#box-agents', 'team'],
+    ['#box-log', 'activity'],
+    ['#box-overlaps', 'inbox'],
+    ['#box-requests', 'inbox'],
     // Unknown or hostile hashes fall back to the dashboard.
     ['#nope', 'home'],
     ['#__proto__', 'home'],

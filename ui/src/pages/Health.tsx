@@ -21,7 +21,7 @@ export function HealthPage({ health }: { health: Health | null }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Is the hub OK?</h1>
-        <p className="answer-text">{!health ? 'Checking…' : ok ? <>Yes. The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'No. The hub reports it is unavailable. This page keeps trying.'}</p>
+        <p className="answer-text">{!health ? 'Checking…' : ok ? <>The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'The hub reports it is unavailable. This page keeps trying.'}</p>
       </div>
       <SectionTabs />
       {!health ? (
@@ -51,7 +51,7 @@ export function HealthPage({ health }: { health: Health | null }) {
                   ))}
                 </dl>
               </Box>
-              <Box tour="health-speed" icon="stopwatch" title="Hook speed" explain="95% of the last 1024 hook calls were answered within this time. The bar fills toward a 250 ms budget.">
+              <Box tour="health-speed" icon="stopwatch" title="Hook speed" explain="95% of the last 1024 hook calls were answered this fast. The bar fills toward a 250 ms budget.">
                 <div className="latency">
                   <span className="latency-value">{p95 > 0 ? <>{Math.round(p95) || '<1'} <small>ms</small></> : <span className="muted">No hook calls measured yet</span>}</span>
                   <span className="muted small">p95 of {BUDGET_MS} ms budget</span>

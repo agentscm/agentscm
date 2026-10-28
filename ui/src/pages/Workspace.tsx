@@ -134,7 +134,7 @@ function Confirm({ label, icon, question, confirm, disabled, busy, onConfirm, to
 function Login() {
   const load = usePoll((signal) => workspaceRequest<{ providers: string[] }>('/login', { signal }), 0, 'login')
   return (
-    <Box tour="workspace-signin" icon="people" title="Sign in to your workspace" explain="The workspace uses your GitHub or GitLab account, not a token. Your operator must add your numeric forge identity first.">
+    <Box tour="workspace-signin" icon="people" title="Sign in to your workspace" explain="Sign in with GitHub or GitLab, not a token. An operator has to add your account first.">
       <p>Manage members and run workflows with your forge account.</p>
       {load.kind === 'loading' && <Skeleton rows={1} />}
       {load.kind === 'error' && <Notice title={pollError(load)} action={<button className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>} />}
@@ -211,7 +211,7 @@ function PendingOperations({ session }: { session: WorkspaceSession }) {
   // Stay mounted while a retry is in flight: its success clears the entry before the outcome is shown.
   if (entries.length === 0 && !done && !error && busy === null) return null
   return (
-    <Box icon="arrow-repeat" tone="warn" title="Pending operation recovery" count={entries.length} explain="Requests that may have reached the hub but whose outcome is unknown. Only their non-secret fields and request IDs are kept, in this tab. Nothing is retried automatically.">
+    <Box icon="arrow-repeat" tone="warn" title="Pending operation recovery" count={entries.length} explain="Requests that may have reached the hub, but we don’t know if they worked. Only their request IDs and non-secret fields are kept, in this tab. Nothing is retried for you.">
       {error && <Notice tone="bad" title={error} />}
       {done && (
         <div ref={result} tabIndex={-1}>
@@ -311,7 +311,7 @@ function Execution({ session }: { session: WorkspaceSession }) {
         tour="workspace-runs"
         icon="folder2-open"
         title="Recent runs"
-        explain="Durable workspace execution state, newest first, 20 per page. Unknown and stale runs need operator review before a new attempt."
+        explain="Runs in this workspace, newest first, 20 per page. Have an operator look at unknown or stale runs before you try again."
         actions={
           <>
             <select
@@ -448,7 +448,7 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
       <summary className="box-head">
         <span className="box-badge tone-brand"><Icon name="play-circle" /></span>
         <span className="box-title">New run & native admission{pendingStart ? ' · request outcome unknown' : ''}</span>
-        <Explain text="Choose an operator-configured profile and load an existing native Change. Execution binds to its exact immutable revision." />
+        <Explain text="Pick a profile and load an existing change. The run is tied to that exact revision." />
       </summary>
       <div className="box-body stack">
         {pendingStart && <Notice title="Start request outcome unknown">The original revision and generation are retained. Inspect recent runs, or retry the same request; changing the form is disabled until its outcome is confirmed.</Notice>}
@@ -483,7 +483,7 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
         )}
         {profile && (
           <div className="ws-grid">
-            <span className="form-label">Native Change <Explain text="Pick a current native Change, or paste the ID of any existing one. Loading it shows the exact revision, review context and requirement the run will bind to." /></span>
+            <span className="form-label">Native Change <Explain text="Pick a current change, or paste the ID of any existing one. Loading it shows the revision, review context and requirement the run will use." /></span>
             <div className="d-flex gap-2 flex-wrap align-items-start">
               <Combobox
                 id="ws-change"
@@ -568,7 +568,7 @@ function NativeAdmission({ session, repositoryId, profile, subject, blocked }: {
   }
   return (
     <section className="ws-admission" aria-label="Native approval and landing">
-      <h3 className="h6">Approve and land this revision <Explain text="Approval and landing are separate actions. The server revalidates membership, the exact subject and required workflow evidence for each." /></h3>
+      <h3 className="h6">Approve and land this revision <Explain text="Approving and landing are separate. The server checks membership, the exact change and the required workflow results again for each." /></h3>
       {error && <Notice tone="bad" title={error} />}
       {pending && <Notice title={`${pending.action === 'approve' ? 'Approval' : 'Landing'} outcome unknown`}>Retry keeps the original subject, generation and request ID. Inspect the native state before making a different change.</Notice>}
       {approval && <Notice tone="ok" icon="patch-check" title="Native approval recorded">Approval <code>{approval.approval_id}</code> is bound to the displayed revision and review context.</Notice>}
@@ -692,7 +692,7 @@ function Members({ session, onChanged }: { session: WorkspaceSession; onChanged:
       icon="people"
       title="Members"
       count={members.length}
-      explain="Roles grant separate permissions. Administrator access alone does not grant repository read or execution access."
+      explain="Each role grants its own permissions. An administrator can’t read repositories or run workflows without those roles too."
       actions={<button type="button" className="btn btn-sm btn-primary" disabled={editing !== null} onClick={() => edit(null)}><Icon name="person-plus" /> Add member</button>}
     >
       {error && <Notice tone="bad" title={error} />}
@@ -822,7 +822,7 @@ function SettingsForm({ session, settings, onChanged }: { session: WorkspaceSess
         <label className="form-label" htmlFor="ws-name">Workspace name</label>
         <input id="ws-name" className={`form-control${problem ? ' is-invalid' : ''}`} maxLength={120} value={name} disabled={busy} aria-describedby="ws-name-help" onChange={(e) => setName(e.target.value)} />
         <div id="ws-name-help" className={problem ? 'invalid-feedback d-block' : 'form-text'}>{problem ?? 'Up to 120 characters.'}</div>
-        <label className="form-label mt-3" htmlFor="ws-max-runs">Maximum concurrent runs <Explain text="This hub currently runs one workflow at a time. Additional runs remain queued." /></label>
+        <label className="form-label mt-3" htmlFor="ws-max-runs">Maximum concurrent runs <Explain text="This hub runs one workflow at a time. Others wait in the queue." /></label>
         <input id="ws-max-runs" className="form-control" type="number" value={settings.max_concurrent_runs} min={1} max={1} disabled readOnly />
         <button type="submit" className="btn btn-primary mt-3" disabled={busy || !!problem || name.trim() === settings.name}>Save settings</button>
       </form>

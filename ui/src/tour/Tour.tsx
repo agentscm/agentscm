@@ -83,14 +83,19 @@ export function TourProvider({ section, data, d, overview, children }: { section
   )
 }
 
-/** The page trigger: small, beside the breadcrumbs, so it never competes with the page's answer. */
+/**
+ * The page trigger: small, beside the breadcrumbs, so it never competes with the page's answer.
+ * A page without its own tour offers the welcome tour, so the top bar keeps one shape on every page.
+ */
 export function TourTrigger({ section }: { section: Section }) {
   const tour = useTour()
-  if (!tour || !tourFor(section)) return null
+  if (!tour) return null
+  const key: TourKey = tourFor(section) ? section : 'welcome'
+  const label = key === 'welcome' ? 'Tour the hub' : 'Tour this page'
   return (
-    <button type="button" data-tour="tour-trigger" className="tour-trigger" onClick={() => tour.start(section)} aria-label="Tour this page" title="Tour this page">
+    <button type="button" data-tour="tour-trigger" className="tour-trigger" onClick={() => tour.start(key)} aria-label={label} title={label}>
       <Icon name="question-lg" />
-      <span className="tour-trigger-text">Tour this page</span>
+      <span className="tour-trigger-text">{label}</span>
     </button>
   )
 }

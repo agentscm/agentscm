@@ -169,7 +169,7 @@ function Lookup({ token }: { token: string }) {
         <p className="answer-fact">Each record shows the source, recorded checks, decision, known gaps and next action.</p>
       </div>
       <SectionTabs />
-      <Box icon="search" title="Open a change record" explain="Search by title, agent, branch or issue number, or paste the durable work ID shown on the Work page or returned by an agent.">
+      <Box icon="search" title="Open a change record" explain="Search by title, agent, branch or issue number, or paste a work ID from the Work page or an agent.">
         <div className="lookup">
           <Combobox
             id="change-record-work-id"
@@ -510,19 +510,19 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
       </div>
 
       <div className="grid-2 align-start">
-        <Box icon="bullseye" title="Intent and declared scope" explain="Intent comes from the bounded Work record and is not synthesized from conversation content.">
+        <Box icon="bullseye" title="Intent and declared scope" explain="Taken from the task record, not pieced together from conversations.">
           <p>{summary.intent.title}</p>
           <div className="small muted mb-2">Declared scope</div>
           <Paths items={summary.intent.scope} max={12} />
           {summary.intent.scope_omitted > 0 ? <p className="small muted mt-2 mb-0">{summary.intent.scope_omitted} additional scope entr{summary.intent.scope_omitted === 1 ? 'y' : 'ies'} omitted from this bounded projection.</p> : null}
         </Box>
 
-        <Box icon="signpost-split" title="Decision and next action" explain="Decision status and authorship remain separate from verification. Reading this view never approves or transfers work.">
+        <Box icon="signpost-split" title="Decision and next action" explain="Who decided what is kept apart from whether it was verified. Opening this page doesn’t approve or hand over the work.">
           <DecisionFacts summary={summary} />
         </Box>
       </div>
 
-      <Box icon="camera" title="Action source snapshot" explain="These typed facts identify the source bound to the latest action. Snapshot coverage and content availability remain separate.">
+      <Box icon="camera" title="Action source snapshot" explain="The source the latest action used. How much of it was captured, and whether its content is still available, are shown separately.">
         {summary.subject ? (
           <>
             <SourceFacts source={summary.subject.source} />
@@ -546,7 +546,7 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
       <Box
         icon={action?.kind === 'execution' ? 'terminal' : 'clipboard2-check'}
         title={action?.kind === 'execution' ? 'Latest execution' : 'Latest verification'}
-        explain="Action type, outcome, verification result, freshness, assurance, evidence availability and coverage are independent facts."
+        explain="Each of these is reported on its own. A pass doesn’t mean the result is fresh, trusted or complete."
       >
         <LatestAction summary={summary} />
       </Box>
@@ -556,7 +556,7 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
       </Box>
 
       <div className="grid-2 align-start">
-        <Box icon="list-check" title="Record completeness" explain="Completeness describes retained metadata. It does not turn an unavailable artifact or digest into a passing verification.">
+        <Box icon="list-check" title="Record completeness" explain="How much was recorded. A missing artifact still isn’t a pass.">
           <dl className="tech mb-0">
             {Object.entries(summary.completeness).map(([key, value]) => (
               <Fact key={key} label={COMPLETENESS_LABEL[key as keyof ChangeRecordSummaryV1['completeness']]}>
@@ -566,7 +566,7 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
           </dl>
         </Box>
 
-        <Box tour="change-gaps" icon="question-diamond" tone={summary.unknowns.length || summary.sessions.gaps ? 'warn' : 'ok'} title="Known gaps" count={summary.unknowns.length + summary.sessions.gaps} explain="Unknowns and capture gaps stay visible instead of becoming empty success states.">
+        <Box tour="change-gaps" icon="question-diamond" tone={summary.unknowns.length || summary.sessions.gaps ? 'warn' : 'ok'} title="Known gaps" count={summary.unknowns.length + summary.sessions.gaps} explain="Anything unknown or not captured stays listed here.">
           {summary.unknowns.length === 0 && summary.sessions.gaps === 0 ? (
             <Empty icon="check2-circle" title="No gaps reported in this projection">This statement is limited to the bounded fields shown here.</Empty>
           ) : (

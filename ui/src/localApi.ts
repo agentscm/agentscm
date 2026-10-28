@@ -283,6 +283,7 @@ export class LocalError extends Error {
 }
 
 const BUSY_RETRIES = [150, 400, 900, 1800]
+const NOT_JSON = Symbol('not JSON')
 
 async function read<T>(path: string, decode: (v: unknown) => T, fixture: () => T, signal: AbortSignal): Promise<Read<T>> {
   const base = loadLocalBase()
@@ -301,10 +302,10 @@ async function read<T>(path: string, decode: (v: unknown) => T, fixture: () => T
     await new Promise((resolve) => setTimeout(resolve, BUSY_RETRIES[attempt]))
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
   }
-  if (res.ok) return { source: 'live', value: decode(await res.json()) }
-  // Only a JSON `{"error"}` is the local server speaking; anything else (a proxy page, 502, 405 from an
-  // older serve) means the read API isn't there yet.
-  const body: unknown = await res.json().catch(() => null)
+  // Only JSON is the local server speaking; anything else (a proxy page, a host's own page answered with
+  // 200, 502, 405 from an older serve) means the read API isn't there yet.
+  const body: unknown = await res.json().catch(() => NOT_JSON)
+  if (res.ok && body !== NOT_JSON) return { source: 'live', value: decode(body) }
   const code = body && typeof body === 'object' && typeof (body as Record<string, unknown>)['error'] === 'string' ? clean((body as Record<string, unknown>)['error'], 100) : null
   if (code !== null && res.status !== 405) throw new LocalError(res.status, code, path)
   return { source: 'preview', value: fixture(), reason: `The local read API isn’t at ${base || 'this page’s address'} yet.` }

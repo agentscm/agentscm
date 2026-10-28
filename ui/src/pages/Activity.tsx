@@ -139,7 +139,7 @@ export function ActivityPage({ d, events: live, fresh, repo, token }: { d: Deriv
         icon="clock-history"
         title="The full log"
         count={rows?.length}
-        explain="What agents did on this repository, newest first: sessions, announced work, refused and repeated edits, and handoffs. New events slide in as they arrive."
+        explain="Everything agents did here, newest first: sessions, announced work, refused and repeated edits, and handoffs."
         actions={
           <div className="btn-group btn-group-sm" data-tour="activity-filter" role="group" aria-label="Filter events">
             {KINDS.map((k) => (
