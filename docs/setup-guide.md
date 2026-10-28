@@ -76,7 +76,7 @@ The flags `--hub-url`, `--yes`, `--only`, `--dry-run` and `--json` are the ones 
 | `--hub-port PORT`, `--hub-project NAME` | Isolated local instance; defaults to port 7332 and a home-specific name. Resume reuses the record. |
 | `--hub-url URL` | The hub for `--hub existing`; still accepted. |
 | `--agent-token-file PATH` | Use this agent token instead of signing in; it is checked against the hub and used where it is. Needed for agent setup without a terminal. |
-| `--agent claude\|codex\|cursor\|copilot\|gemini` | Set up this coding agent (repeatable). Default: Claude Code if the `claude` CLI is on `PATH`. |
+| `--agent claude\|codex\|cursor\|copilot\|gemini` | Set up this coding agent (repeatable; alias of `--only`). Default: every detected agent on supported Unix hosts. |
 | `--no-agents` | Do not set up any coding agent. |
 | `--slack-config-file ABSOLUTE_PATH` | Install a prepared private Slack bundle into a managed local Hub. See [Slack setup](slack.md). Requires `--hub local`; `--yes` alone never enables it. |
 | `--provider github\|gitlab` | Forge to sign in with (default: from `origin`). |
