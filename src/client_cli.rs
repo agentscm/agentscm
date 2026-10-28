@@ -940,6 +940,12 @@ async fn mint_agent_token(
         no_sign_in,
     )
     .await?;
+    // Signing in just now also signed this computer in: mint through it, so revoking the computer
+    // stops this agent too. The session path below is only for a Hub without computers.
+    computer::enroll(&connection.hub).await;
+    if let Some(minted) = computer::mint(connection, Some(provider), false).await? {
+        return Ok(minted);
+    }
     let (mut status, mut reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
     if status == 401 && no_sign_in {
         return Err(cannot_sign_in());
