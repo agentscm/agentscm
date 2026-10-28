@@ -96,7 +96,7 @@ Each developer, from a clone of the connected repository:
 npx agentscm --hub-url https://hub.example.com
 ```
 
-This signs that machine in to the hub and sets up Claude Code there if the `claude` CLI is found (the same setup as `agentscm client setup`). To choose agents, pass `--agent` once for each, such as `--agent claude --agent codex`. See [team member onboarding](team-member-onboarding.md).
+This signs that machine in to the hub and sets up every detected coding agent on supported Unix hosts (the same setup as `agentscm client setup`). To choose agents, pass `--agent` once for each, such as `--agent claude --agent codex`. See [team member onboarding](team-member-onboarding.md).
 
 The host owns every project, plugin, hook and MCP trust prompt. The person must approve those themselves; do not edit trust records. Each repository needs its own agent token, and a token's repository must be connected on the hub.
 
