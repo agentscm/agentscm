@@ -87,7 +87,7 @@ Report build time separately from each warm execution time, along with test coun
 
 ## Local validation attestations
 
-A maintainer may attach a signed record of a local run of this gate to a pull request; see [local validation](advanced/local-validation.md). It is experimental and does not replace the evidence rules above. For same-repository pull requests it is the expected evidence for the test gate: the hosted test suites, Windows, container, hub end-to-end and live execution jobs run only with the `ci-extended` label or a manual `workflow_dispatch`, while `CI / static` and the security checks stay automatic and `main` still runs everything.
+A maintainer may attach a signed record of a local run of this gate to a pull request; see [local validation](advanced/local-validation.md). It is experimental and does not replace the evidence rules above. For same-repository pull requests it is the expected evidence for the test gate: the hosted test suites, Windows, musl and macOS release-target builds, container, hub end-to-end and live execution jobs run only with the `ci-extended` label or a manual `workflow_dispatch`, while `CI / static` and the security checks stay automatic and `main` still runs everything.
 
 ## Resource audit boundaries
 
