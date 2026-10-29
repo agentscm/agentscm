@@ -49,6 +49,42 @@ jobs:
       pull-requests: read
       statuses: write
     steps:
+      - name: Invalidate stale successes
+        shell: bash
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Fail closed: a listing error fails the step. Pagination is bounded by the step timeout.
+          heads=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base="$DEFAULT_BRANCH" -f per_page=100 --paginate --jq '.[].head.sha' </dev/null)
+          # Validate every line before any write; a jq null prints as "null" and fails here.
+          if [[ -n "$heads" ]] && printf '%s\n' "$heads" | grep -qvE '^[0-9a-f]{40}$'; then
+            echo "unexpected head SHA in the pull request listing" >&2
+            exit 1
+          fi
+          count=0
+          for sha in $(printf '%s\n' "$heads" | sort -u); do
+            # The combined status holds the latest status per context. If our context is absent but the
+            # read was truncated, it may be hiding on a later page, so treat it as unknown.
+            state=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --jq '(.statuses | map(select(.context == "agentscm/local-validation")) | first | .state) // (if .total_count > (.statuses | length) then "unknown" else "none" end)' </dev/null)
+            # Only success (and unknown) can satisfy a required check. "none" means the head never opted
+            # in, and writing would opt it in forever. pending, failure and error already block merging.
+            if [[ "$state" != success && "$state" != unknown ]]; then
+              continue
+            fi
+            reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context=agentscm/local-validation -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null)
+            if [[ "$reply" != pending ]]; then
+              echo "unexpected reply writing status for $sha: $reply" >&2
+              exit 1
+            fi
+            echo "$sha: $state -> pending"
+            count=$((count + 1))
+          done
+          echo "set $count stale success(es) to pending"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch || github.ref_name }}
