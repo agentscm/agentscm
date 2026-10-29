@@ -5,16 +5,16 @@
 
 use std::fmt;
 use std::future::Future;
-use std::io::Cursor;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use reqwest::{Client, Method, Response, Url, redirect};
+use sha2::{Digest, Sha256};
 use tokio::runtime::{Builder, Runtime};
 
 use crate::backend::{
-    ImmutableBackend, ObjectKey, ObjectMetadata, PutOutcome, range_end, slice_range,
-    validate_identifier,
+    ImmutableBackend, ObjectKey, ObjectMetadata, PutOutcome, range_end, validate_identifier,
 };
 use crate::error::{Error, Result};
 use crate::hmac::hmac_sha256;
@@ -250,10 +250,10 @@ impl S3Backend {
         request.send().await.map_err(transport)
     }
 
-    /// None when the object does not exist. Never returns more than
-    /// [`MAX_OBJECT_BYTES`]. Bytes are not verified.
-    async fn fetch(&self, path: &str, id: &str) -> Result<Option<Vec<u8>>> {
-        let mut response = self
+    /// The 200 response for the object, or None when it does not exist. Refuses an advertised
+    /// size over [`MAX_OBJECT_BYTES`] before any body is read.
+    async fn open_object(&self, path: &str, id: &str) -> Result<Option<Response>> {
+        let response = self
             .request(Method::GET, path, &[], digest(b""), Vec::new())
             .await?;
         if response.status().as_u16() != 200 {
@@ -263,21 +263,93 @@ impl S3Backend {
                 (status, code) => Err(http_error(status, code)),
             };
         }
-        let too_large = || Error::Limit(format!("object {id} exceeds size limit"));
         if response
             .content_length()
             .is_some_and(|length| length > MAX_OBJECT_BYTES)
         {
-            return Err(too_large());
+            return Err(too_large(id));
         }
+        Ok(Some(response))
+    }
+
+    /// None when the object does not exist. Never returns more than
+    /// [`MAX_OBJECT_BYTES`]. Bytes are not verified.
+    async fn fetch(&self, path: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        let Some(mut response) = self.open_object(path, id).await? else {
+            return Ok(None);
+        };
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(transport)? {
             if (bytes.len() + chunk.len()) as u64 > MAX_OBJECT_BYTES {
-                return Err(too_large());
+                return Err(too_large(id));
             }
             bytes.extend_from_slice(&chunk);
         }
         Ok(Some(bytes))
+    }
+
+    /// Streams the object through SHA-256 and checks it against `id`, keeping only the bytes in
+    /// `keep_start..keep_end`. Returns the object size and the kept bytes; memory stays at one
+    /// chunk plus the kept range. The digest covers the whole object, so a range is only
+    /// returned from an intact object. None when the object does not exist.
+    async fn scan_verified(
+        &self,
+        path: &str,
+        id: &str,
+        keep_start: u64,
+        keep_end: u64,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        let Some(mut response) = self.open_object(path, id).await? else {
+            return Ok(None);
+        };
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut kept = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transport)? {
+            let chunk_start = size;
+            size += chunk.len() as u64;
+            if size > MAX_OBJECT_BYTES {
+                return Err(too_large(id));
+            }
+            hasher.update(&chunk);
+            let (from, to) = (keep_start.max(chunk_start), keep_end.min(size));
+            if from < to {
+                kept.extend_from_slice(
+                    &chunk[(from - chunk_start) as usize..(to - chunk_start) as usize],
+                );
+            }
+        }
+        if format!("{:x}", hasher.finalize()) != id {
+            return Err(Error::Invalid(format!("object digest mismatch: {id}")));
+        }
+        Ok(Some((size, kept)))
+    }
+
+    /// Whether the stored object is byte-for-byte `expected` (None when absent). Stops reading
+    /// at the first difference, so a conflicting object is never held in memory.
+    async fn stored_equals(&self, path: &str, id: &str, expected: &[u8]) -> Result<Option<bool>> {
+        let response = match self.open_object(path, id).await {
+            Ok(response) => response,
+            Err(Error::Limit(_)) => return Ok(Some(false)),
+            Err(error) => return Err(error),
+        };
+        let Some(mut response) = response else {
+            return Ok(None);
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length != expected.len() as u64)
+        {
+            return Ok(Some(false));
+        }
+        let mut at = 0;
+        while let Some(chunk) = response.chunk().await.map_err(transport)? {
+            if expected.get(at..at + chunk.len()) != Some(&chunk[..]) {
+                return Ok(Some(false));
+            }
+            at += chunk.len();
+        }
+        Ok(Some(at == expected.len()))
     }
 
     fn read_verified(&self, key: &ObjectKey, incarnation: &str) -> Result<Vec<u8>> {
@@ -341,10 +413,10 @@ impl ImmutableBackend for S3Backend {
                 .await?;
             match response.status().as_u16() {
                 200 => Ok(PutOutcome::Created),
-                status @ (409 | 412) => match self.fetch(&path, key.id()).await {
-                    Ok(Some(existing)) if existing == bytes => Ok(PutOutcome::AlreadyPresent),
+                status @ (409 | 412) => match self.stored_equals(&path, key.id(), bytes).await {
+                    Ok(Some(true)) => Ok(PutOutcome::AlreadyPresent),
                     Ok(None) => Err(http_error(status, None)),
-                    Ok(Some(_)) | Err(Error::Limit(_)) => Err(Error::Conflict(format!(
+                    Ok(Some(false)) => Err(Error::Conflict(format!(
                         "immutable object differs at backend key: {}",
                         key.id()
                     ))),
@@ -363,9 +435,14 @@ impl ImmutableBackend for S3Backend {
     }
 
     fn inspect_verified(&self, key: &ObjectKey, incarnation: &str) -> Result<ObjectMetadata> {
-        let bytes = self.read_verified(key, incarnation)?;
+        let path = self.object_path(key, incarnation)?;
+        let (size, _) = self
+            .block(self.scan_verified(&path, key.id(), 0, 0))?
+            .ok_or_else(|| {
+                Error::NotFound(format!("object incarnation: {}/{}", key.id(), incarnation))
+            })?;
         Ok(ObjectMetadata {
-            size: bytes.len() as u64,
+            size,
             digest: key.id().to_owned(),
         })
     }
@@ -376,10 +453,15 @@ impl ImmutableBackend for S3Backend {
         incarnation: &str,
     ) -> Result<Box<dyn std::io::Read + Send + '_>> {
         let path = self.object_path(key, incarnation)?;
-        let bytes = self
-            .block(self.fetch(&path, key.id()))?
+        let response = self
+            .block(self.open_object(&path, key.id()))?
             .ok_or_else(|| Error::MissingObject(key.id().to_owned()))?;
-        Ok(Box::new(Cursor::new(bytes)))
+        Ok(Box::new(ObjectStream {
+            backend: self,
+            response,
+            chunk: Bytes::new(),
+            seen: 0,
+        }))
     }
 
     fn delete_incarnation(&self, key: &ObjectKey, incarnation: &str) -> Result<()> {
@@ -411,7 +493,52 @@ impl ImmutableBackend for S3Backend {
         length: u64,
     ) -> Result<Vec<u8>> {
         let end = range_end(offset, length)?;
-        slice_range(&self.read_verified(key, incarnation)?, offset, end)
+        let path = self.object_path(key, incarnation)?;
+        // No HTTP Range: the digest is of the whole object, so every byte must be read and
+        // hashed; only the requested slice is kept.
+        let (size, kept) = self
+            .block(self.scan_verified(&path, key.id(), offset, end))?
+            .ok_or_else(|| {
+                Error::NotFound(format!("object incarnation: {}/{}", key.id(), incarnation))
+            })?;
+        if end > size {
+            return Err(Error::Invalid("range exceeds object bounds".into()));
+        }
+        Ok(kept)
+    }
+}
+
+fn too_large(id: &str) -> Error {
+    Error::Limit(format!("object {id} exceeds size limit"))
+}
+
+/// A raw object body read chunk by chunk; unverified, like [`S3Backend::fetch`].
+struct ObjectStream<'a> {
+    backend: &'a S3Backend,
+    response: Response,
+    chunk: Bytes,
+    seen: u64,
+}
+
+impl std::io::Read for ObjectStream<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        while self.chunk.is_empty() {
+            let Some(next) = self
+                .backend
+                .block(self.response.chunk())
+                .map_err(|error| std::io::Error::other(transport(error)))?
+            else {
+                return Ok(0);
+            };
+            self.seen += next.len() as u64;
+            if self.seen > MAX_OBJECT_BYTES {
+                return Err(std::io::Error::other("object exceeds size limit"));
+            }
+            self.chunk = next;
+        }
+        let length = buffer.len().min(self.chunk.len());
+        buffer[..length].copy_from_slice(&self.chunk.split_to(length));
+        Ok(length)
     }
 }
 
