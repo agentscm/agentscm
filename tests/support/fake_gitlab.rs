@@ -1,5 +1,5 @@
 //! In-process fake of the self-managed GitLab REST surface the hub sync uses. Synthetic data only.
-//! Include with `#[path = "support/fake_gitlab.rs"] mod fake_gitlab;`.
+//! Declared once in `tests/integration/main.rs`.
 #![allow(dead_code)] // each including test uses a different subset
 #![allow(clippy::collapsible_if)] // test fake: clarity over lint style
 #![allow(clippy::result_large_err)] // test fake: the Err is a ready HTTP response

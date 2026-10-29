@@ -3099,7 +3099,7 @@ mod tests {
     mod fake_docker {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/common/fake_docker.rs"
+            "/tests/integration/common/fake_docker.rs"
         ));
     }
 

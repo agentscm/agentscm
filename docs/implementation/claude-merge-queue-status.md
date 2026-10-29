@@ -29,7 +29,7 @@ Rebase `feat/change-record-capture-v1` onto this branch once it lands; expect te
 - `src/hub/sync.rs`: `merge_group` routing, manifest permission and event, `Sync::jwt` and `pending_webhooks` visibility.
 - `src/hub/publish.rs`: `forge_check.merge_queue` on the publication view.
 - `docs/hub.md`, `docs/api.md`, `docs/advanced/README.md`: pointers to the guide and the API fields.
-- `tests/hub_store_conformance.rs`, `tests/support/fake_github.rs`: additive.
+- `tests/integration/hub_store_conformance.rs`, `tests/support/fake_github.rs`: additive.
 
 ## Consumer fields for Codex (UI, MCP, readiness)
 

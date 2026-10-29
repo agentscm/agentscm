@@ -197,10 +197,10 @@ If capture stops before or during publication, only unreferenced objects can rem
 The following ignored tests are the opt-in qualification fixtures. Run these exact parent tests separately; a broad `--ignored` run would also invoke an internal interruption helper that requires environment supplied by its parent test.
 
 ```sh
-cargo test --locked --test git_snapshot_cli capture_qualifies_shared_deep_prefixes_across_native_batches -- --ignored --exact --nocapture
-cargo test --locked --test git_snapshot_cli interrupted_multi_batch_capture_retries_to_complete_identical_revision -- --ignored --exact --nocapture
-cargo test --locked --test git_snapshot_cli snapshot_entry_limit_is_precise_before_publication -- --ignored --exact --nocapture
-cargo test --locked --test git_snapshot_cli snapshot_byte_limits_are_precise_before_publication -- --ignored --exact --nocapture
+cargo test --locked --test integration git_snapshot_cli::capture_qualifies_shared_deep_prefixes_across_native_batches -- --ignored --exact --nocapture
+cargo test --locked --test integration git_snapshot_cli::interrupted_multi_batch_capture_retries_to_complete_identical_revision -- --ignored --exact --nocapture
+cargo test --locked --test integration git_snapshot_cli::snapshot_entry_limit_is_precise_before_publication -- --ignored --exact --nocapture
+cargo test --locked --test integration git_snapshot_cli::snapshot_byte_limits_are_precise_before_publication -- --ignored --exact --nocapture
 ```
 
 The multi-batch fixture captures 130 files below 127 shared directory components, requiring two production checkpoint batches because the 16,510 summed prefixes exceed one batch. It checks the CLI receipt, retry, native history and every captured byte. The interruption fixture kills a child process with `SIGKILL` after the first of those batches is durable, observes retained orphan objects with no revision, receipt, target move or event, and checks that retry matches an independent uninterrupted capture. This qualifies a process kill at that boundary, not power loss or every possible interruption boundary.
