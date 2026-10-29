@@ -221,7 +221,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     let app = router(state, access);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("listening on {}", listener.local_addr()?);
-    agentscm::http_listener::serve(listener, app, shutdown_signal()).await;
+    agentscm::http_listener::serve(listener, app, agentscm::http_listener::shutdown_signal()).await;
     Ok(())
 }
 
@@ -253,7 +253,7 @@ async fn serve_front_door(
     })?;
     eprintln!("listening on {address}");
     let app = front_door::router(state, door.clone());
-    agentscm::http_listener::serve(listener, app, shutdown_signal()).await;
+    agentscm::http_listener::serve(listener, app, agentscm::http_listener::shutdown_signal()).await;
     door.revoke_all().await;
     Ok(())
 }
@@ -1204,23 +1204,6 @@ fn hex(byte: u8) -> std::result::Result<u8, ApiError> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(ApiError::limit("query has invalid percent encoding")),
-    }
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

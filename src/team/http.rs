@@ -218,7 +218,7 @@ pub async fn serve(config: TeamConfig) -> Result<()> {
         "team listener ready on {}",
         listener.local_addr().map_err(Error::Io)?
     );
-    crate::http_listener::serve(listener, app, shutdown_signal()).await;
+    crate::http_listener::serve(listener, app, crate::http_listener::shutdown_signal()).await;
     Ok(())
 }
 
@@ -1185,23 +1185,6 @@ impl IntoResponse for ApiError {
 
 async fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found")
-}
-
-pub(crate) async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 #[cfg(test)]

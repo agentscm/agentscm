@@ -101,6 +101,24 @@ pub(crate) async fn serve_limited(
     while connections.join_next().await.is_some() {}
 }
 
+/// Completes on Ctrl-C or, on Unix, SIGTERM: the shutdown future every listener passes to `serve`.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::net::SocketAddr;
