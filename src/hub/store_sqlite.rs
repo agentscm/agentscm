@@ -22,7 +22,7 @@ use super::catchup::{
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
     TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
     repository_namespace, source_name, tracked_publication_merge,
 };
@@ -7464,54 +7464,6 @@ impl Store for SqliteStore {
             ],
             |row| row.get(0),
         )?)
-    }
-
-    fn catchup_merge_highwater(&self, scope: &CatchupRepositoryScope) -> Result<i64> {
-        scope.validate()?;
-        let conn = self.conn();
-        let repository = repository_namespace(&scope.repository, scope.repository_id);
-        Ok(conn.query_row(
-            "SELECT next_merge_seq-1 FROM hub_catchup_repositories WHERE provider=?1 AND host=?2
-             AND repository=?3 AND repository_key=?4",
-            params![scope.provider,scope.host,repository,catchup_repository_key(scope.repository_id)],
-            |row| row.get(0)).optional()?.unwrap_or(0))
-    }
-
-    fn catchup_merges_through(
-        &self,
-        scope: &CatchupRepositoryScope,
-        after: i64,
-        through: i64,
-        limit: usize,
-    ) -> Result<Vec<CatchupMergeObservation>> {
-        scope.validate()?;
-        if after < 0 || through < after || !(1..=MAX_CATCHUP_PAGE).contains(&limit) {
-            return Err(HubError::Invalid("invalid catch-up merge page".into()));
-        }
-        let conn = self.conn();
-        let repository = repository_namespace(&scope.repository, scope.repository_id);
-        let mut statement = conn.prepare(&format!(
-            "SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
-            WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4
-              AND seq>?5 AND seq<=?6 ORDER BY seq LIMIT ?7"
-        ))?;
-        statement
-            .query_map(
-                params![
-                    scope.provider,
-                    scope.host,
-                    repository,
-                    catchup_repository_key(scope.repository_id),
-                    after,
-                    through,
-                    limit as i64
-                ],
-                sqlite_catchup_merge_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(sqlite_catchup_merge)
-            .collect()
     }
 
     fn record_catchup_source_status(

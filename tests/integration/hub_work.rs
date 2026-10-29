@@ -1839,7 +1839,7 @@ fn postgres_read_briefings_share_the_repository_maintenance_lock(db: &Db) {
         let handle = thread::spawn(move || {
             child_barrier.wait();
             let result = if preview {
-                child_store.work_briefing_preview(&token, 1, unix_now())
+                child_store.work_briefing_preview_for(&token, None, 1, unix_now())
             } else {
                 child_store.work_briefing(&token, &BriefingQuery::default(), unix_now())
             };

@@ -133,6 +133,28 @@ impl Fixture {
             .get(0)
     }
 
+    fn merge_ids(&self, repository_id: i64) -> Vec<String> {
+        const SQL: &str = "SELECT id FROM hub_catchup_merges WHERE repository_id=";
+        if let Some(database) = &self.database {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            let mut statement = connection
+                .prepare(&format!("{SQL}{repository_id} ORDER BY seq"))
+                .unwrap();
+            return statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        }
+        Client::connect(&self._pg.as_ref().unwrap().url, NoTls)
+            .unwrap()
+            .query(&format!("{SQL}{repository_id} ORDER BY seq"), &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
     fn events(&self, kind: &str) -> Vec<serde_json::Value> {
         self.store
             .events_after(0, 1000)
@@ -564,21 +586,6 @@ fn contracts(fixture: &Fixture) {
             .store
             .catchup_merge_known(&scope(REPOSITORY_ID), 1, Some(&later.merge_commit))
             .unwrap()
-    );
-    assert_eq!(
-        fixture
-            .store
-            .catchup_merge_highwater(&scope(REPOSITORY_ID))
-            .unwrap(),
-        3
-    );
-    assert_eq!(
-        fixture
-            .store
-            .catchup_merges_through(&scope(REPOSITORY_ID), 1, 3, 10)
-            .unwrap()
-            .len(),
-        2
     );
 }
 
@@ -1636,16 +1643,7 @@ fn publication_repair_accepts_canonical_forge_observation(fixture: &Fixture) {
             .as_deref(),
         Some(repaired_commit.as_str())
     );
-    let observations = fixture
-        .store
-        .catchup_merges_through(
-            &scope(257),
-            0,
-            fixture.store.catchup_merge_highwater(&scope(257)).unwrap(),
-            10,
-        )
-        .unwrap();
-    assert_eq!(observations, vec![retained_forge]);
+    assert_eq!(fixture.merge_ids(257), vec![retained_forge.id]);
 
     let immutable = fixture.store.repair_catchup_publication_merge(
         &CatchupPublicationRepair {
