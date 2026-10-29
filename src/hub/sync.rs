@@ -265,6 +265,57 @@ pub struct Sync {
     skill_reads: Mutex<HashMap<String, i64>>,
     /// Files already noticed per (intent, repository, pull request number).
     noticed: Mutex<HashMap<(String, String, i64), BTreeSet<String>>>,
+    /// Parsed open pull requests per repository id, so an announce does not reparse them all.
+    pulls: Mutex<PullCache>,
+}
+
+/// Other hub processes on the same database cannot invalidate this process's cache.
+const PULL_CACHE_SECONDS: u64 = 30;
+const MAX_CACHED_REPOSITORIES: usize = 256;
+
+/// An open observed pull request, parsed once: what replies show of it and the files it changes.
+pub(super) struct OpenPull {
+    summary: Value,
+    files: Vec<String>,
+}
+
+#[derive(Default)]
+struct PullCache {
+    /// Bumped by every invalidation, so a read that raced a write does not cache stale rows.
+    generation: u64,
+    entries: HashMap<String, (std::time::Instant, Arc<Vec<OpenPull>>)>,
+}
+
+impl Sync {
+    fn cached_pulls(&self, repo: &str) -> (u64, Option<Arc<Vec<OpenPull>>>) {
+        let cache = lock(&self.pulls);
+        let fresh = cache
+            .entries
+            .get(repo)
+            .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(PULL_CACHE_SECONDS));
+        (cache.generation, fresh.map(|(_, pulls)| pulls.clone()))
+    }
+
+    fn cache_pulls(&self, repo: &str, generation: u64, pulls: Arc<Vec<OpenPull>>) {
+        let mut cache = lock(&self.pulls);
+        if cache.generation != generation {
+            return;
+        }
+        // shortcut: drop every entry when full; a hub with more active repositories rereads more
+        if cache.entries.len() >= MAX_CACHED_REPOSITORIES && !cache.entries.contains_key(repo) {
+            cache.entries.clear();
+        }
+        cache
+            .entries
+            .insert(repo.to_owned(), (std::time::Instant::now(), pulls));
+    }
+
+    /// Called after this process writes a pull request observation of `repo`.
+    fn forget_pulls(&self, repo: &str) {
+        let mut cache = lock(&self.pulls);
+        cache.generation += 1;
+        cache.entries.remove(repo);
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -387,6 +438,7 @@ impl Sync {
             external_cursors: Mutex::default(),
             skill_reads: Mutex::default(),
             noticed: Mutex::default(),
+            pulls: Mutex::default(),
         }
     }
 
@@ -1114,6 +1166,7 @@ async fn observe_pull(
     let Observed::Changed { .. } = observed else {
         return Ok(false);
     };
+    state.sync.forget_pulls(&repo.id);
     notify_overlaps(state, conn, repo, &data).await?;
     Ok(true)
 }
@@ -1160,6 +1213,7 @@ async fn reread_pull(
     })
     .await?;
     if forgotten {
+        state.sync.forget_pulls(&repo.id);
         lock(&state.sync.noticed).retain(|k, _| !(k.1 == repo.id && k.2 == number));
         if let (Some(pull), Some(old)) = (&pull, stored.get(&number))
             && pull["merged"] == true
@@ -1405,25 +1459,40 @@ pub(super) fn find_repository(
     }
 }
 
-/// The open observed pull requests of a repository, as stored.
+/// The open observed pull requests of a repository, as stored, parsed at most once per
+/// `PULL_CACHE_SECONDS` unless this process observes a change first.
 async fn observed_pulls(
     state: &HubState,
     host: &str,
     repository: &str,
     repository_id: Option<i64>,
-) -> Result<Vec<Value>> {
+) -> Result<Arc<Vec<OpenPull>>> {
     let (host, name) = (host.to_owned(), repository.to_owned());
-    let rows = db(state, move |store| {
-        match find_repository(store, &host, &name, repository_id)? {
-            Some(repo) => store.observations(&repo.id, "pull_request"),
-            None => Ok(Vec::new()),
+    let sync = state.sync.clone();
+    db(state, move |store| {
+        let Some(repo) = find_repository(store, &host, &name, repository_id)? else {
+            return Ok(Arc::default());
+        };
+        let (generation, cached) = sync.cached_pulls(&repo.id);
+        if let Some(pulls) = cached {
+            return Ok(pulls);
         }
+        let pulls: Arc<Vec<OpenPull>> = Arc::new(
+            store
+                .observations(&repo.id, "pull_request")?
+                .iter()
+                .filter_map(|row| serde_json::from_str::<Value>(&row.data).ok())
+                .map(|pull| OpenPull {
+                    summary: json!({"number": pull["number"], "title": pull["title"],
+                        "html_url": pull["html_url"], "author": pull["author"]}),
+                    files: files_of(&pull),
+                })
+                .collect(),
+        );
+        sync.cache_pulls(&repo.id, generation, pulls.clone());
+        Ok(pulls)
     })
-    .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| serde_json::from_str::<Value>(&row.data).ok())
-        .collect())
+    .await
 }
 
 /// Open observed pull requests that overlap `specs`, for an announce reply.
@@ -1438,11 +1507,12 @@ pub(super) async fn overlapping_pulls(
     Ok(pulls
         .iter()
         .filter_map(|pull| {
-            let (theirs, yours) = pull_overlap(&files_of(pull), specs);
+            let (theirs, yours) = pull_overlap(&pull.files, specs);
             (!theirs.is_empty()).then(|| {
-                json!({"number": pull["number"], "title": pull["title"],
-                    "html_url": pull["html_url"], "author": pull["author"],
-                    "their_paths": theirs, "your_paths": yours})
+                let mut found = pull.summary.clone();
+                found["their_paths"] = json!(theirs);
+                found["your_paths"] = json!(yours);
+                found
             })
         })
         .collect())
@@ -1459,9 +1529,9 @@ pub(super) async fn open_pulls(
     Ok(pulls
         .iter()
         .map(|pull| {
-            json!({"number": pull["number"], "title": pull["title"],
-                "html_url": pull["html_url"], "author": pull["author"],
-                "their_paths": files_of(pull)})
+            let mut found = pull.summary.clone();
+            found["their_paths"] = json!(pull.files);
+            found
         })
         .collect())
 }
@@ -2522,6 +2592,26 @@ mod tests {
         );
         last = i64::MAX;
         assert!(advance_observation_stamp(&mut last, 0).is_err());
+    }
+
+    #[test]
+    fn a_pull_observation_invalidates_the_parsed_cache() {
+        let sync = Sync::unconfigured();
+        let pulls = || {
+            Arc::new(vec![OpenPull {
+                summary: json!({"number": 1}),
+                files: vec!["a.rs".into()],
+            }])
+        };
+        let (generation, cached) = sync.cached_pulls("repo");
+        assert!(cached.is_none());
+        sync.cache_pulls("repo", generation, pulls());
+        assert_eq!(sync.cached_pulls("repo").1.unwrap()[0].files, ["a.rs"]);
+        sync.forget_pulls("repo");
+        assert!(sync.cached_pulls("repo").1.is_none());
+        // A read that started before the write must not cache what it read.
+        sync.cache_pulls("repo", generation, pulls());
+        assert!(sync.cached_pulls("repo").1.is_none());
     }
 
     #[test]
