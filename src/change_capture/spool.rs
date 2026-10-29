@@ -9,6 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,9 @@ thread_local! {
     };
     static FAIL_OCCURRENCE_UNLINK_AFTER_RECEIPT: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
+    };
+    static COMPACTION_VERIFICATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
     };
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     static FAIL_EXPORT_ACL_CLEAR: std::cell::Cell<bool> = const {
@@ -591,6 +595,33 @@ pub struct LocalSpool {
     root: PathBuf,
     limits: SpoolLimits,
     identity: SpoolIdentityV1,
+    compaction_cache: Arc<CompactionCache>,
+}
+
+type CompactionCache = Mutex<Option<(FileStamp, Arc<CompactionStateV1>)>>;
+
+/// Installed-file identity of a parsed and verified compaction index. `atomic_replace` installs a
+/// new inode, and any in-place write changes the kernel-maintained ctime, so an equal stamp means
+/// the verified bytes are still the installed bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1261,17 +1292,26 @@ impl LocalSpool {
             root: root.to_owned(),
             limits,
             identity: format,
+            compaction_cache: Arc::default(),
         };
         {
             let _lock = spool.lock()?;
             recover_spool_temps(&spool.root, spool.limits)?;
-            recover_compacted_remainders(&spool.root, spool.limits)?;
+            recover_compacted_remainders(&spool)?;
         }
         Ok(spool)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn compaction_state(&self) -> Result<Arc<CompactionStateV1>> {
+        load_compaction_state_cached(
+            &self.root,
+            self.limits.max_total_bytes,
+            Some(&self.compaction_cache),
+        )
     }
 
     pub fn identity(&self) -> SpoolIdentityV1 {
@@ -1512,7 +1552,7 @@ impl LocalSpool {
         }
         let marker_id = sha256(format!("{observed_session_id}\0{tool_use_id}").as_bytes());
         let _lock = self.lock()?;
-        let state = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+        let state = self.compaction_state()?;
         let receipt = state.native_occurrences.get(&marker_id).cloned();
         if receipt.as_ref().is_some_and(|receipt| {
             !validate_occurrence_receipt(receipt)
@@ -1727,7 +1767,7 @@ impl LocalSpool {
                 }
             }
             Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let state = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+                let state = self.compaction_state()?;
                 let Some(compacted) = state.entries.get(&key) else {
                     return Ok(None);
                 };
@@ -1871,7 +1911,7 @@ impl LocalSpool {
                 let pre_operation_id = format!("managed:event:{}:pre", marker.marker_id);
                 if marker.pre_fingerprint.is_none()
                     || !matches!(
-                        retained_envelope(&self.root, self.limits, "event", &pre_operation_id,)?,
+                        retained_envelope(self, "event", &pre_operation_id,)?,
                         Some(CaptureEnvelopeV1::EventBatch(_))
                     )
                 {
@@ -1881,10 +1921,8 @@ impl LocalSpool {
                 }
                 let start_operation_id = format!("recipe:start:{}", marker.marker_id);
                 let finish_operation_id = format!("recipe:finish:{}", marker.marker_id);
-                let start =
-                    retained_envelope(&self.root, self.limits, "start", &start_operation_id)?;
-                let finish =
-                    retained_envelope(&self.root, self.limits, "finish", &finish_operation_id)?;
+                let start = retained_envelope(self, "start", &start_operation_id)?;
+                let finish = retained_envelope(self, "finish", &finish_operation_id)?;
                 match (start, finish) {
                     (None, None) => pending.push(marker),
                     (
@@ -2357,10 +2395,7 @@ impl LocalSpool {
             };
         }
         let observation_key = sha256(operation_id.as_bytes());
-        if let Some(existing) = load_compaction_state(&self.root, self.limits.max_total_bytes)?
-            .observations
-            .get(&observation_key)
-        {
+        if let Some(existing) = self.compaction_state()?.observations.get(&observation_key) {
             return if existing == fingerprint {
                 Ok(AppendOutcome::Duplicate)
             } else {
@@ -2391,7 +2426,7 @@ impl LocalSpool {
                 "native operation was replayed with different observed result fields".into(),
             )),
             Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                match load_compaction_state(&self.root, self.limits.max_total_bytes)?
+                match self.compaction_state()?
                     .observations
                     .get(&key)
                 {
@@ -2510,7 +2545,7 @@ impl LocalSpool {
         let path = self.root.join("outbox").join(format!("{key}.json"));
         let _lock = self.lock()?;
         if let Some(CaptureEnvelopeV1::ActionStart(retained)) =
-            retained_envelope(&self.root, self.limits, "start", &start.operation_id)?
+            retained_envelope(self, "start", &start.operation_id)?
         {
             start.observed_order = retained.observed_order;
             start.observation_scope_id = retained.observation_scope_id.clone();
@@ -2551,10 +2586,7 @@ impl LocalSpool {
             .validate()
             .map_err(|error| CaptureError::Invalid(error.to_string()))?;
         let envelope_bytes = serde_json::to_vec(&envelope)?;
-        if let Some(compacted) = load_compaction_state(&self.root, self.limits.max_total_bytes)?
-            .entries
-            .get(&key)
-        {
+        if let Some(compacted) = self.compaction_state()?.entries.get(&key) {
             return if compacted.digest == sha256(&envelope_bytes) {
                 Ok((AppendOutcome::Duplicate, start))
             } else {
@@ -2670,10 +2702,7 @@ impl LocalSpool {
                 ))
             };
         }
-        if let Some(compacted) = load_compaction_state(&self.root, self.limits.max_total_bytes)?
-            .entries
-            .get(&key)
-        {
+        if let Some(compacted) = self.compaction_state()?.entries.get(&key) {
             // Digest-only compaction keeps no bytes to compare, so a receipt-timed re-delivery
             // falls back to its operation id; only acknowledged envelopes are compacted.
             let matches = match (&compacted.envelope, receipt_timed) {
@@ -2706,7 +2735,7 @@ impl LocalSpool {
         }
         let _lock = self.lock()?;
         recover_spool_temps(&self.root, self.limits)?;
-        recover_compacted_remainders(&self.root, self.limits)?;
+        recover_compacted_remainders(self)?;
         let mut names = regular_file_names(&self.root.join("outbox"), self.limits.max_records)?;
         names.sort();
         let mut values = Vec::new();
@@ -2829,7 +2858,7 @@ impl LocalSpool {
         ) {
             Ok(retained) => retained,
             Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let state = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+                let state = self.compaction_state()?;
                 let Some(compacted) = state.entries.get(&key) else {
                     return Err(CaptureError::NotFound(
                         "capture envelope is not retained locally".into(),
@@ -2871,7 +2900,7 @@ impl LocalSpool {
         }
         let _lock = self.lock()?;
         recover_spool_temps(&self.root, self.limits)?;
-        recover_compacted_remainders(&self.root, self.limits)?;
+        recover_compacted_remainders(self)?;
         let acknowledged: BTreeSet<String> =
             regular_file_names(&self.root.join("acknowledged"), self.limits.max_records)?
                 .into_iter()
@@ -3058,7 +3087,7 @@ impl LocalSpool {
             ));
         }
         atomic_replace(&state_path, &state_bytes)?;
-        recover_compacted_remainders(&self.root, self.limits)?;
+        recover_compacted_remainders(self)?;
         Ok(CompactionReport {
             envelopes: selected.len(),
             bytes_reclaimed: removed_bytes
@@ -3256,7 +3285,7 @@ impl LocalSpool {
         if let Some(order) = state.orders.get(operation_id) {
             return Ok(*order);
         }
-        let compacted = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+        let compacted = self.compaction_state()?;
         if let Some(order) = compacted_observed_order(&compacted, operation_id)? {
             return Ok(order);
         }
@@ -3301,9 +3330,7 @@ impl LocalSpool {
             .join("outbox")
             .join(format!("{start_key}.json"))
             .exists()
-            || load_compaction_state(&self.root, self.limits.max_total_bytes)?
-                .entries
-                .contains_key(&start_key)
+            || self.compaction_state()?.entries.contains_key(&start_key)
         {
             return Err(CaptureError::Conflict(
                 "cannot release an order with a retained action start".into(),
@@ -3411,7 +3438,7 @@ impl LocalSpool {
 
     fn envelope(&self, kind: &str, operation_id: &str) -> Result<Option<CaptureEnvelopeV1>> {
         let _lock = self.lock()?;
-        retained_envelope(&self.root, self.limits, kind, operation_id)
+        retained_envelope(self, kind, operation_id)
     }
 
     fn reserve(&self, additional_bytes: u64, additional_records: usize) -> Result<()> {
@@ -4368,17 +4395,16 @@ fn retain_compacted_envelope(envelope: &CaptureEnvelopeV1) -> bool {
 
 /// Loads one retained envelope while the caller holds the spool lock.
 fn retained_envelope(
-    root: &Path,
-    limits: SpoolLimits,
+    spool: &LocalSpool,
     kind: &str,
     operation_id: &str,
 ) -> Result<Option<CaptureEnvelopeV1>> {
     let key = envelope_key_parts(kind, operation_id);
-    let path = root.join("outbox").join(format!("{key}.json"));
-    let bytes = match read_bounded(&path, limits.max_total_bytes) {
+    let path = spool.root.join("outbox").join(format!("{key}.json"));
+    let bytes = match read_bounded(&path, spool.limits.max_total_bytes) {
         Ok(bytes) => bytes,
         Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            let state = load_compaction_state(root, limits.max_total_bytes)?;
+            let state = spool.compaction_state()?;
             return Ok(state
                 .entries
                 .get(&key)
@@ -5122,24 +5148,59 @@ fn valid_observation_scope_id(value: &str) -> bool {
 }
 
 fn load_compaction_state(root: &Path, max_bytes: u64) -> Result<CompactionStateV1> {
+    Ok(Arc::unwrap_or_clone(load_compaction_state_cached(
+        root, max_bytes, None,
+    )?))
+}
+
+/// Parses and fully verifies the compaction index only when the installed file differs from the
+/// one this spool handle last verified, so repeated lookups cost one `fstat`.
+fn load_compaction_state_cached(
+    root: &Path,
+    max_bytes: u64,
+    cache: Option<&CompactionCache>,
+) -> Result<Arc<CompactionStateV1>> {
     let path = root.join("compaction-v1.json");
-    let bytes = match read_bounded(&path, max_bytes / 2) {
-        Ok(bytes) => bytes,
-        Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CompactionStateV1 {
+    let file = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?,
+        Ok(_) => {
+            return Err(CaptureError::Invalid(format!(
+                "{} is not a regular retained file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Arc::new(CompactionStateV1 {
                 version: 1,
                 entries: BTreeMap::new(),
                 observations: BTreeMap::new(),
                 native_occurrences: BTreeMap::new(),
-            });
+            }));
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
-    let state: CompactionStateV1 = serde_json::from_slice(&bytes)?;
+    let stamp = FileStamp::of(&file.metadata()?);
+    if let Some(Ok(cached)) = cache.map(Mutex::lock)
+        && let Some((verified, state)) = cached.as_ref()
+        && *verified == stamp
+    {
+        return Ok(Arc::clone(state));
+    }
+    let state: CompactionStateV1 =
+        serde_json::from_slice(&read_bounded_from_file(&file, max_bytes / 2)?)?;
+    #[cfg(test)]
+    COMPACTION_VERIFICATIONS.with(|count| count.set(count.get() + 1));
     if !valid_compaction_state(&state) {
         return Err(CaptureError::Invalid(
             "capture compaction index is invalid".into(),
         ));
+    }
+    let state = Arc::new(state);
+    if let Some(Ok(mut cached)) = cache.map(Mutex::lock) {
+        *cached = Some((stamp, Arc::clone(&state)));
     }
     Ok(state)
 }
@@ -6897,8 +6958,9 @@ fn outstanding_actions(root: &Path, max: usize) -> Result<usize> {
 
 /// Completes the deletion half of a compaction transaction whose index was already made durable.
 /// The caller holds the global spool lock, so no live writer can own these exact remnants.
-fn recover_compacted_remainders(root: &Path, limits: SpoolLimits) -> Result<()> {
-    let state = load_compaction_state(root, limits.max_total_bytes)?;
+fn recover_compacted_remainders(spool: &LocalSpool) -> Result<()> {
+    let (root, limits) = (spool.root.as_path(), spool.limits);
+    let state = spool.compaction_state()?;
     let mut changed_occurrences = false;
     for receipt in state.native_occurrences.values() {
         changed_occurrences |= cleanup_compacted_occurrence_marker(root, receipt)?;
@@ -7251,6 +7313,7 @@ mod tests {
                 max_artifact_bytes: spool.limits.max_artifact_bytes,
             },
             identity: spool.identity,
+            compaction_cache: Arc::default(),
         };
 
         assert!(matches!(
@@ -7294,6 +7357,7 @@ mod tests {
                 max_artifact_bytes: 1,
             },
             identity: spool.identity,
+            compaction_cache: Arc::default(),
         };
 
         for index in 0..8 {
@@ -8260,6 +8324,47 @@ mod tests {
             spool.append_priority(&retimed),
             Err(CaptureError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn compaction_index_is_verified_once_per_installed_file_and_again_after_any_edit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let replayable = format!("provider:history:{}:gap", "c".repeat(64));
+        let original = gap_envelope(&replayable, 100, GapReasonV1::AdapterStartedLate);
+        spool.append_priority_at_receipt(&original).unwrap();
+        spool.acknowledge(&original).unwrap();
+        assert_eq!(spool.compact_acknowledged(10).unwrap().envelopes, 1);
+        let fresh = |index: u8| {
+            let operation = format!("cap:{index:064}");
+            gap_envelope(&operation, 100, GapReasonV1::AdapterStartedLate)
+        };
+        let verifications = || COMPACTION_VERIFICATIONS.with(std::cell::Cell::get);
+
+        assert_eq!(
+            spool.append_priority(&fresh(1)).unwrap(),
+            AppendOutcome::Stored
+        );
+        let verified = verifications();
+        for index in 2..5 {
+            assert_eq!(
+                spool.append_priority(&fresh(index)).unwrap(),
+                AppendOutcome::Stored
+            );
+        }
+        assert_eq!(verifications(), verified, "unchanged index was re-verified");
+
+        // A same-length in-place edit keeps the inode and digest but changes the retained receipt.
+        let path = spool.root.join("compaction-v1.json");
+        let installed = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        let tampered = installed.replace("\"observed_at\":100", "\"observed_at\":101");
+        assert_ne!(tampered, installed);
+        fs::write(&path, tampered).unwrap();
+        assert!(matches!(
+            spool.append_priority(&fresh(5)),
+            Err(CaptureError::Invalid(_))
+        ));
+        assert_eq!(verifications(), verified + 1);
     }
 
     #[test]
