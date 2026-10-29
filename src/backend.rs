@@ -387,7 +387,7 @@ impl ImmutableBackend for LocalBackend {
         length: u64,
     ) -> Result<Vec<u8>> {
         let end = range_end(offset, length)?;
-        slice_range(&self.read_verified(key, incarnation)?, offset, end)
+        slice_range(self.read_verified(key, incarnation)?, offset, end)
     }
 }
 
@@ -442,7 +442,7 @@ pub(crate) fn range_end(offset: u64, length: u64) -> Result<u64> {
         .ok_or_else(|| Error::Limit("range end overflow".into()))
 }
 
-pub(crate) fn slice_range(bytes: &[u8], offset: u64, end: u64) -> Result<Vec<u8>> {
+pub(crate) fn slice_range(mut bytes: Vec<u8>, offset: u64, end: u64) -> Result<Vec<u8>> {
     if end > bytes.len() as u64 {
         return Err(Error::Invalid("range exceeds object bounds".into()));
     }
@@ -450,7 +450,9 @@ pub(crate) fn slice_range(bytes: &[u8], offset: u64, end: u64) -> Result<Vec<u8>
         .map_err(|_| Error::Limit("range offset cannot fit in memory".into()))?;
     let end =
         usize::try_from(end).map_err(|_| Error::Limit("range end cannot fit in memory".into()))?;
-    Ok(bytes[start..end].to_vec())
+    bytes.truncate(end);
+    bytes.drain(..start);
+    Ok(bytes)
 }
 
 // Windows cannot open a directory as a file; NTFS journals renames, so there is nothing to sync.
