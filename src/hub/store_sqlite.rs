@@ -2068,10 +2068,11 @@ fn current_capture_work_for_session(
     session: &str,
     now: i64,
 ) -> Result<Option<WorkItem>> {
+    // CROSS JOIN keeps SQLite's join order: the session's participant rows first.
     let mut statement = tx.prepare(
         "SELECT item.snapshot, item.state='active', participant.role='lead'
-         FROM hub_work_items item
-         JOIN hub_work_participants participant ON participant.work=item.id
+         FROM hub_work_participants participant
+         CROSS JOIN hub_work_items item ON participant.work=item.id
          WHERE item.provider=?1 AND item.host=?2 AND item.repository=?3
            AND item.repository_id IS ?4 AND item.state IN ('active','paused','blocked')
            AND participant.token=?5 AND participant.session=?6
@@ -10745,10 +10746,11 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
+        // CROSS JOIN keeps SQLite's join order: the session's participant rows first.
         let snapshots = {
             let mut statement = tx.prepare(
-                "SELECT w.snapshot FROM hub_work_items w
-                 JOIN hub_work_participants p ON p.work = w.id
+                "SELECT w.snapshot FROM hub_work_participants p
+                 CROSS JOIN hub_work_items w ON p.work = w.id
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND w.state IN ('active','blocked')
                    AND p.token = ?5 AND p.session = ?6 AND p.generation = w.generation
@@ -10778,8 +10780,8 @@ impl Store for SqliteStore {
             None
         } else {
             tx.query_row(
-                "SELECT w.snapshot FROM hub_work_items w
-                 JOIN hub_work_participants p ON p.work = w.id
+                "SELECT w.snapshot FROM hub_work_participants p
+                 CROSS JOIN hub_work_items w ON p.work = w.id
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND p.token = ?5 AND p.session = ?6
                  ORDER BY w.updated_at DESC, w.id LIMIT 1",
