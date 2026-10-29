@@ -198,18 +198,18 @@ installation.
 
 ## Source fixtures
 
-`tests/setup.rs` covers new/exact resume, claimed interruption, retained partial
+`tests/integration/setup.rs` covers new/exact resume, claimed interruption, retained partial
 native and bundle state, interrupted receipt writes, wrong ownership ID, changed
 executable identity, foreign native repository, changed bundle members, path
 refusal (including direct and deeper bare-Git ancestors), busy/oversized/public receipts, non-UTF-8 paths and isolated self-check
 separation. Deterministic negatives cover a self-consistent bundle with the wrong
 executable pin, chmod changes and extra files/directories/symlinks. The pin
 fixture exercises validator rejection, without relying on updater race timing.
-`tests/setup_cli.rs` exercises registered argument forms, public ownership-ID
+`tests/integration/setup_cli.rs` exercises registered argument forms, public ownership-ID
 recovery after a post-claim failure, native packaging of the actual CLI, blocked
 doctor fields, typed failures and isolated self-checks. All fixtures own
 disposable synthetic roots. They never target an existing user repository or
-installation. Run the setup and setup_cli test targets locally to exercise
+installation. Run the `setup::` and `setup_cli::` tests of the `integration` test binary locally to exercise
 these fixtures.
 
 Recovery configuration fixtures independently compare both IDs with the actual

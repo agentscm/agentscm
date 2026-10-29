@@ -237,8 +237,8 @@ recorded all-terminal run outcome. The CLI accepts step budgets from 1 to 32.
 
 ## What the tests establish
 
-The [workflow tests](../../tests/skill_workflow.rs) and
-[command workflow tests](../../tests/command_checks/skill_workflows.rs) cover source and recipe
+The [workflow tests](../../tests/integration/skill_workflow.rs) and
+[command workflow tests](../../tests/integration/command_checks/skill_workflows.rs) cover source and recipe
 binding, graph dependencies, retained progress, failure propagation, context and policy drift,
 concurrent-controller cancellation, lost-result recovery without replay, unknown cleanup and CLI
 signal handling. Ordinary command cases use a fake Docker transport.

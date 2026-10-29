@@ -55,7 +55,7 @@ Structurally valid incomplete contexts can be stored and inspected. Unknown/unav
 
 ## Canonical encoding and limits
 
-Version 1 uses compact UTF-8 JSON in the declared field order, with the escaping emitted by the pinned `serde_json` implementation. Set-like lists sort bytewise; duplicates and duplicate dependency/evidence identities are rejected. Text is neither trimmed nor Unicode-normalized. The digest is lowercase SHA-256 of these bytes, with no trailing newline. There are no maps or floating-point values. This is an experimental versioned encoding, not a claim of RFC 8785 compatibility. Fixed vectors live in `tests/context_contract.rs`.
+Version 1 uses compact UTF-8 JSON in the declared field order, with the escaping emitted by the pinned `serde_json` implementation. Set-like lists sort bytewise; duplicates and duplicate dependency/evidence identities are rejected. Text is neither trimmed nor Unicode-normalized. The digest is lowercase SHA-256 of these bytes, with no trailing newline. There are no maps or floating-point values. This is an experimental versioned encoding, not a claim of RFC 8785 compatibility. Fixed vectors live in `tests/integration/context_contract.rs`.
 
 Canonical contexts are limited to 64 KiB. Identity strings are bounded portable ASCII; intent is at most 8 KiB, and individual text entries/reasons at most 1 KiB. Collections have count limits before canonicalization. Invalid or oversized input fails explicitly. Context CLI input is also limited to 64 KiB before JSON parsing, including whitespace.
 

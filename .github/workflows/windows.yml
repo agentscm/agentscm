@@ -51,9 +51,5 @@ jobs:
         env:
           # This job has no PostgreSQL: the postgres variants skip instead of failing under CI=true.
           CI: "false"
-          # Integration tests that build and are meaningful on Windows; the rest use Unix-only APIs.
-          TESTS: "cli context_contract hook_cli hook_end_to_end init_repo hub_gitlab hub_hooks hub_intents hub_login hub_mcp hub_sessions fake_github_smoke fake_gitlab_smoke"
-        run: |
-          args=()
-          for t in $TESTS; do args+=(--test "$t"); done
-          cargo test --locked --no-fail-fast --lib --bin agentscm "${args[@]}"
+        # tests/integration/main.rs compiles only the modules that are meaningful on Windows; the rest use Unix-only APIs.
+        run: cargo test --locked --no-fail-fast --lib --bin agentscm --test integration

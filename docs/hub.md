@@ -363,7 +363,7 @@ Every other route that takes an agent token (announcing, renewing and releasing 
 creating, uploading to and running publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
 answers 403 `{"error":"read_only"}` and writes nothing. `POST /v1/hub/hook/{agent}` treats a
 read-only token as an unknown one: the same "token not accepted" reply, and no session or event.
-Routes for human sessions still answer 401 to any agent token. `tests/hub_read_only.rs` walks every
+Routes for human sessions still answer 401 to any agent token. `tests/integration/hub_read_only.rs` walks every
 route with a read-only token; a new route needs a row there.
 
 Every hub process that shares a database must run a version that knows read-only tokens before any
@@ -1526,7 +1526,7 @@ the test has no forge to sign in with; the product image has no way around sign-
 
 The container test does not include a forge. Pull-request overlaps (webhook and poll intake, the
 `pr_notice` to the intent's agent, and the edited-in-place PR comment and status) are tested in
-`tests/hub_sync.rs` against an in-process fake GitHub.
+`tests/integration/hub_sync.rs` against an in-process fake GitHub.
 
 ## Limits
 
