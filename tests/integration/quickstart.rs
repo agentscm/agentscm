@@ -106,6 +106,33 @@ fn place_binary(dest: &Path) {
     }
 }
 
+/// Accepts connections until one sends a request whose first line starts with `line`, and
+/// returns it with its complete head. Anything else that connects to the ephemeral port, such
+/// as a local port scanner, is dropped, so only the program under test can end the wait.
+fn accept_request(listener: &std::net::TcpListener, line: &str) -> (std::net::TcpStream, Vec<u8>) {
+    use std::io::Read;
+    loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => head.extend_from_slice(&chunk[..count]),
+            }
+        }
+        if head.starts_with(line.as_bytes()) {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
+            return (stream, head);
+        }
+    }
+}
+
 fn find_git() -> PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|dir| dir.join("git"))
@@ -3448,7 +3475,7 @@ fn forged_native_dot_projects_cannot_delete_the_native_root_or_parent() {
 
 #[test]
 fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -3476,11 +3503,7 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(30)))
-                .unwrap();
-            stream.read_exact(&mut [0; 1]).unwrap();
+            let (mut stream, _) = accept_request(&listener, "GET /v1/hub/health ");
             entered_tx.send(()).unwrap();
             let _ = resume_rx.recv_timeout(Duration::from_secs(30));
             let _ = stream.write_all(
@@ -4284,7 +4307,7 @@ fn client_connect_supports_explicit_config_without_home() {
 
 #[test]
 fn client_connect_rejects_local_state_changed_during_hub_wait() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -4302,21 +4325,7 @@ fn client_connect_rejects_local_state_changed_during_hub_wait() {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                let mut chunk = [0_u8; 4096];
-                let count = stream.read(&mut chunk).unwrap();
-                assert_ne!(count, 0, "request ended before its headers");
-                request.extend_from_slice(&chunk[..count]);
-            }
-            assert_eq!(
-                String::from_utf8_lossy(&request).lines().next(),
-                Some("GET /v1/hub/whoami HTTP/1.1")
-            );
+            let (mut stream, _) = accept_request(&listener, "GET /v1/hub/whoami HTTP/1.1\r\n");
             entered_tx.send(()).unwrap();
             resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let body = json!({
