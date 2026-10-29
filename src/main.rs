@@ -839,6 +839,16 @@ fn main() {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.worker_threads(1);
         builder
+    } else if matches!(
+        cli.command,
+        Command::ChangeCapture {
+            command: change_capture_cli::ChangeCaptureCommand::HookClaude
+        }
+    ) {
+        // A capture hook runs on every tool call, so it gets the `hook` path's runtime.
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(2);
+        builder
     } else {
         tokio::runtime::Builder::new_multi_thread()
     };
