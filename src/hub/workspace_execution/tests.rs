@@ -257,6 +257,19 @@ fn one_profile_per_repository_and_target_may_publish_forge_status() {
     assert!(error.to_string().contains("forge status"), "{error}");
 }
 
+#[tokio::test]
+async fn queueing_a_run_wakes_the_idle_worker_at_once() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    service
+        .start(&fixture.owner, REPO, fixture.request(&service, "wake"))
+        .unwrap();
+    // The wake is kept for a worker that is not waiting yet, so it cannot be missed.
+    tokio::time::timeout(Duration::from_millis(100), service.queued.notified())
+        .await
+        .expect("an enqueue wakes the worker before its idle poll");
+}
+
 #[test]
 fn requests_bind_exact_registered_subject_and_are_durably_idempotent() {
     let fixture = Fixture::new();
