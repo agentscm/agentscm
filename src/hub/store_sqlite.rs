@@ -1679,13 +1679,14 @@ fn work_scope_overlaps(
     if scope.is_empty() {
         return Ok(Vec::new());
     }
+    // The scope column mirrors the snapshot's scope, so only overlapping snapshots are decoded.
     let mut statement = tx.prepare(
-        "SELECT snapshot FROM hub_work_items
+        "SELECT id, scope FROM hub_work_items
          WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
            AND state <> 'finished' AND (?5 IS NULL OR id <> ?5)
          ORDER BY id LIMIT 101",
     )?;
-    let snapshots = statement
+    let scopes = statement
         .query_map(
             params![
                 who.owner.identity.provider,
@@ -1694,18 +1695,23 @@ fn work_scope_overlaps(
                 who.repository_id,
                 exclude
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if snapshots.len() > 100 {
+    if scopes.len() > 100 {
         return Err(HubError::WorkOverlapIncomplete);
     }
     let mut found = Vec::new();
-    for snapshot in snapshots {
-        let mut item: WorkItem = json_value(&snapshot)?;
-        project_claim(tx, &mut item, now)?;
-        let reasons = scope_overlap_reasons(scope, &item.scope);
+    for (id, their_scope) in scopes {
+        let reasons = scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?);
         if !reasons.is_empty() {
+            let snapshot: String = tx.query_row(
+                "SELECT snapshot FROM hub_work_items WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )?;
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
             let their_scope = item.scope.clone();
             found.push(WorkScopeOverlap {
                 item,
@@ -2062,10 +2068,11 @@ fn current_capture_work_for_session(
     session: &str,
     now: i64,
 ) -> Result<Option<WorkItem>> {
+    // CROSS JOIN keeps SQLite's join order: the session's participant rows first.
     let mut statement = tx.prepare(
         "SELECT item.snapshot, item.state='active', participant.role='lead'
-         FROM hub_work_items item
-         JOIN hub_work_participants participant ON participant.work=item.id
+         FROM hub_work_participants participant
+         CROSS JOIN hub_work_items item ON participant.work=item.id
          WHERE item.provider=?1 AND item.host=?2 AND item.repository=?3
            AND item.repository_id IS ?4 AND item.state IN ('active','paused','blocked')
            AND participant.token=?5 AND participant.session=?6
@@ -10739,10 +10746,11 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
+        // CROSS JOIN keeps SQLite's join order: the session's participant rows first.
         let snapshots = {
             let mut statement = tx.prepare(
-                "SELECT w.snapshot FROM hub_work_items w
-                 JOIN hub_work_participants p ON p.work = w.id
+                "SELECT w.snapshot FROM hub_work_participants p
+                 CROSS JOIN hub_work_items w ON p.work = w.id
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND w.state IN ('active','blocked')
                    AND p.token = ?5 AND p.session = ?6 AND p.generation = w.generation
@@ -10772,8 +10780,8 @@ impl Store for SqliteStore {
             None
         } else {
             tx.query_row(
-                "SELECT w.snapshot FROM hub_work_items w
-                 JOIN hub_work_participants p ON p.work = w.id
+                "SELECT w.snapshot FROM hub_work_participants p
+                 CROSS JOIN hub_work_items w ON p.work = w.id
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND p.token = ?5 AND p.session = ?6
                  ORDER BY w.updated_at DESC, w.id LIMIT 1",
