@@ -761,10 +761,14 @@ pub(super) fn scope_overlap_reasons(
     reasons
 }
 
-pub(super) fn work_overlap_pairs(items: &[WorkItem]) -> Vec<WorkOverlapPair> {
+/// The first `max` overlapping pairs in item order; callers pass one past their page limit.
+pub(super) fn work_overlap_pairs(items: &[WorkItem], max: usize) -> Vec<WorkOverlapPair> {
     let mut pairs = Vec::new();
     for (index, left) in items.iter().enumerate() {
         for right in &items[index + 1..] {
+            if pairs.len() == max {
+                return pairs;
+            }
             let all_reasons = scope_overlap_reasons(&left.scope, &right.scope);
             let reasons_complete = all_reasons.len() <= 4;
             let reasons = all_reasons
@@ -786,6 +790,38 @@ pub(super) fn work_overlap_pairs(items: &[WorkItem]) -> Vec<WorkOverlapPair> {
         }
     }
     pairs
+}
+
+/// Drops trailing items until the compact JSON array fits `budget`; true when any were dropped.
+/// Each item is serialized once instead of re-serializing the whole array per drop.
+pub(super) fn fit_json_budget<T: Serialize>(items: &mut Vec<T>, budget: usize) -> Result<bool> {
+    let mut lengths = items
+        .iter()
+        .map(|item| serde_json::to_string(item).map(|json| json.len()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| HubError::Unavailable(error.to_string()))?;
+    // `[`, the items joined by `,`, then `]`: exactly what serde_json writes for the array.
+    let mut total = 2 + lengths.iter().sum::<usize>() + lengths.len().saturating_sub(1);
+    let mut dropped = false;
+    while total > budget
+        && let Some(length) = lengths.pop()
+    {
+        items.pop();
+        total -= length + usize::from(!lengths.is_empty());
+        dropped = true;
+    }
+    Ok(dropped)
+}
+
+/// A lead's claim is active while its token is valid and it checked in recently.
+pub(super) fn claim_status(last_checkin_at: i64, lead_valid: bool, now: i64) -> ClaimStatus {
+    if now < last_checkin_at {
+        ClaimStatus::Unknown
+    } else if lead_valid && last_checkin_at >= now - CLAIM_STALE_SECONDS {
+        ClaimStatus::Active
+    } else {
+        ClaimStatus::Stale
+    }
 }
 
 impl BriefingAck {
@@ -944,6 +980,23 @@ mod tests {
         assert!(check_work_payload_capacity(100, -10, 100).is_ok());
         assert!(check_work_payload_capacity(91, 10, 100).is_err());
         assert!(check_work_payload_capacity(i64::MAX, 1, i64::MAX).is_err());
+    }
+
+    #[test]
+    fn json_budget_matches_whole_array_serialization() {
+        let items = ["a", "bb", "", "dddd"].map(String::from).to_vec();
+        for budget in 0..30 {
+            let mut fitted = items.clone();
+            let dropped = super::fit_json_budget(&mut fitted, budget).unwrap();
+            let mut expected = items.clone();
+            while !expected.is_empty() && serde_json::to_string(&expected).unwrap().len() > budget {
+                expected.pop();
+            }
+            assert_eq!(
+                (fitted, dropped),
+                (expected.clone(), expected.len() < items.len())
+            );
+        }
     }
 
     #[test]

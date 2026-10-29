@@ -96,13 +96,13 @@ use super::store::{
     validate_login,
 };
 use super::work::{
-    Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
-    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
-    WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
-    WorkOverviewQuery, WorkParticipant, WorkRepositoryScope, WorkRole, WorkScopeCheck,
-    WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
-    WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
+    Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
+    MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES,
+    WorkCheckpoint, WorkCheckpointResult, WorkCompaction, WorkConflictKind, WorkEvent, WorkItem,
+    WorkOutcome, WorkOutcomeKind, WorkOverview, WorkOverviewQuery, WorkParticipant,
+    WorkRepositoryScope, WorkRole, WorkScopeCheck, WorkScopeOverlap, WorkSearchItem,
+    WorkSearchPage, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState, WorkWho,
+    check_work_delivery_page, check_work_payload_capacity, claim_status, fit_json_budget,
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
     work_payload_row_bytes,
 };
@@ -1565,11 +1565,35 @@ fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i
             &[&item.lead_token, &now],
         )?
         .is_some();
-    item.claim_status = if active && item.last_checkin_at >= now - CLAIM_STALE_SECONDS {
-        ClaimStatus::Active
-    } else {
-        ClaimStatus::Stale
-    };
+    item.claim_status = claim_status(item.last_checkin_at, active, now);
+    Ok(())
+}
+
+/// `project_claim` for many items with one token lookup.
+fn project_claims(
+    tx: &mut postgres::Transaction<'_>,
+    items: &mut [WorkItem],
+    now: i64,
+) -> Result<()> {
+    let leads = items
+        .iter()
+        .map(|item| item.lead_token.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let active = tx
+        .query(
+            "SELECT t.id FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+             WHERE t.id = ANY($1) AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled",
+            &[&leads, &now],
+        )?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<BTreeSet<_>>();
+    for item in items {
+        let valid = active.contains(&item.lead_token);
+        item.claim_status = claim_status(item.last_checkin_at, valid, now);
+    }
     Ok(())
 }
 
@@ -9737,12 +9761,9 @@ impl Store for PgStore {
                 .collect::<Result<Vec<_>>>()?;
             let mut current_complete = current.len() <= query.limit;
             current.truncate(query.limit);
-            for item in &mut current {
-                project_claim(&mut tx, item, now)?;
-            }
+            project_claims(&mut tx, &mut current, now)?;
             let overview_part_budget = (MAX_BRIEFING_BYTES - 4096) / 3;
-            while json_string(&current)?.len() > overview_part_budget {
-                current.pop();
+            if fit_json_budget(&mut current, overview_part_budget)? {
                 current_complete = false;
             }
 
@@ -9787,15 +9808,13 @@ impl Store for PgStore {
             let history_retention_gap = event_floor > 0 || snapshot_floor > 0;
             let mut recent_complete = recent.len() <= query.limit && !history_retention_gap;
             recent.truncate(query.limit);
-            while json_string(&recent)?.len() > overview_part_budget {
-                recent.pop();
+            if fit_json_budget(&mut recent, overview_part_budget)? {
                 recent_complete = false;
             }
-            let mut overlaps = work_overlap_pairs(&current);
+            let mut overlaps = work_overlap_pairs(&current, query.limit + 1);
             let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
             overlaps.truncate(query.limit);
-            while json_string(&overlaps)?.len() > overview_part_budget {
-                overlaps.pop();
+            if fit_json_budget(&mut overlaps, overview_part_budget)? {
                 overlaps_complete = false;
             }
             tx.commit()?;
