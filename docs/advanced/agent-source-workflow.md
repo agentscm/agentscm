@@ -44,7 +44,7 @@ operator's real revision and recipe/toolchain/environment identities rather than
 Add repeated `--path` values to its complete command:
 
 ```text
-workflow start ... --path Cargo.toml --path Cargo.lock --path src --path tests/task_workspace.rs
+workflow start ... --path Cargo.toml --path Cargo.lock --path src --path tests/integration/task_workspace.rs
 ```
 
 Select task files, tests, build manifests, lockfiles, configuration, schemas, fixtures and required

@@ -59,3 +59,5 @@ debug = "line-tables-only"
 # from test executables so metadata does not consume the native bundle's 128 MiB limit.
 [profile.test]
 strip = true
+# Test builds are one-shot; incremental state was ~60% of a gate run's target/.
+incremental = false
