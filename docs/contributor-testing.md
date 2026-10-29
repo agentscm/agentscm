@@ -29,6 +29,8 @@ tools/windows-check.sh
 
 It checks compilation only; Windows test behaviour is still CI's job. It builds into `target/x86_64-pc-windows-gnu`, which takes several GB; delete it with the rest of `target` when space is tight.
 
+`[profile.test]` in `Cargo.toml` sets `incremental = false`, so test builds (nextest, doctests and local validation) do not write `target/debug/incremental`. A gate run builds each revision once, and before this setting incremental state was about 60% of the gate's `target` size. `cargo clippy` and interactive `cargo build`/`cargo check` use the dev profile and still keep incremental state.
+
 The nextest profile disables fail-fast and retries. It writes JUnit output to `target/nextest/default/junit.xml`, including ignored tests as skipped rather than treating them as executed. The `backend_s3` test binary is limited to one process because its tests share an in-process `CreateBucket` mutex. PostgreSQL fixture tests are also limited to one process because independently named schemas still share fixed database-wide migration and event advisory locks; the store's five-second lock timeout can otherwise expire while another test holds one of those locks. These limits do not serialize unrelated tests, internal concurrency within one test or separate nextest invocations; do not run multiple suites against the same bucket or PostgreSQL database concurrently.
 
 The `two_git_worktrees_*` cases in `hub_workspace_execution` share a test group
