@@ -2,6 +2,13 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.1.3](https://github.com/agentscm/agentscm/compare/v0.1.2...v0.1.3) - 2026-10-29
+
+### Fixed
+
+- Use GNU release tooling for changelog preparation ([#232](https://github.com/agentscm/agentscm/pull/232))
+- Repair Work namespaces after repository renames ([#230](https://github.com/agentscm/agentscm/pull/230))
+
 ## 0.1.2 (2026-10-29)
 
 - Make local validation comments clearly attributable to AgentSCM and report missing PostgreSQL/S3 coverage only when the repository policy requires it.
