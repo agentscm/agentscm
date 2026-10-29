@@ -888,6 +888,8 @@ pub trait Store: Send + Sync {
         apply: bool,
         now: i64,
     ) -> Result<WorkCompaction>;
+    /// Every repository scope that retains Work items or coordination requests.
+    fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>>;
     /// Trusted workspace calls only: authorization is held across this transaction.
     fn promise_create(
         &self,

@@ -9614,6 +9614,27 @@ impl Store for PgStore {
         })
     }
 
+    fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>> {
+        self.run(true, |client| {
+            Ok(client
+                .query(
+                    "SELECT provider, host, repository, repository_id FROM hub_work_items
+                     UNION SELECT provider, host, repository, repository_id
+                     FROM hub_coordination_requests
+                     ORDER BY 1, 2, 3, 4",
+                    &[],
+                )?
+                .iter()
+                .map(|row| WorkRepositoryScope {
+                    provider: row.get(0),
+                    host: row.get(1),
+                    repository: row.get(2),
+                    repository_id: row.get(3),
+                })
+                .collect())
+        })
+    }
+
     fn work_briefing_preview_for(
         &self,
         token: &str,

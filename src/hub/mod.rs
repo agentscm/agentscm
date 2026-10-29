@@ -146,6 +146,80 @@ impl From<crate::Error> for HubError {
     }
 }
 
+/// Automatic compaction keeps a week of stand-up history; the operator command can choose any
+/// cutoff at least 24 hours old.
+pub const WORK_AUTO_COMPACTION_AGE_SECONDS: i64 = 7 * 86_400;
+const WORK_COMPACTION_FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const WORK_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const WORK_COMPACTION_BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+const WORK_COMPACTION_BUSY_ATTEMPTS: usize = 12;
+
+/// Applies the operator `work compact` to every repository scope with history older than
+/// [`WORK_AUTO_COMPACTION_AGE_SECONDS`], with that command's own guards. Returns the applied
+/// results and how many scopes were skipped: refused by a guard, such as an unacknowledged
+/// delivery, or the store stayed busy. Each scope is a separate bounded store call.
+pub async fn compact_work_history(
+    state: &HubState,
+    now: i64,
+) -> Result<(Vec<work::WorkCompaction>, usize)> {
+    let store = state.store.clone();
+    let scopes = blocking_when_free(state, move || store.work_compaction_scopes()).await?;
+    let before = now - WORK_AUTO_COMPACTION_AGE_SECONDS;
+    let mut applied = Vec::new();
+    let mut skipped = 0;
+    for scope in scopes {
+        let store = state.store.clone();
+        match blocking_when_free(state, move || store.work_compact(&scope, before, true, now)).await
+        {
+            Ok(result) => applied.push(result),
+            Err(HubError::Invalid(_) | HubError::Busy) => skipped += 1,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((applied, skipped))
+}
+
+async fn blocking_when_free<T: Send + 'static>(
+    state: &HubState,
+    work: impl FnOnce() -> Result<T> + Clone + Send + 'static,
+) -> Result<T> {
+    for _ in 1..WORK_COMPACTION_BUSY_ATTEMPTS {
+        match http::blocking(state, work.clone()).await {
+            Err(HubError::Busy) => tokio::time::sleep(WORK_COMPACTION_BUSY_RETRY).await,
+            result => return result,
+        }
+    }
+    http::blocking(state, work).await
+}
+
+/// Compacts stand-up history a minute after startup and then hourly, logging one line a pass.
+pub async fn work_compaction_loop(state: HubState) {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + WORK_COMPACTION_FIRST_DELAY,
+        WORK_COMPACTION_INTERVAL,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        match compact_work_history(&state, store::unix_now()).await {
+            Ok((applied, skipped)) => {
+                let sum = |field: fn(&work::WorkCompaction) -> u64| -> u64 {
+                    applied.iter().map(field).sum()
+                };
+                eprintln!(
+                    "hub: work compaction removed {} checkpoint receipts, {} work versions, {} coordination requests and {} merge observations across {} repositories ({skipped} skipped)",
+                    sum(|c| c.deleted_operations),
+                    sum(|c| c.deleted_versions),
+                    sum(|c| c.deleted_coordination_requests),
+                    sum(|c| c.deleted_merge_observations),
+                    applied.len(),
+                );
+            }
+            Err(error) => eprintln!("hub: work compaction failed: {error}"),
+        }
+    }
+}
+
 pub const DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 30;
 pub const MAX_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 3650;
 

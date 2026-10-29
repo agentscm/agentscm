@@ -10530,6 +10530,26 @@ impl Store for SqliteStore {
         })
     }
 
+    fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT provider, host, repository, repository_id FROM hub_work_items
+             UNION SELECT provider, host, repository, repository_id FROM hub_coordination_requests
+             ORDER BY 1, 2, 3, 4",
+        )?;
+        let scopes = statement
+            .query_map([], |row| {
+                Ok(WorkRepositoryScope {
+                    provider: row.get(0)?,
+                    host: row.get(1)?,
+                    repository: row.get(2)?,
+                    repository_id: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(scopes)
+    }
+
     fn work_briefing_preview_for(
         &self,
         token: &str,

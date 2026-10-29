@@ -1747,5 +1747,15 @@ SHA and, once closed, its merge commit SHA, and each branch name with its SHA.
 Nothing here prevents a later round trip between Git and native revisions.
 
 Stand-up work has a separate [retention policy](standup.md#storage-maintenance).
-Its four coordination event kinds can be compacted by a local operator; this
-exception does not permit updates or deletion of the general Hub events above.
+Its four coordination event kinds can be compacted; this exception does not
+permit updates or deletion of the general Hub events above. `hub serve` compacts
+automatically a minute after startup and then every hour: for each repository
+that retains Work items or coordination requests, it applies the same
+`agentscm work compact` with a cutoff seven days before the pass and with that
+command's guards. A repository with an unacknowledged briefing or catch-up
+delivery from the last 24 hours is skipped until a later pass. Each pass logs
+one line with the checkpoint receipts, superseded work versions, closed
+coordination requests and merge observations it removed, and how many
+repositories it skipped. Automatic compaction is not configurable. A shorter
+cutoff (at least 24 hours old), a dry run, and a repository that has only merge
+observations remain manual operator maintenance with the command.

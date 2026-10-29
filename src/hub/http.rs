@@ -180,6 +180,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     }
     tokio::spawn(sync::poll_loop(state.clone(), config.poll_seconds));
     tokio::spawn(super::change_record_http::sweep_loop(state.clone()));
+    tokio::spawn(super::work_compaction_loop(state.clone()));
     #[cfg(unix)]
     let execution_worker = state
         .workspace_execution
