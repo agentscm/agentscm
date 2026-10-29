@@ -1,0 +1,11 @@
+[workspace]
+git_only = true
+release_always = false
+git_tag_name = "v{{ version }}"
+git_release_enable = false
+semver_check = false
+dependencies_update = false
+features_always_increment_minor = true
+release_commits = "(?m)^(fix|perf|feat)(\\([^)]*\\))?!?:|^[a-z]+(\\([^)]*\\))?!:|^BREAKING CHANGE:"
+pr_name = "chore: Prepare release"
+pr_body = "Review the version and changelog changes in the files. Publishing begins after this candidate is merged and its release tag is created."

@@ -2,6 +2,14 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## 0.1.2 (2026-10-29)
+
+- Make local validation comments clearly attributable to AgentSCM and report missing PostgreSQL/S3 coverage only when the repository policy requires it.
+- Reduce hook, MCP and Hub memory use by removing repeated scans and bounding retained buffers.
+- Bound contributor build storage and consolidate integration-test linking.
+- Prepare releases from Cargo versions and Git tags with version-free PR text; keep binary/container qualification and npm approval in the existing publishing workflow.
+- Known limits: the software remains alpha. Platform, service and live runtime coverage depend on the release qualification jobs; a passing local suite alone does not establish them.
+
 ## 0.1.0-alpha.9 (2026-10-28)
 
 - The repository moved to `agentscm/agentscm`. Installers, npm metadata, container and plugin references and the local-validation bindings now name it; release jobs check the repository and organization by their IDs, and historical releases and attestations are unchanged (#204, #206).
