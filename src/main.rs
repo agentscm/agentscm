@@ -816,9 +816,9 @@ fn main() {
     {
         let args = std::env::args_os().skip(2);
         let args = args.map(|a| a.to_string_lossy().into_owned()).collect();
-        // One worker, not current_thread: the hub call blocks on git, and the
-        // deadline timer must still fire on the main thread meanwhile.
-        runtime(tokio::runtime::Builder::new_multi_thread().worker_threads(1))
+        // Two workers, not current_thread: the hub call blocks a worker on git,
+        // and only a parked worker drives the timer behind the deadline.
+        runtime(tokio::runtime::Builder::new_multi_thread().worker_threads(2))
             .block_on(hook_cli::run_unparsed(args));
     }
     let cli = match parse_cli_on_bounded_stack() {
