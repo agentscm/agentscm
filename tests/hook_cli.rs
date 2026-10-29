@@ -404,3 +404,86 @@ fn no_git_means_no_root_header_and_a_bad_repo_is_ignored() {
     assert_eq!(seen.path, "/v1/hub/hook/claude");
     assert_eq!(seen.root, "");
 }
+
+/// A saved connection for a real checkout whose `origin` can only be read by running `git`.
+#[cfg(unix)]
+fn connected_checkout(dir: &TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    for args in [
+        &["init", "--quiet"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    ] {
+        let status = Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let root = root.canonicalize().unwrap();
+    let token = dir.path().join("client.token");
+    std::fs::write(&token, "synthetic-private-token\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = dir.path().join("agentscm");
+    std::fs::create_dir_all(&config).unwrap();
+    let saved = json!({"version": 1, "connections": [{
+        "root": root,
+        "origin_host": "github.com",
+        "hub": "http://127.0.0.1:9",
+        "repo": "acme/widgets",
+        "token_file": token,
+    }]});
+    std::fs::write(config.join("connections.json"), saved.to_string()).unwrap();
+    root
+}
+
+/// A directory holding a `git` that stalls for eight seconds in a child that outlives a kill of
+/// the script, as a hung credential helper or a wedged network filesystem would.
+#[cfg(unix)]
+fn stalled_git(dir: &TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.path().join("stalled-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("git");
+    std::fs::write(&script, "#!/bin/sh\n/bin/sleep 8\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stalled_git_cannot_hold_a_client_hook_past_its_deadline() {
+    // (event, wall-clock bound): the 3 s limit, or 4.5 s at session start, plus process start on
+    // a loaded host. Waiting for the stalled child would take 8 s.
+    for (event, bound) in [("PreToolUse", 4000), ("SessionStart", 5500)] {
+        let dir = home();
+        let root = connected_checkout(&dir);
+        let bin = stalled_git(&dir);
+        let payload = json!({"hook_event_name": event, "session_id": "s1", "cwd": root});
+        let path = bin.display().to_string();
+        let run = run_with(
+            &["claude", "--client-connection"],
+            &[("PATH", &path)],
+            &dir,
+            payload.to_string().as_bytes(),
+        );
+        assert!(
+            run.elapsed < Duration::from_millis(bound),
+            "{event}: {:?}",
+            run.elapsed
+        );
+        assert_unknown(&run, event, "");
+        assert!(
+            run.stdout.contains("coordination unknown"),
+            "{event}: {}",
+            run.stdout
+        );
+    }
+}
