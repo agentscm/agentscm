@@ -27,9 +27,20 @@ jobs:
         run: |
           rustc --edition=2024 -D warnings tools/release-files.rs -o "$RUNNER_TEMP/release-files"
           "$RUNNER_TEMP/release-files" --check
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        with:
-          tool: release-plz@0.4.2
+      # The musl build falsely reports a template stack limit on Linux.
+      # Keep the same tool version, using its checksum-pinned GNU build on Ubuntu.
+      - name: Install release-plz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-plz.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/release-plz/release-plz/releases/download/release-plz-v0.4.2/release-plz-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' bd7c3adc1a4ed3831e6bfde51b92b168f32ab6d15cd210ed88044e7f858f0cae "$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/release-plz-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/release-plz-bin" release-plz
+          test "$("$RUNNER_TEMP/release-plz-bin/release-plz" --version)" = 'release-plz 0.4.2'
+          echo "$RUNNER_TEMP/release-plz-bin" >> "$GITHUB_PATH"
       - name: Create release app token
         id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
