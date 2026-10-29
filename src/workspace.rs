@@ -3232,7 +3232,8 @@ impl Scan<'_> {
             } else {
                 // Streamed through the hasher so no whole file is buffered.
                 let mut hasher = Sha256::new();
-                let (kind, length) = read_regular_into(&path, &relative, &mut hasher)?;
+                let before = fs::symlink_metadata(&path)?;
+                let (kind, length) = read_regular_into(&path, &relative, &before, &mut hasher)?;
                 let content = hasher.finalize().to_vec();
                 (Item { kind, content }, length)
             };
@@ -3276,21 +3277,23 @@ fn read_symlink_item(path: &Path, relative: &str) -> Result<Item> {
 }
 
 fn read_regular_file(path: &Path, relative: &str) -> Result<Item> {
-    // Preallocated as before so a large file is not regrown by doubling; the size is rechecked.
-    let size = fs::symlink_metadata(path)?.len().min(MAX_FILE_BYTES as u64);
+    let before = fs::symlink_metadata(path)?;
+    // Preallocated so a large file is not regrown by doubling; the size is rechecked.
+    let size = before.len().min(MAX_FILE_BYTES as u64);
     let mut content = Vec::with_capacity(size as usize);
-    let (kind, _) = read_regular_into(path, relative, &mut content)?;
+    let (kind, _) = read_regular_into(path, relative, &before, &mut content)?;
     Ok(Item { kind, content })
 }
 
 /// Copy a regular file into `sink` under the size bound, refusing a file that changes while it
-/// is read. Returns its kind and byte length.
+/// is read. `before` is the caller's fresh `symlink_metadata` of `path`. Returns its kind and
+/// byte length.
 fn read_regular_into(
     path: &Path,
     relative: &str,
+    before: &fs::Metadata,
     sink: &mut impl Write,
 ) -> Result<(EntryKind, usize)> {
-    let before = fs::symlink_metadata(path)?;
     if !before.file_type().is_file() || before.file_type().is_symlink() {
         return Err(Error::Invalid(format!(
             "workspace path is not a regular file: {relative}"
