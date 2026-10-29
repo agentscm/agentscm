@@ -16,7 +16,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Serialises every release run, not just runs of one tag.
+  group: release
   cancel-in-progress: false
 
 env:
@@ -142,8 +143,9 @@ jobs:
           if-no-files-found: error
 
   image:
-    # Assemble and verify the public version tag only after both native children pass.
-    needs: image-platform
+    # Assemble and verify the public version tag only after both native children pass and every release
+    # binary has built, so a failed binary build leaves no `:<version>` image and the version can be re-tagged.
+    needs: [image-platform, binaries]
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -242,7 +244,7 @@ jobs:
 
   binaries:
     # Builds only: no OIDC token or attestation rights here, so build-time code cannot sign anything.
-    # Runs in parallel with the image once the UI is built; `attest` waits for both.
+    # Runs in parallel with the per-arch image builds once the UI is built; the version index and `attest` wait for it.
     needs: ui
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     strategy:
@@ -303,7 +305,7 @@ jobs:
           if-no-files-found: error
 
   attest:
-    # Waits for `image` so the tag has been checked against Cargo.toml and main before anything is attested.
+    # Waits for `image` (which itself waits for `binaries`) so the tag has been checked against Cargo.toml and main before anything is attested.
     needs: [image, binaries]
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-latest
