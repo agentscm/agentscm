@@ -1754,7 +1754,8 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     Ok(event)
 }
 
-fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+/// Returns the stored snapshot so callers can size it without serializing the item again.
+fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<String> {
     let snapshot = json_string(item)?;
     tx.execute(
         "UPDATE hub_work_items SET lead_token = ?2, lead_agent = ?3, lead_session = ?4,
@@ -1770,7 +1771,7 @@ fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<
             state_name(item.state),
             item.next_action,
             item.current.as_ref().map(json_string).transpose()?,
-            snapshot,
+            &snapshot,
             item.updated_at,
             seq,
             json_string(&item.scope)?,
@@ -1781,9 +1782,9 @@ fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<
     tx.execute(
         "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
          VALUES (?1, ?2, ?3, ?4)",
-        params![item.id, seq, state_name(item.state), json_string(item)?],
+        params![item.id, seq, state_name(item.state), snapshot],
     )?;
-    Ok(())
+    Ok(snapshot)
 }
 
 fn work_payload_bytes(
@@ -3136,8 +3137,7 @@ fn start_in(
                     now
                 ],
             )?;
-            save_work_version(tx, &item, seq)?;
-            let snapshot = json_string(&item)?;
+            let snapshot = save_work_version(tx, &item, seq)?;
             let delta = work_transition_payload_bytes(&snapshot, &event)?
                 .checked_sub(previous_item_bytes)
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -3315,10 +3315,9 @@ fn start_in(
                 now
             ],
         )?;
-        save_work_version(tx, &item, seq)?;
+        let snapshot = save_work_version(tx, &item, seq)?;
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
         retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
-        let snapshot = json_string(&item)?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -7803,14 +7802,13 @@ impl Store for SqliteStore {
         let event = work_event("work_checkpoint", &item)?;
         let seq = append(&tx, &event)?;
         item.updated_seq = seq;
-        save_work_version(&tx, &item, seq)?;
+        let snapshot = save_work_version(&tx, &item, seq)?;
         tx.execute(
             "INSERT INTO hub_work_checkpoint_ops
                 (work, operation_id, request, event_seq)
              VALUES (?1, ?2, ?3, ?4)",
             params![item.id, checkpoint.operation_id, request, seq],
         )?;
-        let snapshot = json_string(&item)?;
         let request_bytes = work_payload_row_bytes(request.len())?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
