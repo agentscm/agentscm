@@ -74,4 +74,5 @@ jobs:
           AGENTSCM_DOCKER_SOCKET: /var/run/docker.sock
         # libtest filters are substrings, so `execution::` also matches any module whose name ends
         # in `execution`; re-check `--list` output when adding ignored tests to other modules.
-        run: cargo test --locked --no-fail-fast --test integration -- --ignored --test-threads=1 --nocapture execution:: command_checks:: execution_canaries::
+        run: |
+          cargo test --locked --no-fail-fast --test integration -- --ignored --test-threads=1 --nocapture execution:: command_checks:: execution_canaries::
