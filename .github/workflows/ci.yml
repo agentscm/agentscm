@@ -35,8 +35,6 @@ jobs:
       # them on every pull request. The labelled `release-targets` job builds every non-Windows release target.
       - run: rustup target add x86_64-unknown-linux-musl
       - name: Install musl-tools
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
@@ -103,10 +101,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked --doc
 
-  # Clippy and release builds for the musl and macOS targets (clippy also catches lints in target-specific
-  # code), so a target-specific lint (for example a libc item
-  # deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the pull
-  # request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
+  # Clippy and release builds for the musl and macOS targets, so a target-specific lint (for example a libc
+  # item deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the
+  # pull request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
   # needs the UI build. Same gate as the `windows` job in windows.yml: with the `ci-extended` label, a
   # fork PR once per labelling, and always on push to main and manual runs.
   release-targets:
