@@ -428,15 +428,7 @@ impl FromRequestParts<HubState> for Reader {
 
 /// The secret from exactly one `Authorization: Bearer` header.
 pub(super) fn bearer(parts: &Parts) -> std::result::Result<&str, ApiError> {
-    let mut values = parts.headers.get_all(header::AUTHORIZATION).iter();
-    match (values.next(), values.next()) {
-        (Some(value), None) => value.to_str().ok(),
-        _ => None,
-    }
-    .and_then(|value| value.split_once(' '))
-    .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-    .map(|(_, token)| token)
-    .ok_or_else(ApiError::unauthorized)
+    crate::http_listener::bearer(&parts.headers).ok_or_else(ApiError::unauthorized)
 }
 
 async fn health(State(state): State<HubState>) -> Response {

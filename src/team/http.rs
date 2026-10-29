@@ -763,19 +763,12 @@ fn credentials(headers: &HeaderMap, mutation: bool, origin: &str) -> ApiResult<C
 }
 
 fn bearer(headers: &HeaderMap) -> ApiResult<Option<&str>> {
-    let values: Vec<_> = headers.get_all(header::AUTHORIZATION).iter().collect();
-    if values.len() > 1 {
-        return Err(ApiError::unauthorized());
-    }
-    let Some(value) = values.first() else {
+    if !headers.contains_key(header::AUTHORIZATION) {
         return Ok(None);
-    };
-    let value = value.to_str().map_err(|_| ApiError::unauthorized())?;
-    let raw = value
-        .strip_prefix("Bearer ")
-        .filter(|raw| !raw.is_empty() && !raw.contains(' '))
-        .ok_or_else(ApiError::unauthorized)?;
-    Ok(Some(raw))
+    }
+    crate::http_listener::bearer(headers)
+        .map(Some)
+        .ok_or_else(ApiError::unauthorized)
 }
 
 fn session_token(headers: &HeaderMap) -> ApiResult<Option<&str>> {

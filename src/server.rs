@@ -415,22 +415,11 @@ pub(super) fn loopback_host(headers: &HeaderMap) -> bool {
 }
 
 fn authorized(token: Option<&str>, headers: &HeaderMap) -> bool {
-    let Some(token) = token else {
-        return true;
-    };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .unwrap_or_default()
-        .as_bytes();
-    // Constant time for equal lengths, as agentscm's hmac comparison.
-    presented.len() == token.len()
-        && presented
-            .iter()
-            .zip(token.as_bytes())
-            .fold(0, |acc, (x, y)| acc | (x ^ y))
-            == 0
+    token.is_none_or(|token| {
+        agentscm::http_listener::bearer(headers).is_some_and(|presented| {
+            agentscm::http_listener::constant_time_eq(presented.as_bytes(), token.as_bytes())
+        })
+    })
 }
 
 /// Pages recent workflow runs, optionally filtered by `q`, as the Hub does.

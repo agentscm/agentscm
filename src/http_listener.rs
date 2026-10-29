@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::http::{HeaderMap, header};
+
+pub use crate::hmac::constant_time_eq;
 
 /// Open connections served at once, like the per-process request limit in `server.rs`. Past it the
 /// listener stops accepting, so excess clients wait in the kernel backlog holding no memory here.
@@ -101,6 +104,18 @@ pub(crate) async fn serve_limited(
     while connections.join_next().await.is_some() {}
 }
 
+/// The secret of exactly one `Authorization: Bearer <secret>` header. A missing, repeated or
+/// malformed header, or a secret that is empty or holds a space, is `None`.
+pub fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let (scheme, secret) = value.to_str().ok()?.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !secret.is_empty() && !secret.contains(' '))
+        .then_some(secret)
+}
+
 /// Completes on Ctrl-C or, on Unix, SIGTERM: the shutdown future every listener passes to `serve`.
 pub async fn shutdown_signal() {
     #[cfg(unix)]
@@ -171,6 +186,30 @@ pub(crate) mod tests {
             std::future::pending(),
         ));
         address
+    }
+
+    #[test]
+    fn bearer_takes_one_well_formed_header_only() {
+        let headers = |values: &[&'static str]| {
+            let mut map = HeaderMap::new();
+            for value in values {
+                map.append(header::AUTHORIZATION, value.parse().unwrap());
+            }
+            map
+        };
+        assert_eq!(bearer(&headers(&["Bearer abc"])), Some("abc"));
+        assert_eq!(bearer(&headers(&["bearer abc"])), Some("abc"));
+        for rejected in [
+            &[][..],
+            &["Bearer abc", "Bearer abc"],
+            &["Bearer abc", "Bearer def"],
+            &["Bearer "],
+            &["Bearer a b"],
+            &["Basic abc"],
+            &["abc"],
+        ] {
+            assert_eq!(bearer(&headers(rejected)), None, "{rejected:?}");
+        }
     }
 
     #[tokio::test]
