@@ -90,3 +90,40 @@ jobs:
       - name: Run doctests
         if: ${{ !cancelled() }}
         run: cargo test --locked --doc
+
+  # Release builds for the musl and macOS targets, so a target-specific lint (for example a libc item
+  # deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the pull
+  # request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
+  # needs the UI build. Same gate as the `windows` job in windows.yml: with the `ci-extended` label, a
+  # fork PR once per labelling, and always on push to main and manual runs.
+  release-targets:
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true}
+          - {target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true}
+          - {target: aarch64-apple-darwin, os: macos-15, musl: false}
+          - {target: x86_64-apple-darwin, os: macos-15, musl: false} # cross-compiled on the arm runner, as release.yml does
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - run: rustup target add "$TARGET"
+      - name: Install musl-tools
+        if: ${{ matrix.musl }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          # ring and bundled SQLite compile C; cc-rs only guesses musl-gcc for x86_64.
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --locked --release --target "$TARGET"
