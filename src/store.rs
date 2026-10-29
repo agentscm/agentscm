@@ -34,6 +34,7 @@ const MAX_CAPTURE_QUALIFICATION_BYTES: u64 = MAX_CHECKPOINT_BYTES as u64;
 const MAX_CAPTURE_QUALIFICATION_BYTES: u64 = 128 * 1024;
 
 const BLOB_MAGIC: &[u8; 9] = b"AGSCM-B1\0";
+const BLOB_HEADER_BYTES: usize = BLOB_MAGIC.len() + 8;
 const TREE_MAGIC: &[u8; 9] = b"AGSCM-T2\0";
 const BRANCH_MAGIC: &[u8; 9] = b"AGSCM-N1\0";
 const LEAF_MAGIC: &[u8; 9] = b"AGSCM-L1\0";
@@ -1008,43 +1009,7 @@ impl Engine {
         id: &str,
         allowance: usize,
     ) -> Result<Option<Vec<u8>>> {
-        validate_id(id)?;
-        let file = File::open(self.object_path(id)).map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                Error::NotFound(format!("object: {id}"))
-            } else {
-                Error::Io(error)
-            }
-        })?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(Error::Invalid("blob object must be a regular file".into()));
-        }
-        let encoded_length = metadata.len();
-        if encoded_length > MAX_OBJECT_BYTES {
-            return Err(Error::Limit(format!("object {id} exceeds size limit")));
-        }
-        const HEADER_BYTES: usize = BLOB_MAGIC.len() + 8;
-        if encoded_length < HEADER_BYTES as u64 {
-            return Err(Error::Invalid("invalid blob length".into()));
-        }
-        let mut reader = BudgetedRead {
-            inner: file,
-            budget: self.read_budget.clone(),
-        };
-        let mut header = [0u8; HEADER_BYTES];
-        reader.read_exact(&mut header)?;
-        if !header.starts_with(BLOB_MAGIC) {
-            return Err(Error::Invalid("invalid blob encoding".into()));
-        }
-        let length = u64::from_be_bytes(
-            header[BLOB_MAGIC.len()..]
-                .try_into()
-                .map_err(|_| Error::Invalid("invalid blob header".into()))?,
-        );
-        if length > MAX_FILE_BYTES as u64 || encoded_length != HEADER_BYTES as u64 + length {
-            return Err(Error::Invalid("invalid blob length".into()));
-        }
+        let (mut reader, header, length) = self.open_blob(id)?;
         if length > allowance as u64 {
             return Ok(None);
         }
@@ -1063,6 +1028,53 @@ impl Engine {
             return Err(Error::Invalid(format!("object digest mismatch: {id}")));
         }
         Ok(Some(payload))
+    }
+
+    /// Declared payload length of a blob, from its header and file size only.
+    /// The payload is neither read nor hashed, so this is not object qualification.
+    pub(crate) fn blob_length(&self, id: &str) -> Result<u64> {
+        Ok(self.open_blob(id)?.2)
+    }
+
+    /// Opens a blob and checks its header against the file length.
+    fn open_blob(&self, id: &str) -> Result<(BudgetedRead<File>, [u8; BLOB_HEADER_BYTES], u64)> {
+        validate_id(id)?;
+        let file = File::open(self.object_path(id)).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                Error::NotFound(format!("object: {id}"))
+            } else {
+                Error::Io(error)
+            }
+        })?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(Error::Invalid("blob object must be a regular file".into()));
+        }
+        let encoded_length = metadata.len();
+        if encoded_length > MAX_OBJECT_BYTES {
+            return Err(Error::Limit(format!("object {id} exceeds size limit")));
+        }
+        if encoded_length < BLOB_HEADER_BYTES as u64 {
+            return Err(Error::Invalid("invalid blob length".into()));
+        }
+        let mut reader = BudgetedRead {
+            inner: file,
+            budget: self.read_budget.clone(),
+        };
+        let mut header = [0u8; BLOB_HEADER_BYTES];
+        reader.read_exact(&mut header)?;
+        if !header.starts_with(BLOB_MAGIC) {
+            return Err(Error::Invalid("invalid blob encoding".into()));
+        }
+        let length = u64::from_be_bytes(
+            header[BLOB_MAGIC.len()..]
+                .try_into()
+                .map_err(|_| Error::Invalid("invalid blob header".into()))?,
+        );
+        if length > MAX_FILE_BYTES as u64 || encoded_length != BLOB_HEADER_BYTES as u64 + length {
+            return Err(Error::Invalid("invalid blob length".into()));
+        }
+        Ok((reader, header, length))
     }
 
     pub fn load_revision(&self, id: &str) -> Result<Revision> {
@@ -2822,6 +2834,14 @@ fn first_differing_nibble(
     start: usize,
 ) -> Option<usize> {
     (start..ID_HEX_LEN).find(|depth| nibble_at(left, *depth) != nibble_at(right, *depth))
+}
+
+/// Once fed exactly `length` payload bytes, finalizes to the id `publish_blob` gives them.
+pub(crate) fn blob_id_hasher(length: u64) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(BLOB_MAGIC);
+    hasher.update(length.to_be_bytes());
+    hasher
 }
 
 fn encode_blob(content: &[u8]) -> Vec<u8> {
