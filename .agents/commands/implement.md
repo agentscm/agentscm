@@ -12,9 +12,10 @@ First reclaim disk from finished work. Earlier runs' PRs merge after their sessi
 
 ```sh
 "$(git rev-parse --show-toplevel)/.agents/prune-worktrees.sh"
+"$(git rev-parse --show-toplevel)/.agents/bound-target.sh"
 ```
 
-It removes only clean worktrees whose PR is merged or closed, and keeps the branches; `git worktree lock <path>` protects one. Report what it removed in one line and do not investigate what it kept. If it fails, say so in one line and continue.
+The first removes only clean worktrees whose PR is merged or closed, and keeps the branches; `git worktree lock <path>` protects one. The second runs `cargo clean` in the main and current checkout when its `target` exceeds `AGENTSCM_TARGET_LIMIT_GB` GiB (default 30), because Cargo never prunes stale artifacts. Report what each removed or cleaned in one line and do not investigate what it kept. If either fails, say so in one line and continue.
 
 1. Read `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `STYLE.md`, `docs/README.md`, `docs/architecture.md` and `docs/roadmap.md`.
 2. Resolve the issue with:
