@@ -431,6 +431,75 @@ fn valid_attestation_succeeds() {
 }
 
 #[test]
+fn service_omissions_follow_policy_and_availability() {
+    for required_postgres in [false, true] {
+        for required_s3 in [false, true] {
+            for available_postgres in [false, true] {
+                for available_s3 in [false, true] {
+                    let mut c = Case::new();
+                    c.policy.required_services = Services {
+                        postgres: required_postgres,
+                        s3: required_s3,
+                    };
+                    c.record.services = Services {
+                        postgres: available_postgres,
+                        s3: available_s3,
+                    };
+                    let missing_postgres = required_postgres && !available_postgres;
+                    let missing_s3 = required_s3 && !available_s3;
+                    c.tamper_payload = Some(Box::new(move |p| {
+                        let mut expected: Vec<String> = [
+                            "ignored tests",
+                            "windows",
+                            "container smoke",
+                            "hub end-to-end",
+                            "live execution",
+                        ]
+                        .map(String::from)
+                        .to_vec();
+                        if missing_postgres {
+                            expected.push("postgres tests".into());
+                        }
+                        if missing_s3 {
+                            expected.push("s3 tests".into());
+                        }
+                        assert_eq!(p.coverage.omissions, expected);
+                        assert_eq!(
+                            p.outcome,
+                            if missing_postgres || missing_s3 {
+                                agentscm::evidence::EvidenceOutcome::Fail
+                            } else {
+                                agentscm::evidence::EvidenceOutcome::Pass
+                            }
+                        );
+                    }));
+                    if missing_postgres || missing_s3 {
+                        fails(c, "required service missing");
+                    } else {
+                        expect(c.run(), VerdictState::Success, "validated");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn historical_optional_service_omissions_still_verify() {
+    let mut c = Case::new();
+    c.policy.required_services = Services {
+        postgres: false,
+        s3: false,
+    };
+    c.record.services = c.policy.required_services;
+    c.tamper_payload = Some(Box::new(|p| {
+        p.coverage.omissions.push("postgres tests".into());
+        p.coverage.omissions.push("s3 tests".into());
+    }));
+    expect(c.run(), VerdictState::Success, "validated");
+}
+
+#[test]
 fn strict_decode_rejects_unknown_fields_and_oversize() {
     let mut value = serde_json::to_value(record()).unwrap();
     value["extra"] = true.into();
@@ -570,7 +639,7 @@ fn producer_passes_when_policy_does_not_require_the_missing_service() {
     c.policy.required_services.s3 = false;
     let (verdict, body) = c.execute();
     assert_eq!(verdict.state, VerdictState::Success);
-    assert!(body.contains("- <code>s3 tests</code>\n"));
+    assert!(!body.contains("- <code>s3 tests</code>\n"));
 }
 
 #[test]

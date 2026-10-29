@@ -601,10 +601,10 @@ pub fn evidence_payload(
             .iter()
             .map(|id| format!("not required: {id}")),
     );
-    if !record.services.postgres {
+    if policy.required_services.postgres && !record.services.postgres {
         omissions.push("postgres tests".into());
     }
-    if !record.services.s3 {
+    if policy.required_services.s3 && !record.services.s3 {
         omissions.push("s3 tests".into());
     }
     let dependency = |identity: &str, revision: &str| DependencyClaim {
