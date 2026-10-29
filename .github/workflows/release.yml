@@ -1,6 +1,6 @@
 name: Release
 
-# Runs only when a maintainer pushes a `v*` tag. It builds and smoke-tests native amd64 and arm64
+# Runs when a maintainer or release automation pushes a `v*` tag. It builds and smoke-tests native amd64 and arm64
 # container children, pushes those exact tested images, assembles a verified two-platform version
 # index (no `latest` during alpha), attests the children, their SBOMs and the index, builds attested
 # provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub prerelease whose body is the
@@ -56,7 +56,7 @@ jobs:
           [ -f NOTICE ] && [ -f THIRD_PARTY_NOTICES.md ] || { echo "NOTICE and THIRD_PARTY_NOTICES.md are required before releasing" >&2; exit 1; }
           # Fail before anything is pushed if the release notes are missing.
           awk -v v="$version" '
-            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) found = 1 }
+            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1 || index($0, "## [" v "]") == 1) found = 1 }
             found { print }
           ' CHANGELOG.md | wc -l | awk '$1 > 2 { ok = 1 } END { exit !ok }' || { echo "no CHANGELOG entry for $version" >&2; exit 1; }
           git merge-base --is-ancestor HEAD origin/main || { echo "tag $TAG is not on main" >&2; exit 1; }
@@ -367,14 +367,21 @@ jobs:
         run: |
           # shellcheck disable=SC2016 # awk program intentionally uses $0 inside single quotes
           awk -v v="$VERSION" '
-            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) found = 1 }
+            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1 || index($0, "## [" v "]") == 1) found = 1 }
             found { print }
           ' CHANGELOG.md > notes.md
           [ "$(wc -l < notes.md)" -gt 2 ] || { echo "no CHANGELOG entry for $VERSION" >&2; exit 1; }
           # shellcheck disable=SC2016 # Markdown backticks are literal inside the format string
           printf '\nImage: `%s:%s` (digest `%s`)\n' "$IMAGE" "$VERSION" "$DIGEST" >> notes.md
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --prerelease --verify-tag \
-            dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Release Please created the release; attach only qualified artifacts.
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md --prerelease
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --prerelease --verify-tag \
+              dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          fi
 
   npm:
     needs: release
