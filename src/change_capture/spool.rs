@@ -106,6 +106,9 @@ thread_local! {
     static COMPACTION_VERIFICATIONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static SEQUENCE_LOG_PARSES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     static OUTBOX_ENVELOPE_READS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -603,9 +606,14 @@ pub struct LocalSpool {
     limits: SpoolLimits,
     identity: SpoolIdentityV1,
     compaction_cache: Arc<CompactionCache>,
+    sequence_log_cache: Arc<SequenceLogCache>,
 }
 
 type CompactionCache = Mutex<Option<(FileStamp, Arc<CompactionStateV1>)>>;
+
+/// One parsed `.events` log with its path, floor and installed-file stamp. Appends happen under
+/// the spool lock, and any write changes the stamp, so an equal stamp means the same records.
+type SequenceLogCache = Mutex<Option<(PathBuf, u64, FileStamp, Arc<Vec<(String, u64)>>)>>;
 
 /// Installed-file identity of a parsed and verified compaction index. `atomic_replace` installs a
 /// new inode, and any in-place write changes the kernel-maintained ctime, so an equal stamp means
@@ -1305,6 +1313,7 @@ impl LocalSpool {
             limits,
             identity: format,
             compaction_cache: Arc::default(),
+            sequence_log_cache: Arc::default(),
         };
         {
             let _lock = spool.lock()?;
@@ -3252,23 +3261,54 @@ impl LocalSpool {
         if let Some(sequence) = state.events.get(event_id) {
             return Ok(*sequence);
         }
-        let log = load_sequence_log(&log_path, state.next)?;
+        let log = self.sequence_log(&log_path, state.next)?;
         let digest = sha256(event_id.as_bytes());
         if let Some((_, sequence)) = log.iter().find(|(logged, _)| *logged == digest) {
             return Ok(*sequence);
         }
         let sequence = next_sequence(&state, &log)?;
+        drop(log);
         if !state.event_log {
             state.event_log = true;
             save_sequence_state(&path, &state, self)?;
         }
-        self.append_sequence_record(&log_path, &digest, sequence)?;
+        self.append_sequence_record(&log_path, state.next, digest, sequence)?;
         Ok(sequence)
+    }
+
+    /// The parsed `.events` log, reused while the installed file keeps the stamp it was parsed at.
+    fn sequence_log(&self, path: &Path, floor: u64) -> Result<Arc<Vec<(String, u64)>>> {
+        let stamp = match fs::symlink_metadata(path) {
+            Ok(metadata) => FileStamp::of(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Arc::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Ok(cached) = self.sequence_log_cache.lock()
+            && let Some((cached_path, cached_floor, cached_stamp, log)) = cached.as_ref()
+            && cached_path == path
+            && *cached_floor == floor
+            && *cached_stamp == stamp
+        {
+            return Ok(Arc::clone(log));
+        }
+        let log = Arc::new(load_sequence_log(path, floor)?);
+        if let Ok(mut cached) = self.sequence_log_cache.lock() {
+            *cached = Some((path.to_owned(), floor, stamp, Arc::clone(&log)));
+        }
+        Ok(log)
     }
 
     /// Appends one durable allocation. Only the 86-byte record is written, so a session's
     /// per-event cost does not grow with the number of sequences it already holds.
-    fn append_sequence_record(&self, path: &Path, digest: &str, sequence: u64) -> Result<()> {
+    fn append_sequence_record(
+        &self,
+        path: &Path,
+        floor: u64,
+        digest: String,
+        sequence: u64,
+    ) -> Result<()> {
         let record = format!("{digest} {sequence:020}\n");
         debug_assert_eq!(record.len(), SEQUENCE_LOG_RECORD);
         let created = match fs::symlink_metadata(path) {
@@ -3289,7 +3329,8 @@ impl LocalSpool {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         // A torn final record from a crashed append was never returned to a caller.
-        let length = file.metadata()?.len();
+        let before = FileStamp::of(&file.metadata()?);
+        let length = before.len;
         let aligned = length - length % SEQUENCE_LOG_RECORD as u64;
         if aligned != length {
             file.set_len(aligned)?;
@@ -3298,6 +3339,23 @@ impl LocalSpool {
         file.sync_all()?;
         if created {
             File::open(&self.root)?.sync_all()?;
+        }
+        // A parse of the pre-append file ignored any torn tail, so it plus this record equals a
+        // fresh parse; past the read bound the next load must fail as it always did.
+        let stamp = FileStamp::of(&file.metadata()?);
+        if let Ok(mut cached) = self.sequence_log_cache.lock() {
+            match cached.as_mut() {
+                Some((cached_path, cached_floor, cached_stamp, log))
+                    if cached_path == path
+                        && *cached_floor == floor
+                        && *cached_stamp == before
+                        && stamp.len <= MAX_SEQUENCE_BYTES =>
+                {
+                    Arc::make_mut(log).push((digest, sequence));
+                    *cached_stamp = stamp;
+                }
+                _ => *cached = None,
+            }
         }
         Ok(())
     }
@@ -3311,8 +3369,9 @@ impl LocalSpool {
         let log_path = self.session_log_path(session_id);
         let _lock = self.lock()?;
         let mut state = load_sequence_state(&path)?;
-        let log = load_sequence_log(&log_path, state.next)?;
+        let log = self.sequence_log(&log_path, state.next)?;
         let sequence = next_sequence(&state, &log)?;
+        drop(log);
         state.uncertain_occurrences = state
             .uncertain_occurrences
             .checked_add(1)
@@ -3330,7 +3389,7 @@ impl LocalSpool {
         // The counter is durable before the record, so a crash never reissues this identity.
         state.event_log = true;
         save_sequence_state(&path, &state, self)?;
-        self.append_sequence_record(&log_path, &sha256(event_id.as_bytes()), sequence)?;
+        self.append_sequence_record(&log_path, state.next, sha256(event_id.as_bytes()), sequence)?;
         Ok(event_id)
     }
 
@@ -3703,7 +3762,7 @@ impl LocalSpool {
         base_reserved_bytes: u64,
         base_reserved_records: usize,
     ) -> Result<()> {
-        let (records, bytes) = usage(&self.root, self.limits.max_records)?;
+        let (records, bytes, outbox) = usage_with_outbox(&self.root)?;
         let fits = |outstanding_actions: usize| -> Result<()> {
             let reserved_records = outstanding_actions.saturating_add(base_reserved_records);
             if records
@@ -3734,10 +3793,7 @@ impl LocalSpool {
         // Every outstanding action keeps its start in the outbox, so the outbox file count plus the
         // start being admitted bounds the exact count. Both checks are monotone in that count, so
         // passing with the bound proves the exact check passes without parsing any envelope.
-        let bound = regular_file_names(&self.root.join("outbox"), self.limits.max_records)?
-            .len()
-            .saturating_add(1);
-        if fits(bound).is_ok() {
+        if fits(outbox.saturating_add(1)).is_ok() {
             return Ok(());
         }
         fits(outstanding_actions()?)
@@ -5188,6 +5244,8 @@ fn valid_digest(value: &str) -> bool {
 /// strictly increase from the frozen whole-map high-water `floor`; a torn final record from a
 /// crashed append was never returned to a caller and is ignored.
 fn load_sequence_log(path: &Path, floor: u64) -> Result<Vec<(String, u64)>> {
+    #[cfg(test)]
+    SEQUENCE_LOG_PARSES.with(|count| count.set(count.get() + 1));
     let bytes = match read_bounded(path, MAX_SEQUENCE_BYTES) {
         Ok(bytes) => bytes,
         Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -7374,8 +7432,14 @@ fn recover_compacted_remainders(spool: &LocalSpool) -> Result<()> {
 }
 
 fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
+    usage_with_outbox(root).map(|(records, bytes, _)| (records, bytes))
+}
+
+/// Physical usage plus the outbox entry count, an upper bound on outstanding action starts.
+fn usage_with_outbox(root: &Path) -> Result<(usize, u64, usize)> {
     let mut records = 0usize;
     let mut bytes = 0u64;
+    let mut outbox = 0usize;
     for name in [
         "artifacts",
         "outbox",
@@ -7399,6 +7463,9 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
             }
             records = records.saturating_add(1);
             bytes = bytes.saturating_add(metadata.len());
+            if name == "outbox" {
+                outbox = outbox.saturating_add(1);
+            }
             if records > MAX_PHYSICAL_RECORDS {
                 return Err(CaptureError::Limit(
                     "capture spool contains too many physical records".into(),
@@ -7495,7 +7562,7 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
             "capture spool contains too many physical records".into(),
         ));
     }
-    Ok((records, bytes))
+    Ok((records, bytes, outbox))
 }
 
 /// Root-level append-only records, counted under the same limits as every other record.
@@ -7639,6 +7706,7 @@ mod tests {
             },
             identity: spool.identity,
             compaction_cache: Arc::default(),
+            sequence_log_cache: Arc::default(),
         };
 
         assert!(matches!(
@@ -7683,6 +7751,7 @@ mod tests {
             },
             identity: spool.identity,
             compaction_cache: Arc::default(),
+            sequence_log_cache: Arc::default(),
         };
 
         for index in 0..8 {
@@ -8794,6 +8863,56 @@ mod tests {
             (records - without_records, bytes - without_bytes),
             (1, 22 * 86)
         );
+    }
+
+    #[test]
+    fn session_sequence_log_parse_is_reused_until_another_writer_changes_the_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let second = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let session = "session_cached";
+        let parses = || SEQUENCE_LOG_PARSES.with(std::cell::Cell::get);
+        assert_eq!(first.sequence_for(session, "evt:a").unwrap(), 1);
+        let before = parses();
+        for index in 0..5 {
+            let event = format!("evt:n{index}");
+            assert_eq!(first.sequence_for(session, &event).unwrap(), 2 + index);
+            if index == 0 {
+                // The first allocation after creating the log parses it once.
+                assert_eq!(parses(), before + 1);
+            }
+        }
+        assert_eq!(first.sequence_for(session, "evt:a").unwrap(), 1);
+        assert_eq!(parses(), before + 1, "own appends reuse the parsed log");
+
+        // Another handle's append changes the stamp, so the first handle reparses and never
+        // reissues a sequence.
+        assert_eq!(second.sequence_for(session, "evt:other").unwrap(), 7);
+        assert_eq!(first.sequence_for(session, "evt:next").unwrap(), 8);
+        assert_eq!(first.sequence_for(session, "evt:other").unwrap(), 7);
+
+        // A torn tail written behind a warm cache is still dropped before the next append.
+        let log = first.session_log_path(session);
+        OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"0123")
+            .unwrap();
+        assert_eq!(first.sequence_for(session, "evt:after-torn").unwrap(), 9);
+        assert_eq!(fs::metadata(&log).unwrap().len(), 9 * 86);
+
+        // A complete invalid record is refused exactly as an uncached load refuses it.
+        OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(&[b'x'; 86])
+            .unwrap();
+        assert!(matches!(
+            first.sequence_for(session, "evt:refused"),
+            Err(CaptureError::Invalid(_))
+        ));
     }
 
     #[test]
