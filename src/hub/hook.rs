@@ -224,9 +224,8 @@ async fn hook(
             &state,
             token.clone(),
             repo.clone(),
-            super::onboarding::client(&parts.headers),
+            &parts.headers,
             onboarding_epoch,
-            super::insights::completion_enabled(&parts.headers),
             &mut delivered,
         ),
     )
@@ -479,11 +478,12 @@ impl Call {
         state: &HubState,
         token: Option<String>,
         repo: Option<String>,
-        client: Option<&str>,
+        headers: &HeaderMap,
         onboarding_epoch: u64,
-        completion_reporting: bool,
         delivered: &mut Option<Delivered>,
     ) -> Result<Outcome, &'static str> {
+        let client = super::onboarding::client(headers);
+        let completion_reporting = super::insights::completion_enabled(headers);
         let call = |paths: Vec<String>| SessionCall {
             session: self.session.clone(),
             via: self.via.clone(),
