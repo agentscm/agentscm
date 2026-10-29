@@ -198,7 +198,7 @@ installation.
 
 ## Source fixtures
 
-`tests/integration/setup.rs` covers new/exact resume, claimed interruption, retained partial
+`tests/setup.rs` covers new/exact resume, claimed interruption, retained partial
 native and bundle state, interrupted receipt writes, wrong ownership ID, changed
 executable identity, foreign native repository, changed bundle members, path
 refusal (including direct and deeper bare-Git ancestors), busy/oversized/public receipts, non-UTF-8 paths and isolated self-check
