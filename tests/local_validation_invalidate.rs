@@ -54,6 +54,23 @@ fn extract(path: &str) -> String {
     body.join("\n").trim_end().to_owned() + "\n"
 }
 
+/// The whole step, dedented: name, shell, timeout, env and run.
+fn step_block(path: &str) -> String {
+    let text = fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let mut lines = text.lines().skip_while(|l| l.trim() != STEP);
+    let first = lines.next().expect("step");
+    let indent = first.len() - first.trim_start().len();
+    let rest = lines
+        .take_while(|l| l.trim().is_empty() || l.len() - l.trim_start().len() > indent)
+        .map(|l| l.get(indent..).unwrap_or(""));
+    std::iter::once(first.trim_start())
+        .chain(rest)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_owned()
+}
+
 fn sha(c: char) -> String {
     c.to_string().repeat(40)
 }
@@ -135,8 +152,11 @@ fn success_for(c: char) -> (String, String) {
 fn step_is_identical_in_every_copy() {
     let first = extract(FILES[0]);
     assert!(first.starts_with("set -euo pipefail\n"));
+    let block = step_block(FILES[0]);
+    assert!(block.contains("timeout-minutes: 5") && block.contains("GH_TOKEN:"));
     for f in &FILES[1..] {
         assert_eq!(extract(f), first, "{f}");
+        assert_eq!(step_block(f), block, "{f}");
     }
 }
 
@@ -188,6 +208,10 @@ fn context_found_only_on_a_later_page() {
     let o = run(&pulls(&[quoted('a')]), &[(sha('a'), two_pages)], &[]);
     assert!(o.ok);
     assert_eq!(o.posts, [sha('a')]);
+    // The fake reads every page regardless, so require the flag on both reads.
+    for read in o.calls.iter().filter(|c| !c.contains("-X POST")) {
+        assert!(read.contains("--paginate"), "{read}");
+    }
 }
 
 #[test]
