@@ -2,6 +2,19 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.1.1-alpha.9](https://github.com/agentscm/agentscm/compare/v0.1.0-alpha.9...v0.1.1-alpha.9) (2026-10-29)
+
+
+### Bug Fixes
+
+* Brand local validation comments and clarify service coverage ([#224](https://github.com/agentscm/agentscm/issues/224)) ([47d06bf](https://github.com/agentscm/agentscm/commit/47d06bfe31fdb7b3a93aed088b9d38f30f1999d5))
+
+
+### Performance Improvements
+
+* Reduce memory of hook, MCP and hub hot paths ([#222](https://github.com/agentscm/agentscm/issues/222)) ([5548071](https://github.com/agentscm/agentscm/commit/554807157c1ede3da08bf8b04d2431fc4415a59a))
+* Remove remaining per-call scans and unbounded buffers ([#225](https://github.com/agentscm/agentscm/issues/225)) ([356fbfb](https://github.com/agentscm/agentscm/commit/356fbfb098ef94252b579694070b9fa292d95706))
+
 ## 0.1.0-alpha.9 (2026-10-28)
 
 - The repository moved to `agentscm/agentscm`. Installers, npm metadata, container and plugin references and the local-validation bindings now name it; release jobs check the repository and organization by their IDs, and historical releases and attestations are unchanged (#204, #206).
