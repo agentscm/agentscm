@@ -182,6 +182,21 @@ enum OpenMode {
 }
 
 pub fn start(data_dir: &Path, run_id: &str, plan: &CompiledPlan) -> Result<RunView> {
+    start_inner(data_dir, run_id, plan, true)
+}
+
+/// Like [`start`] for a caller that compiled `plan` in this same call and so
+/// needs no second recompile to prove it is current.
+pub fn start_compiled(data_dir: &Path, run_id: &str, plan: &CompiledPlan) -> Result<RunView> {
+    start_inner(data_dir, run_id, plan, false)
+}
+
+fn start_inner(
+    data_dir: &Path,
+    run_id: &str,
+    plan: &CompiledPlan,
+    verify: bool,
+) -> Result<RunView> {
     validate_run_id(run_id)?;
     let definition_json = serde_json::to_vec(plan.definition())?;
     if definition_json.len() > MAX_DEFINITION_BYTES {
@@ -201,7 +216,9 @@ pub fn start(data_dir: &Path, run_id: &str, plan: &CompiledPlan) -> Result<RunVi
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    verify_current(data_dir, plan)?;
+    if verify {
+        verify_current(data_dir, plan)?;
+    }
     let mut journal = Journal::open(data_dir, OpenMode::Create)?;
     let tx = journal
         .connection

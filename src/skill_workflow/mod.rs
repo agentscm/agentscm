@@ -14,6 +14,6 @@ pub use runtime::intent;
 pub use runtime::{
     AgentAttemptState, AgentTaskService, CollectorAction, CollectorOriginAuthorizationGuard,
     LiveImportedOrigins, RunState, RunView, StepState, StepView, TaskAttemptView,
-    TaskAuthorizationGuard, TaskClock, advance, cancel, start, status,
+    TaskAuthorizationGuard, TaskClock, advance, cancel, start, start_compiled, status,
 };
 pub use task_contracts::*;

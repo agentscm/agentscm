@@ -602,39 +602,13 @@ impl Library {
     }
 
     pub fn skills(&self) -> Result<Vec<SkillVersion>> {
-        let mut stmt = self.db.prepare("SELECT id,name,version,generation,digest,entrypoint,files_json,provenance_json,created_at,archived FROM skill_versions ORDER BY created_at DESC,id")?;
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {SKILL_COLUMNS} FROM skill_versions ORDER BY created_at DESC,id"
+        ))?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, u32>(2)?,
-                    r.get::<_, u64>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, i64>(8)?,
-                    r.get::<_, bool>(9)?,
-                ))
-            })?
+            .query_map([], skill_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|r| {
-                Ok(SkillVersion {
-                    id: r.0,
-                    name: r.1,
-                    version: r.2,
-                    generation: r.3,
-                    digest: r.4,
-                    entrypoint: r.5,
-                    files: serde_json::from_str(&r.6)?,
-                    provenance: serde_json::from_str(&r.7)?,
-                    created_at: r.8,
-                    archived: r.9,
-                })
-            })
-            .collect()
+        rows.into_iter().map(skill_version).collect()
     }
 
     pub fn save_preview(
@@ -1122,35 +1096,14 @@ impl Library {
 
     pub fn attachments(&self, repository: &str) -> Result<Vec<Attachment>> {
         validate_repository(repository)?;
-        let mut stmt=self.db.prepare("SELECT id,workflow_version_id,generation,state,params_json,source_binding_json,pipeline_rule_json,diagnostics_json FROM workflow_attachments WHERE repository=?1 ORDER BY id")?;
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {ATTACHMENT_COLUMNS} FROM workflow_attachments WHERE repository=?1 ORDER BY id"
+        ))?;
         let rows = stmt
-            .query_map([repository], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, u64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                    r.get::<_, String>(7)?,
-                ))
-            })?
+            .query_map([repository], attachment_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|r| {
-                Ok(Attachment {
-                    id: r.0,
-                    repository: repository.into(),
-                    workflow_version_id: r.1,
-                    generation: r.2,
-                    state: r.3,
-                    params: serde_json::from_str(&r.4)?,
-                    source_binding: r.5.map(|v| serde_json::from_str(&v)).transpose()?,
-                    pipeline_rule: r.6.map(|v| serde_json::from_str(&v)).transpose()?,
-                    diagnostics: serde_json::from_str(&r.7)?,
-                })
-            })
+            .map(|row| attachment_value(repository, row))
             .collect()
     }
 
@@ -1927,9 +1880,15 @@ impl Library {
     }
 
     fn skill(&self, id: &str) -> Result<SkillVersion> {
-        self.skills()?
-            .into_iter()
-            .find(|v| v.id == id)
+        self.db
+            .query_row(
+                &format!("SELECT {SKILL_COLUMNS} FROM skill_versions WHERE id=?1"),
+                [id],
+                skill_row,
+            )
+            .optional()?
+            .map(skill_version)
+            .transpose()?
             .ok_or_else(|| Error::NotFound("skill version".into()))
     }
     fn package(&self, id: &str) -> Result<Vec<PackageFile>> {
@@ -1977,11 +1936,105 @@ impl Library {
         })
     }
     fn attachment(&self, repository: &str, id: &str) -> Result<Attachment> {
-        self.attachments(repository)?
-            .into_iter()
-            .find(|a| a.id == id)
+        validate_repository(repository)?;
+        self.db
+            .query_row(
+                &format!(
+                    "SELECT {ATTACHMENT_COLUMNS} FROM workflow_attachments \
+                     WHERE repository=?1 AND id=?2"
+                ),
+                [repository, id],
+                attachment_row,
+            )
+            .optional()?
+            .map(|row| attachment_value(repository, row))
+            .transpose()?
             .ok_or_else(|| Error::NotFound("workflow attachment".into()))
     }
+}
+
+const SKILL_COLUMNS: &str =
+    "id,name,version,generation,digest,entrypoint,files_json,provenance_json,created_at,archived";
+type SkillRow = (
+    String,
+    String,
+    u32,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    bool,
+);
+
+fn skill_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+    ))
+}
+
+fn skill_version(r: SkillRow) -> Result<SkillVersion> {
+    Ok(SkillVersion {
+        id: r.0,
+        name: r.1,
+        version: r.2,
+        generation: r.3,
+        digest: r.4,
+        entrypoint: r.5,
+        files: serde_json::from_str(&r.6)?,
+        provenance: serde_json::from_str(&r.7)?,
+        created_at: r.8,
+        archived: r.9,
+    })
+}
+
+const ATTACHMENT_COLUMNS: &str = "id,workflow_version_id,generation,state,params_json,source_binding_json,pipeline_rule_json,diagnostics_json";
+type AttachmentRow = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+    ))
+}
+
+fn attachment_value(repository: &str, r: AttachmentRow) -> Result<Attachment> {
+    Ok(Attachment {
+        id: r.0,
+        repository: repository.into(),
+        workflow_version_id: r.1,
+        generation: r.2,
+        state: r.3,
+        params: serde_json::from_str(&r.4)?,
+        source_binding: r.5.map(|v| serde_json::from_str(&v)).transpose()?,
+        pipeline_rule: r.6.map(|v| serde_json::from_str(&v)).transpose()?,
+        diagnostics: serde_json::from_str(&r.7)?,
+    })
 }
 
 fn workflow_from(db: &Connection, id: &str) -> Result<WorkflowDraft> {
@@ -3022,7 +3075,13 @@ mod tests {
         let mut lib = Library::open(dir.path()).unwrap();
         assert_eq!(lib.skills().unwrap().len(), 1);
         assert!(lib.archive_skill(&skill.id, 2).is_err());
+        assert_eq!(lib.skill(&skill.id).unwrap(), lib.skills().unwrap()[0]);
         assert!(lib.archive_skill(&skill.id, 1).unwrap().archived);
+        // Archived rows stay addressable and equal their list entry.
+        let archived = lib.skill(&skill.id).unwrap();
+        assert!(archived.archived);
+        assert_eq!(archived, lib.skills().unwrap()[0]);
+        assert!(matches!(lib.skill("skv_missing"), Err(Error::NotFound(_))));
         assert!(lib.accept_import(&accepted).is_err());
         assert!(
             lib.accept_import(&AcceptImport {
@@ -3833,6 +3892,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.generation, attachment.generation);
+        assert_eq!(
+            lib.attachment("acme/widgets", "release").unwrap(),
+            lib.attachments("acme/widgets").unwrap()[0]
+        );
+        assert!(matches!(
+            lib.attachment("acme/other", "release"),
+            Err(Error::NotFound(_))
+        ));
         let other_repository = lib
             .put_attachment(
                 "acme/other",
