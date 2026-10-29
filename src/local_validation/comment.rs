@@ -78,42 +78,12 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
             .map(|value| format!("- {}\n", code(value)))
             .collect()
     };
-    let missing_services = [
-        (!parsed.services.postgres).then_some("PostgreSQL"),
-        (!parsed.services.s3).then_some("S3"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    let missing_services = if missing_services.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\n&#x26a0;&#xfe0f; Missing services: {}. Coverage is incomplete.",
-            missing_services.join(", ")
-        )
-    };
     let short_commit: String = parsed.subject.commit.chars().take(12).collect();
     let mut body = format!(
-        "{MARKER_PREFIX}{} -->\n\n<img src=\"{LOGO_URL}\" alt=\"AgentSCM icon\" width=\"28\"> **Local validation: reported {outcome}**\n\nSource: {} at {}\n\nWorker-reported; the verifier checks the signature and source bindings, not whether commands ran.\n\nCoverage: {observed}/{expected} checks reported; {omission_count} omissions.{missing_services}\n\n<details>\n<summary>Coverage omissions ({omission_count})</summary>\n\n{omission_details}\n</details>\n\n<details>\n<summary>Source and environment</summary>\n\n- Repository: {}\n- Commit: {}\n- Tree: {}\n- Base ref: {}\n- Base tip: {}\n- Merge base: {}\n- Services: PostgreSQL={}, S3={}\n- Platform: {}\n- Toolchain: {}\n\n</details>\n\n<details>\n<summary>Command results</summary>\n\n",
+        "{MARKER_PREFIX}{} -->\n\n<img src=\"{LOGO_URL}\" alt=\"AgentSCM icon\" width=\"28\"> **AgentSCM · Local validation**\n\n**Reported outcome: {outcome}** · {observed}/{expected} checks reported · {omission_count} omissions\n\nSource: {} at {}\n\nWorker-reported; the verifier checks the signature and source bindings, not whether commands ran.\n\n<details>\n<summary>Command results</summary>\n\n",
         envelope_sha256(envelope),
         code(&parsed.subject.repository),
         code(&short_commit),
-        code(&parsed.subject.repository),
-        code(&parsed.subject.commit),
-        code(&parsed.subject.tree),
-        code(&parsed.context.base_ref),
-        code(&parsed.base_tip),
-        code(&parsed.context.merge_base),
-        parsed.services.postgres,
-        parsed.services.s3,
-        code(&parsed.platform),
-        parsed
-            .toolchain
-            .iter()
-            .map(|value| code(value))
-            .collect::<Vec<_>>()
-            .join(", "),
     );
     for r in &parsed.results {
         let exit = r.exit_code.map_or("none".to_owned(), |c| c.to_string());
@@ -131,6 +101,19 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
             ids.join(", ")
         ));
     }
+    body.push_str(&format!(
+        "\n</details>\n\n<details>\n<summary>Coverage and environment</summary>\n\nCoverage: {observed}/{expected} checks reported; {omission_count} omissions.\n\n{omission_details}\n- Services available: PostgreSQL={}, S3={}\n- Platform: {}\n- Toolchain: {}\n\n</details>\n\n<details>\n<summary>Source details</summary>\n\n- Repository: {}\n- Commit: {}\n- Tree: {}\n- Base ref: {}\n- Base tip: {}\n- Merge base: {}\n",
+        parsed.services.postgres,
+        parsed.services.s3,
+        code(&parsed.platform),
+        parsed.toolchain.iter().map(|value| code(value)).collect::<Vec<_>>().join(", "),
+        code(&parsed.subject.repository),
+        code(&parsed.subject.commit),
+        code(&parsed.subject.tree),
+        code(&parsed.context.base_ref),
+        code(&parsed.base_tip),
+        code(&parsed.context.merge_base),
+    ));
     body.push_str("\n</details>\n\n<details>\n<summary>Signed machine-readable evidence</summary>\n\nThe exact signed bytes are preserved below for verification and audit tooling.\n\n");
     body.push_str(&block(ENVELOPE_FENCE, envelope));
     body.push('\n');

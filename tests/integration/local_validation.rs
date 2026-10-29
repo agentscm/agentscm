@@ -272,11 +272,11 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
     assert_eq!(body, comment::render(&envelope, &record).unwrap());
     assert!(body.starts_with("<!-- agentscm-local-validation:v1 "));
     assert!(body.contains("alt=\"AgentSCM icon\" width=\"28\""));
-    assert!(body.contains("**Local validation: reported pass**"));
+    assert!(body.contains("**AgentSCM · Local validation**"));
     assert!(body.contains("Source: <code>repo&#x2d;1</code> at <code>111111111111</code>"));
     assert!(body.contains("the verifier checks the signature and source bindings"));
     assert!(body.contains("Coverage: 1/1 checks reported; 5 omissions."));
-    assert!(body.contains("<summary>Coverage omissions (5)</summary>"));
+    assert!(body.contains("<summary>Coverage and environment</summary>"));
     for omission in [
         "<code>ignored tests</code>",
         "<code>windows</code>",
@@ -293,6 +293,20 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
     assert_eq!(body.matches("</details>").count(), 4);
     assert!(!body.contains("<details open"));
 
+    let sections: Vec<_> = body
+        .lines()
+        .filter(|line| line.starts_with("<summary>"))
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            "<summary>Command results</summary>",
+            "<summary>Coverage and environment</summary>",
+            "<summary>Source details</summary>",
+            "<summary>Signed machine-readable evidence</summary>"
+        ]
+    );
+
     let signed_details = body
         .find("<summary>Signed machine-readable evidence</summary>")
         .unwrap();
@@ -305,14 +319,33 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
 }
 
 #[test]
-fn rendered_comment_warns_when_services_are_missing() {
+fn rendered_comment_reports_absent_services_as_environment_facts() {
     let (envelope, _) = comment_bytes();
     let mut missing_service_record = record();
     missing_service_record.services.s3 = false;
     let record_bytes = serde_json::to_vec(&missing_service_record).unwrap();
     let body = comment::render(&envelope, &record_bytes).unwrap();
 
-    assert!(body.contains("Missing services: S3. Coverage is incomplete."));
+    assert!(body.contains("Services available: PostgreSQL=true, S3=false"));
+    assert!(!body.contains("Coverage is incomplete"));
+    assert!(!body.contains("Missing services"));
+}
+
+#[test]
+fn rendered_comment_preserves_reported_failure_and_historical_service_omissions() {
+    let (envelope, record) = comment_bytes();
+    let mut envelope_json: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    envelope_json["payload"]["outcome"] = "fail".into();
+    envelope_json["payload"]["coverage"]["omissions"] =
+        serde_json::json!(["postgres tests", "s3 tests"]);
+    let envelope = serde_json::to_vec(&envelope_json).unwrap();
+    let body = comment::render(&envelope, &record).unwrap();
+    let visible = body.split("<details>").next().unwrap();
+    assert!(visible.contains("**Reported outcome: fail**"));
+    assert!(visible.contains("2 omissions"));
+    assert!(body.contains("- <code>postgres tests</code>\n"));
+    assert!(body.contains("- <code>s3 tests</code>\n"));
+    assert_eq!(comment::parse(&body).unwrap(), (envelope, record));
 }
 
 #[test]
@@ -386,7 +419,7 @@ fn hostile_display_strings_cannot_escape_collapsed_sections() {
     record_bytes = serde_json::to_vec(&hostile_record).unwrap();
 
     let body = comment::render(&hostile_envelope, &record_bytes).unwrap();
-    assert!(body.contains("**Local validation: reported unknown**"));
+    assert!(body.contains("**Reported outcome: unknown**"));
     assert_eq!(body.matches("<details>").count(), 4);
     assert_eq!(body.matches("</details>").count(), 4);
     assert!(!body.contains("<details open>"));

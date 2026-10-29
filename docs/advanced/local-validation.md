@@ -25,7 +25,7 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 
 ## Compact comment display and compatibility
 
-`local-validation show` renders a compact comment with the AgentSCM icon, reported outcome, abbreviated source and coverage summary visible at first. Coverage omissions, source and environment fields, command results and the signed machine-readable evidence are four closed disclosure sections, so supporting Markdown renderers show them collapsed by default. Missing PostgreSQL or S3 coverage remains visible in the summary.
+`local-validation show` renders a compact comment with the pinned AgentSCM icon and “AgentSCM · Local validation” heading, reported outcome, observed/expected check counts, omission count, repository and 12-character commit visible at first. Command results, coverage and environment, source details and signed machine-readable evidence are four closed disclosure sections in that order, so supporting Markdown renderers show them collapsed by default. The coverage section lists every signed omission, service availability, platform and toolchain. Missing services are environment facts; the renderer does not infer incomplete coverage without the repository policy.
 
 The summary and disclosure markup are display only. The exact signed envelope and record bytes remain in their named fences, and the first-line marker still commits to the envelope digest. `verify` extracts those exact bytes while ignoring surrounding Markdown, so the compact layout does not change signatures, verification or adoption of legacy flat comments.
 
@@ -41,7 +41,7 @@ Recipes and policies that do not use `paths` or `exempt_paths` serialize as befo
 - The signing user account and host are trusted. Recipe commands run as the signing user with `HOME` passed, so attested code can read `~/.config/gh`, the signing key, cargo configuration such as `.cargo/config.toml` aliases and anything else that user can read. The environment allowlist only avoids passing tokens through environment variables; it is not a sandbox. Never attest code you would not run as that user, and never attest third-party or fork code on a signing host.
 - Anyone with `statuses: write` can post the same status context. Required-status configuration is operator-owned, and nothing here changes branch protection.
 - Policy, recipe and registry are read from the default branch, not from the PR.
-- This repository's policy requires the PostgreSQL and S3 test services (`AGENTSCM_TEST_DATABASE_URL`, `AGENTSCM_TEST_S3_*`). A run without a service the policy requires is recorded and verifies as a failure; a service the policy does not require that is absent is listed as a coverage omission only.
+- This repository's policy requires the PostgreSQL and S3 test services (`AGENTSCM_TEST_DATABASE_URL`, `AGENTSCM_TEST_S3_*`). A run without a service the policy requires is recorded and verifies as a failure; an absent service the policy does not require adds no service coverage omission.
 
 ## Maintainer workflow
 
@@ -83,7 +83,7 @@ Advancing the base branch tip does not invalidate it; only the merge-base is bou
 
 ## Coverage omissions
 
-A command skipped by `paths` is listed as `not required: <id>`. Every attestation records these as not covered: ignored tests, Windows, container smoke, hub end-to-end and live execution. Hosted CI remains the way to get platform and runtime coverage; request it as described above.
+A command skipped by `paths` is listed as `not required: <id>`. Missing PostgreSQL or S3 adds a service omission only when the policy requires that service. Comments preserve all signed omissions, including service omissions in historical attestations, regardless of current policy. Every attestation records these as not covered: ignored tests, Windows, container smoke, hub end-to-end and live execution. Hosted CI remains the way to get platform and runtime coverage; request it as described above.
 
 ## Not done
 
