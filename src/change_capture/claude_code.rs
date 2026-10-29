@@ -569,7 +569,7 @@ pub fn deferred_native_hook(
         format!("evt:{}", sha256(&identity))
     };
     let reserved_sequence = spool.sequence_for(session_id, &occurrence_id)?;
-    let input_digest = sha256(&serde_json::to_vec(&Value::Object(payload.clone()))?);
+    let input_digest = sha256(&serde_json::to_vec(payload)?);
     let (retained_source, recipe_digest, action_kind) = if event_name == "PreToolUse" {
         let native_tool = tool_name.filter(|value| identifier(value, 128));
         if native_tool
