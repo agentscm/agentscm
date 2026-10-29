@@ -110,6 +110,7 @@ use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::{HubError, Result};
 
 mod preflight;
+mod repository_rename;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -449,7 +450,11 @@ fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result
             "SELECT t.repository, t.repository_id, t.name, t.read_only,
                     u.id, u.provider, u.host, u.forge_user_id, u.login
              FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled AND NOT EXISTS (
+                 SELECT 1 FROM hub_repositories r JOIN hub_connections c ON c.id = r.connection
+                 WHERE c.provider = u.provider AND r.host = u.host
+                   AND r.repository_id = t.repository_id AND r.full_name <> t.repository
+             )
              FOR SHARE",
             &[&token, &now],
         )?
@@ -1501,7 +1506,7 @@ fn pg_insight_input(
                 publications_complete = false;
                 break;
             }
-            let found=tx.query("SELECT p.id,p.branch_state,p.pr_number,p.merge_commit,p.updated_at FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token JOIN hub_users u ON u.id=t.owner WHERE p.commit_sha=$1 AND p.repository=$2 AND t.repository=$2 AND t.repository_id=$3 AND u.provider=$4 AND u.host=$5 ORDER BY p.updated_at,p.id LIMIT $6",&[commit,&item.repository,&repository_id,&provider,&host,&((remaining+1)as i64)])?;
+            let found=tx.query("SELECT p.id,p.branch_state,p.pr_number,p.merge_commit,p.updated_at FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token JOIN hub_users u ON u.id=t.owner WHERE p.commit_sha=$1 AND p.repository=t.repository AND t.repository_id=$2 AND u.provider=$3 AND u.host=$4 ORDER BY p.updated_at,p.id LIMIT $5",&[commit,&repository_id,&provider,&host,&((remaining+1)as i64)])?;
             if found.len() > remaining {
                 publications_complete = false;
             }
@@ -1561,7 +1566,11 @@ fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i
     let active = tx
         .query_opt(
             "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled",
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled AND NOT EXISTS (
+                 SELECT 1 FROM hub_repositories r JOIN hub_connections c ON c.id = r.connection
+                 WHERE c.provider = u.provider AND r.host = u.host
+                   AND r.repository_id = t.repository_id AND r.full_name <> t.repository
+             )",
             &[&item.lead_token, &now],
         )?
         .is_some();
@@ -9180,6 +9189,21 @@ impl Store for PgStore {
         Ok(CatchupAckResult{status,event_through,merge_through,current_event_ack:current.0,current_merge_ack:current.1})})
     }
 
+    fn work_repair_repository(
+        &self,
+        repair: &super::work::WorkRepositoryRename,
+        now: i64,
+    ) -> Result<super::work::WorkRepositoryRenameResult> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let result = repository_rename::repair(&mut tx, repair, now)?;
+            if repair.apply {
+                tx.commit()?;
+            }
+            Ok(result)
+        })
+    }
+
     fn work_compact(
         &self,
         scope: &WorkRepositoryScope,
@@ -10347,13 +10371,11 @@ impl Store for PgStore {
                 coordination_request_at(&mut tx, &who, &withdraw.request_id, i64::MAX, now)?
                     .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
             let requester = coordination_is_requester(&request, &who, &withdraw.session);
-            let requester_available = tx
-                .query_opt(
-                    "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id=t.owner
-                     WHERE t.id=$1 AND NOT t.revoked AND t.expires_at>$2 AND NOT u.disabled",
-                    &[&request.requester.token, &now],
-                )?
-                .is_some();
+            let requester_available = match work_who(&mut tx, &request.requester.token, now) {
+                Ok(_) => true,
+                Err(HubError::Unauthorized) => false,
+                Err(error) => return Err(error),
+            };
             let current_target_lead = request.targets.iter().any(|target| {
                 target.lead.token == who.token && target.lead.session == withdraw.session
             });

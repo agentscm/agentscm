@@ -127,6 +127,20 @@ pub(super) fn checked(request: &WorkPreflightRequest, merge: &CatchupMergeObserv
     })
 }
 
+/// An included exact merge needs no path inventory to establish source freshness. The ancestry
+/// assertion remains caller-reported; matching a PR number alone never establishes inclusion.
+pub(super) fn included(request: &WorkPreflightRequest, merge: &CatchupMergeObservation) -> bool {
+    request.source_revision == merge.merge_commit
+        || (request.source_relation_checked
+            && request.checked_merges.iter().any(|candidate| {
+                candidate.in_source
+                    && candidate.source == merge.source
+                    && candidate.source_id == merge.source_id
+                    && candidate.pull_number == merge.pull_number
+                    && candidate.merge_commit == merge.merge_commit
+            }))
+}
+
 pub(super) fn status(reasons: &[WorkPreflightReason]) -> WorkPreflightStatus {
     if reasons.iter().any(|reason| {
         matches!(

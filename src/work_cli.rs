@@ -179,6 +179,36 @@ pub enum WorkCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Repair Work after a verified repository rename; local operator database access required.
+    RepairRepository {
+        #[arg(
+            long,
+            conflicts_with = "database_env",
+            required_unless_present = "database_env"
+        )]
+        database: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "database",
+            required_unless_present = "database"
+        )]
+        database_env: Option<String>,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        host: String,
+        /// Previous owner/name namespace.
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        repository_id: i64,
+        /// Current connected owner/name namespace.
+        #[arg(long)]
+        destination: String,
+        /// Apply atomically; omission previews all changes and collision checks then rolls back.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Preview or apply guarded repair of one retained merged-publication projection failure.
     RepairMerge {
         /// Explicit SQLite or passwordless PostgreSQL URL. Use --database-env for secret URLs.
@@ -219,7 +249,9 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Preflight { .. }
         | WorkCommand::Insight { .. }
         | WorkCommand::Insights { .. } => false,
-        WorkCommand::Compact { apply, .. } | WorkCommand::RepairMerge { apply, .. } => *apply,
+        WorkCommand::Compact { apply, .. }
+        | WorkCommand::RepairMerge { apply, .. }
+        | WorkCommand::RepairRepository { apply, .. } => *apply,
         WorkCommand::CoordinationAck { .. }
         | WorkCommand::CoordinationReply { .. }
         | WorkCommand::CoordinationResolve { .. }
@@ -234,6 +266,36 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
 
 pub async fn run(command: WorkCommand) -> Result<()> {
     let command = match command {
+        WorkCommand::RepairRepository {
+            database,
+            database_env,
+            provider,
+            host,
+            repository,
+            repository_id,
+            destination,
+            apply,
+        } => {
+            let database = database_url(database, database_env)?;
+            let store = store::open(&database).map_err(map_hub_error)?;
+            let result = store
+                .work_repair_repository(
+                    &agentscm::hub::work::WorkRepositoryRename {
+                        scope: WorkRepositoryScope {
+                            provider,
+                            host,
+                            repository,
+                            repository_id: Some(repository_id),
+                        },
+                        destination,
+                        apply,
+                    },
+                    unix_now(),
+                )
+                .map_err(map_hub_error)?;
+            println!("{}", serde_json::to_value(result)?);
+            return Ok(());
+        }
         WorkCommand::Compact {
             database,
             database_env,
@@ -549,7 +611,9 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 false,
             )
         }
-        WorkCommand::Compact { .. } | WorkCommand::RepairMerge { .. } => {
+        WorkCommand::Compact { .. }
+        | WorkCommand::RepairMerge { .. }
+        | WorkCommand::RepairRepository { .. } => {
             unreachable!("local maintenance returned before hub connection")
         }
     };

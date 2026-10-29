@@ -2458,3 +2458,346 @@ fn postgres_merge_ingest_and_work_admission_share_a_repository_lock() {
         Err(error) => panic!("unexpected admission error: {error}"),
     }
 }
+
+fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::work::{ForgeWorkRef, WorkRepositoryRename, WorkSource};
+    let now = unix_now();
+    let owner = fixture.owner(845);
+    let old = "acme/previous";
+    let new = "acme/current";
+    let old_token = fixture.token_for_repository(&owner, "before", old, 845, false);
+    let new_token = fixture.token_for_repository(&owner, "after", new, 845, false);
+    let start = |key: &str, path: &str| WorkStart {
+        work_id: None,
+        source: None,
+        request_key: Some(key.into()),
+        title: key.into(),
+        session: format!("session-{key}"),
+        role: WorkRole::Lead,
+        scope: vec![path.into()],
+        branch: None,
+        worktree: None,
+        next_action: None,
+        depends_on: vec![],
+        related_work: vec![],
+        takeover_generation: None,
+        preflight: None,
+    };
+    let original = fixture
+        .store
+        .work_start(&old_token, &start("retained", "src/retained.rs"), now)
+        .unwrap()
+        .item;
+    let publication = publication(old, "feature/retained", "retained evidence");
+    fixture
+        .store
+        .create_publication(&old_token, &publication, now)
+        .unwrap();
+    let original = fixture
+        .store
+        .work_checkpoint(
+            &old_token,
+            &WorkCheckpoint {
+                work_id: original.id.clone(),
+                operation_id: "before-rename".into(),
+                generation: original.generation,
+                session: original.lead_session.clone(),
+                expected_updated_seq: Some(original.updated_seq),
+                kind: CheckpointKind::Progress,
+                summary: "Recorded publication".into(),
+                next_action: None,
+                scope: None,
+                branch: None,
+                worktree: None,
+                resolve_blocker: false,
+                source_refs: vec![agentscm::hub::work::SourceRef::Commit {
+                    oid: publication.manifest.commit.clone(),
+                    path: None,
+                }],
+                depends_on: vec![],
+                related_work: vec![],
+            },
+            now,
+        )
+        .unwrap()
+        .item;
+    let mut forge = start("unused", "src/issue.rs");
+    forge.request_key = None;
+    forge.source = Some(ForgeWorkRef {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: old.into(),
+        issue: "179".into(),
+    });
+    let issue = fixture
+        .store
+        .work_start(&old_token, &forge, now)
+        .unwrap()
+        .item;
+    let occupied = fixture
+        .store
+        .work_start(&new_token, &start("destination", "src/other.rs"), now)
+        .unwrap()
+        .item;
+    if collision {
+        fixture
+            .store
+            .work_start(&new_token, &start("retained", "src/collision.rs"), now)
+            .unwrap();
+    }
+    // An outstanding proposal must retain its identity and target after migration.
+    let blocked = fixture
+        .store
+        .work_start(&old_token, &start("proposal", "src/retained.rs"), now)
+        .unwrap();
+    let request_id = blocked.coordination_request.unwrap().id;
+    let connection = fixture
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: "con_84500000000000000000000000000000".into(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("synthetic".into()),
+            },
+            &owner,
+        )
+        .unwrap();
+    fixture
+        .store
+        .upsert_repository(&connection.id, "github.com", 845, new, None, None)
+        .unwrap();
+    let mut repair = WorkRepositoryRename {
+        scope: WorkRepositoryScope {
+            provider: "github".into(),
+            host: "github.com".into(),
+            repository: old.into(),
+            repository_id: Some(845),
+        },
+        destination: new.into(),
+        apply: false,
+    };
+    for invalid in [
+        WorkRepositoryRename {
+            destination: "acme/unverified".into(),
+            ..repair.clone()
+        },
+        WorkRepositoryRename {
+            scope: WorkRepositoryScope {
+                repository_id: None,
+                ..repair.scope.clone()
+            },
+            ..repair.clone()
+        },
+        WorkRepositoryRename {
+            scope: WorkRepositoryScope {
+                repository_id: Some(846),
+                ..repair.scope.clone()
+            },
+            ..repair.clone()
+        },
+        WorkRepositoryRename {
+            scope: WorkRepositoryScope {
+                host: "other.example".into(),
+                ..repair.scope.clone()
+            },
+            ..repair.clone()
+        },
+    ] {
+        assert!(
+            fixture
+                .store
+                .work_repair_repository(&invalid, now + 1)
+                .is_err()
+        );
+    }
+    let before = fixture.store.latest_event_seq().unwrap();
+    if collision {
+        assert!(
+            fixture
+                .store
+                .work_repair_repository(&repair, now + 1)
+                .is_err()
+        );
+        repair.apply = true;
+        assert!(
+            fixture
+                .store
+                .work_repair_repository(&repair, now + 1)
+                .is_err()
+        );
+        assert_eq!(fixture.store.latest_event_seq().unwrap(), before);
+        assert!(
+            fixture
+                .store
+                .work_get(&new_token, &issue.id, now + 1)
+                .unwrap()
+                .is_none()
+        );
+        return;
+    }
+    let preview = fixture
+        .store
+        .work_repair_repository(&repair, now + 1)
+        .unwrap();
+    assert_eq!(preview.work_items, 2);
+    assert_eq!(preview.coordination_requests, 1);
+    assert!(!preview.applied);
+    assert_eq!(fixture.store.latest_event_seq().unwrap(), before);
+    assert!(
+        fixture
+            .store
+            .work_get(&new_token, &original.id, now + 1)
+            .unwrap()
+            .is_none()
+    );
+    repair.apply = true;
+    fixture
+        .store
+        .work_repair_repository(&repair, now + 2)
+        .unwrap();
+    let repaired = fixture
+        .store
+        .work_get(&new_token, &original.id, now + 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.repository, new);
+    assert_eq!(repaired.generation, original.generation);
+    assert_eq!(repaired.lead_token, original.lead_token);
+    assert_eq!(repaired.lead_session, original.lead_session);
+    assert_eq!(repaired.participants, original.participants);
+    assert_eq!(repaired.created_seq, original.created_seq);
+    assert_eq!(repaired.current, original.current);
+    assert_eq!(
+        repaired.claim_status,
+        agentscm::hub::work::ClaimStatus::Stale
+    );
+    let insight = fixture
+        .store
+        .work_insight(&new_token, &original.id, now + 3)
+        .unwrap()
+        .unwrap();
+    assert!(
+        insight
+            .publications
+            .iter()
+            .any(|p| p.publication_id == publication.id)
+    );
+    assert!(repaired.updated_seq > original.updated_seq);
+    assert!(
+        fixture
+            .store
+            .work_get(&old_token, &original.id, now + 3)
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .work_get(&new_token, &occupied.id, now + 3)
+            .unwrap()
+            .unwrap(),
+        occupied
+    );
+    let repaired_issue = fixture
+        .store
+        .work_get(&new_token, &issue.id, now + 3)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(repaired_issue.source, WorkSource::Forge { repository, .. } if repository == new)
+    );
+    forge.source.as_mut().unwrap().repository = new.into();
+    let resolved = fixture
+        .store
+        .work_start(&new_token, &forge, now + 3)
+        .unwrap();
+    assert_eq!(resolved.item.id, issue.id);
+    assert!(!resolved.created);
+    assert!(
+        resolved.conflict.is_some(),
+        "rename must not transfer claim authority"
+    );
+    let blocked = fixture
+        .store
+        .work_start(
+            &new_token,
+            &start("another-proposal", "src/retained.rs"),
+            now + 3,
+        )
+        .unwrap();
+    assert!(blocked.coordination_request.is_some());
+    let inbox = fixture
+        .store
+        .coordination_list(&new_token, &Default::default(), now + 3)
+        .unwrap();
+    // Repository-scoped read remains available even though the old lead token owns the target.
+    let request = inbox.requests.iter().find(|r| r.id == request_id).unwrap();
+    assert_eq!(request.targets[0].work_id, original.id);
+    let before_repeat = fixture.store.latest_event_seq().unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .work_repair_repository(&repair, now + 4)
+            .unwrap()
+            .work_items,
+        0
+    );
+    assert_eq!(fixture.store.latest_event_seq().unwrap(), before_repeat);
+    let mut takeover = start("retained", "src/retained.rs");
+    takeover.takeover_generation = Some(original.generation);
+    let resumed = fixture
+        .store
+        .work_start(&new_token, &takeover, now + 4)
+        .unwrap();
+    assert!(resumed.took_over);
+    assert_eq!(resumed.item.id, original.id);
+    assert_eq!(resumed.item.generation, original.generation + 1);
+    let requests = fixture
+        .store
+        .coordination_list(&new_token, &Default::default(), now + 5)
+        .unwrap();
+    let request = requests
+        .requests
+        .iter()
+        .find(|r| r.id == request_id)
+        .unwrap();
+    fixture
+        .store
+        .coordination_withdraw(
+            &new_token,
+            &agentscm::hub::coordination::CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "cleanup-renamed-requester".into(),
+                session: resumed.item.lead_session.clone(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 5,
+        )
+        .unwrap();
+    // A different repository reusing the old name cannot see the migrated Work.
+    let other = fixture.token_for_repository(&owner, "reused", old, 846, false);
+    assert!(
+        fixture
+            .store
+            .work_get(&other, &original.id, now + 1001)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn sqlite_repository_namespace_repair() {
+    repository_namespace_repair(&Fixture::sqlite(), false);
+    repository_namespace_repair(&Fixture::sqlite(), true);
+}
+#[test]
+fn postgres_repository_namespace_repair() {
+    if let Some(fixture) = Fixture::postgres() {
+        repository_namespace_repair(&fixture, false);
+        repository_namespace_repair(&Fixture::postgres().unwrap(), true);
+    }
+}

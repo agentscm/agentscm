@@ -1378,6 +1378,101 @@ fn checked_merge_identity_rejects_hidden_characters_before_lookup() {
     );
 }
 
+fn included_merge_does_not_require_complete_paths(fixture: &StoreFixture) {
+    use agentscm::hub::work_preflight::CheckedMerge;
+
+    let token = direct_token(&*fixture.store, 804, "large-merge-reader");
+    let now = store::unix_now();
+    observe_complete_sources(&*fixture.store, now);
+    let merge = NewCatchupMerge {
+        source: CatchupMergeSource::ForgePull,
+        source_id: "pull:32".into(),
+        occurred_at: Some(now - 1),
+        title: Some("Large source move".into()),
+        branch: "feature/large-move".into(),
+        base: "main".into(),
+        head_commit: "d".repeat(40),
+        merge_commit: "e".repeat(40),
+        pull_number: 32,
+        paths: vec!["src/visible.rs".into()],
+        paths_complete: false,
+    };
+    fixture
+        .store
+        .record_catchup_merge(&repository_scope(), &merge, now)
+        .unwrap();
+    let mut request = direct_start(
+        "large-merge",
+        "Continue after a large merge",
+        "large-merge-session",
+        &["src/omitted.rs"],
+        Some(WorkPreflightRequest {
+            source_revision: "f".repeat(40),
+            merge_after: 0,
+            merge_through: 1,
+            source_relation_checked: true,
+            checked_merges: vec![CheckedMerge {
+                source: merge.source,
+                source_id: merge.source_id.clone(),
+                pull_number: merge.pull_number,
+                merge_commit: merge.merge_commit.clone(),
+                in_source: true,
+            }],
+        }),
+    );
+    let result = fixture.store.work_preflight(&token, &request, now).unwrap();
+    assert_eq!(result.status, WorkPreflightStatus::ClearWithinCheckedWindow);
+    assert!(!result.merges[0].paths_complete);
+    // Neither an unchecked relation nor a missing merge can excuse incomplete paths.
+    for (relation_checked, in_source) in [(false, true), (true, false)] {
+        let evidence = request.preflight.as_mut().unwrap();
+        evidence.source_relation_checked = relation_checked;
+        evidence.checked_merges[0].in_source = in_source;
+        let result = fixture.store.work_preflight(&token, &request, now).unwrap();
+        assert!(
+            result
+                .reasons
+                .contains(&WorkPreflightReason::MergePathsIncomplete)
+        );
+        assert!(matches!(
+            fixture.store.work_start(&token, &request, now),
+            Err(HubError::WorkPreflight(_))
+        ));
+    }
+    let evidence = request.preflight.as_mut().unwrap();
+    evidence.source_revision = merge.merge_commit.clone();
+    evidence.source_relation_checked = false;
+    let result = fixture.store.work_preflight(&token, &request, now).unwrap();
+    assert_eq!(result.status, WorkPreflightStatus::ClearWithinCheckedWindow);
+    // Exact merged heads must still be flagged, even with a claimed inclusion.
+    let evidence = request.preflight.as_mut().unwrap();
+    evidence.source_revision = merge.head_commit.clone();
+    evidence.source_relation_checked = true;
+    evidence.checked_merges[0].in_source = true;
+    let result = fixture.store.work_preflight(&token, &request, now).unwrap();
+    assert!(
+        result
+            .reasons
+            .contains(&WorkPreflightReason::SourceHeadAlreadyMerged)
+    );
+    request.preflight.as_mut().unwrap().source_revision = "f".repeat(40);
+    let started = fixture.store.work_start(&token, &request, now).unwrap();
+    assert!(started.created);
+}
+
+#[test]
+fn sqlite_included_merge_does_not_require_complete_paths() {
+    included_merge_does_not_require_complete_paths(&StoreFixture::sqlite());
+}
+
+#[test]
+fn postgres_included_merge_does_not_require_complete_paths() {
+    let Some(fixture) = StoreFixture::postgres() else {
+        return;
+    };
+    included_merge_does_not_require_complete_paths(&fixture);
+}
+
 /// The checkout's MCP server lists `agent_tools()` before it is connected; a connected agent must
 /// see the same definitions, less the skill tools a repository that adopted no skills does not list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
