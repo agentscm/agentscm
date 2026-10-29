@@ -35,7 +35,10 @@ Capture has three modes per checkout, and `metadata-only` is the default:
 
 The spool has finite operator-configured record, total-byte, and per-artifact limits and never
 silently evicts retained evidence. Defaults are 4,096 records, 64 MiB total, and 16 MiB per
-artifact. Configuration refuses an action-capable spool below 48 records or 64 KiB total because
+artifact. Two derived files at the spool root count toward those limits: `session-<digest>.events`,
+an append-only log of the sequences a session has issued (older whole-map session files are still
+read), and `delivery-index-v1.jsonl`, a delivery-order index that is rebuilt from the outbox whenever
+it is missing, torn or disagrees with an envelope. Configuration refuses an action-capable spool below 48 records or 64 KiB total because
 that space cannot retain the declared minimal managed lifecycle and its recovery metadata. At the
 48-record floor, 12 records remain reserved as health headroom and 36 are available for the fixed
 metadata plus configure, session start, managed Pre, child start and finish, and managed Post
