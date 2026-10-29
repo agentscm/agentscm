@@ -90,6 +90,20 @@ impl SkillBundle {
     pub fn resource(&self, path: &str) -> Option<&[u8]> {
         self.resources.get(path).map(Vec::as_slice)
     }
+
+    #[cfg(test)]
+    pub fn skill_bytes(&self) -> &[u8] {
+        self.resources
+            .get("SKILL.md")
+            .expect("validated skill bundle has an entrypoint")
+    }
+
+    #[cfg(test)]
+    pub fn resources(&self) -> impl ExactSizeIterator<Item = (&str, &[u8])> {
+        self.resources
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+    }
 }
 
 impl SkillBundleIdentity {
