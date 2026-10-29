@@ -7,7 +7,7 @@ use agentscm::checks::{PathObservation, SourcePathExpectation};
 use agentscm::model::{EntryChange, EntryKind, FileChange};
 use agentscm::skill_workflow::{
     RunState, SkillReference, StepAction, StepDefinition, StepState, WorkflowDefinition,
-    WorkflowSource, advance, cancel, compile, start, status, verify_current,
+    WorkflowSource, advance, cancel, compile, start, start_compiled, status, verify_current,
 };
 use agentscm::store::{Engine, digest};
 use rusqlite::{Connection, params};
@@ -226,6 +226,30 @@ fn run_id_retry_is_idempotent_and_a_different_plan_conflicts() {
     let changed = compile(fixture.root.path(), &changed).expect("changed plan");
     assert!(start(fixture.root.path(), "stable-run", &changed).is_err());
     assert_eq!(status(fixture.root.path(), "stable-run").unwrap(), first);
+}
+
+#[test]
+fn start_compiled_keeps_identity_checks_and_start_still_rejects_stale_plans() {
+    let fixture = make_fixture();
+    let definition = make_definition(
+        &fixture,
+        vec![source_step("check", &[], true, &digest(SOURCE_BYTES))],
+    );
+    let plan = compile(fixture.root.path(), &definition).expect("compiled plan");
+    let first = start_compiled(fixture.root.path(), "reuse-run", &plan).expect("start");
+    assert_eq!(
+        start_compiled(fixture.root.path(), "reuse-run", &plan).expect("exact retry"),
+        first
+    );
+    let mut changed = definition;
+    changed.name = "different-plan".to_owned();
+    let changed = compile(fixture.root.path(), &changed).expect("changed plan");
+    assert!(start_compiled(fixture.root.path(), "reuse-run", &changed).is_err());
+
+    let mut authority = Authority::open(fixture.root.path()).expect("authority");
+    authority.advance_policy(0).expect("advance policy");
+    drop(authority);
+    assert!(start(fixture.root.path(), "stale-run", &plan).is_err());
 }
 
 #[test]
