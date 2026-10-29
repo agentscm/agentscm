@@ -1011,7 +1011,7 @@ status is always `success`, so never mark it as a required check. The separate
 Failures. A 401, or a 403 with no rate-limit headers, on the app JWT, an
 installation token or discovery marks the connection `auth_failed` (status code and
 endpoint kind only) and keeps all data; the poller then leaves it for 10 minutes (webhooks
-are not processed meanwhile, and an administrator's refresh retries at once), and the
+are not processed meanwhile, the wait survives a restart, and an administrator's refresh retries at once), and the
 next success marks it `enabled` and ends the wait. The same
 on a repository endpoint only skips that repository for the round. Each round starts
 at a different repository. A 429, a 403 with no quota left, or a GraphQL `RATE_LIMITED` error moves the next poll
