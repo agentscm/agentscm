@@ -250,6 +250,9 @@ fn bounded_process(
         Some(Stop::Cancelled) => ActionOutcome::Cancelled,
         Some(Stop::Output) => return Ok((ActionOutcome::OutputLimit, Vec::new())),
         Some(Stop::Timeout) => ActionOutcome::TimedOut,
+        // A child that exits non-zero before draining its input still failed on its
+        // own terms; only a clean exit after an input or drain failure is uncertain.
+        Some(Stop::Io) if matches!(capture.code, Some(code) if code != 0) => ActionOutcome::Failed,
         Some(Stop::Io) => return Ok((ActionOutcome::Uncertain, Vec::new())),
         None if capture.incomplete => return Ok((ActionOutcome::Uncertain, Vec::new())),
         None if capture.code == Some(0) => ActionOutcome::Succeeded,
@@ -313,6 +316,22 @@ mod tests {
             (ActionOutcome::Succeeded, b"inok\n".to_vec())
         );
         assert_eq!(run("exit 3", 1024, 5000, &never).0, ActionOutcome::Failed);
+    }
+
+    #[test]
+    fn a_child_that_exits_before_reading_its_input_keeps_its_verdict() {
+        let never = || false;
+        // Larger than a pipe buffer, so the input pump cannot finish before the exit.
+        let input = vec![b'x'; 1 << 20];
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 3"]).process_group(0);
+        let (outcome, _) =
+            bounded_process(&mut command, input.clone(), 1024, 5000, &never).unwrap();
+        assert_eq!(outcome, ActionOutcome::Failed);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]).process_group(0);
+        let (outcome, _) = bounded_process(&mut command, input, 1024, 5000, &never).unwrap();
+        assert_eq!(outcome, ActionOutcome::Uncertain);
     }
 
     #[test]
