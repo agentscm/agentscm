@@ -650,7 +650,7 @@ pub async fn announce_for(
         store.touch_session(&token, &call, unix_now())
     })
     .await?;
-    NOTICES.notify_waiters();
+    wake_notice_waiters(&NOTICES, &touched);
     count(&DENIED, !touched.denied.is_empty());
     count(&REPEATED, !touched.repeated.is_empty());
     count(&RATE_LIMITED, touched.rate_limited);
@@ -712,6 +712,14 @@ static FAIL_OPEN: AtomicU64 = AtomicU64::new(0);
 const LATENCIES: usize = 1024;
 /// Milliseconds of the last `LATENCIES` hook requests.
 static HOOK_MS: Mutex<VecDeque<u32>> = Mutex::new(VecDeque::new());
+
+/// Notices go only to other intents overlapping a path this touch added (an expired intent's
+/// paths count as added), so a touch that added none wrote nothing a notice waiter reads.
+fn wake_notice_waiters(waiters: &tokio::sync::Notify, touched: &Touched) {
+    if !touched.added.is_empty() {
+        waiters.notify_waiters();
+    }
+}
 
 fn count(counter: &AtomicU64, when: bool) {
     if when {
@@ -917,6 +925,38 @@ mod tests {
         for case in bad {
             assert!(check(&case).is_err(), "{case:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_touch_that_added_paths_wakes_notice_waiters() {
+        let waiters = tokio::sync::Notify::new();
+        let mut touched = Touched {
+            session: "s".into(),
+            via: Vec::new(),
+            intent: None,
+            added: Vec::new(),
+            overlaps: Vec::new(),
+            notices: Vec::new(),
+            denied: Vec::new(),
+            repeated: Vec::new(),
+            rate_limited: false,
+            handoffs: Vec::new(),
+            requested: Vec::new(),
+        };
+        let woken = |touched: &Touched| {
+            let notified = waiters.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            wake_notice_waiters(&waiters, touched);
+            std::future::Future::poll(
+                notified,
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            )
+            .is_ready()
+        };
+        assert!(!woken(&touched), "a repeat edit wrote no notice");
+        touched.added.push("a.rs".into());
+        assert!(woken(&touched));
     }
 
     #[test]

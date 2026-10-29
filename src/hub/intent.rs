@@ -37,7 +37,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Wakes long-polling notice requests in this process after an announce.
 pub(super) static NOTICES: Notify = Notify::const_new();
 /// Bounds long-polls held open per process; past it, a request answers at once.
-static WAITERS: Semaphore = Semaphore::const_new(256);
+static WAITERS: Semaphore = Semaphore::const_new(32);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewIntent {
