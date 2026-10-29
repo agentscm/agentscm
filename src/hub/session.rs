@@ -15,7 +15,7 @@ use super::intent::{
     Announced, Intent, MAX_LIVE_INTENTS, MAX_TASK_BYTES, NOTICES, NewIntent, Overlap, display_all,
     key_of, spec_key, text,
 };
-use super::store::{Event, HubEvent, Principal, new_id, unix_now};
+use super::store::{Event, HubEvent, Principal, Store, new_id, unix_now};
 use super::sync::{open_pulls, overlapping_pulls};
 use super::work::WorkItem;
 use super::{HubError, HubState, Result};
@@ -644,10 +644,23 @@ pub async fn announce_for(
     principal: &Principal,
     call: SessionCall,
 ) -> Result<Advice> {
+    Ok(announce_reading(state, principal, call, |_, _| ()).await?.0)
+}
+
+/// [`announce_for`], also running `read` in the same store hop right after the touch commits.
+/// What `read` returns is its own result, so a failed read cannot fail the committed touch.
+pub(super) async fn announce_reading<T: Send + 'static>(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
+) -> Result<(Advice, T)> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
-    let touched = blocking(state, move || {
-        store.touch_session(&token, &call, unix_now())
+    let (touched, read) = blocking(state, move || {
+        let touched = store.touch_session(&token, &call, unix_now())?;
+        let read = read(&*store, &touched);
+        Ok((touched, read))
     })
     .await?;
     wake_notice_waiters(&NOTICES, &touched);
@@ -697,12 +710,15 @@ pub async fn announce_for(
             unix_now(),
         )
     });
-    Ok(Advice {
-        touched,
-        text,
-        stop,
-        deny,
-    })
+    Ok((
+        Advice {
+            touched,
+            text,
+            stop,
+            deny,
+        },
+        read,
+    ))
 }
 
 static DENIED: AtomicU64 = AtomicU64::new(0);
