@@ -14,7 +14,7 @@ hub-postgres = { max-threads = 1 }
 hub-worktree-lifecycle = { max-threads = 2 }
 
 [[profile.default.overrides]]
-filter = 'test(/^backend_s3::/)'
+filter = 'binary(integration) & test(/^backend_s3::/)'
 test-group = 'backend-s3'
 
 [[profile.default.overrides]]
@@ -22,5 +22,5 @@ filter = 'test(/(^\w+::(on_postgres::|postgres_)|::postgres$|_on_postgres$)/)'
 test-group = 'hub-postgres'
 
 [[profile.default.overrides]]
-filter = 'test(/^hub_workspace_execution::two_git_worktrees_/)'
+filter = 'binary(integration) & test(/^hub_workspace_execution::two_git_worktrees_/)'
 test-group = 'hub-worktree-lifecycle'

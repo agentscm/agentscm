@@ -46,7 +46,8 @@ for co in "${checkouts[@]}"; do
   [[ -d "$dir" ]] || continue
   case "$seen" in *"|$dir|"*) continue ;; esac
   seen+="|$dir|"
-  kb=$(du -sk "$dir" | awk '{print $1}')
+  kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}') || true
+  [[ -n "$kb" ]] || continue
   (( kb > limit * 1024 * 1024 )) || continue
   gib=$(awk -v kb="$kb" 'BEGIN{printf "%.1f", kb / 1048576}')
   if [[ -n "$dry" ]]; then

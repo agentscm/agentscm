@@ -19,7 +19,7 @@ Install the version required by `.config/nextest.toml` so local and CI behavior 
 cargo install cargo-nextest --version 0.9.148 --locked
 ```
 
-On macOS or Linux, also compile the Windows build before pushing a change that touches `#[cfg(unix)]` code or calls into a Unix-only module (`client_plugin`, `client_setup`, `tray` and others). The gate above only compiles the host platform, so these mistakes otherwise surface only in the `windows` CI job. `tools/windows-check.sh` compiles what that job compiles, with warnings as errors, and reads its test list from `.github/workflows/windows.yml`. It needs the target and a MinGW C compiler once:
+On macOS or Linux, also compile the Windows build before pushing a change that touches `#[cfg(unix)]` code or calls into a Unix-only module (`client_plugin`, `client_setup`, `tray` and others). The gate above only compiles the host platform, so these mistakes otherwise surface only in the `windows` CI job. `tools/windows-check.sh` compiles what that job compiles, with warnings as errors, and checks the library, the binary and `--test integration`; the Windows test set is the modules in `tests/integration/main.rs` declared without `#[cfg(unix)]`. It needs the target and a MinGW C compiler once:
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
@@ -50,7 +50,7 @@ for each test can add host startup latency to the existing probe deadlines.
 
 ## Integration test layout
 
-Top-level integration tests are one test binary, `integration`, built from `tests/integration/main.rs`; the crate links once instead of once per file. Add a new integration test as `tests/integration/<name>.rs` and declare it in `main.rs` with `mod <name>;` (a guard test fails when a file is not declared). Tests are named `<name>::<test>`, so select them with `-E 'test(/^<name>::/)'` under nextest, or `cargo test --locked --test integration <name>::` under Cargo. Helpers shared by several modules are declared once in `main.rs` and imported with `use crate::<helper>;`; `tests/support/` and `tests/fixtures/` hold files read at run time. Only the modules in `main.rs` without `#[cfg(unix)]` build on Windows, and the `windows` CI job runs them with `--test integration`. A file placed directly in `tests/` still builds as its own binary, which is rarely wanted.
+Top-level integration tests are one test binary, `integration`, built from `tests/integration/main.rs`; the crate links once instead of once per file. Add a new integration test as `tests/integration/<name>.rs` and declare it in `main.rs` with `mod <name>;` (a guard test fails when a file is not declared). Tests are named `<name>::<test>`, so select them with `-E 'test(/^<name>::/)'` under nextest, or `cargo test --locked --test integration <name>::` under Cargo. Cargo's filter is a substring match (`sync::` also selects `hub_sync::`), while `-E 'test(/^<name>::/)'` selects exactly one module. Helpers shared by several modules are declared once in `main.rs` and imported with `use crate::<helper>;`; `tests/support/` and `tests/fixtures/` hold files read at run time. Only the modules in `main.rs` without `#[cfg(unix)]` build on Windows, and the `windows` CI job runs them with `--test integration`. A file placed directly in `tests/` still builds as its own binary, which is rarely wanted. The one deliberate exception is `tests/setup.rs` (select it with `-E 'binary(setup)'`): its tests package the running test executable, which must stay under the 128 MiB bundle limit, so it cannot be part of the large `integration` binary.
 
 ## Focused iteration
 
