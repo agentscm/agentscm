@@ -3,11 +3,13 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::Json;
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::http::{ApiError, JsonBody, blocking};
 use super::workspace::{WorkspaceActor, api_error};
@@ -19,6 +21,25 @@ use super::workspace_execution::{CancelRequest, ExecutionService, RunSubject, St
 use super::{HubError, HubState, Result};
 
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
+
+/// Collector uploads buffer up to 16 MiB of JSON each, so only this many read bodies at once.
+static COLLECTOR_UPLOADS: Semaphore = Semaphore::const_new(2);
+
+/// A collector-upload slot, taken before the body is read and held until the reply.
+struct UploadSlot {
+    _permit: SemaphorePermit<'static>,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for UploadSlot {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(_: &mut Parts, _: &S) -> std::result::Result<Self, ApiError> {
+        COLLECTOR_UPLOADS
+            .try_acquire()
+            .map(|permit| UploadSlot { _permit: permit })
+            .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy"))
+    }
+}
 
 pub fn routes() -> Router<HubState> {
     Router::new()
@@ -295,6 +316,7 @@ async fn collector_upload(
     State(state): State<HubState>,
     actor: WorkspaceActor,
     Path((repository, profile)): Path<(String, String)>,
+    _slot: UploadSlot,
     JsonBody(request): JsonBody<CollectorUploadRequest>,
 ) -> ApiResult<AgentTaskEnvelope> {
     let execution = state.workspace_execution.clone().ok_or_else(|| {
@@ -307,4 +329,27 @@ async fn collector_upload(
     .await
     .map(Json)
     .map_err(api_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collector_uploads_past_the_limit_are_refused_before_the_body() {
+        let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+        let mut held = Vec::new();
+        while let Ok(slot) = UploadSlot::from_request_parts(&mut parts, &()).await {
+            held.push(slot);
+        }
+        assert_eq!(held.len(), 2);
+        let refused = UploadSlot::from_request_parts(&mut parts, &()).await;
+        assert!(refused.is_err());
+        held.pop();
+        assert!(
+            UploadSlot::from_request_parts(&mut parts, &())
+                .await
+                .is_ok()
+        );
+    }
 }
