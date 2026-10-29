@@ -272,11 +272,11 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
     assert_eq!(body, comment::render(&envelope, &record).unwrap());
     assert!(body.starts_with("<!-- agentscm-local-validation:v1 "));
     assert!(body.contains("alt=\"AgentSCM icon\" width=\"28\""));
-    assert!(body.contains("**Local validation: reported pass**"));
+    assert!(body.contains("**AgentSCM · Local validation**"));
     assert!(body.contains("Source: <code>repo&#x2d;1</code> at <code>111111111111</code>"));
     assert!(body.contains("the verifier checks the signature and source bindings"));
     assert!(body.contains("Coverage: 1/1 checks reported; 5 omissions."));
-    assert!(body.contains("<summary>Coverage omissions (5)</summary>"));
+    assert!(body.contains("<summary>Coverage and environment</summary>"));
     for omission in [
         "<code>ignored tests</code>",
         "<code>windows</code>",
@@ -293,6 +293,20 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
     assert_eq!(body.matches("</details>").count(), 4);
     assert!(!body.contains("<details open"));
 
+    let sections: Vec<_> = body
+        .lines()
+        .filter(|line| line.starts_with("<summary>"))
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            "<summary>Command results</summary>",
+            "<summary>Coverage and environment</summary>",
+            "<summary>Source details</summary>",
+            "<summary>Signed machine-readable evidence</summary>"
+        ]
+    );
+
     let signed_details = body
         .find("<summary>Signed machine-readable evidence</summary>")
         .unwrap();
@@ -305,14 +319,33 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
 }
 
 #[test]
-fn rendered_comment_warns_when_services_are_missing() {
+fn rendered_comment_reports_absent_services_as_environment_facts() {
     let (envelope, _) = comment_bytes();
     let mut missing_service_record = record();
     missing_service_record.services.s3 = false;
     let record_bytes = serde_json::to_vec(&missing_service_record).unwrap();
     let body = comment::render(&envelope, &record_bytes).unwrap();
 
-    assert!(body.contains("Missing services: S3. Coverage is incomplete."));
+    assert!(body.contains("Services available: PostgreSQL=true, S3=false"));
+    assert!(!body.contains("Coverage is incomplete"));
+    assert!(!body.contains("Missing services"));
+}
+
+#[test]
+fn rendered_comment_preserves_reported_failure_and_historical_service_omissions() {
+    let (envelope, record) = comment_bytes();
+    let mut envelope_json: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    envelope_json["payload"]["outcome"] = "fail".into();
+    envelope_json["payload"]["coverage"]["omissions"] =
+        serde_json::json!(["postgres tests", "s3 tests"]);
+    let envelope = serde_json::to_vec(&envelope_json).unwrap();
+    let body = comment::render(&envelope, &record).unwrap();
+    let visible = body.split("<details>").next().unwrap();
+    assert!(visible.contains("**Reported outcome: fail**"));
+    assert!(visible.contains("2 omissions"));
+    assert!(body.contains("- <code>postgres tests</code>\n"));
+    assert!(body.contains("- <code>s3 tests</code>\n"));
+    assert_eq!(comment::parse(&body).unwrap(), (envelope, record));
 }
 
 #[test]
@@ -386,7 +419,7 @@ fn hostile_display_strings_cannot_escape_collapsed_sections() {
     record_bytes = serde_json::to_vec(&hostile_record).unwrap();
 
     let body = comment::render(&hostile_envelope, &record_bytes).unwrap();
-    assert!(body.contains("**Local validation: reported unknown**"));
+    assert!(body.contains("**Reported outcome: unknown**"));
     assert_eq!(body.matches("<details>").count(), 4);
     assert_eq!(body.matches("</details>").count(), 4);
     assert!(!body.contains("<details open>"));
@@ -428,6 +461,75 @@ fn recipe_and_policy_decode_strictly() {
 #[test]
 fn valid_attestation_succeeds() {
     expect(Case::new().run(), VerdictState::Success, "validated");
+}
+
+#[test]
+fn service_omissions_follow_policy_and_availability() {
+    for required_postgres in [false, true] {
+        for required_s3 in [false, true] {
+            for available_postgres in [false, true] {
+                for available_s3 in [false, true] {
+                    let mut c = Case::new();
+                    c.policy.required_services = Services {
+                        postgres: required_postgres,
+                        s3: required_s3,
+                    };
+                    c.record.services = Services {
+                        postgres: available_postgres,
+                        s3: available_s3,
+                    };
+                    let missing_postgres = required_postgres && !available_postgres;
+                    let missing_s3 = required_s3 && !available_s3;
+                    c.tamper_payload = Some(Box::new(move |p| {
+                        let mut expected: Vec<String> = [
+                            "ignored tests",
+                            "windows",
+                            "container smoke",
+                            "hub end-to-end",
+                            "live execution",
+                        ]
+                        .map(String::from)
+                        .to_vec();
+                        if missing_postgres {
+                            expected.push("postgres tests".into());
+                        }
+                        if missing_s3 {
+                            expected.push("s3 tests".into());
+                        }
+                        assert_eq!(p.coverage.omissions, expected);
+                        assert_eq!(
+                            p.outcome,
+                            if missing_postgres || missing_s3 {
+                                agentscm::evidence::EvidenceOutcome::Fail
+                            } else {
+                                agentscm::evidence::EvidenceOutcome::Pass
+                            }
+                        );
+                    }));
+                    if missing_postgres || missing_s3 {
+                        fails(c, "required service missing");
+                    } else {
+                        expect(c.run(), VerdictState::Success, "validated");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn historical_optional_service_omissions_still_verify() {
+    let mut c = Case::new();
+    c.policy.required_services = Services {
+        postgres: false,
+        s3: false,
+    };
+    c.record.services = c.policy.required_services;
+    c.tamper_payload = Some(Box::new(|p| {
+        p.coverage.omissions.push("postgres tests".into());
+        p.coverage.omissions.push("s3 tests".into());
+    }));
+    expect(c.run(), VerdictState::Success, "validated");
 }
 
 #[test]
@@ -570,7 +672,7 @@ fn producer_passes_when_policy_does_not_require_the_missing_service() {
     c.policy.required_services.s3 = false;
     let (verdict, body) = c.execute();
     assert_eq!(verdict.state, VerdictState::Success);
-    assert!(body.contains("- <code>s3 tests</code>\n"));
+    assert!(!body.contains("- <code>s3 tests</code>\n"));
 }
 
 #[test]
