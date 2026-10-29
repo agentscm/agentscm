@@ -122,6 +122,9 @@ pub struct CommandResult {
     pub stdout_sha256: String,
     pub stderr_sha256: String,
     pub truncated: bool,
+    /// Collection lost stream or child completion evidence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
 }
 
 /// Whether the PostgreSQL / S3 test environment was present for the run.
@@ -461,6 +464,12 @@ impl ValidationRecord {
                         Some(code) => format!("{} exited with {code}", r.id),
                         None => format!("{} exited without a code", r.id),
                     },
+                ));
+            }
+            if r.incomplete {
+                return Some((
+                    "capture incomplete",
+                    format!("{} capture was incomplete", r.id),
                 ));
             }
             if r.truncated {

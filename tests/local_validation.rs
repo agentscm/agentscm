@@ -98,6 +98,7 @@ fn record() -> ValidationRecord {
             stdout_sha256: hex(4),
             stderr_sha256: hex(5),
             truncated: false,
+            incomplete: false,
         }],
         not_required: vec![],
         services: Services {
@@ -1207,4 +1208,30 @@ fn conditional_command_that_ran_passes_when_required() {
     lint.argv = vec!["cargo".into(), "clippy".into()];
     c.record.results.push(lint);
     expect(c.run(), VerdictState::Success, "validated");
+}
+
+#[test]
+fn command_result_preserves_incomplete_capture_and_legacy_encoding() {
+    let legacy = serde_json::json!({
+        "id": "test", "argv": ["test"], "exit_code": null,
+        "stop": "output_limit", "duration_ms": 1,
+        "stdout_sha256": "a", "stderr_sha256": "b", "truncated": true
+    });
+    let mut result: CommandResult = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!result.incomplete);
+    assert_eq!(serde_json::to_value(&result).unwrap(), legacy);
+    result.incomplete = true;
+    let encoded = serde_json::to_value(&result).unwrap();
+    assert_eq!(encoded["incomplete"], true);
+    assert_eq!(
+        serde_json::from_value::<CommandResult>(encoded).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn incomplete_capture_cannot_validate_a_successful_exit() {
+    let mut c = Case::new();
+    c.record.results[0].incomplete = true;
+    fails(c, "capture incomplete");
 }
