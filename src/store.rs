@@ -342,6 +342,9 @@ impl Engine {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         crate::local_recovery::check_before_create(path.as_ref(), false)?;
+        if let Some(engine) = Self::open_published(path.as_ref())? {
+            return Ok(engine);
+        }
         let root = create_directory_durable(path)?;
         let access = crate::local_recovery::AccessGuard::shared(&root)?;
         let objects = create_directory_durable(root.join("objects"))?;
@@ -351,6 +354,30 @@ impl Engine {
             read_budget: None,
             staged: None,
         })
+    }
+
+    /// Skips the creation syncs when `objects` is a real directory holding an entry:
+    /// objects are published only through an engine whose open already synced the
+    /// directory chain, so the layout is durable. Anything else takes the creating path.
+    fn open_published(path: &Path) -> Result<Option<Self>> {
+        let root = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let objects = root.join("objects");
+        let published = fs::symlink_metadata(&objects).is_ok_and(|meta| meta.is_dir())
+            && fs::read_dir(&objects).is_ok_and(|mut entries| entries.next().is_some());
+        if !published {
+            return Ok(None);
+        }
+        let access = crate::local_recovery::AccessGuard::shared(&root)?;
+        Ok(Some(Self {
+            objects,
+            _access: access,
+            read_budget: None,
+            staged: None,
+        }))
     }
 
     /// Opens an already provisioned store without creating directories or the lock file.
@@ -3612,6 +3639,31 @@ mod blob_reference_tests {
         assert_eq!(names(&store), before);
         assert!(!lock.exists());
         assert!(provisioned.contains(&objects));
+    }
+
+    #[test]
+    fn open_syncs_the_directory_chain_until_objects_are_published() {
+        let data = TempDir::new().unwrap();
+        let store = data.path().join("nested").join("store");
+        let syncs = |store: &Path| {
+            SYNC_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+            let engine = Engine::open(store).unwrap();
+            let log = SYNC_LOG.with(|log| log.borrow_mut().take().unwrap());
+            (engine, log)
+        };
+        let (engine, created) = syncs(&store);
+        assert!(created.contains(&SyncEvent::DirSync(store.join("objects"))));
+        assert!(created.contains(&SyncEvent::DirSync(data.path().to_path_buf())));
+        drop(engine);
+        // An empty objects directory may belong to a creator that has not synced yet.
+        let (engine, empty) = syncs(&store);
+        assert_eq!(empty, created);
+        let revision = engine.checkpoint(None, &[]).unwrap();
+        drop(engine);
+        let (engine, published) = syncs(&store);
+        assert_eq!(published, []);
+        assert_eq!(engine.objects, store.join("objects"));
+        assert!(engine.checkpoint(Some(&revision), &[]).is_ok());
     }
 }
 
