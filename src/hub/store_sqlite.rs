@@ -3706,7 +3706,16 @@ fn publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Publication> {
         commit: row.get(7)?,
         branch: row.get(8)?,
         base: row.get(9)?,
-        manifest: row.get(10)?,
+        // PUBLICATION_SELECT returns NULL for an oversized manifest; publication_error maps it.
+        manifest: row.get::<_, Option<String>>(10)?.ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Null,
+                Box::new(HubError::Invalid(
+                    "retained publication exceeds manifest budget".into(),
+                )),
+            )
+        })?,
         branch_state: row.get(11)?,
         branch_message: row.get(12)?,
         pr_number: row.get(13)?,
@@ -3719,14 +3728,24 @@ fn publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Publication> {
     })
 }
 
+/// Surfaces `publication_row`'s oversized-manifest failure as `Invalid`, as PostgreSQL does.
+fn publication_error(error: rusqlite::Error) -> HubError {
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, inner) = &error
+        && let Some(HubError::Invalid(message)) = inner.downcast_ref::<HubError>()
+    {
+        return HubError::Invalid(message.clone());
+    }
+    error.into()
+}
+
 fn publication_by_id(tx: &Connection, id: &str) -> Result<Option<Publication>> {
-    Ok(tx
-        .query_row(
-            &format!("{PUBLICATION_SELECT} WHERE p.id = ?1"),
-            [id],
-            publication_row,
-        )
-        .optional()?)
+    tx.query_row(
+        &format!("{PUBLICATION_SELECT} WHERE p.id = ?1"),
+        [id],
+        publication_row,
+    )
+    .optional()
+    .map_err(publication_error)
 }
 
 fn connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForgeConnection> {
@@ -6973,7 +6992,8 @@ impl Store for SqliteStore {
                 params![repository, after, oldest, limit as i64],
                 publication_row,
             )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7114,7 +7134,8 @@ impl Store for SqliteStore {
         ))?;
         let rows = statement
             .query_map(params![repository, before, limit as i64], publication_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7174,7 +7195,8 @@ impl Store for SqliteStore {
                 ],
                 publication_row,
             )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(PublicationSearch {
             rows,
             searched_to: Some(oldest_id),
@@ -7199,7 +7221,8 @@ impl Store for SqliteStore {
         ))?;
         let rows = statement
             .query_map(params![repository, after, limit as i64], publication_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 

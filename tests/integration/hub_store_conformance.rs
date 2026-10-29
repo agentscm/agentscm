@@ -2271,7 +2271,11 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
             )
             .unwrap();
     }
-    assert!(store.publication(REPO, &id).is_err());
+    assert!(matches!(
+        store.publication(REPO, &id),
+        Err(agentscm::hub::HubError::Invalid(message))
+            if message == "retained publication exceeds manifest budget"
+    ));
 }
 fn pull_publications_are_newest_per_pull_request(db: &Db) {
     let store = db.open();
