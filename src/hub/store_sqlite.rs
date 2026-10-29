@@ -8,9 +8,9 @@ use serde_json::json;
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
-    CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1, IngestReceiptV1,
-    MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
-    parse_conversation_cursor,
+    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1,
+    IngestReceiptV1, MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1,
+    SessionSetupV1, parse_conversation_cursor,
 };
 
 use super::catchup::{
@@ -7964,18 +7964,49 @@ impl Store for SqliteStore {
         }
         let existing = tx
             .query_row(
-                "SELECT identity FROM hub_change_sessions
+                "SELECT identity,event_count,watermark,start_count,start_sequence,end_count,
+                        end_sequence
+                 FROM hub_change_sessions
                  WHERE work=?1 AND generation=?2 AND session_id=?3",
                 params![batch.work_id, batch.generation, batch.session.session_id],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                        ),
+                    ))
+                },
             )
             .optional()?;
-        if let Some(retained_identity) = existing {
+        // Retained lifecycle counters, updated from this batch alone so ingest is O(batch).
+        let (
+            mut retained_events,
+            mut retained_watermark,
+            mut start_count,
+            mut start_sequence,
+            mut end_count,
+            mut end_sequence,
+        ) = (0_i64, 0_i64, 0_i64, None, 0_i64, None);
+        if let Some((retained_identity, lifecycle)) = existing {
             if retained_identity != identity {
                 return Err(HubError::Invalid(
                     "capture session identity or generation changed".into(),
                 ));
             }
+            (
+                retained_events,
+                retained_watermark,
+                start_count,
+                start_sequence,
+                end_count,
+                end_sequence,
+            ) = lifecycle;
         } else {
             let first = batch.events[0].observed_at;
             tx.execute(
@@ -8071,40 +8102,22 @@ impl Store for SqliteStore {
             gap_count += usize::from(event.gap.is_some());
             watermark = watermark.max(event.sequence);
             last_observed = last_observed.max(event.observed_at);
+            let sequence = event.sequence as i64;
+            retained_events += 1;
+            retained_watermark = retained_watermark.max(sequence);
+            // A compaction restart continues the same session, not a second origin. A boundary
+            // sequence is kept only while exactly one such event is retained.
+            if event.kind == CapturedEventKindV1::SessionStarted
+                && event.boundary.as_deref() != Some("compact")
+            {
+                start_count += 1;
+                start_sequence = (start_count == 1).then_some(sequence);
+            }
+            if event.kind == CapturedEventKindV1::SessionEnded {
+                end_count += 1;
+                end_sequence = (end_count == 1).then_some(sequence);
+            }
         }
-        // Aggregate in SQL so a large retained session is not loaded and re-parsed per batch.
-        // A compaction restart continues the same session, not a second origin.
-        let (retained_events, retained_watermark, start_count, start_min, end_count, end_min): (
-            i64,
-            i64,
-            i64,
-            Option<i64>,
-            i64,
-            Option<i64>,
-        ) = tx.query_row(
-            "SELECT COUNT(*), COALESCE(MAX(sequence),0),
-                    COUNT(CASE WHEN kind='session_started' AND boundary IS NOT 'compact' THEN 1 END),
-                    MIN(CASE WHEN kind='session_started' AND boundary IS NOT 'compact' THEN sequence END),
-                    COUNT(CASE WHEN kind='session_ended' THEN 1 END),
-                    MIN(CASE WHEN kind='session_ended' THEN sequence END)
-             FROM (SELECT sequence, json_extract(event,'$.kind') AS kind,
-                          json_extract(event,'$.boundary') AS boundary
-                   FROM hub_change_events
-                   WHERE work=?1 AND generation=?2 AND session_id=?3)",
-            params![batch.work_id, batch.generation, batch.session.session_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )?;
-        let start_sequence = if start_count == 1 { start_min } else { None };
-        let end_sequence = if end_count == 1 { end_min } else { None };
         let lifecycle_valid = start_sequence == Some(1)
             && end_sequence == Some(retained_watermark)
             && retained_watermark > 1;
@@ -8113,7 +8126,8 @@ impl Store for SqliteStore {
                  watermark=?4, event_count=?5,
                  gap_count=gap_count+?6, started=?7, ended=?8,
                  start_sequence=?9,end_sequence=?10,lifecycle_valid=?11,
-                 last_observed_at=max(last_observed_at,?12), updated_at=?13
+                 last_observed_at=max(last_observed_at,?12), updated_at=?13,
+                 start_count=?14, end_count=?15
              WHERE work=?1 AND generation=?2 AND session_id=?3",
             params![
                 batch.work_id,
@@ -8128,7 +8142,9 @@ impl Store for SqliteStore {
                 end_sequence,
                 lifecycle_valid,
                 last_observed,
-                now
+                now,
+                start_count,
+                end_count
             ],
         )?;
         let retained_operations: i64 = tx.query_row(
@@ -10512,6 +10528,26 @@ impl Store for SqliteStore {
             deleted_merge_observations: merge_observations as u64,
             merge_retention_floor,
         })
+    }
+
+    fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT provider, host, repository, repository_id FROM hub_work_items
+             UNION SELECT provider, host, repository, repository_id FROM hub_coordination_requests
+             ORDER BY 1, 2, 3, 4",
+        )?;
+        let scopes = statement
+            .query_map([], |row| {
+                Ok(WorkRepositoryScope {
+                    provider: row.get(0)?,
+                    host: row.get(1)?,
+                    repository: row.get(2)?,
+                    repository_id: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(scopes)
     }
 
     fn work_briefing_preview_for(

@@ -196,7 +196,8 @@ fn remove_change_records(db: &Db) {
          DROP TABLE hub_change_actions;
          DROP TABLE hub_change_sessions;
          DROP TABLE hub_change_operations;
-         DELETE FROM hub_named_migrations WHERE name IN ('change_records', 'shared_conversations');",
+         DELETE FROM hub_named_migrations
+         WHERE name IN ('change_records', 'shared_conversations', 'change_session_lifecycle');",
     )
     .unwrap();
     assert_eq!(
@@ -463,6 +464,259 @@ fn interrupted_migration_rolls_back_and_retries(db: &Db) {
     assert_migrated_schema(db);
     let projection = write_change_record(&*store, &fixture);
     assert_eq!(projection["latest_action"]["result"], "passed");
+}
+
+type Lifecycle = (String, Vec<Option<i64>>);
+
+impl Db {
+    fn lifecycle_rows(&self, sql: &str) -> Vec<Lifecycle> {
+        let row = |session: String, values: Vec<Option<i64>>| (session, values);
+        if self.pg_schema.is_some() {
+            postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .query(sql, &[])
+                .unwrap()
+                .iter()
+                .map(|r| row(r.get(0), (1..r.len()).map(|i| r.get(i)).collect()))
+                .collect()
+        } else {
+            let connection =
+                rusqlite::Connection::open(self.sqlite_path.as_ref().unwrap()).unwrap();
+            let mut statement = connection.prepare(sql).unwrap();
+            let width = statement.column_count();
+            statement
+                .query_map([], |r| {
+                    Ok(row(
+                        r.get(0)?,
+                        (1..width).map(|i| r.get(i).unwrap()).collect(),
+                    ))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+    }
+
+    /// Each session's lifecycle as stored by ingest.
+    fn stored_lifecycle(&self, with_counts: bool) -> Vec<Lifecycle> {
+        let counts = if with_counts {
+            ", start_count, end_count"
+        } else {
+            ""
+        };
+        self.lifecycle_rows(&format!(
+            "SELECT session_id, event_count, watermark,
+                    CAST(CAST(started AS INTEGER) AS BIGINT), CAST(CAST(ended AS INTEGER) AS BIGINT),
+                    start_sequence, end_sequence,
+                    CAST(CAST(lifecycle_valid AS INTEGER) AS BIGINT){counts}
+             FROM hub_change_sessions ORDER BY session_id"
+        ))
+    }
+
+    /// The full-session aggregate ingest used before lifecycle counters were retained.
+    fn aggregate_lifecycle(&self, with_counts: bool) -> Vec<Lifecycle> {
+        let sql = if self.pg_schema.is_some() {
+            "SELECT session_id, COUNT(*)::bigint, COALESCE(MAX(sequence),0)::bigint,
+                    COUNT(*) FILTER (WHERE kind='session_started' AND boundary IS DISTINCT FROM 'compact')::bigint,
+                    MIN(sequence) FILTER (WHERE kind='session_started' AND boundary IS DISTINCT FROM 'compact'),
+                    COUNT(*) FILTER (WHERE kind='session_ended')::bigint,
+                    MIN(sequence) FILTER (WHERE kind='session_ended')
+             FROM (SELECT session_id, sequence, event::jsonb->>'kind' AS kind,
+                          event::jsonb->>'boundary' AS boundary FROM hub_change_events) e
+             GROUP BY session_id ORDER BY session_id"
+        } else {
+            "SELECT session_id, COUNT(*), COALESCE(MAX(sequence),0),
+                    COUNT(CASE WHEN kind='session_started' AND boundary IS NOT 'compact' THEN 1 END),
+                    MIN(CASE WHEN kind='session_started' AND boundary IS NOT 'compact' THEN sequence END),
+                    COUNT(CASE WHEN kind='session_ended' THEN 1 END),
+                    MIN(CASE WHEN kind='session_ended' THEN sequence END)
+             FROM (SELECT session_id, sequence, json_extract(event,'$.kind') AS kind,
+                          json_extract(event,'$.boundary') AS boundary FROM hub_change_events)
+             GROUP BY session_id ORDER BY session_id"
+        };
+        self.lifecycle_rows(sql)
+            .into_iter()
+            .map(|(session, v)| {
+                let (events, watermark) = (v[0].unwrap(), v[1].unwrap());
+                let start = (v[2] == Some(1)).then_some(v[3]).flatten();
+                let end = (v[4] == Some(1)).then_some(v[5]).flatten();
+                let valid = start == Some(1) && end == Some(watermark) && watermark > 1;
+                let mut row = vec![
+                    Some(events),
+                    Some(watermark),
+                    Some(i64::from(start.is_some())),
+                    Some(i64::from(end.is_some())),
+                    start,
+                    end,
+                    Some(i64::from(valid)),
+                ];
+                if with_counts {
+                    row.extend([v[2], v[4]]);
+                }
+                (session, row)
+            })
+            .collect()
+    }
+}
+
+fn lifecycle_event(
+    sequence: u64,
+    kind: CapturedEventKindV1,
+    boundary: Option<&str>,
+) -> CapturedEventV1 {
+    CapturedEventV1 {
+        event_id: format!("lifecycle-{sequence}"),
+        sequence,
+        observed_at: unix_now(),
+        kind,
+        tool: None,
+        artifact: None,
+        setup: None,
+        gap: None,
+        boundary: boundary.map(str::to_owned),
+        subagent: None,
+    }
+}
+
+/// Sessions ingested before the lifecycle-counter migration keep the exact lifecycle the
+/// full-session aggregate computed, and later batches continue from the backfilled counters.
+fn lifecycle_counters_match_the_retained_aggregate(db: &Db) {
+    use CapturedEventKindV1::{SessionEnded, SessionStarted, TurnEnded, UserPrompt};
+    let fixture = seed_representative_work(db);
+    let store = db.open();
+    // (session, events ingested before the migration, events ingested after it)
+    let shapes: [(&str, Vec<_>, Vec<_>); 6] = [
+        (
+            "life-valid",
+            vec![(1, SessionStarted, Some("startup")), (2, UserPrompt, None)],
+            vec![
+                (3, SessionStarted, Some("compact")),
+                (4, SessionEnded, None),
+            ],
+        ),
+        (
+            "life-two-origins",
+            vec![
+                (1, SessionStarted, None),
+                (2, SessionStarted, Some("resume")),
+            ],
+            vec![(3, SessionEnded, Some("other"))],
+        ),
+        (
+            "life-late-start",
+            vec![(1, UserPrompt, None)],
+            vec![(2, SessionStarted, None), (3, SessionEnded, None)],
+        ),
+        (
+            "life-two-ends",
+            vec![(1, SessionStarted, None), (2, SessionEnded, None)],
+            vec![(3, SessionEnded, Some("other"))],
+        ),
+        (
+            "life-compact-only",
+            vec![(1, SessionStarted, Some("compact")), (2, TurnEnded, None)],
+            vec![(3, SessionStarted, None)],
+        ),
+        (
+            "life-open",
+            vec![(2, SessionStarted, None), (1, UserPrompt, None)],
+            vec![(4, TurnEnded, None), (5, SessionEnded, None)],
+        ),
+    ];
+    let ingest = |store: &dyn Store,
+                  work: &str,
+                  session: &str,
+                  phase: &str,
+                  events: &[(u64, CapturedEventKindV1, Option<&str>)]| {
+        let mut events: Vec<_> = events
+            .iter()
+            .map(|(sequence, kind, boundary)| lifecycle_event(*sequence, *kind, *boundary))
+            .collect();
+        events.sort_by_key(|event| event.sequence);
+        store
+            .change_ingest(
+                &fixture.token,
+                &CaptureBatchV1 {
+                    schema_version: 1,
+                    operation_id: format!("{session}:{phase}"),
+                    work_id: work.into(),
+                    generation: 1,
+                    session: SessionIdentityV1 {
+                        harness: AgentHarnessV1::Codex,
+                        adapter_version: "lifecycle-fixture-v1".into(),
+                        session_id: session.into(),
+                        parent_session_id: None,
+                        capture_mode: CaptureModeV1::MetadataOnly,
+                    },
+                    events,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    };
+    let mut works = Vec::new();
+    for (index, (session, before, _)) in shapes.iter().enumerate() {
+        let work = store
+            .work_start(
+                &fixture.token,
+                &WorkStart {
+                    work_id: None,
+                    source: None,
+                    request_key: Some(format!("lifecycle-{index}")),
+                    title: format!("lifecycle shape {session}"),
+                    session: (*session).into(),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("lifecycle/{index}/**")],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: vec![],
+                    related_work: vec![],
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap()
+            .item;
+        assert_eq!(work.generation, 1);
+        ingest(&*store, &work.id, session, "before", before);
+        works.push(work.id);
+    }
+    drop(store);
+    // The pre-migration boundary: the counters and their migration marker do not exist.
+    db.execute(
+        "ALTER TABLE hub_change_sessions DROP COLUMN start_count;
+         ALTER TABLE hub_change_sessions DROP COLUMN end_count;
+         DELETE FROM hub_named_migrations WHERE name = 'change_session_lifecycle';",
+    )
+    .unwrap();
+    assert_eq!(db.stored_lifecycle(false), db.aggregate_lifecycle(false));
+
+    let store = db.open();
+    assert_eq!(
+        db.scalar(
+            "SELECT count(*) FROM hub_named_migrations WHERE name = 'change_session_lifecycle'"
+        ),
+        1
+    );
+    assert_eq!(db.stored_lifecycle(true), db.aggregate_lifecycle(true));
+    for ((session, _, after), work) in shapes.iter().zip(&works) {
+        ingest(&*store, work, session, "after", after);
+    }
+    let after = db.stored_lifecycle(true);
+    assert_eq!(after, db.aggregate_lifecycle(true));
+    let valid: Vec<_> = after
+        .iter()
+        .filter(|(_, values)| values[6] == Some(1))
+        .map(|(session, _)| session.as_str())
+        .collect();
+    assert_eq!(valid, ["life-valid"]);
+}
+
+#[test]
+fn sqlite_lifecycle_counters_match_the_retained_aggregate() {
+    lifecycle_counters_match_the_retained_aggregate(&Db::sqlite());
 }
 
 #[test]
@@ -948,6 +1202,16 @@ mod on_postgres {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(db) = Db::postgres() {
             super::representative_upgrade_roundtrip(&db);
+        }
+    }
+
+    #[test]
+    fn lifecycle_counters_match_the_retained_aggregate() {
+        let _guard = POSTGRES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(db) = Db::postgres() {
+            super::lifecycle_counters_match_the_retained_aggregate(&db);
         }
     }
 
