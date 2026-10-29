@@ -4,13 +4,20 @@
 //! configuration and `[include]` are honored exactly as Git reads them. Git missing, failing or
 //! slow is a typed error rather than a silent fallback. A workspace without `.git` never runs Git
 //! and probes the filesystem for case sensitivity instead.
+//!
+//! Reading the settings costs three Git processes, and `agent task stop` scans twice per Stop, so
+//! a result is remembered per root for the life of the process while the configuration files it
+//! came from still look the same.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use super::selection::Settings;
 use crate::execution::Cancellation;
@@ -68,8 +75,87 @@ pub(super) fn ambient_settings(
     selected_settings(root, &git)
 }
 
+/// What identifies a configuration file's content without reading it: length, inode and mtime.
+type Stamp = (u64, u64, SystemTime);
+
+struct Remembered {
+    git: PathBuf,
+    environment: Vec<Option<OsString>>,
+    watched: Vec<(PathBuf, Option<Stamp>)>,
+    settings: Settings,
+}
+
+static REMEMBERED: Mutex<BTreeMap<PathBuf, Remembered>> = Mutex::new(BTreeMap::new());
+
+/// A file younger than this might still be mid-edit when stamped, so it is not trusted.
+const SETTLE: Duration = Duration::from_secs(2);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.ino(), metadata.modified().ok()?))
+}
+
+/// The configuration files Git would read for the repository: its own, the global ones and an
+/// explicit system file. Files pulled in with `include` and a distribution's system file are not
+/// watched; changing those inside a running process is not noticed.
+fn watched_paths(common_dir: &Path) -> Vec<PathBuf> {
+    let var = |name| std::env::var_os(name).filter(|value| !value.is_empty());
+    let mut paths = vec![common_dir.join("config")];
+    if let Some(global) = var("GIT_CONFIG_GLOBAL") {
+        paths.push(global.into());
+    } else {
+        let home = var("HOME").map(PathBuf::from);
+        let xdg = var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".config")));
+        paths.extend(xdg.map(|xdg| xdg.join("git").join("config")));
+        paths.extend(home.map(|home| home.join(".gitconfig")));
+    }
+    paths.extend(var("GIT_CONFIG_SYSTEM").map(PathBuf::from));
+    paths
+}
+
 /// Attachment scans must use the operator-selected Git executable.
 pub(super) fn selected_settings(root: &Path, git: &Path) -> Result<Settings> {
+    let environment: Vec<_> = KEPT_ENVIRONMENT.map(std::env::var_os).into();
+    let hit = REMEMBERED.lock().ok().and_then(|remembered| {
+        let found = remembered.get(root)?;
+        let unchanged = found.git == git
+            && found.environment == environment
+            && found.watched.iter().all(|(path, was)| stamp(path) == *was);
+        unchanged.then(|| found.settings.clone())
+    });
+    if let Some(settings) = hit {
+        return Ok(settings);
+    }
+    let settings = read_settings(root, git)?;
+    if let Some(common_dir) = &settings.git_common_dir {
+        let watched: Vec<_> = watched_paths(common_dir)
+            .into_iter()
+            .map(|path| {
+                let stamp = stamp(&path);
+                (path, stamp)
+            })
+            .collect();
+        let settled = watched.iter().all(|(_, stamp)| {
+            stamp.is_none_or(|(_, _, modified)| modified.elapsed().is_ok_and(|age| age > SETTLE))
+        });
+        if settled && let Ok(mut remembered) = REMEMBERED.lock() {
+            remembered.insert(
+                root.to_path_buf(),
+                Remembered {
+                    git: git.to_path_buf(),
+                    environment,
+                    watched,
+                    settings: settings.clone(),
+                },
+            );
+        }
+    }
+    Ok(settings)
+}
+
+fn read_settings(root: &Path, git: &Path) -> Result<Settings> {
     let common_dir = repository_common_dir(git, root)?;
     let excludes = git_config(git, root, &["--path", "--get", "core.excludesFile"])?;
     let global_excludes = match excludes.map(strip_nul) {
@@ -226,4 +312,67 @@ fn git_command(git: &Path, root: &Path, args: &[&str]) -> Result<Capture> {
         )));
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn age(path: &Path) {
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    #[test]
+    fn settings_are_read_once_until_the_repository_configuration_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let real = git_executable();
+        let init = Command::new(&real)
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+        // A wrapper that logs each Git process, so spawns can be counted.
+        let log = directory.path().join("spawns");
+        let wrapper = directory.path().join("git");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\necho x >> '{}'\nexec '{}' \"$@\"\n",
+                log.display(),
+                real.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let spawns = || fs::read_to_string(&log).map_or(0, |text| text.lines().count());
+        let config = root.join(".git").join("config");
+        age(&config);
+
+        let first = selected_settings(&root, &wrapper).unwrap();
+        assert_eq!(spawns(), 3);
+        let second = selected_settings(&root, &wrapper).unwrap();
+        assert_eq!(spawns(), 3, "the second read is served from memory");
+        assert_eq!(first.case_insensitive, second.case_insensitive);
+        assert_eq!(first.git_common_dir, second.git_common_dir);
+
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str("[core]\n\tignorecase = false\n");
+        fs::write(&config, text).unwrap();
+        let changed = selected_settings(&root, &wrapper).unwrap();
+        assert_eq!(spawns(), 6, "a changed repository config is read again");
+        assert!(!changed.case_insensitive);
+    }
 }
