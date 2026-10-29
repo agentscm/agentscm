@@ -59,7 +59,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          # Fail closed: a listing error fails the step. Pagination is bounded by the step timeout.
+          # A listing error or an invalid head SHA fails the step before any write. Pagination is bounded by the step timeout.
           heads=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base="$DEFAULT_BRANCH" -f per_page=100 --paginate --jq '.[].head.sha' </dev/null)
           # Validate every line before any write; a jq null prints as "null" and fails here.
           if [[ -n "$heads" ]] && printf '%s\n' "$heads" | grep -qvE '^[0-9a-f]{40}$'; then
@@ -67,24 +67,39 @@ jobs:
             exit 1
           fi
           count=0
+          failed=0
           for sha in $(printf '%s\n' "$heads" | sort -u); do
-            # The combined status holds the latest status per context. If our context is absent but the
-            # read was truncated, it may be hiding on a later page, so treat it as unknown.
-            state=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --jq '(.statuses | map(select(.context == "agentscm/local-validation")) | first | .state) // (if .total_count > (.statuses | length) then "unknown" else "none" end)' </dev/null)
-            # Only success (and unknown) can satisfy a required check. "none" means the head never opted
+            # --paginate reads every page of the combined status, which has at most one entry for our context.
+            # Take the first non-empty line; no output means the head never opted in ("none"). A failed read
+            # is "unknown": invalidate anyway, because a stale success is worse than an extra pending.
+            if out=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --paginate --jq '.statuses[] | select(.context == "agentscm/local-validation") | .state' </dev/null); then
+              state=$(printf '%s\n' "$out" | grep -m1 . || true)
+              state=${state:-none}
+            else
+              echo "::warning::could not read the status of $sha; setting it to pending anyway"
+              state=unknown
+            fi
+            # Only success (or a failed read) can satisfy a required check. "none" means the head never opted
             # in, and writing would opt it in forever. pending, failure and error already block merging.
             if [[ "$state" != success && "$state" != unknown ]]; then
               continue
             fi
-            reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context=agentscm/local-validation -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null)
+            if ! reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context=agentscm/local-validation -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null); then
+              echo "::error::failed to set $sha to pending"
+              failed=$((failed + 1))
+              continue
+            fi
             if [[ "$reply" != pending ]]; then
-              echo "unexpected reply writing status for $sha: $reply" >&2
-              exit 1
+              echo "::error::unexpected reply writing status for $sha: $reply"
+              failed=$((failed + 1))
+              continue
             fi
             echo "$sha: $state -> pending"
             count=$((count + 1))
           done
-          echo "set $count stale success(es) to pending"
+          echo "set $count stale success(es) to pending; $failed failure(s)"
+          # Exit 0 even after per-head failures so setup and reconcile still run; reconcile retries and reports its own errors.
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch || github.ref_name }}

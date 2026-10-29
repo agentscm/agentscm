@@ -13,6 +13,8 @@
 //! ponytail: invalidate-first writes two statuses per opted-in head per run, and GitHub keeps
 //! at most 1000 statuses per sha and context, so a head hits the cap after about 500 runs. Upgrade
 //! path: skip both writes when the head's latest status already equals the verdict and nothing changed.
+//! The workflow's pre-setup invalidation step writes `pending` first, so the latest status is usually
+//! `pending` when reconcile starts.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
