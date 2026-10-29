@@ -5730,7 +5730,7 @@ mod tests {
         );
     }
 
-    /// The Git these tests drive, resolved as in tests/git_snapshot.rs. A missing Git is a test
+    /// The Git these tests drive, resolved as in tests/integration/git_snapshot.rs. A missing Git is a test
     /// failure, never a silent skip.
     fn test_git() -> PathBuf {
         let path = PathBuf::from(
