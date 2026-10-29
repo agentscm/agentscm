@@ -888,6 +888,12 @@ pub trait Store: Send + Sync {
         apply: bool,
         now: i64,
     ) -> Result<WorkCompaction>;
+    /// Operator-only, transactional repair of a verified repository rename.
+    fn work_repair_repository(
+        &self,
+        repair: &super::work::WorkRepositoryRename,
+        now: i64,
+    ) -> Result<super::work::WorkRepositoryRenameResult>;
     /// Every repository scope that retains Work items or coordination requests.
     fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>>;
     /// Trusted workspace calls only: authorization is held across this transaction.

@@ -254,6 +254,22 @@ pub struct WorkRepositoryScope {
     pub repository_id: Option<i64>,
 }
 
+/// Local operator repair; the destination must match a connected stable repository ID.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRepositoryRename {
+    pub scope: WorkRepositoryScope,
+    pub destination: String,
+    pub apply: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkRepositoryRenameResult {
+    pub work_items: usize,
+    pub coordination_requests: usize,
+    pub applied: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkCompaction {
