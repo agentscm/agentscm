@@ -830,29 +830,34 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut builder = if matches!(
-        cli.command,
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(workers) = worker_threads(&cli.command) {
+        builder.worker_threads(workers);
+    }
+    runtime(&mut builder).block_on(run_parsed(cli));
+}
+
+/// The per-tool-call client processes get small runtimes; everything else keeps the default.
+fn worker_threads(command: &Command) -> Option<usize> {
+    if matches!(
+        command,
         Command::Client {
             command: client_cli::ClientCommand::Mcp(_)
         }
     ) {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder.worker_threads(1);
-        builder
-    } else if matches!(
-        cli.command,
+        return Some(1);
+    }
+    #[cfg(unix)]
+    if matches!(
+        command,
         Command::ChangeCapture {
             command: change_capture_cli::ChangeCaptureCommand::HookClaude
         }
     ) {
         // A capture hook runs on every tool call, so it gets the `hook` path's runtime.
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder.worker_threads(2);
-        builder
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-    };
-    runtime(&mut builder).block_on(run_parsed(cli));
+        return Some(2);
+    }
+    None
 }
 
 async fn run_parsed(cli: Cli) {
