@@ -26,6 +26,8 @@ const MAX_PENDING_PAGE: usize = 100;
 const MAX_DELIVERY_PAGE: usize = 10;
 const MAX_SEQUENCE_EVENTS: usize = 16_384;
 const MAX_SEQUENCE_BYTES: u64 = 2 * 1024 * 1024;
+/// One session sequence-log record: 64 hex digest, space, 20 decimal digits, newline.
+const SEQUENCE_LOG_RECORD: usize = 86;
 const MAX_PHYSICAL_RECORDS: usize = 65_536;
 const ACTION_FINISH_RESERVE_BYTES: u64 = 16 * 1024;
 pub const MIN_ACTION_CAPTURE_RECORDS: usize = 48;
@@ -672,6 +674,11 @@ struct SequenceState {
     start_observed: bool,
     #[serde(default)]
     provider_history: Option<ProviderHistoryCursorV1>,
+    /// Set before the session's first append-only sequence record. `next` and `events` then hold
+    /// only the frozen whole-map allocations of earlier releases, and binaries that know only
+    /// that format refuse the state instead of reallocating logged sequences.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    event_log: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3100,24 +3107,60 @@ impl LocalSpool {
     pub fn sequence_for(&self, session_id: &str, event_id: &str) -> Result<u64> {
         validate_session_key(session_id, event_id)?;
         let path = self.session_state_path(session_id);
+        let log_path = self.session_log_path(session_id);
         let _lock = self.lock()?;
         let mut state = load_sequence_state(&path)?;
         if let Some(sequence) = state.events.get(event_id) {
             return Ok(*sequence);
         }
-        if state.events.len() >= MAX_SEQUENCE_EVENTS || state.next == 0 {
-            return Err(CaptureError::Limit(
-                "session sequence map reached its retention bound".into(),
-            ));
+        let log = load_sequence_log(&log_path, state.next)?;
+        let digest = sha256(event_id.as_bytes());
+        if let Some((_, sequence)) = log.iter().find(|(logged, _)| *logged == digest) {
+            return Ok(*sequence);
         }
-        let sequence = state.next;
-        state.next = state
-            .next
-            .checked_add(1)
-            .ok_or_else(|| CaptureError::Limit("session sequence overflow".into()))?;
-        state.events.insert(event_id.to_owned(), sequence);
-        save_sequence_state(&path, &state, self)?;
+        let sequence = next_sequence(&state, &log)?;
+        if !state.event_log {
+            state.event_log = true;
+            save_sequence_state(&path, &state, self)?;
+        }
+        self.append_sequence_record(&log_path, &digest, sequence)?;
         Ok(sequence)
+    }
+
+    /// Appends one durable allocation. Only the 86-byte record is written, so a session's
+    /// per-event cost does not grow with the number of sequences it already holds.
+    fn append_sequence_record(&self, path: &Path, digest: &str, sequence: u64) -> Result<()> {
+        let record = format!("{digest} {sequence:020}\n");
+        debug_assert_eq!(record.len(), SEQUENCE_LOG_RECORD);
+        let created = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => false,
+            Ok(_) => {
+                return Err(CaptureError::Invalid(
+                    "session sequence log is not a regular file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        self.reserve(record.len() as u64, usize::from(created))?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        // A torn final record from a crashed append was never returned to a caller.
+        let length = file.metadata()?.len();
+        let aligned = length - length % SEQUENCE_LOG_RECORD as u64;
+        if aligned != length {
+            file.set_len(aligned)?;
+        }
+        file.write_all(record.as_bytes())?;
+        file.sync_all()?;
+        if created {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Allocates a fresh durable identity when the provider supplies no replay-stable event
@@ -3126,13 +3169,11 @@ impl LocalSpool {
     pub fn uncertain_event_id(&self, session_id: &str, fingerprint: &str) -> Result<String> {
         validate_session_key(session_id, fingerprint)?;
         let path = self.session_state_path(session_id);
+        let log_path = self.session_log_path(session_id);
         let _lock = self.lock()?;
         let mut state = load_sequence_state(&path)?;
-        if state.events.len() >= MAX_SEQUENCE_EVENTS || state.next == 0 {
-            return Err(CaptureError::Limit(
-                "session sequence map reached its retention bound".into(),
-            ));
-        }
+        let log = load_sequence_log(&log_path, state.next)?;
+        let sequence = next_sequence(&state, &log)?;
         state.uncertain_occurrences = state
             .uncertain_occurrences
             .checked_add(1)
@@ -3147,13 +3188,10 @@ impl LocalSpool {
                 .as_bytes()
             )
         );
-        let sequence = state.next;
-        state.next = state
-            .next
-            .checked_add(1)
-            .ok_or_else(|| CaptureError::Limit("session sequence overflow".into()))?;
-        state.events.insert(event_id.clone(), sequence);
+        // The counter is durable before the record, so a crash never reissues this identity.
+        state.event_log = true;
         save_sequence_state(&path, &state, self)?;
+        self.append_sequence_record(&log_path, &sha256(event_id.as_bytes()), sequence)?;
         Ok(event_id)
     }
 
@@ -3357,6 +3395,13 @@ impl LocalSpool {
         self.root
             .join("sessions")
             .join(format!("{}.json", sha256(session_id.as_bytes())))
+    }
+
+    /// Append-only allocations, kept at the root so `sessions/` still holds exactly one JSON
+    /// state per session for existing readers.
+    fn session_log_path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(format!("session-{}.events", sha256(session_id.as_bytes())))
     }
 
     fn lock(&self) -> Result<SpoolLock> {
@@ -4998,6 +5043,62 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Reads one session's complete append-only allocations as (event-id digest, sequence). Records
+/// strictly increase from the frozen whole-map high-water `floor`; a torn final record from a
+/// crashed append was never returned to a caller and is ignored.
+fn load_sequence_log(path: &Path, floor: u64) -> Result<Vec<(String, u64)>> {
+    let bytes = match read_bounded(path, MAX_SEQUENCE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut records = Vec::with_capacity(bytes.len() / SEQUENCE_LOG_RECORD);
+    let mut previous = floor.saturating_sub(1);
+    for record in bytes.chunks_exact(SEQUENCE_LOG_RECORD) {
+        let parsed = std::str::from_utf8(record)
+            .ok()
+            .and_then(|record| record.strip_suffix('\n'))
+            .and_then(|record| record.split_once(' '))
+            .filter(|(digest, sequence)| {
+                valid_digest(digest)
+                    && sequence.len() == 20
+                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .and_then(|(digest, sequence)| Some((digest.to_owned(), sequence.parse().ok()?)));
+        match parsed {
+            Some((digest, sequence)) if sequence > previous => {
+                previous = sequence;
+                records.push((digest, sequence));
+            }
+            _ => {
+                return Err(CaptureError::Invalid(
+                    "session sequence log is invalid".into(),
+                ));
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// The next unused sequence across a session's frozen whole map and its append-only log, under
+/// the same retention bound the whole map enforced.
+fn next_sequence(state: &SequenceState, log: &[(String, u64)]) -> Result<u64> {
+    if state.events.len().saturating_add(log.len()) >= MAX_SEQUENCE_EVENTS || state.next == 0 {
+        return Err(CaptureError::Limit(
+            "session sequence map reached its retention bound".into(),
+        ));
+    }
+    let sequence = match log.last() {
+        Some((_, last)) => last.checked_add(1),
+        None => Some(state.next),
+    };
+    sequence
+        .filter(|sequence| sequence.checked_add(1).is_some())
+        .ok_or_else(|| CaptureError::Limit("session sequence overflow".into()))
 }
 
 fn load_sequence_state(path: &Path) -> Result<SequenceState> {
@@ -7174,12 +7275,33 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
         records = records.saturating_add(1);
         bytes = bytes.saturating_add(metadata.len());
     }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_name().to_str().is_some_and(appended_root_record) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(CaptureError::Invalid(
+                "capture spool appended record is not a regular file".into(),
+            ));
+        }
+        records = records.saturating_add(1);
+        bytes = bytes.saturating_add(metadata.len());
+    }
     if records > MAX_PHYSICAL_RECORDS {
         return Err(CaptureError::Limit(
             "capture spool contains too many physical records".into(),
         ));
     }
     Ok((records, bytes))
+}
+
+/// Root-level append-only records, counted under the same limits as every other record.
+fn appended_root_record(name: &str) -> bool {
+    name.strip_prefix("session-")
+        .and_then(|rest| rest.strip_suffix(".events"))
+        .is_some_and(valid_digest)
 }
 
 #[cfg(test)]
@@ -8324,6 +8446,65 @@ mod tests {
             spool.append_priority(&retimed),
             Err(CaptureError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn session_sequences_append_without_rewriting_and_keep_reading_whole_maps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let session = "session_legacy";
+        // Whole-map state exactly as earlier releases wrote it.
+        let header = spool.session_state_path(session);
+        fs::write(
+            &header,
+            br#"{"next":3,"events":{"evt:a":1,"evt:b":2},"uncertain_occurrences":0,"start_observed":true,"provider_history":null}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&header, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(spool.sequence_for(session, "evt:b").unwrap(), 2);
+        assert_eq!(spool.sequence_for(session, "evt:c").unwrap(), 3);
+        let fenced = fs::read(&header).unwrap();
+        let fenced_text = String::from_utf8_lossy(&fenced);
+        assert!(fenced_text.contains("\"event_log\":true"));
+        assert!(fenced_text.contains("\"evt:a\":1") && fenced_text.contains("\"next\":3"));
+        for index in 0..20 {
+            let event = format!("evt:n{index}");
+            assert_eq!(spool.sequence_for(session, &event).unwrap(), 4 + index);
+        }
+        assert_eq!(
+            fs::read(&header).unwrap(),
+            fenced,
+            "allocation rewrote state"
+        );
+        let log = spool.session_log_path(session);
+        assert_eq!(fs::metadata(&log).unwrap().len(), 21 * 86);
+        assert_eq!(spool.sequence_for(session, "evt:a").unwrap(), 1);
+        assert_eq!(spool.sequence_for(session, "evt:c").unwrap(), 3);
+
+        // A torn record from a crashed append is dropped; logged allocations stay replay-stable.
+        OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"0123")
+            .unwrap();
+        let reopened = LocalSpool::open(temp.path().join("spool")).unwrap();
+        assert_eq!(reopened.sequence_for(session, "evt:n19").unwrap(), 23);
+        let uncertain = reopened
+            .uncertain_event_id(session, &"f".repeat(64))
+            .unwrap();
+        assert_eq!(reopened.sequence_for(session, &uncertain).unwrap(), 24);
+        assert_eq!(fs::metadata(&log).unwrap().len(), 22 * 86);
+
+        let (records, bytes) = usage(&spool.root, 0).unwrap();
+        let moved = temp.path().join("moved-log");
+        fs::rename(&log, &moved).unwrap();
+        let (without_records, without_bytes) = usage(&spool.root, 0).unwrap();
+        assert_eq!(
+            (records - without_records, bytes - without_bytes),
+            (1, 22 * 86)
+        );
     }
 
     #[test]
