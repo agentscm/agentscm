@@ -209,7 +209,7 @@ fixture exercises validator rejection, without relying on updater race timing.
 recovery after a post-claim failure, native packaging of the actual CLI, blocked
 doctor fields, typed failures and isolated self-checks. All fixtures own
 disposable synthetic roots. They never target an existing user repository or
-installation. Run the `setup::` and `setup_cli::` tests of the `integration` test binary locally to exercise
+installation. Run the `setup` test binary and the `setup_cli::` tests of the `integration` test binary locally to exercise
 these fixtures.
 
 Recovery configuration fixtures independently compare both IDs with the actual

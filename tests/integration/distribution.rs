@@ -1,12 +1,3 @@
-// `src/setup.rs` calls `crate::distribution::package_native`, so the packager source is
-// exposed here, in the module that takes the `distribution` name in this binary.
-#[cfg(target_os = "macos")]
-#[path = "../../src/distribution.rs"]
-#[allow(dead_code)] // The binary packager also exposes the optional verifier entry point.
-mod packager;
-#[cfg(target_os = "macos")]
-pub(crate) use packager::package_native;
-
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;

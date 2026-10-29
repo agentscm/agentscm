@@ -1,8 +1,8 @@
 //! The integration tests, built as one binary so the crate links once.
 //!
 //! Every file in this directory is a module declared here. Shared helpers are declared once
-//! below and imported with `use crate::<helper>;`. Only the modules in the Windows set compile
-//! on Windows; keep that set in sync with `.github/workflows/windows.yml`.
+//! below and imported with `use crate::<helper>;`. Only the modules declared without
+//! `#[cfg(unix)]` (the Windows set) compile on Windows.
 
 // Shared helpers.
 #[cfg(unix)]
@@ -233,8 +233,6 @@ mod repo_explorer_git;
 mod reviewer;
 #[cfg(unix)]
 mod reviewer_claude_code;
-#[cfg(unix)]
-mod setup;
 #[cfg(unix)]
 mod setup_cli;
 #[cfg(unix)]

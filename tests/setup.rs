@@ -1,7 +1,13 @@
 //! Source fixtures only until explicitly executed; no existing installation is used.
+//!
+//! This stays a separate test binary: `setup::begin` packages and copies the running test
+//! executable, which must stay under the 128 MiB bundle limit, and the consolidated
+//! `integration` binary is far larger.
 #![cfg(target_os = "macos")]
-#[path = "../../src/setup.rs"]
-#[allow(clippy::module_inception)] // the source under test keeps its own name
+#[path = "../src/distribution.rs"]
+#[allow(dead_code)] // The binary packager also exposes the optional verifier entry point.
+mod distribution;
+#[path = "../src/setup.rs"]
 mod setup;
 
 use std::ffi::OsString;
