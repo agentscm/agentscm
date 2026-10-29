@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::process::{Capture, Stop, capture};
 use super::{CleanupHandle, ExecutionOutcome, ExecutionRecord, ExecutionRequest, Snapshot};
@@ -186,7 +185,7 @@ impl OciBackend {
             let stable = json!({"daemon":daemon_id,"kernel":info["KernelVersion"],"arch":info["Architecture"],
                 "cgroup_version":info["CgroupVersion"],"cgroup_driver":info["CgroupDriver"],
                 "security":info["SecurityOptions"],"runtime":info["Runtimes"]["runc"],"server":runtime});
-            Ok(format!("docker:{version}:runc:builtin:{}", hex(&serde_json::to_vec(&stable).expect("JSON value"))))
+            Ok(format!("docker:{version}:runc:builtin:{}", crate::checks::sha256(&serde_json::to_vec(&stable).expect("JSON value"))))
         }) {
             Ok(identity) => RuntimeProbe {
                 available: true,
@@ -287,8 +286,12 @@ impl OciBackend {
         // identical attempts. Never target a reusable user-controlled container name.
         let mut nonce = [0u8; 16];
         fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
-        let name = format!("agentscm-{}", hex(&nonce));
-        let owner = format!("{}:{}", record.request_sha256, hex(&nonce));
+        let name = format!("agentscm-{}", crate::checks::sha256(&nonce));
+        let owner = format!(
+            "{}:{}",
+            record.request_sha256,
+            crate::checks::sha256(&nonce)
+        );
         record.cleanup_confirmed = false;
         record.cleanup_handle = Some(CleanupHandle {
             container_name: name.clone(),
@@ -753,9 +756,6 @@ fn parsed_env(value: &Value) -> Option<BTreeMap<String, String>> {
 }
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| (*s).to_owned()).collect()
-}
-fn hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]

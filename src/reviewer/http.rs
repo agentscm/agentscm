@@ -69,7 +69,7 @@ impl LocalHttpTransport {
             failure: None,
             http_status: None,
             captured_response_bytes: 0,
-            captured_response_sha256: hash_bytes(&[]),
+            captured_response_sha256: crate::checks::sha256(&[]),
             captured_response: Vec::new(),
             response_capture_complete: false,
         };
@@ -157,7 +157,7 @@ impl LocalHttpTransport {
             result = exchange => result,
         };
         observation.captured_response_bytes = captured.len() as u64;
-        observation.captured_response_sha256 = hash_bytes(&captured);
+        observation.captured_response_sha256 = crate::checks::sha256(&captured);
         observation.captured_response = captured;
         match result {
             Ok(reply) => {
@@ -336,8 +336,8 @@ mod tests {
             path: "src/fixture.rs".into(),
             start_line: 1,
             end_line: 1,
-            raw_sha256: hash_bytes(text.as_bytes()),
-            rendered_sha256: hash_bytes(text.as_bytes()),
+            raw_sha256: crate::checks::sha256(text.as_bytes()),
+            rendered_sha256: crate::checks::sha256(text.as_bytes()),
             required: true,
         };
         let row_id = selector.row_id().unwrap();
@@ -493,7 +493,10 @@ mod tests {
         assert_eq!(observed.state, CallState::Acknowledged);
         assert_eq!(observed.basis, TransportBasis::LocalHttpUnqualified);
         assert_eq!(observed.captured_response, expected);
-        assert_eq!(observed.captured_response_sha256, hash_bytes(&expected));
+        assert_eq!(
+            observed.captured_response_sha256,
+            crate::checks::sha256(&expected)
+        );
         assert!(observed.response_capture_complete);
         handle.join().unwrap();
     }
@@ -627,7 +630,7 @@ mod tests {
             assert_eq!(observed.captured_response, expected_body);
             assert_eq!(
                 observed.captured_response_sha256,
-                hash_bytes(&expected_body)
+                crate::checks::sha256(&expected_body)
             );
             assert!(observed.response_capture_complete);
             assert_eq!(observed.http_status, Some(200));
@@ -810,7 +813,7 @@ mod tests {
                         unresolved: vec!["Different decision".into()],
                     };
                     reply.content_sha256 =
-                        hash_bytes(&serde_json::to_vec(&reply.decision).unwrap());
+                        crate::checks::sha256(&serde_json::to_vec(&reply.decision).unwrap());
                 }
                 2 => {
                     reply.usage.input_tokens += 1;
