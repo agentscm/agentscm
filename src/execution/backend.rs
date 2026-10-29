@@ -227,6 +227,7 @@ impl OciBackend {
                 "source snapshot does not match execution subject".into(),
             ));
         }
+        let mut capture_incomplete = false;
         let mut record = ExecutionRecord {
             version: 1,
             request: request.clone(),
@@ -344,6 +345,7 @@ impl OciBackend {
             && !cancel.is_cancelled()
         {
             record.isolation_observed = true;
+
             let attached = capture(
                 &mut self.command(&strings(&[
                     "container",
@@ -357,6 +359,7 @@ impl OciBackend {
             );
             match attached {
                 Ok(result) => {
+                    capture_incomplete = result.incomplete;
                     record.stdout = result.stdout;
                     record.stderr = result.stderr;
                     record.output_truncated = result.stop == Some(Stop::Output);
@@ -416,6 +419,9 @@ impl OciBackend {
             record.outcome = ExecutionOutcome::Indeterminate;
             record.detail =
                 format!("cleanup unconfirmed; reconcile owned container {name} before recovery");
+        }
+        if capture_incomplete {
+            record.detail.push_str("; capture incomplete");
         }
         Ok(record)
     }

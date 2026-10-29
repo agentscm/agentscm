@@ -274,9 +274,9 @@ fn run_command(
     );
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let spawn_failed = captured.is_err();
-    let (code, stdout, stderr, stop) = match captured {
-        Ok(c) => (c.code, c.stdout, c.stderr, c.stop),
-        Err(_) => (None, vec![], vec![], None),
+    let (code, stdout, stderr, stop, incomplete) = match captured {
+        Ok(c) => (c.code, c.stdout, c.stderr, c.stop, c.incomplete),
+        Err(_) => (None, vec![], vec![], None, false),
     };
     let reason = match stop {
         Some(Stop::Timeout) => StopReason::TimedOut,
@@ -301,6 +301,7 @@ fn run_command(
         stdout_sha256: sha256(&stdout),
         stderr_sha256: sha256(&stderr),
         truncated: reason == StopReason::OutputLimit,
+        incomplete,
     };
     (result, CommandOutput { stdout, stderr })
 }
