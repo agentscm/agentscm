@@ -10,9 +10,9 @@ use serde_json::json;
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
-    CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1, IngestReceiptV1,
-    MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
-    parse_conversation_cursor,
+    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1,
+    IngestReceiptV1, MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1,
+    SessionSetupV1, parse_conversation_cursor,
 };
 
 use super::catchup::{
@@ -7906,8 +7906,11 @@ impl Store for PgStore {
             if tx.query_opt("SELECT 1 FROM hub_work_participants WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",&[&batch.work_id,&token,&batch.session.session_id,&batch.generation])?.is_none() {
                 return Err(HubError::Invalid("capture session is not a current work participant".into()));
             }
-            if let Some(row)=tx.query_opt("SELECT identity FROM hub_change_sessions WHERE work=$1 AND generation=$2 AND session_id=$3 FOR UPDATE",&[&batch.work_id,&batch.generation,&batch.session.session_id])? {
+            // Retained lifecycle counters, updated from this batch alone so ingest is O(batch).
+            let (mut retained_events,mut retained_watermark,mut start_count,mut start_sequence,mut end_count,mut end_sequence)=(0_i64,0_i64,0_i64,None::<i64>,0_i64,None::<i64>);
+            if let Some(row)=tx.query_opt("SELECT identity,event_count,watermark,start_count,start_sequence,end_count,end_sequence FROM hub_change_sessions WHERE work=$1 AND generation=$2 AND session_id=$3 FOR UPDATE",&[&batch.work_id,&batch.generation,&batch.session.session_id])? {
                 if row.get::<_,String>(0)!=identity {return Err(HubError::Invalid("capture session identity changed".into()));}
+                (retained_events,retained_watermark,start_count,start_sequence,end_count,end_sequence)=(row.get(1),row.get(2),row.get(3),row.get(4),row.get(5),row.get(6));
             } else {
                 let first=batch.events[0].observed_at;
                 tx.execute("INSERT INTO hub_change_sessions (work,session_id,generation,identity,watermark,event_count,gap_count,started,ended,start_sequence,end_sequence,lifecycle_valid,first_observed_at,last_observed_at,updated_at) VALUES ($1,$2,$3,$4,0,0,0,FALSE,FALSE,NULL,NULL,FALSE,$5,$5,$6)",&[&batch.work_id,&batch.session.session_id,&batch.generation,&identity,&first,&now])?;
@@ -7924,14 +7927,14 @@ impl Store for PgStore {
                 tx.execute("INSERT INTO hub_change_events (work,generation,session_id,event_id,sequence,event,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",&[&batch.work_id,&batch.generation,&batch.session.session_id,&event.event_id,&sequence,&encoded,&event.observed_at])?;
                 if let Some(artifact)=event.artifact.as_ref().filter(|artifact|artifact.retention==RetentionClassV1::SharedApproved){declare_shared_body(&mut tx,batch,token,event,artifact,now)?;}
                 accepted+=1;new_event_bytes=new_event_bytes.checked_add(work_payload_row_bytes(encoded.len())?).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;gap_count+=usize::from(event.gap.is_some());watermark=watermark.max(event.sequence);last_observed=last_observed.max(event.observed_at);
+                retained_events+=1;retained_watermark=retained_watermark.max(sequence);
+                // A compaction restart continues the same session, not a second origin. A boundary
+                // sequence is kept only while exactly one such event is retained.
+                if event.kind==CapturedEventKindV1::SessionStarted&&event.boundary.as_deref()!=Some("compact"){start_count+=1;start_sequence=(start_count==1).then_some(sequence);}
+                if event.kind==CapturedEventKindV1::SessionEnded{end_count+=1;end_sequence=(end_count==1).then_some(sequence);}
             }
-            // Aggregate in SQL so a large retained session is not loaded and re-parsed per batch.
-            // A compaction restart continues the same session, not a second origin.
-            let life=tx.query_one("SELECT COUNT(*)::bigint,COALESCE(MAX(sequence),0)::bigint,COUNT(*) FILTER (WHERE kind='session_started' AND boundary IS DISTINCT FROM 'compact')::bigint,MIN(sequence) FILTER (WHERE kind='session_started' AND boundary IS DISTINCT FROM 'compact'),COUNT(*) FILTER (WHERE kind='session_ended')::bigint,MIN(sequence) FILTER (WHERE kind='session_ended') FROM (SELECT sequence,event::jsonb->>'kind' AS kind,event::jsonb->>'boundary' AS boundary FROM hub_change_events WHERE work=$1 AND generation=$2 AND session_id=$3) e",&[&batch.work_id,&batch.generation,&batch.session.session_id])?;
-            let retained_events:i64=life.get(0);let retained_watermark:i64=life.get(1);
-            let start_sequence:Option<i64>=if life.get::<_,i64>(2)==1{life.get(3)}else{None};let end_sequence:Option<i64>=if life.get::<_,i64>(4)==1{life.get(5)}else{None};
             let lifecycle_valid=start_sequence==Some(1)&&end_sequence==Some(retained_watermark)&&retained_watermark>1;let gaps_i64=gap_count as i64;
-            tx.execute("UPDATE hub_change_sessions SET watermark=$4,event_count=$5,gap_count=gap_count+$6,started=$7,ended=$8,start_sequence=$9,end_sequence=$10,lifecycle_valid=$11,last_observed_at=GREATEST(last_observed_at,$12),updated_at=$13 WHERE work=$1 AND generation=$2 AND session_id=$3",&[&batch.work_id,&batch.generation,&batch.session.session_id,&retained_watermark,&retained_events,&gaps_i64,&start_sequence.is_some(),&end_sequence.is_some(),&start_sequence,&end_sequence,&lifecycle_valid,&last_observed,&now])?;
+            tx.execute("UPDATE hub_change_sessions SET watermark=$4,event_count=$5,gap_count=gap_count+$6,started=$7,ended=$8,start_sequence=$9,end_sequence=$10,lifecycle_valid=$11,last_observed_at=GREATEST(last_observed_at,$12),updated_at=$13,start_count=$14,end_count=$15 WHERE work=$1 AND generation=$2 AND session_id=$3",&[&batch.work_id,&batch.generation,&batch.session.session_id,&retained_watermark,&retained_events,&gaps_i64,&start_sequence.is_some(),&end_sequence.is_some(),&start_sequence,&end_sequence,&lifecycle_valid,&last_observed,&now,&start_count,&end_count])?;
             let retained_operations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&batch.work_id])?.get(0);
             if retained_events>MAX_CHANGE_EVENTS_PER_SESSION||retained_operations>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}
             let capture_bytes=work_payload_row_bytes(request.len())?.checked_add(new_event_bytes).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;
