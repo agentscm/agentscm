@@ -1,18 +1,16 @@
 //! The Hub's automatic stand-up compaction removes exactly what the operator command removes
 //! at the automatic cutoff, with the same guards. Runs on SQLite and, when configured,
 //! PostgreSQL.
-#[path = "common/hub_pg.rs"]
-mod hub_pg;
 
 use std::sync::Arc;
 
+use crate::hub_pg::PgSchema;
 use agentscm::backend::LocalBackend;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
 use agentscm::hub::work::{
     BriefingQuery, CheckpointKind, WorkCheckpoint, WorkCompaction, WorkRole, WorkStart,
 };
 use agentscm::hub::{HubError, HubState, WORK_AUTO_COMPACTION_AGE_SECONDS, compact_work_history};
-use hub_pg::PgSchema;
 use tempfile::TempDir;
 
 const DAY: i64 = 86_400;
