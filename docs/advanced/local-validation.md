@@ -20,8 +20,8 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 - Every anonymous or authenticated reconciliation fetch runs through one per-run private bare Git directory with an empty template and empty private home. System, global, include and checkout transport configuration are excluded; credential helpers, prompts, redirects, hooks, fsmonitor, submodules, maintenance, lazy fetching and executable transports are disabled. The explicit validated origin URL is used for the base, pull ref and final default-branch configuration freshness fetch, with objects written to the checkout's resolved object directory. After a base fetch succeeds, a separate bounded credential-free command updates the checkout's `origin/<base>` ref. Pull code is never checked out or executed.
 - Anonymous fetch is the default. It passes no API token to Git and accepts credential-free HTTP(S), `file` and local-path origins; userinfo, SSH, Git and external-command transports are refused. `--github-authenticated-fetch` is an explicit private-repository opt-in and works only with the exact API URL `https://api.github.com`, a policy repository matching `github.com/OWNER/NAME`, and one direct origin exactly `https://github.com/OWNER/NAME` with an optional `.git` suffix. It reuses the selected API token as an `Authorization: Basic base64(x-access-token:TOKEN)` extra header only in each fetch child's runtime Git environment, scoped to the canonical repository URL. The token and encoded header are absent from argv, persistent Git configuration and surfaced transport diagnostics.
 - When the policy sets `exempt_paths`, `reconcile` also checks every open pull request on `--base`, opted in or not, against Git: one fetch per pull request, so cost grows with the number of open pull requests. If the change from the merge-base to the head is non-empty, touches no trust input and every changed path matches an exempt pathspec, it posts `success` with the description `not required: only exempt paths changed`, with no attestation, no opt-in and no `max_age_seconds`. This wins over any attestation verdict for that head. An empty diff, a mixed change or a head that cannot be read is never exempt, and a head shared by several open pull requests is not exempted. Other unmarked heads still get no status. If an unmarked head cannot be fetched or read, nothing is written for it and a warning is logged; it does not affect the exit code, because an unmarked head has not opted in. An opted-in head that cannot be fetched still exits 1.
-- `.github/workflows/local-validation.yml` is a thin wrapper that builds `agentscm` from the default branch and runs `reconcile`. It runs on `pull_request_target` (opened, synchronize, reopened, and edited only when the base branch changed) so that a head that changes only exempt paths gets its status promptly, on a PR comment that starts with the attestation marker from an `OWNER`, `MEMBER` or `COLLABORATOR` (created, edited or deleted; an edit that removes the marker also runs it; other commenters are ignored and the signature still decides), on pushes to `main` that touch `src/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.github/local-validation/**` or the workflow itself, and daily. There is no manual dispatch. All runs that pass the trust filter share one repository-wide job-level concurrency group (`local-validation`, queued rather than cancelled; job-level so that ignored comments never enter it and cannot cancel the queued run) and every run reconciles all open pull requests on the default branch. Runs are full sweeps because GitHub keeps only the newest queued run per concurrency group, so a per-PR run could be superseded by another PR's run and leave a stale `success`. It never checks out, builds or runs PR code.
-- Status count: every run (each trusted attestation comment event, each pull request opened, synchronize, reopened or retarget event from any author, each push touching verifier inputs, and the daily run) writes two statuses (`pending`, then the verdict) on every opted-in head. GitHub keeps at most 1000 statuses per SHA and context, so a head reaches the cap after about 500 runs. After that the `pending` write is refused, that head is not re-verified, the run exits 1 and the earlier verdict remains on the head, which may be stale. Because pull request events from any author start a sweep, an untrusted author can drive status writes toward that cap on opted-in heads; a head with an exempt success is opted in through its status. This is a limit, not handled.
+- `.github/workflows/local-validation.yml` is a thin wrapper that builds `agentscm` from the default branch and runs `reconcile`. It runs on `pull_request_target` (opened, synchronize, reopened, and edited only when the base branch changed) so that a head that changes only exempt paths gets its status promptly, on a PR comment that starts with the attestation marker from an `OWNER`, `MEMBER` or `COLLABORATOR` (created, edited or deleted; an edit that removes the marker also runs it; other commenters are ignored and the signature still decides), on pushes to `main` that touch `src/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.github/local-validation/**` or the workflow itself, and daily. There is no manual dispatch. All runs that pass the trust filter share one repository-wide job-level concurrency group (`local-validation`, queued rather than cancelled; job-level so that ignored comments never enter it and cannot cancel the queued run) and every run reconciles all open pull requests on the default branch. Runs are full sweeps because GitHub keeps only the newest queued run per concurrency group, so a per-PR run could be superseded by another PR's run and leave a stale `success`. Its first step, `Invalidate stale successes`, runs before checkout, toolchain and build and uses only `gh` to set to `pending` every open default-branch pull request head whose latest `agentscm/local-validation` status is `success`, so a setup failure cannot leave a stale `success`. It reads every page of each head's status. A head whose status read fails is treated as unknown and set to `pending` anyway. A failed or unexpected write for one head is reported with `::error::` and the SHA, the step continues with the next head and still exits 0 so that setup and `reconcile` run (reconcile retries and reports its own errors). It leaves heads with no such status (not opted in), `pending`, `failure` and `error` alone. A listing failure or an invalid head SHA fails the step before any status is written. The 5-minute step timeout can also stop it partway, leaving later heads unchanged and skipping `reconcile`. It never checks out, builds or runs PR code.
+- Status count: every run (each trusted attestation comment event, each pull request opened, synchronize, reopened or retarget event from any author, each push touching verifier inputs, and the daily run) writes two statuses (`pending`, then the verdict) on every opted-in head, plus one earlier `pending` from the invalidation step on a head whose latest verdict is `success`, so up to three. GitHub keeps at most 1000 statuses per SHA and context, so a head reaches the cap after about 333 runs (about 500 if the head never holds a `success` when a run starts). After that the `pending` write is refused, that head is not re-verified, the run exits 1 and the earlier verdict remains on the head, which may be stale. Because pull request events from any author start a sweep, an untrusted author can drive status writes toward that cap on opted-in heads; a head with an exempt success is opted in through its status. This is a limit, not handled.
 
 ## Compact comment display and compatibility
 
@@ -49,7 +49,7 @@ Recipes and policies that do not use `paths` or `exempt_paths` serialize as befo
 2. Enroll the public key in `.github/local-validation/registry.json` by a reviewed pull request. Only enrolled, unrevoked and unexpired keys verify; revoke by setting `revoked_at_ms` in a reviewed change.
 3. On a clean checkout of the PR head, run `git fetch origin main` (the merge-base is computed against the local `origin/main`), start the PostgreSQL and S3 test services, then run `agentscm local-validation run --recipe .github/local-validation/recipe.json --policy .github/local-validation/policy.json --registry .github/local-validation/registry.json --key-file KEY --issuer-id ID --state-dir DIR`. `run` has no defaults for the recipe, policy or registry; pass all three. Note the printed envelope digest. Ctrl-C (SIGINT) cancels the running command's process group and signs a failure that records the command as `cancelled`; a second Ctrl-C exits immediately.
 4. `local-validation post` the attestation to the PR (it refuses if the PR head differs from the attested commit). Do not post statuses by hand.
-5. The verifier workflow reports the status. If it cannot read or write something it exits 1 and leaves that head `pending`, or its previous status if the invalidating `pending` write itself was refused or uncertain; the next comment, push or daily run retries, or re-run the failed job. Report `pending` or `failure` as it is.
+5. The verifier workflow reports the status. Its first step sets a previous `success` on an open pull request head to `pending` before any setup. If `reconcile` cannot read or write something it exits 1 and leaves that head `pending`, or its previous status if the invalidating `pending` write itself was refused or uncertain; the next comment, push or daily run retries, or re-run the failed job. Report `pending` or `failure` as it is.
 
 `verify` is forge-neutral and also runs standalone against a local Git checkout; its `--recipe` default, `.github/local-validation/recipe.json`, is relative to the current directory. `reconcile` is anonymous by default; private GitHub repositories require the explicit authenticated-fetch flag and canonical origin described above. The standalone `evidence-verifier` tool has not been exercised on these envelopes.
 
@@ -73,7 +73,7 @@ The `main` ruleset has no required status checks today (it requires no deletion,
 
 ## Limits
 
-- Workflow setup can fail before `reconcile` starts and writes its invalidating `pending` statuses, so an earlier verdict can remain visible; this is the setup-failure limitation tracked in #156. An `always()` step that calls a missing or unverified binary does not close the gap. The next admitted event or daily run retries.
+- The first step, `Invalidate stale successes`, resets a `success` to `pending` before checkout, toolchain, build and install, so a failure in any of them cannot leave a stale `success`. Limits: if the listing fails, statuses are unchanged and an earlier `success` can remain visible until the next admitted event or daily run retries. A write refused for one head (for example at the status cap) is reported and leaves that head's `success` in place, but the other heads are still reset and `reconcile` still runs. `failure` and `error` are deliberately not reset. A failed status read sets `pending` anyway, which opts that head in for good, because `reconcile` treats any status in this context as opt-in. A force-push back to an earlier SHA, or a SHA shared with another pull request, can carry a `success`; the step resets those too. Every admitted run now holds `success` heads at `pending` for the whole setup and build time, not only during reconcile, which affects auto-merge and merge queues waiting on that status. The step is tested only against a fake `gh`, not on live GitHub.
 - The status is attached to the commit, so PRs that share a head commit (for example one branch opened against two bases) share it; that case is unsupported.
 - A base change (`pull_request_target` `edited`) runs the verifier, so the reconciled base is refreshed promptly. A PR retargeted away from `--base` keeps its last status on that head, including an exempt success, which `reconcile` no longer updates.
 - Pull requests are read in bounded pages (30 pages of open pull requests, 10 of comments per pull request); a larger listing fails closed with exit 1. Runs process pull requests serially within the 30-minute job and the token rate limit, which is practical for tens of open PRs, not hundreds.
@@ -140,7 +140,7 @@ jobs:
       github-authenticated-fetch: false
 ```
 
-The caller supplies all triggers; the reusable workflow owns the trusted-comment/base-change filter, repository-wide job concurrency and full sweep. Do not add the same concurrency group to the caller. Each admitted run checks out only the caller's default branch with full history and `persist-credentials: false`; it never checks out, builds or runs a pull request head, recipe, script or artifact. The reusable job has only `contents: read`, `pull-requests: read` and `statuses: write`, accepts no PAT, GitHub App, OIDC or `secrets: inherit` input, and installs the exact npm package outside the caller checkout with lifecycle scripts disabled. The install runs `local-validation reconcile --help`, which reaches the verified binary installer; `npx agentscm --version` would only print the npm package version and is not an installation or provenance check.
+The reusable workflow runs the same `Invalidate stale successes` step first, so a caller gets it only by pinning a reusable-workflow commit SHA that includes it. The caller supplies all triggers; the reusable workflow owns the trusted-comment/base-change filter, repository-wide job concurrency and full sweep. Do not add the same concurrency group to the caller. Each admitted run checks out only the caller's default branch with full history and `persist-credentials: false`; it never checks out, builds or runs a pull request head, recipe, script or artifact. The reusable job has only `contents: read`, `pull-requests: read` and `statuses: write`, accepts no PAT, GitHub App, OIDC or `secrets: inherit` input, and installs the exact npm package outside the caller checkout with lifecycle scripts disabled. The install runs `local-validation reconcile --help`, which reaches the verified binary installer; `npx agentscm --version` would only print the npm package version and is not an installation or provenance check.
 
 For a canonical private GitHub repository, set `github-authenticated-fetch: true`. This does not introduce another credential: the verifier reuses the same job-scoped `github.token` selected for the GitHub API and exposes it to Git only for the isolated canonical HTTPS fetch commands. The default is `false`. Live private acquisition, redirects and timeouts remain unqualified.
 
@@ -160,7 +160,7 @@ The verifier workflow path is always a trust input; a custom path is not exempt 
 
 ### Source-build fallback until publication
 
-Until the pinned package exists, use the following exact source fallback. It preserves the same triggers, trusted-comment/base-change filter, repository-wide job concurrency and full-sweep behavior. The AgentSCM source pin `24cf76705bcbbac284fbcb18646d225f911b39a2` contains `reconcile`, path-scoped recipes, exempt paths and the opt-in authenticated fetch boundary, but not the reusable prebuilt-release workflow. This fallback is not an automatic mode of the reusable workflow and must be removed deliberately after published-release qualification.
+Until the pinned package exists, use the following exact source fallback. It preserves the same triggers, trusted-comment/base-change filter, repository-wide job concurrency and full-sweep behavior. The sample's first step, `Invalidate stale successes`, is the same script as in the reusable workflow. The AgentSCM source pin `24cf76705bcbbac284fbcb18646d225f911b39a2` contains `reconcile`, path-scoped recipes, exempt paths and the opt-in authenticated fetch boundary, but not the reusable prebuilt-release workflow. This fallback is not an automatic mode of the reusable workflow and must be removed deliberately after published-release qualification.
 
 ```yaml
 name: Local validation
@@ -193,6 +193,57 @@ jobs:
       pull-requests: read
       statuses: write
     steps:
+      - name: Invalidate stale successes
+        shell: bash
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # A listing error or an invalid head SHA fails the step before any write. Pagination is bounded by the step timeout.
+          heads=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base="$DEFAULT_BRANCH" -f per_page=100 --paginate --jq '.[].head.sha' </dev/null)
+          # Validate every line before any write; a jq null prints as "null" and fails here.
+          if [[ -n "$heads" ]] && printf '%s\n' "$heads" | grep -qvE '^[0-9a-f]{40}$'; then
+            echo "unexpected head SHA in the pull request listing" >&2
+            exit 1
+          fi
+          count=0
+          failed=0
+          for sha in $(printf '%s\n' "$heads" | sort -u); do
+            # --paginate reads every page of the combined status, which has at most one entry for our context.
+            # Take the first non-empty line; no output means the head never opted in ("none"). A failed read
+            # is "unknown": invalidate anyway, because a stale success is worse than an extra pending.
+            if out=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --paginate --jq '.statuses[] | select(.context == "agentscm/local-validation") | .state' </dev/null); then
+              state=$(printf '%s\n' "$out" | grep -m1 . || true)
+              state=${state:-none}
+            else
+              echo "::warning::could not read the status of $sha; setting it to pending anyway"
+              state=unknown
+            fi
+            # Only success (or a failed read) can satisfy a required check. "none" means the head never opted
+            # in, and writing would opt it in forever. pending, failure and error already block merging.
+            if [[ "$state" != success && "$state" != unknown ]]; then
+              continue
+            fi
+            if ! reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context=agentscm/local-validation -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null); then
+              echo "::error::failed to set $sha to pending"
+              failed=$((failed + 1))
+              continue
+            fi
+            if [[ "$reply" != pending ]]; then
+              echo "::error::unexpected reply writing status for $sha: $reply"
+              failed=$((failed + 1))
+              continue
+            fi
+            echo "$sha: $state -> pending"
+            count=$((count + 1))
+          done
+          echo "set $count stale success(es) to pending; $failed failure(s)"
+          # Exit 0 even after per-head failures so setup and reconcile still run; reconcile retries and reports its own errors.
+          exit 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch || github.ref_name }}
