@@ -32,6 +32,7 @@ use crate::change_record::{
     AssuranceBasisV1, CaptureEnvelopeV1, CaptureOmissionV1, CheckResultV1, CoverageV1, DriftV1,
     RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SourceBindingV1,
 };
+use crate::checks::sha256;
 #[cfg(unix)]
 use crate::execution::Cancellation;
 #[cfg(unix)]
@@ -1907,11 +1908,6 @@ pub(crate) fn now_seconds() -> Result<i64> {
         .map_err(|_| CaptureError::Invalid("system time is before the Unix epoch".into()))?
         .as_secs();
     i64::try_from(seconds).map_err(|_| CaptureError::Limit("system time is out of range".into()))
-}
-
-pub(crate) fn sha256(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]

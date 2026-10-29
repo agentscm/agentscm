@@ -15,12 +15,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::change_capture::{CaptureError, Result, sha256};
+use crate::change_capture::{CaptureError, Result};
 use crate::change_record::{
     ActionFinishV1, ActionKindV1, ActionStartV1, ArtifactMediaV1, ArtifactRefV1, CaptureBatchV1,
     CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1, ContentAvailabilityV1, CoverageV1,
     RetentionClassV1, SourceBindingV1, ToolKindV1,
 };
+use crate::checks::sha256;
 
 const MAX_PENDING_PAGE: usize = 100;
 const MAX_DELIVERY_PAGE: usize = 10;

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use super::{Journal, OpenMode};
 use crate::authority::Authority;
 use crate::authority::workflows::CurrentEvidence;
+use crate::checks::sha256;
 use crate::context::ReviewContext;
 use crate::model::TargetState;
 use crate::model::{Approval, IntegrateRequest, IntegrationEvent};
@@ -3035,10 +3036,6 @@ fn validate_raw_digest(value: &str) -> Result<()> {
         return Err(Error::Invalid("invalid lowercase SHA-256 digest".into()));
     }
     Ok(())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn decode_hex<const N: usize>(value: &str) -> Result<[u8; N]> {

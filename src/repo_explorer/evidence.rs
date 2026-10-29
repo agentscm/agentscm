@@ -6,14 +6,15 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::change_capture::CaptureError;
 use crate::change_capture::spool::{ReadOnlyEnvelopeState, ReadOnlySpool, ReadOnlySpoolProjection};
-use crate::change_capture::{CaptureError, sha256};
 use crate::change_record::{
     ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ArtifactMediaV1,
     AssuranceBasisV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1, CheckResultV1,
     ContentAvailabilityV1, CoverageV1, DriftV1, GapFactV1, RecipeProvenanceV1, SourceBindingV1,
     ToolFactV1,
 };
+use crate::checks::sha256;
 use crate::{Error, Result};
 
 const MAX_PAGE_LIMIT: usize = 100;

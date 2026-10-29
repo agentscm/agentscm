@@ -20,7 +20,7 @@ use crate::change_capture::spool::{
 };
 use crate::change_capture::{
     AppendOutcome, CaptureError, DeferredHookV1, DeferredReasonV1, GitSourceRequest, OpenedGitRoot,
-    Result, capture_git_source, capture_git_source_opened, now_seconds, sha256,
+    Result, capture_git_source, capture_git_source_opened, now_seconds,
 };
 use crate::change_record::{
     ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ArtifactMediaV1,
@@ -29,6 +29,7 @@ use crate::change_record::{
     RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SetupComponentV1,
     SetupObservationV1, SubagentFactV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
 };
+use crate::checks::sha256;
 use crate::hub::github::parse_rfc3339;
 use crate::hub::insights::{
     AttemptOutcome, AttemptPhase, UsageBasis, UsageMeasurementScope, UsageRecord,
