@@ -1679,13 +1679,14 @@ fn work_scope_overlaps(
     if scope.is_empty() {
         return Ok(Vec::new());
     }
+    // The scope column mirrors the snapshot's scope, so only overlapping snapshots are decoded.
     let mut statement = tx.prepare(
-        "SELECT snapshot FROM hub_work_items
+        "SELECT id, scope FROM hub_work_items
          WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
            AND state <> 'finished' AND (?5 IS NULL OR id <> ?5)
          ORDER BY id LIMIT 101",
     )?;
-    let snapshots = statement
+    let scopes = statement
         .query_map(
             params![
                 who.owner.identity.provider,
@@ -1694,18 +1695,23 @@ fn work_scope_overlaps(
                 who.repository_id,
                 exclude
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if snapshots.len() > 100 {
+    if scopes.len() > 100 {
         return Err(HubError::WorkOverlapIncomplete);
     }
     let mut found = Vec::new();
-    for snapshot in snapshots {
-        let mut item: WorkItem = json_value(&snapshot)?;
-        project_claim(tx, &mut item, now)?;
-        let reasons = scope_overlap_reasons(scope, &item.scope);
+    for (id, their_scope) in scopes {
+        let reasons = scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?);
         if !reasons.is_empty() {
+            let snapshot: String = tx.query_row(
+                "SELECT snapshot FROM hub_work_items WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )?;
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
             let their_scope = item.scope.clone();
             found.push(WorkScopeOverlap {
                 item,
