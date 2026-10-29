@@ -937,6 +937,22 @@ impl Engine {
         ReadObjects::read_entry_impl(self, revision, path)
     }
 
+    /// Like `read_entry`, but refuses a blob over `allowance` before allocating it.
+    /// `None` is a size refusal.
+    pub fn read_entry_bounded(
+        &self,
+        revision: &str,
+        path: &str,
+        allowance: usize,
+    ) -> Result<Option<(EntryKind, Vec<u8>)>> {
+        let entry = self
+            .stat_file(revision, path)?
+            .ok_or_else(|| Error::NotFound(format!("path: {path}")))?;
+        Ok(self
+            .blob_by_digest_bounded(&entry.blob, allowance)?
+            .map(|bytes| (entry.kind, bytes)))
+    }
+
     /// Resolve membership before reading a regular blob within a payload allowance.
     /// `None` is a size refusal, never a successful or qualified source observation.
     pub(crate) fn read_regular_file_bounded(

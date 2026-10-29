@@ -474,6 +474,8 @@ impl ExecutionService {
                 request_json BLOB NOT NULL, actor_json BLOB NOT NULL, run_json BLOB NOT NULL,
                 state TEXT NOT NULL, UNIQUE(actor_id,request_id)
             ) STRICT;
+            CREATE INDEX IF NOT EXISTS workspace_runs_state_sequence
+                ON workspace_runs(state, sequence);
             CREATE TABLE IF NOT EXISTS workspace_run_events(
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL, event TEXT NOT NULL, run_json BLOB NOT NULL
@@ -838,7 +840,11 @@ impl ExecutionService {
             loop {
                 let service = self.clone();
                 match tokio::task::spawn_blocking(move || service.process_next()).await {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(true)) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Ok(Ok(false)) => {}
                     Ok(Err(error)) => {
                         eprintln!("workspace execution worker stopped: {error}");
                         break;
@@ -848,7 +854,7 @@ impl ExecutionService {
                         break;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         })
     }
