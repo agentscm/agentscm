@@ -64,7 +64,7 @@ async fn reserve(
     Ok((service, permit))
 }
 
-async fn body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
+async fn body(request: Request, limit: usize) -> Result<Bytes, ApiError> {
     if request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -80,7 +80,6 @@ async fn body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
     tokio::time::timeout(BODY_TIMEOUT, to_bytes(request.into_body(), limit))
         .await
         .map_err(|_| ApiError::new(StatusCode::REQUEST_TIMEOUT, "source_body_timeout"))?
-        .map(|value| value.to_vec())
         .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "source_body_invalid"))
 }
 

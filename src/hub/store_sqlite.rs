@@ -8,9 +8,9 @@ use serde_json::json;
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
-    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1,
-    IngestReceiptV1, MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1,
-    SessionSetupV1, parse_conversation_cursor,
+    CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1, IngestReceiptV1,
+    MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
+    parse_conversation_cursor,
 };
 
 use super::catchup::{
@@ -4190,12 +4190,16 @@ fn guard_managed_touch(
         return Ok(());
     }
     let work = work_who(tx, &who.token, now)?;
-    let rows = {
+    // The state and generation columns are rewritten with every snapshot, so SQL can filter them.
+    // Two rows are enough: more than one eligible assignment is already ambiguous.
+    let snapshots = {
         let mut statement = tx.prepare(
-            "SELECT w.snapshot, p.generation FROM hub_work_items w
+            "SELECT w.snapshot FROM hub_work_items w
              JOIN hub_work_participants p ON p.work=w.id
              WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
-               AND w.repository_id IS ?4 AND p.token=?5 AND p.session=?6",
+               AND w.repository_id IS ?4 AND w.state IN ('active','blocked')
+               AND p.token=?5 AND p.session=?6 AND p.generation=w.generation
+             ORDER BY w.id LIMIT 2",
         )?;
         statement
             .query_map(
@@ -4207,22 +4211,34 @@ fn guard_managed_touch(
                     work.token,
                     name
                 ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| row.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let mut eligible = Vec::new();
-    for (snapshot, generation) in rows {
-        let item: WorkItem = json_value(&snapshot)?;
-        if matches!(item.state, WorkState::Active | WorkState::Blocked)
-            && item.generation == generation
-        {
-            eligible.push(item);
+    if snapshots.is_empty() {
+        let joined = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_work_items w
+             JOIN hub_work_participants p ON p.work=w.id
+             WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
+               AND w.repository_id IS ?4 AND p.token=?5 AND p.session=?6)",
+            params![
+                work.owner.identity.provider,
+                work.owner.identity.host,
+                work.repository,
+                work.repository_id,
+                work.token,
+                name
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !joined {
+            return Ok(());
         }
     }
+    let eligible = snapshots
+        .iter()
+        .map(|snapshot| json_value::<WorkItem>(snapshot))
+        .collect::<Result<Vec<_>>>()?;
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
@@ -8056,38 +8072,39 @@ impl Store for SqliteStore {
             watermark = watermark.max(event.sequence);
             last_observed = last_observed.max(event.observed_at);
         }
-        let retained_lifecycle = {
-            let mut statement = tx.prepare(
-                "SELECT sequence,event FROM hub_change_events
-                 WHERE work=?1 AND generation=?2 AND session_id=?3 ORDER BY sequence",
-            )?;
-            statement
-                .query_map(
-                    params![batch.work_id, batch.generation, batch.session.session_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let mut start_sequences = Vec::new();
-        let mut end_sequences = Vec::new();
-        for (sequence, encoded) in &retained_lifecycle {
-            let event: CapturedEventV1 = json_value(encoded)?;
-            match event.kind {
-                // A compaction restart continues the same session, not a second origin.
-                CapturedEventKindV1::SessionStarted
-                    if event.boundary.as_deref() != Some("compact") =>
-                {
-                    start_sequences.push(*sequence)
-                }
-                CapturedEventKindV1::SessionEnded => end_sequences.push(*sequence),
-                _ => {}
-            }
-        }
-        let retained_watermark = retained_lifecycle
-            .last()
-            .map_or(0, |(sequence, _)| *sequence);
-        let start_sequence = (start_sequences.len() == 1).then(|| start_sequences[0]);
-        let end_sequence = (end_sequences.len() == 1).then(|| end_sequences[0]);
+        // Aggregate in SQL so a large retained session is not loaded and re-parsed per batch.
+        // A compaction restart continues the same session, not a second origin.
+        let (retained_events, retained_watermark, start_count, start_min, end_count, end_min): (
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            i64,
+            Option<i64>,
+        ) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(sequence),0),
+                    COUNT(CASE WHEN kind='session_started' AND boundary IS NOT 'compact' THEN 1 END),
+                    MIN(CASE WHEN kind='session_started' AND boundary IS NOT 'compact' THEN sequence END),
+                    COUNT(CASE WHEN kind='session_ended' THEN 1 END),
+                    MIN(CASE WHEN kind='session_ended' THEN sequence END)
+             FROM (SELECT sequence, json_extract(event,'$.kind') AS kind,
+                          json_extract(event,'$.boundary') AS boundary
+                   FROM hub_change_events
+                   WHERE work=?1 AND generation=?2 AND session_id=?3)",
+            params![batch.work_id, batch.generation, batch.session.session_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let start_sequence = if start_count == 1 { start_min } else { None };
+        let end_sequence = if end_count == 1 { end_min } else { None };
         let lifecycle_valid = start_sequence == Some(1)
             && end_sequence == Some(retained_watermark)
             && retained_watermark > 1;
@@ -8103,7 +8120,7 @@ impl Store for SqliteStore {
                 batch.generation,
                 batch.session.session_id,
                 retained_watermark,
-                retained_lifecycle.len() as i64,
+                retained_events,
                 gap_count as i64,
                 start_sequence.is_some(),
                 end_sequence.is_some(),
@@ -8114,7 +8131,6 @@ impl Store for SqliteStore {
                 now
             ],
         )?;
-        let retained_events = retained_lifecycle.len() as i64;
         let retained_operations: i64 = tx.query_row(
             "SELECT COUNT(*) FROM hub_change_operations WHERE work=?1",
             [batch.work_id.as_str()],

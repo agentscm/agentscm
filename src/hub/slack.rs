@@ -1156,9 +1156,10 @@ impl Slack {
                     Err(_) => eprintln!("Slack event collection unavailable"),
                 }
                 // Several sends per pass, so a burst is not paced at one message per sleep.
+                let mut sent = false;
                 for _ in 0..SENDS_PER_PASS {
                     match self.deliver(&state).await {
-                        Ok(true) => {}
+                        Ok(true) => sent = true,
                         Ok(false) | Err(HubError::Unauthorized | HubError::Busy) => break,
                         Err(_) => {
                             eprintln!("Slack delivery journal unavailable");
@@ -1166,7 +1167,9 @@ impl Slack {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Back off when the pass delivered nothing.
+                let idle = if sent { 500 } else { 2000 };
+                tokio::time::sleep(Duration::from_millis(idle)).await;
             }
         })
     }

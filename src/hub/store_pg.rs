@@ -10,9 +10,9 @@ use serde_json::json;
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
-    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1,
-    IngestReceiptV1, MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1,
-    SessionSetupV1, parse_conversation_cursor,
+    CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1, IngestReceiptV1,
+    MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
+    parse_conversation_cursor,
 };
 
 use super::catchup::{
@@ -4079,11 +4079,15 @@ fn guard_managed_touch(
     if keys.is_empty() {
         return Ok(());
     }
+    // The state and generation columns are rewritten with every snapshot, so SQL can filter them.
+    // Two rows are enough: more than one eligible assignment is already ambiguous.
     let rows = tx.query(
-        "SELECT w.snapshot,p.generation FROM hub_work_items w
+        "SELECT w.snapshot FROM hub_work_items w
          JOIN hub_work_participants p ON p.work=w.id
          WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
-           AND w.repository_id IS NOT DISTINCT FROM $4 AND p.token=$5 AND p.session=$6",
+           AND w.repository_id IS NOT DISTINCT FROM $4 AND w.state IN ('active','blocked')
+           AND p.token=$5 AND p.session=$6 AND p.generation=w.generation
+         ORDER BY w.id LIMIT 2",
         &[
             &who.owner.identity.provider,
             &who.owner.identity.host,
@@ -4094,16 +4098,27 @@ fn guard_managed_touch(
         ],
     )?;
     if rows.is_empty() {
-        return Ok(());
+        let joined = tx.query_one(
+            "SELECT EXISTS(SELECT 1 FROM hub_work_items w
+             JOIN hub_work_participants p ON p.work=w.id
+             WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
+               AND w.repository_id IS NOT DISTINCT FROM $4 AND p.token=$5 AND p.session=$6)",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &who.token,
+                &name,
+            ],
+        )?;
+        if !joined.get::<_, bool>(0) {
+            return Ok(());
+        }
     }
     let mut eligible = Vec::new();
     for row in rows {
-        let item: WorkItem = json_value(&row.get::<_, String>(0))?;
-        if matches!(item.state, WorkState::Active | WorkState::Blocked)
-            && item.generation == row.get::<_, i64>(1)
-        {
-            eligible.push(item);
-        }
+        eligible.push(json_value::<WorkItem>(&row.get::<_, String>(0))?);
     }
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
@@ -7910,11 +7925,12 @@ impl Store for PgStore {
                 if let Some(artifact)=event.artifact.as_ref().filter(|artifact|artifact.retention==RetentionClassV1::SharedApproved){declare_shared_body(&mut tx,batch,token,event,artifact,now)?;}
                 accepted+=1;new_event_bytes=new_event_bytes.checked_add(work_payload_row_bytes(encoded.len())?).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;gap_count+=usize::from(event.gap.is_some());watermark=watermark.max(event.sequence);last_observed=last_observed.max(event.observed_at);
             }
-            let rows=tx.query("SELECT sequence,event FROM hub_change_events WHERE work=$1 AND generation=$2 AND session_id=$3 ORDER BY sequence",&[&batch.work_id,&batch.generation,&batch.session.session_id])?;
-            let mut start_sequences=Vec::new();let mut end_sequences=Vec::new();
-            for row in &rows {let sequence:i64=row.get(0);let encoded:String=row.get(1);let retained:CapturedEventV1=json_value(&encoded)?;match retained.kind{CapturedEventKindV1::SessionStarted if retained.boundary.as_deref()!=Some("compact")=>start_sequences.push(sequence),CapturedEventKindV1::SessionEnded=>end_sequences.push(sequence),_=>{}}}
-            let retained_watermark=rows.last().map_or(0,|row|row.get::<_,i64>(0));let retained_events=rows.len() as i64;
-            let start_sequence=(start_sequences.len()==1).then(||start_sequences[0]);let end_sequence=(end_sequences.len()==1).then(||end_sequences[0]);let lifecycle_valid=start_sequence==Some(1)&&end_sequence==Some(retained_watermark)&&retained_watermark>1;let gaps_i64=gap_count as i64;
+            // Aggregate in SQL so a large retained session is not loaded and re-parsed per batch.
+            // A compaction restart continues the same session, not a second origin.
+            let life=tx.query_one("SELECT COUNT(*)::bigint,COALESCE(MAX(sequence),0)::bigint,COUNT(*) FILTER (WHERE kind='session_started' AND boundary IS DISTINCT FROM 'compact')::bigint,MIN(sequence) FILTER (WHERE kind='session_started' AND boundary IS DISTINCT FROM 'compact'),COUNT(*) FILTER (WHERE kind='session_ended')::bigint,MIN(sequence) FILTER (WHERE kind='session_ended') FROM (SELECT sequence,event::jsonb->>'kind' AS kind,event::jsonb->>'boundary' AS boundary FROM hub_change_events WHERE work=$1 AND generation=$2 AND session_id=$3) e",&[&batch.work_id,&batch.generation,&batch.session.session_id])?;
+            let retained_events:i64=life.get(0);let retained_watermark:i64=life.get(1);
+            let start_sequence:Option<i64>=if life.get::<_,i64>(2)==1{life.get(3)}else{None};let end_sequence:Option<i64>=if life.get::<_,i64>(4)==1{life.get(5)}else{None};
+            let lifecycle_valid=start_sequence==Some(1)&&end_sequence==Some(retained_watermark)&&retained_watermark>1;let gaps_i64=gap_count as i64;
             tx.execute("UPDATE hub_change_sessions SET watermark=$4,event_count=$5,gap_count=gap_count+$6,started=$7,ended=$8,start_sequence=$9,end_sequence=$10,lifecycle_valid=$11,last_observed_at=GREATEST(last_observed_at,$12),updated_at=$13 WHERE work=$1 AND generation=$2 AND session_id=$3",&[&batch.work_id,&batch.generation,&batch.session.session_id,&retained_watermark,&retained_events,&gaps_i64,&start_sequence.is_some(),&end_sequence.is_some(),&start_sequence,&end_sequence,&lifecycle_valid,&last_observed,&now])?;
             let retained_operations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&batch.work_id])?.get(0);
             if retained_events>MAX_CHANGE_EVENTS_PER_SESSION||retained_operations>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}
