@@ -21,13 +21,15 @@ use tokio::time::{Instant, timeout_at};
 
 use super::advice::unknown;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
+use super::coordination::CoordinationInbox;
 use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
-    SessionCall, announce_for, check_name, count_fail_open, done_for, others_for, record_hook_ms,
+    SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for, others_for,
+    record_hook_ms,
 };
-use super::store::{Principal, agent_token_digest, unix_now};
+use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{
     Briefing, CheckpointKind, WorkCheckpoint, WorkOverview, WorkOverviewQuery, WorkState,
 };
@@ -215,15 +217,16 @@ async fn hook(
             format!("{:x}", hasher.finish())
         },
     );
+    let mut delivered = None;
     let mut outcome = match timeout_at(
         deadline,
         call.run(
             &state,
             token.clone(),
             repo.clone(),
-            super::onboarding::client(&parts.headers),
+            &parts.headers,
             onboarding_epoch,
-            super::insights::completion_enabled(&parts.headers),
+            &mut delivered,
         ),
     )
     .await
@@ -236,6 +239,10 @@ async fn hook(
         && let Some(token) = token
     {
         let delivery = async {
+            // The touch already read the inbox; only a call that did not touch reads it here.
+            if let Some((principal, session, page)) = delivered {
+                return Ok((principal, session, page.map_err(reason)?));
+            }
             let principal = authenticate(&state, Some(token), repo).await?;
             let store = state.store.clone();
             let requested = call.session.clone();
@@ -347,6 +354,24 @@ fn reason(error: HubError) -> &'static str {
     }
 }
 
+/// The inbox a touch read for this hook: who called, the touched session and its first page.
+type Delivered = (Principal, String, Result<CoordinationInbox, HubError>);
+
+/// Reads the touched session's coordination inbox inside the touch's own store hop.
+fn read_inbox(
+    token: String,
+) -> impl FnOnce(&dyn Store, &Touched) -> (String, Result<CoordinationInbox, HubError>) + Send + 'static
+{
+    move |store, touched| {
+        let query = CoordinationInboxQuery {
+            session: Some(touched.session.clone()),
+            ..Default::default()
+        };
+        let page = store.coordination_inbox(&token, &query, unix_now());
+        (touched.session.clone(), page)
+    }
+}
+
 async fn authenticate(
     state: &HubState,
     token: Option<String>,
@@ -453,10 +478,12 @@ impl Call {
         state: &HubState,
         token: Option<String>,
         repo: Option<String>,
-        client: Option<&str>,
+        headers: &HeaderMap,
         onboarding_epoch: u64,
-        completion_reporting: bool,
+        delivered: &mut Option<Delivered>,
     ) -> Result<Outcome, &'static str> {
+        let client = super::onboarding::client(headers);
+        let completion_reporting = super::insights::completion_enabled(headers);
         let call = |paths: Vec<String>| SessionCall {
             session: self.session.clone(),
             via: self.via.clone(),
@@ -490,8 +517,18 @@ impl Call {
                         status: "stop",
                     });
                 }
-                let advice = match announce_for(state, &principal, call(self.paths.clone())).await {
-                    Ok(advice) => advice,
+                let touched = announce_reading(
+                    state,
+                    &principal,
+                    call(self.paths.clone()),
+                    read_inbox(principal.token_id.clone()),
+                )
+                .await;
+                let advice = match touched {
+                    Ok((advice, (session, page))) => {
+                        *delivered = Some((principal.clone(), session, page));
+                        advice
+                    }
                     Err(HubError::Invalid(_)) => {
                         let text = "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned();
                         return Ok(Outcome {
@@ -552,9 +589,12 @@ impl Call {
                     Ok((briefing, overview, catchup))
                 })
                 .await;
-                let advice = announce_for(state, &principal, call(Vec::new()))
-                    .await
-                    .map_err(reason)?;
+                let inbox = read_inbox(principal.token_id.clone());
+                let (advice, (session, page)) =
+                    announce_reading(state, &principal, call(Vec::new()), inbox)
+                        .await
+                        .map_err(reason)?;
+                *delivered = Some((principal.clone(), session, page));
                 let own = advice.touched.intent.as_ref().map(|i| i.id.as_str());
                 // The touch is committed; a failed listing must not report the whole call as unknown.
                 let listing = others_for(state, &principal, own)

@@ -25,7 +25,7 @@ use tokio::sync::Semaphore;
 
 use super::advice::sanitize;
 use super::handoff::Answered;
-use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, overlaps};
+use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
 use super::{HubError, HubState, Result};
@@ -754,9 +754,12 @@ impl Slack {
         };
         let mut found = Vec::new();
         for name in names {
-            let intents = state
-                .store
-                .live_intents(name, unix_now(), MAX_LIVE_INTENTS)?;
+            let (intents, truncated) = live_intents_capped(&*state.store, name, unix_now())?;
+            if truncated {
+                eprintln!(
+                    "hub: {name} has more than {MAX_LIVE_INTENTS} live intents; Slack messages see only the first"
+                );
+            }
             if bound.is_some() || intents.iter().any(|i| i.token == token) {
                 found.push((name.to_owned(), intents));
             }

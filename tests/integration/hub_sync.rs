@@ -1769,6 +1769,20 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
     );
     assert_eq!(env.observed("pull_request").len(), 1);
     assert_eq!(env.event_count(), events + 1);
+    // The failed credential is not retried every round.
+    let next = env
+        .store
+        .connection(&connection)
+        .unwrap()
+        .unwrap()
+        .next_poll_at;
+    assert!(
+        (unix_now() + 595..=unix_now() + 605).contains(&next),
+        "{next}"
+    );
+    let requests = env.fake.with(|s| s.requests.len());
+    assert!(env.poll().await.is_empty(), "skipped while backing off");
+    assert_eq!(env.fake.with(|s| s.requests.len()), requests);
     // A 403 with no rate-limit headers is the same; the same detail adds no event.
     env.fake.with(|s| {
         s.fail.push_back(Failure {
@@ -1777,10 +1791,10 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
             headers: vec![],
         });
     });
-    env.poll().await;
+    env.refresh(&connection).await;
     assert_eq!(env.event_count(), events + 1);
-    // A working call puts it back.
-    assert_eq!(env.poll().await.len(), 1);
+    // A working call (an administrator's refresh does not wait) puts it back.
+    assert_eq!(env.refresh(&connection).await.len(), 1);
     assert_eq!(status().await, ("enabled".to_owned(), Value::Null));
     assert_eq!(env.events("connection_status").len(), 2);
 

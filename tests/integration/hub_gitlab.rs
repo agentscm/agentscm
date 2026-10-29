@@ -992,11 +992,15 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
     );
     assert_eq!(env.observed("pull_request").len(), 1);
     assert_eq!(env.event_count(), events + 1);
+    // The failed credential waits out a backoff; a refresh does not wait.
+    let requests = env.requests();
+    assert!(env.poll().await.is_empty(), "skipped while backing off");
+    assert_eq!(env.requests(), requests);
     // The same failure again adds no event; a working call puts it back.
     fail_once(&env, "/merge_requests?", 401, &[]);
-    env.poll().await;
+    env.refresh().await;
     assert_eq!(env.event_count(), events + 1);
-    assert_eq!(env.poll().await.len(), 1);
+    assert_eq!(env.refresh().await.len(), 1);
     assert_eq!(
         env.connection_status().await,
         ("enabled".to_owned(), Value::Null)

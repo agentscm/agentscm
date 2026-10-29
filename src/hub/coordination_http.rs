@@ -18,7 +18,7 @@ use super::store::unix_now;
 use super::{HubError, HubState, Result};
 
 pub(super) static CHANGED: Notify = Notify::const_new();
-static WAITERS: Semaphore = Semaphore::const_new(256);
+static WAITERS: Semaphore = Semaphore::const_new(32);
 
 pub fn routes() -> Router<HubState> {
     Router::new()
