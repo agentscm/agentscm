@@ -18,7 +18,6 @@ use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRe
 use super::store::{self, Principal, agent_token_digest, unix_now, web_read_token_digest};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
 use super::{HubError, HubState, Result, open_objects, router};
-use crate::team::http::shutdown_signal;
 
 pub struct HubConfig {
     pub database_url: String,
@@ -191,7 +190,12 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .slack
         .as_ref()
         .map(|slack| slack.clone().spawn_worker(state.clone()));
-    crate::http_listener::serve(listener, router(state), shutdown_signal()).await;
+    crate::http_listener::serve(
+        listener,
+        router(state),
+        crate::http_listener::shutdown_signal(),
+    )
+    .await;
     if let Some(worker) = slack_worker {
         worker.abort();
     }
@@ -424,15 +428,7 @@ impl FromRequestParts<HubState> for Reader {
 
 /// The secret from exactly one `Authorization: Bearer` header.
 pub(super) fn bearer(parts: &Parts) -> std::result::Result<&str, ApiError> {
-    let mut values = parts.headers.get_all(header::AUTHORIZATION).iter();
-    match (values.next(), values.next()) {
-        (Some(value), None) => value.to_str().ok(),
-        _ => None,
-    }
-    .and_then(|value| value.split_once(' '))
-    .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-    .map(|(_, token)| token)
-    .ok_or_else(ApiError::unauthorized)
+    crate::http_listener::bearer(&parts.headers).ok_or_else(ApiError::unauthorized)
 }
 
 async fn health(State(state): State<HubState>) -> Response {
