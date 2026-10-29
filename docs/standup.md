@@ -242,7 +242,7 @@ A coordination acknowledgement is a client assertion of receipt, not agreement o
 
 Stand-up storage has a 128 MiB retained-payload budget per provider, host, repository and stable repository ID. It counts serialized work snapshots, checkpoint requests, cached briefing pages and work-event records, with a fixed allowance for each row. Other table data, database pages, indexes and write-ahead logs require additional disk space. New writes that exceed the budget fail and roll back; reads, acknowledgements and retained exact checkpoint retries remain available.
 
-A local operator with direct database access can inspect and compact old history. This command uses the explicitly supplied database, rather than a Hub bearer token, and is not exposed through HTTP or MCP:
+The Hub compacts history older than seven days on its own, a minute after startup and then hourly, with the same guards as the operator command (see [hub.md](hub.md)). A local operator with direct database access can inspect and compact more recent history. This command uses the explicitly supplied database, rather than a Hub bearer token, and is not exposed through HTTP or MCP:
 
 ```sh
 agentscm work compact --database sqlite:///absolute/path/hub.sqlite \

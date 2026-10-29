@@ -528,12 +528,23 @@ fn scripted_s3(
                 head.push(byte[0]);
             }
             let head = String::from_utf8(head).unwrap();
+            // Read any request body so closing the socket cannot reset the reply.
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_owned)
+                })
+                .map_or(0, |value| value.trim().parse().unwrap());
+            stream.read_exact(&mut vec![0_u8; length]).unwrap();
             seen.push(head.lines().next().unwrap().to_owned());
             let reply = format!(
                 "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream.write_all(reply.as_bytes()).unwrap();
+            // The client may hang up early once it has seen enough.
+            let _ = stream.write_all(reply.as_bytes());
         }
         seen
     });
@@ -569,4 +580,84 @@ fn delete_treats_204_and_no_such_key_as_removed_and_reports_other_failures() {
         key.id()
     );
     assert!(seen.iter().all(|line| *line == path), "{seen:?}");
+}
+
+fn scripted_backend(endpoint: String) -> S3Backend {
+    S3Backend::open(S3Config {
+        endpoint,
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        prefix: "pfx".into(),
+        access_key_id: ["synthetic", "access"].join("-"),
+        secret_access_key: ["synthetic", "secret"].join("-"),
+    })
+    .unwrap()
+}
+
+#[test]
+fn ranges_and_inspection_stream_the_object_and_still_check_its_digest() {
+    const BODY: &str = "0123456789";
+    let key = key("team", "repository", BODY.as_bytes());
+    let (endpoint, server) = scripted_s3(&[
+        (200, BODY),
+        (200, BODY),
+        (200, "x123456789"),
+        (200, "x123456789"),
+        (200, BODY),
+    ]);
+    let backend = scripted_backend(endpoint);
+    assert_eq!(
+        backend.get_range_verified(&key, "v1", 3, 4).unwrap(),
+        b"3456"
+    );
+    assert_eq!(backend.inspect_verified(&key, "v1").unwrap().size, 10);
+    assert!(matches!(
+        backend.get_range_verified(&key, "v1", 3, 4),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        backend.inspect_verified(&key, "v1"),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        backend.get_range_verified(&key, "v1", 9, 2),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(server.join().unwrap().len(), 5);
+}
+
+#[test]
+fn a_put_conflict_compares_the_stored_object_without_keeping_it() {
+    const BODY: &str = "0123456789";
+    let key = key("team", "repository", BODY.as_bytes());
+    let (endpoint, server) = scripted_s3(&[
+        (412, ""),
+        (200, BODY),
+        (409, ""),
+        (200, "0123"),
+        (412, ""),
+        (200, "9876543210"),
+    ]);
+    let backend = scripted_backend(endpoint);
+    let put = || backend.put_if_absent(&key, "v1", BODY.as_bytes());
+    assert_eq!(put().unwrap(), PutOutcome::AlreadyPresent);
+    assert!(matches!(put(), Err(Error::Conflict(_))));
+    assert!(matches!(put(), Err(Error::Conflict(_))));
+    assert_eq!(server.join().unwrap().len(), 6);
+}
+
+#[test]
+fn raw_streams_read_the_body_incrementally() {
+    const BODY: &str = "0123456789";
+    let key = key("team", "repository", BODY.as_bytes());
+    let (endpoint, server) = scripted_s3(&[(200, BODY)]);
+    let backend = scripted_backend(endpoint);
+    let mut stream = backend.open_encoded(&key, "v1").unwrap();
+    let mut small = [0_u8; 3];
+    assert_eq!(stream.read(&mut small).unwrap(), 3);
+    assert_eq!(&small, b"012");
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"3456789");
+    server.join().unwrap();
 }

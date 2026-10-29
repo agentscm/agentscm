@@ -9,6 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,10 @@ const MAX_PENDING_PAGE: usize = 100;
 const MAX_DELIVERY_PAGE: usize = 10;
 const MAX_SEQUENCE_EVENTS: usize = 16_384;
 const MAX_SEQUENCE_BYTES: u64 = 2 * 1024 * 1024;
+/// Derived causal-order index of the outbox, one JSON record per line.
+const DELIVERY_INDEX: &str = "delivery-index-v1.jsonl";
+/// One session sequence-log record: 64 hex digest, space, 20 decimal digits, newline.
+const SEQUENCE_LOG_RECORD: usize = 86;
 const MAX_PHYSICAL_RECORDS: usize = 65_536;
 const ACTION_FINISH_RESERVE_BYTES: u64 = 16 * 1024;
 pub const MIN_ACTION_CAPTURE_RECORDS: usize = 48;
@@ -97,6 +102,12 @@ thread_local! {
     };
     static FAIL_OCCURRENCE_UNLINK_AFTER_RECEIPT: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
+    };
+    static COMPACTION_VERIFICATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static OUTBOX_ENVELOPE_READS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
     };
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     static FAIL_EXPORT_ACL_CLEAR: std::cell::Cell<bool> = const {
@@ -591,6 +602,33 @@ pub struct LocalSpool {
     root: PathBuf,
     limits: SpoolLimits,
     identity: SpoolIdentityV1,
+    compaction_cache: Arc<CompactionCache>,
+}
+
+type CompactionCache = Mutex<Option<(FileStamp, Arc<CompactionStateV1>)>>;
+
+/// Installed-file identity of a parsed and verified compaction index. `atomic_replace` installs a
+/// new inode, and any in-place write changes the kernel-maintained ctime, so an equal stamp means
+/// the verified bytes are still the installed bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -641,6 +679,11 @@ struct SequenceState {
     start_observed: bool,
     #[serde(default)]
     provider_history: Option<ProviderHistoryCursorV1>,
+    /// Set before the session's first append-only sequence record. `next` and `events` then hold
+    /// only the frozen whole-map allocations of earlier releases, and binaries that know only
+    /// that format refuse the state instead of reallocating logged sequences.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    event_log: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1261,17 +1304,26 @@ impl LocalSpool {
             root: root.to_owned(),
             limits,
             identity: format,
+            compaction_cache: Arc::default(),
         };
         {
             let _lock = spool.lock()?;
             recover_spool_temps(&spool.root, spool.limits)?;
-            recover_compacted_remainders(&spool.root, spool.limits)?;
+            recover_compacted_remainders(&spool)?;
         }
         Ok(spool)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn compaction_state(&self) -> Result<Arc<CompactionStateV1>> {
+        load_compaction_state_cached(
+            &self.root,
+            self.limits.max_total_bytes,
+            Some(&self.compaction_cache),
+        )
     }
 
     pub fn identity(&self) -> SpoolIdentityV1 {
@@ -1512,7 +1564,7 @@ impl LocalSpool {
         }
         let marker_id = sha256(format!("{observed_session_id}\0{tool_use_id}").as_bytes());
         let _lock = self.lock()?;
-        let state = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+        let state = self.compaction_state()?;
         let receipt = state.native_occurrences.get(&marker_id).cloned();
         if receipt.as_ref().is_some_and(|receipt| {
             !validate_occurrence_receipt(receipt)
@@ -1727,7 +1779,7 @@ impl LocalSpool {
                 }
             }
             Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let state = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+                let state = self.compaction_state()?;
                 let Some(compacted) = state.entries.get(&key) else {
                     return Ok(None);
                 };
@@ -1871,7 +1923,7 @@ impl LocalSpool {
                 let pre_operation_id = format!("managed:event:{}:pre", marker.marker_id);
                 if marker.pre_fingerprint.is_none()
                     || !matches!(
-                        retained_envelope(&self.root, self.limits, "event", &pre_operation_id,)?,
+                        retained_envelope(self, "event", &pre_operation_id,)?,
                         Some(CaptureEnvelopeV1::EventBatch(_))
                     )
                 {
@@ -1881,10 +1933,8 @@ impl LocalSpool {
                 }
                 let start_operation_id = format!("recipe:start:{}", marker.marker_id);
                 let finish_operation_id = format!("recipe:finish:{}", marker.marker_id);
-                let start =
-                    retained_envelope(&self.root, self.limits, "start", &start_operation_id)?;
-                let finish =
-                    retained_envelope(&self.root, self.limits, "finish", &finish_operation_id)?;
+                let start = retained_envelope(self, "start", &start_operation_id)?;
+                let finish = retained_envelope(self, "finish", &finish_operation_id)?;
                 match (start, finish) {
                     (None, None) => pending.push(marker),
                     (
@@ -2357,10 +2407,7 @@ impl LocalSpool {
             };
         }
         let observation_key = sha256(operation_id.as_bytes());
-        if let Some(existing) = load_compaction_state(&self.root, self.limits.max_total_bytes)?
-            .observations
-            .get(&observation_key)
-        {
+        if let Some(existing) = self.compaction_state()?.observations.get(&observation_key) {
             return if existing == fingerprint {
                 Ok(AppendOutcome::Duplicate)
             } else {
@@ -2391,7 +2438,7 @@ impl LocalSpool {
                 "native operation was replayed with different observed result fields".into(),
             )),
             Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                match load_compaction_state(&self.root, self.limits.max_total_bytes)?
+                match self.compaction_state()?
                     .observations
                     .get(&key)
                 {
@@ -2510,7 +2557,7 @@ impl LocalSpool {
         let path = self.root.join("outbox").join(format!("{key}.json"));
         let _lock = self.lock()?;
         if let Some(CaptureEnvelopeV1::ActionStart(retained)) =
-            retained_envelope(&self.root, self.limits, "start", &start.operation_id)?
+            retained_envelope(self, "start", &start.operation_id)?
         {
             start.observed_order = retained.observed_order;
             start.observation_scope_id = retained.observation_scope_id.clone();
@@ -2551,10 +2598,7 @@ impl LocalSpool {
             .validate()
             .map_err(|error| CaptureError::Invalid(error.to_string()))?;
         let envelope_bytes = serde_json::to_vec(&envelope)?;
-        if let Some(compacted) = load_compaction_state(&self.root, self.limits.max_total_bytes)?
-            .entries
-            .get(&key)
-        {
+        if let Some(compacted) = self.compaction_state()?.entries.get(&key) {
             return if compacted.digest == sha256(&envelope_bytes) {
                 Ok((AppendOutcome::Duplicate, start))
             } else {
@@ -2670,10 +2714,7 @@ impl LocalSpool {
                 ))
             };
         }
-        if let Some(compacted) = load_compaction_state(&self.root, self.limits.max_total_bytes)?
-            .entries
-            .get(&key)
-        {
+        if let Some(compacted) = self.compaction_state()?.entries.get(&key) {
             // Digest-only compaction keeps no bytes to compare, so a receipt-timed re-delivery
             // falls back to its operation id; only acknowledged envelopes are compacted.
             let matches = match (&compacted.envelope, receipt_timed) {
@@ -2706,7 +2747,7 @@ impl LocalSpool {
         }
         let _lock = self.lock()?;
         recover_spool_temps(&self.root, self.limits)?;
-        recover_compacted_remainders(&self.root, self.limits)?;
+        recover_compacted_remainders(self)?;
         let mut names = regular_file_names(&self.root.join("outbox"), self.limits.max_records)?;
         names.sort();
         let mut values = Vec::new();
@@ -2743,12 +2784,36 @@ impl LocalSpool {
         }
         let _lock = self.lock()?;
         recover_spool_temps(&self.root, self.limits)?;
-        let mut retained = retained_envelopes(&self.root, self.limits)?;
-        retained.sort_by(|left, right| delivery_key(&left.1).cmp(&delivery_key(&right.1)));
-        let start = match load_delivery_cursor(&self.root)? {
-            Some(cursor) => retained
+        let cursor = load_delivery_cursor(&self.root)?;
+        match self.delivery_page_from_index(limit, cursor.as_deref(), true)? {
+            Some(page) => Ok(page),
+            // The derived index disagreed with a retained envelope or marker; rebuild it.
+            None => self
+                .delivery_page_from_index(limit, cursor.as_deref(), false)?
+                .ok_or_else(|| {
+                    CaptureError::Conflict(
+                        "rebuilt delivery index disagrees with the outbox".into(),
+                    )
+                }),
+        }
+    }
+
+    /// Walks the indexed causal order once from the cursor. Every visited acknowledgement must
+    /// equal the indexed digest, and every returned envelope is read, validated and compared with
+    /// its index record. With `trust_index` a disagreement returns `None` so the caller rebuilds;
+    /// against a freshly rebuilt index an acknowledgement mismatch is the retained-envelope
+    /// conflict it always was.
+    fn delivery_page_from_index(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        trust_index: bool,
+    ) -> Result<Option<Vec<CaptureEnvelopeV1>>> {
+        let entries = self.delivery_entries(trust_index)?;
+        let start = match cursor {
+            Some(cursor) => entries
                 .iter()
-                .position(|(key, _)| *key == cursor)
+                .position(|entry| entry.key == cursor)
                 .ok_or_else(|| {
                     CaptureError::Conflict(
                         "delivery cursor does not name a retained envelope".into(),
@@ -2758,19 +2823,129 @@ impl LocalSpool {
             None => 0,
         };
         let mut page = Vec::new();
-        for offset in 0..retained.len() {
-            let index = (start + offset) % retained.len().max(1);
-            let (key, envelope) = &retained[index];
-            let bytes = serde_json::to_vec(envelope)?;
-            if exact_acknowledgement(&self.root, key, &bytes)? {
-                continue;
+        for offset in 0..entries.len() {
+            let entry = &entries[(start + offset) % entries.len()];
+            match acknowledgement_marker(&self.root, &entry.key)? {
+                Some(marker) if marker == entry.digest.as_bytes() => continue,
+                Some(_) if trust_index => return Ok(None),
+                Some(_) => {
+                    return Err(CaptureError::Conflict(
+                        "acknowledgement differs from the retained envelope".into(),
+                    ));
+                }
+                None => {}
             }
-            page.push(envelope.clone());
+            let envelope = read_outbox_envelope(&self.root, self.limits, &entry.key)?;
+            if *entry != DeliveryIndexEntryV1::new(entry.key.clone(), &envelope)? {
+                return Ok(None);
+            }
+            page.push(envelope);
             if page.len() == limit {
                 break;
             }
         }
-        Ok(page)
+        Ok(Some(page))
+    }
+
+    /// Retained outbox entries in causal delivery order. Index records are reused for envelopes
+    /// still in the outbox; envelopes it does not cover are parsed once and appended. A missing,
+    /// torn, malformed or conflicting index, or `trust_index == false`, is rebuilt from the outbox.
+    fn delivery_entries(&self, trust_index: bool) -> Result<Vec<DeliveryIndexEntryV1>> {
+        let mut names = BTreeSet::new();
+        for name in regular_file_names(&self.root.join("outbox"), self.limits.max_records)? {
+            let key = name
+                .strip_suffix(".json")
+                .ok_or_else(|| CaptureError::Invalid("invalid outbox filename".into()))?;
+            names.insert(key.to_owned());
+        }
+        let path = self.root.join(DELIVERY_INDEX);
+        let indexed = if trust_index {
+            read_delivery_index(&path, self.limits.max_total_bytes)
+        } else {
+            None
+        };
+        let mut rewrite = indexed.is_none();
+        let mut live = BTreeMap::new();
+        for entry in indexed.into_iter().flatten() {
+            if !names.contains(&entry.key) {
+                // Compacted since it was indexed.
+                rewrite = true;
+            } else if live
+                .get(&entry.key)
+                .is_some_and(|existing| *existing != entry)
+            {
+                live.clear();
+                rewrite = true;
+                break;
+            } else {
+                live.insert(entry.key.clone(), entry);
+            }
+        }
+        let mut added = Vec::new();
+        for key in names.iter().filter(|key| !live.contains_key(*key)) {
+            let envelope = read_outbox_envelope(&self.root, self.limits, key)?;
+            added.push(DeliveryIndexEntryV1::new(key.clone(), &envelope)?);
+        }
+        live.extend(added.iter().map(|entry| (entry.key.clone(), entry.clone())));
+        let mut entries: Vec<_> = live.into_values().collect();
+        // Best effort: the index only caches facts that every later page re-verifies, and a
+        // failed or torn write is detected and rebuilt.
+        let _ = if rewrite {
+            self.persist_delivery_index(&path, &entries, false)
+        } else if !added.is_empty() {
+            self.persist_delivery_index(&path, &added, true)
+        } else {
+            Ok(())
+        };
+        entries.sort_by(|left, right| left.order.cmp(&right.order));
+        Ok(entries)
+    }
+
+    fn persist_delivery_index(
+        &self,
+        path: &Path,
+        entries: &[DeliveryIndexEntryV1],
+        append: bool,
+    ) -> Result<()> {
+        let mut bytes = Vec::new();
+        for entry in entries {
+            serde_json::to_writer(&mut bytes, entry)?;
+            bytes.push(b'\n');
+        }
+        let existing = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => Some(metadata.len()),
+            Ok(_) => {
+                return Err(CaptureError::Invalid(
+                    "delivery index is not a regular file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let installed = if append {
+            existing.unwrap_or(0).saturating_add(bytes.len() as u64)
+        } else {
+            bytes.len() as u64
+        };
+        // Derived records use ordinary admission, never the health headroom kept for evidence.
+        self.reserve_artifact(
+            installed.saturating_sub(existing.unwrap_or(0)),
+            usize::from(existing.is_none()),
+        )?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        if existing.is_none() {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Durably records that an exact retained envelope was attempted. This is delivery traversal
@@ -2829,7 +3004,7 @@ impl LocalSpool {
         ) {
             Ok(retained) => retained,
             Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let state = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+                let state = self.compaction_state()?;
                 let Some(compacted) = state.entries.get(&key) else {
                     return Err(CaptureError::NotFound(
                         "capture envelope is not retained locally".into(),
@@ -2871,7 +3046,7 @@ impl LocalSpool {
         }
         let _lock = self.lock()?;
         recover_spool_temps(&self.root, self.limits)?;
-        recover_compacted_remainders(&self.root, self.limits)?;
+        recover_compacted_remainders(self)?;
         let acknowledged: BTreeSet<String> =
             regular_file_names(&self.root.join("acknowledged"), self.limits.max_records)?
                 .into_iter()
@@ -3058,7 +3233,7 @@ impl LocalSpool {
             ));
         }
         atomic_replace(&state_path, &state_bytes)?;
-        recover_compacted_remainders(&self.root, self.limits)?;
+        recover_compacted_remainders(self)?;
         Ok(CompactionReport {
             envelopes: selected.len(),
             bytes_reclaimed: removed_bytes
@@ -3071,24 +3246,60 @@ impl LocalSpool {
     pub fn sequence_for(&self, session_id: &str, event_id: &str) -> Result<u64> {
         validate_session_key(session_id, event_id)?;
         let path = self.session_state_path(session_id);
+        let log_path = self.session_log_path(session_id);
         let _lock = self.lock()?;
         let mut state = load_sequence_state(&path)?;
         if let Some(sequence) = state.events.get(event_id) {
             return Ok(*sequence);
         }
-        if state.events.len() >= MAX_SEQUENCE_EVENTS || state.next == 0 {
-            return Err(CaptureError::Limit(
-                "session sequence map reached its retention bound".into(),
-            ));
+        let log = load_sequence_log(&log_path, state.next)?;
+        let digest = sha256(event_id.as_bytes());
+        if let Some((_, sequence)) = log.iter().find(|(logged, _)| *logged == digest) {
+            return Ok(*sequence);
         }
-        let sequence = state.next;
-        state.next = state
-            .next
-            .checked_add(1)
-            .ok_or_else(|| CaptureError::Limit("session sequence overflow".into()))?;
-        state.events.insert(event_id.to_owned(), sequence);
-        save_sequence_state(&path, &state, self)?;
+        let sequence = next_sequence(&state, &log)?;
+        if !state.event_log {
+            state.event_log = true;
+            save_sequence_state(&path, &state, self)?;
+        }
+        self.append_sequence_record(&log_path, &digest, sequence)?;
         Ok(sequence)
+    }
+
+    /// Appends one durable allocation. Only the 86-byte record is written, so a session's
+    /// per-event cost does not grow with the number of sequences it already holds.
+    fn append_sequence_record(&self, path: &Path, digest: &str, sequence: u64) -> Result<()> {
+        let record = format!("{digest} {sequence:020}\n");
+        debug_assert_eq!(record.len(), SEQUENCE_LOG_RECORD);
+        let created = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => false,
+            Ok(_) => {
+                return Err(CaptureError::Invalid(
+                    "session sequence log is not a regular file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        self.reserve(record.len() as u64, usize::from(created))?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        // A torn final record from a crashed append was never returned to a caller.
+        let length = file.metadata()?.len();
+        let aligned = length - length % SEQUENCE_LOG_RECORD as u64;
+        if aligned != length {
+            file.set_len(aligned)?;
+        }
+        file.write_all(record.as_bytes())?;
+        file.sync_all()?;
+        if created {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Allocates a fresh durable identity when the provider supplies no replay-stable event
@@ -3097,13 +3308,11 @@ impl LocalSpool {
     pub fn uncertain_event_id(&self, session_id: &str, fingerprint: &str) -> Result<String> {
         validate_session_key(session_id, fingerprint)?;
         let path = self.session_state_path(session_id);
+        let log_path = self.session_log_path(session_id);
         let _lock = self.lock()?;
         let mut state = load_sequence_state(&path)?;
-        if state.events.len() >= MAX_SEQUENCE_EVENTS || state.next == 0 {
-            return Err(CaptureError::Limit(
-                "session sequence map reached its retention bound".into(),
-            ));
-        }
+        let log = load_sequence_log(&log_path, state.next)?;
+        let sequence = next_sequence(&state, &log)?;
         state.uncertain_occurrences = state
             .uncertain_occurrences
             .checked_add(1)
@@ -3118,13 +3327,10 @@ impl LocalSpool {
                 .as_bytes()
             )
         );
-        let sequence = state.next;
-        state.next = state
-            .next
-            .checked_add(1)
-            .ok_or_else(|| CaptureError::Limit("session sequence overflow".into()))?;
-        state.events.insert(event_id.clone(), sequence);
+        // The counter is durable before the record, so a crash never reissues this identity.
+        state.event_log = true;
         save_sequence_state(&path, &state, self)?;
+        self.append_sequence_record(&log_path, &sha256(event_id.as_bytes()), sequence)?;
         Ok(event_id)
     }
 
@@ -3256,7 +3462,7 @@ impl LocalSpool {
         if let Some(order) = state.orders.get(operation_id) {
             return Ok(*order);
         }
-        let compacted = load_compaction_state(&self.root, self.limits.max_total_bytes)?;
+        let compacted = self.compaction_state()?;
         if let Some(order) = compacted_observed_order(&compacted, operation_id)? {
             return Ok(order);
         }
@@ -3301,9 +3507,7 @@ impl LocalSpool {
             .join("outbox")
             .join(format!("{start_key}.json"))
             .exists()
-            || load_compaction_state(&self.root, self.limits.max_total_bytes)?
-                .entries
-                .contains_key(&start_key)
+            || self.compaction_state()?.entries.contains_key(&start_key)
         {
             return Err(CaptureError::Conflict(
                 "cannot release an order with a retained action start".into(),
@@ -3330,6 +3534,13 @@ impl LocalSpool {
         self.root
             .join("sessions")
             .join(format!("{}.json", sha256(session_id.as_bytes())))
+    }
+
+    /// Append-only allocations, kept at the root so `sessions/` still holds exactly one JSON
+    /// state per session for existing readers.
+    fn session_log_path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(format!("session-{}.events", sha256(session_id.as_bytes())))
     }
 
     fn lock(&self) -> Result<SpoolLock> {
@@ -3411,7 +3622,7 @@ impl LocalSpool {
 
     fn envelope(&self, kind: &str, operation_id: &str) -> Result<Option<CaptureEnvelopeV1>> {
         let _lock = self.lock()?;
-        retained_envelope(&self.root, self.limits, kind, operation_id)
+        retained_envelope(self, kind, operation_id)
     }
 
     fn reserve(&self, additional_bytes: u64, additional_records: usize) -> Result<()> {
@@ -4368,17 +4579,16 @@ fn retain_compacted_envelope(envelope: &CaptureEnvelopeV1) -> bool {
 
 /// Loads one retained envelope while the caller holds the spool lock.
 fn retained_envelope(
-    root: &Path,
-    limits: SpoolLimits,
+    spool: &LocalSpool,
     kind: &str,
     operation_id: &str,
 ) -> Result<Option<CaptureEnvelopeV1>> {
     let key = envelope_key_parts(kind, operation_id);
-    let path = root.join("outbox").join(format!("{key}.json"));
-    let bytes = match read_bounded(&path, limits.max_total_bytes) {
+    let path = spool.root.join("outbox").join(format!("{key}.json"));
+    let bytes = match read_bounded(&path, spool.limits.max_total_bytes) {
         Ok(bytes) => bytes,
         Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            let state = load_compaction_state(root, limits.max_total_bytes)?;
+            let state = spool.compaction_state()?;
             return Ok(state
                 .entries
                 .get(&key)
@@ -4974,6 +5184,62 @@ fn valid_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Reads one session's complete append-only allocations as (event-id digest, sequence). Records
+/// strictly increase from the frozen whole-map high-water `floor`; a torn final record from a
+/// crashed append was never returned to a caller and is ignored.
+fn load_sequence_log(path: &Path, floor: u64) -> Result<Vec<(String, u64)>> {
+    let bytes = match read_bounded(path, MAX_SEQUENCE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut records = Vec::with_capacity(bytes.len() / SEQUENCE_LOG_RECORD);
+    let mut previous = floor.saturating_sub(1);
+    for record in bytes.chunks_exact(SEQUENCE_LOG_RECORD) {
+        let parsed = std::str::from_utf8(record)
+            .ok()
+            .and_then(|record| record.strip_suffix('\n'))
+            .and_then(|record| record.split_once(' '))
+            .filter(|(digest, sequence)| {
+                valid_digest(digest)
+                    && sequence.len() == 20
+                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .and_then(|(digest, sequence)| Some((digest.to_owned(), sequence.parse().ok()?)));
+        match parsed {
+            Some((digest, sequence)) if sequence > previous => {
+                previous = sequence;
+                records.push((digest, sequence));
+            }
+            _ => {
+                return Err(CaptureError::Invalid(
+                    "session sequence log is invalid".into(),
+                ));
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// The next unused sequence across a session's frozen whole map and its append-only log, under
+/// the same retention bound the whole map enforced.
+fn next_sequence(state: &SequenceState, log: &[(String, u64)]) -> Result<u64> {
+    if state.events.len().saturating_add(log.len()) >= MAX_SEQUENCE_EVENTS || state.next == 0 {
+        return Err(CaptureError::Limit(
+            "session sequence map reached its retention bound".into(),
+        ));
+    }
+    let sequence = match log.last() {
+        Some((_, last)) => last.checked_add(1),
+        None => Some(state.next),
+    };
+    sequence
+        .filter(|sequence| sequence.checked_add(1).is_some())
+        .ok_or_else(|| CaptureError::Limit("session sequence overflow".into()))
+}
+
 fn load_sequence_state(path: &Path) -> Result<SequenceState> {
     if path.exists() {
         serde_json::from_slice(&read_bounded(path, MAX_SEQUENCE_BYTES)?).map_err(Into::into)
@@ -5072,19 +5338,81 @@ fn retained_envelopes(
         let key = name
             .strip_suffix(".json")
             .ok_or_else(|| CaptureError::Invalid("invalid outbox filename".into()))?;
-        let bytes = read_bounded(&root.join("outbox").join(&name), limits.max_total_bytes)?;
-        let envelope: CaptureEnvelopeV1 = serde_json::from_slice(&bytes)?;
-        envelope
-            .validate()
-            .map_err(|error| CaptureError::Invalid(error.to_string()))?;
-        if envelope_key(&envelope) != key {
-            return Err(CaptureError::Conflict(
-                "retained envelope filename does not match its identity".into(),
-            ));
-        }
-        values.push((key.to_owned(), envelope));
+        values.push((key.to_owned(), read_outbox_envelope(root, limits, key)?));
     }
     Ok(values)
+}
+
+/// Reads, validates and identity-checks one retained outbox envelope.
+fn read_outbox_envelope(root: &Path, limits: SpoolLimits, key: &str) -> Result<CaptureEnvelopeV1> {
+    #[cfg(test)]
+    OUTBOX_ENVELOPE_READS.with(|count| count.set(count.get() + 1));
+    let path = root.join("outbox").join(format!("{key}.json"));
+    let envelope: CaptureEnvelopeV1 =
+        serde_json::from_slice(&read_bounded(&path, limits.max_total_bytes)?)?;
+    envelope
+        .validate()
+        .map_err(|error| CaptureError::Invalid(error.to_string()))?;
+    if envelope_key(&envelope) != key {
+        return Err(CaptureError::Conflict(
+            "retained envelope filename does not match its identity".into(),
+        ));
+    }
+    Ok(envelope)
+}
+
+/// Derived record of one retained outbox envelope: its identity, the digest of its canonical
+/// bytes (the value an exact acknowledgement holds) and its causal delivery order.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DeliveryIndexEntryV1 {
+    key: String,
+    digest: String,
+    order: (u8, String, i64, String, u64, String),
+}
+
+impl DeliveryIndexEntryV1 {
+    fn new(key: String, envelope: &CaptureEnvelopeV1) -> Result<Self> {
+        let (kind, work, generation, stream, sequence, operation) = delivery_key(envelope);
+        Ok(Self {
+            key,
+            digest: sha256(&serde_json::to_vec(envelope)?),
+            order: (
+                kind,
+                work.to_owned(),
+                generation,
+                stream.to_owned(),
+                sequence,
+                operation.to_owned(),
+            ),
+        })
+    }
+}
+
+/// Complete delivery-index records, or `None` when the index is absent, unreadable, torn or
+/// malformed and must be rebuilt.
+fn read_delivery_index(path: &Path, max_bytes: u64) -> Option<Vec<DeliveryIndexEntryV1>> {
+    let bytes = read_bounded(path, max_bytes).ok()?;
+    if bytes.last().is_some_and(|last| *last != b'\n') {
+        return None;
+    }
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<DeliveryIndexEntryV1>(line)
+                .ok()
+                .filter(|entry| valid_digest(&entry.key) && valid_digest(&entry.digest))
+        })
+        .collect()
+}
+
+fn acknowledgement_marker(root: &Path, key: &str) -> Result<Option<Vec<u8>>> {
+    match read_bounded(&root.join("acknowledged").join(key), 64) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn load_delivery_cursor(root: &Path) -> Result<Option<String>> {
@@ -5122,24 +5450,59 @@ fn valid_observation_scope_id(value: &str) -> bool {
 }
 
 fn load_compaction_state(root: &Path, max_bytes: u64) -> Result<CompactionStateV1> {
+    Ok(Arc::unwrap_or_clone(load_compaction_state_cached(
+        root, max_bytes, None,
+    )?))
+}
+
+/// Parses and fully verifies the compaction index only when the installed file differs from the
+/// one this spool handle last verified, so repeated lookups cost one `fstat`.
+fn load_compaction_state_cached(
+    root: &Path,
+    max_bytes: u64,
+    cache: Option<&CompactionCache>,
+) -> Result<Arc<CompactionStateV1>> {
     let path = root.join("compaction-v1.json");
-    let bytes = match read_bounded(&path, max_bytes / 2) {
-        Ok(bytes) => bytes,
-        Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CompactionStateV1 {
+    let file = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?,
+        Ok(_) => {
+            return Err(CaptureError::Invalid(format!(
+                "{} is not a regular retained file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Arc::new(CompactionStateV1 {
                 version: 1,
                 entries: BTreeMap::new(),
                 observations: BTreeMap::new(),
                 native_occurrences: BTreeMap::new(),
-            });
+            }));
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
-    let state: CompactionStateV1 = serde_json::from_slice(&bytes)?;
+    let stamp = FileStamp::of(&file.metadata()?);
+    if let Some(Ok(cached)) = cache.map(Mutex::lock)
+        && let Some((verified, state)) = cached.as_ref()
+        && *verified == stamp
+    {
+        return Ok(Arc::clone(state));
+    }
+    let state: CompactionStateV1 =
+        serde_json::from_slice(&read_bounded_from_file(&file, max_bytes / 2)?)?;
+    #[cfg(test)]
+    COMPACTION_VERIFICATIONS.with(|count| count.set(count.get() + 1));
     if !valid_compaction_state(&state) {
         return Err(CaptureError::Invalid(
             "capture compaction index is invalid".into(),
         ));
+    }
+    let state = Arc::new(state);
+    if let Some(Ok(mut cached)) = cache.map(Mutex::lock) {
+        *cached = Some((stamp, Arc::clone(&state)));
     }
     Ok(state)
 }
@@ -6897,8 +7260,9 @@ fn outstanding_actions(root: &Path, max: usize) -> Result<usize> {
 
 /// Completes the deletion half of a compaction transaction whose index was already made durable.
 /// The caller holds the global spool lock, so no live writer can own these exact remnants.
-fn recover_compacted_remainders(root: &Path, limits: SpoolLimits) -> Result<()> {
-    let state = load_compaction_state(root, limits.max_total_bytes)?;
+fn recover_compacted_remainders(spool: &LocalSpool) -> Result<()> {
+    let (root, limits) = (spool.root.as_path(), spool.limits);
+    let state = spool.compaction_state()?;
     let mut changed_occurrences = false;
     for receipt in state.native_occurrences.values() {
         changed_occurrences |= cleanup_compacted_occurrence_marker(root, receipt)?;
@@ -7112,12 +7476,35 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
         records = records.saturating_add(1);
         bytes = bytes.saturating_add(metadata.len());
     }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_name().to_str().is_some_and(appended_root_record) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(CaptureError::Invalid(
+                "capture spool appended record is not a regular file".into(),
+            ));
+        }
+        records = records.saturating_add(1);
+        bytes = bytes.saturating_add(metadata.len());
+    }
     if records > MAX_PHYSICAL_RECORDS {
         return Err(CaptureError::Limit(
             "capture spool contains too many physical records".into(),
         ));
     }
     Ok((records, bytes))
+}
+
+/// Root-level append-only records, counted under the same limits as every other record.
+fn appended_root_record(name: &str) -> bool {
+    name == DELIVERY_INDEX
+        || name
+            .strip_prefix("session-")
+            .and_then(|rest| rest.strip_suffix(".events"))
+            .is_some_and(valid_digest)
 }
 
 #[cfg(test)]
@@ -7251,6 +7638,7 @@ mod tests {
                 max_artifact_bytes: spool.limits.max_artifact_bytes,
             },
             identity: spool.identity,
+            compaction_cache: Arc::default(),
         };
 
         assert!(matches!(
@@ -7294,6 +7682,7 @@ mod tests {
                 max_artifact_bytes: 1,
             },
             identity: spool.identity,
+            compaction_cache: Arc::default(),
         };
 
         for index in 0..8 {
@@ -8260,6 +8649,192 @@ mod tests {
             spool.append_priority(&retimed),
             Err(CaptureError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn delivery_index_keeps_causal_order_reads_only_page_envelopes_and_rebuilds() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let gap = |index: u8| {
+            let operation = format!("cap:{index:064}");
+            gap_envelope(&operation, 100, GapReasonV1::AdapterStartedLate)
+        };
+        for index in [3, 1, 2] {
+            spool.append(&gap(index)).unwrap();
+        }
+        let (_, start) = spool
+            .append_action_start_ordered(ordered_start("operation:late"))
+            .unwrap();
+        // Action starts precede event batches even when admitted later.
+        let causal = vec![
+            CaptureEnvelopeV1::ActionStart(start),
+            gap(1),
+            gap(2),
+            gap(3),
+        ];
+        assert_eq!(spool.delivery_page(10).unwrap(), causal);
+        let index = spool.root.join(DELIVERY_INDEX);
+        let lines = || {
+            let mut lines: Vec<Vec<u8>> = fs::read(&index)
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect();
+            lines.sort();
+            lines
+        };
+        let complete = lines();
+        assert_eq!(complete.len(), 4);
+
+        // Acknowledged envelopes are skipped by their exact marker; only page envelopes are read.
+        for envelope in &causal[..3] {
+            spool.acknowledge(envelope).unwrap();
+        }
+        let reads = || OUTBOX_ENVELOPE_READS.with(std::cell::Cell::get);
+        let before = reads();
+        assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3)]);
+        assert_eq!(reads() - before, 1);
+
+        // Missing, torn and disagreeing indexes are rebuilt from the outbox.
+        let installed = fs::read(&index).unwrap();
+        let first_digest = serde_json::from_slice::<DeliveryIndexEntryV1>(&complete[0])
+            .unwrap()
+            .digest;
+        let wrong_digests = String::from_utf8(installed.clone())
+            .unwrap()
+            .replace(&first_digest, &"0".repeat(64));
+        for damaged in [
+            None,
+            Some(installed[..installed.len() - 5].to_vec()),
+            Some(wrong_digests.into_bytes()),
+        ] {
+            match damaged {
+                None => fs::remove_file(&index).unwrap(),
+                Some(bytes) => fs::write(&index, bytes).unwrap(),
+            }
+            assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3)]);
+            assert_eq!(lines(), complete);
+        }
+
+        // A newly admitted envelope is indexed once; compacted ones leave the index.
+        spool.append(&gap(4)).unwrap();
+        assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3), gap(4)]);
+        assert_eq!(lines().len(), 5);
+        assert_eq!(spool.compact_acknowledged(10).unwrap().envelopes, 2);
+        assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3), gap(4)]);
+        assert_eq!(lines().len(), 3);
+
+        // A marker that differs from the retained envelope still stops delivery after a rebuild.
+        let marker = spool
+            .root
+            .join("acknowledged")
+            .join(envelope_key(&causal[0]));
+        fs::write(&marker, "0".repeat(64)).unwrap();
+        assert!(matches!(
+            spool.delivery_page(10),
+            Err(CaptureError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn session_sequences_append_without_rewriting_and_keep_reading_whole_maps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let session = "session_legacy";
+        // Whole-map state exactly as earlier releases wrote it.
+        let header = spool.session_state_path(session);
+        fs::write(
+            &header,
+            br#"{"next":3,"events":{"evt:a":1,"evt:b":2},"uncertain_occurrences":0,"start_observed":true,"provider_history":null}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&header, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(spool.sequence_for(session, "evt:b").unwrap(), 2);
+        assert_eq!(spool.sequence_for(session, "evt:c").unwrap(), 3);
+        let fenced = fs::read(&header).unwrap();
+        let fenced_text = String::from_utf8_lossy(&fenced);
+        assert!(fenced_text.contains("\"event_log\":true"));
+        assert!(fenced_text.contains("\"evt:a\":1") && fenced_text.contains("\"next\":3"));
+        for index in 0..20 {
+            let event = format!("evt:n{index}");
+            assert_eq!(spool.sequence_for(session, &event).unwrap(), 4 + index);
+        }
+        assert_eq!(
+            fs::read(&header).unwrap(),
+            fenced,
+            "allocation rewrote state"
+        );
+        let log = spool.session_log_path(session);
+        assert_eq!(fs::metadata(&log).unwrap().len(), 21 * 86);
+        assert_eq!(spool.sequence_for(session, "evt:a").unwrap(), 1);
+        assert_eq!(spool.sequence_for(session, "evt:c").unwrap(), 3);
+
+        // A torn record from a crashed append is dropped; logged allocations stay replay-stable.
+        OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"0123")
+            .unwrap();
+        let reopened = LocalSpool::open(temp.path().join("spool")).unwrap();
+        assert_eq!(reopened.sequence_for(session, "evt:n19").unwrap(), 23);
+        let uncertain = reopened
+            .uncertain_event_id(session, &"f".repeat(64))
+            .unwrap();
+        assert_eq!(reopened.sequence_for(session, &uncertain).unwrap(), 24);
+        assert_eq!(fs::metadata(&log).unwrap().len(), 22 * 86);
+
+        let (records, bytes) = usage(&spool.root, 0).unwrap();
+        let moved = temp.path().join("moved-log");
+        fs::rename(&log, &moved).unwrap();
+        let (without_records, without_bytes) = usage(&spool.root, 0).unwrap();
+        assert_eq!(
+            (records - without_records, bytes - without_bytes),
+            (1, 22 * 86)
+        );
+    }
+
+    #[test]
+    fn compaction_index_is_verified_once_per_installed_file_and_again_after_any_edit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let replayable = format!("provider:history:{}:gap", "c".repeat(64));
+        let original = gap_envelope(&replayable, 100, GapReasonV1::AdapterStartedLate);
+        spool.append_priority_at_receipt(&original).unwrap();
+        spool.acknowledge(&original).unwrap();
+        assert_eq!(spool.compact_acknowledged(10).unwrap().envelopes, 1);
+        let fresh = |index: u8| {
+            let operation = format!("cap:{index:064}");
+            gap_envelope(&operation, 100, GapReasonV1::AdapterStartedLate)
+        };
+        let verifications = || COMPACTION_VERIFICATIONS.with(std::cell::Cell::get);
+
+        assert_eq!(
+            spool.append_priority(&fresh(1)).unwrap(),
+            AppendOutcome::Stored
+        );
+        let verified = verifications();
+        for index in 2..5 {
+            assert_eq!(
+                spool.append_priority(&fresh(index)).unwrap(),
+                AppendOutcome::Stored
+            );
+        }
+        assert_eq!(verifications(), verified, "unchanged index was re-verified");
+
+        // A same-length in-place edit keeps the inode and digest but changes the retained receipt.
+        let path = spool.root.join("compaction-v1.json");
+        let installed = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        let tampered = installed.replace("\"observed_at\":100", "\"observed_at\":101");
+        assert_ne!(tampered, installed);
+        fs::write(&path, tampered).unwrap();
+        assert!(matches!(
+            spool.append_priority(&fresh(5)),
+            Err(CaptureError::Invalid(_))
+        ));
+        assert_eq!(verifications(), verified + 1);
     }
 
     #[test]
