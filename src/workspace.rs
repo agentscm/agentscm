@@ -145,7 +145,7 @@ pub(crate) fn capture_selected_worktree(
             "attachment probe and worktree must be on the same filesystem".into(),
         ));
     }
-    require_executable_support(scan.probe)?;
+    require_executable_support_cached(scan.probe)?;
     let settings = git_config::selected_settings(scan.root, scan.git)?;
     let base = require_complete_snapshot(source_snapshot(engine, base_revision)?)?;
     let tracked = Tracked::from_paths(
@@ -2999,8 +2999,23 @@ fn scan_workspace_full_scoped_with_probe<'a>(
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     // Kinds are recorded from file modes, so a mount that reports every file
     // executable must be refused rather than reported as phantom changes.
-    require_executable_support(probe_directory)?;
-    let settings = git_config::ambient_settings(root, || probe_case_insensitive(probe_directory))?;
+    // Only the long-lived metadata directory remembers probe results; a transient probe
+    // directory (capture's) would be left holding a marker.
+    let persistent = probe_directory == root.join(METADATA_DIRECTORY);
+    if persistent {
+        require_executable_support_cached(probe_directory)?;
+    } else {
+        require_executable_support(probe_directory)?;
+    }
+    let settings = git_config::ambient_settings(root, || {
+        if persistent {
+            cached_capability(probe_directory, "case", true, || {
+                probe_case_insensitive(probe_directory)
+            })
+        } else {
+            probe_case_insensitive(probe_directory)
+        }
+    })?;
     scan_with_settings_scoped(root, tracked, &settings, scope, retain_content)
 }
 
@@ -4063,17 +4078,65 @@ fn require_filesystem_support(directory: &Path) -> Result<()> {
             "unsupported filesystem: it does not support symbolic links".to_owned(),
         ));
     }
-    require_executable_support(directory)
+    require_executable_support_cached(directory)
 }
 
 fn require_executable_support(directory: &Path) -> Result<()> {
-    if probe_executable_bit(directory)? {
+    require_executable_result(probe_executable_bit(directory)?)
+}
+
+/// `require_executable_support` for scans, which run on every status: a success is remembered in
+/// a marker in `directory` so the create/chmod/delete probe runs once per directory.
+fn require_executable_support_cached(directory: &Path) -> Result<()> {
+    require_executable_result(cached_capability(directory, "exec", false, || {
+        probe_executable_bit(directory)
+    })?)
+}
+
+fn require_executable_result(preserved: bool) -> Result<()> {
+    if preserved {
         Ok(())
     } else {
         Err(Error::Invalid(
             "unsupported filesystem: it does not preserve executable modes".to_owned(),
         ))
     }
+}
+
+const CAPABILITY_MARKER_PREFIX: &str = ".agentscm-capability-";
+
+/// A filesystem probe result remembered in `directory`, keyed by the directory's device and inode
+/// so a copy or a move to another filesystem probes again. An unreadable, unwritable or
+/// mismatched marker falls back to running `probe`. A negative result is stored only when
+/// `cache_negative` is set, so a refused filesystem is re-probed after it is fixed.
+fn cached_capability(
+    directory: &Path,
+    name: &str,
+    cache_negative: bool,
+    probe: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    let marker = directory.join(format!("{CAPABILITY_MARKER_PREFIX}{name}"));
+    let key = fs::metadata(directory)
+        .ok()
+        .map(|metadata| format!("{}:{}:", metadata.dev(), metadata.ino()));
+    if let Some(key) = &key
+        && let Ok(text) = fs::read_to_string(&marker)
+        && let Some(value) = text.strip_prefix(key.as_str())
+    {
+        match value {
+            "1" => return Ok(true),
+            "0" => return Ok(false),
+            _ => {}
+        }
+    }
+    let result = probe()?;
+    if let Some(key) = key
+        && (result || cache_negative)
+    {
+        // Best effort: a failed write only costs the next call another probe.
+        let _ = fs::write(&marker, format!("{key}{}", u8::from(result)));
+    }
+    Ok(result)
 }
 
 /// The owner execute bit is preserved only if it reads back clear after
@@ -5622,6 +5685,35 @@ mod tests {
             symlink("probe-target", dir.join(".agentscm-probe-link-1-2")).unwrap();
             fs::write(dir.join(".agentscm-probe-mode-1-2"), b"").unwrap();
         }
+    }
+
+    #[test]
+    fn capability_probe_runs_once_per_directory_and_falls_back_on_a_bad_marker() {
+        use std::cell::Cell;
+        let fixtures = TempDir::new().unwrap();
+        let dir = fixtures.path();
+        let runs = Cell::new(0);
+        let counted = |answer: bool| -> Result<bool> {
+            runs.set(runs.get() + 1);
+            Ok(answer)
+        };
+        assert!(cached_capability(dir, "exec", false, || counted(true)).unwrap());
+        assert!(cached_capability(dir, "exec", false, || counted(false)).unwrap());
+        assert_eq!(runs.get(), 1, "the second call is served by the marker");
+
+        // A marker for another directory (copied metadata) or with garbage is ignored.
+        for contents in ["1:1:1", "garbage", ""] {
+            fs::write(dir.join(".agentscm-capability-exec"), contents).unwrap();
+            assert!(!cached_capability(dir, "exec", false, || counted(false)).unwrap());
+        }
+        assert_eq!(runs.get(), 4);
+
+        // A negative answer is remembered only on request.
+        assert!(!cached_capability(dir, "never", false, || counted(false)).unwrap());
+        assert!(cached_capability(dir, "never", false, || counted(true)).unwrap());
+        assert!(!cached_capability(dir, "case", true, || counted(false)).unwrap());
+        assert!(!cached_capability(dir, "case", true, || counted(true)).unwrap());
+        assert_eq!(runs.get(), 7);
     }
 
     #[test]
