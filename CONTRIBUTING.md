@@ -46,3 +46,13 @@ require a separate contributor license agreement or a Signed-off-by line.
 ## Security and conduct
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Release titles and publishing
+
+Use `<type>[optional scope][!]: <subject>` for PR titles (at most 72 characters), for example `fix: Restore Hub reconnect` or `feat(cli): Add status output`. The Conventional PR title check runs again when a title is edited. Squash-merge using the PR title as the commit subject: release automation reads the merged subjects.
+
+`fix:` and `perf:` request a patch; `feat:` requests a minor; `!` or a `BREAKING CHANGE:` footer requests a major. Other allowed types (`build`, `chore`, `ci`, `docs`, `refactor`, `revert`, `style`, `test`) do not normally request a release. The highest requested bump wins across changes in a release PR. The automation setup commit must retain its one-time `Release-As: 0.1.0` footer when squash-merged to transition from `0.1.0-alpha.9` (the default strategy otherwise retains the alpha suffix). Review the generated `0.1.0` release PR before merging; subsequent patch versions follow `0.1.1`, `0.1.2`, etc. GitHub releases remain marked prerelease while the product is alpha.
+
+Release Please maintains a release PR updating Cargo.toml, Cargo.lock, the npm package version, the version manifest and CHANGELOG.md. Maintainers review and merge it through normal CI. It then creates a version tag and GitHub release; the existing Release workflow builds, qualifies and attaches artifacts and publishes npm behind the existing environment approval. A GitHub release may exist before its artifacts finish building: inspect the Release workflow before treating it as installable. Failed publishing needs investigation and a rerun; never move a published tag.
+
+Repository setup: configure squash merges with PR-title commit subjects, make `Conventional PR title` a required check on main, and provision the `RELEASE_PLEASE_TOKEN` Actions secret with repository contents, issues and pull-request write permissions. Use a dedicated automation identity allowed to create release tags by the existing tag ruleset, without bypassing main's protections. The built-in GITHUB_TOKEN is unsuitable because its generated PRs and tags do not trigger the downstream workflows. Keep the npm environment approval and existing release protections. These repository settings and credentials are not installed by committing the workflow files.
