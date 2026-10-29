@@ -31,6 +31,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # Crate-level `warnings = "deny"` turns musl-only deprecations into errors; linting musl here catches
+      # them on every pull request. The labelled `release-targets` job builds every non-Windows release target.
+      - run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo clippy --locked --target x86_64-unknown-linux-musl -- -D warnings
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
 
   # Hosted tests with PostgreSQL and S3. Always on push to main and manual runs. For a pull request:
   # fork PRs run on opened, synchronize and reopened (they cannot carry a local validation
@@ -91,7 +103,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked --doc
 
-  # Release builds for the musl and macOS targets, so a target-specific lint (for example a libc item
+  # Clippy and release builds for the musl and macOS targets (clippy also catches lints in target-specific
+  # code), so a target-specific lint (for example a libc item
   # deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the pull
   # request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
   # needs the UI build. Same gate as the `windows` job in windows.yml: with the `ci-extended` label, a
@@ -126,4 +139,5 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
+      - run: cargo clippy --locked --target "$TARGET" -- -D warnings
       - run: cargo build --locked --release --target "$TARGET"
