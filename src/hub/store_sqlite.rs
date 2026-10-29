@@ -94,13 +94,13 @@ use super::store::{
     validate_login,
 };
 use super::work::{
-    Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
-    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
-    WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
-    WorkOverviewQuery, WorkParticipant, WorkRepositoryScope, WorkRole, WorkScopeCheck,
-    WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
-    WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
+    Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
+    MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES,
+    WorkCheckpoint, WorkCheckpointResult, WorkCompaction, WorkConflictKind, WorkEvent, WorkItem,
+    WorkOutcome, WorkOutcomeKind, WorkOverview, WorkOverviewQuery, WorkParticipant,
+    WorkRepositoryScope, WorkRole, WorkScopeCheck, WorkScopeOverlap, WorkSearchItem,
+    WorkSearchPage, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState, WorkWho,
+    check_work_delivery_page, check_work_payload_capacity, claim_status, fit_json_budget,
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
     work_payload_row_bytes,
 };
@@ -1620,11 +1620,30 @@ fn project_claim(tx: &Transaction<'_>, item: &mut WorkItem, now: i64) -> Result<
         )
         .optional()?
         .is_some();
-    item.claim_status = if active && item.last_checkin_at >= now - CLAIM_STALE_SECONDS {
-        ClaimStatus::Active
-    } else {
-        ClaimStatus::Stale
-    };
+    item.claim_status = claim_status(item.last_checkin_at, active, now);
+    Ok(())
+}
+
+/// `project_claim` for many items with one token lookup.
+fn project_claims(tx: &Transaction<'_>, items: &mut [WorkItem], now: i64) -> Result<()> {
+    let leads = items
+        .iter()
+        .map(|item| item.lead_token.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut statement = tx.prepare(
+        "SELECT t.id FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+         WHERE t.id IN (SELECT value FROM json_each(?1))
+           AND t.revoked = 0 AND t.expires_at > ?2 AND u.disabled = 0",
+    )?;
+    let active = statement
+        .query_map(params![json_string(&leads)?, now], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    for item in items {
+        let valid = active.contains(&item.lead_token);
+        item.claim_status = claim_status(item.last_checkin_at, valid, now);
+    }
     Ok(())
 }
 
@@ -1735,7 +1754,8 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     Ok(event)
 }
 
-fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+/// Returns the stored snapshot so callers can size it without serializing the item again.
+fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<String> {
     let snapshot = json_string(item)?;
     tx.execute(
         "UPDATE hub_work_items SET lead_token = ?2, lead_agent = ?3, lead_session = ?4,
@@ -1751,7 +1771,7 @@ fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<
             state_name(item.state),
             item.next_action,
             item.current.as_ref().map(json_string).transpose()?,
-            snapshot,
+            &snapshot,
             item.updated_at,
             seq,
             json_string(&item.scope)?,
@@ -1762,9 +1782,9 @@ fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<
     tx.execute(
         "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
          VALUES (?1, ?2, ?3, ?4)",
-        params![item.id, seq, state_name(item.state), json_string(item)?],
+        params![item.id, seq, state_name(item.state), snapshot],
     )?;
-    Ok(())
+    Ok(snapshot)
 }
 
 fn work_payload_bytes(
@@ -3117,8 +3137,7 @@ fn start_in(
                     now
                 ],
             )?;
-            save_work_version(tx, &item, seq)?;
-            let snapshot = json_string(&item)?;
+            let snapshot = save_work_version(tx, &item, seq)?;
             let delta = work_transition_payload_bytes(&snapshot, &event)?
                 .checked_sub(previous_item_bytes)
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -3296,10 +3315,9 @@ fn start_in(
                 now
             ],
         )?;
-        save_work_version(tx, &item, seq)?;
+        let snapshot = save_work_version(tx, &item, seq)?;
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
         retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
-        let snapshot = json_string(&item)?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -3688,7 +3706,16 @@ fn publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Publication> {
         commit: row.get(7)?,
         branch: row.get(8)?,
         base: row.get(9)?,
-        manifest: row.get(10)?,
+        // PUBLICATION_SELECT returns NULL for an oversized manifest; publication_error maps it.
+        manifest: row.get::<_, Option<String>>(10)?.ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Null,
+                Box::new(HubError::Invalid(
+                    "retained publication exceeds manifest budget".into(),
+                )),
+            )
+        })?,
         branch_state: row.get(11)?,
         branch_message: row.get(12)?,
         pr_number: row.get(13)?,
@@ -3701,14 +3728,24 @@ fn publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Publication> {
     })
 }
 
+/// Surfaces `publication_row`'s oversized-manifest failure as `Invalid`, as PostgreSQL does.
+fn publication_error(error: rusqlite::Error) -> HubError {
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, inner) = &error
+        && let Some(HubError::Invalid(message)) = inner.downcast_ref::<HubError>()
+    {
+        return HubError::Invalid(message.clone());
+    }
+    error.into()
+}
+
 fn publication_by_id(tx: &Connection, id: &str) -> Result<Option<Publication>> {
-    Ok(tx
-        .query_row(
-            &format!("{PUBLICATION_SELECT} WHERE p.id = ?1"),
-            [id],
-            publication_row,
-        )
-        .optional()?)
+    tx.query_row(
+        &format!("{PUBLICATION_SELECT} WHERE p.id = ?1"),
+        [id],
+        publication_row,
+    )
+    .optional()
+    .map_err(publication_error)
 }
 
 fn connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForgeConnection> {
@@ -6955,7 +6992,8 @@ impl Store for SqliteStore {
                 params![repository, after, oldest, limit as i64],
                 publication_row,
             )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7096,7 +7134,8 @@ impl Store for SqliteStore {
         ))?;
         let rows = statement
             .query_map(params![repository, before, limit as i64], publication_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7156,7 +7195,8 @@ impl Store for SqliteStore {
                 ],
                 publication_row,
             )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(PublicationSearch {
             rows,
             searched_to: Some(oldest_id),
@@ -7181,7 +7221,8 @@ impl Store for SqliteStore {
         ))?;
         let rows = statement
             .query_map(params![repository, after, limit as i64], publication_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7784,14 +7825,13 @@ impl Store for SqliteStore {
         let event = work_event("work_checkpoint", &item)?;
         let seq = append(&tx, &event)?;
         item.updated_seq = seq;
-        save_work_version(&tx, &item, seq)?;
+        let snapshot = save_work_version(&tx, &item, seq)?;
         tx.execute(
             "INSERT INTO hub_work_checkpoint_ops
                 (work, operation_id, request, event_seq)
              VALUES (?1, ?2, ?3, ?4)",
             params![item.id, checkpoint.operation_id, request, seq],
         )?;
-        let snapshot = json_string(&item)?;
         let request_bytes = work_payload_row_bytes(request.len())?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
@@ -10647,12 +10687,9 @@ impl Store for SqliteStore {
             .collect::<Result<Vec<_>>>()?;
         let mut current_complete = current.len() <= query.limit;
         current.truncate(query.limit);
-        for item in &mut current {
-            project_claim(&tx, item, now)?;
-        }
+        project_claims(&tx, &mut current, now)?;
         let overview_part_budget = (MAX_BRIEFING_BYTES - 4096) / 3;
-        while json_string(&current)?.len() > overview_part_budget {
-            current.pop();
+        if fit_json_budget(&mut current, overview_part_budget)? {
             current_complete = false;
         }
 
@@ -10709,15 +10746,13 @@ impl Store for SqliteStore {
         let history_retention_gap = event_floor > 0 || snapshot_floor > 0;
         let mut recent_complete = recent.len() <= query.limit && !history_retention_gap;
         recent.truncate(query.limit);
-        while json_string(&recent)?.len() > overview_part_budget {
-            recent.pop();
+        if fit_json_budget(&mut recent, overview_part_budget)? {
             recent_complete = false;
         }
-        let mut overlaps = work_overlap_pairs(&current);
+        let mut overlaps = work_overlap_pairs(&current, query.limit + 1);
         let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
         overlaps.truncate(query.limit);
-        while json_string(&overlaps)?.len() > overview_part_budget {
-            overlaps.pop();
+        if fit_json_budget(&mut overlaps, overview_part_budget)? {
             overlaps_complete = false;
         }
         tx.commit()?;
