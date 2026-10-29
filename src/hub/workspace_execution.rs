@@ -840,11 +840,7 @@ impl ExecutionService {
             loop {
                 let service = self.clone();
                 match tokio::task::spawn_blocking(move || service.process_next()).await {
-                    Ok(Ok(true)) => {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                    Ok(Ok(false)) => {}
+                    Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
                         eprintln!("workspace execution worker stopped: {error}");
                         break;
@@ -854,7 +850,7 @@ impl ExecutionService {
                         break;
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
     }
