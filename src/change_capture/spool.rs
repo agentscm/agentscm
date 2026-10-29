@@ -26,6 +26,8 @@ const MAX_PENDING_PAGE: usize = 100;
 const MAX_DELIVERY_PAGE: usize = 10;
 const MAX_SEQUENCE_EVENTS: usize = 16_384;
 const MAX_SEQUENCE_BYTES: u64 = 2 * 1024 * 1024;
+/// Derived causal-order index of the outbox, one JSON record per line.
+const DELIVERY_INDEX: &str = "delivery-index-v1.jsonl";
 /// One session sequence-log record: 64 hex digest, space, 20 decimal digits, newline.
 const SEQUENCE_LOG_RECORD: usize = 86;
 const MAX_PHYSICAL_RECORDS: usize = 65_536;
@@ -102,6 +104,9 @@ thread_local! {
         std::cell::Cell::new(false)
     };
     static COMPACTION_VERIFICATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static OUTBOX_ENVELOPE_READS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -2779,12 +2784,36 @@ impl LocalSpool {
         }
         let _lock = self.lock()?;
         recover_spool_temps(&self.root, self.limits)?;
-        let mut retained = retained_envelopes(&self.root, self.limits)?;
-        retained.sort_by(|left, right| delivery_key(&left.1).cmp(&delivery_key(&right.1)));
-        let start = match load_delivery_cursor(&self.root)? {
-            Some(cursor) => retained
+        let cursor = load_delivery_cursor(&self.root)?;
+        match self.delivery_page_from_index(limit, cursor.as_deref(), true)? {
+            Some(page) => Ok(page),
+            // The derived index disagreed with a retained envelope or marker; rebuild it.
+            None => self
+                .delivery_page_from_index(limit, cursor.as_deref(), false)?
+                .ok_or_else(|| {
+                    CaptureError::Conflict(
+                        "rebuilt delivery index disagrees with the outbox".into(),
+                    )
+                }),
+        }
+    }
+
+    /// Walks the indexed causal order once from the cursor. Every visited acknowledgement must
+    /// equal the indexed digest, and every returned envelope is read, validated and compared with
+    /// its index record. With `trust_index` a disagreement returns `None` so the caller rebuilds;
+    /// against a freshly rebuilt index an acknowledgement mismatch is the retained-envelope
+    /// conflict it always was.
+    fn delivery_page_from_index(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        trust_index: bool,
+    ) -> Result<Option<Vec<CaptureEnvelopeV1>>> {
+        let entries = self.delivery_entries(trust_index)?;
+        let start = match cursor {
+            Some(cursor) => entries
                 .iter()
-                .position(|(key, _)| *key == cursor)
+                .position(|entry| entry.key == cursor)
                 .ok_or_else(|| {
                     CaptureError::Conflict(
                         "delivery cursor does not name a retained envelope".into(),
@@ -2794,19 +2823,129 @@ impl LocalSpool {
             None => 0,
         };
         let mut page = Vec::new();
-        for offset in 0..retained.len() {
-            let index = (start + offset) % retained.len().max(1);
-            let (key, envelope) = &retained[index];
-            let bytes = serde_json::to_vec(envelope)?;
-            if exact_acknowledgement(&self.root, key, &bytes)? {
-                continue;
+        for offset in 0..entries.len() {
+            let entry = &entries[(start + offset) % entries.len()];
+            match acknowledgement_marker(&self.root, &entry.key)? {
+                Some(marker) if marker == entry.digest.as_bytes() => continue,
+                Some(_) if trust_index => return Ok(None),
+                Some(_) => {
+                    return Err(CaptureError::Conflict(
+                        "acknowledgement differs from the retained envelope".into(),
+                    ));
+                }
+                None => {}
             }
-            page.push(envelope.clone());
+            let envelope = read_outbox_envelope(&self.root, self.limits, &entry.key)?;
+            if *entry != DeliveryIndexEntryV1::new(entry.key.clone(), &envelope)? {
+                return Ok(None);
+            }
+            page.push(envelope);
             if page.len() == limit {
                 break;
             }
         }
-        Ok(page)
+        Ok(Some(page))
+    }
+
+    /// Retained outbox entries in causal delivery order. Index records are reused for envelopes
+    /// still in the outbox; envelopes it does not cover are parsed once and appended. A missing,
+    /// torn, malformed or conflicting index, or `trust_index == false`, is rebuilt from the outbox.
+    fn delivery_entries(&self, trust_index: bool) -> Result<Vec<DeliveryIndexEntryV1>> {
+        let mut names = BTreeSet::new();
+        for name in regular_file_names(&self.root.join("outbox"), self.limits.max_records)? {
+            let key = name
+                .strip_suffix(".json")
+                .ok_or_else(|| CaptureError::Invalid("invalid outbox filename".into()))?;
+            names.insert(key.to_owned());
+        }
+        let path = self.root.join(DELIVERY_INDEX);
+        let indexed = if trust_index {
+            read_delivery_index(&path, self.limits.max_total_bytes)
+        } else {
+            None
+        };
+        let mut rewrite = indexed.is_none();
+        let mut live = BTreeMap::new();
+        for entry in indexed.into_iter().flatten() {
+            if !names.contains(&entry.key) {
+                // Compacted since it was indexed.
+                rewrite = true;
+            } else if live
+                .get(&entry.key)
+                .is_some_and(|existing| *existing != entry)
+            {
+                live.clear();
+                rewrite = true;
+                break;
+            } else {
+                live.insert(entry.key.clone(), entry);
+            }
+        }
+        let mut added = Vec::new();
+        for key in names.iter().filter(|key| !live.contains_key(*key)) {
+            let envelope = read_outbox_envelope(&self.root, self.limits, key)?;
+            added.push(DeliveryIndexEntryV1::new(key.clone(), &envelope)?);
+        }
+        live.extend(added.iter().map(|entry| (entry.key.clone(), entry.clone())));
+        let mut entries: Vec<_> = live.into_values().collect();
+        // Best effort: the index only caches facts that every later page re-verifies, and a
+        // failed or torn write is detected and rebuilt.
+        let _ = if rewrite {
+            self.persist_delivery_index(&path, &entries, false)
+        } else if !added.is_empty() {
+            self.persist_delivery_index(&path, &added, true)
+        } else {
+            Ok(())
+        };
+        entries.sort_by(|left, right| left.order.cmp(&right.order));
+        Ok(entries)
+    }
+
+    fn persist_delivery_index(
+        &self,
+        path: &Path,
+        entries: &[DeliveryIndexEntryV1],
+        append: bool,
+    ) -> Result<()> {
+        let mut bytes = Vec::new();
+        for entry in entries {
+            serde_json::to_writer(&mut bytes, entry)?;
+            bytes.push(b'\n');
+        }
+        let existing = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => Some(metadata.len()),
+            Ok(_) => {
+                return Err(CaptureError::Invalid(
+                    "delivery index is not a regular file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let installed = if append {
+            existing.unwrap_or(0).saturating_add(bytes.len() as u64)
+        } else {
+            bytes.len() as u64
+        };
+        // Derived records use ordinary admission, never the health headroom kept for evidence.
+        self.reserve_artifact(
+            installed.saturating_sub(existing.unwrap_or(0)),
+            usize::from(existing.is_none()),
+        )?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        if existing.is_none() {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Durably records that an exact retained envelope was attempted. This is delivery traversal
@@ -5199,19 +5338,81 @@ fn retained_envelopes(
         let key = name
             .strip_suffix(".json")
             .ok_or_else(|| CaptureError::Invalid("invalid outbox filename".into()))?;
-        let bytes = read_bounded(&root.join("outbox").join(&name), limits.max_total_bytes)?;
-        let envelope: CaptureEnvelopeV1 = serde_json::from_slice(&bytes)?;
-        envelope
-            .validate()
-            .map_err(|error| CaptureError::Invalid(error.to_string()))?;
-        if envelope_key(&envelope) != key {
-            return Err(CaptureError::Conflict(
-                "retained envelope filename does not match its identity".into(),
-            ));
-        }
-        values.push((key.to_owned(), envelope));
+        values.push((key.to_owned(), read_outbox_envelope(root, limits, key)?));
     }
     Ok(values)
+}
+
+/// Reads, validates and identity-checks one retained outbox envelope.
+fn read_outbox_envelope(root: &Path, limits: SpoolLimits, key: &str) -> Result<CaptureEnvelopeV1> {
+    #[cfg(test)]
+    OUTBOX_ENVELOPE_READS.with(|count| count.set(count.get() + 1));
+    let path = root.join("outbox").join(format!("{key}.json"));
+    let envelope: CaptureEnvelopeV1 =
+        serde_json::from_slice(&read_bounded(&path, limits.max_total_bytes)?)?;
+    envelope
+        .validate()
+        .map_err(|error| CaptureError::Invalid(error.to_string()))?;
+    if envelope_key(&envelope) != key {
+        return Err(CaptureError::Conflict(
+            "retained envelope filename does not match its identity".into(),
+        ));
+    }
+    Ok(envelope)
+}
+
+/// Derived record of one retained outbox envelope: its identity, the digest of its canonical
+/// bytes (the value an exact acknowledgement holds) and its causal delivery order.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DeliveryIndexEntryV1 {
+    key: String,
+    digest: String,
+    order: (u8, String, i64, String, u64, String),
+}
+
+impl DeliveryIndexEntryV1 {
+    fn new(key: String, envelope: &CaptureEnvelopeV1) -> Result<Self> {
+        let (kind, work, generation, stream, sequence, operation) = delivery_key(envelope);
+        Ok(Self {
+            key,
+            digest: sha256(&serde_json::to_vec(envelope)?),
+            order: (
+                kind,
+                work.to_owned(),
+                generation,
+                stream.to_owned(),
+                sequence,
+                operation.to_owned(),
+            ),
+        })
+    }
+}
+
+/// Complete delivery-index records, or `None` when the index is absent, unreadable, torn or
+/// malformed and must be rebuilt.
+fn read_delivery_index(path: &Path, max_bytes: u64) -> Option<Vec<DeliveryIndexEntryV1>> {
+    let bytes = read_bounded(path, max_bytes).ok()?;
+    if bytes.last().is_some_and(|last| *last != b'\n') {
+        return None;
+    }
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<DeliveryIndexEntryV1>(line)
+                .ok()
+                .filter(|entry| valid_digest(&entry.key) && valid_digest(&entry.digest))
+        })
+        .collect()
+}
+
+fn acknowledgement_marker(root: &Path, key: &str) -> Result<Option<Vec<u8>>> {
+    match read_bounded(&root.join("acknowledged").join(key), 64) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn load_delivery_cursor(root: &Path) -> Result<Option<String>> {
@@ -7299,9 +7500,11 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
 
 /// Root-level append-only records, counted under the same limits as every other record.
 fn appended_root_record(name: &str) -> bool {
-    name.strip_prefix("session-")
-        .and_then(|rest| rest.strip_suffix(".events"))
-        .is_some_and(valid_digest)
+    name == DELIVERY_INDEX
+        || name
+            .strip_prefix("session-")
+            .and_then(|rest| rest.strip_suffix(".events"))
+            .is_some_and(valid_digest)
 }
 
 #[cfg(test)]
@@ -8444,6 +8647,92 @@ mod tests {
         let retimed = gap_envelope(&replayable, 200, GapReasonV1::AdapterStartedLate);
         assert!(matches!(
             spool.append_priority(&retimed),
+            Err(CaptureError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn delivery_index_keeps_causal_order_reads_only_page_envelopes_and_rebuilds() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let gap = |index: u8| {
+            let operation = format!("cap:{index:064}");
+            gap_envelope(&operation, 100, GapReasonV1::AdapterStartedLate)
+        };
+        for index in [3, 1, 2] {
+            spool.append(&gap(index)).unwrap();
+        }
+        let (_, start) = spool
+            .append_action_start_ordered(ordered_start("operation:late"))
+            .unwrap();
+        // Action starts precede event batches even when admitted later.
+        let causal = vec![
+            CaptureEnvelopeV1::ActionStart(start),
+            gap(1),
+            gap(2),
+            gap(3),
+        ];
+        assert_eq!(spool.delivery_page(10).unwrap(), causal);
+        let index = spool.root.join(DELIVERY_INDEX);
+        let lines = || {
+            let mut lines: Vec<Vec<u8>> = fs::read(&index)
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect();
+            lines.sort();
+            lines
+        };
+        let complete = lines();
+        assert_eq!(complete.len(), 4);
+
+        // Acknowledged envelopes are skipped by their exact marker; only page envelopes are read.
+        for envelope in &causal[..3] {
+            spool.acknowledge(envelope).unwrap();
+        }
+        let reads = || OUTBOX_ENVELOPE_READS.with(std::cell::Cell::get);
+        let before = reads();
+        assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3)]);
+        assert_eq!(reads() - before, 1);
+
+        // Missing, torn and disagreeing indexes are rebuilt from the outbox.
+        let installed = fs::read(&index).unwrap();
+        let first_digest = serde_json::from_slice::<DeliveryIndexEntryV1>(&complete[0])
+            .unwrap()
+            .digest;
+        let wrong_digests = String::from_utf8(installed.clone())
+            .unwrap()
+            .replace(&first_digest, &"0".repeat(64));
+        for damaged in [
+            None,
+            Some(installed[..installed.len() - 5].to_vec()),
+            Some(wrong_digests.into_bytes()),
+        ] {
+            match damaged {
+                None => fs::remove_file(&index).unwrap(),
+                Some(bytes) => fs::write(&index, bytes).unwrap(),
+            }
+            assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3)]);
+            assert_eq!(lines(), complete);
+        }
+
+        // A newly admitted envelope is indexed once; compacted ones leave the index.
+        spool.append(&gap(4)).unwrap();
+        assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3), gap(4)]);
+        assert_eq!(lines().len(), 5);
+        assert_eq!(spool.compact_acknowledged(10).unwrap().envelopes, 2);
+        assert_eq!(spool.delivery_page(10).unwrap(), vec![gap(3), gap(4)]);
+        assert_eq!(lines().len(), 3);
+
+        // A marker that differs from the retained envelope still stops delivery after a rebuild.
+        let marker = spool
+            .root
+            .join("acknowledged")
+            .join(envelope_key(&causal[0]));
+        fs::write(&marker, "0".repeat(64)).unwrap();
+        assert!(matches!(
+            spool.delivery_page(10),
             Err(CaptureError::Conflict(_))
         ));
     }
