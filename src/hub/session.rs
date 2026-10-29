@@ -13,7 +13,7 @@ use super::handoff::HandoffNote;
 use super::http::blocking;
 use super::intent::{
     Announced, Intent, MAX_LIVE_INTENTS, MAX_TASK_BYTES, NOTICES, NewIntent, Overlap, display_all,
-    key_of, spec_key, text,
+    key_of, live_intents_capped, spec_key, text,
 };
 use super::store::{Event, HubEvent, Principal, Store, new_id, unix_now};
 use super::sync::{open_pulls, overlapping_pulls};
@@ -782,16 +782,18 @@ pub async fn others_for(
 ) -> Result<String> {
     let store = state.store.clone();
     let repository = principal.repository.clone();
-    let intents = blocking(state, move || {
-        store.live_intents(&repository, unix_now(), MAX_LIVE_INTENTS)
+    let (intents, truncated) = blocking(state, move || {
+        live_intents_capped(&*store, &repository, unix_now())
     })
     .await?;
-    Ok(advice::others(
-        &intents,
-        own_intent,
-        &principal.repository,
-        unix_now(),
-    ))
+    let mut text = advice::others(&intents, own_intent, &principal.repository, unix_now());
+    if truncated {
+        text.push('\n');
+        text.push_str(&advice::unknown(&format!(
+            "more than {MAX_LIVE_INTENTS} live intents; only the first are listed"
+        )));
+    }
+    Ok(text)
 }
 
 /// Other agents' ongoing work (`current`) and open PR titles that read like `task`: one

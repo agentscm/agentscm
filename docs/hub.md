@@ -1597,7 +1597,10 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
 - Only the same intent id is excluded from overlaps, so two intents held by one
   token can overlap and notice each other.
 - There is no cap on live intents per token and no rate limit; announces are
-  attributed to the token's owner. At most 32 notice requests and 32 inbox
+  attributed to the token's owner. Lists of a repository's live intents read at
+  most 1,000: the intent list sets `truncated`, the session-start listing says
+  coordination is unknown, and pull request overlap notices, comments and Slack
+  messages consider only those 1,000 (the Hub logs that to stderr). At most 32 notice requests and 32 inbox
   requests wait at once per process, so long-polls cannot hold every connection;
   beyond that a request answers immediately as if `wait` were 0.
 - The PostgreSQL connection is plaintext: this build has no TLS. Unix sockets

@@ -28,7 +28,9 @@ use super::github::{
 };
 use super::gitlab;
 use super::http::{ApiError, JsonBody, Reader, blocking};
-use super::intent::{Intent, MAX_LIVE_INTENTS, NOTICES, key_of, overlaps, scope};
+use super::intent::{
+    Intent, MAX_LIVE_INTENTS, NOTICES, key_of, live_intents_capped, overlaps, scope,
+};
 use super::login::{HumanSession, Table, forge_urls, optional_secret, random_hex};
 use super::store::{Store, lower_hex_of, new_connection_id, unix_now, validate_repository};
 use super::{HubError, HubState, Result};
@@ -1317,10 +1319,17 @@ async fn repo_intents(
     repo: &ConnectedRepository,
 ) -> Gh<Vec<Intent>> {
     let name = repo.full_name.clone();
-    let intents = db(state, move |store| {
-        store.live_intents(&name, unix_now(), MAX_LIVE_INTENTS)
+    let (intents, truncated) = db(state, move |store| {
+        live_intents_capped(store, &name, unix_now())
     })
     .await?;
+    if truncated {
+        // The repository status reply reports this as `intents_truncated`.
+        eprintln!(
+            "hub: {} has more than {MAX_LIVE_INTENTS} live intents; pull request overlap checks see only the first",
+            repo.full_name
+        );
+    }
     Ok(intents
         .into_iter()
         .filter(|i| {
