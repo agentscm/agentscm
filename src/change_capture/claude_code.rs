@@ -873,7 +873,11 @@ fn capture_native_hook_inner(
         );
     }
     let mut claim = claim.take().expect("new or retained v4 occurrence claim");
-    if phase == "pre" && claim.source.is_none() {
+    // Only the Managed and OrdinaryAction routes consume the source; skip the git scan otherwise.
+    if phase == "pre"
+        && claim.source.is_none()
+        && claim.route != Some(NativeOccurrenceRouteV1::OrdinaryEvent)
+    {
         let root =
             Path::new(claim.root_path.as_deref().ok_or_else(|| {
                 CaptureError::Conflict("native occurrence root is missing".into())
