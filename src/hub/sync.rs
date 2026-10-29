@@ -271,6 +271,8 @@ pub struct Sync {
     pulls: Mutex<PullCache>,
 }
 
+/// How long a connection marked `auth_failed` waits before the poller tries it again.
+const AUTH_FAILED_BACKOFF_SECONDS: i64 = 600;
 /// Other hub processes on the same database cannot invalidate this process's cache.
 const PULL_CACHE_SECONDS: u64 = 30;
 const MAX_CACHED_REPOSITORIES: usize = 256;
@@ -813,7 +815,9 @@ pub(super) async fn failed(
             lock(&state.sync.installs).clear();
             let (id, why) = (conn.id.clone(), detail);
             db(state, move |store| {
-                store.set_connection_status(&id, "auth_failed", Some(&why))
+                store.set_connection_status(&id, "auth_failed", Some(&why))?;
+                // A credential that failed will fail again next round; a refresh still retries at once.
+                store.set_next_poll(&id, unix_now() + AUTH_FAILED_BACKOFF_SECONDS)
             })
             .await?;
             Ok(true)
@@ -832,9 +836,14 @@ pub(super) async fn failed(
 
 async fn mark_enabled(state: &HubState, conn: &Connection) -> Result<()> {
     if conn.status != "enabled" {
-        let id = conn.id.clone();
+        let (id, recovered) = (conn.id.clone(), conn.status == "auth_failed");
         db(state, move |store| {
-            store.set_connection_status(&id, "enabled", None)
+            store.set_connection_status(&id, "enabled", None)?;
+            // A credential that works again ends its backoff.
+            if recovered {
+                store.set_next_poll(&id, 0)?;
+            }
+            Ok(())
         })
         .await?;
     }
@@ -1015,10 +1024,9 @@ async fn read_repo(
         ..PollReport::default()
     };
     let mut cut = serde_json::Map::new();
-
     // Rereading disappeared open proposals may ingest merges before the recent
-    // closed-proposal pass. Publish uncertainty before either batch begins.
-    super::catchup_sync::begin(state, conn, repo).await?;
+    // closed-proposal pass; the caller's `begin`, under the same repository lock,
+    // already published that uncertainty.
 
     // Pull requests.
     let started = observation_stamp(state, &repo.id).await?;
