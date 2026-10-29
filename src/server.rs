@@ -963,13 +963,13 @@ async fn read_file(
     let query = read_query(raw_query.as_deref())?;
     check_text(&revision, "revision")?;
     check_text(&query.path, "path")?;
-    let ((kind, content), permit) = blocking(state, move |engine| {
-        engine.read_entry(&revision, &query.path)
+    let (entry, permit) = blocking(state, move |engine| {
+        engine.read_entry_bounded(&revision, &query.path, MAX_SOURCE_BYTES)
     })
     .await?;
-    if content.len() > MAX_SOURCE_BYTES {
+    let Some((kind, content)) = entry else {
         return Err(ApiError::limit("source response exceeds 8388608 bytes"));
-    }
+    };
     let mut response = Response::new(Body::from(content));
     response.headers_mut().insert(
         header::CONTENT_TYPE,

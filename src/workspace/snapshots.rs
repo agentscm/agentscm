@@ -273,6 +273,7 @@ impl Workspace {
                 &tracked,
                 fence.scope.as_ref(),
                 probe_directory.path(),
+                true,
             )?
             .map(|(snapshot, _)| snapshot),
         )?;

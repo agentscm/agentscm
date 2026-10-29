@@ -802,14 +802,24 @@ fn parse_cli_on_bounded_stack() -> Result<ParsedCli> {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Hooks and `client mcp` run beside an agent on every tool call, so they get the smallest
+/// runtime: neither path uses `block_in_place`. A hook only races one call against a timeout. The
+/// MCP loop blocks on stdin, so one worker keeps its pooled HTTP connections serviced meanwhile.
+fn runtime(builder: &mut tokio::runtime::Builder) -> tokio::runtime::Runtime {
+    builder.enable_all().build().expect("tokio runtime")
+}
+
+fn main() {
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").
     if std::env::args_os().nth(1).is_some_and(|a| a == "hook")
         && !std::env::args_os().any(|a| a == "--help" || a == "-h")
     {
         let args = std::env::args_os().skip(2);
-        hook_cli::run_unparsed(args.map(|a| a.to_string_lossy().into_owned()).collect()).await;
+        let args = args.map(|a| a.to_string_lossy().into_owned()).collect();
+        // Two workers, not current_thread: the hub call blocks a worker on git,
+        // and only a parked worker drives the timer behind the deadline.
+        runtime(tokio::runtime::Builder::new_multi_thread().worker_threads(2))
+            .block_on(hook_cli::run_unparsed(args));
     }
     let cli = match parse_cli_on_bounded_stack() {
         Ok(ParsedCli::Run(cli)) => *cli,
@@ -820,7 +830,22 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let mut builder = if matches!(
+        cli.command,
+        Command::Client {
+            command: client_cli::ClientCommand::Mcp(_)
+        }
+    ) {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(1);
+        builder
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    runtime(&mut builder).block_on(run_parsed(cli));
+}
 
+async fn run_parsed(cli: Cli) {
     let invocation_off = cli.no_telemetry;
     let verified_install = matches!(
         std::env::var("AGENTSCM_VERIFIED_INSTALL").as_deref(),

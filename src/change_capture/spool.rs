@@ -2249,7 +2249,7 @@ impl LocalSpool {
                 "deferred capture record exceeds its byte bound".into(),
             ));
         }
-        let outstanding = outstanding_actions(&self.root, self.limits.max_records)?;
+        let outstanding = || outstanding_actions(&self.root, self.limits.max_records);
         self.reserve_with_action_capacity(
             bytes.len() as u64,
             1,
@@ -2569,8 +2569,11 @@ impl LocalSpool {
                 "observed action order exceeds its byte bound".into(),
             ));
         }
-        let mut outstanding = outstanding_action_keys(&self.root, self.limits.max_records)?;
-        outstanding.insert(action_key_start(&start));
+        let outstanding = || {
+            let mut outstanding = outstanding_action_keys(&self.root, self.limits.max_records)?;
+            outstanding.insert(action_key_start(&start));
+            Ok(outstanding.len())
+        };
         self.reserve_with_action_capacity(
             (envelope_bytes.len() as u64).saturating_add(if allocated {
                 order_bytes.len() as u64
@@ -2578,7 +2581,7 @@ impl LocalSpool {
                 0
             }),
             1 + usize::from(allocated),
-            outstanding.len(),
+            outstanding,
             BASE_METADATA_RESERVE_BYTES.min(self.limits.max_total_bytes / 4),
             BASE_METADATA_RESERVE_RECORDS.min(self.limits.max_records / 4),
         )?;
@@ -3412,7 +3415,7 @@ impl LocalSpool {
     }
 
     fn reserve(&self, additional_bytes: u64, additional_records: usize) -> Result<()> {
-        let outstanding = outstanding_actions(&self.root, self.limits.max_records)?;
+        let outstanding = || outstanding_actions(&self.root, self.limits.max_records);
         self.reserve_with_action_capacity(additional_bytes, additional_records, outstanding, 0, 0)
     }
 
@@ -3434,7 +3437,7 @@ impl LocalSpool {
     }
 
     fn reserve_artifact(&self, additional_bytes: u64, additional_records: usize) -> Result<()> {
-        let outstanding = outstanding_actions(&self.root, self.limits.max_records)?;
+        let outstanding = || outstanding_actions(&self.root, self.limits.max_records);
         self.reserve_with_action_capacity(
             additional_bytes,
             additional_records,
@@ -3450,15 +3453,18 @@ impl LocalSpool {
         bytes: u64,
         priority: bool,
     ) -> Result<()> {
-        let mut outstanding = outstanding_action_keys(&self.root, self.limits.max_records)?;
-        match envelope {
-            CaptureEnvelopeV1::ActionStart(start) => {
-                outstanding.insert(action_key_start(start));
-            }
-            CaptureEnvelopeV1::ActionFinish(finish) => {
-                outstanding.remove(&action_key_finish(finish));
-            }
-            CaptureEnvelopeV1::EventBatch(_) | CaptureEnvelopeV1::Usage(_) => {}
+        let outstanding = || {
+            let mut outstanding = outstanding_action_keys(&self.root, self.limits.max_records)?;
+            match envelope {
+                CaptureEnvelopeV1::ActionStart(start) => {
+                    outstanding.insert(action_key_start(start));
+                }
+                CaptureEnvelopeV1::ActionFinish(finish) => {
+                    outstanding.remove(&action_key_finish(finish));
+                }
+                CaptureEnvelopeV1::EventBatch(_) | CaptureEnvelopeV1::Usage(_) => {}
+            };
+            Ok(outstanding.len())
         };
         let reserve_health = !priority && !matches!(envelope, CaptureEnvelopeV1::ActionFinish(_));
         let (base_reserved_bytes, base_reserved_records) = if reserve_health {
@@ -3472,7 +3478,7 @@ impl LocalSpool {
         self.reserve_with_action_capacity(
             bytes,
             1,
-            outstanding.len(),
+            outstanding,
             base_reserved_bytes,
             base_reserved_records,
         )
@@ -3482,36 +3488,48 @@ impl LocalSpool {
         &self,
         additional_bytes: u64,
         additional_records: usize,
-        outstanding_actions: usize,
+        outstanding_actions: impl FnOnce() -> Result<usize>,
         base_reserved_bytes: u64,
         base_reserved_records: usize,
     ) -> Result<()> {
         let (records, bytes) = usage(&self.root, self.limits.max_records)?;
-        let reserved_records = outstanding_actions.saturating_add(base_reserved_records);
-        if records
-            .saturating_add(additional_records)
-            .saturating_add(reserved_records)
-            > self.limits.max_records
-        {
-            return Err(CaptureError::Limit(
-                "local capture spool record limit reached; acknowledge/export or increase the explicit limit"
-                    .into(),
-            ));
+        let fits = |outstanding_actions: usize| -> Result<()> {
+            let reserved_records = outstanding_actions.saturating_add(base_reserved_records);
+            if records
+                .saturating_add(additional_records)
+                .saturating_add(reserved_records)
+                > self.limits.max_records
+            {
+                return Err(CaptureError::Limit(
+                    "local capture spool record limit reached; acknowledge/export or increase the explicit limit"
+                        .into(),
+                ));
+            }
+            let reserved_bytes = u64::try_from(outstanding_actions)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(ACTION_FINISH_RESERVE_BYTES)
+                .saturating_add(base_reserved_bytes);
+            if bytes
+                .saturating_add(additional_bytes)
+                .saturating_add(reserved_bytes)
+                > self.limits.max_total_bytes
+            {
+                return Err(CaptureError::Limit(
+                    "local capture spool byte limit reached; no retained data was evicted".into(),
+                ));
+            }
+            Ok(())
+        };
+        // Every outstanding action keeps its start in the outbox, so the outbox file count plus the
+        // start being admitted bounds the exact count. Both checks are monotone in that count, so
+        // passing with the bound proves the exact check passes without parsing any envelope.
+        let bound = regular_file_names(&self.root.join("outbox"), self.limits.max_records)?
+            .len()
+            .saturating_add(1);
+        if fits(bound).is_ok() {
+            return Ok(());
         }
-        let reserved_bytes = u64::try_from(outstanding_actions)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(ACTION_FINISH_RESERVE_BYTES)
-            .saturating_add(base_reserved_bytes);
-        if bytes
-            .saturating_add(additional_bytes)
-            .saturating_add(reserved_bytes)
-            > self.limits.max_total_bytes
-        {
-            return Err(CaptureError::Limit(
-                "local capture spool byte limit reached; no retained data was evicted".into(),
-            ));
-        }
-        Ok(())
+        fits(outstanding_actions()?)
     }
 }
 

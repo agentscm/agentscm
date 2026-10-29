@@ -216,7 +216,6 @@ const fn enabled_by_default() -> bool {
 pub struct DeliveryReport {
     pub delivered: usize,
     pub blocked: usize,
-    pub pending_page: usize,
 }
 
 struct ConfigLock(File);
@@ -1801,15 +1800,7 @@ pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<Delivery
             )));
         }
     }
-    let pending_page = spool
-        .delivery_page(DELIVERY_PAGE)
-        .map_err(|error| invalid(format!("local capture: {error}")))?
-        .len();
-    Ok(DeliveryReport {
-        delivered,
-        blocked,
-        pending_page,
-    })
+    Ok(DeliveryReport { delivered, blocked })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

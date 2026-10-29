@@ -159,6 +159,7 @@ pub(crate) fn capture_selected_worktree(
         &tracked,
         &settings,
         scope.as_ref(),
+        true,
     )?)?;
     let includes = |path: &str| scope.as_ref().is_none_or(|s| s.includes(path));
     let changes: Vec<_> = staged_between(&base.files, &working.files)
@@ -678,11 +679,11 @@ impl Workspace {
                 pending: state.pending,
             }
         } else if let Some(base) =
-            source_snapshot_scoped(engine, &state.base_revision, scope.as_ref())?
+            source_digests_scoped(engine, &state.base_revision, scope.as_ref())?
         {
             let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
             if let Some((working, report)) =
-                scan_workspace_full_scoped(&self.root, &tracked, scope.as_ref())?
+                scan_workspace_digests_scoped(&self.root, &tracked, scope.as_ref())?
             {
                 let mut changes = changes_between(&base.files, &working.files);
                 let complete = changes.len() <= limit;
@@ -743,12 +744,11 @@ impl Workspace {
             pending: state.pending,
         };
         if state.ready
-            && let Some(base) =
-                source_snapshot_scoped(engine, &state.base_revision, scope.as_ref())?
+            && let Some(base) = source_digests_scoped(engine, &state.base_revision, scope.as_ref())?
         {
             let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
             if let Some((working, mut report)) =
-                scan_workspace_full_scoped(&self.root, &tracked, scope.as_ref())?
+                scan_workspace_digests_scoped(&self.root, &tracked, scope.as_ref())?
             {
                 preview.included_total = working.files.len();
                 preview.excluded_total = report.excluded_total;
@@ -1386,7 +1386,8 @@ struct Stage {
     after: Option<Item>,
 }
 
-/// One tracked workspace entry. For a symlink `content` is the link target.
+/// One tracked workspace entry. For a symlink `content` is the link target. In a digest-only
+/// snapshot (status and preview) `content` is the SHA-256 of those bytes instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Item {
     kind: EntryKind,
@@ -2720,6 +2721,7 @@ fn snapshot_from_inventory(
         inventory,
         |path| scope.is_none_or(|scope| scope.includes(path)),
         |path| scope.is_none_or(|scope| scope.traverses(path)),
+        true,
     )
 }
 
@@ -2772,6 +2774,7 @@ fn snapshot_from_inventory_where(
     inventory: &SourceInventory,
     mut selected: impl FnMut(&str) -> bool,
     mut traversed: impl FnMut(&str) -> bool,
+    retain_content: bool,
 ) -> Result<Option<Snapshot>> {
     let mut files = BTreeMap::new();
     let mut directories = BTreeSet::new();
@@ -2796,6 +2799,11 @@ fn snapshot_from_inventory_where(
                 directories.insert(directory.to_owned());
             }
         }
+        let content = if retain_content {
+            content
+        } else {
+            Sha256::digest(&content).to_vec()
+        };
         files.insert(
             path.clone(),
             Item {
@@ -2821,6 +2829,25 @@ fn source_snapshot_scoped(
         return Ok(None);
     };
     snapshot_from_inventory(engine, revision, &inventory, scope)
+}
+
+/// `source_snapshot_scoped` with digests in place of contents, under the same limits.
+fn source_digests_scoped(
+    engine: &Engine,
+    revision: &str,
+    scope: Option<&Scope>,
+) -> Result<Option<Snapshot>> {
+    let Some(inventory) = source_inventory(engine, revision)? else {
+        return Ok(None);
+    };
+    snapshot_from_inventory_where(
+        engine,
+        revision,
+        &inventory,
+        |path| scope.is_none_or(|scope| scope.includes(path)),
+        |path| scope.is_none_or(|scope| scope.traverses(path)),
+        false,
+    )
 }
 
 fn require_scope_selection_dependencies(
@@ -2925,6 +2952,8 @@ struct Scan<'a> {
     /// Everything read from directories, selected or not; bounded by `MAX_VISITED_ENTRIES`.
     visited: usize,
     report: ScanReport,
+    /// False keeps only a SHA-256 per file, so status does not hold every working byte.
+    retain_content: bool,
 }
 
 struct Candidate {
@@ -2948,7 +2977,17 @@ fn scan_workspace_full_scoped<'a>(
     scope: Option<&'a Scope>,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     let metadata = root.join(METADATA_DIRECTORY);
-    scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata)
+    scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata, true)
+}
+
+/// `scan_workspace_full_scoped` with digests in place of contents, under the same limits.
+fn scan_workspace_digests_scoped<'a>(
+    root: &Path,
+    tracked: &'a Tracked,
+    scope: Option<&'a Scope>,
+) -> Result<Option<(Snapshot, ScanReport)>> {
+    let metadata = root.join(METADATA_DIRECTORY);
+    scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata, false)
 }
 
 fn scan_workspace_full_scoped_with_probe<'a>(
@@ -2956,12 +2995,13 @@ fn scan_workspace_full_scoped_with_probe<'a>(
     tracked: &'a Tracked,
     scope: Option<&'a Scope>,
     probe_directory: &Path,
+    retain_content: bool,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     // Kinds are recorded from file modes, so a mount that reports every file
     // executable must be refused rather than reported as phantom changes.
     require_executable_support(probe_directory)?;
     let settings = git_config::ambient_settings(root, || probe_case_insensitive(probe_directory))?;
-    scan_with_settings_scoped(root, tracked, &settings, scope)
+    scan_with_settings_scoped(root, tracked, &settings, scope, retain_content)
 }
 
 #[cfg(test)]
@@ -2982,7 +3022,7 @@ fn scan_with_settings(
     tracked: &Tracked,
     settings: &Settings,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
-    scan_with_settings_scoped(root, tracked, settings, None)
+    scan_with_settings_scoped(root, tracked, settings, None, true)
 }
 
 fn scan_with_settings_scoped<'a>(
@@ -2990,6 +3030,7 @@ fn scan_with_settings_scoped<'a>(
     tracked: &'a Tracked,
     settings: &'a Settings,
     scope: Option<&'a Scope>,
+    retain_content: bool,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     let mut scan = Scan {
         selector: Selector::open(root, tracked, settings)?,
@@ -3003,6 +3044,7 @@ fn scan_with_settings_scoped<'a>(
         entry_count: 0,
         visited: 0,
         report: ScanReport::default(),
+        retain_content,
     };
     if !scan.directory(root, Path::new(""), 0, None)? {
         return Ok(None);
@@ -3142,13 +3184,16 @@ impl Scan<'_> {
                 }
                 // Never followed: the link itself is the entry, so a link to a
                 // directory is not descended into.
-                let item = read_symlink_item(&path, &relative)?;
+                let mut item = read_symlink_item(&path, &relative)?;
                 self.total_bytes = self
                     .total_bytes
                     .checked_add(item.content.len())
                     .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
                 if self.total_bytes > MAX_TOTAL_BYTES {
                     return Ok(false);
+                }
+                if !self.retain_content {
+                    item.content = Sha256::digest(&item.content).to_vec();
                 }
                 self.snapshot.files.insert(relative, item);
                 continue;
@@ -3180,10 +3225,20 @@ impl Scan<'_> {
             if metadata.len() > MAX_FILE_BYTES as u64 {
                 return Ok(false);
             }
-            let item = read_regular_file(&path, &relative)?;
+            let (item, length) = if self.retain_content {
+                let item = read_regular_file(&path, &relative)?;
+                let length = item.content.len();
+                (item, length)
+            } else {
+                // Streamed through the hasher so no whole file is buffered.
+                let mut hasher = Sha256::new();
+                let (kind, length) = read_regular_into(&path, &relative, &mut hasher)?;
+                let content = hasher.finalize().to_vec();
+                (Item { kind, content }, length)
+            };
             self.total_bytes = self
                 .total_bytes
-                .checked_add(item.content.len())
+                .checked_add(length)
                 .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
             if self.total_bytes > MAX_TOTAL_BYTES {
                 return Ok(false);
@@ -3221,6 +3276,20 @@ fn read_symlink_item(path: &Path, relative: &str) -> Result<Item> {
 }
 
 fn read_regular_file(path: &Path, relative: &str) -> Result<Item> {
+    // Preallocated as before so a large file is not regrown by doubling; the size is rechecked.
+    let size = fs::symlink_metadata(path)?.len().min(MAX_FILE_BYTES as u64);
+    let mut content = Vec::with_capacity(size as usize);
+    let (kind, _) = read_regular_into(path, relative, &mut content)?;
+    Ok(Item { kind, content })
+}
+
+/// Copy a regular file into `sink` under the size bound, refusing a file that changes while it
+/// is read. Returns its kind and byte length.
+fn read_regular_into(
+    path: &Path,
+    relative: &str,
+    sink: &mut impl Write,
+) -> Result<(EntryKind, usize)> {
     let before = fs::symlink_metadata(path)?;
     if !before.file_type().is_file() || before.file_type().is_symlink() {
         return Err(Error::Invalid(format!(
@@ -3234,11 +3303,11 @@ fn read_regular_file(path: &Path, relative: &str) -> Result<Item> {
             "workspace file exceeds {MAX_FILE_BYTES} bytes: {relative}"
         )));
     }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    Read::by_ref(&mut file)
-        .take(MAX_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_FILE_BYTES {
+    let length = std::io::copy(
+        &mut Read::by_ref(&mut file).take(MAX_FILE_BYTES as u64 + 1),
+        sink,
+    )?;
+    if length > MAX_FILE_BYTES as u64 {
         return Err(Error::Limit(format!(
             "workspace file exceeds {MAX_FILE_BYTES} bytes: {relative}"
         )));
@@ -3256,10 +3325,8 @@ fn read_regular_file(path: &Path, relative: &str) -> Result<Item> {
             "workspace file changed while it was read: {relative}"
         )));
     }
-    Ok(Item {
-        kind: kind_of_mode(opened.permissions().mode()),
-        content: bytes,
-    })
+    // The bound check above keeps `length` within `MAX_FILE_BYTES`.
+    Ok((kind_of_mode(opened.permissions().mode()), length as usize))
 }
 
 fn changes_between(

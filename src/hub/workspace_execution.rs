@@ -474,6 +474,8 @@ impl ExecutionService {
                 request_json BLOB NOT NULL, actor_json BLOB NOT NULL, run_json BLOB NOT NULL,
                 state TEXT NOT NULL, UNIQUE(actor_id,request_id)
             ) STRICT;
+            CREATE INDEX IF NOT EXISTS workspace_runs_state_sequence
+                ON workspace_runs(state, sequence);
             CREATE TABLE IF NOT EXISTS workspace_run_events(
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL, event TEXT NOT NULL, run_json BLOB NOT NULL
