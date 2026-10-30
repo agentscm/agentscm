@@ -126,7 +126,7 @@ The download and verification steps do not send product telemetry. After verific
 ```sh
 npx agentscm            # setup guide; flags go to `agentscm quickstart`
 npx agentscm uninstall  # any other subcommand is passed through as given
-npx agentscm tray       # optional macOS status-bar companion
+npx agentscm tray       # macOS status-bar companion; Linux terminal companion
 ```
 
 Needs Node 18 or later. The package has no dependencies and no install scripts. On Windows, run the same command in PowerShell:

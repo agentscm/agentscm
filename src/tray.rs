@@ -8,19 +8,30 @@ pub(crate) struct TrayArgs {
     /// Run the status-bar event loop in this process (used by the detached launcher).
     #[arg(long, hide = true)]
     foreground: bool,
+    /// Open the compact panel immediately when starting a new tray instance.
+    #[arg(long)]
+    panel: bool,
 }
 
 pub(crate) async fn run(args: TrayArgs) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        macos::run(args.foreground).await
+        macos::run(args.foreground, args.panel).await
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = args;
-        Err(agentscm::Error::Invalid(
-            "the AgentSCM tray is currently supported only on macOS".into(),
-        ))
+        #[cfg(target_os = "linux")]
+        {
+            let _ = args;
+            terminal::run().await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = args;
+            Err(agentscm::Error::Invalid(
+                "the AgentSCM companion is not supported on this platform".into(),
+            ))
+        }
     }
 }
 
@@ -47,10 +58,14 @@ fn with_client_lifecycle_using<T>(
     operation()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod companion_launch;
 #[cfg(target_os = "macos")]
 mod login;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+mod terminal;
 
 #[cfg(any(target_os = "macos", test))]
 fn clean_label(value: &str) -> String {
@@ -72,8 +87,12 @@ fn open_argv(path: &std::path::Path) -> Vec<std::ffi::OsString> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn foreground_argv() -> [&'static str; 3] {
-    ["--no-telemetry", "tray", "--foreground"]
+fn foreground_argv(panel: bool) -> Vec<&'static str> {
+    let mut args = vec!["--no-telemetry", "tray", "--foreground"];
+    if panel {
+        args.push("--panel");
+    }
+    args
 }
 
 #[cfg(test)]
@@ -94,9 +113,10 @@ mod tests {
     #[test]
     fn detached_tray_disables_invocation_telemetry() {
         assert_eq!(
-            foreground_argv(),
+            foreground_argv(false),
             ["--no-telemetry", "tray", "--foreground"]
         );
+        assert_eq!(foreground_argv(true).last(), Some(&"--panel"));
     }
 
     #[cfg(target_os = "macos")]
