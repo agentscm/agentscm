@@ -1,10 +1,16 @@
 import { useEffect, useState } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
-import { fetchPublication, headline, listPublications, listTrack, loadRecent, rememberRecent, track, validPublicationId, type ExternalRun, type ExternalState, type Outcome, type Publication, type Step } from '../publications.ts'
-import { Ago, Box, Empty, Explain, Icon, Notice, Pill, Skeleton, Tip, relative, type Tone } from '../ui.tsx'
+import { dateSpan, fetchPublication, headline, listPublications, listTrack, loadRecent, recentLabels, rememberRecent, track, validPublicationId, type ExternalRun, type ExternalState, type Outcome, type Publication, type Step } from '../publications.ts'
+import { Ago, Box, Empty, Explain, Icon, Notice, PageHead, Pill, Skeleton, Tip, relative, type Tone } from '../ui.tsx'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
+import { who } from '../nextStep.ts'
+import { ProofBadge } from '../Proof.tsx'
+import { proofOfExternal } from '../proof.ts'
+import type { WorkItem } from '../standup.ts'
+import { useTaskIndex } from '../taskIndex.ts'
+import { lead, WorkLink } from './workParts.tsx'
 
 export const landedHref = (id: string) => `#landed/${encodeURIComponent(id)}`
 
@@ -53,6 +59,22 @@ export function Track({ steps, compact = false }: { steps: Step[]; compact?: boo
   )
 }
 
+/** "Task: <title> · maria’s Claude Code", the title linking to the task. Keep it outside any row link so anchors don't nest. */
+export function TaskLine({ item, className = '' }: { item: WorkItem; className?: string }) {
+  return <p className={`small mb-0 ${className}`}><TaskInline item={item} /></p>
+}
+/** The same line without a paragraph, for places that already sit inside one. */
+export function TaskInline({ item }: { item: WorkItem }) {
+  const l = lead(item)
+  return (
+    <>
+      Task:{' '}
+      <span className="task-line-link"><WorkLink id={item.id}>{item.title}</WorkLink></span>
+      {' '}· {who(l.login, l.agent)}
+    </>
+  )
+}
+
 const HONESTY: Record<ExternalState, { tone: Tone; icon: string; title: string; body: string }> = {
   observed: { tone: 'ok', icon: 'eye', title: 'Checked', body: 'The hub read GitHub for this merge in full.' },
   incomplete: { tone: 'warn', icon: 'exclamation-triangle', title: 'Partly checked', body: 'The hub could not read everything, so this list may be missing runs.' },
@@ -98,14 +120,15 @@ function RunList({ runs, deployment, state }: { runs: ExternalRun[]; deployment:
 
 function Detail({ repo, id, token }: { repo: string; id: string; token: string }) {
   const load = usePoll((signal) => fetchPublication(repo, id, token, signal), 15_000, `${repo}|${id}`)
+  const tasks = useTaskIndex(token)
   useEffect(() => {
-    if (load.kind === 'ready' && load.value.supported) rememberRecent(id)
+    if (load.kind === 'ready' && load.value.supported) rememberRecent(id, load.value.publication.title ?? load.value.publication.branch)
   }, [load, id])
   if (load.kind === 'loading') return <Skeleton rows={6} />
   if (load.kind === 'error')
     return (
       <div className="page">
-        <a href="#landed" className="back"><Icon name="arrow-left" /> All landed changes</a>
+        <a href="#landed" className="back"><Icon name="arrow-left" /> All changes</a>
         <Notice tone="bad" title={load.status === 404 ? 'No change with this ID in this repository' : 'Could not load this change'} action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Try again</button>}>
           {load.status === 404 ? 'Check the ID. Your token only sees changes published to its own repository.' : load.message}
         </Notice>
@@ -114,22 +137,19 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
   if (!load.value.supported)
     return (
       <div className="page">
-        <a href="#landed" className="back"><Icon name="arrow-left" /> All landed changes</a>
-        <Notice tone="muted" icon="lock" title="Landed changes aren’t readable here yet">This hub doesn’t let the status page read landed changes yet — it needs a newer hub. The page uses a read-only token and never asks for an agent token.</Notice>
+        <a href="#landed" className="back"><Icon name="arrow-left" /> All changes</a>
+        <Notice tone="muted" icon="lock" title="Published changes aren’t readable here yet">This hub doesn’t let the status page read published changes yet — it needs a newer hub. The page uses a read-only token and never asks for an agent token.</Notice>
       </div>
     )
   const p = load.value.publication
   const x = p.external
   const h = headline(p)
+  const task = p.branch ? tasks?.byBranch.get(p.branch) : undefined
+  const route = <><code className="branch-name">{p.branch || p.id}</code> into <code className="branch-name">{p.base}</code></>
   return (
     <div className="page">
-      <a href="#landed" className="back"><Icon name="arrow-left" /> All landed changes</a>
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">
-          <code className="branch-name">{p.branch || p.id}</code> <Icon name="arrow-right" className="muted" /> <code className="branch-name">{p.base}</code>
-        </h1>
-        <p className="answer-text"><Pill tone={h.tone}>{h.text}</Pill></p>
-      </div>
+      <a href="#landed" className="back"><Icon name="arrow-left" /> All changes</a>
+      <PageHead question={p.title ?? `${p.branch || p.id} into ${p.base}`} answer={<Pill tone={h.tone}>{h.text}</Pill>} fact={task ? <TaskInline item={task} /> : p.title ? route : undefined} />
       {load.refreshError && <Notice title="Showing the last loaded state">The latest refresh failed: {load.refreshError}</Notice>}
       {p.error && <Notice tone="bad" title="The hub recorded a problem with this change">{p.error}</Notice>}
       <Box icon="signpost-split" title="How far it got" explain="Each step is what the hub recorded. Hover a step for why it shows that word.">
@@ -147,16 +167,17 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
                 {x.state === 'observed' && x.reconciledAt ? <> <Ago at={x.reconciledAt} /></> : null}. {HONESTY[x.state].body}
                 {x.state === 'incomplete' && x.reconciledAt ? <> Last full read attempt <Ago at={x.reconciledAt} />.</> : null}
               </span>
+              <ProofBadge {...proofOfExternal(x)} />
             </div>
             <div className="grid-2 align-start">
-              <Box icon="gear-wide-connected" title="CI after landing" count={x.ci.length} explain="GitHub Actions runs for the exact merge commit on the base branch. Runs for pull requests or other branches are left out.">
+              <Box icon="gear-wide-connected" title="CI after merge" count={x.ci.length} explain="GitHub Actions runs for the exact merge commit on the base branch. Runs for pull requests or other branches are left out.">
                 <RunList runs={x.ci} deployment={false} state={x.state} />
               </Box>
               <Box icon="cloud-upload" title="Deployments" count={x.deployments.length} explain="Each deployment of the merge commit and its latest status. An environment can have more than one.">
                 <RunList runs={x.deployments} deployment state={x.state} />
               </Box>
             </div>
-            <p className="small muted"><Icon name="info-circle" /> {x.note} Source approval and landing are decided elsewhere.</p>
+            <p className="small muted"><Icon name="info-circle" /> {x.note} Nothing here decides whether a change can merge.</p>
           </>
         ) : (
           <Notice tone="muted" icon="eye-slash" title="CI and deployments are not tracked here">This hub is not set to watch GitHub CI and deployments for this repository, so nothing is shown. It does not mean they passed.</Notice>
@@ -165,6 +186,7 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
         <summary>Technical details</summary>
         <dl className="tech">
           <dt>Change ID</dt><dd><code>{p.id}</code></dd>
+          <dt>Branch</dt><dd>{route}</dd>
           <dt>Revision</dt><dd><code>{p.revision}</code></dd>
           <dt>Branch commit</dt><dd><code>{p.commit}</code></dd>
           {p.pr.mergeCommit && <><dt>Merge commit</dt><dd><code>{p.pr.mergeCommit}</code></dd></>}
@@ -174,7 +196,7 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
               <dd>{p.pr.url ? <a href={p.pr.url} target="_blank" rel="noreferrer noopener">#{p.pr.number} <Icon name="box-arrow-up-right" /></a> : `#${p.pr.number}`}</dd>
             </>
           )}
-          <dt>Recorded locally as landed</dt><dd>{p.nativeLanded ? 'Yes, by the publishing agent' : 'No'} <Explain text="The publishing agent says so. The hub has nothing to check it against." /></dd>
+          <dt>Recorded locally as landed</dt><dd>{p.nativeLanded ? <>Yes, by the publishing agent <ProofBadge level="reported" /></> : 'No'} <Explain text="The publishing agent says so. The hub has nothing to check it against." /></dd>
           {p.historical && <><dt>Kind</dt><dd>Historical candidate, not re-qualified</dd></>}
         </dl>
       </details>
@@ -183,14 +205,15 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
 }
 
 function Lookup({ repo, token, recent, onOpen }: { repo: string; token: string; recent: string[]; onOpen: (id: string) => void }) {
+  const labels = recentLabels()
   return (
-    <Box icon="search" title="Find a change" explain="Search by branch, title, PR number or change ID. Change IDs start with pub_; the publishing agent prints them and the hub posts them on the PR.">
+    <div className="mb-3">
       <div className="lookup">
         <Combobox
           id="landed-id"
           data-tour="landed-picker"
           label="Find a change"
-          placeholder="Search by branch, title or PR number, or paste a pub_ ID"
+          placeholder="Find a change by branch, title or PR number, or paste a pub_ ID"
           describedBy="landed-id-help"
           parseId={(t) => (validPublicationId(t) ? t : null)}
           onSelect={(id) => onOpen(id)}
@@ -226,16 +249,16 @@ function Lookup({ repo, token, recent, onOpen }: { repo: string; token: string; 
           }}
         />
       </div>
-      <div id="landed-id-help" className="form-text">Pick a change, or paste the ID of one your agents published.</div>
+      <div id="landed-id-help" className="form-text">Change IDs start with pub_; the publishing agent prints them and the hub posts them on the PR.</div>
       {recent.length > 0 && (
         <div className="recent">
-          <span className="small muted">Opened recently in this browser:</span>
+          <span className="small muted">Opened in this browser</span>
           {recent.map((r) => (
-            <a key={r} href={landedHref(r)} className="recent-chip"><code>{r.slice(0, 12)}…</code></a>
+            <a key={r} href={landedHref(r)} className="recent-chip" title={r}>{labels[r] ?? <code>{r.slice(0, 12)}…</code>}</a>
           ))}
         </div>
       )}
-    </Box>
+    </div>
   )
 }
 
@@ -300,35 +323,46 @@ function List({ repo, token }: { repo: string; token: string }) {
   const ready = load.kind === 'ready' && load.value.supported ? load.value : null
   const landed = ready?.publications.filter((p) => p.pr.state === 'merged') ?? []
   const details = useDetails(repo, token, landed.map((p) => p.id))
+  const tasks = useTaskIndex(token)
   const shown = (p: Publication) => {
     const d = details[p.id]
     return d && d !== 'failed' ? d : p
   }
   // Only changes whose details loaded can count as failing; "Checking…" never counts either way.
   const failing = landed.filter((p) => details[p.id] && details[p.id] !== 'failed' && headline(shown(p)).tone === 'bad')
+  const span = ready ? dateSpan(ready.publications) : null
+  // "Not tracked" only once every merged change's details have loaded and none carries a CI read; until then the page makes no claim.
+  const untracked = landed.length > 0 && landed.every((p) => { const d = details[p.id]; return d !== undefined && d !== 'failed' && d.external === null })
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Did our changes land, and did checks pass after?</h1>
-        <p className="answer-text">
-          {load.kind === 'loading'
+      <PageHead
+        question="Were our agents’ changes merged, and what happened after?"
+        answer={
+          load.kind === 'loading'
             ? 'Looking…'
             : !ready
-              ? 'This hub doesn’t let the status page read landed changes yet — it needs a newer hub.'
+              ? 'This hub doesn’t let the status page read published changes yet — it needs a newer hub.'
               : ready.publications.length === 0
                 ? 'No published changes yet.'
-                : <>{landed.length} of {ready.publications.length} recent change{ready.publications.length === 1 ? '' : 's'} landed{failing.length ? <>, and <span className="text-danger-emphasis">{failing.length} had a failure after landing</span></> : null}.</>}
-        </p>
-      </div>
+                : <>{landed.length} of {ready.publications.length} recent change{ready.publications.length === 1 ? '' : 's'} merged{span ? ` (${span})` : ''}{failing.length ? <>, and <span className="text-danger-emphasis">{failing.length} had a failure after merging</span></> : null}.{untracked ? ' Test and deploy results after merge are not tracked.' : null}</>
+        }
+        fact={
+          untracked ? (
+            <>Tracking is off. A hub admin can turn it on for this repository (GitHub only, experimental). <Explain text="The hub operator sets AGENTSCM_GITHUB_EXTERNAL_RUNS to this repository’s owner/name. The token needs Actions and Deployments read access. See External CI and deployment outcomes in the hub docs." /></>
+          ) : (
+            'Merged on GitHub or GitLab, as of the hub’s last sync. Nothing here decides whether a change can merge.'
+          )
+        }
+      />
       <SectionTabs />
-      <Lookup repo={repo} token={token} recent={recent} onOpen={(id) => { window.location.hash = landedHref(id).slice(1) }} />
-      <Box tour="landed-list" icon="rocket-takeoff" tone={failing.length ? 'bad' : 'brand'} title="Recent changes" count={ready ? ready.publications.length : undefined} explain="Changes agents published to this repository through the hub, newest first. Each row shows how far it got.">
+      <Box tour="landed-list" icon="rocket-takeoff" tone={failing.length ? 'bad' : 'brand'} title="Recent changes" explain="Changes agents published to this repository, newest first. Search by branch, title or PR number; each row shows how far it got. Nothing here decides whether a change can merge.">
+        <Lookup repo={repo} token={token} recent={recent} onOpen={(id) => { window.location.hash = landedHref(id).slice(1) }} />
         {load.kind === 'loading' ? (
           <Skeleton rows={4} />
         ) : load.kind === 'error' ? (
           <Notice tone="bad" title="Could not load recent changes" action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Try again</button>}>{load.message}</Notice>
         ) : !ready ? (
-          <Empty icon="lock" title="Not readable with this page’s token yet">This hub doesn’t let the status page read landed changes yet — it needs a newer hub. Once it is, every change shows here with its branch, pull request, merge, CI and deploys.</Empty>
+          <Empty icon="lock" title="Not readable with this page’s token yet">This hub doesn’t let the status page read published changes yet — it needs a newer hub. Once it is, every change shows here with its branch, pull request, merge, CI and deploys.</Empty>
         ) : ready.publications.length === 0 ? (
           <Empty icon="rocket" title="Nothing published yet">Changes appear here once an agent publishes one through the hub.</Empty>
         ) : (
@@ -336,18 +370,21 @@ function List({ repo, token }: { repo: string; token: string }) {
             <ul className="run-list">
               {ready.publications.map((p) => {
                 const checking = p.pr.state === 'merged' && (!details[p.id] || details[p.id] === 'failed')
-                const h = checking ? { tone: 'muted' as const, text: details[p.id] === 'failed' ? 'Landed, couldn’t check after' : 'Landed, checking…' } : headline(shown(p))
+                const h = checking ? { tone: 'muted' as const, text: details[p.id] === 'failed' ? 'Merged, couldn’t check after' : 'Merged, checking…' } : headline(shown(p))
+                const branch = <code className="branch-name">{p.branch || p.id}</code>
+                const task = p.branch ? tasks?.byBranch.get(p.branch) : undefined
                 return (
                   <li key={p.id}>
                     <a href={landedHref(p.id)} className="run-row landed-row">
                       <span className="run-main">
-                        <strong><code className="branch-name">{p.branch || p.id}</code></strong>
-                        <span className="small muted">into <code>{p.base}</code>{p.pr.number !== null ? <> · PR #{p.pr.number}</> : null}</span>
+                        <strong>{p.title ?? branch}</strong>
+                        <span className="small muted">{p.title && <>{branch} </>}into <code>{p.base}</code>{p.pr.number !== null ? <> · PR #{p.pr.number}</> : null}</span>
                       </span>
                       <Track steps={listTrack(p, details[p.id])} compact />
                       <Pill tone={h.tone}>{h.text}</Pill>
                       <Icon name="chevron-right" className="muted" />
                     </a>
+                    {task && <TaskLine item={task} className="px-3 pb-1" />}
                   </li>
                 )
               })}
@@ -357,7 +394,6 @@ function List({ repo, token }: { repo: string; token: string }) {
           </>
         )}
       </Box>
-      <p className="small muted"><Icon name="info-circle" /> Read-only. CI and deploy results are watched after a change lands; they never decided whether it could land.</p>
     </div>
   )
 }

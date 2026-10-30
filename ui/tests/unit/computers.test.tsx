@@ -89,6 +89,7 @@ describe('ComputersPage', () => {
     })
     render(<Computers token="read-only-token" />)
     fireEvent.click(await screen.findByRole('button', { name: 'Revoke' }))
+    expect(screen.getByRole('group', { name: 'Revoke jonny-mbp' }).textContent).toContain('agent tokens it made for counterbranch/agentscm. Those agents lose access to this Hub. It does not stop them running, change their GitHub or GitLab access, or release files they announced; those expire on their own.')
     fireEvent.click(screen.getByRole('button', { name: 'Revoke jonny-mbp' }))
     expect(await screen.findByText(/jonny-mbp was revoked/)).toBeTruthy()
     await waitFor(() => expect(screen.getByText('No computers are signed in')).toBeTruthy())

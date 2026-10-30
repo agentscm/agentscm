@@ -17,7 +17,7 @@ const item = (id: string, login: string, over: Partial<WorkItem> = {}): WorkItem
   }) as unknown as WorkItem
 const overview = (current: WorkItem[]) => ({ current, recent: [], overlaps: [], current_complete: true, recent_complete: true, overlaps_complete: true }) as unknown as WorkOverview
 const d = { agents: [], groups: [], filesHeld: 0, contested: [], prOverlaps: [], otherOpenPrs: 0, intentById: new Map() } as unknown as Derived
-const data = { whoami: { owner: { login: 'maria' } }, failing: false, activity: null, fresh: new Set() } as unknown as HubData
+const data = { whoami: { owner: { login: 'maria', provider: 'github', host: 'github.com' }, token: { repository: 'acme/widgets' } }, failing: false, activity: null, fresh: new Set() } as unknown as HubData
 const ready = (ov: WorkOverview): Poll<WorkOverview> => ({ kind: 'ready', value: ov }) as Poll<WorkOverview>
 
 afterEach(() => localStorage.removeItem('agentscm.hidden.v1'))
@@ -38,6 +38,39 @@ describe('Needs you', () => {
     expect(needsBox().getByText('Resume it or hand it over')).toBeTruthy()
     expect(needsBox().getByText('Ask dev before picking it up')).toBeTruthy()
     expect(needsBox().queryByText(/Ask maria/)).toBeNull()
+  })
+
+  it('names the requester of a contested file from its handoff, and offers the words to paste', () => {
+    const contested = [{ path: 'src/a.rs', holders: [{ id: 'm', owner: 'maria', name: 'claude-code' }, { id: 'd', owner: 'dev', name: 'cursor' }], handoff: { request: 'r', at: now, from: { owner: 'dev', name: 'cursor' }, to: { owner: 'maria', name: 'claude-code' }, note: null, answer: { kind: 'declined' as const, at: now } } }]
+    render(<DashboardPage section="home" question="q" token="t" repo="acme/widgets" data={data} d={{ ...d, contested }} overview={ready(overview([]))} />)
+    expect(needsBox().getByText(/Agree who keeps it · ask maria or dev/)).toBeTruthy()
+    expect(needsBox().getByRole('button', { name: /^Copy prompt for dev’s / })).toBeTruthy()
+    expect(needsBox().queryByText(/another agent/)).toBeNull()
+  })
+
+  it('a settled handoff is listed under the agents, and no count includes it', () => {
+    const contested = [{ path: 'src/ledger.rs', holders: [{ id: 'm', owner: 'maria', name: 'claude-code' }], handoff: { request: 'r', at: now, from: { owner: 'dev', name: 'codex' }, to: { owner: 'maria', name: 'claude-code' }, note: null, answer: { kind: 'declined' as const, at: now, reason: 'Mid-refactor' } } }]
+    const dd = { ...d, contested } as Derived
+    expect(dashboardStatus(overview([]), dd, null, null).home).toEqual({ text: 'Nothing needs you', tone: 'ok' })
+    render(<DashboardPage section="home" question="q" token="t" repo="acme/widgets" data={data} d={dd} overview={ready(overview([]))} />)
+    expect(needsBox().getByText('Agents are sorting it out · 1')).toBeTruthy()
+    expect(needsBox().getByText(/kept/).textContent).toMatch(/^maria’s .+ kept src\/ledger\.rs: “Mid-refactor”\.$/)
+  })
+})
+
+describe('Headline', () => {
+  it('counts only moving tasks as worked on, says why the rest are still, and matches the Needs you count', () => {
+    const ov = overview([
+      item('a', 'maria', { claim_status: 'active' }),
+      item('b', 'dev', { claim_status: 'active' }),
+      item('c', 'dev', { state: 'blocked' }),
+      item('e', 'sam', { state: 'paused' }),
+      item('f', 'sam', { state: 'handover', claim_status: 'active' }),
+    ])
+    render(page(ov))
+    expect(document.querySelector('.answer-text')!.textContent).toBe('5 unfinished tasks: 2 moving, 3 stuck. 2 things need you.')
+    expect(document.querySelector('.answer-fact')!.textContent).toBe('Stuck: 1 blocked, 1 paused, 1 waiting for another agent. 0 agents are connected.')
+    expect(dashboardStatus(ov, d, null, null).home?.text).toBe('Waiting on you')
   })
 })
 

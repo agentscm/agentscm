@@ -8,7 +8,8 @@ import { usePoll } from '../usePoll.ts'
 import { loadSingleKeys, saveSingleKeys, type Density, type ThemePref } from '../storage.ts'
 import type { Whoami } from '../types.ts'
 import { ViewSettingsBox } from '../ViewSettings.tsx'
-import { Box, Icon, Pill, Skeleton, localDate } from '../ui.tsx'
+import { Box, Icon, PageHead, Pill, Skeleton, localDate } from '../ui.tsx'
+import { OPEN_FROM_THIS_COMPUTER } from '../copy.ts'
 import { SECTIONS } from '../App.tsx'
 import { useTour } from '../tour/Tour.tsx'
 import { tourFor } from '../tour/content.ts'
@@ -59,11 +60,7 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
   const [singleKeys, setSingleKeys] = useState(loadSingleKeys)
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">How is this page set up for me?</h1>
-        <p className="answer-text">How the Hub looks for you, kept in this browser.</p>
-        <p className="answer-fact">Nothing here changes the hub, except inline agent views, which are shared by everyone.</p>
-      </div>
+      <PageHead question="How is this page set up for me?" answer="How the Hub looks for you, kept in this browser." fact="Nothing here changes the hub, except inline agent views (shared by everyone) and conversation sharing." />
       <SectionTabs />
       <div className="stack">
         <Box icon="palette" title="Appearance" explain="Saved in this browser. Other people see their own choice.">
@@ -103,6 +100,8 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
           </div>
         </Box>
 
+        <ViewSettingsBox token={token} />
+
         <Walkthrough />
 
         {isLocalCredential(token) ? (
@@ -139,8 +138,6 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
           </div>
         </Box>
         )}
-
-        <ViewSettingsBox token={token} />
 
         <Box icon="arrow-repeat" title="Refresh" explain="Refreshing pauses while this tab is hidden and slows down after errors. If a refresh fails, you keep the last data, marked as such.">
           <ul className="cadence">
@@ -190,8 +187,11 @@ function LocalServer() {
       >
         <div>
           <label className="settings-label" htmlFor="local-base">Local read API</label>
-          <div className="small mb-2">To browse your files and saved conversations, run <code>agentscm open</code> in your repository, or choose Open Hub in the AgentSCM menu bar app. Nothing below is needed then.</div>
-          <div className="muted small">Advanced: leave the address empty to use this page’s own address. Only addresses on this computer are allowed, such as http://127.0.0.1:7331. The repository explorer always requires the local service’s read token. Other local features also require it when configured. Use the local read token here; it is kept for this tab only.</div>
+          <div className="small mb-2">Browse your files and saved conversations from this computer’s own page. {OPEN_FROM_THIS_COMPUTER} Nothing below is needed then.</div>
+          <details className="disclosure">
+            <summary>Advanced: use another local address</summary>
+            <div className="muted small mt-2">Leave the address empty to use this page’s own address. Only addresses on this computer are allowed, such as http://127.0.0.1:7331. The repository explorer always requires the local service’s read token. Other local features also require it when configured. Use the local read token here; it is kept for this tab only.</div>
+          </details>
           <div className="mt-2">
             <span className="small muted me-2">Timeline connection:</span>
             {status.kind === 'ready' ? <Pill tone={STATUS[status.value].tone} icon={STATUS[status.value].icon}>{STATUS[status.value].word}</Pill> : status.kind === 'loading' ? <span className="small muted">Checking…</span> : <Pill tone="bad">Could not check</Pill>}
@@ -217,6 +217,8 @@ function LocalServer() {
 /** Per-viewer tour switches; stored in this browser only, like the theme. */
 function Walkthrough() {
   const tour = useTour()
+  // Open on arrival only when some tour is already set to play; later toggles never move it under the reader.
+  const [open] = useState(() => (tour?.prefs.autoplay.length ?? 0) > 0)
   if (!tour) return null
   const welcomeOn = !tour.prefs.welcomeSeen && !tour.prefs.welcomeOff
   const pages = SECTIONS.filter((s) => tourFor(s.key))
@@ -238,27 +240,30 @@ function Walkthrough() {
           </div>
         </div>
       </div>
-      <div className="settings-label mt-3">Page tours</div>
-      <div className="muted small">Switch one on to play it by itself the next time you open that page. Every page also has a question-mark button in the top bar that tours it.</div>
-      <ul className="tour-list">
-        {pages.map((s) => (
-          <li key={s.key}>
-            <Icon name={s.icon} />
-            <span>
-              {tourFor(s.key)!.title}
-              <span className="muted small"> · {s.question}</span>
-            </span>
-            <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => {
-              window.location.hash = s.key
-              tour.start(s.key)
-            }} aria-label={`Run the ${tourFor(s.key)!.title} tour now`}>Run now</button>
-            <div className="form-check form-switch m-0">
-              <input id={`tour-${s.key}`} className="form-check-input" type="checkbox" role="switch" checked={tour.prefs.autoplay.includes(s.key)} disabled={!tour.remember} onChange={(e) => tour.update((p) => setAutoplay(p, s.key, e.target.checked))} />
-              <label className="visually-hidden" htmlFor={`tour-${s.key}`}>Play the {tourFor(s.key)!.title} tour on my next visit</label>
-            </div>
-          </li>
-        ))}
-      </ul>
+      <details className="disclosure mt-3" open={open}>
+        <summary>{`Page tours · ${tour.prefs.autoplay.length} of ${pages.length} set to play`}</summary>
+        <div className="settings-label">Page tours</div>
+        <div className="muted small">Switch one on to play it by itself the next time you open that page. Most pages have a question-mark button in the top bar that tours them; the rest replay this welcome tour.</div>
+        <ul className="tour-list">
+          {pages.map((s) => (
+            <li key={s.key}>
+              <Icon name={s.icon} />
+              <span>
+                {tourFor(s.key)!.title}
+                <span className="muted small"> · {s.question}</span>
+              </span>
+              <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => {
+                window.location.hash = s.key
+                tour.start(s.key)
+              }} aria-label={`Run the ${tourFor(s.key)!.title} tour now`}>Run now</button>
+              <div className="form-check form-switch m-0">
+                <input id={`tour-${s.key}`} className="form-check-input" type="checkbox" role="switch" checked={tour.prefs.autoplay.includes(s.key)} disabled={!tour.remember} onChange={(e) => tour.update((p) => setAutoplay(p, s.key, e.target.checked))} />
+                <label className="visually-hidden" htmlFor={`tour-${s.key}`}>Play the {tourFor(s.key)!.title} tour on my next visit</label>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </details>
     </Box>
   )
 }

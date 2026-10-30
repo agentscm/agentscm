@@ -1,0 +1,68 @@
+/* Shared plain-language pieces (WP0): glosses, next steps and the six-step lifecycle strip.
+   Reuses the Twilight --hub-* tokens; no new colours. The track itself is styles.css `.track`. */
+
+.gloss {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+.next-step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 6px;
+}
+.next-step-human { color: var(--hub-text-2); }
+.next-step-human.is-lead-in { flex-basis: 100%; }
+
+.track.is-lifecycle { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.track.is-lifecycle a.track-label { color: inherit; text-decoration: none; }
+.track.is-lifecycle a.track-label:hover,
+.track.is-lifecycle a.track-label:focus-visible { color: var(--hub-brand-ink); text-decoration: underline; text-underline-offset: 3px; }
+.track-proof { margin-top: 2px; }
+
+@container main (max-width: 720px) {
+  /* styles.css stacks `.track` on phones; the six-column rule above is more specific, so restate it. */
+  .track.is-lifecycle { grid-template-columns: minmax(0, 1fr); }
+  .track.is-lifecycle a.track-label { display: inline-flex; align-items: center; min-height: 44px; }
+  .next-step-copy { min-height: 44px; }
+  .task-line-link { display: inline-flex; align-items: center; min-height: 44px; }
+}
+
+/* G1 dashboard */
+/* The area drawer sat as a card inside the repository box: keep its content, drop the inner card. */
+.area-drawer { padding: 14px 0 0; border-radius: 0; background: transparent; border-top: 1px solid var(--hub-rule); }
+:root[data-density='condensed'] .area-drawer { padding: 10px 0 0; }
+
+/* G2 inbox+history */
+/* A request's target is a section of the request, not a card inside it. */
+.request-body .target.target-plain { background: none; border: 0; border-top: 1px solid var(--hub-rule); border-radius: 0; padding: 12px 0 0; }
+/* The task page shows two facts here now that the last check-in is in the head. */
+.action-grid.is-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* G3 skills */
+/* The existing segmented switch, used as buttons for the run list and the skill source. */
+button.lens-seg { border: 0; background: transparent; cursor: pointer; font-family: inherit; }
+.lens-seg:focus-visible { outline: 2px solid var(--hub-brand); outline-offset: 2px; }
+.box .lens, .page > .lens + .box { margin-top: 0; }
+
+/* G4 setup+front door */
+.seg a { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 999px; color: var(--hub-text-2); font-size: 0.75rem; font-weight: 500; text-decoration: none; }
+.seg a.on { background: var(--hub-surface); color: var(--hub-text); box-shadow: var(--thumb); }
+.seg a:focus-visible { outline: 2px solid var(--hub-brand); outline-offset: 2px; }
+.ws-seg { align-self: flex-start; }
+/* Panels inside the New run box are plain sections, not cards in a card. */
+.ws-subject, .ws-member-form { padding: 12px 0 0; background: none; border-top: 1px solid var(--hub-rule); border-radius: 0; }
+.ws-member-form { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--hub-rule); }
+
+/* F1 handoffs */
+.next-step-decides { font-weight: 600; color: var(--hub-text); }
+.next-step-words { display: flex; flex-basis: 100%; flex-direction: column; gap: 2px; font-size: 0.75rem; color: var(--hub-text-2); }
+.start-task { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.start-task > input { flex: 1 1 260px; min-width: 0; }
+.start-task-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+@container main (max-width: 720px) {
+  .start-task-actions .btn { min-height: 44px; }
+}

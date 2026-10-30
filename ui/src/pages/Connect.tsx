@@ -18,7 +18,7 @@ export function InstallCommand({ lead = 'Run this in a checkout of a repository 
         <code>{command}</code>
         <CopyButton text={command} />
       </div>
-      <p className="install-after">It asks before it changes anything, then opens your browser to sign in with GitHub or GitLab. Over SSH it shows a one-time code instead, where this Hub allows one. macOS and Linux.</p>
+      <p className="install-after">It signs you in with GitHub or GitLab in your browser, then sets up every coding agent it finds without asking again. Over SSH it shows a one-time code instead, where this Hub allows one. macOS and Linux.</p>
     </div>
   )
 }
@@ -40,16 +40,20 @@ export function ConnectAgent() {
   const prompt = agentSetupPrompt(window.location.origin)
   const command = agent ? clientSetupCommand(window.location.origin, agent) : null
   if (!origin || !prompt) {
-    const { protocol, hostname, port } = window.location
+    const { protocol, hostname, port, origin: here } = window.location
     const local = protocol === 'http:' && (hostname === 'localhost' || hostname.endsWith('.localhost'))
+    const note = `The AgentSCM Hub at ${here} is served over ${protocol === 'http:' ? 'plain http' : 'an address'} that agent setup does not accept. Please give us its HTTPS address (or put it behind HTTPS), so engineers can connect their agents.`
     return (
-      <Notice title="This page is not served from a supported Hub address">
-        {local ? `Open this page at http://127.0.0.1${port ? `:${port}` : ''}/ui/ instead of ${hostname}. ` : 'Ask your operator for the Hub’s HTTPS URL. '}Setup commands are only offered for HTTPS or a loopback address.
+      <Notice title="Agent setup is not offered at this address">
+        {local ? `Your sign-in would travel unencrypted over plain http. Open this page at http://127.0.0.1${port ? `:${port}` : ''}/ui/ instead of ${hostname}.` : 'Your sign-in would travel unencrypted over plain http. Open this Hub from its own computer at http://127.0.0.1:PORT/ui/, or ask your hub admin for its HTTPS address.'}{' '}
+        Setup is only offered over HTTPS or a loopback address.{' '}
+        <CopyButton text={note} label="Copy a note for the hub admin" />
       </Notice>
     )
   }
   return (
     <div className="connect">
+      <p className="muted small">Your GitHub or GitLab account needs access to a repository this hub is connected to; otherwise the hub refuses with “not connected”.</p>
       <ol className="steps" data-tour="setup-steps">
         {STEPS.map((s, i) => (
           <li key={s.title}>
@@ -76,6 +80,7 @@ export function ConnectAgent() {
           <Icon name="eye" /> Preview the instructions
         </summary>
         <p className="prompt-preview">{prompt}</p>
+        <p className="muted small mb-0">Your agent has no terminal to answer in, so it passes <code>--yes</code> and takes the recommended answers: every coding agent it finds, set up once for all your projects. It runs the latest published AgentSCM through <code>npx</code>. You approve sign-in and trust yourself. To run it yourself, use <code>{installCommand(window.location.origin)}</code> in a terminal; add <code>--dry-run</code> to preview and <code>npx agentscm uninstall</code> to undo.</p>
       </details>
       <details className="disclosure">
         <summary>
@@ -100,7 +105,12 @@ export function ConnectAgent() {
         )}
         {command && <p className="muted small mt-2 mb-0">Then run <code>npx agentscm client check</code> in the checkout (Hub binding only). Verify hooks and MCP from your agent.</p>}
       </details>
-      <p className="muted small mb-0">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification. <code>agentscm quickstart</code> sets up agents through the same <code>client setup</code>, so either way the agent reports here. Undo one checkout with <code>agentscm client remove</code>. <code>agentscm init-repo</code> only commits shared instructions; each developer still runs this setup.</p>
+      <details className="disclosure">
+        <summary>
+          <Icon name="info-circle" /> Good to know
+        </summary>
+        <p className="muted small mt-2 mb-0">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification. <code>agentscm quickstart</code> sets up agents through the same <code>client setup</code>, so either way the agent reports here. Undo one checkout with <code>agentscm client remove</code>. <code>agentscm init-repo</code> only commits shared instructions; each developer still runs this setup.</p>
+      </details>
     </div>
   )
 }

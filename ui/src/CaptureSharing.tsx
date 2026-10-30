@@ -49,7 +49,7 @@ export function CaptureSharingBox({ token }: { token: string }) {
       setAnnouncement(`Sharing ${on ? 'turned on' : 'turned off'} for ${checkout.repository} in ${checkout.folder}`)
     } catch (e) {
       // The list is re-read below either way; a checkout that vanished from it needs a fresh look.
-      setError(e instanceof SharingError && e.code === 'unknown_checkout' ? 'The checkout list changed; review and try again' : e instanceof Error ? e.message : 'The change failed')
+      setError(e instanceof SharingError && e.code === 'unknown_checkout' ? 'The checkout list changed; review and try again' : e instanceof Error && !e.message.startsWith('HTTP ') ? e.message : 'The change did not go through. Try again in a moment.')
       setAnnouncement('')
     } finally {
       restoreFocus.current = switchId(checkout)
@@ -81,6 +81,7 @@ export function CaptureSharingBox({ token }: { token: string }) {
                 <div className="mt-1">
                   {on ? <Pill tone="brand" icon="cloud-upload">{state}</Pill> : <Pill tone="muted">{state}</Pill>}
                 </div>
+                {on && <p className="muted small mt-1 mb-0">Switching off stops future uploads at once. Copies already uploaded stay until they expire or you delete them.</p>}
                 {checkout.lineage_mismatch && (
                   <p className="small mt-1 mb-0" role="note">
                     Sharing was set for {checkout.saved_hub}; this checkout is now connected to {checkout.hub}. {on ? 'It can only be turned off here.' : 'It cannot be turned on here.'} To start fresh, run <code>agentscm change-capture unconfigure</code> and then <code>agentscm change-capture forget</code> for this checkout.
@@ -126,7 +127,7 @@ export function CaptureSharingBox({ token }: { token: string }) {
 export function CaptureSharingElsewhere() {
   return (
     <Box tour="settings-sharing" icon="chat-square-text" title="Conversation sharing" explain="Off by default.">
-      <p className="small m-0">Sharing agent conversations with the Hub is a setting of each checkout on your computer. Change it in the AgentSCM menu bar app (Share agent conversations with Hub) or on the Hub page opened from this computer with <code>agentscm open</code>.</p>
+      <p className="small m-0">Sharing agent conversations is set per checkout on your computer: in the AgentSCM menu bar app (Share agent conversations with Hub), or in Settings on that computer’s own Hub page.</p>
     </Box>
   )
 }

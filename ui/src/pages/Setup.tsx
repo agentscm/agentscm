@@ -2,10 +2,11 @@ import { fetchSetup } from '../api.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import { blockerLabel, setupState, type SetupStatus } from '../onboarding.ts'
 import { useNow } from '../useHub.ts'
-import { agentLabel, Avatar, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
+import { agentLabel, Avatar, Box, Empty, Icon, Notice, PageHead, Pill, Skeleton } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { ConnectAgent, InstallCommand } from './Connect.tsx'
 
+const STATE_LABEL = { Ready: 'Ready', Blocked: 'Needs action', Unverified: 'Not yet verified' } as const
 const STATE_TONE = { Ready: 'ok', Blocked: 'warn', Unverified: 'muted' } as const
 const STATE_ICON = { Ready: 'patch-check', Blocked: 'exclamation-octagon', Unverified: 'question-circle' } as const
 
@@ -24,14 +25,10 @@ export function SetupPage({ token }: { token: string }) {
   const rows: SetupStatus[] = load.kind === 'ready' ? load.value : []
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Is my agent set up?</h1>
-        <p className="answer-text">Connect an agent, then let it prove itself once.</p>
-        <p className="answer-fact">An agent is ready when, in one session, it reached the hub over MCP and its edit hook fired on a real edit.</p>
-      </div>
+      <PageHead question="Is my agent set up?" answer="Connect an agent, then let it prove itself once." fact="Ready means one session reached the hub over MCP and its edit hook fired on a real edit." />
       <SectionTabs />
       <div className="grid-2 align-start">
-        <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts 15 minutes after the agent’s last check, and never longer than its token (30 days for client setup). Ready doesn’t promise future quota, or that every edit tool is covered.">
+        <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts 15 minutes after the agent’s last check, and never longer than the agent’s token: 24 hours from a signed-in computer (it renews itself), 30 days on a Hub older than computer sign-in. Ready doesn’t promise future quota, or that every edit tool is covered.">
           {load.kind === 'loading' && <Skeleton rows={3} />}
           {!available && load.kind !== 'loading' && <Notice tone="muted" icon="info-circle" title="Setup verification unavailable">No agent is marked ready until the hub answers again.</Notice>}
           {load.kind === 'ready' && rows.length === 0 && (
@@ -50,22 +47,19 @@ export function SetupPage({ token }: { token: string }) {
                 <li key={row.key} className="setup-row">
                   <div className="d-flex align-items-center gap-2 flex-wrap">
                     <Avatar name={row.name} size={28} />
-                    <strong title={row.name}>{agentLabel(row.name)}</strong>
+                    <strong title={`${row.name} (session ${row.key.slice(0, 8)})`}>{agentLabel(row.name)}</strong>
                     <span className="muted small">
                       {row.owner} · {row.agent}
                     </span>
                     <span className="ms-auto">
                       <Pill tone={STATE_TONE[state]} icon={STATE_ICON[state]}>
-                        {state}
+                        {STATE_LABEL[state]}
                       </Pill>
                     </span>
                   </div>
                   <div className="pills mt-2">
                     <Check ok={row.mcp_verified && live} label="MCP" tip="The agent called AgentSCM over MCP from this session." />
                     <Check ok={row.native_verified && live} label={row.agent === 'cursor' ? 'Edit hook (after edit)' : 'Edit hook'} tip="The agent’s native edit hook reported a real edit to the hub in this session." />
-                    <span className="small muted">
-                      <Icon name="hash" /> {row.key.slice(0, 8)}
-                    </span>
                   </div>
                   {state !== 'Ready' && <p className="small mt-2 mb-0">
                     <Icon name="arrow-right-circle" /> {!available ? 'Verification unavailable. Reconnect to the hub before relying on setup status.' : row.expires_at <= now / 1000 ? 'Evidence expired. Ask your agent to verify MCP and a native edit again.' : row.blocker ? `${blockerLabel(row.blocker)}. ${row.next_action}` : state === 'Unverified' ? `Ask your agent to: ${row.next_action}` : row.next_action}
@@ -77,11 +71,11 @@ export function SetupPage({ token }: { token: string }) {
           {/* Ready rows share one next step; it is said once rather than under every agent. */}
           {(() => {
             const ready = rows.find((row) => setupState(row, now, available) === 'Ready')
-            return ready ? <p className="small muted mt-2 mb-0"><Icon name="check2-circle" /> Ready: {ready.next_action}</p> : null
+            return ready ? <p className="small muted mt-2 mb-0"><Icon name="check2-circle" /> For Ready agents: {ready.next_action}</p> : null
           })()}
           {rows.length > 30 && <p className="small muted">Showing 30 setup sessions.</p>}
         </Box>
-        <Box tour="setup-connect" icon="plug" title="Connect an agent" explain="Copies the instructions your agent follows to install AgentSCM.">
+        <Box tour="setup-connect" icon="plug" title="Connect an agent" intro="Send this to each engineer: they copy these instructions into their agent." explain="Copies the instructions your agent follows to install AgentSCM.">
           <ConnectAgent />
         </Box>
       </div>

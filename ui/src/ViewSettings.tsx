@@ -8,6 +8,11 @@ import { usePoll } from './usePoll.ts'
 const SIGN_IN = 'Sign in to the workspace to change your views.'
 const ADMIN_ONLY = 'Only a workspace administrator can change the hub default.'
 const CHILD_OFF = 'Off because the master switch is off'
+/** What a failed read means to a reader; never the raw status. */
+const unavailable = (status?: number): { title: string; body: string } =>
+  status === 404 ? { title: 'This hub does not offer inline agent views', body: 'It is probably an older version. Ask your hub admin to update it, then reload this page.' }
+  : status === 401 || status === 403 ? { title: 'This sign-in cannot read this setting', body: 'Sign in again, then reload this page.' }
+  : { title: 'Could not load this setting', body: 'The hub did not answer properly. Retry in a moment.' }
 const FIELDS: { id: string; field: keyof ViewSettings; label: string; hint: string; child: boolean }[] = [
   { id: 'master', field: 'enabled', label: 'Show views in agent apps', hint: 'Turns inline views on or off everywhere.', child: false },
   { id: 'work', field: 'work_overview', label: 'Work overview', hint: 'Who is working on what, as a card.', child: true },
@@ -66,15 +71,14 @@ export function ViewSettingsBox({ token }: { token: string }) {
   })
   const settled = session.kind !== 'loading'
   return (
-    <Box id="view-settings" icon="window-stack" title="Inline agent views">
-      <p className="muted small" id="view-settings-explain">When an agent app supports it, the work overview and coordination inbox appear as cards inside the conversation. Turning this off keeps the plain text answers.</p>
+    <Box id="view-settings" icon="window-stack" title="Inline agent views" tone="warn" explain="Shared with everyone on this hub. Where an agent app supports it, the work overview and coordination inbox appear as cards in the conversation. Off keeps plain text answers.">
       {load.kind === 'loading' && <Skeleton rows={3} />}
-      {load.kind === 'error' && <Notice title="Could not load this setting" action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>}>{load.message}</Notice>}
-      {load.kind === 'ready' && load.refreshError && <Notice title="Showing the last value. The latest refresh failed.">{load.refreshError}</Notice>}
+      {load.kind === 'error' && <Notice title={unavailable(load.status).title} action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>}>{unavailable(load.status).body}</Notice>}
+      {load.kind === 'ready' && load.refreshError && <Notice title="Showing the last value. The latest refresh failed.">The hub did not answer; this page tries again.</Notice>}
       {current && (
         <>
           <h3 className="h6 mt-2">Your views</h3>
-          <p className="muted small" id="mine-explain">These choices apply only to your own agents. Agents can also change them with the <code>agentscm_view_settings</code> tool.</p>
+          <p className="muted small" id="mine-explain">Switches save at once and apply only to your own agents. Agents can also change them with the <code>agentscm_view_settings</code> tool.</p>
           {row('mine', current.effective, !!member, (f, on) => void mine({ [f]: on }), (f) => (current.override?.[f] != null ? 'from your setting' : 'from the hub default'))}
           {current.override && Object.values(current.override).some((v) => v != null) && (
             <button type="button" className="btn btn-sm btn-outline-secondary mt-2" disabled={!member || saving} onClick={() => void mine({ reset: true })}>Use the hub default</button>
@@ -82,7 +86,7 @@ export function ViewSettingsBox({ token }: { token: string }) {
           {!member && settled && <p className="muted small mt-2 mb-0" id="view-settings-readonly">{SIGN_IN}</p>}
           <details className="mt-3">
             <summary className="small">Hub default</summary>
-            <p className="muted small mt-2" id="default-explain">Used for anyone who hasn&apos;t chosen their own setting.</p>
+            <p className="muted small mt-2" id="default-explain">Used for anyone who hasn&apos;t chosen their own setting. Switches save at once, for everyone on this hub.</p>
             {row('default', current.hub_default, admin, (f, on) => void setDefault({ [f]: on }))}
             {!admin && settled && <p className="muted small mb-0" id="default-readonly">{ADMIN_ONLY}</p>}
           </details>

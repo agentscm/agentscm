@@ -34,7 +34,7 @@ describe.skipIf(!live)('the Twilight app rendered against the live hub', () => {
   it('Where answers who holds which files', async () => {
     go('#now')
     render(<App />)
-    await main().findByText(/are working on/, {}, LOAD)
+    await main().findByText(/unfinished tasks/, {}, LOAD)
     expect(main().getByText('The repository')).toBeTruthy()
     expect(main().getByText('Contested files')).toBeTruthy()
   })

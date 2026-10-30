@@ -10,9 +10,10 @@ use sha2::{Digest, Sha256};
 
 // `'unsafe-inline'` for styles only: React sets inline `style` attributes, which `style-src` governs.
 // Fonts and images are inlined into app.css as `data:` URIs, hence `font-src` and `img-src` allow `data:`.
+// `manifest-src` lets the browser fetch /ui/manifest.webmanifest, which makes the page installable as an app.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-    img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; \
-    form-action 'none'; frame-ancestors 'none'";
+    img-src 'self' data:; font-src 'self' data:; connect-src 'self'; manifest-src 'self'; \
+    base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[cfg(feature = "ui")]
 const INDEX: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/index.html"));
@@ -20,6 +21,17 @@ const INDEX: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dis
 const SCRIPT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/app.js"));
 #[cfg(feature = "ui")]
 const STYLE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/app.css"));
+#[cfg(feature = "ui")]
+const MANIFEST: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/ui/dist/manifest.webmanifest"
+));
+#[cfg(feature = "ui")]
+const ICON_192: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/icon-192.png"));
+#[cfg(feature = "ui")]
+const ICON_512: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/icon-512.png"));
 
 #[cfg(not(feature = "ui"))]
 const INDEX: &[u8] = b"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -32,6 +44,12 @@ static INDEX_TAG: LazyLock<String> = LazyLock::new(|| tag(INDEX));
 static SCRIPT_TAG: LazyLock<String> = LazyLock::new(|| tag(SCRIPT));
 #[cfg(feature = "ui")]
 static STYLE_TAG: LazyLock<String> = LazyLock::new(|| tag(STYLE));
+#[cfg(feature = "ui")]
+static MANIFEST_TAG: LazyLock<String> = LazyLock::new(|| tag(MANIFEST));
+#[cfg(feature = "ui")]
+static ICON_192_TAG: LazyLock<String> = LazyLock::new(|| tag(ICON_192));
+#[cfg(feature = "ui")]
+static ICON_512_TAG: LazyLock<String> = LazyLock::new(|| tag(ICON_512));
 
 /// The page's routes. They hold no state, so the local service mounts the same page.
 pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
@@ -67,6 +85,29 @@ pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
             "/ui/app.css",
             get(|headers: HeaderMap| async move {
                 asset(&headers, "text/css; charset=utf-8", STYLE, &STYLE_TAG)
+            }),
+        )
+        .route(
+            "/ui/manifest.webmanifest",
+            get(|headers: HeaderMap| async move {
+                asset(
+                    &headers,
+                    "application/manifest+json",
+                    MANIFEST,
+                    &MANIFEST_TAG,
+                )
+            }),
+        )
+        .route(
+            "/ui/icon-192.png",
+            get(|headers: HeaderMap| async move {
+                asset(&headers, "image/png", ICON_192, &ICON_192_TAG)
+            }),
+        )
+        .route(
+            "/ui/icon-512.png",
+            get(|headers: HeaderMap| async move {
+                asset(&headers, "image/png", ICON_512, &ICON_512_TAG)
             }),
         );
     router

@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
-import { CLIENT_AGENTS, agentSetupPrompt, clientSetupCommand, installCommand, safeHubOrigin } from '../src/connectAgent.ts'
+import { CLIENT_AGENTS, agentSetupPrompt, clientSetupCommand, installCommand, safeHubOrigin, signInHelpPrompt } from '../src/connectAgent.ts'
 import { decodeSetup, setupState } from '../src/onboarding.ts'
 
 assert.equal(safeHubOrigin('https://hub.example.com'), 'https://hub.example.com')
@@ -34,6 +34,13 @@ assert.ok(prompt?.includes('/hooks'))
 assert.ok(prompt && prompt.length < 800)
 assert.ok(!prompt?.toLowerCase().includes('token='))
 assert.equal(agentSetupPrompt('https://hub.example.com/?token=secret'), null)
+
+const help = signInHelpPrompt('https://hub.example.com')
+assert.ok(help?.includes('Hub at https://hub.example.com has no GitHub or GitLab sign-in'))
+assert.ok(help?.includes('Sign-in configuration'))
+assert.ok(help?.includes('deploy a Hub'))
+assert.ok(!help?.toLowerCase().includes('token='))
+assert.equal(signInHelpPrompt('http://hub.example.com'), null)
 
 console.log('connect-agent command checks passed')
 

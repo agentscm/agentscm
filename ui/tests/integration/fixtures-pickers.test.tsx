@@ -45,7 +45,7 @@ describe('Landed picker', () => {
     const sent = stubHub()
     at('#landed')
     render(<LandedPage repo={REPO} token="fixture-token" />)
-    await screen.findByText(/recent changes landed/, {}, LOAD)
+    await screen.findByText(/recent changes merged/, {}, LOAD)
     expect(document.querySelector('[data-tour="pager"]')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /Older changes/ }))
     await waitFor(() => expect(window.location.hash).toMatch(/^#landed\?before=pub_/))

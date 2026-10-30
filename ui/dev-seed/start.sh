@@ -27,7 +27,8 @@ export AGENTSCM_DATABASE_URL="sqlite://$data/hub.sqlite"
 # connection never polls (mint pushes next_poll_at ten years out) and the API URL points at a dead
 # local port, so nothing here can reach real GitHub (the PR-opened publication's merge check fails closed).
 export AGENTSCM_GITHUB_EXTERNAL_RUNS=counterbranch/agentscm
-export AGENTSCM_GITHUB_API_URL=http://127.0.0.1:9
+# Set AGENTSCM_GITHUB_API_URL=https://api.github.com with AGENTSCM_GITHUB_CLIENT_ID/_SECRET_FILE to try real GitHub sign-in.
+export AGENTSCM_GITHUB_API_URL="${AGENTSCM_GITHUB_API_URL:-http://127.0.0.1:9}"
 "$bin" hub --no-telemetry serve --bind "127.0.0.1:$port" --objects "$data/objects" --secrets "$data/secrets" &
 hub=$!
 trap 'kill $hub 2>/dev/null' EXIT

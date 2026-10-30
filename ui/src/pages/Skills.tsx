@@ -1,12 +1,20 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
 import { Track } from './Landed.tsx'
+import { lead, WorkLink } from './workParts.tsx'
+import { Gloss } from '../Gloss.tsx'
+import { who } from '../nextStep.ts'
+import { SEARCH_THIS_PAGE_ONLY } from '../copy.ts'
+import { ProofBadge } from '../Proof.tsx'
+import { runProof } from '../proof.ts'
+import type { WorkItem } from '../standup.ts'
+import { useTaskIndex } from '../taskIndex.ts'
 import {
   GATE_STATE_VIEW, addCommand, adoptionLabel, assuranceView, enforcement, fetchLibrary, fetchRun, fetchRuns, gateLabel, gateSteps, lastEvidence, paramText, parseStep, removeCommand,
-  runMatches, runStateLabel, stepText, runStateTone, selfReportedCount, shortSha, skillRunHref, skillRunsHref, skillsHref, skillsRoute, type CatalogEntry, type Evidence, type Library, type Pin, type RunView, type StepEnforce,
+  runMatches, runStateLabel, stepText, runStateTone, selfReportedCount, shortSha, skillRunHref, stepCounts, skillRunsHref, skillsHref, skillsRoute, type CatalogEntry, type Evidence, type Library, type Pin, type RunView, type StepEnforce,
 } from '../skills.ts'
 import { Markdown } from '../Markdown.tsx'
-import { Ago, Box, CopyButton, Empty, Icon, Notice, Pill, Skeleton, type Tone } from '../ui.tsx'
+import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, PageHead, Pill, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 
 function Loaded<T>({ poll, what, children }: { poll: Poll<T>; what: string; children: (v: T) => ReactNode }) {
@@ -50,9 +58,9 @@ function Applicability({ c }: { c: CatalogEntry }) {
 }
 
 const ENFORCE_VIEW: Record<StepEnforce, { label: string; tone: Tone; icon: string }> = {
-  block: { label: 'Blocks finish', tone: 'brand', icon: 'sign-stop' },
-  warn: { label: 'Warns', tone: 'muted', icon: 'bell' },
-  record: { label: 'Recorded', tone: 'muted', icon: 'journal-text' },
+  block: { label: 'Blocks the author’s session where the Stop hook is installed', tone: 'brand', icon: 'sign-stop' },
+  warn: { label: 'Warns only', tone: 'muted', icon: 'bell' },
+  record: { label: 'Recorded only', tone: 'muted', icon: 'journal-text' },
 }
 const whoIcon = (who: string) => (/^maintainer/i.test(who) ? 'person' : /session/i.test(who) ? 'people' : 'robot')
 
@@ -101,7 +109,11 @@ function SkillItem({ c, pin, children }: { c: CatalogEntry; pin: Pin | null; chi
       <p className="skill-summary">{c.summary}</p>
       <Applicability c={c} />
       <HowItWorks c={c} pin={pin} />
-      <Params c={c} pin={pin} />
+      <details className="skill-details">
+        <summary>Settings and version digest</summary>
+        <p className="small mb-1">Digest <code>sha256:{shortSha(c.sha256)}</code></p>
+        <Params c={c} pin={pin} />
+      </details>
       <div className="skill-act">{children}</div>
     </li>
   )
@@ -111,9 +123,9 @@ function SkillHead({ c, children }: { c: CatalogEntry; children?: ReactNode }) {
   const { enforced, planned } = enforcement(c.gates)
   return (
     <div className="skill-head" data-tour="skills-head">
-      <strong>{c.name}</strong> <span className="muted">v{c.workflow_version}</span> <code className="small muted">sha256:{shortSha(c.sha256)}</code>
-      {c.first_party && <Pill tone="brand" icon="patch-check">First-party</Pill>}
-      {enforced.length > 0 && <Pill tone="ok" icon="shield-check">Enforced: {enforced.join(', ')}</Pill>}
+      <strong>{c.name}</strong> <span className="muted">v{c.workflow_version}</span>
+      {c.first_party && <Pill tone="brand" icon="patch-check">Built in</Pill>}
+      {enforced.length > 0 && <Pill tone="muted" icon="shield" tip="Installed per checkout with the agentscm skill stop command. The hub does not know which checkouts have it, and it lets the agent finish when the hub is unreachable or the checkout is detached.">Available: {enforced.join(', ')} (opt-in, fails open)</Pill>}
       {planned.length > 0 && <Pill tone="muted" icon="hourglass-split">Planned: {planned.join(', ')}</Pill>}
       {children}
     </div>
@@ -121,9 +133,9 @@ function SkillHead({ c, children }: { c: CatalogEntry; children?: ReactNode }) {
 }
 
 function Params({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
-  if (c.parameters.length === 0) return null
+  if (c.parameters.length === 0) return <p className="small muted mb-0">No settings.</p>
   return (
-    <p className="small mb-1">
+    <p className="small mb-0">
       <span className="muted">Settings: </span>
       {c.parameters.map((p, i) => {
         const v = pin && p.name in pin.params ? pin.params[p.name] : p.default
@@ -144,14 +156,13 @@ function LibraryView({ repo, token }: { repo: string; token: string }) {
   const poll = usePoll((signal) => fetchLibrary(repo, token, signal), 15_000, `skills|${repo}`)
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Which workflows do agents in this repository have to follow?</h1>
-        <p className="answer-text">{poll.kind === 'ready' ? (() => { const n = poll.value.adoption.pins.filter((p) => p.status === 'adopted').length; return n === 0 ? 'This repository requires no skills yet.' : <>Agents here have to follow <b>{n} {n === 1 ? 'skill' : 'skills'}</b>.</> })() : 'Checking which skills this repository requires…'}</p>
-        <p className="answer-fact"><code>{repo}</code>{poll.kind === 'ready' && <> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></>} · <a href="#templates?view=skills">Create or import reusable skills</a></p>
-      </div>
+      <PageHead
+        question="Which workflows are agents in this repository expected to follow?"
+        answer={poll.kind === 'ready' ? (() => { const n = poll.value.adoption.pins.filter((p) => p.status === 'adopted').length; const { steps, canStop } = stepCounts(poll.value); return n === 0 ? 'This repository has adopted no skills yet.' : <>Agents here are expected to follow <b>{n} <Gloss term="skills">{n === 1 ? 'skill' : 'skills'}</Gloss></b>. {canStop} of {steps} steps can stop an agent (opt-in Stop hook); evidence is reported by the agent.</> })() : 'Checking which skills this repository has adopted…'}
+        fact={<>{poll.kind === 'ready' && <><span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span>. </>}<a href="#templates?view=skills">Create or import reusable skills</a></>}
+      />
       <SectionTabs />
       <Loaded poll={poll} what="skills">{(lib) => <Library lib={lib} />}</Loaded>
-      <p className="small muted"><Icon name="info-circle" /> Read-only. Adoption is the lock file in the repository; it takes effect when <code>agentscm-skills.lock.json</code> is committed.</p>
     </div>
   )
 }
@@ -164,16 +175,16 @@ function Library({ lib }: { lib: Library }) {
   const attention = lib.adoption.pins.filter((p) => p.status !== 'adopted')
   return (
     <>
-      <Box tour="skills-adopted" icon="check2-circle" title="Adopted" count={adopted.length} explain="Skills pinned in this repository’s lock file. Agents are expected to follow them.">
+      <Box tour="skills-adopted" icon="check2-circle" title="Adopted" intro="Adoption takes effect once agentscm-skills.lock.json is committed." explain="Skills pinned in this repository’s lock file. Agents are expected to follow them.">
         {adopted.length === 0 ? (
-          <Empty icon="journal-check" title={lib.adoption.source === 'none' ? 'Not adopted' : 'Nothing adopted'}>No skill is pinned for this repository yet. Pick one under Available.</Empty>
+          <Empty icon="journal-check" title={lib.adoption.source === 'none' ? 'Not adopted' : 'Nothing adopted'}>No skill is pinned yet. Copy an adopt command under Available, run it in the repository, then commit the lock file.</Empty>
         ) : (
           <ul className="skill-list">
             {adopted.map(({ p, c }) => {
               const n = lib.counts[c.name] ?? { open: 0, at_stop_gate: 0, completed: 0 }
               return (
                 <SkillItem key={c.name} c={c} pin={p}>
-                  <p className="small mb-2">{n.open} open run{n.open === 1 ? '' : 's'} · {n.at_stop_gate} at a stop gate · {n.completed} completed <a className="ms-2" href={skillRunsHref}>View runs</a></p>
+                  <p className="small mb-2">{n.open} open, {n.at_stop_gate} at a stop gate, {n.completed} completed <a className="ms-2" href={skillRunsHref}>View runs</a></p>
                   <p className="small muted mb-1">To remove it, run this in the repository, then commit the lock file:</p>
                   <Cmd command={removeCommand(c.name)} label={`Remove ${c.name}`} />
                 </SkillItem>
@@ -225,13 +236,10 @@ function RunsList({ repo, token }: { repo: string; token: string }) {
   const poll = usePoll((signal) => fetchRuns(repo, token, signal), 15_000, `skill-runs|${repo}`)
   const [tab, setTab] = useState<RunTab>('open')
   const [search, setSearch] = useState('')
+  const tasks = useTaskIndex(token)
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Where is each pull request in its workflow?</h1>
-        <p className="answer-text">Every pull request, at the step its workflow reached.</p>
-        <p className="answer-fact"><a href={skillsHref}><Icon name="arrow-left" /> Skills library</a> · <code>{repo}</code></p>
-      </div>
+      <PageHead question="Where is each pull request in its workflow?" answer="Every pull request, at the step its workflow reached." fact={<a href={skillsHref}><Icon name="arrow-left" /> Back to the skills library</a>} />
       <SectionTabs />
       <Loaded poll={poll} what="skill runs">
         {({ runs, truncated }) => {
@@ -240,9 +248,9 @@ function RunsList({ repo, token }: { repo: string; token: string }) {
           return (
             <>
               {truncated && <Notice title="This list is incomplete">The hub returned only the most recent runs. Older runs are not shown.</Notice>}
-              <div className="tabbar" role="tablist" aria-label="Run views">
+              <div className="lens" role="tablist" aria-label="Run views">
                 {(['open', 'completed'] as const).map((t) => (
-                  <button key={t} type="button" role="tab" aria-selected={tab === t} className={`tab${tab === t ? ' active' : ''}`} onClick={() => setTab(t)}>
+                  <button key={t} type="button" role="tab" aria-selected={tab === t} className={`lens-seg${tab === t ? ' on' : ''}`} onClick={() => setTab(t)}>
                     {t === 'open' ? 'Open' : 'Completed'}
                     <span className="tab-count">{runs.filter((r) => (t === 'open') === (r.state === 'open')).length}</span>
                   </button>
@@ -252,11 +260,11 @@ function RunsList({ repo, token }: { repo: string; token: string }) {
                 <span className="input-group-text"><Icon name="search" /></span>
                 <input className="form-control" aria-label="Search runs on this page" placeholder="Search runs on this page" value={search} onChange={(e) => setSearch(e.target.value)} />
               </div>
-              <Box tour="skills-runs" icon="signpost-split" title={tab === 'open' ? 'Open runs' : 'Completed runs'} count={shown.length} explain="Searches only the runs loaded on this page.">
+              <Box tour="skills-runs" icon="signpost-split" title={tab === 'open' ? 'Open runs' : 'Completed runs'} explain={SEARCH_THIS_PAGE_ONLY}>
                 {shown.length === 0 ? (
-                  <Empty icon="signpost-split" title={search ? 'No runs match' : tab === 'open' ? 'No open runs' : 'No completed runs'}>{search ? 'Search covers only the runs loaded on this page.' : 'Runs start when an agent records the first evidence for a branch.'}</Empty>
+                  <Empty icon="signpost-split" title={search ? 'No runs match' : tab === 'open' ? 'No open runs' : 'No completed runs'}>{search ? 'Try another branch, pull request number or next action.' : 'Runs start when an agent records the first evidence for a branch. Adopt a skill on the Skills page to begin.'}</Empty>
                 ) : (
-                  <ul className="run-list">{shown.map((r) => <RunRow key={r.run_id} run={r} />)}</ul>
+                  <ul className="run-list">{shown.map((r) => <RunRow key={r.run_id} run={r} task={tasks?.byBranch.get(r.branch)} />)}</ul>
                 )}
               </Box>
             </>
@@ -267,14 +275,16 @@ function RunsList({ repo, token }: { repo: string; token: string }) {
   )
 }
 
-function RunRow({ run }: { run: RunView }) {
+function RunRow({ run, task }: { run: RunView; task: WorkItem | undefined }) {
   const self = selfReportedCount(run)
+  const l = task ? lead(task) : null
   return (
     <li>
       <a href={skillRunHref(run.run_id)} className="run-row skill-run-row">
         <span className="run-main">
-          <strong>{run.pull_request !== null ? `#${run.pull_request}` : 'No pull request yet'}</strong> <code className="branch-name">{run.branch}</code>
-          <span className="small muted">head <code>{shortSha(run.head_sha)}</code> · {run.skill.name} v{run.skill.workflow_version}</span>
+          {task && l && <strong className="d-block">{task.title} · {who(l.login, l.agent)}</strong>}
+          {task ? <span className="small">{run.pull_request !== null ? `#${run.pull_request}` : 'No pull request yet'} <code className="branch-name">{run.branch}</code></span> : <><strong>{run.pull_request !== null ? `#${run.pull_request}` : 'No pull request yet'}</strong> <code className="branch-name">{run.branch}</code></>}
+          <span className="small muted">{run.skill.name} v{run.skill.workflow_version}, head <code>{shortSha(run.head_sha)}</code></span>
           <span className="skill-next">{run.next_action}</span>
         </span>
         <span className="skill-track"><Track steps={gateSteps(run.gates)} /></span>
@@ -302,35 +312,40 @@ function EvidenceItem({ e }: { e: Evidence }) {
 
 function RunDetail({ repo, runId, token }: { repo: string; runId: string; token: string }) {
   const poll = usePoll((signal) => fetchRun(repo, runId, token, signal), 15_000, `skill-run|${repo}|${runId}`)
+  const tasks = useTaskIndex(token)
   return (
     <div className="page">
       <p className="mb-2"><a href={skillRunsHref}><Icon name="arrow-left" /> All runs</a></p>
-      <Loaded poll={poll} what="this run">{(run) => <Run run={run} />}</Loaded>
+      <Loaded poll={poll} what="this run">{(run) => <Run run={run} task={tasks?.byBranch.get(run.branch)} />}</Loaded>
     </div>
   )
 }
 
-function Run({ run }: { run: RunView }) {
+function Run({ run, task }: { run: RunView; task: WorkItem | undefined }) {
   const last = lastEvidence(run)
   const lastA = last ? assuranceView(last.assurance) : null
+  const l = task ? lead(task) : null
+  const pr = run.pull_request !== null ? `#${run.pull_request} ` : ''
   return (
     <>
-      <div className="answer detail-head" data-tour="answer">
-        <h1 className="page-question">{run.pull_request !== null ? `#${run.pull_request} · ` : ''}<code className="branch-name">{run.branch}</code></h1>
-        <p className="answer-text">{run.skill.name} v{run.skill.workflow_version} · head <code>{shortSha(run.head_sha)}</code> · <Pill tone={runStateTone(run)}>{runStateLabel(run)}</Pill></p>
-      </div>
+      <PageHead
+        className="detail-head"
+        question={task ? task.title : `${pr}${run.branch}`}
+        answer={<><Pill tone={runStateTone(run)}>{runStateLabel(run)}</Pill> {run.skill.name} v{run.skill.workflow_version}</>}
+        fact={<>{task && l && <><WorkLink id={task.id}>Open the task</WorkLink> by {who(l.login, l.agent)}. </>}<span>Proof so far: <ProofBadge level={runProof(run.gates)} /></span></>}
+      />
       <div className="skill-cells">
         <div><h2>Next action</h2><p className="mb-0">{run.next_action}</p></div>
         <div>
-          <h2>Blocking finish?</h2>
-          <p className="mb-0"><strong>{run.blocks_finish ? 'Yes' : 'No'}</strong>. {run.blocks_finish ? 'Where the opt-in Stop hook is installed, it blocks the author at tests, review and fix until this gate has evidence for the current head.' : 'Where the opt-in Stop hook is installed, it blocks the author only at tests, review and fix. This run is not at one of them.'}</p>
+          <h2>Blocking finish? <Explain text={run.blocks_finish ? 'Where the opt-in Stop hook is installed, it blocks the author at tests, review and fix until this gate has evidence for the current head.' : 'Where the opt-in Stop hook is installed, it blocks the author only at tests, review and fix.'} /></h2>
+          <p className="mb-0"><strong>{run.blocks_finish ? 'Yes' : 'No'}</strong>. {run.blocks_finish ? 'The author is held here until this gate has evidence.' : 'This run is not at tests, review or fix.'}</p>
         </div>
         <div>
           <h2>Last evidence</h2>
           <p className="mb-0">{last ? <>{last.summary} · <Ago at={last.recorded_at} />{lastA && last.assurance === 'self_reported' && <> <Pill tone={lastA.tone} icon={lastA.icon}>{lastA.label}</Pill></>}</> : 'None recorded.'}</p>
         </div>
       </div>
-      <Box icon="list-check" title="Gates" count={run.gates.length}>
+      <Box icon="list-check" title="Gates">
         <table className="skill-gates">
           <thead><tr><th scope="col">Gate</th><th scope="col">State</th><th scope="col">Evidence</th><th scope="col">Assurance</th></tr></thead>
           <tbody>
@@ -356,6 +371,8 @@ function Run({ run }: { run: RunView }) {
       <details className="skill-details">
         <summary>Technical details</summary>
         <dl className="skill-tech">
+          {task && <><dt>task</dt><dd><WorkLink id={task.id}>{task.title}</WorkLink></dd></>}
+          <dt>pull request</dt><dd>{run.pull_request !== null ? `#${run.pull_request}` : 'none yet'} on <code>{run.branch}</code></dd>
           <dt>run_id</dt><dd><code>{run.run_id}</code></dd>
           <dt>skill sha256</dt><dd><code>{run.skill.sha256}</code></dd>
           <dt>head</dt><dd><code>{run.head_sha}</code></dd>

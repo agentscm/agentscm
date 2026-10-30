@@ -6,7 +6,8 @@ test.use({ storageState: { cookies: [], origins: [] } })
 
 test.beforeAll(async ({ request }) => {
   const up = await request.get('/__mock/up').catch(() => null)
-  test.skip(!up?.ok(), 'Needs the mock hub: run with MOCK=1 so vite serves it.')
+  // Without MOCK=1, vite's SPA fallback answers this path with index.html, so check the mock's own reply.
+  test.skip(!up?.ok() || !(await up.text()).includes('hub is now healthy'), 'Needs the mock hub: run with MOCK=1 so vite serves it.')
 })
 
 const dialog = (page: Page) => page.getByRole('dialog')
@@ -48,7 +49,7 @@ test('first sign-in shows the welcome tour; Next, Back and the counter work', as
   await expect(title(page)).toHaveText(first!)
   await page.keyboard.press('ArrowRight')
   await expect(count(page)).toHaveText(/^2 \/ \d+$/)
-  await expect(page.locator('.tour-hole')).toBeVisible() // step 2 spotlights the repo button
+  await expect(page.locator('.tour-hole')).toBeVisible() // step 2 spotlights the answer sentence
 })
 
 test('every welcome step stays inside the viewport with reachable buttons', async ({ page }) => {
@@ -106,7 +107,7 @@ test('the Settings switch brings the welcome tour back after a reload', async ({
   await expect(dialog(page)).toBeVisible()
 })
 
-test('the Tour this page trigger runs the Dashboard › Now tour', async ({ page }) => {
+test('the Tour this page trigger runs the Now tour', async ({ page }) => {
   await signIn(page)
   await page.keyboard.press('Escape')
   await trigger(page).click()
@@ -127,8 +128,8 @@ test('the Skills tour spotlights the live page and quotes its plain-English step
   await page.evaluate(() => (window.location.hash = 'skills'))
   await expect(page.locator('[data-tour="skills-how"]').first()).toBeVisible()
   await trigger(page).click()
-  await expect(title(page)).toHaveText('Which workflows agents must follow')
-  for (const [name, live] of [['Adopted skills', /adopted here/], ['What is enforced and what is planned', /Enforced: Stop hook/], ['How it works, in plain English', /Step 1 says: “.+”/], ['Adopt or remove with a command', /Copy this: agentscm skill (add|remove) /]] as const) {
+  await expect(title(page)).toHaveText('Which workflows agents are expected to follow')
+  for (const [name, live] of [['Adopted skills', /adopted here/], ['What can stop an agent, and what is planned', /Available: Stop hook/], ['How it works, in plain English', /Step 1 says: “.+”/], ['Adopt or remove with a command', /Copy this: agentscm skill (add|remove) /]] as const) {
     await page.keyboard.press('ArrowRight')
     await expect(title(page)).toHaveText(name)
     await expect(page.locator('.tour-hole')).toBeVisible()
@@ -158,7 +159,8 @@ test('a Settings "Run now" starts that page’s tour', async ({ page }) => {
   await signIn(page)
   await page.keyboard.press('Escape')
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await page.getByRole('button', { name: 'Run the Dashboard › Now tour now' }).click()
+  await page.getByText(/^Page tours ·/).click()
+  await page.getByRole('button', { name: 'Run the Now tour now' }).click()
   await expect(title(page)).toHaveText('The answer comes first')
   await expect(page.locator('[data-tour="answer"]')).toBeVisible() // it took us to the page
 })
@@ -168,7 +170,8 @@ test('a page tour switched on in Settings plays until finished or turned off', a
   await dialog(page).getByRole('checkbox', { name: 'Don’t show again' }).check()
   await page.keyboard.press('Escape')
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await page.getByRole('switch', { name: 'Play the Dashboard › Now tour on my next visit' }).check()
+  await page.getByText(/^Page tours ·/).click()
+  await page.getByRole('switch', { name: 'Play the Now tour on my next visit' }).check()
   await page.evaluate(() => (window.location.hash = 'home'))
   await expect(title(page)).toHaveText('The answer comes first')
   await page.keyboard.press('Escape') // closed without the box: it plays again next visit
@@ -179,7 +182,8 @@ test('a page tour switched on in Settings plays until finished or turned off', a
   await reload(page)
   await expect(dialog(page)).toHaveCount(0)
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await expect(page.getByRole('switch', { name: 'Play the Dashboard › Now tour on my next visit' })).not.toBeChecked()
+  await page.getByText(/^Page tours ·/).click()
+  await expect(page.getByRole('switch', { name: 'Play the Now tour on my next visit' })).not.toBeChecked()
 })
 
 test('leaving the page closes its tour, so old copy never spotlights a new page', async ({ page }) => {
@@ -198,14 +202,17 @@ test('after Settings “Run now” and closing, focus lands on the page', async 
   await signIn(page)
   await page.keyboard.press('Escape')
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await page.getByRole('button', { name: 'Run the Setup › Hub tour now' }).click()
+  await page.getByText(/^Page tours ·/).click()
+  await page.getByRole('button', { name: 'Run the Hub tour now' }).click()
   await expect(dialog(page)).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(dialog(page)).toHaveCount(0)
-  expect(await page.evaluate(() => document.activeElement?.id)).toBe('main')
+  // Polled: focus returns on the frame after the tour layer unmounts.
+  await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('main')
 })
 
 test.describe('storage blocked', () => {
+  test.afterEach(async ({ request }) => void (await request.get('/__mock/reset')))
   test('the page loads, no tour auto-opens, and the trigger still works', async ({ page }) => {
     const errors: string[] = []
     page.on('pageerror', (e) => errors.push(e.message))
@@ -215,9 +222,11 @@ test.describe('storage blocked', () => {
       }
     })
     // A #token= link cannot be adopted without storage, so sign in with the form; the token lives in memory.
+    // Sign the mock's browser session out first, or the page opens signed in and never shows the form.
+    await page.request.get('/__mock/signout')
     await page.goto('/')
-    await page.getByLabel('Read-only token').fill('mock')
-    await page.getByRole('button', { name: /Open status/ }).click()
+    await page.getByLabel('Read-only link or token').fill('mock')
+    await page.getByRole('button', { name: /Open repository/ }).click()
     await expect(page.locator('[data-tour="live"]')).toBeVisible()
     await page.waitForTimeout(1200)
     await expect(dialog(page)).toHaveCount(0)

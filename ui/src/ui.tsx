@@ -31,8 +31,22 @@ export function Explain({ text }: { text: string }) {
   )
 }
 
-/** An evidence box: icon-badged header strip, an (i) explainer beside the title, optional count, then content. */
-export function Box({ id, tour, icon, title, explain, count, tone = 'brand', actions, children, className = '', flush = false }: { id?: string; /** Stable walkthrough anchor (`data-tour`). */ tour?: string; icon: string; title: string; explain?: string; count?: number | string; tone?: Tone; actions?: ReactNode; children: ReactNode; className?: string; flush?: boolean }) {
+/** The page head every page shares: one answer sentence (what is true now) and at most one short fact line.
+ *  `question` is the h1 (Twilight hides it visually; it stays for screen readers). `className` adds e.g. `detail-head`.
+ *  Keeps `data-tour="answer"` and the `.answer-text` / `.answer-fact` classes the walkthrough reads. */
+export function PageHead({ question, answer, fact, className = '', live = false }: { question: string; answer: ReactNode; fact?: ReactNode; className?: string; /** Announce changes to the answer (a live page). */ live?: boolean }) {
+  return (
+    <div className={`answer ${className}`.trim()} data-tour="answer">
+      <h1 className="page-question">{question}</h1>
+      <p className="answer-text" aria-live={live ? 'polite' : undefined}>{answer}</p>
+      {fact && <p className="answer-fact">{fact}</p>}
+    </div>
+  )
+}
+
+/** An evidence box: icon-badged header strip, an (i) explainer beside the title, optional count, then content.
+ *  The why/how goes in `explain` (tooltip). `intro` is an opt-in visible one-liner (<= 15 words), only when the reader needs it to act. */
+export function Box({ id, tour, icon, title, explain, intro, count, tone = 'brand', actions, children, className = '', flush = false }: { id?: string; /** Stable walkthrough anchor (`data-tour`). */ tour?: string; icon: string; title: string; explain?: string; intro?: string; count?: number | string; tone?: Tone; actions?: ReactNode; children: ReactNode; className?: string; flush?: boolean }) {
   return (
     <section id={id} data-tour={tour} className={`box box-tone-${tone} ${className}`} aria-labelledby={id ? `${id}-title` : undefined}>
       <header className="box-head">
@@ -46,7 +60,10 @@ export function Box({ id, tour, icon, title, explain, count, tone = 'brand', act
         {count !== undefined && <span className="box-count">{count}</span>}
         {actions && <div className="box-actions">{actions}</div>}
       </header>
-      <div className={flush ? 'box-body flush' : 'box-body'}>{children}</div>
+      <div className={flush ? 'box-body flush' : 'box-body'}>
+        {intro && <p className="box-intro small muted">{intro}</p>}
+        {children}
+      </div>
     </section>
   )
 }
@@ -149,15 +166,18 @@ export function Reported({ at }: { at: number }) {
   return at > 0 ? <Ago at={at} /> : <span className="muted">time not reported</span>
 }
 
-export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-outline-secondary' }: { text: string; label?: string; className?: string }) {
+/** `icon` replaces the idle clipboard glyph; `done` (e.g. "Copied, paste in Grok") replaces "Copied" and is also announced politely. `onCopy` runs synchronously in the click, so a caller can open an app inside the user gesture. */
+export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-outline-secondary', icon, done, title, onCopy }: { text: string; label?: string; className?: string; icon?: ReactNode; done?: string; title?: string; onCopy?: () => void }) {
   const [state, setState] = useState<'idle' | 'ok' | 'fail'>('idle')
   const timer = useRef<number>()
   useEffect(() => () => window.clearTimeout(timer.current), [])
-  return (
+  const button = (
     <button
       type="button"
       className={className}
+      title={title}
       onClick={() => {
+        onCopy?.()
         // `navigator.clipboard` is missing on plain-http pages (a LAN hub), so a throw is a failed copy too.
         void Promise.resolve()
           .then(() => navigator.clipboard.writeText(text))
@@ -166,8 +186,15 @@ export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-o
         timer.current = window.setTimeout(() => setState('idle'), 2000)
       }}
     >
-      <Icon name={state === 'ok' ? 'check2' : state === 'fail' ? 'x-lg' : 'clipboard'} /> {state === 'ok' ? 'Copied' : state === 'fail' ? 'Copy failed' : label}
+      {state === 'idle' && icon ? icon : <Icon name={state === 'ok' ? 'check2' : state === 'fail' ? 'x-lg' : 'clipboard'} />} {state === 'ok' ? (done ?? 'Copied') : state === 'fail' ? 'Copy failed' : label}
     </button>
+  )
+  if (!done) return button
+  return (
+    <>
+      {button}
+      <span className="visually-hidden" role="status">{state === 'ok' ? done : state === 'fail' ? 'Copy failed' : ''}</span>
+    </>
   )
 }
 
@@ -219,7 +246,7 @@ export function OnThisComputer({ what }: { what: string }) {
 export function PreviewBanner({ reason }: { reason?: string }) {
   return (
     <Notice tone="brand" icon="easel" title="Preview data — the local read API isn’t connected yet">
-      {reason ? `${reason} ` : ''}Everything below is sample data so you can see how this page works. Set the local server address in Settings once <code>agentscm serve</code> offers these reads.
+      {reason ? `${reason} ` : ''}Everything below is sample data so you can see how this page works. Set the local server address in Setup › Preferences once <code>agentscm serve</code> offers these reads.
     </Notice>
   )
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
 import { fetchDiff, fetchEntry, fetchTimeline, localReachable, type DiffEntry, type EvidenceState, type TimelineEntry, type Trigger } from '../localApi.ts'
-import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, OnThisComputer, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
+import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, OnThisComputer, PageHead, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 
@@ -85,10 +85,12 @@ function List() {
                   <a href={entryHref(e.id)} className="snap-main">
                     <strong>{t.title}</strong>
                     <span className="small muted">
-                      <Ago at={e.recorded_at} /> · #{e.id}
+                      <Ago at={e.recorded_at} />
                       {e.kind === 'snapshot' && <> · {e.changed_paths} file{e.changed_paths === 1 ? '' : 's'} changed</>}
-                      {e.kind === 'check_link' && <> · run <code title={e.run_id}>{e.run_id.length > 16 ? `${e.run_id.slice(0, 16)}…` : e.run_id}</code></>}
-                      {e.scope && <> · only {e.scope.join(', ')}</>}
+                      {e.scope && <>, only {e.scope.join(', ')}</>}
+                      <br />
+                      #{e.id}
+                      {e.kind === 'check_link' && <>, run <code title={e.run_id}>{e.run_id.length > 16 ? `${e.run_id.slice(0, 16)}…` : e.run_id}</code></>}
                     </span>
                   </a>
                   <label className="snap-pick">
@@ -140,7 +142,7 @@ function EntryDetail({ id }: { id: number }) {
         <p className="mt-3 mb-0"><Pill tone={ev.tone}>{ev.word}</Pill> <span className="small">{ev.text}</span></p>
       </Box>
       <Box icon="diagram-2" title="Start again from here" explain="Forking copies this saved moment into a new folder so you can try a different direction without touching the current one.">
-        <p className="mb-2">To start fresh from #{e.id}, run this on this computer. This page only reads, so it can’t do it for you.</p>
+        <p className="mb-2">To start fresh from #{e.id}, run this on this computer.</p>
         <div className="cmd"><code>{forkCmd}</code><CopyButton text={forkCmd} /></div>
       </Box>
     </>
@@ -213,11 +215,7 @@ export function TimelinePage() {
   const route = useRoute()
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">What did this workspace look like earlier?</h1>
-        <p className="answer-text">Saved moments of your files, to look back on or start again from.</p>
-        <p className="answer-fact">A <strong>snapshot</strong> is a picture of your files at one moment. Compare two, or fork a new change from one.</p>
-      </div>
+      <PageHead question="What did this workspace look like earlier?" answer="Saved moments of your files, to look back on or start again from." fact={<>A <strong>snapshot</strong> is a picture of your files at one moment. Compare two, or fork a new change from one.</>} />
       <SectionTabs />
       {!localReachable() ? (
         <OnThisComputer what="The timeline" />
@@ -229,7 +227,7 @@ export function TimelinePage() {
           {route.kind === 'compare' && <Compare key={`${route.left}|${route.right}`} left={route.left} right={route.right} />}
         </>
       )}
-      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer (the workspace it was started with), not the hub. Saving and forking happen in the CLI or your agent; this page only reads. <Explain text="Shows what was saved since the timeline was turned on. Anything earlier isn’t here." /></p>
+      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not the hub. Saving and forking happen in the CLI or your agent. <Explain text="Shows what was saved since the timeline was turned on. Anything earlier isn’t here." /></p>
     </div>
   )
 }

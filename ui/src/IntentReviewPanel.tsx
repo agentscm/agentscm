@@ -80,7 +80,7 @@ function Findings({ attempt, review }: { attempt: Attempt; review: IntentReview 
     </Notice> : null}
     <div className="d-grid gap-3">{assessment.criteria.map((finding) => {
       const criterion = criteria.get(finding.criterion), state = FINDING[finding.status]
-      return <article key={finding.criterion} className="border rounded p-3">
+      return <article key={finding.criterion} className="border-top pt-3">
         <div className="d-flex justify-content-between gap-2 mb-2"><strong>{sameContract ? criterion?.description ?? `Unrecognized criterion ${finding.criterion}` : `Historical criterion ${finding.criterion}`}</strong><Pill tone={criterion && sameContract ? state.tone : 'warn'}>{criterion && sameContract ? state.label : 'Historical finding'}</Pill></div>
         <p className="mb-2">{finding.explanation}</p>
         <EvidenceList attempt={attempt} finding={finding} />
@@ -165,19 +165,22 @@ function Review({ review, onDispositionSaved }: { review: IntentReview; onDispos
       <p className="small muted mb-0">Admission: {review.admission.replaceAll('_', ' ')} · skill version <code>{review.record.subject.skill.skill_version_id}</code>, step <code>{review.record.subject.skill.step_id}</code></p>
       {latestAttempt && <p className="small mt-2 mb-0"><strong>Latest attempt:</strong> {latestAttempt.phase} execution {latestAttempt.execution ?? (latestAttempt.state === 'leased' ? 'running' : 'not recorded')}. This execution state is separate from the semantic outcome above.</p>}
     </Box>
-    <Box icon="chat-left-text" title="Original request"><References rows={review.record.contracts[0]!.request} /></Box>
-    {contract.amendments.length > 0 && <Box icon="pencil-square" title="Human amendments"><References rows={contract.amendments} /></Box>}
-    {contract.focus.length > 0 && <Box icon="list-task" title="Agent focus"><References rows={contract.focus} /></Box>}
-    <Box icon="diagram-3" title="Candidate and scope" explain="Which source snapshot this work used, and how much of it was captured."><SourceFacts review={review} /></Box>
     <Box icon="clipboard-check" title={lastAssessment?.attempt_id === latestAttempt?.attempt_id ? 'Latest assessment findings' : 'Most recent assessment findings'} count={lastAssessment?.assessment?.criteria.length ?? 0}>
       {lastAssessment && lastAssessment.attempt_id !== latestAttempt?.attempt_id && <Notice tone="warn" title="These findings are from an earlier attempt">A later task attempt exists. Reassess its resulting candidate before treating these findings as current.</Notice>}
       {lastAssessment ? <Findings attempt={lastAssessment} review={review} /> : <Empty icon="question-circle" title="No completed assessment">No criteria have an assessed result yet.</Empty>}
     </Box>
-    <Box icon="arrow-repeat" title="Correction budget">
-      <p className="mb-0">{review.root_correction_rounds} of {review.record.limits.max_correction_rounds} correction rounds · {review.root_invocations} of {review.record.limits.max_invocations} agent invocations · {Math.round(review.record.limits.wall_time_ms / 60_000)} minutes total wall-time budget</p>
-    </Box>
     <DispositionForm review={review} onSaved={onDispositionSaved} />
-    <Box icon="clock-history" title="Retained attempts" count={review.record.attempts.length}><AttemptHistory attempts={review.record.attempts} /></Box>
+    <details className="disclosure">
+      <summary>Review details: request, source, budget and {review.record.attempts.length} retained {review.record.attempts.length === 1 ? 'attempt' : 'attempts'}</summary>
+      <div className="d-grid gap-3 mt-2">
+        <section><h3 className="h6">Original request</h3><References rows={review.record.contracts[0]!.request} /></section>
+        {contract.amendments.length > 0 && <section><h3 className="h6">Human amendments</h3><References rows={contract.amendments} /></section>}
+        {contract.focus.length > 0 && <section><h3 className="h6">Agent focus</h3><References rows={contract.focus} /></section>}
+        <section><h3 className="h6">Candidate and scope</h3><p className="small muted">Which source snapshot this work used, and how much of it was captured.</p><SourceFacts review={review} /></section>
+        <section><h3 className="h6">Correction budget</h3><p className="mb-0">{review.root_correction_rounds} of {review.record.limits.max_correction_rounds} correction rounds · {review.root_invocations} of {review.record.limits.max_invocations} agent invocations · {Math.round(review.record.limits.wall_time_ms / 60_000)} minutes total wall-time budget</p></section>
+        <section><h3 className="h6">Retained attempts</h3><AttemptHistory attempts={review.record.attempts} /></section>
+      </div>
+    </details>
   </div>
 }
 
