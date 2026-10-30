@@ -1,7 +1,7 @@
 import { act, fireEvent, render, renderHook, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { InstallOffer } from '../../src/InstallOffer.tsx'
-import { installHint, installKind, setBadge, useAppBadge, useInstall, type InstallEnv } from '../../src/install.ts'
+import { dockTip, installHint, installKind, listenForLaunches, routeLaunch, setBadge, useAppBadge, useInstall, watchTitleBar, type InstallEnv } from '../../src/install.ts'
 
 const SAFARI_MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'
 const SAFARI_IOS = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1'
@@ -113,7 +113,7 @@ describe('InstallOffer', () => {
     expect(screen.queryByText(/in your Dock/)).toBeNull()
   })
 
-  it('shows nothing in an installed app', () => {
+  it('shows nothing in an installed Safari app, already in the Dock', () => {
     standalone(true)
     const { container } = render(<InstallOffer />)
     expect(container.firstChild).toBeNull()
@@ -162,5 +162,80 @@ describe('app badge', () => {
     expect(api.setAppBadge).toHaveBeenLastCalledWith(4)
     unmount()
     expect(api.clearAppBadge).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('launch queue', () => {
+  const origin = window.location.origin
+  beforeEach(() => history.replaceState(null, '', '/ui/#home'))
+  afterEach(() => {
+    delete (window as { launchQueue?: unknown }).launchQueue
+    history.replaceState(null, '', '/')
+  })
+
+  it('routes a launched Hub link in the open window', () => {
+    let consume: ((p: { targetURL?: string }) => void) | undefined
+    Object.assign(window, { launchQueue: { setConsumer: (c: typeof consume) => (consume = c) } })
+    listenForLaunches()
+    consume!({ targetURL: `${origin}/ui/#inbox` })
+    expect(window.location.hash).toBe('#inbox')
+  })
+
+  it('leaves the window where it was for the bare app URL, another origin or a malformed URL', () => {
+    for (const target of [`${origin}/ui/`, 'https://example.test/ui/#inbox', 'not a url']) routeLaunch(target)
+    expect(window.location.hash).toBe('#home')
+  })
+
+  it('does nothing without a launch queue', () => {
+    expect(() => listenForLaunches()).not.toThrow()
+  })
+})
+
+describe('window-controls overlay', () => {
+  afterEach(() => {
+    setNavigator({ windowControlsOverlay: undefined })
+    document.documentElement.classList.remove('wco')
+  })
+
+  it('marks the page only while the overlay is visible', () => {
+    const overlay = Object.assign(new EventTarget(), { visible: true })
+    setNavigator({ windowControlsOverlay: overlay })
+    watchTitleBar()
+    expect(document.documentElement.classList.contains('wco')).toBe(true)
+    overlay.visible = false
+    overlay.dispatchEvent(new Event('geometrychange'))
+    expect(document.documentElement.classList.contains('wco')).toBe(false)
+  })
+
+  it('leaves a normal tab alone', () => {
+    watchTitleBar()
+    expect(document.documentElement.classList.contains('wco')).toBe(false)
+  })
+})
+
+describe('Dock tip', () => {
+  const WINDOWS_CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
+  it('says Dock on a Mac, taskbar on Windows, and nothing elsewhere', () => {
+    expect(dockTip(CHROME_MAC, 0)).toMatch(/Keep in Dock/)
+    expect(dockTip(WINDOWS_CHROME, 0)).toMatch(/pin it to the taskbar/)
+    expect(dockTip(SAFARI_MAC, 0)).toBeNull()
+    expect(dockTip(SAFARI_MAC, 5)).toBeNull()
+    expect(dockTip(SAFARI_IOS, 5)).toBeNull()
+  })
+
+  it('shows only in the installed app, and stays gone once dismissed', () => {
+    setNavigator({ userAgent: CHROME_MAC })
+    const tab = render(<InstallOffer />)
+    expect(screen.queryByText(/Keep in Dock/)).toBeNull()
+    tab.unmount()
+    standalone(true)
+    const first = render(<InstallOffer />)
+    expect(screen.getByText(/Keep AgentSCM in your Dock/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByText(/Keep in Dock/)).toBeNull()
+    first.unmount()
+    render(<InstallOffer />)
+    expect(screen.queryByText(/Keep in Dock/)).toBeNull()
   })
 })

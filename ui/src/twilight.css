@@ -412,6 +412,40 @@ textarea.form-control {
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   gap: 14px;
 }
+/* The installed app with the window-controls overlay (html.wco): the top bar is the title bar. */
+html.wco .app-shell {
+  --top-h: max(var(--hub-top-h, 56px), calc(env(titlebar-area-y, 0px) + env(titlebar-area-height, 0px)));
+}
+html.wco .topbar {
+  -webkit-app-region: drag;
+  app-region: drag;
+  /* Clear the traffic lights (macOS, left) or the caption buttons (Windows, right). */
+  padding-left: calc(env(titlebar-area-x, 0px) + 12px);
+  padding-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw) + 12px);
+}
+html.wco .topbar :is(a, button, input, .pop) {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+@media (min-width: 961px) {
+  html.wco .topbar-logo {
+    min-width: max(0px, calc(var(--side-w) - 36px - env(titlebar-area-x, 0px)));
+  }
+}
+/* Pages without the top bar (sign-in) keep a frame-coloured strip to drag the window by. */
+html.wco:not(:has(.topbar)) body {
+  padding-top: env(titlebar-area-height, 0px);
+}
+html.wco:not(:has(.topbar)) body::before {
+  content: '';
+  position: fixed;
+  inset: 0 0 auto;
+  height: env(titlebar-area-height, 0px);
+  z-index: 1040;
+  background: var(--frame);
+  -webkit-app-region: drag;
+  app-region: drag;
+}
 .topbar-div {
   background: rgba(255, 255, 255, 0.12);
 }
