@@ -100,7 +100,7 @@ use super::work::{
     ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
     WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
-    WorkOverviewQuery, WorkParticipant, WorkRepositoryScope, WorkRole, WorkScopeCheck,
+    WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
@@ -4963,6 +4963,122 @@ fn promise_receipt_matches(
     Ok(())
 }
 
+impl PgStore {
+    /// Read-only current work, recent decisions/completions and declared-scope overlaps for `reader`.
+    fn overview_for(
+        &self,
+        reader: &WorkReader<'_>,
+        query: &WorkOverviewQuery,
+        now: i64,
+    ) -> Result<WorkOverview> {
+        let recent_since = query.validate(now)?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = reader.who(|token| work_who(&mut tx, token, now))?;
+            lock_work_repository_shared(
+                &mut tx,
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
+            let fetch_limit = i64::try_from(query.limit + 1).unwrap_or(101);
+            let mut current = tx
+                .query(
+                    "SELECT snapshot FROM hub_work_items
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4 AND state <> 'finished'
+                     ORDER BY id LIMIT $5",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &fetch_limit,
+                    ],
+                )?
+                .into_iter()
+                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut current_complete = current.len() <= query.limit;
+            current.truncate(query.limit);
+            for item in &mut current {
+                project_claim(&mut tx, item, now)?;
+            }
+            let overview_part_budget = (MAX_BRIEFING_BYTES - 4096) / 3;
+            while json_string(&current)?.len() > overview_part_budget {
+                current.pop();
+                current_complete = false;
+            }
+
+            let mut recent = tx
+                .query(
+                    "SELECT v.event_seq, e.at, v.snapshot FROM hub_work_versions v
+                     JOIN hub_work_items w ON w.id = v.work
+                     JOIN hub_events e ON e.seq = v.event_seq
+                     WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4
+                       AND e.at >= $5 AND e.at <= $6
+                       AND e.kind = 'work_checkpoint'
+                       AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish')
+                     ORDER BY v.event_seq DESC LIMIT $7",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &recent_since,
+                        &now,
+                        &fetch_limit,
+                    ],
+                )?
+                .into_iter()
+                .map(|row| {
+                    let item: WorkItem = json_value(&row.get::<_, String>(2))?;
+                    let kind = if item.state == WorkState::Finished {
+                        WorkOutcomeKind::Completion
+                    } else {
+                        WorkOutcomeKind::Decision
+                    };
+                    Ok(WorkOutcome {
+                        seq: row.get(0),
+                        at: row.get(1),
+                        kind,
+                        item,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (event_floor, snapshot_floor) = work_retention_floors(&mut tx, &who)?;
+            let history_retention_gap = event_floor > 0 || snapshot_floor > 0;
+            let mut recent_complete = recent.len() <= query.limit && !history_retention_gap;
+            recent.truncate(query.limit);
+            while json_string(&recent)?.len() > overview_part_budget {
+                recent.pop();
+                recent_complete = false;
+            }
+            let mut overlaps = work_overlap_pairs(&current);
+            let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
+            overlaps.truncate(query.limit);
+            while json_string(&overlaps)?.len() > overview_part_budget {
+                overlaps.pop();
+                overlaps_complete = false;
+            }
+            tx.commit()?;
+            Ok(WorkOverview {
+                recent_since,
+                until: now,
+                current,
+                recent,
+                overlaps,
+                current_complete,
+                recent_complete,
+                overlaps_complete,
+                history_retention_gap,
+            })
+        })
+    }
+}
+
 impl Store for PgStore {
     fn backend(&self) -> &'static str {
         "postgres"
@@ -9701,111 +9817,23 @@ impl Store for PgStore {
         query: &WorkOverviewQuery,
         now: i64,
     ) -> Result<WorkOverview> {
-        let recent_since = query.validate(now)?;
-        self.run(true, |client| {
-            let mut tx = client.transaction()?;
-            let who = work_who(&mut tx, token, now)?;
-            lock_work_repository_shared(
-                &mut tx,
-                &who.owner.identity.provider,
-                &who.owner.identity.host,
-                &who.repository,
-                who.repository_id,
-            )?;
-            let fetch_limit = i64::try_from(query.limit + 1).unwrap_or(101);
-            let mut current = tx
-                .query(
-                    "SELECT snapshot FROM hub_work_items
-                     WHERE provider = $1 AND host = $2 AND repository = $3
-                       AND repository_id IS NOT DISTINCT FROM $4 AND state <> 'finished'
-                     ORDER BY id LIMIT $5",
-                    &[
-                        &who.owner.identity.provider,
-                        &who.owner.identity.host,
-                        &who.repository,
-                        &who.repository_id,
-                        &fetch_limit,
-                    ],
-                )?
-                .into_iter()
-                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
-                .collect::<Result<Vec<_>>>()?;
-            let mut current_complete = current.len() <= query.limit;
-            current.truncate(query.limit);
-            for item in &mut current {
-                project_claim(&mut tx, item, now)?;
-            }
-            let overview_part_budget = (MAX_BRIEFING_BYTES - 4096) / 3;
-            while json_string(&current)?.len() > overview_part_budget {
-                current.pop();
-                current_complete = false;
-            }
+        self.overview_for(&WorkReader::Token(token), query, now)
+    }
 
-            let mut recent = tx
-                .query(
-                    "SELECT v.event_seq, e.at, v.snapshot FROM hub_work_versions v
-                     JOIN hub_work_items w ON w.id = v.work
-                     JOIN hub_events e ON e.seq = v.event_seq
-                     WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
-                       AND w.repository_id IS NOT DISTINCT FROM $4
-                       AND e.at >= $5 AND e.at <= $6
-                       AND e.kind = 'work_checkpoint'
-                       AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish')
-                     ORDER BY v.event_seq DESC LIMIT $7",
-                    &[
-                        &who.owner.identity.provider,
-                        &who.owner.identity.host,
-                        &who.repository,
-                        &who.repository_id,
-                        &recent_since,
-                        &now,
-                        &fetch_limit,
-                    ],
-                )?
-                .into_iter()
-                .map(|row| {
-                    let item: WorkItem = json_value(&row.get::<_, String>(2))?;
-                    let kind = if item.state == WorkState::Finished {
-                        WorkOutcomeKind::Completion
-                    } else {
-                        WorkOutcomeKind::Decision
-                    };
-                    Ok(WorkOutcome {
-                        seq: row.get(0),
-                        at: row.get(1),
-                        kind,
-                        item,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let (event_floor, snapshot_floor) = work_retention_floors(&mut tx, &who)?;
-            let history_retention_gap = event_floor > 0 || snapshot_floor > 0;
-            let mut recent_complete = recent.len() <= query.limit && !history_retention_gap;
-            recent.truncate(query.limit);
-            while json_string(&recent)?.len() > overview_part_budget {
-                recent.pop();
-                recent_complete = false;
-            }
-            let mut overlaps = work_overlap_pairs(&current);
-            let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
-            overlaps.truncate(query.limit);
-            while json_string(&overlaps)?.len() > overview_part_budget {
-                overlaps.pop();
-                overlaps_complete = false;
-            }
-            tx.commit()?;
-            Ok(WorkOverview {
-                recent_since,
-                until: now,
-                current,
-                recent,
-                overlaps,
-                current_complete,
-                recent_complete,
-                overlaps_complete,
-                history_retention_gap,
-            })
-        })
+    fn repository_work_overview(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        query: &WorkOverviewQuery,
+        now: i64,
+    ) -> Result<WorkOverview> {
+        let reader = WorkReader::Person {
+            owner,
+            repository,
+            repository_id,
+        };
+        self.overview_for(&reader, query, now)
     }
 
     fn work_scope_check(

@@ -1995,6 +1995,101 @@ async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
 }
 
 #[tokio::test]
+async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only() {
+    let env = Env::start("github").await;
+    env.connect_repo("acme/docs", 4343, ALICE);
+    // Connected, but alice has no role on it.
+    env.connect_repo("acme/secret", 4444, BOB);
+    let cookie = web_sign_in(&env, ALICE).await;
+    let path = "/v1/hub/session/repositories";
+    let list = || with_cookie(&env.hub, Method::GET, path, &cookie, None);
+
+    // An agent of alice's holds a file in acme/widgets.
+    let (session, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let intent = json!({"intent_id": format!("int_{}", "a".repeat(32)), "task": "t",
+        "branch": null, "base": null, "machine": null, "paths": ["src/lib.rs"], "ttl_s": 600});
+    let (status, announced) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            &format!("/v1/hub/repos/{}/intents", REPO.replace('/', "%2F")),
+            minted["token"].as_str(),
+            Some(intent),
+        )
+        .await;
+    assert_eq!(status, 200, "{announced}");
+
+    let (status, body) = list().await;
+    assert_eq!(status, 200, "{body}");
+    let names: Vec<_> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["repository"].as_str().unwrap())
+        .collect();
+    // The one with activity first; the one alice cannot read is not named.
+    assert_eq!(names, [REPO, "acme/docs"]);
+    let widgets = &body["repositories"][0];
+    assert_eq!(widgets["repository_id"], REPO_ID);
+    assert_eq!(widgets["agents"], 1);
+    assert_eq!(widgets["needs_you"], 0);
+    assert_eq!(
+        widgets["unfinished"],
+        json!({"total": 0, "moving": 0, "stuck": 0})
+    );
+    assert!(widgets["last_activity_at"].as_i64().is_some());
+    assert_eq!(widgets["complete"], true);
+    assert_eq!(body["repositories"][1]["last_activity_at"], Value::Null);
+    assert_eq!(
+        (&body["unchecked"], &body["complete"]),
+        (&json!(0), &json!(true))
+    );
+    // Counts only: nothing a repository's own read token would hide.
+    let mut keys: Vec<_> = widgets.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "agents",
+            "complete",
+            "last_activity_at",
+            "needs_you",
+            "provider",
+            "repository",
+            "repository_id",
+            "unfinished"
+        ]
+    );
+
+    // Only the web sign-in asks.
+    let (status, refused) = env
+        .call(&env.hub, Method::GET, path, Some(&session), None)
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("forbidden"))
+    );
+
+    // A forge that cannot answer is counted, never named, and never shown as lost access.
+    env.fake.lock().unwrap().hub_reads_roles = false;
+    let (status, body) = list().await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["repositories"], json!([]));
+    assert_eq!(body["unchecked"], 3);
+    env.fake.lock().unwrap().hub_reads_roles = true;
+
+    // Losing the role leaves the repository out, with no refused sign-in recorded.
+    env.drop_role(ALICE);
+    let (_, body) = list().await;
+    assert_eq!(body["repositories"][0]["repository"], "acme/docs");
+    assert_eq!(body["repositories"].as_array().unwrap().len(), 1);
+    let refusals = env.store.refusals(unix_now()).unwrap();
+    assert!(!refusals.iter().any(|r| r.via == "session_repositories"));
+}
+
+#[tokio::test]
 async fn web_read_tokens_cannot_cross_workspace_authentication_and_hub_sign_out_keeps_workspace() {
     let mut env = Env::start("github").await;
     env.workspace = Some(device_promise_workspace(&env, REPO_ID));

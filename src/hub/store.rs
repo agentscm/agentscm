@@ -820,6 +820,16 @@ pub trait Store: Send + Sync {
         query: &WorkOverviewQuery,
         now: i64,
     ) -> Result<WorkOverview>;
+    /// `work_overview` of one connected repository for `owner`, with no token: the caller has
+    /// checked `owner`'s current role on it, as a mint would.
+    fn repository_work_overview(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+        query: &WorkOverviewQuery,
+        now: i64,
+    ) -> Result<WorkOverview>;
     /// Check whether one lead session's durable claim covers requested paths. Never writes.
     fn work_scope_check(
         &self,

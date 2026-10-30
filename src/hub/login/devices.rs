@@ -1,6 +1,8 @@
 //! Computer credentials: issued at sign-in, they mint and renew their owner's agent tokens with
 //! the repository role re-checked through the Hub's own connection credential, never a stored
 //! user forge token. They are refused on every human-session and agent route.
+use std::time::Duration;
+
 use axum::Router;
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::StatusCode;
@@ -18,10 +20,12 @@ use super::super::device::{
 use super::super::forge_api::ForgeApi;
 use super::super::github::GhError;
 use super::super::http::{ApiError, JsonBody, bearer, blocking};
+use super::super::repository_summary::{Facts, summarize};
 use super::super::store::{
-    NewAgentToken, User, agent_token_digest, device_digest, mint_web_read_token, unix_now,
-    validate_agent_name, validate_repository,
+    NewAgentToken, Principal, User, agent_token_digest, device_digest, mint_web_read_token,
+    unix_now, validate_agent_name, validate_repository,
 };
+use super::super::work::WorkOverviewQuery;
 use super::super::{HubError, HubState};
 use super::{ApiResult, Human, random_hex, session_digest};
 use crate::team::auth::generate_secret;
@@ -33,6 +37,7 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/device/tokens", post(mint))
         .route("/v1/hub/device/tokens/{id}", delete(revoke_token))
         .route("/v1/hub/session/read-token", post(web_read_token))
+        .route("/v1/hub/session/repositories", get(session_repositories))
         .route("/v1/hub/devices", get(list).post(enroll))
         .route("/v1/hub/devices/{id}", delete(revoke))
         .route("/v1/hub/admin/devices", get(admin_devices))
@@ -418,15 +423,8 @@ async fn mint_check(
     repository: &str,
     via: &'static str,
 ) -> ApiResult<ConnectedRepository> {
+    allow_listed(state, owner, via).await?;
     let identity = &owner.identity;
-    let login = &state.login;
-    if login.has_allow_list()
-        && !login.is_admin(&identity.provider, identity.user_id, &owner.login)
-        && !login.is_allowed(&identity.provider, identity.user_id, &owner.login)
-    {
-        record_refusal(state, owner, "not_allowed", via).await;
-        return Err(refused("not_allowed"));
-    }
     let (store, host, named) = (
         state.store.clone(),
         identity.host.clone(),
@@ -461,6 +459,19 @@ async fn mint_check(
         }
     }
     Ok(repo)
+}
+
+/// Refuses someone the allow list leaves out, recording it under `via`.
+async fn allow_listed(state: &HubState, owner: &User, via: &'static str) -> ApiResult<()> {
+    let (identity, login) = (&owner.identity, &state.login);
+    if login.has_allow_list()
+        && !login.is_admin(&identity.provider, identity.user_id, &owner.login)
+        && !login.is_allowed(&identity.provider, identity.user_id, &owner.login)
+    {
+        record_refusal(state, owner, "not_allowed", via).await;
+        return Err(refused("not_allowed"));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -499,6 +510,131 @@ async fn web_read_token(
     .await?;
     let reply = json!({"token": secret, "expires_at": expires_at});
     Ok((StatusCode::CREATED, Json(reply)).into_response())
+}
+
+/// At most this many role checks of one repository list are with the forge at once.
+const LIST_CONCURRENCY: usize = 8;
+/// A repository list stops waiting for the forge after this long; the rest count as unchecked.
+const LIST_DEADLINE: Duration = Duration::from_secs(10);
+/// Live intents and sessions read per repository for its counts.
+const LIST_LIVE_LIMIT: usize = 500;
+
+/// The connected repositories on the person's forge host that they can read now, with a few
+/// counts each, for the web pages' All repositories list. Each passes the role check a mint makes,
+/// with no token stored. A refused one is left out without a refusal row; one the forge could not
+/// answer for is only counted, never named.
+async fn session_repositories(
+    State(state): State<HubState>,
+    super::HumanSession(human): super::HumanSession,
+) -> ApiResult<Json<Value>> {
+    if human.browser.is_none() {
+        return Err(super::forbidden().with_message(
+            "Only the Hub's web pages ask for this; agents get tokens through this computer's sign-in",
+        ));
+    }
+    let owner = human.user;
+    allow_listed(&state, &owner, "session_repositories").await?;
+    let (store, host) = (state.store.clone(), owner.identity.host.clone());
+    let mut candidates = blocking(&state, move || {
+        store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
+    })
+    .await?;
+    let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
+    candidates.truncate(super::MAX_SIGN_IN_PROBES);
+    let (readable, unchecked) = readable(&state, &owner, candidates).await;
+    let store = state.store.clone();
+    let mut rows = blocking(&state, move || {
+        let now = unix_now();
+        let mut rows = Vec::with_capacity(readable.len());
+        for repo in readable {
+            let overview = store.repository_work_overview(
+                &owner,
+                &repo.full_name,
+                repo.repository_id,
+                &WorkOverviewQuery::default(),
+                now,
+            )?;
+            let intents = store.live_intents(&repo.full_name, now, LIST_LIVE_LIMIT + 1)?;
+            // `live_sessions` and `repository_events` read only the repository and forge of a
+            // principal: this one names the repository the role check just allowed, with no token.
+            let scope = Principal {
+                token_id: String::new(),
+                name: String::new(),
+                repository: repo.full_name.clone(),
+                repository_id: Some(repo.repository_id),
+                expires_at: now,
+                read_only: true,
+                owner: owner.clone(),
+            };
+            let sessions = store.live_sessions(&scope, now, LIST_LIVE_LIMIT + 1)?;
+            let last_event_at = store
+                .repository_events(&scope, None, 1)?
+                .first()
+                .map(|row| row.event.at);
+            let facts = Facts {
+                live_complete: intents.len() <= LIST_LIVE_LIMIT
+                    && sessions.len() <= LIST_LIVE_LIMIT,
+                overview,
+                intents,
+                sessions,
+                last_event_at,
+            };
+            rows.push(summarize(
+                repo.full_name,
+                repo.repository_id,
+                owner.identity.provider.clone(),
+                &facts,
+            ));
+        }
+        Ok(rows)
+    })
+    .await?;
+    // What needs a person first, then stuck work, then the newest activity.
+    rows.sort_by(|a, b| {
+        (b.needs_you > 0)
+            .cmp(&(a.needs_you > 0))
+            .then((b.unfinished.stuck > 0).cmp(&(a.unfinished.stuck > 0)))
+            .then(b.last_activity_at.cmp(&a.last_activity_at))
+            .then(a.repository.cmp(&b.repository))
+    });
+    Ok(Json(json!({"repositories": rows, "unchecked": unchecked,
+        "complete": complete, "checked_at": unix_now()})))
+}
+
+/// The candidates `owner` may read now by [`repository_role`], and how many could not be checked
+/// in time or at all. A role short of read, or a repository no longer connected, is left out.
+async fn readable(
+    state: &HubState,
+    owner: &User,
+    candidates: Vec<ConnectedRepository>,
+) -> (Vec<ConnectedRepository>, usize) {
+    let deadline = tokio::time::Instant::now() + LIST_DEADLINE;
+    let mut pending = candidates.into_iter();
+    let mut checks = tokio::task::JoinSet::new();
+    let (mut allowed, mut unchecked) = (Vec::new(), 0);
+    loop {
+        while checks.len() < LIST_CONCURRENCY
+            && let Some(repo) = pending.next()
+        {
+            let (state, owner) = (state.clone(), owner.clone());
+            checks.spawn(async move {
+                let role = repository_role(&state, &owner, &repo).await;
+                (repo, role)
+            });
+        }
+        match tokio::time::timeout_at(deadline, checks.join_next()).await {
+            Ok(None) => break,
+            Ok(Some(Ok((repo, Ok(()))))) => allowed.push(repo),
+            Ok(Some(Ok((_, Err(Denial::Role(_) | Denial::Kind("not_connected")))))) => {}
+            Ok(Some(_)) => unchecked += 1,
+            Err(_) => {
+                unchecked += checks.len() + pending.len();
+                checks.abort_all();
+                break;
+            }
+        }
+    }
+    (allowed, unchecked)
 }
 
 async fn revoke_token(

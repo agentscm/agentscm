@@ -2995,3 +2995,52 @@ a.brief-cite:hover {
 :is(.burger, .search-pill, .top-icon, .tour-trigger, .side-icon, .repo-mark, .attn-icon, .event-icon, .run-icon, .step-mark, .track-dot, .box-badge, .snap-dot, .lb-hit, .empty-icon) > .bi::before {
   vertical-align: top;
 }
+
+/* ---------- All repositories: one ruled row per repository, status in words first ---------- */
+.repo-list { list-style: none; margin: 0; padding: 0; }
+.repo-list > li { border-bottom: 1px solid var(--hub-rule); }
+.repo-list > li:last-child { border-bottom: 0; }
+.repo-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 16px;
+  grid-template-areas: 'name status go' 'meta meta go';
+  align-items: center;
+  gap: 4px 16px;
+  width: calc(100% + 20px);
+  margin: 0 -10px;
+  padding: var(--hub-row-y) 10px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  transition: background-color 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+button.repo-row:hover { background: var(--hub-sunken); }
+button.repo-row:focus-visible { outline: 2px solid var(--hub-brand); outline-offset: 3px; }
+.repo-row-name { grid-area: name; display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 15px; }
+.repo-row-name > .bi, .repo-row-name > .pill { flex: none; }
+.repo-row-title { min-width: 0; overflow-wrap: anywhere; }
+.repo-row-title b { font-weight: 600; }
+.repo-row-owner { color: var(--hub-text-2); }
+.repo-row-forge { color: var(--hub-text-3); }
+.repo-row-name .pill { margin-left: 4px; }
+.repo-row-status { grid-area: status; justify-self: end; }
+.repo-row-meta { grid-area: meta; font-size: 13px; color: var(--hub-text-3); }
+.repo-row[aria-busy='true'] .repo-row-meta { color: var(--hub-brand-ink); }
+.repo-row-go { grid-area: go; color: var(--hub-text-3); transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), color 0.18s; }
+button.repo-row:hover .repo-row-go { color: var(--hub-brand-ink); transform: translateX(2px); }
+/* A quiet repository stays listed, as a shorter row. */
+.repo-list > li.is-quiet .repo-row { padding-block: calc(var(--hub-row-y) * 0.6); }
+.repo-list > li.is-quiet .repo-row-name { font-size: 14.5px; }
+.answer-trouble { color: var(--coral); }
+html[data-density='condensed'] .repo-row-name { font-size: 14px; }
+html[data-density='condensed'] .repo-row-meta { font-size: 12px; }
+@media (max-width: 640px) {
+  .repo-row { grid-template-columns: minmax(0, 1fr) 16px; grid-template-areas: 'name go' 'status go' 'meta go'; }
+  .repo-row-status { justify-self: start; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .repo-row, .repo-row-go { transition: none; }
+}

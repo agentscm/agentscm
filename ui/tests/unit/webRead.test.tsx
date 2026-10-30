@@ -223,6 +223,18 @@ describe('useWebRead', () => {
     expect(screen.getByTestId('repos').textContent).toBe('acme/docs,acme/widgets')
   })
 
+  it('offers what the Hub says is readable now first, even with no agent token or computer', async () => {
+    const calls = hub({
+      'GET /v1/hub/tokens': () => ({ status: 200, body: { tokens: [] } }),
+      'GET /v1/hub/devices': () => ({ status: 200, body: { devices: [] } }),
+      'GET /v1/hub/session/repositories': () => ({ status: 200, body: { repositories: [{ repository: 'acme/zeta' }, { repository: 'acme/alpha' }], unchecked: 0, complete: true } }),
+    })
+    render(<Probe />)
+    expect((await screen.findByTestId('repo')).textContent).toBe('acme/zeta')
+    expect(screen.getByTestId('repos').textContent).toBe('acme/zeta,acme/alpha')
+    expect(minted(calls)).toHaveLength(1)
+  })
+
   it('distinguishes no web sign-in from an identified session with nothing to open', async () => {
     hub({ 'GET /v1/hub/session': () => ({ status: 401 }) })
     const { unmount } = render(<Probe />)

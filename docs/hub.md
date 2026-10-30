@@ -216,6 +216,21 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `forbidden`, and a computer credential 401. Each call stores a new token, so a page keeps its
   token in memory and asks again only near `expires_at`. Signing out does not end a token
   already handed out; it lasts until it expires.
+- `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
+  on the person's forge host that they can read now, for the web pages' All repositories list.
+  Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,
+  through that repository's connection credential, at most 8 at a time and for at most 10
+  seconds; no token is stored. A Hub admin gets the same check, not every repository. The reply is
+  `{"repositories": [...], "unchecked", "complete", "checked_at"}`, worst first. Each row has
+  `repository`, `repository_id`, `provider`, `unfinished` (`total`, `moving`, `stuck`),
+  `needs_you`, `agents`, `last_activity_at` (or `null`) and `complete` (false when a list was cut
+  short, so counts are lower bounds): counts only, never titles, paths or people. `needs_you`
+  counts blockers, quiet leads, handovers, declared-scope overlaps and files two agents hold now;
+  pull-request overlaps and files with only a recent refusal are not counted. A refused role or a
+  repository no longer connected is left out and not recorded as a refused sign-in; one the forge
+  could not answer for in time is counted in `unchecked`, never named. `complete` is false past
+  200 connected repositories. A `hub login` session gets 403 `forbidden`. Each call makes one forge
+  request per repository, so the page asks every two minutes.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 
@@ -801,7 +816,11 @@ are pending. See [local change capture](change-capture.md) for configuration and
 
 ## Status page
 
-`/ui/` is a read-only page of what the hub knows about one repository. Its rail has six items, each
+`/ui/` is a read-only page of what the hub knows about one repository. On a web sign-in that can
+read several repositories it first opens All repositories (`#repositories`, also in the repository
+menu and behind the logo): one row per readable repository with what needs you, unfinished work,
+live agents and the last activity, worst first; a row opens that repository's Dashboard. See
+[the design](design/all-repositories.md). Its rail has six items, each
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps and directed requests), History (Finished, Changes, Change records, and Files from this

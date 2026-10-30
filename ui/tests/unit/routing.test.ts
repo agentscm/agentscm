@@ -133,10 +133,10 @@ describe('workspace routes and crumbs', () => {
     expect(crumbsFor('#workspace/members', ws, null).at(-1)).toEqual({ label: 'Members', href: '#workspace/members' })
     expect(crumbsFor(`#workspace/workflow/${R}/synthetic-workspace-run/steps/lint`, ws, null)).toEqual([
       { label: 'Access', href: '#workspace', icon: 'people' },
-      { label: 'Repositories & runs', href: '#workspace' },
+      { label: 'Runs', href: '#workspace' },
       { label: 'Run synthetic-work…', href: workspaceRunHref('acme/widgets', 'synthetic-workspace-run'), mono: true },
       { label: 'Step lint', mono: true },
     ])
-    expect(crumbsFor('#workspace/workflow/%E0%A4%A/x', ws, null).map((c) => c.label)).toEqual(['Access', 'Repositories & runs'])
+    expect(crumbsFor('#workspace/workflow/%E0%A4%A/x', ws, null).map((c) => c.label)).toEqual(['Access', 'Runs'])
   })
 })

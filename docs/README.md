@@ -38,6 +38,7 @@ observed actions and source; they are not independent verification or human appr
 ## Reuse workflows and track commitments
 
 - [Supported skills](design/supported-skills.md): experimental `pr-gate` v1 and its self-reported evidence.
+- [All repositories](design/all-repositories.md): experimental cross-repository home page for a web sign-in.
 - [Local workflow library](advanced/workflow-library.md): versioned authoring, pinned imports, simulation and explicit export.
 - [Productive actions](advanced/productive-workflow-actions.md) and [pipeline rules](advanced/pipeline-rules.md): bounded artifacts and operator-local post-merge workflows, separate from native admission.
 - [Intent review](advanced/intent-review.md): advisory assessment and correction tracking for Git Work.
