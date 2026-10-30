@@ -229,8 +229,12 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   pull-request overlaps and files with only a recent refusal are not counted. A refused role or a
   repository no longer connected is left out and not recorded as a refused sign-in; one the forge
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
-  200 connected repositories. A `hub login` session gets 403 `forbidden`. Each call makes one forge
-  request per repository, so the page asks every two minutes.
+  200 connected repositories. A `hub login` session gets 403 `forbidden`. The Hub keeps each
+  person's forge answer (readable or not) for a repository for 90 seconds and reuses it for this
+  list only, so a granted or lost access shows here within 90 seconds; minting a token always asks
+  the forge. Answers are never shared between people, a forge that could not answer is never kept,
+  at most 1,024 answers are held, and signing out forgets that person's. A call past those 90
+  seconds makes one forge request per repository, so the page asks every two minutes.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 

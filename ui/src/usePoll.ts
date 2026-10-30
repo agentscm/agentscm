@@ -18,17 +18,22 @@ function remember(key: string, value: unknown, fetchedAt: number) {
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value as string)
 }
 
+/** A value for `key` another part of the page already fetched. */
+export interface Seed<T> { key: string; value: T; fetchedAt: number }
+
 /**
  * Loads `load` now and every `everyMs` (0 = once) while the tab is visible. A failed refresh keeps
  * and labels the last good value instead of replacing it. `key` restarts from its cached value, or loading;
- * `refresh` re-fetches now but keeps the shown value (stale-while-revalidate).
+ * `refresh` re-fetches now but keeps the shown value (stale-while-revalidate). A newer `seed` for the
+ * key shows at once, and the first load waits until it is `everyMs` old.
  */
-export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: number, key: string, refresh = 0): Poll<T> {
+export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: number, key: string, refresh = 0, seed?: Seed<T> | null): Poll<T> {
   const [attempt, setAttempt] = useState(0)
   // Keys are only unique per call site (several use the token), so the loader's source text names the site.
   const site = load.toString()
   const cached = (k: string): Poll<T> => {
-    const c = cache.get(`${site}\u0000${k}`)
+    const stored = cache.get(`${site}\u0000${k}`)
+    const c = seed?.key === k && !(stored && stored.fetchedAt >= seed.fetchedAt) ? seed : stored
     return c ? { kind: 'ready', value: c.value as T, fetchedAt: c.fetchedAt, refreshError: null, retry: () => setAttempt((n) => n + 1) } : { kind: 'loading' }
   }
   // The state is tagged with the key it was loaded for; a result for another key reads as its cached value or loading.
@@ -75,13 +80,15 @@ export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: n
       if (!document.hidden) void run()
     }
     document.addEventListener('visibilitychange', onVisibility)
-    void run()
+    const seedAge = seed?.key === key && attempt === 0 && refresh === 0 ? Date.now() - seed.fetchedAt : Infinity
+    if (everyMs > 0 && seedAge < everyMs) timer = window.setTimeout(() => void run(), everyMs - seedAge)
+    else void run()
     return () => {
       disposed = true
       window.clearTimeout(timer)
       controller?.abort()
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [everyMs, key, attempt, refresh]) // eslint-disable-line react-hooks/exhaustive-deps -- site and cached are fixed per call site
+  }, [everyMs, key, attempt, refresh]) // eslint-disable-line react-hooks/exhaustive-deps -- site and cached are fixed per call site; a seed only shapes the first load
   return tagged.key === key ? tagged.poll : cached(key)
 }

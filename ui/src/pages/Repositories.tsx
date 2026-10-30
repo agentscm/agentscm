@@ -7,7 +7,7 @@ import { usePoll } from '../usePoll.ts'
 import type { Load } from './Computers.tsx'
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
-// Each refresh is one forge request per repository on the Hub, so this page polls slowly.
+// A refresh can be one forge request per repository on the Hub, so this page polls slowly.
 const EVERY_MS = 120_000
 
 /**
@@ -17,7 +17,9 @@ const EVERY_MS = 120_000
  */
 export function RepositoriesPage({ auth, web, current }: { auth: Load<DeviceAuth | null>; web?: WebChoice; current: string | null }) {
   const session = auth.kind === 'ready' && auth.value?.kind === 'browser' ? auth.value.session : null
-  const list = usePoll((signal) => (session ? fetchRepositoryList(session, signal) : Promise.reject(new Error('Sign in on the web to list repositories'))), EVERY_MS, session?.login ?? '')
+  // The list the web sign-in just fetched shows at once; the poll takes over once it is EVERY_MS old.
+  const seed = session && web?.list ? { key: session.login, ...web.list } : null
+  const list = usePoll((signal) => (session ? fetchRepositoryList(session, signal) : Promise.reject(new Error('Sign in on the web to list repositories'))), EVERY_MS, session?.login ?? '', 0, seed)
   const [opening, setOpening] = useState<string | null>(null)
   const refused = opening && web && !web.repos.includes(opening) ? web.refusal : null
   useEffect(() => {
@@ -60,7 +62,7 @@ export function RepositoriesPage({ auth, web, current }: { auth: Load<DeviceAuth
               The forge didn’t answer whether you can read {v.unchecked === 1 ? 'it' : 'them'}, so {v.unchecked === 1 ? 'it isn’t' : 'they aren’t'} listed. This is not a change to your access.
             </Notice>
           )}
-          <Box icon="collection" tone={needing > 0 ? 'bad' : 'brand'} title="All repositories" count={v.rows.length} explain="Counts only, checked against your role on the forge each time this page refreshes (every two minutes). Needs you counts blockers, quiet leads, handovers, overlapping declared work and files two agents hold; pull-request overlaps show on each Dashboard.">
+          <Box icon="collection" tone={needing > 0 ? 'bad' : 'brand'} title="All repositories" count={v.rows.length} explain="Counts only, checked against your role on the forge when this page refreshes (every two minutes; the Hub reuses an answer for up to 90 seconds). Needs you counts blockers, quiet leads, handovers, overlapping declared work and files two agents hold; pull-request overlaps show on each Dashboard.">
             {v.rows.length === 0 ? <Empty icon="plug" title="No connected repository you can read">Ask a repository owner for access, or connect an agent to a repository first.</Empty> : <Rows rows={v.rows} current={current} onOpen={web ? open : undefined} opening={refused ? null : opening} />}
           </Box>
           {!v.complete && <p className="muted small">Only the first 200 connected repositories are checked.</p>}

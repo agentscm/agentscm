@@ -210,7 +210,7 @@ function decodeRepositoryRow(raw: unknown): RepositoryRow | null {
   }
 }
 
-/** Every connected repository this web sign-in can read now, worst first, with counts only. Each is role-checked by the Hub, so this is one forge request per repository. */
+/** Every connected repository this web sign-in can read now, worst first, with counts only. Each is role-checked by the Hub, so this can be one forge request per repository (the Hub reuses an answer for 90 seconds). */
 export async function fetchRepositoryList(session: BrowserSession, signal?: AbortSignal): Promise<RepositoryList> {
   const j = rec(await (await request('/v1/hub/session/repositories', { kind: 'browser', session }, signal)).json())
   return { rows: list(j, 'repositories', decodeRepositoryRow, 200), unchecked: count(j['unchecked']), complete: j['complete'] === true }
