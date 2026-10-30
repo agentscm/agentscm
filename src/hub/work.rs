@@ -546,6 +546,38 @@ pub(super) struct WorkWho {
     pub owner: User,
 }
 
+/// Whose view a work read is: an agent token's, or a person's on one connected repository whose
+/// role the caller has just checked (the web pages' repository list, which holds no token).
+pub(super) enum WorkReader<'a> {
+    Token(&'a str),
+    Person {
+        owner: &'a User,
+        repository: &'a str,
+        repository_id: i64,
+    },
+}
+
+impl WorkReader<'_> {
+    /// The reader's scope, resolving a token through `token`.
+    pub(super) fn who(&self, token: impl FnOnce(&str) -> Result<WorkWho>) -> Result<WorkWho> {
+        match *self {
+            Self::Token(id) => token(id),
+            Self::Person {
+                owner,
+                repository,
+                repository_id,
+            } => Ok(WorkWho {
+                token: String::new(),
+                repository: repository.to_owned(),
+                repository_id: Some(repository_id),
+                agent: String::new(),
+                read_only: true,
+                owner: owner.clone(),
+            }),
+        }
+    }
+}
+
 impl WorkStart {
     pub(super) fn validate(&self, who: &WorkWho) -> Result<Vec<String>> {
         if usize::from(self.work_id.is_some())

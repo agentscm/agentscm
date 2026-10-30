@@ -180,6 +180,41 @@ export async function mintWebReadToken(session: BrowserSession, repository: stri
   return { repository, token, expiresAt }
 }
 
+/** One connected repository the person can read now, as GET /v1/hub/session/repositories counts it. */
+export interface RepositoryRow {
+  repository: string
+  provider: string
+  unfinished: { total: number; moving: number; stuck: number }
+  needsYou: number
+  agents: number
+  lastActivityAt: number | null
+  /** False when the Hub cut a list short, so the counts are at least these. */
+  complete: boolean
+}
+export interface RepositoryList { rows: RepositoryRow[]; unchecked: number; complete: boolean }
+
+function decodeRepositoryRow(raw: unknown): RepositoryRow | null {
+  const r = rec(raw)
+  const repository = typeof r['repository'] === 'string' && REPO.test(r['repository']) ? r['repository'] : null
+  if (!repository) return null
+  const u = rec(r['unfinished'])
+  return {
+    repository,
+    provider: typeof r['provider'] === 'string' && PROVIDER.test(r['provider']) ? r['provider'] : 'github',
+    unfinished: { total: count(u['total']), moving: count(u['moving']), stuck: count(u['stuck']) },
+    needsYou: count(r['needs_you']),
+    agents: count(r['agents']),
+    lastActivityAt: unix(r['last_activity_at']),
+    complete: r['complete'] === true,
+  }
+}
+
+/** Every connected repository this web sign-in can read now, worst first, with counts only. Each is role-checked by the Hub, so this is one forge request per repository. */
+export async function fetchRepositoryList(session: BrowserSession, signal?: AbortSignal): Promise<RepositoryList> {
+  const j = rec(await (await request('/v1/hub/session/repositories', { kind: 'browser', session }, signal)).json())
+  return { rows: list(j, 'repositories', decodeRepositoryRow, 200), unchecked: count(j['unchecked']), complete: j['complete'] === true }
+}
+
 /**
  * Repositories this browser's sign-in can offer, from what it may already read: the person's live
  * agent tokens and their computers, and for a Hub admin every connected repository. A source that

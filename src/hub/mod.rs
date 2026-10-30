@@ -29,6 +29,7 @@ pub mod pipeline_rules;
 pub mod promise;
 mod promise_http;
 pub mod publish;
+mod repository_summary;
 pub mod session;
 pub mod skill_workflow;
 pub mod skills;

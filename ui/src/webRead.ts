@@ -5,7 +5,7 @@
 // expires, or after a 401, and never twice at once.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from './api.ts'
-import { fetchBrowserSession, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type WebReadToken } from './devices.ts'
+import { fetchBrowserSession, fetchRepositoryList, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type WebReadToken } from './devices.ts'
 import type { Refusal } from './refusal.ts'
 
 export type WebRead =
@@ -15,8 +15,8 @@ export type WebRead =
   | { kind: 'unavailable'; session: BrowserSession | null; reason: 'connection' | 'empty' | 'refused'; refusal: Refusal | null }
   /** No browser session, or a confirmed sign-out. */
   | { kind: 'none'; refusal: Refusal | null; empty: boolean }
-  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. */
-  | { kind: 'ready'; session: BrowserSession; repos: string[]; read: WebReadToken; refusal: Refusal | null; restarts: number }
+  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. `readable` counts the repositories the Hub listed as readable now. */
+  | { kind: 'ready'; session: BrowserSession; repos: string[]; readable: number; read: WebReadToken; refusal: Refusal | null; restarts: number }
 
 const PICKED_KEY = 'agentscm.web.repository'
 export const RENEW_BEFORE_SECONDS = 120
@@ -189,8 +189,11 @@ export function useWebRead(enabled: boolean) {
         setState(identified)
         keepFailuresFor(session)
         if (!allowed(session)) return
-        const repos = await sessionRepositories(session, ctl.signal)
+        const [known, list] = await Promise.all([sessionRepositories(session, ctl.signal), fetchRepositoryList(session, ctl.signal).catch(() => null)])
         if (!allowed(session)) return
+        // What the Hub says this sign-in can read now comes first; what it only knew of may still be refused.
+        const readable = list?.rows.map((r) => r.repository) ?? []
+        const repos = [...new Set([...readable, ...known])]
         const { read, refused, refusal, ended } = await firstAllowed(session, tryOrder(repos, picked()), ctl.signal)
         if (!allowed(session)) return
         if (ended) return endSession(session)
@@ -200,7 +203,7 @@ export function useWebRead(enabled: boolean) {
           return setState(unavailable)
         }
         remember(read.repository)
-        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), read, refusal: null, restarts: 0 } as const
+        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), readable: readable.length, read, refusal: null, restarts: 0 } as const
         current.current = ready
         bootstrap.current = null
         setState(ready)
