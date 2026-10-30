@@ -17,7 +17,7 @@ implementation.
 Build and validate the two packages separately with the pinned toolchain:
 
 ```sh
-cargo test --locked --test evidence_conformance
+cargo test --locked --test integration evidence_conformance::
 cargo test --manifest-path tools/portable-verifier/Cargo.toml --locked
 cargo clippy --manifest-path tools/portable-verifier/Cargo.toml --locked --all-targets -- -D warnings
 cargo build --manifest-path tools/portable-verifier/Cargo.toml --locked --release

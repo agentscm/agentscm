@@ -1,11 +1,21 @@
 //! The one HTTP/1 accept loop for every listener this crate serves (Hub, team server,
-//! `serve` and the demo), so each gets hyper's header read timeout.
+//! `serve` and the demo), so each gets hyper's header read timeout and one connection cap.
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::http::{HeaderMap, header};
 
-/// A client must send its whole request head within this; trickled headers do not extend it.
+pub use crate::hmac::constant_time_eq;
+
+/// Open connections served at once, like the per-process request limit in `server.rs`. Past it the
+/// listener stops accepting, so excess clients wait in the kernel backlog holding no memory here.
+const MAX_CONNECTIONS: usize = 256;
+
+/// A client must send its whole request head within this; trickled headers do not extend it. Hyper
+/// starts the same clock for the next request on a kept-alive connection, so a client that
+/// connects and goes quiet, or idles after a response, is closed after this long.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serves `app` until `shutdown` completes, then drains open connections.
@@ -25,10 +35,33 @@ pub(crate) async fn serve_with(
     header_read_timeout: Duration,
     shutdown: impl Future<Output = ()>,
 ) {
+    serve_limited(
+        listener,
+        app,
+        header_read_timeout,
+        MAX_CONNECTIONS,
+        shutdown,
+    )
+    .await;
+}
+
+pub(crate) async fn serve_limited(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_read_timeout: Duration,
+    max_connections: usize,
+    shutdown: impl Future<Output = ()>,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(max_connections));
     let (stop, stopped) = tokio::sync::watch::channel(());
     let mut connections = tokio::task::JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
+        // Take a slot before accepting, so the cap holds back the accept itself.
+        let permit = tokio::select! {
+            permit = slots.clone().acquire_owned() => permit.expect("the semaphore is never closed"),
+            () = &mut shutdown => break,
+        };
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
@@ -43,6 +76,7 @@ pub(crate) async fn serve_with(
         let app = app.clone();
         let mut stopped = stopped.clone();
         connections.spawn(async move {
+            let _permit = permit;
             let service = hyper::service::service_fn(move |request: hyper::Request<_>| {
                 let mut request = request.map(axum::body::Body::new);
                 request
@@ -68,6 +102,36 @@ pub(crate) async fn serve_with(
     }
     drop(stop);
     while connections.join_next().await.is_some() {}
+}
+
+/// The secret of exactly one `Authorization: Bearer <secret>` header. A missing, repeated or
+/// malformed header, or a secret that is empty or holds a space, is `None`.
+pub fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let (scheme, secret) = value.to_str().ok()?.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !secret.is_empty() && !secret.contains(' '))
+        .then_some(secret)
+}
+
+/// Completes on Ctrl-C or, on Unix, SIGTERM: the shutdown future every listener passes to `serve`.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +188,30 @@ pub(crate) mod tests {
         address
     }
 
+    #[test]
+    fn bearer_takes_one_well_formed_header_only() {
+        let headers = |values: &[&'static str]| {
+            let mut map = HeaderMap::new();
+            for value in values {
+                map.append(header::AUTHORIZATION, value.parse().unwrap());
+            }
+            map
+        };
+        assert_eq!(bearer(&headers(&["Bearer abc"])), Some("abc"));
+        assert_eq!(bearer(&headers(&["bearer abc"])), Some("abc"));
+        for rejected in [
+            &[][..],
+            &["Bearer abc", "Bearer abc"],
+            &["Bearer abc", "Bearer def"],
+            &["Bearer "],
+            &["Bearer a b"],
+            &["Basic abc"],
+            &["abc"],
+        ] {
+            assert_eq!(bearer(&headers(rejected)), None, "{rejected:?}");
+        }
+    }
+
     #[tokio::test]
     async fn served_requests_carry_the_peer_address() {
         let address = listen(HEADER_READ_TIMEOUT).await;
@@ -145,5 +233,75 @@ pub(crate) mod tests {
         assert!(elapsed >= limit, "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
         assert!(!response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    }
+
+    async fn listen_limited(header_read_timeout: Duration, max_connections: usize) -> SocketAddr {
+        let app = Router::new().route("/peer", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_limited(
+            listener,
+            app,
+            header_read_timeout,
+            max_connections,
+            std::future::pending(),
+        ));
+        address
+    }
+
+    /// How long until the server closes a connection that has been quiet since `stream` opened.
+    async fn closed_after(mut stream: tokio::net::TcpStream) -> Duration {
+        let started = Instant::now();
+        let mut sink = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut sink))
+            .await
+            .expect("the server closes the quiet connection")
+            .ok();
+        started.elapsed()
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_sends_is_closed() {
+        let limit = Duration::from_millis(300);
+        let address = listen_limited(limit, 8).await;
+        let elapsed = closed_after(tokio::net::TcpStream::connect(address).await.unwrap()).await;
+        assert!(elapsed >= limit, "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_kept_alive_connection_that_goes_quiet_is_closed() {
+        let limit = Duration::from_millis(300);
+        let address = listen_limited(limit, 8).await;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /peer HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = [0_u8; 256];
+        assert!(stream.read(&mut reply).await.unwrap() > 0);
+        let elapsed = closed_after(stream).await;
+        assert!(elapsed >= limit / 2, "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn connections_past_the_cap_wait_until_a_slot_frees() {
+        let address = listen_limited(HEADER_READ_TIMEOUT, 2).await;
+        let first = tokio::net::TcpStream::connect(address).await.unwrap();
+        let _second = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut third = tokio::net::TcpStream::connect(address).await.unwrap();
+        third
+            .write_all(b"GET /peer HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        // Both slots are held by quiet clients, so the third is not served.
+        let waited = tokio::time::timeout(Duration::from_millis(500), third.read_buf(&mut reply));
+        assert!(waited.await.is_err(), "{reply:?}");
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), third.read_to_end(&mut reply))
+            .await
+            .expect("a freed slot serves the waiting client")
+            .unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 200"), "{reply:?}");
     }
 }

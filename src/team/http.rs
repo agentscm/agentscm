@@ -218,7 +218,7 @@ pub async fn serve(config: TeamConfig) -> Result<()> {
         "team listener ready on {}",
         listener.local_addr().map_err(Error::Io)?
     );
-    crate::http_listener::serve(listener, app, shutdown_signal()).await;
+    crate::http_listener::serve(listener, app, crate::http_listener::shutdown_signal()).await;
     Ok(())
 }
 
@@ -763,19 +763,12 @@ fn credentials(headers: &HeaderMap, mutation: bool, origin: &str) -> ApiResult<C
 }
 
 fn bearer(headers: &HeaderMap) -> ApiResult<Option<&str>> {
-    let values: Vec<_> = headers.get_all(header::AUTHORIZATION).iter().collect();
-    if values.len() > 1 {
-        return Err(ApiError::unauthorized());
-    }
-    let Some(value) = values.first() else {
+    if !headers.contains_key(header::AUTHORIZATION) {
         return Ok(None);
-    };
-    let value = value.to_str().map_err(|_| ApiError::unauthorized())?;
-    let raw = value
-        .strip_prefix("Bearer ")
-        .filter(|raw| !raw.is_empty() && !raw.contains(' '))
-        .ok_or_else(ApiError::unauthorized)?;
-    Ok(Some(raw))
+    }
+    crate::http_listener::bearer(headers)
+        .map(Some)
+        .ok_or_else(ApiError::unauthorized)
 }
 
 fn session_token(headers: &HeaderMap) -> ApiResult<Option<&str>> {
@@ -1185,23 +1178,6 @@ impl IntoResponse for ApiError {
 
 async fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found")
-}
-
-pub(crate) async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 #[cfg(test)]

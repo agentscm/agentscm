@@ -221,7 +221,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     let app = router(state, access);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("listening on {}", listener.local_addr()?);
-    agentscm::http_listener::serve(listener, app, shutdown_signal()).await;
+    agentscm::http_listener::serve(listener, app, agentscm::http_listener::shutdown_signal()).await;
     Ok(())
 }
 
@@ -253,7 +253,7 @@ async fn serve_front_door(
     })?;
     eprintln!("listening on {address}");
     let app = front_door::router(state, door.clone());
-    agentscm::http_listener::serve(listener, app, shutdown_signal()).await;
+    agentscm::http_listener::serve(listener, app, agentscm::http_listener::shutdown_signal()).await;
     door.revoke_all().await;
     Ok(())
 }
@@ -415,22 +415,11 @@ pub(super) fn loopback_host(headers: &HeaderMap) -> bool {
 }
 
 fn authorized(token: Option<&str>, headers: &HeaderMap) -> bool {
-    let Some(token) = token else {
-        return true;
-    };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .unwrap_or_default()
-        .as_bytes();
-    // Constant time for equal lengths, as agentscm's hmac comparison.
-    presented.len() == token.len()
-        && presented
-            .iter()
-            .zip(token.as_bytes())
-            .fold(0, |acc, (x, y)| acc | (x ^ y))
-            == 0
+    token.is_none_or(|token| {
+        agentscm::http_listener::bearer(headers).is_some_and(|presented| {
+            agentscm::http_listener::constant_time_eq(presented.as_bytes(), token.as_bytes())
+        })
+    })
 }
 
 /// Pages recent workflow runs, optionally filtered by `q`, as the Hub does.
@@ -963,13 +952,13 @@ async fn read_file(
     let query = read_query(raw_query.as_deref())?;
     check_text(&revision, "revision")?;
     check_text(&query.path, "path")?;
-    let ((kind, content), permit) = blocking(state, move |engine| {
-        engine.read_entry(&revision, &query.path)
+    let (entry, permit) = blocking(state, move |engine| {
+        engine.read_entry_bounded(&revision, &query.path, MAX_SOURCE_BYTES)
     })
     .await?;
-    if content.len() > MAX_SOURCE_BYTES {
+    let Some((kind, content)) = entry else {
         return Err(ApiError::limit("source response exceeds 8388608 bytes"));
-    }
+    };
     let mut response = Response::new(Body::from(content));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -1204,23 +1193,6 @@ fn hex(byte: u8) -> std::result::Result<u8, ApiError> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(ApiError::limit("query has invalid percent encoding")),
-    }
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

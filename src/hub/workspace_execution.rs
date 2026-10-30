@@ -32,6 +32,8 @@ use crate::skill_workflow::{self, RunState};
 pub const CONFIG_ENV: &str = "AGENTSCM_WORKSPACE_EXECUTION_FILE";
 const MAX_QUEUE: i64 = 32;
 const MAX_PROFILES: usize = 32;
+/// How long an idle worker waits for a queue notification before it looks again anyway.
+const IDLE_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -291,6 +293,8 @@ pub struct ExecutionService {
     // Prevent a second server from recovering or dispatching the same queue.
     _lease: Lease,
     worker: Mutex<()>,
+    /// Wakes the worker when a run is queued; `notify_one` keeps the wake if it is not waiting yet.
+    queued: tokio::sync::Notify,
 }
 
 impl ExecutionService {
@@ -474,6 +478,8 @@ impl ExecutionService {
                 request_json BLOB NOT NULL, actor_json BLOB NOT NULL, run_json BLOB NOT NULL,
                 state TEXT NOT NULL, UNIQUE(actor_id,request_id)
             ) STRICT;
+            CREATE INDEX IF NOT EXISTS workspace_runs_state_sequence
+                ON workspace_runs(state, sequence);
             CREATE TABLE IF NOT EXISTS workspace_run_events(
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL, event TEXT NOT NULL, run_json BLOB NOT NULL
@@ -505,6 +511,7 @@ impl ExecutionService {
             workspace,
             _lease: lease,
             worker: Mutex::new(()),
+            queued: tokio::sync::Notify::new(),
         })
     }
 
@@ -730,6 +737,7 @@ impl ExecutionService {
             tx.commit()?;
             Ok(())
         })?;
+        self.queued.notify_one();
         Ok(run)
     }
 
@@ -838,7 +846,9 @@ impl ExecutionService {
             loop {
                 let service = self.clone();
                 match tokio::task::spawn_blocking(move || service.process_next()).await {
-                    Ok(Ok(_)) => {}
+                    // A run finished; another may already be queued.
+                    Ok(Ok(true)) => continue,
+                    Ok(Ok(false)) => {}
                     Ok(Err(error)) => {
                         eprintln!("workspace execution worker stopped: {error}");
                         break;
@@ -848,7 +858,8 @@ impl ExecutionService {
                         break;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Enqueue wakes the worker at once; the timeout is only a safety net.
+                let _ = tokio::time::timeout(IDLE_POLL, self.queued.notified()).await;
             }
         })
     }

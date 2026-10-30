@@ -1,18 +1,15 @@
 //! One bounded operator-selected local dispatch. No prompt text becomes argv.
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use super::{ActionOutcome, ActionProfile, CompiledAction, ProductiveAction};
 use crate::execution::Cancellation;
+use crate::execution::process::{Stop, capture_with_input};
 use crate::{Error, Result};
 
 pub struct ActionExecutor<'a> {
@@ -218,78 +215,50 @@ fn result(outcome: ActionOutcome) -> DispatchResult {
     }
 }
 
+/// Runs `command` (already in its own process group) through the shared supervised
+/// capture. The retained-byte budget covers stdout and stderr together.
 fn bounded_process(
     command: &mut Command,
     input: Vec<u8>,
     limit: usize,
     timeout_ms: u64,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<(ActionOutcome, Vec<u8>)> {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let group = child.id() as i32;
-    let overflow = Arc::new(AtomicBool::new(false));
-    let mut stdin = child.stdin.take().unwrap();
-    let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let reader = |stream: Box<dyn Read + Send>| {
-        let overflow = overflow.clone();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let read = stream.take(limit as u64 + 1).read_to_end(&mut bytes);
-            if bytes.len() > limit {
-                overflow.store(true, Ordering::SeqCst);
+    let cancellation = Cancellation::default();
+    let done = AtomicBool::new(false);
+    let capture = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Acquire) {
+                if cancelled() {
+                    cancellation.cancel();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            (read, bytes)
-        })
+        });
+        let capture = capture_with_input(
+            command,
+            Some(input),
+            Duration::from_millis(timeout_ms),
+            limit as u64,
+            &cancellation,
+        );
+        done.store(true, Ordering::Release);
+        capture
+    })?;
+    let outcome = match capture.stop {
+        Some(Stop::Cancelled) => ActionOutcome::Cancelled,
+        Some(Stop::Output) => return Ok((ActionOutcome::OutputLimit, Vec::new())),
+        Some(Stop::Timeout) => ActionOutcome::TimedOut,
+        // A child that exits non-zero before draining its input still failed on its
+        // own terms; only a clean exit after an input or drain failure is uncertain.
+        Some(Stop::Io) if matches!(capture.code, Some(code) if code != 0) => ActionOutcome::Failed,
+        Some(Stop::Io) => return Ok((ActionOutcome::Uncertain, Vec::new())),
+        None if capture.incomplete => return Ok((ActionOutcome::Uncertain, Vec::new())),
+        None if capture.code == Some(0) => ActionOutcome::Succeeded,
+        None => ActionOutcome::Failed,
     };
-    let stdout = reader(Box::new(child.stdout.take().unwrap()));
-    let stderr = reader(Box::new(child.stderr.take().unwrap()));
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let outcome = loop {
-        if cancelled() {
-            break ActionOutcome::Cancelled;
-        }
-        if overflow.load(Ordering::SeqCst) {
-            break ActionOutcome::OutputLimit;
-        }
-        if Instant::now() >= deadline {
-            break ActionOutcome::TimedOut;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                break if status.success() {
-                    ActionOutcome::Succeeded
-                } else {
-                    ActionOutcome::Failed
-                };
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => break ActionOutcome::Uncertain,
-        }
-    };
-    // Terminate the whole owned group, including descendants retaining pipe handles.
-    // The child was placed in its own process group; kill takes integer IDs only.
-    unsafe {
-        libc::kill(-group, libc::SIGKILL);
-    }
-    let _ = child.wait();
-    let input_ok = writer.join().is_ok_and(|result| result.is_ok());
-    let (read, bytes) = stdout
-        .join()
-        .map_err(|_| Error::Invalid("action output reader interrupted".into()))?;
-    let (error_read, error_bytes) = stderr
-        .join()
-        .map_err(|_| Error::Invalid("action diagnostic reader interrupted".into()))?;
-    if bytes.len() > limit || error_bytes.len() > limit {
-        return Ok((ActionOutcome::OutputLimit, Vec::new()));
-    }
-    if read.is_err() || error_read.is_err() || (!input_ok && outcome == ActionOutcome::Succeeded) {
-        return Ok((ActionOutcome::Uncertain, Vec::new()));
-    }
-    Ok((outcome, bytes))
+    Ok((outcome, capture.stdout))
 }
 
 struct PrivateWork(PathBuf);
@@ -321,5 +290,73 @@ use std::os::unix::fs::DirBuilderExt;
 impl Drop for PrivateWork {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(
+        script: &str,
+        limit: usize,
+        timeout_ms: u64,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> (ActionOutcome, Vec<u8>) {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]).process_group(0);
+        bounded_process(&mut command, b"in".to_vec(), limit, timeout_ms, cancelled).unwrap()
+    }
+
+    #[test]
+    fn exit_status_maps_to_outcome_and_output_is_returned() {
+        let never = || false;
+        assert_eq!(
+            run("cat; echo ok", 1024, 5000, &never),
+            (ActionOutcome::Succeeded, b"inok\n".to_vec())
+        );
+        assert_eq!(run("exit 3", 1024, 5000, &never).0, ActionOutcome::Failed);
+    }
+
+    #[test]
+    fn a_child_that_exits_before_reading_its_input_keeps_its_verdict() {
+        let never = || false;
+        // Larger than a pipe buffer, so the input pump cannot finish before the exit.
+        let input = vec![b'x'; 1 << 20];
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 3"]).process_group(0);
+        let (outcome, _) =
+            bounded_process(&mut command, input.clone(), 1024, 5000, &never).unwrap();
+        assert_eq!(outcome, ActionOutcome::Failed);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]).process_group(0);
+        let (outcome, _) = bounded_process(&mut command, input, 1024, 5000, &never).unwrap();
+        assert_eq!(outcome, ActionOutcome::Uncertain);
+    }
+
+    #[test]
+    fn output_over_the_cap_is_refused_without_bytes() {
+        let never = || false;
+        let (outcome, bytes) = run("cat; head -c 4096 /dev/zero", 64, 5000, &never);
+        assert_eq!((outcome, bytes), (ActionOutcome::OutputLimit, Vec::new()));
+    }
+
+    #[test]
+    fn timeout_and_cancellation_interrupt_a_running_child() {
+        let never = || false;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run("sleep 30", 1024, 200, &never).0,
+            ActionOutcome::TimedOut
+        );
+        let cancel_after = {
+            let start = std::time::Instant::now();
+            move || start.elapsed() > Duration::from_millis(200)
+        };
+        assert_eq!(
+            run("sleep 30", 1024, 20_000, &cancel_after).0,
+            ActionOutcome::Cancelled
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

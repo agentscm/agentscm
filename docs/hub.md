@@ -216,6 +216,21 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `forbidden`, and a computer credential 401. Each call stores a new token, so a page keeps its
   token in memory and asks again only near `expires_at`. Signing out does not end a token
   already handed out; it lasts until it expires.
+- `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
+  on the person's forge host that they can read now, for the web pages' All repositories list.
+  Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,
+  through that repository's connection credential, at most 8 at a time and for at most 10
+  seconds; no token is stored. A Hub admin gets the same check, not every repository. The reply is
+  `{"repositories": [...], "unchecked", "complete", "checked_at"}`, worst first. Each row has
+  `repository`, `repository_id`, `provider`, `unfinished` (`total`, `moving`, `stuck`),
+  `needs_you`, `agents`, `last_activity_at` (or `null`) and `complete` (false when a list was cut
+  short, so counts are lower bounds): counts only, never titles, paths or people. `needs_you`
+  counts blockers, quiet leads, handovers, declared-scope overlaps and files two agents hold now;
+  pull-request overlaps and files with only a recent refusal are not counted. A refused role or a
+  repository no longer connected is left out and not recorded as a refused sign-in; one the forge
+  could not answer for in time is counted in `unchecked`, never named. `complete` is false past
+  200 connected repositories. A `hub login` session gets 403 `forbidden`. Each call makes one forge
+  request per repository, so the page asks every two minutes.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 
@@ -363,7 +378,7 @@ Every other route that takes an agent token (announcing, renewing and releasing 
 creating, uploading to and running publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
 answers 403 `{"error":"read_only"}` and writes nothing. `POST /v1/hub/hook/{agent}` treats a
 read-only token as an unknown one: the same "token not accepted" reply, and no session or event.
-Routes for human sessions still answer 401 to any agent token. `tests/hub_read_only.rs` walks every
+Routes for human sessions still answer 401 to any agent token. `tests/integration/hub_read_only.rs` walks every
 route with a read-only token; a new route needs a row there.
 
 Every hub process that shares a database must run a version that knows read-only tokens before any
@@ -801,7 +816,11 @@ are pending. See [local change capture](change-capture.md) for configuration and
 
 ## Status page
 
-`/ui/` is a read-only page of what the hub knows about one repository. Its rail has six items, each
+`/ui/` is a read-only page of what the hub knows about one repository. On a web sign-in that can
+read several repositories it first opens All repositories (`#repositories`, also in the repository
+menu and behind the logo): one row per readable repository with what needs you, unfinished work,
+live agents and the last activity, worst first; a row opens that repository's Dashboard. See
+[the design](design/all-repositories.md). Its rail has six items, each
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps and directed requests), History (Finished, Changes, Change records, and Files from this
@@ -1010,7 +1029,9 @@ status is always `success`, so never mark it as a required check. The separate
 
 Failures. A 401, or a 403 with no rate-limit headers, on the app JWT, an
 installation token or discovery marks the connection `auth_failed` (status code and
-endpoint kind only) and keeps all data; the next success marks it `enabled`. The same
+endpoint kind only) and keeps all data; the poller then leaves it for 10 minutes (webhooks
+are not processed meanwhile, the wait survives a restart, and an administrator's refresh retries at once), and the
+next success marks it `enabled` and ends the wait. The same
 on a repository endpoint only skips that repository for the round. Each round starts
 at a different repository. A 429, a 403 with no quota left, or a GraphQL `RATE_LIMITED` error moves the next poll
 to the latest of `Retry-After`, `X-RateLimit-Reset` and a minute away, and changes
@@ -1526,7 +1547,7 @@ the test has no forge to sign in with; the product image has no way around sign-
 
 The container test does not include a forge. Pull-request overlaps (webhook and poll intake, the
 `pr_notice` to the intent's agent, and the edited-in-place PR comment and status) are tested in
-`tests/hub_sync.rs` against an in-process fake GitHub.
+`tests/integration/hub_sync.rs` against an in-process fake GitHub.
 
 ## Limits
 
@@ -1597,8 +1618,12 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
 - Only the same intent id is excluded from overlaps, so two intents held by one
   token can overlap and notice each other.
 - There is no cap on live intents per token and no rate limit; announces are
-  attributed to the token's owner. At most 256 notice requests wait at once per
-  process; beyond that a request answers immediately as if `wait` were 0.
+  attributed to the token's owner. Lists of a repository's live intents read at
+  most 1,000: the intent list sets `truncated`, the session-start listing says
+  coordination is unknown, and pull request overlap notices, comments and Slack
+  messages consider only those 1,000 (the Hub logs that to stderr). At most 32 notice requests and 32 inbox
+  requests wait at once per process, so long-polls cannot hold every connection;
+  beyond that a request answers immediately as if `wait` were 0.
 - The PostgreSQL connection is plaintext: this build has no TLS. Unix sockets
   and loopback IP addresses are accepted (not the name `localhost`, which the OS
   resolves); any other TCP host is refused unless the URL sets
@@ -1747,5 +1772,15 @@ SHA and, once closed, its merge commit SHA, and each branch name with its SHA.
 Nothing here prevents a later round trip between Git and native revisions.
 
 Stand-up work has a separate [retention policy](standup.md#storage-maintenance).
-Its four coordination event kinds can be compacted by a local operator; this
-exception does not permit updates or deletion of the general Hub events above.
+Its four coordination event kinds can be compacted; this exception does not
+permit updates or deletion of the general Hub events above. `hub serve` compacts
+automatically a minute after startup and then every hour: for each repository
+that retains Work items or coordination requests, it applies the same
+`agentscm work compact` with a cutoff seven days before the pass and with that
+command's guards. A repository with an unacknowledged briefing or catch-up
+delivery from the last 24 hours is skipped until a later pass. Each pass logs
+one line with the checkpoint receipts, superseded work versions, closed
+coordination requests and merge observations it removed, and how many
+repositories it skipped. Automatic compaction is not configurable. A shorter
+cutoff (at least 24 hours old), a dry run, and a repository that has only merge
+observations remain manual operator maintenance with the command.

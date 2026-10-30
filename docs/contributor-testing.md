@@ -19,7 +19,7 @@ Install the version required by `.config/nextest.toml` so local and CI behavior 
 cargo install cargo-nextest --version 0.9.148 --locked
 ```
 
-On macOS or Linux, also compile the Windows build before pushing a change that touches `#[cfg(unix)]` code or calls into a Unix-only module (`client_plugin`, `client_setup`, `tray` and others). The gate above only compiles the host platform, so these mistakes otherwise surface only in the `windows` CI job. `tools/windows-check.sh` compiles what that job compiles, with warnings as errors, and reads its test list from `.github/workflows/windows.yml`. It needs the target and a MinGW C compiler once:
+On macOS or Linux, also compile the Windows build before pushing a change that touches `#[cfg(unix)]` code or calls into a Unix-only module (`client_plugin`, `client_setup`, `tray` and others). The gate above only compiles the host platform, so these mistakes otherwise surface only in the `windows` CI job. `tools/windows-check.sh` compiles what that job compiles, with warnings as errors, and checks the library, the binary and `--test integration`; the Windows test set is the modules in `tests/integration/main.rs` declared without `#[cfg(unix)]`. It needs the target and a MinGW C compiler once:
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
@@ -29,14 +29,18 @@ tools/windows-check.sh
 
 It checks compilation only; Windows test behaviour is still CI's job. It builds into `target/x86_64-pc-windows-gnu`, which takes several GB; delete it with the rest of `target` when space is tight.
 
-The nextest profile disables fail-fast and retries. It writes JUnit output to `target/nextest/default/junit.xml`, including ignored tests as skipped rather than treating them as executed. The `backend_s3` test binary is limited to one process because its tests share an in-process `CreateBucket` mutex. PostgreSQL fixture tests are also limited to one process because independently named schemas still share fixed database-wide migration and event advisory locks; the store's five-second lock timeout can otherwise expire while another test holds one of those locks. These limits do not serialize unrelated tests, internal concurrency within one test or separate nextest invocations; do not run multiple suites against the same bucket or PostgreSQL database concurrently.
+`.agents/bound-target.sh` runs `cargo clean` in the main and current checkout when its `target` exceeds `AGENTSCM_TARGET_LIMIT_GB` GiB (default 30). `/implement` runs it; manual workflows can run it directly, or with `-n` to only report what it would clean.
 
-The `two_git_worktrees_*` cases in `hub_workspace_execution` share a test group
+`[profile.test]` in `Cargo.toml` sets `incremental = false`, so test builds (nextest, doctests and local validation) do not write `target/debug/incremental`. A gate run builds each revision once, and before this setting incremental state was about 60% of the gate's `target` size. `cargo clippy` and interactive `cargo build`/`cargo check` use the dev profile and still keep incremental state.
+
+The nextest profile disables fail-fast and retries. It writes JUnit output to `target/nextest/default/junit.xml`, including ignored tests as skipped rather than treating them as executed. The `backend_s3` tests (the `backend_s3` module of the `integration` test binary) are limited to one process because its tests share an in-process `CreateBucket` mutex. PostgreSQL fixture tests are also limited to one process because independently named schemas still share fixed database-wide migration and event advisory locks; the store's five-second lock timeout can otherwise expire while another test holds one of those locks. These limits do not serialize unrelated tests, internal concurrency within one test or separate nextest invocations; do not run multiple suites against the same bucket or PostgreSQL database concurrently.
+
+The `two_git_worktrees_*` cases in the `hub_workspace_execution` module share a test group
 limited to two concurrent processes. These cases each run a Hub, Git worktrees,
 collectors and subprocess fixtures; overlapping the whole family can exhaust the
 local fixture's existing HTTP deadline. The group bounds that resource load while
 preserving the tests' deadlines, assertions and zero-retry policy. Other cases in
-the binary remain outside this group.
+the `hub_workspace_execution` module remain outside this group.
 
 Quickstart's Docker fixture uses a tracked executable launcher and per-test script
 data under its temporary HOME. The Hub workflow fixture uses the tracked Python
@@ -44,15 +48,19 @@ Docker fixture, with a sidecar beside each fake Unix socket selecting that daemo
 state directory. Keep those tracked fixtures executable; rewriting a new executable
 for each test can add host startup latency to the existing probe deadlines.
 
+## Integration test layout
+
+Top-level integration tests are one test binary, `integration`, built from `tests/integration/main.rs`; the crate links once instead of once per file. Add a new integration test as `tests/integration/<name>.rs` and declare it in `main.rs` with `mod <name>;` (a guard test fails when a file is not declared). Tests are named `<name>::<test>`, so select them with `-E 'test(/^<name>::/)'` under nextest, or `cargo test --locked --test integration <name>::` under Cargo. Cargo's filter is a substring match (`sync::` also selects `hub_sync::`), while `-E 'test(/^<name>::/)'` selects exactly one module. Helpers shared by several modules are declared once in `main.rs` and imported with `use crate::<helper>;`; `tests/support/` holds fixture sources and scripts that modules include or run, and `tests/fixtures/` holds data. Only the modules in `main.rs` without `#[cfg(unix)]` build on Windows, and the `windows` CI job runs them with `--test integration`. A file placed directly in `tests/` still builds as its own binary, which is rarely wanted. The one deliberate exception is `tests/setup.rs` (select it with `-E 'binary(setup)'`): its tests package the running test executable, which must stay under the 128 MiB bundle limit, so it cannot be part of the large `integration` binary.
+
 ## Focused iteration
 
 During implementation, select tests from the behavior that changed, its callers and its failure paths. A filename or similarly named test alone is not enough evidence. Nextest filter expressions make the selected scope explicit:
 
 ```sh
-cargo nextest run --locked -E 'binary(git_collisions)'
+cargo nextest run --locked -E 'test(/^git_collisions::/)'
 ```
 
-Record the command and the selected scope. For a two-line deletion of test diagnostics, rerun the affected test binary during iteration and retain unchanged check evidence with its original scope. For behavior changes, include callers and failure paths. Focused checks support iteration; they do not replace final whole-branch validation or waive the applicable review policy.
+Record the command and the selected scope. For a two-line deletion of test diagnostics, rerun the affected tests during iteration and retain unchanged check evidence with its original scope. For behavior changes, include callers and failure paths. Focused checks support iteration; they do not replace final whole-branch validation or waive the applicable review policy.
 
 Before a branch is submitted, complete the whole-branch gate above and the applicable reviews. A final whole-branch gate completed earlier in the workflow may satisfy a later workflow step without rerunning it only when its exact source and test inputs, parent/candidate mapping, `Cargo.lock`, toolchain, feature flags, nextest version and configuration, and service environment remain applicable and unchanged. Retain the original commands and results, the tested snapshot and environment, and a comparison showing that the later candidate matches them; a workflow-step or command-invocation label alone is not evidence of reuse.
 
@@ -87,11 +95,11 @@ Report build time separately from each warm execution time, along with test coun
 
 ## Local validation attestations
 
-A maintainer may attach a signed record of a local run of this gate to a pull request; see [local validation](advanced/local-validation.md). It is experimental and does not replace the evidence rules above. For same-repository pull requests it is the expected evidence for the test gate: the hosted test suites, Windows, container, hub end-to-end and live execution jobs run only with the `ci-extended` label or a manual `workflow_dispatch`, while `CI / static` and the security checks stay automatic and `main` still runs everything.
+A maintainer may attach a signed record of a local run of this gate to a pull request; see [local validation](advanced/local-validation.md). It is experimental and does not replace the evidence rules above. For same-repository pull requests it is the expected evidence for the test gate: the hosted test suites, Windows, musl and macOS release-target builds, container, hub end-to-end and live execution jobs run only with the `ci-extended` label or a manual `workflow_dispatch`, while `CI / static` and the security checks stay automatic and `main` still runs everything.
 
 ## Resource audit boundaries
 
-At the revision where nextest was introduced, the audit found temporary-directory isolation, ephemeral ports, random PostgreSQL schemas and process-local telemetry state. Those patterns support concurrent execution but do not prove every timing interaction is safe. A source and inventory audit found 109 PostgreSQL fixture tests across ten integration binaries. Every fixture test uses one of four full-name forms selected by the `hub-postgres` group: `on_postgres::*`, `*::postgres`, `postgres_*` or `*_on_postgres`. Future tests that create a `PgSchema` must retain one of those forms. The similarly named SQLite test `on_sqlite::postgres_read_briefings_share_the_repository_maintenance_lock` is deliberately outside the group.
+At the revision where nextest was introduced, the audit found temporary-directory isolation, ephemeral ports, random PostgreSQL schemas and process-local telemetry state. Those patterns support concurrent execution but do not prove every timing interaction is safe. A source and inventory audit found 109 PostgreSQL fixture tests across ten integration modules. Every fixture test uses one of four forms after its module prefix, selected by the `hub-postgres` group: `<module>::on_postgres::*`, `*::postgres`, `<module>::postgres_*` or `*_on_postgres`. Future tests that create a `PgSchema` must retain one of those forms. The similarly named SQLite test `on_sqlite::postgres_read_briefings_share_the_repository_maintenance_lock` is deliberately outside the group.
 
 The PostgreSQL limit serializes tests that share one database's global advisory locks. It is not a connection-quota workaround and does not replace schema isolation. The hosted-laptop tests retain a process mutex, and repeated RSA key generation may affect runtime; both need empirical observation during qualification. The S3 backend keeps its single-process nextest group because its existing bucket-creation mutex is process-local.
 

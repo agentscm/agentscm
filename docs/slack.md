@@ -136,7 +136,7 @@ An app created from an earlier version of this manifest (Home tab, `/agentscm` c
 
 ## Messages and buttons
 
-A background worker reads the Hub event log every half second. On its first run it starts at the newest event, so history from before installation is never sent. Each event becomes at most one message per person. A message has a short header saying what happened, two columns of fields (the files, up to five then `+N more`; the repository; your agent; their agent with its owner's login), the buttons, and one line of guidance. For example, the holder of a file another agent edited again sees:
+A background worker reads the Hub event log every two seconds, and every half second while it has just delivered something. On its first run it starts at the newest event, so history from before installation is never sent. Each event becomes at most one message per person. A message has a short header saying what happened, two columns of fields (the files, up to five then `+N more`; the repository; your agent; their agent with its owner's login), the buttons, and one line of guidance. For example, the holder of a file another agent edited again sees:
 
 ```text
 Another agent edited a file your agent holds

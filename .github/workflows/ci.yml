@@ -30,7 +30,24 @@ jobs:
       - run: rustup toolchain install # reads rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
+      - name: Check release metadata
+        run: |
+          rustfmt --edition 2024 --check tools/release-files.rs
+          rustc --edition=2024 -D warnings --test tools/release-files.rs -o "$RUNNER_TEMP/release-files-test"
+          "$RUNNER_TEMP/release-files-test"
+          rustc --edition=2024 -D warnings tools/release-files.rs -o "$RUNNER_TEMP/release-files"
+          "$RUNNER_TEMP/release-files" --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # Crate-level `warnings = "deny"` turns musl-only deprecations into errors; linting musl here catches
+      # them on every pull request. The labelled `release-targets` job builds every non-Windows release target.
+      - run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo clippy --locked --target x86_64-unknown-linux-musl -- -D warnings
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
 
   # Hosted tests with PostgreSQL and S3. Always on push to main and manual runs. For a pull request:
   # fork PRs run on opened, synchronize and reopened (they cannot carry a local validation
@@ -90,3 +107,41 @@ jobs:
       - name: Run doctests
         if: ${{ !cancelled() }}
         run: cargo test --locked --doc
+
+  # Clippy and release builds for the musl and macOS targets, so a target-specific lint (for example a libc
+  # item deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the
+  # pull request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
+  # needs the UI build. Same gate as the `windows` job in windows.yml: with the `ci-extended` label, a
+  # fork PR once per labelling, and always on push to main and manual runs.
+  release-targets:
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true}
+          - {target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true}
+          - {target: aarch64-apple-darwin, os: macos-15, musl: false}
+          - {target: x86_64-apple-darwin, os: macos-15, musl: false} # cross-compiled on the arm runner, as release.yml does
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - run: rustup target add "$TARGET"
+      - name: Install musl-tools
+        if: ${{ matrix.musl }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          # ring and bundled SQLite compile C; cc-rs only guesses musl-gcc for x86_64.
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo clippy --locked --target "$TARGET" -- -D warnings
+      - run: cargo build --locked --release --target "$TARGET"

@@ -25,7 +25,7 @@ use tokio::sync::Semaphore;
 
 use super::advice::sanitize;
 use super::handoff::Answered;
-use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, overlaps};
+use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
 use super::{HubError, HubState, Result};
@@ -754,9 +754,12 @@ impl Slack {
         };
         let mut found = Vec::new();
         for name in names {
-            let intents = state
-                .store
-                .live_intents(name, unix_now(), MAX_LIVE_INTENTS)?;
+            let (intents, truncated) = live_intents_capped(&*state.store, name, unix_now())?;
+            if truncated {
+                eprintln!(
+                    "hub: {name} has more than {MAX_LIVE_INTENTS} live intents; Slack messages see only the first"
+                );
+            }
             if bound.is_some() || intents.iter().any(|i| i.token == token) {
                 found.push((name.to_owned(), intents));
             }
@@ -1156,9 +1159,10 @@ impl Slack {
                     Err(_) => eprintln!("Slack event collection unavailable"),
                 }
                 // Several sends per pass, so a burst is not paced at one message per sleep.
+                let mut sent = false;
                 for _ in 0..SENDS_PER_PASS {
                     match self.deliver(&state).await {
-                        Ok(true) => {}
+                        Ok(true) => sent = true,
                         Ok(false) | Err(HubError::Unauthorized | HubError::Busy) => break,
                         Err(_) => {
                             eprintln!("Slack delivery journal unavailable");
@@ -1166,7 +1170,9 @@ impl Slack {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Back off when the pass delivered nothing.
+                let idle = if sent { 500 } else { 2000 };
+                tokio::time::sleep(Duration::from_millis(idle)).await;
             }
         })
     }

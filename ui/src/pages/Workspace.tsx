@@ -900,7 +900,7 @@ function WorkspaceWorkflow({ repositoryId, runId, stepId }: { repositoryId: stri
   const reload = <button className="btn btn-sm btn-outline-secondary" onClick={() => setN((x) => x + 1)}>Refresh</button>
   return (
     <div className="stack">
-      <a href="#workspace" className="back"><Icon name="arrow-left" /> Repositories & runs</a>
+      <a href="#workspace" className="back"><Icon name="arrow-left" /> Runs</a>
       {load.kind === 'loading' && <Skeleton rows={6} />}
       {load.kind === 'error' && <Notice title="Retained workflow is not available" action={reload}>{pollError(load)}</Notice>}
       {load.kind === 'ready' && load.value.availability === 'unavailable' && <Notice title="Retained workflow is not available yet" action={reload}>A queued run may not have written its native journal. Refresh after execution starts.</Notice>}
@@ -918,7 +918,7 @@ function WorkspaceWorkflow({ repositoryId, runId, stepId }: { repositoryId: stri
 // ---------- Page
 
 const TABS = [
-  { key: 'repositories', label: 'Repositories & runs', icon: 'folder2-open', href: '#workspace' },
+  { key: 'repositories', label: 'Runs', icon: 'folder2-open', href: '#workspace' },
   { key: 'members', label: 'Members', icon: 'people', href: '#workspace/members' },
   { key: 'settings', label: 'Settings', icon: 'gear', href: '#workspace/settings' },
 ] as const
@@ -986,7 +986,7 @@ export function WorkspacePage() {
             ))}
           </nav>
           {route.tab === 'workflow' && ('invalid' in route ? (
-            <Notice tone="bad" title="Invalid workspace run link.">Open Repositories & runs to choose a run.</Notice>
+            <Notice tone="bad" title="Invalid workspace run link.">Open Runs to choose a run.</Notice>
           ) : (
             <WorkspaceWorkflow key={`${route.repositoryId}/${route.runId}`} repositoryId={route.repositoryId} runId={route.runId} {...(route.stepId ? { stepId: route.stepId } : {})} />
           ))}

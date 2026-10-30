@@ -1,5 +1,5 @@
 //! In-process fake of the GitHub REST/GraphQL surface the hub sync uses. Synthetic data only.
-//! Include with `#[path = "support/fake_github.rs"] mod fake_github;`.
+//! Declared once in `tests/integration/main.rs`.
 #![allow(dead_code)] // each including test uses a different subset
 #![allow(clippy::collapsible_if, clippy::result_large_err)] // test fake: clarity over lint style
 

@@ -285,7 +285,7 @@ pub(crate) fn decode_reply(
         model: response.model,
         usage,
         decision,
-        content_sha256: hash_bytes(choice.message.content.as_bytes()),
+        content_sha256: crate::checks::sha256(choice.message.content.as_bytes()),
         system_fingerprint: response.system_fingerprint,
         service_tier: response.service_tier,
     })

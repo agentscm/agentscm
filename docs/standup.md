@@ -227,6 +227,8 @@ acknowledge that agent subscriber. Opening new agent sessions therefore does not
 consume delivery quotas or pin retained history. MCP is advisory and cannot
 intercept arbitrary edits outside a supported hook.
 
+An incomplete merge path inventory does not block source freshness when the source revision is the exact merge commit, or an exact typed checked observation reports that merge as included with `source_relation_checked`. Unknown ancestry and an exact already-merged proposal head remain blocked.
+
 ## Before work and after an overlap
 
 1. Read `agentscm_work_overview` (or `agentscm work overview`) before planning. It shows unfinished assignments, declared overlaps, and reported outcomes in the last 24 hours by default. `recent_since` selects another starting time. A compacted history is explicitly incomplete.
@@ -242,7 +244,7 @@ A coordination acknowledgement is a client assertion of receipt, not agreement o
 
 Stand-up storage has a 128 MiB retained-payload budget per provider, host, repository and stable repository ID. It counts serialized work snapshots, checkpoint requests, cached briefing pages and work-event records, with a fixed allowance for each row. Other table data, database pages, indexes and write-ahead logs require additional disk space. New writes that exceed the budget fail and roll back; reads, acknowledgements and retained exact checkpoint retries remain available.
 
-A local operator with direct database access can inspect and compact old history. This command uses the explicitly supplied database, rather than a Hub bearer token, and is not exposed through HTTP or MCP:
+The Hub compacts history older than seven days on its own, a minute after startup and then hourly, with the same guards as the operator command (see [hub.md](hub.md)). A local operator with direct database access can inspect and compact more recent history. This command uses the explicitly supplied database, rather than a Hub bearer token, and is not exposed through HTTP or MCP:
 
 ```sh
 agentscm work compact --database sqlite:///absolute/path/hub.sqlite \
@@ -295,6 +297,22 @@ Compaction also removes coordination requests that were resolved or withdrawn be
 This maintenance path can delete `work_started`, `work_joined`, `work_takeover` and `work_checkpoint` events, plus the closed request's `coordination_requested`, `coordination_bound`, `coordination_retargeted`, `coordination_acknowledged`, `coordination_responded`, `coordination_resolved` and `coordination_withdrawn` events. Removed coordination history advances the durable retention floor described above. All event updates remain prohibited, and other Hub event kinds retain their append-only protection. Stand-up history is self-reported coordination context, not retained execution or approval evidence.
 
 Checkpoint retries are supported for at least 24 hours. After a receipt has been compacted, its old version guard prevents the request from being applied again; the caller must inspect current work rather than infer whether the old operation committed. Compaction does not remove current work items, so repositories with many retained items can still reach capacity. Back up the database before maintenance and provision disk space for retained data; compaction does not promise to shrink database files immediately.
+
+### Repair Work after a repository rename
+
+Reconnect the client using the new repository name and refresh the Hub's connected repository identity first. A rename can leave retained Work under the former owner/name; changing a Git remote or reconnecting alone does not migrate that namespace. A local operator with database access can preview the repair:
+
+```sh
+agentscm work repair-repository --database-env AGENTSCM_DATABASE_URL \
+  --provider github --host github.com --repository acme/previous \
+  --repository-id 123 --destination acme/current
+```
+
+The destination must match the connected repository's stable ID. The command does not query the forge. Preview executes the same collision and capacity checks in a rolled-back transaction; repeat with `--apply` to commit. The destination may already contain Work. Native-key, forge-issue or active coordination fingerprint collisions abort the entire repair. PostgreSQL takes exclusive maintenance locks while evaluating the repair, including previews.
+
+Repair preserves Work IDs, owners, lead tokens, sessions, generations, participants, relationships and historical snapshots. It updates current namespace and matching forge source names, records new version fences, moves coordination requests, retains the greatest history retention floors and recomputes payload usage. Existing name-based Work briefings and their acknowledgements for both names are invalidated: read a fresh briefing afterward. Stable-ID catch-up cursors and merge observations are preserved. A completed repair is safe to repeat.
+
+Old-name tokens cannot perform Work operations after the connected identity changes, and their claims are projected as stale. Reconnect under the new name and use the existing explicit generation-fenced takeover flow; repair itself never transfers ownership. Unbound tokens and different stable repository IDs are not migrated. Retained publication evidence remains associated through the publishing token's stable repository ID, provider and host.
 
 ## Agent surfaces
 

@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::context::ChangeId;
 use crate::model::{EntryChange, EntryKind};
-use crate::store::{Engine, SourceReader, digest, validate_id, validate_symlink_target};
+use crate::store::{
+    Engine, SourceReader, blob_id_hasher, digest, validate_id, validate_symlink_target,
+};
 use crate::sync;
 use crate::{Error, Result};
 
@@ -145,7 +147,7 @@ pub(crate) fn capture_selected_worktree(
             "attachment probe and worktree must be on the same filesystem".into(),
         ));
     }
-    require_executable_support(scan.probe)?;
+    require_executable_support_cached(scan.probe)?;
     let settings = git_config::selected_settings(scan.root, scan.git)?;
     let base = require_complete_snapshot(source_snapshot(engine, base_revision)?)?;
     let tracked = Tracked::from_paths(
@@ -159,6 +161,7 @@ pub(crate) fn capture_selected_worktree(
         &tracked,
         &settings,
         scope.as_ref(),
+        true,
     )?)?;
     let includes = |path: &str| scope.as_ref().is_none_or(|s| s.includes(path));
     let changes: Vec<_> = staged_between(&base.files, &working.files)
@@ -678,11 +681,11 @@ impl Workspace {
                 pending: state.pending,
             }
         } else if let Some(base) =
-            source_snapshot_scoped(engine, &state.base_revision, scope.as_ref())?
+            source_digests_scoped(engine, &state.base_revision, scope.as_ref())?
         {
             let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
             if let Some((working, report)) =
-                scan_workspace_full_scoped(&self.root, &tracked, scope.as_ref())?
+                scan_workspace_digests_scoped(&self.root, &tracked, scope.as_ref())?
             {
                 let mut changes = changes_between(&base.files, &working.files);
                 let complete = changes.len() <= limit;
@@ -743,12 +746,11 @@ impl Workspace {
             pending: state.pending,
         };
         if state.ready
-            && let Some(base) =
-                source_snapshot_scoped(engine, &state.base_revision, scope.as_ref())?
+            && let Some(base) = source_digests_scoped(engine, &state.base_revision, scope.as_ref())?
         {
             let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
             if let Some((working, mut report)) =
-                scan_workspace_full_scoped(&self.root, &tracked, scope.as_ref())?
+                scan_workspace_digests_scoped(&self.root, &tracked, scope.as_ref())?
             {
                 preview.included_total = working.files.len();
                 preview.excluded_total = report.excluded_total;
@@ -1386,7 +1388,8 @@ struct Stage {
     after: Option<Item>,
 }
 
-/// One tracked workspace entry. For a symlink `content` is the link target.
+/// One tracked workspace entry. For a symlink `content` is the link target. In a digest-only
+/// snapshot (status and preview) `content` is the SHA-256 of those bytes instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Item {
     kind: EntryKind,
@@ -1401,7 +1404,8 @@ struct Snapshot {
 
 #[derive(Clone, Debug)]
 struct SourceInventory {
-    entries: BTreeMap<String, EntryKind>,
+    /// Path to kind and blob id.
+    entries: BTreeMap<String, (EntryKind, String)>,
     directories: BTreeSet<String>,
 }
 
@@ -2680,7 +2684,7 @@ fn source_inventory(engine: &Engine, revision: &str) -> Result<Option<SourceInve
             if entries.len() + directories.len() >= MAX_ENTRIES {
                 return Ok(None);
             }
-            entries.insert(entry.path, entry.kind);
+            entries.insert(entry.path, (entry.kind, entry.blob));
         }
         match page.next {
             Some(next) => {
@@ -2720,6 +2724,7 @@ fn snapshot_from_inventory(
         inventory,
         |path| scope.is_none_or(|scope| scope.includes(path)),
         |path| scope.is_none_or(|scope| scope.traverses(path)),
+        true,
     )
 }
 
@@ -2772,20 +2777,27 @@ fn snapshot_from_inventory_where(
     inventory: &SourceInventory,
     mut selected: impl FnMut(&str) -> bool,
     mut traversed: impl FnMut(&str) -> bool,
+    retain_content: bool,
 ) -> Result<Option<Snapshot>> {
     let mut files = BTreeMap::new();
     let mut directories = BTreeSet::new();
     let mut total_bytes = 0usize;
-    for (path, kind) in &inventory.entries {
+    for (path, (kind, blob)) in &inventory.entries {
         if !selected(path) {
             continue;
         }
-        let content = engine.read_file(revision, path)?;
-        if content.len() > MAX_FILE_BYTES {
+        // A blob id hashes the framed payload, so digest mode needs only its length.
+        let (length, content) = if retain_content {
+            let content = engine.read_file(revision, path)?;
+            (content.len(), content)
+        } else {
+            (engine.blob_length(blob)? as usize, blob.as_bytes().to_vec())
+        };
+        if length > MAX_FILE_BYTES {
             return Ok(None);
         }
         total_bytes = total_bytes
-            .checked_add(content.len())
+            .checked_add(length)
             .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
         if total_bytes > MAX_TOTAL_BYTES || files.len() + directories.len() >= MAX_ENTRIES {
             return Ok(None);
@@ -2821,6 +2833,26 @@ fn source_snapshot_scoped(
         return Ok(None);
     };
     snapshot_from_inventory(engine, revision, &inventory, scope)
+}
+
+/// `source_snapshot_scoped` with blob ids in place of contents, under the same limits.
+/// Blob payloads are not read or re-verified; only their headers are checked.
+fn source_digests_scoped(
+    engine: &Engine,
+    revision: &str,
+    scope: Option<&Scope>,
+) -> Result<Option<Snapshot>> {
+    let Some(inventory) = source_inventory(engine, revision)? else {
+        return Ok(None);
+    };
+    snapshot_from_inventory_where(
+        engine,
+        revision,
+        &inventory,
+        |path| scope.is_none_or(|scope| scope.includes(path)),
+        |path| scope.is_none_or(|scope| scope.traverses(path)),
+        false,
+    )
 }
 
 fn require_scope_selection_dependencies(
@@ -2925,6 +2957,8 @@ struct Scan<'a> {
     /// Everything read from directories, selected or not; bounded by `MAX_VISITED_ENTRIES`.
     visited: usize,
     report: ScanReport,
+    /// False keeps only the blob id per file, so status does not hold every working byte.
+    retain_content: bool,
 }
 
 struct Candidate {
@@ -2948,7 +2982,17 @@ fn scan_workspace_full_scoped<'a>(
     scope: Option<&'a Scope>,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     let metadata = root.join(METADATA_DIRECTORY);
-    scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata)
+    scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata, true)
+}
+
+/// `scan_workspace_full_scoped` with blob ids in place of contents, under the same limits.
+fn scan_workspace_digests_scoped<'a>(
+    root: &Path,
+    tracked: &'a Tracked,
+    scope: Option<&'a Scope>,
+) -> Result<Option<(Snapshot, ScanReport)>> {
+    let metadata = root.join(METADATA_DIRECTORY);
+    scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata, false)
 }
 
 fn scan_workspace_full_scoped_with_probe<'a>(
@@ -2956,12 +3000,28 @@ fn scan_workspace_full_scoped_with_probe<'a>(
     tracked: &'a Tracked,
     scope: Option<&'a Scope>,
     probe_directory: &Path,
+    retain_content: bool,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     // Kinds are recorded from file modes, so a mount that reports every file
     // executable must be refused rather than reported as phantom changes.
-    require_executable_support(probe_directory)?;
-    let settings = git_config::ambient_settings(root, || probe_case_insensitive(probe_directory))?;
-    scan_with_settings_scoped(root, tracked, &settings, scope)
+    // Only the long-lived metadata directory remembers probe results; a transient probe
+    // directory (capture's) would be left holding a marker.
+    let persistent = probe_directory == root.join(METADATA_DIRECTORY);
+    if persistent {
+        require_executable_support_cached(probe_directory)?;
+    } else {
+        require_executable_support(probe_directory)?;
+    }
+    let settings = git_config::ambient_settings(root, || {
+        if persistent {
+            cached_capability(probe_directory, "case", true, || {
+                probe_case_insensitive(probe_directory)
+            })
+        } else {
+            probe_case_insensitive(probe_directory)
+        }
+    })?;
+    scan_with_settings_scoped(root, tracked, &settings, scope, retain_content)
 }
 
 #[cfg(test)]
@@ -2982,7 +3042,7 @@ fn scan_with_settings(
     tracked: &Tracked,
     settings: &Settings,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
-    scan_with_settings_scoped(root, tracked, settings, None)
+    scan_with_settings_scoped(root, tracked, settings, None, true)
 }
 
 fn scan_with_settings_scoped<'a>(
@@ -2990,6 +3050,7 @@ fn scan_with_settings_scoped<'a>(
     tracked: &'a Tracked,
     settings: &'a Settings,
     scope: Option<&'a Scope>,
+    retain_content: bool,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     let mut scan = Scan {
         selector: Selector::open(root, tracked, settings)?,
@@ -3003,6 +3064,7 @@ fn scan_with_settings_scoped<'a>(
         entry_count: 0,
         visited: 0,
         report: ScanReport::default(),
+        retain_content,
     };
     if !scan.directory(root, Path::new(""), 0, None)? {
         return Ok(None);
@@ -3142,13 +3204,18 @@ impl Scan<'_> {
                 }
                 // Never followed: the link itself is the entry, so a link to a
                 // directory is not descended into.
-                let item = read_symlink_item(&path, &relative)?;
+                let mut item = read_symlink_item(&path, &relative)?;
                 self.total_bytes = self
                     .total_bytes
                     .checked_add(item.content.len())
                     .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
                 if self.total_bytes > MAX_TOTAL_BYTES {
                     return Ok(false);
+                }
+                if !self.retain_content {
+                    let mut hasher = blob_id_hasher(item.content.len() as u64);
+                    hasher.update(&item.content);
+                    item.content = format!("{:x}", hasher.finalize()).into_bytes();
                 }
                 self.snapshot.files.insert(relative, item);
                 continue;
@@ -3180,10 +3247,27 @@ impl Scan<'_> {
             if metadata.len() > MAX_FILE_BYTES as u64 {
                 return Ok(false);
             }
-            let item = read_regular_file(&path, &relative)?;
+            let (item, length) = if self.retain_content {
+                let item = read_regular_file(&path, &relative)?;
+                let length = item.content.len();
+                (item, length)
+            } else {
+                // Streamed through the hasher so no whole file is buffered; the
+                // digest is the blob id, so the base side need not read its blob.
+                let before = fs::symlink_metadata(&path)?;
+                let mut hasher = blob_id_hasher(before.len());
+                let (kind, length) = read_regular_into(&path, &relative, &before, &mut hasher)?;
+                if length as u64 != before.len() {
+                    return Err(Error::Conflict(format!(
+                        "workspace file changed while it was read: {relative}"
+                    )));
+                }
+                let content = format!("{:x}", hasher.finalize()).into_bytes();
+                (Item { kind, content }, length)
+            };
             self.total_bytes = self
                 .total_bytes
-                .checked_add(item.content.len())
+                .checked_add(length)
                 .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
             if self.total_bytes > MAX_TOTAL_BYTES {
                 return Ok(false);
@@ -3222,6 +3306,22 @@ fn read_symlink_item(path: &Path, relative: &str) -> Result<Item> {
 
 fn read_regular_file(path: &Path, relative: &str) -> Result<Item> {
     let before = fs::symlink_metadata(path)?;
+    // Preallocated so a large file is not regrown by doubling; the size is rechecked.
+    let size = before.len().min(MAX_FILE_BYTES as u64);
+    let mut content = Vec::with_capacity(size as usize);
+    let (kind, _) = read_regular_into(path, relative, &before, &mut content)?;
+    Ok(Item { kind, content })
+}
+
+/// Copy a regular file into `sink` under the size bound, refusing a file that changes while it
+/// is read. `before` is the caller's fresh `symlink_metadata` of `path`. Returns its kind and
+/// byte length.
+fn read_regular_into(
+    path: &Path,
+    relative: &str,
+    before: &fs::Metadata,
+    sink: &mut impl Write,
+) -> Result<(EntryKind, usize)> {
     if !before.file_type().is_file() || before.file_type().is_symlink() {
         return Err(Error::Invalid(format!(
             "workspace path is not a regular file: {relative}"
@@ -3234,11 +3334,11 @@ fn read_regular_file(path: &Path, relative: &str) -> Result<Item> {
             "workspace file exceeds {MAX_FILE_BYTES} bytes: {relative}"
         )));
     }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    Read::by_ref(&mut file)
-        .take(MAX_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_FILE_BYTES {
+    let length = std::io::copy(
+        &mut Read::by_ref(&mut file).take(MAX_FILE_BYTES as u64 + 1),
+        sink,
+    )?;
+    if length > MAX_FILE_BYTES as u64 {
         return Err(Error::Limit(format!(
             "workspace file exceeds {MAX_FILE_BYTES} bytes: {relative}"
         )));
@@ -3256,10 +3356,8 @@ fn read_regular_file(path: &Path, relative: &str) -> Result<Item> {
             "workspace file changed while it was read: {relative}"
         )));
     }
-    Ok(Item {
-        kind: kind_of_mode(opened.permissions().mode()),
-        content: bytes,
-    })
+    // The bound check above keeps `length` within `MAX_FILE_BYTES`.
+    Ok((kind_of_mode(opened.permissions().mode()), length as usize))
 }
 
 fn changes_between(
@@ -3993,17 +4091,65 @@ fn require_filesystem_support(directory: &Path) -> Result<()> {
             "unsupported filesystem: it does not support symbolic links".to_owned(),
         ));
     }
-    require_executable_support(directory)
+    require_executable_support_cached(directory)
 }
 
 fn require_executable_support(directory: &Path) -> Result<()> {
-    if probe_executable_bit(directory)? {
+    require_executable_result(probe_executable_bit(directory)?)
+}
+
+/// `require_executable_support` for scans, which run on every status: a success is remembered in
+/// a marker in `directory` so the create/chmod/delete probe runs once per directory.
+fn require_executable_support_cached(directory: &Path) -> Result<()> {
+    require_executable_result(cached_capability(directory, "exec", false, || {
+        probe_executable_bit(directory)
+    })?)
+}
+
+fn require_executable_result(preserved: bool) -> Result<()> {
+    if preserved {
         Ok(())
     } else {
         Err(Error::Invalid(
             "unsupported filesystem: it does not preserve executable modes".to_owned(),
         ))
     }
+}
+
+const CAPABILITY_MARKER_PREFIX: &str = ".agentscm-capability-";
+
+/// A filesystem probe result remembered in `directory`, keyed by the directory's device and inode
+/// so a copy or a move to another filesystem probes again. An unreadable, unwritable or
+/// mismatched marker falls back to running `probe`. A negative result is stored only when
+/// `cache_negative` is set, so a refused filesystem is re-probed after it is fixed.
+fn cached_capability(
+    directory: &Path,
+    name: &str,
+    cache_negative: bool,
+    probe: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    let marker = directory.join(format!("{CAPABILITY_MARKER_PREFIX}{name}"));
+    let key = fs::metadata(directory)
+        .ok()
+        .map(|metadata| format!("{}:{}:", metadata.dev(), metadata.ino()));
+    if let Some(key) = &key
+        && let Ok(text) = fs::read_to_string(&marker)
+        && let Some(value) = text.strip_prefix(key.as_str())
+    {
+        match value {
+            "1" => return Ok(true),
+            "0" => return Ok(false),
+            _ => {}
+        }
+    }
+    let result = probe()?;
+    if let Some(key) = key
+        && (result || cache_negative)
+    {
+        // Best effort: a failed write only costs the next call another probe.
+        let _ = fs::write(&marker, format!("{key}{}", u8::from(result)));
+    }
+    Ok(result)
 }
 
 /// The owner execute bit is preserved only if it reads back clear after
@@ -5555,6 +5701,35 @@ mod tests {
     }
 
     #[test]
+    fn capability_probe_runs_once_per_directory_and_falls_back_on_a_bad_marker() {
+        use std::cell::Cell;
+        let fixtures = TempDir::new().unwrap();
+        let dir = fixtures.path();
+        let runs = Cell::new(0);
+        let counted = |answer: bool| -> Result<bool> {
+            runs.set(runs.get() + 1);
+            Ok(answer)
+        };
+        assert!(cached_capability(dir, "exec", false, || counted(true)).unwrap());
+        assert!(cached_capability(dir, "exec", false, || counted(false)).unwrap());
+        assert_eq!(runs.get(), 1, "the second call is served by the marker");
+
+        // A marker for another directory (copied metadata) or with garbage is ignored.
+        for contents in ["1:1:1", "garbage", ""] {
+            fs::write(dir.join(".agentscm-capability-exec"), contents).unwrap();
+            assert!(!cached_capability(dir, "exec", false, || counted(false)).unwrap());
+        }
+        assert_eq!(runs.get(), 4);
+
+        // A negative answer is remembered only on request.
+        assert!(!cached_capability(dir, "never", false, || counted(false)).unwrap());
+        assert!(cached_capability(dir, "never", false, || counted(true)).unwrap());
+        assert!(!cached_capability(dir, "case", true, || counted(false)).unwrap());
+        assert!(!cached_capability(dir, "case", true, || counted(true)).unwrap());
+        assert_eq!(runs.get(), 7);
+    }
+
+    #[test]
     fn executable_probe_needs_both_sides() {
         assert!(executable_bit_preserved(0o100600, 0o100700));
         // A mount reporting every file executable fails the clear check.
@@ -5730,7 +5905,7 @@ mod tests {
         );
     }
 
-    /// The Git these tests drive, resolved as in tests/git_snapshot.rs. A missing Git is a test
+    /// The Git these tests drive, resolved as in tests/integration/git_snapshot.rs. A missing Git is a test
     /// failure, never a silent skip.
     fn test_git() -> PathBuf {
         let path = PathBuf::from(

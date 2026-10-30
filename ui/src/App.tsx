@@ -30,6 +30,7 @@ import { TimelinePage } from './pages/Timeline.tsx'
 import { ExplorerPage } from './pages/Explorer.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
 import { PromisesPage } from './pages/Promises.tsx'
+import { RepositoriesPage } from './pages/Repositories.tsx'
 import { AppChrome, type Badges, type NavDef, type SectionDef, type TabStatuses, type WebChoice } from './TopNav.tsx'
 import { useWebRead, type WebRead } from './webRead.ts'
 import { Notice } from './ui.tsx'
@@ -47,7 +48,7 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'promises' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'computers' | 'admin' | 'health' | 'settings'
+export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'promises' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'computers' | 'admin' | 'health' | 'settings' | 'repositories'
 
 /** Every routed page. `label` names its tab inside its nav item; `question` is the page's hidden h1. */
 export const SECTIONS: SectionDef[] = [
@@ -71,6 +72,8 @@ export const SECTIONS: SectionDef[] = [
   { key: 'computers', nav: 'setup', icon: 'laptop', label: 'Computers', question: 'Which computers can act for me?' },
   { key: 'admin', nav: 'setup', icon: 'shield-lock', label: 'Admin', question: 'Which repositories are connected, and who was turned away?' },
   { key: 'settings', nav: 'setup', icon: 'sliders', label: 'Preferences', question: 'How is this page set up for me?' },
+  // Outside the rail: reached from the repository menu and the logo.
+  { key: 'repositories', nav: 'home', icon: 'collection', label: 'All repositories', question: 'Which of my repositories need me?' },
 ]
 
 /** The rail: one item per question; items with more than one page show them as tabs. */
@@ -184,6 +187,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     setup: { text: 'Hooks and tokens', tone: 'muted' },
     health: data.failing ? { text: 'Not answering', tone: 'bad' } : data.health ? { text: data.health.status === 'ok' ? 'Answering' : 'Degraded', tone: data.health.status === 'ok' ? 'ok' : 'warn' } : undefined,
     workspace: { text: 'Members and runs', tone: 'muted' },
+    repositories: { text: 'Every one you can read', tone: 'muted' },
     settings: { text: 'This browser', tone: 'muted' },
   }
 
@@ -194,7 +198,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
   }, [])
 
   const shell = (
-    <TourProvider key={section === 'promises' || section === 'workspace' ? 'independent' : web ? token : 'hub'} signedIn={!hubSignedOut} section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
+    <TourProvider key={section === 'promises' || section === 'workspace' || section === 'repositories' ? 'independent' : web ? token : 'hub'} signedIn={!hubSignedOut} section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
       <AppChrome
         // The frame is deep violet in both themes, so the top bar always carries the light-on-dark logo.
         logo={<Logo dark height={26} />}
@@ -245,6 +249,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
         {section === 'explorer' && <ExplorerPage hubRepository={data.whoami?.token.repository ?? null} />}
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
+        {section === 'repositories' && <RepositoriesPage auth={device.auth} web={web} current={data.whoami?.token.repository ?? null} />}
         {section === 'health' && <HealthPage health={data.health} />}
         {section === 'computers' && <ComputersPage auth={device.auth} provider={provider} onSignedOut={(session) => { device.reload(); onHubSignedOut?.(session) }} onSignOutFailed={onHubSignOutFailed} />}
         {section === 'admin' && <AdminPage auth={device.auth} provider={provider} />}
@@ -266,6 +271,13 @@ export default function App() {
   const [signedInLanding] = useState(isSignedInHash)
   // No pasted token on the hosted Hub: open its pages on the web sign-in, if there is one.
   const web = useWebRead(!token && !onFrontDoor() && !signedInLanding, morphToApp)
+  // Someone who can read several repositories lands on All repositories, once per page load.
+  const landed = useRef(false)
+  useEffect(() => {
+    if (landed.current || web.state.kind !== 'ready') return
+    landed.current = true
+    if (web.state.readable > 1 && ['', '#', '#home'].includes(window.location.hash)) window.location.replace('#repositories')
+  }, [web.state])
   const prefersDark = useSyncExternalStore(subscribeDark, systemDark)
   const dark = pref === 'dark' || (pref === 'system' && prefersDark)
   const [workflowDirty, setWorkflowDirty] = useState(false)
@@ -304,7 +316,7 @@ export default function App() {
     [signedOut, token],
   )
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
-  const independent = section === 'workspace' || section === 'promises'
+  const independent = section === 'workspace' || section === 'promises' || section === 'repositories'
   const unavailable = web.state.kind === 'unavailable' ? unavailableCopy(web.state) : null
   const acceptToken = (t: string, keep: boolean) => {
     saveToken(t, keep)

@@ -531,6 +531,16 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           return res.end()
         }
         if (url.pathname === '/session') return scenario === 'empty' || !browserSignedIn ? send(401, { error: 'sign_in_required' }) : send(200, { user: { id: 'usr_maria', login: 'maria', provider: 'github', host: 'github.com', user_id: 1001 }, admin: true, csrf_token: 'synthetic-csrf-no-authority', expires_at: ago(-86400 / 3) })
+        if (url.pathname === '/session/repositories') {
+          if (scenario === 'empty' || !browserSignedIn) return send(401, { error: 'sign_in_required' })
+          const row = (repository: string, needs_you: number, total: number, moving: number, stuck: number, agents: number, idle: number | null, complete = true) => ({ repository, repository_id: repository.length, provider: 'github', unfinished: { total, moving, stuck }, needs_you, agents, last_activity_at: idle === null ? null : ago(idle), complete })
+          // One row in the full scenario keeps the landing on #home that the e2e specs expect; demo shows several,
+          // including the repository whose read token the mock refuses.
+          const rows = scenario === 'demo'
+            ? [row(REPO, 2, 5, 3, 2, 4, 120), row(REFUSED_REPO, 1, 2, 1, 1, 2, 3600), row('acme/billing-docs', 0, 3, 1, 2, 1, 7200, false), row('acme/infra', 0, 2, 2, 0, 3, 600), row('acme/design-system', 0, 0, 0, 0, 0, 86400 * 9), row('acme/handbook', 0, 0, 0, 0, 0, null)]
+            : [row(REPO, 0, 1, 1, 0, 1, 300)]
+          return send(200, { repositories: rows, unchecked: scenario === 'demo' ? 1 : 0, complete: true, checked_at: ago(0) })
+        }
         if (url.pathname === '/devices') return send(200, { devices: scenario === 'empty' ? [] : devices().filter((d) => d.owner.login === maria.login).map((d) => ({ ...d, owner: undefined })) })
         if (url.pathname.startsWith('/devices/') && req.method === 'DELETE') {
           const id = url.pathname.slice('/devices/'.length)

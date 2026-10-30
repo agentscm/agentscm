@@ -598,9 +598,9 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('workspace-tabs'),
         title: 'Repositories, members, settings',
-        what: 'Repositories & runs shows recent workflow runs and starts new ones. Members lists who has access. Settings holds the shared name.',
+        what: 'Runs shows recent workflow runs and starts new ones. Members lists who has access. Settings holds the shared name.',
         why: 'Each tab is a separate permission. Many people only need the first.',
-        how: 'Open Repositories & runs to see run results. Run history is kept on the hub, not in this browser.',
+        how: 'Open Runs to see run results. Run history is kept on the hub, not in this browser.',
         empty: 'These tabs appear after you sign in.',
       },
       {

@@ -29,6 +29,7 @@ pub mod pipeline_rules;
 pub mod promise;
 mod promise_http;
 pub mod publish;
+mod repository_summary;
 pub mod session;
 pub mod skill_workflow;
 pub mod skills;
@@ -143,6 +144,80 @@ impl From<std::io::Error> for HubError {
 impl From<crate::Error> for HubError {
     fn from(error: crate::Error) -> Self {
         Self::Unavailable(error.to_string())
+    }
+}
+
+/// Automatic compaction keeps a week of stand-up history; the operator command can choose any
+/// cutoff at least 24 hours old.
+pub const WORK_AUTO_COMPACTION_AGE_SECONDS: i64 = 7 * 86_400;
+const WORK_COMPACTION_FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const WORK_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const WORK_COMPACTION_BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+const WORK_COMPACTION_BUSY_ATTEMPTS: usize = 12;
+
+/// Applies the operator `work compact` to every repository scope with history older than
+/// [`WORK_AUTO_COMPACTION_AGE_SECONDS`], with that command's own guards. Returns the applied
+/// results and how many scopes were skipped: refused by a guard, such as an unacknowledged
+/// delivery, or the store stayed busy. Each scope is a separate bounded store call.
+pub async fn compact_work_history(
+    state: &HubState,
+    now: i64,
+) -> Result<(Vec<work::WorkCompaction>, usize)> {
+    let store = state.store.clone();
+    let scopes = blocking_when_free(state, move || store.work_compaction_scopes()).await?;
+    let before = now - WORK_AUTO_COMPACTION_AGE_SECONDS;
+    let mut applied = Vec::new();
+    let mut skipped = 0;
+    for scope in scopes {
+        let store = state.store.clone();
+        match blocking_when_free(state, move || store.work_compact(&scope, before, true, now)).await
+        {
+            Ok(result) => applied.push(result),
+            Err(HubError::Invalid(_) | HubError::Busy) => skipped += 1,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((applied, skipped))
+}
+
+async fn blocking_when_free<T: Send + 'static>(
+    state: &HubState,
+    work: impl FnOnce() -> Result<T> + Clone + Send + 'static,
+) -> Result<T> {
+    for _ in 1..WORK_COMPACTION_BUSY_ATTEMPTS {
+        match http::blocking(state, work.clone()).await {
+            Err(HubError::Busy) => tokio::time::sleep(WORK_COMPACTION_BUSY_RETRY).await,
+            result => return result,
+        }
+    }
+    http::blocking(state, work).await
+}
+
+/// Compacts stand-up history a minute after startup and then hourly, logging one line a pass.
+pub async fn work_compaction_loop(state: HubState) {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + WORK_COMPACTION_FIRST_DELAY,
+        WORK_COMPACTION_INTERVAL,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        match compact_work_history(&state, store::unix_now()).await {
+            Ok((applied, skipped)) => {
+                let sum = |field: fn(&work::WorkCompaction) -> u64| -> u64 {
+                    applied.iter().map(field).sum()
+                };
+                eprintln!(
+                    "hub: work compaction removed {} checkpoint receipts, {} work versions, {} coordination requests and {} merge observations across {} repositories ({skipped} skipped)",
+                    sum(|c| c.deleted_operations),
+                    sum(|c| c.deleted_versions),
+                    sum(|c| c.deleted_coordination_requests),
+                    sum(|c| c.deleted_merge_observations),
+                    applied.len(),
+                );
+            }
+            Err(error) => eprintln!("hub: work compaction failed: {error}"),
+        }
     }
 }
 
@@ -343,8 +418,7 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
         .merge(workspace_agent_tasks::routes())
-        .merge(workspace_publication::status_routes())
-        .merge(workspace_source_http::routes());
+        .merge(workspace_publication::status_routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();
     let router = Router::new()
@@ -368,7 +442,25 @@ pub fn router(state: HubState) -> Router {
     let publication = workspace_publication::routes();
     #[cfg(not(unix))]
     let publication = Router::new();
-    bounded(router, publication, &state).with_state(state)
+    let router = bounded(router, publication, &state);
+    #[cfg(unix)]
+    let router = router.merge(source_bounded(workspace_source_http::routes()));
+    router.with_state(state)
+}
+
+/// Source bundles may take [`workspace_source_http::BODY_TIMEOUT`] to arrive, longer than the
+/// Hub-wide bound, so these routes get the body read plus the usual processing time.
+#[cfg(unix)]
+fn source_bounded(routes: Router<HubState>) -> Router<HubState> {
+    routes
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(|request, next| {
+            timeout_after(
+                workspace_source_http::BODY_TIMEOUT + REQUEST_TIMEOUT,
+                request,
+                next,
+            )
+        }))
 }
 
 /// Applies the Hub-wide body and time bounds to `routes`, then merges `publication` behind
@@ -393,7 +485,7 @@ fn bounded(
     routes.merge(publication)
 }
 
-/// Longest any request may run; the notices long-poll caps at 25 seconds and uploads at 8 MiB.
+/// Longest a request outside the publication and source groups may run; the notices long-poll caps at 25 seconds and uploads at 8 MiB.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn request_timeout(
@@ -443,6 +535,38 @@ mod tests {
         };
         assert_eq!(status("/slow").await, 408);
         assert_eq!(status("/fast").await, 200);
+    }
+
+    /// A source upload may read its body for 60 seconds, so the 30-second Hub bound must not
+    /// wrap it; every other route still gets 408 past 30 seconds.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn source_routes_outlast_the_hub_timeout() {
+        use tower_service::Service;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.sqlite");
+        let store = store::open(&format!("sqlite://{}", path.display())).unwrap();
+        let objects = Arc::new(LocalBackend::open(dir.path().join("objects")).unwrap());
+        let state = HubState::new(store, objects);
+        let slow = || {
+            Router::new().route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(REQUEST_TIMEOUT + std::time::Duration::from_secs(10)).await
+                }),
+            )
+        };
+        let status = |router: Router<HubState>| {
+            let mut app = router.with_state(state.clone());
+            async move {
+                let request = axum::extract::Request::get("/slow")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                app.call(request).await.unwrap().status().as_u16()
+            }
+        };
+        assert_eq!(status(bounded(slow(), Router::new(), &state)).await, 408);
+        assert_eq!(status(source_bounded(slow())).await, 200);
     }
 
     fn config(extra: &[(&str, &str)]) -> Result<Option<S3Config>> {

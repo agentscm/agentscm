@@ -57,9 +57,11 @@ export interface TabDef {
 
 /** The tabs of the nav item `section` belongs to. History splits Work into what finished and the change log. */
 export function tabsFor(sections: SectionDef[], section: Section, hash: string): TabDef[] {
+  // All repositories sits outside the rail and its tabs: the rail is about one repository.
+  if (section === 'repositories') return []
   const nav = sections.find((s) => s.key === section)?.nav
   const out: TabDef[] = []
-  for (const s of sections.filter((x) => x.nav === nav)) {
+  for (const s of sections.filter((x) => x.nav === nav && x.key !== 'repositories')) {
     if (s.key === 'work') {
       const tab = workTabFromHash(hash)
       out.push({ key: 'work', label: 'Finished', href: workTabHref('finished'), on: section === 'work' && tab !== 'history' })
@@ -203,6 +205,11 @@ function WebRepoSwitcher({ repo, web, onSignOut }: { repo: string; web: WebChoic
       </button>
       {open && (
         <div className="pop-menu pop-left" role="menu">
+          <a role="menuitem" href="#repositories" className="pop-item" onClick={() => setOpen(false)}>
+            <Icon name="collection" />
+            <span className="pop-main">All repositories<span className="pop-sub">What needs you in each one</span></span>
+          </a>
+          <div className="pop-sep" />
           <div className="pop-head">Repositories you can open</div>
           <div className="pop-item is-current">
             <span className="repo-mark" aria-hidden="true"><Icon name="git" /></span>
@@ -233,7 +240,7 @@ function WebRepoSwitcher({ repo, web, onSignOut }: { repo: string; web: WebChoic
             </p>
           )}
           <p className="pop-note">
-            <Icon name="info-circle" /> Opened with your web sign-in. Repositories show here once you have an agent token or a computer connected for them.
+            <Icon name="info-circle" /> Opened with your web sign-in. Every connected repository you can read on the forge shows here.
           </p>
           <div className="pop-sep" />
           <button type="button" role="menuitem" className="pop-item" onClick={onSignOut}>
@@ -273,7 +280,7 @@ function RepoSwitcher({ repo, onForget }: { repo: string; onForget: () => void }
           <div className="pop-sep" />
           <a role="menuitem" href="#workspace" className="pop-item" onClick={() => setOpen(false)}>
             <Icon name="people" />
-            <span className="pop-main">Open the workspace<span className="pop-sub">Members, repositories and runs</span></span>
+            <span className="pop-main">Open the workspace<span className="pop-sub">Members and runs</span></span>
           </a>
           <button type="button" role="menuitem" className="pop-item" onClick={onForget}>
             <Icon name="arrow-left-right" />
@@ -624,7 +631,7 @@ function RailTip({ on, text, children }: { on: boolean; text: string; children: 
 function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer, onClose }: { nav: NavDef[]; sections: SectionDef[]; section: Section; badges: Badges; collapsed: boolean; onCollapse: () => void; drawer: boolean; onClose: () => void }) {
   const hash = useHash()
   // A task's own page is reached from the dashboard's track, so the dashboard stays lit.
-  const here = section === 'work' && workIdFromHash(hash) ? 'home' : sections.find((s) => s.key === section)?.nav
+  const here = section === 'repositories' ? null : section === 'work' && workIdFromHash(hash) ? 'home' : sections.find((s) => s.key === section)?.nav
   return (
     <>
       {drawer && <div className="drawer-scrim" onClick={onClose} aria-hidden="true" />}
@@ -691,7 +698,7 @@ export function crumbsFor(hash: string, section: SectionDef, overview: WorkOverv
     if (route.tab === 'members') out.push({ label: 'Members', href: '#workspace/members' })
     else if (route.tab === 'settings') out.push({ label: 'Settings', href: '#workspace/settings' })
     else if (route.tab === 'workflow') {
-      out.push({ label: 'Repositories & runs', href: '#workspace' })
+      out.push({ label: 'Runs', href: '#workspace' })
       if (!('invalid' in route)) {
         out.push({ label: `Run ${route.runId.length > 14 ? `${route.runId.slice(0, 14)}…` : route.runId}`, href: workspaceRunHref(route.repositoryId, route.runId), mono: true })
         if (route.stepId) out.push({ label: `Step ${route.stepId}`, mono: true })
@@ -872,7 +879,7 @@ export function AppChrome({ logo, token, repo, web, hubSignedOut = false, nav, s
           {!hubSignedOut && <button ref={burger} type="button" data-tour="menu" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
             <Icon name={drawer ? 'x-lg' : 'list'} />
           </button>}
-          <a href="#home" className="topbar-logo" aria-label="AgentSCM Hub home">
+          <a href={web && web.repos.length > 1 ? '#repositories' : '#home'} className="topbar-logo" aria-label="AgentSCM Hub home">
             {logo}
           </a>
           {hubSignedOut ? <a href="#home" className="btn btn-link">Back to Hub</a> : isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} navigationBlocked={navigationBlocked} /> : web ? <WebRepoSwitcher repo={repo} web={web} onSignOut={onForget} /> : <RepoSwitcher repo={repo} onForget={onForget} />}

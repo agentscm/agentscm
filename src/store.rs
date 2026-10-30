@@ -34,6 +34,7 @@ const MAX_CAPTURE_QUALIFICATION_BYTES: u64 = MAX_CHECKPOINT_BYTES as u64;
 const MAX_CAPTURE_QUALIFICATION_BYTES: u64 = 128 * 1024;
 
 const BLOB_MAGIC: &[u8; 9] = b"AGSCM-B1\0";
+const BLOB_HEADER_BYTES: usize = BLOB_MAGIC.len() + 8;
 const TREE_MAGIC: &[u8; 9] = b"AGSCM-T2\0";
 const BRANCH_MAGIC: &[u8; 9] = b"AGSCM-N1\0";
 const LEAF_MAGIC: &[u8; 9] = b"AGSCM-L1\0";
@@ -342,6 +343,9 @@ impl Engine {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         crate::local_recovery::check_before_create(path.as_ref(), false)?;
+        if let Some(engine) = Self::open_published(path.as_ref())? {
+            return Ok(engine);
+        }
         let root = create_directory_durable(path)?;
         let access = crate::local_recovery::AccessGuard::shared(&root)?;
         let objects = create_directory_durable(root.join("objects"))?;
@@ -351,6 +355,30 @@ impl Engine {
             read_budget: None,
             staged: None,
         })
+    }
+
+    /// Skips the creation syncs when `objects` is a real directory holding an entry:
+    /// objects are published only through an engine whose open already synced the
+    /// directory chain, so the layout is durable. Anything else takes the creating path.
+    fn open_published(path: &Path) -> Result<Option<Self>> {
+        let root = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let objects = root.join("objects");
+        let published = fs::symlink_metadata(&objects).is_ok_and(|meta| meta.is_dir())
+            && fs::read_dir(&objects).is_ok_and(|mut entries| entries.next().is_some());
+        if !published {
+            return Ok(None);
+        }
+        let access = crate::local_recovery::AccessGuard::shared(&root)?;
+        Ok(Some(Self {
+            objects,
+            _access: access,
+            read_budget: None,
+            staged: None,
+        }))
     }
 
     /// Opens an already provisioned store without creating directories or the lock file.
@@ -937,6 +965,22 @@ impl Engine {
         ReadObjects::read_entry_impl(self, revision, path)
     }
 
+    /// Like `read_entry`, but refuses a blob over `allowance` before allocating it.
+    /// `None` is a size refusal.
+    pub fn read_entry_bounded(
+        &self,
+        revision: &str,
+        path: &str,
+        allowance: usize,
+    ) -> Result<Option<(EntryKind, Vec<u8>)>> {
+        let entry = self
+            .stat_file(revision, path)?
+            .ok_or_else(|| Error::NotFound(format!("path: {path}")))?;
+        Ok(self
+            .blob_by_digest_bounded(&entry.blob, allowance)?
+            .map(|bytes| (entry.kind, bytes)))
+    }
+
     /// Resolve membership before reading a regular blob within a payload allowance.
     /// `None` is a size refusal, never a successful or qualified source observation.
     pub(crate) fn read_regular_file_bounded(
@@ -965,43 +1009,7 @@ impl Engine {
         id: &str,
         allowance: usize,
     ) -> Result<Option<Vec<u8>>> {
-        validate_id(id)?;
-        let file = File::open(self.object_path(id)).map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                Error::NotFound(format!("object: {id}"))
-            } else {
-                Error::Io(error)
-            }
-        })?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(Error::Invalid("blob object must be a regular file".into()));
-        }
-        let encoded_length = metadata.len();
-        if encoded_length > MAX_OBJECT_BYTES {
-            return Err(Error::Limit(format!("object {id} exceeds size limit")));
-        }
-        const HEADER_BYTES: usize = BLOB_MAGIC.len() + 8;
-        if encoded_length < HEADER_BYTES as u64 {
-            return Err(Error::Invalid("invalid blob length".into()));
-        }
-        let mut reader = BudgetedRead {
-            inner: file,
-            budget: self.read_budget.clone(),
-        };
-        let mut header = [0u8; HEADER_BYTES];
-        reader.read_exact(&mut header)?;
-        if !header.starts_with(BLOB_MAGIC) {
-            return Err(Error::Invalid("invalid blob encoding".into()));
-        }
-        let length = u64::from_be_bytes(
-            header[BLOB_MAGIC.len()..]
-                .try_into()
-                .map_err(|_| Error::Invalid("invalid blob header".into()))?,
-        );
-        if length > MAX_FILE_BYTES as u64 || encoded_length != HEADER_BYTES as u64 + length {
-            return Err(Error::Invalid("invalid blob length".into()));
-        }
+        let (mut reader, header, length) = self.open_blob(id)?;
         if length > allowance as u64 {
             return Ok(None);
         }
@@ -1020,6 +1028,53 @@ impl Engine {
             return Err(Error::Invalid(format!("object digest mismatch: {id}")));
         }
         Ok(Some(payload))
+    }
+
+    /// Declared payload length of a blob, from its header and file size only.
+    /// The payload is neither read nor hashed, so this is not object qualification.
+    pub(crate) fn blob_length(&self, id: &str) -> Result<u64> {
+        Ok(self.open_blob(id)?.2)
+    }
+
+    /// Opens a blob and checks its header against the file length.
+    fn open_blob(&self, id: &str) -> Result<(BudgetedRead<File>, [u8; BLOB_HEADER_BYTES], u64)> {
+        validate_id(id)?;
+        let file = File::open(self.object_path(id)).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                Error::NotFound(format!("object: {id}"))
+            } else {
+                Error::Io(error)
+            }
+        })?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(Error::Invalid("blob object must be a regular file".into()));
+        }
+        let encoded_length = metadata.len();
+        if encoded_length > MAX_OBJECT_BYTES {
+            return Err(Error::Limit(format!("object {id} exceeds size limit")));
+        }
+        if encoded_length < BLOB_HEADER_BYTES as u64 {
+            return Err(Error::Invalid("invalid blob length".into()));
+        }
+        let mut reader = BudgetedRead {
+            inner: file,
+            budget: self.read_budget.clone(),
+        };
+        let mut header = [0u8; BLOB_HEADER_BYTES];
+        reader.read_exact(&mut header)?;
+        if !header.starts_with(BLOB_MAGIC) {
+            return Err(Error::Invalid("invalid blob encoding".into()));
+        }
+        let length = u64::from_be_bytes(
+            header[BLOB_MAGIC.len()..]
+                .try_into()
+                .map_err(|_| Error::Invalid("invalid blob header".into()))?,
+        );
+        if length > MAX_FILE_BYTES as u64 || encoded_length != BLOB_HEADER_BYTES as u64 + length {
+            return Err(Error::Invalid("invalid blob length".into()));
+        }
+        Ok((reader, header, length))
     }
 
     pub fn load_revision(&self, id: &str) -> Result<Revision> {
@@ -2781,6 +2836,14 @@ fn first_differing_nibble(
     (start..ID_HEX_LEN).find(|depth| nibble_at(left, *depth) != nibble_at(right, *depth))
 }
 
+/// Once fed exactly `length` payload bytes, finalizes to the id `publish_blob` gives them.
+pub(crate) fn blob_id_hasher(length: u64) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(BLOB_MAGIC);
+    hasher.update(length.to_be_bytes());
+    hasher
+}
+
 fn encode_blob(content: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(BLOB_MAGIC.len() + 8 + content.len());
     bytes.extend_from_slice(BLOB_MAGIC);
@@ -3596,6 +3659,31 @@ mod blob_reference_tests {
         assert_eq!(names(&store), before);
         assert!(!lock.exists());
         assert!(provisioned.contains(&objects));
+    }
+
+    #[test]
+    fn open_syncs_the_directory_chain_until_objects_are_published() {
+        let data = TempDir::new().unwrap();
+        let store = data.path().join("nested").join("store");
+        let syncs = |store: &Path| {
+            SYNC_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+            let engine = Engine::open(store).unwrap();
+            let log = SYNC_LOG.with(|log| log.borrow_mut().take().unwrap());
+            (engine, log)
+        };
+        let (engine, created) = syncs(&store);
+        assert!(created.contains(&SyncEvent::DirSync(store.join("objects"))));
+        assert!(created.contains(&SyncEvent::DirSync(data.path().to_path_buf())));
+        drop(engine);
+        // An empty objects directory may belong to a creator that has not synced yet.
+        let (engine, empty) = syncs(&store);
+        assert_eq!(empty, created);
+        let revision = engine.checkpoint(None, &[]).unwrap();
+        drop(engine);
+        let (engine, published) = syncs(&store);
+        assert_eq!(published, []);
+        assert_eq!(engine.objects, store.join("objects"));
+        assert!(engine.checkpoint(Some(&revision), &[]).is_ok());
     }
 }
 

@@ -25,6 +25,9 @@ use super::{Result, TeamError};
 
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024 + 1024;
 const MAX_NATIVE_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Bytes a blob object adds to its content: the 9-byte magic and 8-byte length in `store.rs`.
+/// The exact post-read check stays as the backstop.
+const BLOB_ENCODED_OVERHEAD: u64 = 17;
 const MAX_PAGE_LIMIT: usize = 256;
 const MAX_REQUEST_WORK_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OBJECT_OPENS: usize = 4_096;
@@ -410,9 +413,20 @@ impl TeamService {
         let result = (|| {
             let reader = SourceReader::new(&access);
             checked_revision(&reader, &access, &access.retained.info.root)?;
+            // The retained manifest states each blob's encoded size, so an oversize file is
+            // refused before its blob is opened or allocated.
+            let entry = reader
+                .stat_file(&access.retained.info.root, path)?
+                .ok_or_else(|| Error::NotFound(format!("path: {path}")))?;
+            let oversize = || Error::Limit("native file exceeds 1MiB response limit".into());
+            if access.require_member(&entry.blob)?
+                > MAX_NATIVE_OUTPUT_BYTES as u64 + BLOB_ENCODED_OVERHEAD
+            {
+                return Err(oversize().into());
+            }
             let bytes = reader.read_file(&access.retained.info.root, path)?;
             if bytes.len() > MAX_NATIVE_OUTPUT_BYTES {
-                return Err(Error::Limit("native file exceeds 1MiB response limit".into()).into());
+                return Err(oversize().into());
             }
             access.reserve_work(bytes.len() as u64, 4)?;
             Ok(NativeFile {
@@ -1903,6 +1917,8 @@ mod tests {
     struct HookBackend {
         inner: LocalBackend,
         hook: Hook,
+        /// Bytes returned by every encoded-object stream opened through this backend.
+        read_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl HookBackend {
@@ -1910,6 +1926,7 @@ mod tests {
             Self {
                 inner,
                 hook: Arc::new(Mutex::new(None)),
+                read_bytes: Arc::default(),
             }
         }
 
@@ -1921,11 +1938,14 @@ mod tests {
     struct HookRead<'a> {
         inner: Box<dyn Read + Send + 'a>,
         hook: Hook,
+        read_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Read for HookRead<'_> {
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
             let read = self.inner.read(bytes)?;
+            self.read_bytes
+                .fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
             if read > 0
                 && let Some(action) = self.hook.lock().unwrap().take()
             {
@@ -1969,6 +1989,7 @@ mod tests {
             Ok(Box::new(HookRead {
                 inner: self.inner.open_encoded(key, incarnation)?,
                 hook: self.hook.clone(),
+                read_bytes: self.read_bytes.clone(),
             }))
         }
 
@@ -2094,8 +2115,8 @@ mod tests {
             Credentials::bearer(&reader_credential).unwrap(),
         )
         .unwrap();
-        // Prove this is the post-SourceReader output-limit branch, rather than
-        // an error that already passed through the native callback fence.
+        // An oversize file is refused from the retained manifest, before its blob is opened,
+        // so this error never passed through a blob read or the native callback fence.
         assert!(matches!(
             reader.source_file(&backend, 1, "publication", "private"),
             Err(TeamError::Storage(Error::Limit(message))) if message.contains("native file exceeds")
@@ -2126,6 +2147,38 @@ mod tests {
             reader.source_file(&backend, 1, "publication", "private"),
             Err(TeamError::Storage(Error::SourceDenied))
         ));
+    }
+
+    #[test]
+    #[ignore = "requires installed PG18; creates only an isolated local cluster"]
+    fn an_oversize_source_file_is_refused_without_reading_its_blob() {
+        let cluster = Cluster::new();
+        let directory = tempfile::tempdir().unwrap();
+        let (credential, backend, _) = browser_fixture_with_content(
+            &cluster,
+            &directory,
+            vec![b'x'; MAX_NATIVE_OUTPUT_BYTES + 1],
+        );
+        let scope = RepositoryScope {
+            trust_domain: "team".into(),
+            repository: "browser-native".into(),
+        };
+        let mut reader = TeamService::connect(
+            &cluster.config,
+            scope,
+            Credentials::bearer(&credential).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.source_file(&backend, 1, "publication", "private"),
+            Err(TeamError::Storage(Error::Limit(message)))
+                if message == "native file exceeds 1MiB response limit"
+        ));
+        // Only manifest nodes were read; the 1 MiB blob was never streamed.
+        let read = backend
+            .read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(read > 0 && read < MAX_NATIVE_OUTPUT_BYTES as u64, "{read}");
     }
 
     #[test]

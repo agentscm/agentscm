@@ -13,9 +13,9 @@ use super::handoff::HandoffNote;
 use super::http::blocking;
 use super::intent::{
     Announced, Intent, MAX_LIVE_INTENTS, MAX_TASK_BYTES, NOTICES, NewIntent, Overlap, display_all,
-    key_of, spec_key, text,
+    key_of, live_intents_capped, spec_key, text,
 };
-use super::store::{Event, HubEvent, Principal, new_id, unix_now};
+use super::store::{Event, HubEvent, Principal, Store, new_id, unix_now};
 use super::sync::{open_pulls, overlapping_pulls};
 use super::work::WorkItem;
 use super::{HubError, HubState, Result};
@@ -644,13 +644,26 @@ pub async fn announce_for(
     principal: &Principal,
     call: SessionCall,
 ) -> Result<Advice> {
+    Ok(announce_reading(state, principal, call, |_, _| ()).await?.0)
+}
+
+/// [`announce_for`], also running `read` in the same store hop right after the touch commits.
+/// What `read` returns is its own result, so a failed read cannot fail the committed touch.
+pub(super) async fn announce_reading<T: Send + 'static>(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
+) -> Result<(Advice, T)> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
-    let touched = blocking(state, move || {
-        store.touch_session(&token, &call, unix_now())
+    let (touched, read) = blocking(state, move || {
+        let touched = store.touch_session(&token, &call, unix_now())?;
+        let read = read(&*store, &touched);
+        Ok((touched, read))
     })
     .await?;
-    NOTICES.notify_waiters();
+    wake_notice_waiters(&NOTICES, &touched);
     count(&DENIED, !touched.denied.is_empty());
     count(&REPEATED, !touched.repeated.is_empty());
     count(&RATE_LIMITED, touched.rate_limited);
@@ -697,12 +710,15 @@ pub async fn announce_for(
             unix_now(),
         )
     });
-    Ok(Advice {
-        touched,
-        text,
-        stop,
-        deny,
-    })
+    Ok((
+        Advice {
+            touched,
+            text,
+            stop,
+            deny,
+        },
+        read,
+    ))
 }
 
 static DENIED: AtomicU64 = AtomicU64::new(0);
@@ -712,6 +728,14 @@ static FAIL_OPEN: AtomicU64 = AtomicU64::new(0);
 const LATENCIES: usize = 1024;
 /// Milliseconds of the last `LATENCIES` hook requests.
 static HOOK_MS: Mutex<VecDeque<u32>> = Mutex::new(VecDeque::new());
+
+/// Notices go only to other intents overlapping a path this touch added (an expired intent's
+/// paths count as added), so a touch that added none wrote nothing a notice waiter reads.
+fn wake_notice_waiters(waiters: &tokio::sync::Notify, touched: &Touched) {
+    if !touched.added.is_empty() {
+        waiters.notify_waiters();
+    }
+}
 
 fn count(counter: &AtomicU64, when: bool) {
     if when {
@@ -758,16 +782,18 @@ pub async fn others_for(
 ) -> Result<String> {
     let store = state.store.clone();
     let repository = principal.repository.clone();
-    let intents = blocking(state, move || {
-        store.live_intents(&repository, unix_now(), MAX_LIVE_INTENTS)
+    let (intents, truncated) = blocking(state, move || {
+        live_intents_capped(&*store, &repository, unix_now())
     })
     .await?;
-    Ok(advice::others(
-        &intents,
-        own_intent,
-        &principal.repository,
-        unix_now(),
-    ))
+    let mut text = advice::others(&intents, own_intent, &principal.repository, unix_now());
+    if truncated {
+        text.push('\n');
+        text.push_str(&advice::unknown(&format!(
+            "more than {MAX_LIVE_INTENTS} live intents; only the first are listed"
+        )));
+    }
+    Ok(text)
 }
 
 /// Other agents' ongoing work (`current`) and open PR titles that read like `task`: one
@@ -917,6 +943,38 @@ mod tests {
         for case in bad {
             assert!(check(&case).is_err(), "{case:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_touch_that_added_paths_wakes_notice_waiters() {
+        let waiters = tokio::sync::Notify::new();
+        let mut touched = Touched {
+            session: "s".into(),
+            via: Vec::new(),
+            intent: None,
+            added: Vec::new(),
+            overlaps: Vec::new(),
+            notices: Vec::new(),
+            denied: Vec::new(),
+            repeated: Vec::new(),
+            rate_limited: false,
+            handoffs: Vec::new(),
+            requested: Vec::new(),
+        };
+        let woken = |touched: &Touched| {
+            let notified = waiters.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            wake_notice_waiters(&waiters, touched);
+            std::future::Future::poll(
+                notified,
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            )
+            .is_ready()
+        };
+        assert!(!woken(&touched), "a repeat edit wrote no notice");
+        touched.added.push("a.rs".into());
+        assert!(woken(&touched));
     }
 
     #[test]

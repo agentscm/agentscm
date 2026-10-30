@@ -237,6 +237,19 @@ describe('useWebRead', () => {
     expect(screen.getByTestId('repos').textContent).toBe('acme/docs,acme/widgets')
   })
 
+  it('offers what the Hub says is readable now first, even with no agent token or computer', async () => {
+    const calls = hub({
+      'GET /v1/hub/tokens': () => ({ status: 200, body: { tokens: [] } }),
+      'GET /v1/hub/devices': () => ({ status: 200, body: { devices: [] } }),
+      'GET /v1/hub/session/repositories': () => ({ status: 200, body: { repositories: [{ repository: 'acme/zeta' }, { repository: 'acme/alpha' }], unchecked: 0, complete: true } }),
+    })
+    render(<Probe />)
+    expect((await screen.findByTestId('repo')).textContent).toBe('acme/zeta')
+    expect(screen.getByTestId('repos').textContent).toBe('acme/zeta,acme/alpha')
+    // First sign-in also reads acme/alpha looking for unfinished work; neither has any, so acme/zeta opens.
+    expect(minted(calls)).toHaveLength(2)
+  })
+
   it('keeps the Hub\'s own sentence when its access check is unavailable', async () => {
     hub({
       'POST /v1/hub/session/read-token': () => ({ status: 503, body: { error: 'permission_unavailable', message: "GitHub didn't answer the Hub's access check; nothing changed, so try again in a minute" } }),

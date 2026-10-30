@@ -60,7 +60,7 @@ pub mod forge;
 pub mod intent_review_host;
 pub mod issue_workflow;
 
-pub mod skill_bundle;
+pub(crate) mod skill_bundle;
 pub mod skill_workflow;
 pub mod skill_workflow_service;
 #[cfg(unix)]

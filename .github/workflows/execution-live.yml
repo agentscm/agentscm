@@ -13,10 +13,11 @@ on:
       - src/store.rs
       - src/model.rs
       - src/error.rs
-      - tests/execution.rs
-      - tests/command_checks.rs
-      - tests/execution_canaries.rs
-      - tests/common/fake_docker.rs
+      - tests/integration/main.rs
+      - tests/integration/execution.rs
+      - tests/integration/command_checks.rs
+      - tests/integration/execution_canaries.rs
+      - tests/integration/common/fake_docker.rs
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
@@ -71,4 +72,7 @@ jobs:
         env:
           AGENTSCM_DOCKER: /usr/bin/docker
           AGENTSCM_DOCKER_SOCKET: /var/run/docker.sock
-        run: cargo test --locked --no-fail-fast --test execution --test command_checks --test execution_canaries -- --ignored --test-threads=1 --nocapture
+        # libtest filters are substrings, so `execution::` also matches any module whose name ends
+        # in `execution`; re-check `--list` output when adding ignored tests to other modules.
+        run: |
+          cargo test --locked --no-fail-fast --test integration -- --ignored --test-threads=1 --nocapture execution:: command_checks:: execution_canaries::

@@ -102,7 +102,7 @@ Flags shown by `npx agentscm --help`:
 |---|---|
 | `--hub-url URL` | Connect to the hub that already runs at URL. |
 | `--yes` | Answer every question with the recommended choice (needed without a terminal). |
-| `--only AGENT` | Set up this coding agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`); repeat for more. Default: Claude Code when it is installed. |
+| `--only AGENT` | Set up this coding agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`); repeat for more. Default: every detected agent on supported Unix hosts. |
 | `--dry-run` | Print what would be written and stop without writing. |
 | `--json` | Print one JSON object on stdout when done (`agents.installed`, `agents.skipped`, `agents.needs_user`, `hub`, `hub_up`, `signed_in`); the progress text goes to stderr. Not on Windows. |
 
@@ -194,12 +194,10 @@ and, after `agentscm open`, `front-door/` (run `agentscm open --stop` first). To
 delete the folder when no AgentSCM command is running.
 
 The optional macOS tray is part of this same binary; no separate app install is needed. Run
-`npx agentscm tray` to open it. On macOS, once an interactive quickstart has connected your
-agents, it asks once: "Keep AgentSCM in the menu bar, and start it when you log in?" Yes (the
-default) opens the tray and turns on Start at Login; No leaves both off and quickstart does not ask
-again. With `--yes` or without a terminal it does not ask, and the tray stays off unless you add
-`--tray`, which opens it without changing Start at Login. You can switch Start at Login in the tray
-menu at any time. When quickstart connects agents on macOS it also writes a small
+`npx agentscm tray` to open it, or add `--tray` to quickstart to open it after successful setup.
+Quickstart no longer prompts to enable the tray or Start at Login. Without `--tray`, it prints
+the command for opening the menu-bar app. Opening the tray does not change Start at Login;
+you can enable or disable that option in the tray menu. When quickstart connects agents on macOS it also writes a small
 `~/Applications/AgentSCM.app` that runs `~/.agentscm/bin/agentscm tray`, so Spotlight, Launchpad
 or the Dock can bring the menu bar app back after a restart. It is generated on your Mac, so it
 carries no download quarantine. Running quickstart again leaves it as it is, and an app of that

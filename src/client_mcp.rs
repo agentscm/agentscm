@@ -3,7 +3,7 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
@@ -62,12 +62,28 @@ fn renewed_in_place(saved: &Connection, connection: &Connection) -> bool {
 
 /// The token to use for the next request. The same binding keeps working when only its
 /// managed token was renewed in place; any other change stops the server.
-fn current_token(connection: &Connection, checkout: &Path, token: &str) -> Result<String> {
+///
+/// `verified` remembers the last saved connection whose checkout origin passed `is_current_in`
+/// (which spawns a subprocess); it is trusted for `ORIGIN_RECHECK` while the saved connection is
+/// unchanged. shortcut: an origin edited inside that window is noticed late, upgrade to a
+/// config-file mtime key.
+fn current_token(
+    connection: &Connection,
+    checkout: &Path,
+    token: &str,
+    verified: &mut Option<(Connection, Instant)>,
+) -> Result<String> {
     let changed = || invalid("client connection changed; restart the AgentSCM MCP server");
     let saved = selected(&connection.root, &load()?)?;
     let renewed = renewed_in_place(&saved, connection);
-    if !(saved == *connection || renewed) || !is_current_in(&saved, checkout) {
+    let fresh = verified
+        .as_ref()
+        .is_some_and(|(seen, at)| *seen == saved && at.elapsed() < ORIGIN_RECHECK);
+    if !(saved == *connection || renewed) || !(fresh || is_current_in(&saved, checkout)) {
         return Err(changed());
+    }
+    if !fresh {
+        *verified = Some((saved.clone(), Instant::now()));
     }
     let current = read_token(&saved.token_file)?;
     // A supplied token file whose contents changed is another credential, not a renewal.
@@ -168,7 +184,8 @@ fn write_json(writer: &mut impl Write, value: &Value) -> Result<()> {
 
 const NOT_SIGNED_IN: &str = "AgentSCM is not signed in on this computer, so this checkout cannot connect yet. Run `agentscm hub login`, then try again.";
 const STILL_CONNECTING: &str = "AgentSCM is still connecting this checkout to its Hub. Try again in a few seconds. If this keeps happening, the repository may not be on your Hub; ask a Hub admin to connect it.";
-const POLL: Duration = Duration::from_secs(2);
+const POLL: Duration = Duration::from_secs(10);
+const ORIGIN_RECHECK: Duration = Duration::from_secs(30);
 
 /// Why this checkout has no connection yet, in words for the person or agent reading it. A
 /// refusal the auto-connect hook recorded (repository not on the Hub, computer revoked or
@@ -443,8 +460,9 @@ pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
             }
         }
     };
+    let mut verified = None;
     serve(&connection, &token, first, &mut reader, &mut writer, || {
-        current_token(&connection, &checkout, &token)
+        current_token(&connection, &checkout, &token, &mut verified)
     })
     .await
 }

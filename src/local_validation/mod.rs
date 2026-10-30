@@ -122,6 +122,9 @@ pub struct CommandResult {
     pub stdout_sha256: String,
     pub stderr_sha256: String,
     pub truncated: bool,
+    /// Collection lost stream or child completion evidence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
 }
 
 /// Whether the PostgreSQL / S3 test environment was present for the run.
@@ -463,6 +466,12 @@ impl ValidationRecord {
                     },
                 ));
             }
+            if r.incomplete {
+                return Some((
+                    "capture incomplete",
+                    format!("{} capture was incomplete", r.id),
+                ));
+            }
             if r.truncated {
                 return Some(("output truncated", format!("{} output was truncated", r.id)));
             }
@@ -592,10 +601,10 @@ pub fn evidence_payload(
             .iter()
             .map(|id| format!("not required: {id}")),
     );
-    if !record.services.postgres {
+    if policy.required_services.postgres && !record.services.postgres {
         omissions.push("postgres tests".into());
     }
-    if !record.services.s3 {
+    if policy.required_services.s3 && !record.services.s3 {
         omissions.push("s3 tests".into());
     }
     let dependency = |identity: &str, revision: &str| DependencyClaim {

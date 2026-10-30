@@ -1,6 +1,6 @@
 [package]
 name = "agentscm"
-version = "0.1.0-alpha.9"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.96.0"
 license = "FSL-1.1-ALv2"
@@ -59,3 +59,5 @@ debug = "line-tables-only"
 # from test executables so metadata does not consume the native bundle's 128 MiB limit.
 [profile.test]
 strip = true
+# Test builds are one-shot; incremental state was ~60% of a gate run's target/.
+incremental = false

@@ -32,6 +32,7 @@ use crate::change_record::{
     AssuranceBasisV1, CaptureEnvelopeV1, CaptureOmissionV1, CheckResultV1, CoverageV1, DriftV1,
     RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SourceBindingV1,
 };
+use crate::checks::sha256;
 #[cfg(unix)]
 use crate::execution::Cancellation;
 #[cfg(unix)]
@@ -1909,11 +1910,6 @@ pub(crate) fn now_seconds() -> Result<i64> {
     i64::try_from(seconds).map_err(|_| CaptureError::Limit("system time is out of range".into()))
 }
 
-pub(crate) fn sha256(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2126,6 +2122,57 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ordinary_event_pre_tool_use_spawns_no_source_git() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repository_path = temp.path().join("repository");
+        fs::create_dir(&repository_path).unwrap();
+        initialize_git_repository(&repository_path);
+        fs::write(repository_path.join("tracked.txt"), "dirty\n").unwrap();
+        let repository_path = repository_path.canonicalize().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let capture = claude_code::CaptureRequest {
+            operation_prefix: "capture:read".into(),
+            work_id: "wrk_read".into(),
+            generation: 1,
+            observed_session_id: "observed_read".into(),
+            canonical_session_id: "canonical_read".into(),
+            parent_session_id: None,
+            capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
+            live_capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
+        };
+        let actions = claude_code::ActionCaptureConfig {
+            source: GitSourceRequest {
+                repository: "example/repository".into(),
+                worktree_id: "worktree_read".into(),
+                repository_path,
+                base_ref: "HEAD".into(),
+            },
+            setup_digest: "1".repeat(64),
+            rules: Vec::new(),
+            managed_invocations: Vec::new(),
+        };
+        let pre = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": capture.observed_session_id,
+            "tool_name": "Read",
+            "tool_use_id": "toolu_read",
+            "tool_input": {"file_path": "tracked.txt"},
+        }))
+        .unwrap();
+        // Every source git child runs in the opened root, so an armed fault proves none spawned.
+        FAIL_NEXT_CWD_CLONE.with(|fail| fail.set(true));
+        let report = claude_code::capture_native_hook(&pre, &capture, &actions, &spool);
+        let armed = FAIL_NEXT_CWD_CLONE.with(|fail| fail.replace(false));
+        report.unwrap();
+        assert!(armed, "a Read PreToolUse must not run source git");
+        let marker = spool
+            .managed_invocation_for_occurrence("observed_read", "toolu_read")
+            .unwrap()
+            .expect("ordinary occurrence claim");
+        assert!(marker.source.is_none());
     }
 
     #[test]

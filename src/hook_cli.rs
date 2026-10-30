@@ -95,7 +95,7 @@ async fn hook(
     let Ok(Ok(Some(body))) = read else {
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
-    let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
     if is_session_start(agent, &payload) {
         deadline += SESSION_START_LIMIT - LIMIT;
     }
@@ -107,7 +107,7 @@ async fn hook(
         repo,
         client_connection,
         destination_args,
-        payload.clone(),
+        std::sync::Arc::clone(&payload),
         HubCallContext {
             original_body: body,
             activity_tracker: activity.clone(),
@@ -144,7 +144,7 @@ async fn call_hub(
     repo: Option<String>,
     client_connection: bool,
     destination_args: bool,
-    payload: Value,
+    payload: std::sync::Arc<Value>,
     context: HubCallContext,
 ) -> Result<Value, String> {
     let HubCallContext {
@@ -200,7 +200,7 @@ async fn call_hub(
                 Some(routed.connection.repo.clone()),
                 None,
                 routed.endpoint_agent,
-                routed.payload,
+                std::borrow::Cow::Owned(routed.payload),
                 Some(routed.connection.clone()),
                 routed.connection.report_completion,
             )
@@ -223,9 +223,9 @@ async fn call_hub(
             )?;
             let root = repo_root(&cwd_of(&payload));
             let outbound = if agent == "codex" {
-                sanitized_codex(&payload, None)?
+                std::borrow::Cow::Owned(sanitized_codex(&payload, None)?)
             } else {
-                payload.clone()
+                std::borrow::Cow::Borrowed(&*payload)
             };
             (url, token, repo, root, agent.clone(), outbound, None, false)
         };

@@ -5,231 +5,176 @@
   </picture>
 </h1>
 
-**Source control for teams of coding agents.**
+**Catch up on shared agent work. Review changes with their source and evidence.**
 
-AgentSCM combines a native source-control engine with a self-hosted coordination Hub.
-It records exact source revisions, the checks and reviews applied to them, and the
-approvals that permit native landing.
+AgentSCM gives people and coding agents a shared place to see who is working on what,
+what changed, what checks were recorded, and what needs attention next. Use it alongside
+**your existing Git repositories, coding agents and GitHub or GitLab workflow**.
 
-Start alongside your existing **Git repository, editor and GitHub or GitLab workflow**
-for collision warnings and shared work intents. You do not have to migrate a repository
-to use coordination. Native workflows and landing controls are a separate, opt-in alpha.
+A self-hosted Hub holds coordination and shared records. Your computer can connect local
+source and saved agent conversations to that view. Experimental native workflows add
+revision-bound checks, review and explicit human approval; adopting coordination does
+not require migrating your repository.
 
-> **Alpha: try it, don't depend on it.** APIs and storage may change without migration.
-> Native workflows are experimental; production security and scale are not qualified.
+> **Alpha: try it, don't depend on it.** CLI, APIs and storage may change without migration.
+> Production security and scale are not qualified. Git and your forge retain their merge
+> authority; native landing requirements do not protect raw Git pushes or forge merges.
 
-## Why AgentSCM?
-
-When you and a teammate each run several agents, separate worktrees keep edits apart,
-but you still need to know who is touching the same files and which checks apply to
-what will land. You should not need to build a frontier lab's development infrastructure
-to start coordinating that work.
-
-AgentSCM connects three parts of that process:
-
-- **Coordinate work before a merge.** See announced agent activity across machines,
-  spot overlapping files and PRs, and request a handoff. Supported hooks refuse the
-  first contested edit once with a reason; a repeat passes.
-- **Keep checks attached to exact source.** In the experimental native workflow,
-  pinned tests and bounded Claude Code review evaluate an immutable revision.
-  Failures return for fixes; new bytes require fresh qualifying evidence.
-- **Make native landing a deliberate decision.** Required evidence, human approval
-  and the current target are rechecked at the native landing boundary. A green
-  historical run is not permission to land a different revision.
+[Install](docs/install.md) · [Supported agents](docs/agents.md) ·
+[Documentation](docs/README.md) · [Releases](https://github.com/agentscm/agentscm/releases)
 
 ## Quickstart
 
-| Your starting point | Use AgentSCM for | Start here |
-|---|---|---|
-| Existing Git repository | Local collision checks; no shared Hub or account required | [Scripted demo](docs/scripted-demo.md), then [collision checks](docs/collisions.md) |
-| Team using an existing Hub | Connect a local coding agent to shared coordination | [Join a Hub](docs/team-member-onboarding.md) |
-| Native workflow pilot | Revision-bound tests/review, explicit approval and native landing | [Claude Code workflow loop](docs/advanced/claude-code-workflows.md) |
-
-For packaged binaries or containers, see [install options](docs/install.md).
-
-**Try it first.** From a Git repository, run the local demo:
+### Try a scripted demo first
 
 ```sh
 npx agentscm demo
 ```
 
-It simulates three agents against a temporary Hub. No account, Docker or forge is needed, and it
-writes nothing to your repository. See the [scripted demo guide](docs/scripted-demo.md) for its
-prerequisites and limits.
+This starts a temporary local Hub, simulates three agents through its real hook endpoint and
+opens the status page. No account, Docker or forge is required; nothing is written to your
+repository. The agents and decisions are scripted. Press Ctrl-C to stop. See the
+[scripted demo guide](docs/scripted-demo.md) for prerequisites and limits.
 
-**Connect your agents.** On macOS or Linux, run one command once per computer (not per repository):
+### Connect your agents
+
+On a supported Unix host (macOS or Linux), run once per computer, not once per repository.
+Requires Node 18 or later; see [Windows support](docs/install.md#windows) for its current limits:
 
 ```sh
-npx agentscm                                    # run a Hub on this computer
-npx agentscm --hub-url https://hub.example.com  # join a Hub that already runs
+npx agentscm
 ```
 
-Quickstart signs you in and sets up detected coding agents (Claude Code, Codex, Cursor, GitHub
-Copilot and Gemini CLI) for your projects, without writing to your repositories. Then fully quit
-and reopen your agents and ask one, in a repository, "Get started with AgentSCM". In Codex, run
-`/hooks` once and trust the AgentSCM hooks. Undo it with `npx agentscm uninstall`. Windows has an
-alpha CLI, but quickstart does not set up agent integrations there. A managed local Hub runs
-natively only on Apple Silicon macOS; other hosts need Docker or an existing Hub. Creating a new
-local Hub opens a page to create and install its GitHub App, then asks you to sign in. To share it, see
-[Tailscale](docs/install.md#share-your-local-hub-over-tailscale); to deploy a Hub for a team, ask
-your agent to follow [hosted setup](docs/hosted.md). Details: [install](docs/install.md).
-Building from source? Without the `ui` feature the hub serves only a notice page at `/ui/`; for the
-real status page run `(cd ui && npm ci && npm run build) && cargo build --locked --features ui`.
+This installs a release binary, guides local Hub setup, signs you in and sets up **every detected
+agent**: Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI. A managed Hub runs natively
+on Apple Silicon macOS; Linux and Intel macOS need Docker or an existing Hub. Setup writes no
+repository files. The local Hub's first run opens a page to create and install its GitHub App.
 
-Joining an existing Hub? Use **Connect an agent** in its status page. Your agent guides sign-in,
-native approvals and verification; readiness requires recent MCP and native edit-hook observations.
-See [member onboarding](docs/team-member-onboarding.md#verify-trust-and-behavior).
+To join a Hub that already runs:
 
-## Set up real agents
-
-For your own agents, run `npx agentscm`, or read the [setup guide](docs/setup-guide.md). Existing configuration changes are shown before
-confirmation. The [agent guide](docs/agents.md) distinguishes native hooks, advisory MCP
-and client qualification; coordination support is broader than workflow execution support.
-Generated instructions also guide [selective source use](docs/advanced/agent-source-workflow.md)
-at task start and dependency expansion, using a configured native store or a dedicated sparse
-Git worktree. Rerun `init-repo` to review the updated instruction block; hooks still handle
-coordination, and selection does not narrow required checks or establish model-cost savings.
-
-See [guided setup](docs/setup-guide.md) for what the command does and its options.
-
-Run `agentscm open` in a connected checkout to see your files, saved agent conversations and your
-team's work in one browser page ([details](docs/connect-this-computer.md)).
-
-On macOS, `npx agentscm tray` opens the optional status-bar companion from the same installation;
-`npx agentscm --tray` opens it after successful setup. Start at Login is off by default.
-The current alpha binary is unsigned and unnotarized, and the tray has no independent updater.
-Linux and Windows users can inspect the same local state with `agentscm client status`.
-
-## The native workflow loop
-
-The experimental native engine adds a controlled path from a change to landing:
-
-```text
-Edit -> checkpoint -> tests -> review -> human approval -> native landing
- ^                      |         |
- +-------- fixes -------+---------+
+```sh
+npx agentscm --hub-url https://hub.example.com
 ```
 
-The configured workflow runs against exact source and retains step evidence. Tests or
-required review failures return feedback; fixes create a fresh revision. Approval and
-landing are separate actions, and native admission rejects missing or stale required
-evidence. An optional Claude Code Stop hook triggers the loop; the authority enforces
-the landing requirement even if that hook is skipped.
+Then fully quit and reopen your agents. In a repository, ask one:
 
-Use the [local workflow guide](docs/advanced/claude-code-workflows.md) or the experimental
-[Community workspace](docs/advanced/community-workspace.md) for shared execution,
-independent member roles, run inspection and explicit approval/integration. The
-[laptop-to-hosted guide](docs/advanced/hosted-laptop-workflows.md) covers the opt-in native
-source transfer profile. These are trusted-team alpha paths, not a finished hosted service.
-For repeated local graphs, the [reusable workflow library](docs/advanced/reusable-workflows.md)
-binds one explicit, versioned manifest from immutable native source to an existing Change.
+> Get started with AgentSCM.
 
-## Inspect work and evidence in the Hub
+In Codex, run `/hooks` once and trust the AgentSCM hooks. Other clients may ask you to trust
+the folder or enable MCP. Installation does not mean every integration has been qualified in
+live sessions; see [agent support and qualification](docs/agents.md#support-tiers).
 
-The Hub shows agent coordination and, when configured, workflow runs, source freshness,
-retained step evidence and workspace permissions.
-Its [work insights](docs/work-insights.md) API exposes bounded reported duration,
-partial usage reports and stored publication observations without turning them into approval or landing claims.
+Open a connected checkout's source and team view:
 
-The experimental [local change-capture](docs/change-capture.md) path can bind an observed Claude
-Code action to inspectable Git or native source facts and expose a concise Hub handoff: bounded Work
-intent, action-bound source, action outcome, verification result, decision, gaps and next action. Local
-conversation bodies and command output stay in an operator-chosen private spool; the shared record
-contains typed metadata and artifact identities. The [implementation status](docs/implementation/agentscm-build-status.md)
-records the qualified slice and remaining runtime and release limits.
+```sh
+npx agentscm open
+```
 
-<a href="docs/assets/hub-workflow.jpg">
-  <img src="docs/assets/hub-workflow.jpg" alt="AgentSCM Hub inspecting a source-check workflow, revision freshness and separate native landing status" width="640">
-</a>
+The page can switch between repositories connected on this computer, each using its own Hub
+and access. The local source explorer is currently Unix-only. On macOS, the optional
+[menu-bar companion](docs/install.md#where-files-go) also opens this view and shows connections.
 
-<sub>Running local Hub with synthetic data. This example checks source paths; it does
-not demonstrate model review, CI/CD or a native landing decision.</sub>
+See [install options](docs/install.md) for platform/runtime requirements, `--only`, `--dry-run`,
+containers and uninstall (`npx agentscm uninstall`). A managed native Hub is qualified on Apple
+Silicon macOS; Docker is an explicit fallback. Server deployment is
+[agent-guided and unsupported in the alpha](docs/hosted.md).
 
-<details>
-<summary>Watch the Hub walkthrough and open full-size screenshots</summary>
+## What you can do
 
-<img src="docs/assets/hub-tour.gif" alt="Four-view Hub walkthrough: runs, workflow bindings, retained evidence and member permissions" width="800">
+| Need | Available alpha capability | Start here |
+|---|---|---|
+| Catch up before taking over | Durable work claims, checkpoints, blockers, handovers and bounded agent briefings | [Stand-up and catch-up](docs/standup.md) |
+| Coordinate concurrent edits | Shared file intents, overlap notices and handoff requests across machines; read-only Git branch/worktree collision checks | [Coordination](docs/intents.md) · [Collision checks](docs/collisions.md) |
+| Inspect what an agent changed and checked | Source-bound action records with separate outcome, coverage, freshness and evidence availability | [Change capture](docs/change-capture.md) |
+| Connect code and context | Read-only committed Git files, history and diffs beside available local conversations and recorded actions | [Repository explorer](docs/repository-explorer.md) · [Open this computer](docs/connect-this-computer.md) |
+| Make a team's PR process visible | Experimental `pr-gate` v1: adopted steps, head-bound evidence, findings and next actions; opt-in Claude Code/Codex Stop hooks | [Supported skills](docs/design/supported-skills.md) |
+| Reuse skills and workflow definitions | Local versioned authoring, pinned imports, simulation and an explicit export path to native execution | [Workflow library](docs/advanced/workflow-library.md) |
+| Retain an owner's commitment | Living Promises keep versioned requests, criteria and constraints; agent proposals and reports remain advisory | [Living Promises](docs/advanced/living-promises.md) |
+| Pilot controlled native landing | Immutable revisions, pinned checks, bounded Claude Code review and human approval checked at native admission | [Native workflow loop](docs/advanced/claude-code-workflows.md) |
 
-[Runs](docs/assets/hub-workspace.jpg) · [Workflow](docs/assets/hub-workflow.jpg) ·
-[Evidence](docs/assets/hub-evidence.jpg) · [Members](docs/assets/hub-members.jpg)
+Coordination is **not locking**. Supported hooks refuse the first contested edit once per
+session and file; a repeat passes, and hook failures let edits through. Cursor receives a
+note after the edit; MCP-only clients receive advice. Only announced work is visible, and
+same-file overlap is not proof of conflict. See [support boundaries](docs/agents.md).
 
-The 17-second loop is a sequence of actual screenshots. The UI is an early prototype;
-pagination, large histories, search and navigation still need substantial refinement.
+`pr-gate` evidence is **self-reported**. A recorded test, independent review or approval is
+not proof that it happened. Its opt-in Stop hook gates session completion; it does not own
+GitHub merge permissions or replace branch protection. Other workflow-library declarations
+can be authored or simulated without being runnable; export reports unmet bindings explicitly.
 
-</details>
+## Source and evidence you can inspect
 
-The optional [Slack adapter](docs/slack.md) sends each person a direct message when a coordination moment needs them: an agent edits a file again after AgentSCM refused it, a handoff is declined, or new work reads like work already under way. A file's holder can hand it over with a button. Its CLI prepares the app, invokes the official installer with the bundled icon and configures a managed local Hub from private credential files. See its [capability map](docs/slack-capabilities.md) for implemented journeys and browser fallbacks. Live Slack delivery and rendering remain separate operator checks.
+Change capture retains bounded session facts and can bind an observed command to the source,
+recipe and setup recorded before it ran. Clean Git bindings identify commits and trees;
+working-file capture handles dirty source and reports omissions. Outcome, evidence availability,
+coverage, source drift and freshness stay separate. A local receipt remains a caller assertion,
+not independently verified execution.
 
-## Git, GitHub and GitLab
+Claude Code has the fuller capture adapter. Codex currently exposes session boundaries and
+selected edit starts, **not** prompts, assistant messages, all tool completions or retrospective
+visible history. Capture is best effort and bounded; missing events and unavailable evidence
+must remain visible. See [capture and qualification](docs/change-capture.md).
 
-Keep Git and your forge in charge of their existing merge path. Experimental bridges
-already capture clean Git commits, reconcile changes, export native source to Git mirrors,
-and exchange with remotes over authenticated HTTPS or SSH.
+Conversation capture defaults to **metadata-only**: no conversation bodies are retained or sent
+to the Hub. Per checkout, you can opt into local conversations or shared conversations.
+Shared bodies are redacted on the computer on a best-effort basis, then uploaded; only the
+person sharing them and Hub admins can read them. Hub retention defaults to 30 days.
+Turning sharing off stops future sharing; existing copies remain until expiry or deletion.
+Read [sharing, access and deletion](docs/change-capture.md#sharing-conversations-with-the-hub)
+before enabling it. This is distinct from task text and coordination metadata the Hub already
+stores; see [Hub data](docs/hub.md#data-the-hub-stores).
 
-The attached-checkout lifecycle can bind an exact native Change, require its current configured evidence, build a typed unlanded candidate in an owned mirror, and deliberately publish a separate branch and a GitHub PR or GitLab MR through the existing Mirror transport and Hub bridge. Qualification uses synthetic checkouts, local/loopback HTTPS transport and in-process fake GitHub or GitLab; live forge and attached SSH use are not qualified. GitLab MR publication for these candidates is fake-tested only, covers no event publication (its opt-in workflow status is also fake-tested only), and is not full-history migration or native authority cutover. Native landing controls do not enforce raw Git pushes or forge merges.
+The repository explorer reads local source and retained evidence. It does not run an agent,
+execute checks, fetch or check out branches. One connected local page can combine that private
+view with read-only team data from multiple repositories and Hubs.
 
-See [Git exchange](docs/advanced/git-remote-network.md) and the [roadmap](docs/roadmap.md).
-Moving authority from Git to the native ledger is a separate, proposed per-target cutover.
+## Git, forge checks and native workflows
 
-## What works today
+Keep using your existing Git merge path. Experimental bridges can capture clean commits,
+reconcile changes, export native source and publish a separate candidate branch with a GitHub
+PR or GitLab MR. These bridges have synthetic/fake-provider qualification; live forge and
+attached SSH operation are not qualified. See [Git exchange](docs/advanced/git-remote-network.md).
 
-| Capability | Current boundary |
-|---|---|
-| Git collision checks | Read-only branch/worktree checks; same-file overlap is not proof of conflict |
-| Hub, intents and coordination hooks | Cross-machine announced work; hooks fail open and contested-edit refusal is once per session/file |
-| Agent handoff | Experimental request/reply flow; see [handoff](docs/hub.md#handoff) |
-| Native source and workflows | Experimental immutable revisions, pinned command checks, bounded Claude Code review, authenticated agent-task collection and exact-revision native landing requirements |
-| Community workspace | Experimental single-server pilot: persistent members/settings, independent permissions and one serial workflow queue |
-| Git bridges and forge integration | Experimental; see the Git section above for transport and provider limits |
+In the optional native workflow, checks and review apply to an immutable revision. Fixes create
+new source that needs fresh qualifying evidence. Required evidence, current context, policy,
+target and human approval are checked at native landing. Approval and landing are separate
+operations. See the [workflow guide](docs/advanced/claude-code-workflows.md) and the
+[single-server Community workspace pilot](docs/advanced/community-workspace.md).
 
-The legacy token dashboard and `agentscm_workflow_status` MCP tool inspect retained
-workflow runs; they do not grant execution or landing authority. See the
-[changelog](CHANGELOG.md) for known limits.
+The opt-in GitHub workflow status also handles a restricted **merge-group** case: Unix,
+GitHub App connections, and a single candidate whose group source matches its qualified native
+source. Combined/stacked group source is unsupported. This path is fake-tested only and has not
+been live-qualified; do not require it on a queue-protected branch before qualification.
+See [GitHub merge queues](docs/advanced/github-merge-queue.md).
 
-## Trust and operating limits
+AgentSCM does not configure branch protection or grant forge merge authority. An old green run,
+a session report or an advisory status cannot authorize different source. Moving authority from
+Git to the native ledger remains a separate proposed cutover, described in the [roadmap](docs/roadmap.md).
 
-- **Coordination is not locking.** Hooks fail open when unavailable. Only announced work
-  is visible; semantic conflicts and unannounced shell edits can go undetected.
-- **Native admission and Git protections are distinct.** Native requirements bind source,
-  context, policy and target. Your forge needs its own configured merge protections.
-- **You run the Hub.** Hub data stays with the service you configure. This source also
-  contains staged, configurable usage telemetry, but it cannot send until an endpoint and
-  data-handling profile are configured. Review the [telemetry data and controls](docs/telemetry.md)
-  and [what the Hub stores](docs/hub.md#data-the-hub-stores), including task text from agents.
-- **One writer for the pilot.** Shared native execution requires the documented Unix/runtime
-  setup, persistent storage and explicit recovery. No automatic failover or production
-  security/scale qualification is claimed.
-- **Back up native state separately.** Git exports preserve source, not workflow/approval
-  state. Follow the [consistent backup guidance](docs/advanced/community-workspace.md#operations-and-recovery).
+## Operating the alpha
+
+- **You run the Hub.** Shared data goes to the service you configure. Review its
+  [data handling](docs/hub.md#data-the-hub-stores) and [deployment guide](docs/deployment.md).
+- **Native execution is a trusted-team pilot.** It needs persistent storage and explicit
+  recovery; automatic failover and production security/scale qualification are not provided.
+- **Back up native state separately.** Git exports preserve source, not workflow or approval
+  state. Follow the [backup and recovery guide](docs/advanced/community-workspace.md#operations-and-recovery).
+- **Telemetry requires configuration.** No usage event can be sent until an endpoint and
+  data-handling profile are configured. See [data and controls](docs/telemetry.md).
 
 ## Documentation and contributing
 
-[Documentation index](docs/README.md) · [Install](docs/install.md) ·
-[Supported agents](docs/agents.md) · [Hub setup](docs/hub.md) ·
-[Deployment](docs/deployment.md) · [CLI reference](docs/reference/cli.md) ·
-[Architecture](docs/architecture.md) · [Roadmap](docs/roadmap.md)
+[Documentation index](docs/README.md) · [CLI reference](docs/reference/cli.md) ·
+[Architecture](docs/architecture.md) · [Roadmap](docs/roadmap.md) · [Changelog](CHANGELOG.md)
 
-Packaged versions and notes are in [Releases](https://github.com/agentscm/agentscm/releases).
-These docs describe the branch/tag you are viewing; newer `main` features may require a
-source build. Use your release tag's documentation for packaged binaries.
+These docs describe the branch/tag you are viewing. Features on `main` may need a source build;
+use the documentation at your release tag for packaged binaries. Contributor setup and the
+pinned Rust/Git requirements are in [CONTRIBUTING](CONTRIBUTING.md).
 
-Contributions are welcome; read [CONTRIBUTING](CONTRIBUTING.md) and [SECURITY](SECURITY.md).
-For hosted Hub interest or setup help: support@counterbranch.com.
+Contributions are welcome. Maintainers review and merge; see [CONTRIBUTING](CONTRIBUTING.md),
+[SECURITY](SECURITY.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+For setup help or hosted Hub interest: support@counterbranch.com.
 
-## License
-
-AgentSCM is source-available under FSL-1.1-ALv2. See [LICENSE](LICENSE) for its terms.
-
-## Stability and contributing
-
-AgentSCM is alpha: any release may change the CLI, the HTTP API and the on-disk
-storage format, and no migrations are promised. The Rust toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml)
-is also the minimum supported version. Maintained by the [Counterbranch](https://counterbranch.com)
-maintainers. See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md). Building from source is for contributors: `cargo build --locked`
-with that toolchain and `git` 2.45.0 or newer; `agentscm collisions` itself needs Git 2.43 or newer.
-
-AgentSCM and Counterbranch are trademarks of DUVATL, Inc. The license does not
-grant permission to use these names or logos; see TRADEMARKS.md.
-GitHub, GitLab, Docker, Claude Code and other names are trademarks of their
-respective owners and are used here only to describe compatibility.
+AgentSCM is **source-available under FSL-1.1-ALv2**; see [LICENSE](LICENSE).
+AgentSCM and Counterbranch are trademarks of DUVATL, Inc.; see [TRADEMARKS](TRADEMARKS.md).
+Other product names describe compatibility and belong to their respective owners.

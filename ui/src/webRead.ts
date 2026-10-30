@@ -5,7 +5,7 @@
 // expires, or after a 401, and never twice at once.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from './api.ts'
-import { fetchBrowserSession, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type WebReadToken } from './devices.ts'
+import { fetchBrowserSession, fetchRepositoryList, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type WebReadToken } from './devices.ts'
 import type { Refusal } from './refusal.ts'
 import { fetchOverview } from './standup.ts'
 
@@ -17,8 +17,8 @@ export type WebRead =
   | { kind: 'unavailable'; session: BrowserSession | null; reason: 'connection' | 'empty' | 'refused'; refusal: Refusal | null; /** How far a failed check got: the repositories seen so far. */ repos?: number }
   /** No browser session, or a confirmed sign-out. */
   | { kind: 'none'; refusal: Refusal | null; empty: boolean }
-  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. */
-  | { kind: 'ready'; session: BrowserSession; repos: string[]; read: WebReadToken; refusal: Refusal | null; restarts: number }
+  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. `readable` counts the repositories the Hub listed as readable now. */
+  | { kind: 'ready'; session: BrowserSession; repos: string[]; readable: number; read: WebReadToken; refusal: Refusal | null; restarts: number }
 
 const PICKED_KEY = 'agentscm.web.repository'
 export const RENEW_BEFORE_SECONDS = 120
@@ -91,10 +91,10 @@ export function useWebRead(enabled: boolean, commit: (apply: () => void) => void
   const flight = useRef<Promise<void> | null>(null)
   const signOutFlight = useRef(new Map<string, Promise<void>>())
   const current = useRef(state)
-  const active = useRef(enabled)
-  const generation = useRef(0)
   const commitRef = useRef(commit)
   useEffect(() => { commitRef.current = commit })
+  const active = useRef(enabled)
+  const generation = useRef(0)
   const bootstrap = useRef<{ generation: number; session: BrowserSession | null; controller: AbortController } | null>(null)
   const confirmedGone = useRef(new Map<string, BrowserSession>())
   const failedSignOut = useRef(new Map<string, BrowserSession>())
@@ -216,8 +216,11 @@ export function useWebRead(enabled: boolean, commit: (apply: () => void) => void
         setState(identified)
         keepFailuresFor(session)
         if (!allowed(session)) return
-        const repos = await sessionRepositories(session, ctl.signal)
+        const [known, list] = await Promise.all([sessionRepositories(session, ctl.signal), fetchRepositoryList(session, ctl.signal).catch(() => null)])
         if (!allowed(session)) return
+        // What the Hub says this sign-in can read now comes first; what it only knew of may still be refused.
+        const readable = list?.rows.map((r) => r.repository) ?? []
+        const repos = [...new Set([...readable, ...known])]
         run.repos = repos.length
         const counted = { kind: 'checking', session, repos: repos.length } as const
         current.current = counted
@@ -233,7 +236,7 @@ export function useWebRead(enabled: boolean, commit: (apply: () => void) => void
           return setState(unavailable)
         }
         remember(read.repository)
-        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), read, refusal, restarts: 0 } as const
+        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), readable: readable.length, read, refusal, restarts: 0 } as const
         commitRef.current(() => {
           if (!valid()) return
           current.current = ready

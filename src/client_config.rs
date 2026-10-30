@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -471,7 +472,10 @@ fn collect_git_output(mut stdout: std::process::ChildStdout) -> std::io::Result<
 }
 
 /// Ask Git for the effective fetch URLs. This honors Git's config includes, worktree layout and
-/// URL rewriting while remaining a local config-only operation.
+/// URL rewriting while remaining a local config-only operation. The checkout's own config file
+/// is not read directly: `insteadOf` rewrites and extra `remote.origin.url` values may come from
+/// global or system configuration (whose location is Git's build-time choice), includes or the
+/// environment, and each changes the identity compared.
 fn effective_origin_urls(root: &Path) -> Result<Vec<String>> {
     let mut child = Command::new("git")
         .args(["remote", "get-url", "--all", "origin"])
@@ -491,32 +495,40 @@ fn effective_origin_urls(root: &Path) -> Result<Vec<String>> {
         .stdout
         .take()
         .ok_or_else(|| invalid("cannot inspect the checkout origin"))?;
-    let reader = std::thread::spawn(move || collect_git_output(stdout));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Detached: if Git, or a child it left holding the pipe, stalls, the caller is not held up
+    // joining it.
+    std::thread::spawn(move || {
+        let _ = sender.send(collect_git_output(stdout));
+    });
     let deadline = Instant::now() + ORIGIN_WAIT;
+    let abandon = |child: &mut std::process::Child, message: &str| {
+        let _ = child.kill();
+        let _ = child.wait();
+        invalid(message)
+    };
+    // End of output wakes this thread the moment Git exits, so there is no polling floor.
+    let output = match receiver.recv_timeout(ORIGIN_WAIT) {
+        Ok(output) => output,
+        Err(RecvTimeoutError::Timeout) => {
+            return Err(abandon(&mut child, "checkout origin inspection timed out"));
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            return Err(abandon(&mut child, "cannot inspect the checkout origin"));
+        }
+    };
+    // Git has closed its output and is exiting; reap it, still bounded by the deadline.
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(1));
             }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(invalid("checkout origin inspection timed out"));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(invalid("cannot inspect the checkout origin"));
-            }
+            Ok(None) => return Err(abandon(&mut child, "checkout origin inspection timed out")),
+            Err(_) => return Err(abandon(&mut child, "cannot inspect the checkout origin")),
         }
     };
-    let output = reader
-        .join()
-        .map_err(|_| invalid("cannot inspect the checkout origin"))?
-        .map_err(|_| invalid("cannot inspect the checkout origin"))?;
+    let output = output.map_err(|_| invalid("cannot inspect the checkout origin"))?;
     if !status.success() {
         return Err(invalid(
             "checkout origin is not a supported forge repository URL",

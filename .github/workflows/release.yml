@@ -1,9 +1,9 @@
 name: Release
 
-# Runs only when a maintainer pushes a `v*` tag. It builds and smoke-tests native amd64 and arm64
+# Runs when a maintainer or release automation pushes a `v*` tag. It builds and smoke-tests native amd64 and arm64
 # container children, pushes those exact tested images, assembles a verified two-platform version
 # index (no `latest` during alpha), attests the children, their SBOMs and the index, builds attested
-# provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub prerelease whose body is the
+# provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub release whose body is the
 # CHANGELOG entry. It then publishes the `agentscm` npm package unless the tag contains `-dry`
 # (for example v0.2.0-dry1); any other tag publishes with npm trusted publishing.
 # Anyone who can push a `v*` tag can start this workflow, so protect `v*` tags with a repository ruleset
@@ -16,7 +16,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Serialises every release run, not just runs of one tag.
+  group: release
   cancel-in-progress: false
 
 env:
@@ -55,7 +56,7 @@ jobs:
           [ -f NOTICE ] && [ -f THIRD_PARTY_NOTICES.md ] || { echo "NOTICE and THIRD_PARTY_NOTICES.md are required before releasing" >&2; exit 1; }
           # Fail before anything is pushed if the release notes are missing.
           awk -v v="$version" '
-            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) found = 1 }
+            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1 || index($0, "## [" v "]") == 1) found = 1 }
             found { print }
           ' CHANGELOG.md | wc -l | awk '$1 > 2 { ok = 1 } END { exit !ok }' || { echo "no CHANGELOG entry for $version" >&2; exit 1; }
           git merge-base --is-ancestor HEAD origin/main || { echo "tag $TAG is not on main" >&2; exit 1; }
@@ -142,8 +143,9 @@ jobs:
           if-no-files-found: error
 
   image:
-    # Assemble and verify the public version tag only after both native children pass.
-    needs: image-platform
+    # Assemble and verify the public version tag only after both native children pass and every release
+    # binary has built, so a failed binary build leaves no `:<version>` image and the version can be re-tagged.
+    needs: [image-platform, binaries]
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -242,7 +244,7 @@ jobs:
 
   binaries:
     # Builds only: no OIDC token or attestation rights here, so build-time code cannot sign anything.
-    # Runs in parallel with the image once the UI is built; `attest` waits for both.
+    # Runs in parallel with the per-arch image builds once the UI is built; the version index and `attest` wait for it.
     needs: ui
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     strategy:
@@ -303,7 +305,7 @@ jobs:
           if-no-files-found: error
 
   attest:
-    # Waits for `image` so the tag has been checked against Cargo.toml and main before anything is attested.
+    # Waits for `image` (which itself waits for `binaries`) so the tag has been checked against Cargo.toml and main before anything is attested.
     needs: [image, binaries]
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private }}
     runs-on: ubuntu-latest
@@ -355,7 +357,7 @@ jobs:
         with:
           name: release-dist
           path: dist
-      - name: Create the prerelease from the CHANGELOG entry
+      - name: Create the release from the CHANGELOG entry
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -365,14 +367,24 @@ jobs:
         run: |
           # shellcheck disable=SC2016 # awk program intentionally uses $0 inside single quotes
           awk -v v="$VERSION" '
-            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) found = 1 }
+            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1 || index($0, "## [" v "]") == 1) found = 1 }
             found { print }
           ' CHANGELOG.md > notes.md
           [ "$(wc -l < notes.md)" -gt 2 ] || { echo "no CHANGELOG entry for $VERSION" >&2; exit 1; }
           # shellcheck disable=SC2016 # Markdown backticks are literal inside the format string
           printf '\nImage: `%s:%s` (digest `%s`)\n' "$IMAGE" "$VERSION" "$DIGEST" >> notes.md
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --prerelease --verify-tag \
-            dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          # Plain versions are normal releases; suffixed versions remain prereleases.
+          release_flags=(--prerelease=false --latest)
+          case "$VERSION" in *-*) release_flags=(--prerelease --latest=false) ;; esac
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A previous attempt created the release; attach only qualified artifacts.
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md "${release_flags[@]}"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md "${release_flags[@]}" --verify-tag \
+              dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
+          fi
 
   npm:
     needs: release
@@ -427,5 +439,6 @@ jobs:
         run: |
           case "$TAG" in *-dry*) echo "dry-run tag $TAG: not publishing to npm"; exit 0 ;; esac
           for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md SHA256SUMS; do [ -s "$f" ] || { echo "packages/npm/$f is missing" >&2; exit 1; }; done
-          # shortcut: every release is a prerelease, so it takes `latest` for `npx agentscm`; use `next` for prereleases after the first stable release
-          npm publish --provenance --access public --ignore-scripts --tag latest
+          dist_tag=latest
+          case "$TAG" in *-*) dist_tag=next ;; esac
+          npm publish --provenance --access public --ignore-scripts --tag "$dist_tag"

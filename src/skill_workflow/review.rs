@@ -122,6 +122,8 @@ struct Calls<'a> {
     step_id: &'a str,
     generation: u64,
     guard: Option<&'a super::DispatchGuard<'a>>,
+    /// The plan is re-verified against current source once per step claim, not per model call.
+    verified: bool,
 }
 
 #[cfg(unix)]
@@ -131,7 +133,10 @@ impl ReviewJournal for Calls<'_> {
             guard()?;
         }
         let mut journal = Journal::open(self.data_dir, OpenMode::Write)?;
-        super::verify_current(self.data_dir, self.plan)?;
+        if !self.verified {
+            super::verify_current(self.data_dir, self.plan)?;
+            self.verified = true;
+        }
         let tx = journal
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -335,6 +340,7 @@ pub(super) fn execute(
         step_id,
         generation,
         guard,
+        verified: false,
     };
     // A cancellation from another CLI process is durable state, not this
     // process's signal token. Retain a validated read-only connection and the

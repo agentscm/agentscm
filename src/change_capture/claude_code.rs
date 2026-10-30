@@ -20,7 +20,7 @@ use crate::change_capture::spool::{
 };
 use crate::change_capture::{
     AppendOutcome, CaptureError, DeferredHookV1, DeferredReasonV1, GitSourceRequest, OpenedGitRoot,
-    Result, capture_git_source, capture_git_source_opened, now_seconds, sha256,
+    Result, capture_git_source, capture_git_source_opened, now_seconds,
 };
 use crate::change_record::{
     ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ArtifactMediaV1,
@@ -29,6 +29,7 @@ use crate::change_record::{
     RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SetupComponentV1,
     SetupObservationV1, SubagentFactV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
 };
+use crate::checks::sha256;
 use crate::hub::github::parse_rfc3339;
 use crate::hub::insights::{
     AttemptOutcome, AttemptPhase, UsageBasis, UsageMeasurementScope, UsageRecord,
@@ -569,7 +570,7 @@ pub fn deferred_native_hook(
         format!("evt:{}", sha256(&identity))
     };
     let reserved_sequence = spool.sequence_for(session_id, &occurrence_id)?;
-    let input_digest = sha256(&serde_json::to_vec(&Value::Object(payload.clone()))?);
+    let input_digest = sha256(&serde_json::to_vec(payload)?);
     let (retained_source, recipe_digest, action_kind) = if event_name == "PreToolUse" {
         let native_tool = tool_name.filter(|value| identifier(value, 128));
         if native_tool
@@ -873,7 +874,11 @@ fn capture_native_hook_inner(
         );
     }
     let mut claim = claim.take().expect("new or retained v4 occurrence claim");
-    if phase == "pre" && claim.source.is_none() {
+    // Only the Managed and OrdinaryAction routes consume the source; skip the git scan otherwise.
+    if phase == "pre"
+        && claim.source.is_none()
+        && claim.route != Some(NativeOccurrenceRouteV1::OrdinaryEvent)
+    {
         let root =
             Path::new(claim.root_path.as_deref().ok_or_else(|| {
                 CaptureError::Conflict("native occurrence root is missing".into())

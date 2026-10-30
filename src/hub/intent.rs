@@ -16,7 +16,9 @@ use tokio::time::Instant;
 use super::github::valid_ref_name;
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::session::same_agent;
-use super::store::{Event, HubEvent, Principal, User, new_id, unix_now, validate_repository};
+use super::store::{
+    Event, HubEvent, Principal, Store, User, new_id, unix_now, validate_repository,
+};
 use super::sync::overlapping_pulls;
 use super::{HubError, HubState, Result};
 
@@ -37,7 +39,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Wakes long-polling notice requests in this process after an announce.
 pub(super) static NOTICES: Notify = Notify::const_new();
 /// Bounds long-polls held open per process; past it, a request answers at once.
-static WAITERS: Semaphore = Semaphore::const_new(256);
+static WAITERS: Semaphore = Semaphore::const_new(32);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewIntent {
@@ -585,6 +587,19 @@ async fn announce(
     ))
 }
 
+/// At most `MAX_LIVE_INTENTS` live intents of `repository`, and whether more exist (then any
+/// overlap check over them is incomplete).
+pub(super) fn live_intents_capped(
+    store: &dyn Store,
+    repository: &str,
+    now: i64,
+) -> Result<(Vec<Intent>, bool)> {
+    let mut intents = store.live_intents(repository, now, MAX_LIVE_INTENTS + 1)?;
+    let truncated = intents.len() > MAX_LIVE_INTENTS;
+    intents.truncate(MAX_LIVE_INTENTS);
+    Ok((intents, truncated))
+}
+
 async fn list(
     State(state): State<HubState>,
     Reader(principal): Reader,
@@ -592,12 +607,10 @@ async fn list(
 ) -> ApiResult {
     scope(&principal, &repo)?;
     let store = state.store.clone();
-    let mut intents = blocking(&state, move || {
-        store.live_intents(&repo, unix_now(), MAX_LIVE_INTENTS + 1)
+    let (intents, truncated) = blocking(&state, move || {
+        live_intents_capped(&*store, &repo, unix_now())
     })
     .await?;
-    let truncated = intents.len() > MAX_LIVE_INTENTS;
-    intents.truncate(MAX_LIVE_INTENTS);
     let intents: Vec<Value> = intents.iter().map(Intent::to_json).collect();
     Ok(Json(json!({"intents": intents, "truncated": truncated})))
 }

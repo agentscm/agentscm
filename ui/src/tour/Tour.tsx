@@ -32,7 +32,8 @@ export function TourProvider({ section, data, d, overview, signedIn = true, chil
   const [init] = useState(() => {
     const remember = canRemember()
     const prefs = loadPrefs()
-    const first: TourKey | null = !signedIn ? null : shouldWelcome(prefs, remember) ? 'welcome' : shouldAutoplay(prefs, section, remember) && tourFor(section) ? section : null
+    // The welcome tour describes one repository's Dashboard, so it waits for one rather than covering All repositories.
+    const first: TourKey | null = !signedIn ? null : section !== 'repositories' && shouldWelcome(prefs, remember) ? 'welcome' : shouldAutoplay(prefs, section, remember) && tourFor(section) ? section : null
     return { remember, prefs, first }
   })
   const remember = init.remember
