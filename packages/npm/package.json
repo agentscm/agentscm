@@ -1,6 +1,6 @@
 {
   "name": "agentscm",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Downloads, verifies and starts the AgentSCM release binary.",
   "license": "FSL-1.1-ALv2",
   "repository": {"type": "git", "url": "git+https://github.com/agentscm/agentscm.git"},
