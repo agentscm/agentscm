@@ -2021,8 +2021,19 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         .await;
     assert_eq!(status, 200, "{announced}");
 
+    // A forge that cannot answer is counted, never named, and never shown as lost access.
+    env.fake.lock().unwrap().hub_reads_roles = false;
     let (status, body) = list().await;
     assert_eq!(status, 200, "{body}");
+    assert_eq!(body["repositories"], json!([]));
+    assert_eq!(body["unchecked"], 3);
+    env.fake.lock().unwrap().hub_reads_roles = true;
+
+    // Those failures were not kept: the next list asks the forge again.
+    let reads = env.fake.lock().unwrap().role_reads;
+    let (status, body) = list().await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
     let names: Vec<_> = body["repositories"]
         .as_array()
         .unwrap()
@@ -2072,17 +2083,43 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         (403, Some("forbidden"))
     );
 
-    // A forge that cannot answer is counted, never named, and never shown as lost access.
-    env.fake.lock().unwrap().hub_reads_roles = false;
-    let (status, body) = list().await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["repositories"], json!([]));
-    assert_eq!(body["unchecked"], 3);
-    env.fake.lock().unwrap().hub_reads_roles = true;
-
-    // Losing the role leaves the repository out, with no refused sign-in recorded.
+    // Within the TTL the list reuses those answers, the refused one too, so losing the role
+    // shows only once they expire or alice signs in again.
+    let reads = env.fake.lock().unwrap().role_reads;
     env.drop_role(ALICE);
     let (_, body) = list().await;
+    assert_eq!(body["repositories"][0]["repository"], REPO);
+    assert_eq!(body["repositories"].as_array().unwrap().len(), 2);
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads);
+
+    // Another person's list never uses alice's answers.
+    let bob = web_sign_in(&env, BOB).await;
+    let (_, body) = with_cookie(&env.hub, Method::GET, path, &bob, None).await;
+    assert!(
+        body["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["repository"] == "acme/secret"),
+        "{body}"
+    );
+    assert_eq!(env.fake.lock().unwrap().role_reads, reads + 3);
+
+    // Signing out forgets them: losing the role leaves the repository out, with no refused
+    // sign-in recorded.
+    let (_, session) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    let csrf = session["csrf_token"].as_str().unwrap();
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        "/v1/hub/session",
+        &cookie,
+        Some(csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let cookie = web_sign_in(&env, ALICE).await;
+    let (_, body) = with_cookie(&env.hub, Method::GET, path, &cookie, None).await;
     assert_eq!(body["repositories"][0]["repository"], "acme/docs");
     assert_eq!(body["repositories"].as_array().unwrap().len(), 1);
     let refusals = env.store.refusals(unix_now()).unwrap();

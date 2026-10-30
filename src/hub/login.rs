@@ -344,6 +344,11 @@ impl<T> Table<T> {
             .map(|(_, value)| value)
     }
 
+    /// Drops every entry whose key starts with `prefix`.
+    pub(super) fn remove_prefixed(&mut self, prefix: &str) {
+        self.0.retain(|key, _| !key.starts_with(prefix));
+    }
+
     pub(super) fn take(&mut self, key: &str, now: i64) -> Option<T> {
         self.0
             .remove(key)
@@ -457,6 +462,9 @@ struct Pending {
     device: Table<DeviceLogin>,
     handoffs: Table<Handoff>,
     sessions: Table<Human>,
+    /// Recent role checks of the All repositories list, keyed by person, connection and
+    /// repository: true when readable. Only forge answers are kept, never a failure.
+    role_checks: Table<bool>,
     /// Providers whose forge app refused device sign-in when last asked.
     no_device: std::collections::BTreeSet<String>,
 }
@@ -1496,6 +1504,7 @@ async fn logout(
     State(state): State<HubState>,
     HumanSession(human): HumanSession,
 ) -> ApiResult<Response> {
+    devices::forget_role_checks(&state.login, &human.user.id);
     let Some(browser) = human.browser else {
         state.login.pending().sessions.0.remove(&human.key);
         return Ok(StatusCode::NO_CONTENT.into_response());

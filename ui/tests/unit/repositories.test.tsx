@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DeviceAuth } from '../../src/devices.ts'
 import { RepositoriesPage } from '../../src/pages/Repositories.tsx'
@@ -56,6 +56,36 @@ describe('All repositories', () => {
     rerender(<RepositoriesPage auth={AUTH} web={{ ...web, repos: ['example-org/api'], refusal }} current="example-org/api" />)
     expect(await screen.findByText(/no longer have read access/)).toBeTruthy()
     expect(window.location.hash).toBe('')
+  })
+
+  it('shows the list the web sign-in already fetched without asking again, then refreshes on the slow poll', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    try {
+      const calls = stubList({ repositories: [ROW('example-org/api'), ROW('example-org/new')], unchecked: 0, complete: true })
+      const list = { rows: [{ repository: 'example-org/api', provider: 'github', unfinished: { total: 0, moving: 0, stuck: 0 }, needsYou: 1, agents: 0, lastActivityAt: null, complete: true }], unchecked: 0, complete: true }
+      const web = { repos: ['example-org/api'], pick: vi.fn(), refusal: null, list: { value: list, fetchedAt: Date.now() } }
+      render(<RepositoriesPage auth={AUTH} web={web} current={null} />)
+      // Rows at once, no skeleton and no second request on mount.
+      expect(screen.getByRole('button', { name: 'Open example-org/api' })).toBeTruthy()
+      expect(document.querySelector('.answer-text')?.textContent).toBe('1 repository you can read. 1 needs you.')
+      expect(calls).toEqual([])
+      await act(async () => { await vi.advanceTimersByTimeAsync(119_000) })
+      expect(calls).toEqual([])
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      expect(calls).toEqual(['/v1/hub/session/repositories'])
+      expect(screen.getByRole('button', { name: 'Open example-org/new' })).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('asks at once when the handed-over list is older than the poll', async () => {
+    const calls = stubList({ repositories: [ROW('example-org/new')], unchecked: 0, complete: true })
+    const list = { rows: [], unchecked: 0, complete: true }
+    const web = { repos: [], pick: vi.fn(), refusal: null, list: { value: list, fetchedAt: Date.now() - 121_000 } }
+    render(<RepositoriesPage auth={AUTH} web={web} current={null} />)
+    await screen.findByRole('button', { name: 'Open example-org/new' })
+    expect(calls).toEqual(['/v1/hub/session/repositories'])
   })
 
   it('asks nothing without a web sign-in', () => {
