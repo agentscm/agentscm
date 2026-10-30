@@ -972,49 +972,6 @@ impl Workspace {
         }
     }
 
-    /// Native authority retries retain their own exact-subject idempotency.
-    /// This audit records each attempted action and observed completion without
-    /// pretending the two SQLite databases form one transaction.
-    pub fn with_audited_authorization<T>(
-        &self,
-        actor: &WorkspaceActor,
-        repository: &str,
-        action: WorkspaceAction,
-        request_id: &str,
-        subject: &impl Serialize,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        if !valid_id(request_id) {
-            return Err(invalid("invalid request id"));
-        }
-        let action_name = match action {
-            WorkspaceAction::ApproveRevision => "approve_revision",
-            WorkspaceAction::IntegrateRevision => "integrate_revision",
-            _ => return Err(forbidden()),
-        };
-        let conn = self.conn()?;
-        self.authorized(&conn, actor, repository, action)?;
-        let data = json!({"request_id":request_id,"repository":repository,"action":action_name,"subject":subject});
-        audit(
-            &conn,
-            &actor.identity.key()?,
-            "native_action_started",
-            &data,
-        )?;
-        let outcome = operation();
-        audit(
-            &conn,
-            &actor.identity.key()?,
-            if outcome.is_ok() {
-                "native_action_succeeded"
-            } else {
-                "native_action_failed"
-            },
-            &data,
-        )?;
-        outcome
-    }
-
     pub(super) fn with_identity_change<T>(
         &self,
         operation: impl FnOnce() -> Result<T>,

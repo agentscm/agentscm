@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::checks::CheckSubject;
+use crate::checks::{CheckSubject, sha256};
 use crate::{Error, Result};
 
 const RECIPE_VERSION: u32 = 1;
@@ -492,10 +492,6 @@ fn bounded(kind: &str, value: u64, minimum: u64, maximum: u64) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]

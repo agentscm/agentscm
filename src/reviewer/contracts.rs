@@ -141,7 +141,7 @@ impl ReviewRecipe {
     }
 
     pub fn digest(&self) -> Result<String> {
-        Ok(hash_bytes(&self.canonical_bytes()?))
+        Ok(crate::checks::sha256(&self.canonical_bytes()?))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -449,7 +449,7 @@ impl ModelCallObservation {
         if self.basis != basis
             || self.captured_response.len() > call.max_response_bytes
             || self.captured_response_bytes != self.captured_response.len() as u64
-            || self.captured_response_sha256 != hash_bytes(&self.captured_response)
+            || self.captured_response_sha256 != crate::checks::sha256(&self.captured_response)
         {
             return false;
         }
@@ -508,8 +508,9 @@ impl ModelCallObservation {
                             // synthetic envelope; content hashes the canonical decision.
                             serde_json::from_slice::<ModelReply>(&self.captured_response)
                                 .is_ok_and(|decoded| decoded == *reply)
-                                && serde_json::to_vec(&reply.decision)
-                                    .is_ok_and(|bytes| hash_bytes(&bytes) == reply.content_sha256)
+                                && serde_json::to_vec(&reply.decision).is_ok_and(|bytes| {
+                                    crate::checks::sha256(&bytes) == reply.content_sha256
+                                })
                         }
                         #[cfg(unix)]
                         TransportBasis::ClaudeCode => super::claude_code::decode_reply(
@@ -531,7 +532,7 @@ impl ModelCallObservation {
         self.captured_response =
             self.captured_response[..self.captured_response.len().min(limit)].to_vec();
         self.captured_response_bytes = self.captured_response.len() as u64;
-        self.captured_response_sha256 = hash_bytes(&self.captured_response);
+        self.captured_response_sha256 = crate::checks::sha256(&self.captured_response);
         self.response_capture_complete = false;
         self.state = CallState::Uncertain;
         self.failure = Some(ModelFailure::InvalidResponse);
@@ -546,7 +547,7 @@ impl ModelCallObservation {
             failure: Some(failure),
             http_status: None,
             captured_response_bytes: 0,
-            captured_response_sha256: hash_bytes(&[]),
+            captured_response_sha256: crate::checks::sha256(&[]),
             captured_response: Vec::new(),
             response_capture_complete: false,
         }
@@ -567,7 +568,7 @@ impl PreparedModelCall {
         &self.body
     }
     pub fn request_sha256(&self) -> String {
-        hash_bytes(&self.body)
+        crate::checks::sha256(&self.body)
     }
     pub fn timeout_ms(&self) -> u32 {
         self.timeout_ms
@@ -719,10 +720,6 @@ pub struct ReviewRecord {
     pub unconfirmed_reservation: Option<CallReservation>,
     pub findings: Vec<ReviewFinding>,
     pub unresolved: Vec<String>,
-}
-
-pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub(crate) fn domain_digest<T: Serialize>(domain: &str, value: &T) -> Result<String> {

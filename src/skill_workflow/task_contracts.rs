@@ -1016,7 +1016,7 @@ impl ReferenceFetchResponse {
             raw_digest(sha256)?;
             if *schema_version != AGENT_TASK_CONTRACT_VERSION
                 || content.len() > MAX_REFERENCE_BYTES
-                || sha256_bytes(content.as_bytes()) != *sha256
+                || crate::checks::sha256(content.as_bytes()) != *sha256
             {
                 return invalid("invalid available reference content");
             }
@@ -1429,10 +1429,6 @@ fn domain_digest(domain: &[u8], bytes: &[u8]) -> Result<String> {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn invalid<T>(message: &str) -> Result<T> {
@@ -1919,13 +1915,14 @@ mod tests {
         let task = task();
         let content = "pinned instructions";
         let mut task_with_content_digest = task.clone();
-        task_with_content_digest.entrypoint.references[0].sha256 = sha256_bytes(content.as_bytes());
+        task_with_content_digest.entrypoint.references[0].sha256 =
+            crate::checks::sha256(content.as_bytes());
         let request = ReferenceFetchRequest {
             version: 1,
             task_id: task_with_content_digest.task_id.clone(),
             task_digest: task_with_content_digest.digest().unwrap(),
             reference_name: "skill".into(),
-            expected_sha256: sha256_bytes(content.as_bytes()),
+            expected_sha256: crate::checks::sha256(content.as_bytes()),
             expected_schema_version: 1,
             actor: AuthenticatedAgentIdentity {
                 owner_id: "owner-1".into(),

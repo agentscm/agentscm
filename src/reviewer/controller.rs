@@ -536,8 +536,8 @@ fn load_rows<S: ReviewSource>(
         if observation.raw.len() > remaining || observation.rendered.len() > remaining {
             return Err(ReviewStop::SourceLimit);
         }
-        let raw_digest = hash_bytes(&observation.raw);
-        let rendered_digest = hash_bytes(observation.rendered.as_bytes());
+        let raw_digest = crate::checks::sha256(&observation.raw);
+        let rendered_digest = crate::checks::sha256(observation.rendered.as_bytes());
         if let Some(metadata) = &mut coverage.source_observation {
             metadata.raw_sha256 = Some(raw_digest.clone());
             metadata.rendered_sha256 = Some(rendered_digest.clone());
@@ -622,7 +622,7 @@ mod replay_tests {
                         prompt_details: None,
                         completion_details: None,
                     },
-                    content_sha256: hash_bytes(&serde_json::to_vec(&decision).unwrap()),
+                    content_sha256: crate::checks::sha256(&serde_json::to_vec(&decision).unwrap()),
                     decision,
                     system_fingerprint: None,
                     service_tier: None,
@@ -635,7 +635,7 @@ mod replay_tests {
                     failure: None,
                     http_status: None,
                     captured_response_bytes: captured_response.len() as u64,
-                    captured_response_sha256: hash_bytes(&captured_response),
+                    captured_response_sha256: crate::checks::sha256(&captured_response),
                     captured_response,
                     response_capture_complete: true,
                 }
@@ -690,8 +690,8 @@ mod replay_tests {
             path: "src/lib.rs".into(),
             start_line: 1,
             end_line: 1,
-            raw_sha256: hash_bytes(&raw),
-            rendered_sha256: hash_bytes(&raw),
+            raw_sha256: crate::checks::sha256(&raw),
+            rendered_sha256: crate::checks::sha256(&raw),
             required: true,
         };
         let scope = "2".repeat(64);

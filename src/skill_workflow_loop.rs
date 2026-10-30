@@ -229,7 +229,7 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
                 json!({"outcome":"unavailable"})
             }
         });
-    skill_workflow::start(data_dir, &run_id, &plan)?;
+    skill_workflow::start_compiled(data_dir, &run_id, &plan)?;
 
     let work_dir = if needs_command || needs_claude {
         Some(crate::private_execution_dir(data_dir)?)

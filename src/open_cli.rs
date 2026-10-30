@@ -66,12 +66,7 @@ pub(crate) async fn run(args: OpenArgs) -> Result<()> {
 
 /// Requests to this computer's own service never go through a configured HTTP proxy.
 fn loopback_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|_| Error::Invalid("HTTP client unavailable".into()))
+    crate::hub_cli::direct_client().map_err(|_| Error::Invalid("HTTP client unavailable".into()))
 }
 
 /// Open the browser on `path`'s repository, starting the local service when needed.

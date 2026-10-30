@@ -334,18 +334,11 @@ async fn hook_claude() -> Result<i32> {
             return Ok(0);
         }
     };
-    let binding = match change_capture_client::binding_for_payload(&payload) {
-        Ok(Some(binding)) => binding,
+    let (binding, spool, connection) = match change_capture_client::binding_for_payload(&payload) {
+        Ok(Some(bound)) => bound,
         Ok(None) => return Ok(0),
         Err(_) => {
             eprintln!("AgentSCM local capture warning: configured checkout binding is unavailable");
-            return Ok(0);
-        }
-    };
-    let spool = match change_capture_client::open_bound_spool(&binding) {
-        Ok(spool) => spool,
-        Err(_) => {
-            eprintln!("AgentSCM local capture warning: private spool is unavailable");
             return Ok(0);
         }
     };
@@ -379,7 +372,20 @@ async fn hook_claude() -> Result<i32> {
             }
         },
     };
-    let target = match change_capture_client::resolve_target(&binding, &session_id).await {
+    let hub = change_capture_client::CaptureHub::new(connection).ok();
+    let deliver = || async {
+        match &hub {
+            Some(hub) => {
+                change_capture_client::deliver_pending_with(&binding.root, &spool, hub).await
+            }
+            None => Err(Error::Invalid("capture Hub client unavailable".into())),
+        }
+    };
+    let target = match &hub {
+        Some(hub) => change_capture_client::resolve_target_with(&binding, hub, &session_id).await,
+        None => Err(Error::Invalid("capture Hub client unavailable".into())),
+    };
+    let target = match target {
         Ok(Some(target)) => target,
         Ok(None) => {
             let retained = claude_code::deferred_native_hook(
@@ -388,7 +394,7 @@ async fn hook_claude() -> Result<i32> {
                 &actions,
                 &spool,
             );
-            let _ = change_capture_client::deliver_pending(&binding.root, &spool).await;
+            let _ = deliver().await;
             if retained.is_err() {
                 eprintln!(
                     "AgentSCM local capture warning: native session has no current authorized work and its sanitized deferred fact could not be retained"
@@ -407,7 +413,7 @@ async fn hook_claude() -> Result<i32> {
                 &actions,
                 &spool,
             );
-            let _ = change_capture_client::deliver_pending(&binding.root, &spool).await;
+            let _ = deliver().await;
             if retained.is_err() {
                 eprintln!(
                     "AgentSCM local capture warning: current authorized work and sanitized deferred retention are unavailable"
@@ -485,7 +491,7 @@ async fn hook_claude() -> Result<i32> {
             );
         }
     }
-    match change_capture_client::deliver_pending(&binding.root, &spool).await {
+    match deliver().await {
         Ok(report) if report.blocked > 0 => eprintln!(
             "AgentSCM local capture warning: {} retained record(s) remain blocked by current Hub authorization or work generation",
             report.blocked

@@ -28,7 +28,7 @@ use super::workspace_execution::source::{
 static METADATA_IO: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 static SOURCE_IO: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 const MAX_METADATA_BYTES: usize = 3 * 1024 * 1024;
-const BODY_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn routes() -> Router<HubState> {
     Router::new()

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use agentscm::Result;
 use agentscm::change_record::CaptureModeV1;
+use agentscm::http_listener::bearer;
 use agentscm::repo_explorer::Explorer;
 use axum::Json;
 use axum::Router;
@@ -150,20 +151,7 @@ fn digest(secret: &str) -> String {
 }
 
 fn same(left: &str, right: &str) -> bool {
-    left.len() == right.len()
-        && left
-            .bytes()
-            .zip(right.bytes())
-            .fold(0, |acc, (x, y)| acc | (x ^ y))
-            == 0
-}
-
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+    agentscm::http_listener::constant_time_eq(left.as_bytes(), right.as_bytes())
 }
 
 /// The grant and selector of a `local:<grant>:<selector>` credential.

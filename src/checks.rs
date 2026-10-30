@@ -1282,7 +1282,7 @@ pub(crate) fn sql_u64(kind: &str, value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::Invalid(format!("stored {kind} is negative")))
 }
 
-pub(crate) fn sha256(bytes: &[u8]) -> String {
+pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 

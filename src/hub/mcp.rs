@@ -9,8 +9,8 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
-use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde::de::DeserializeOwned;
@@ -1239,16 +1239,6 @@ fn promise_id_ok(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
-fn promise_bearer(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .split_once(' ')
-        .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())
-        .map(|(_, token)| token.to_owned())
-}
-
 fn promise_repositories(view: &PromiseViewV1) -> Vec<String> {
     view.current
         .definition
@@ -1290,7 +1280,7 @@ async fn promise_call(
     let Some(workspace) = state.workspace.clone() else {
         return Some(refused("promise workspace unavailable"));
     };
-    let Some(token) = promise_bearer(headers) else {
+    let Some(token) = crate::http_listener::bearer(headers).map(str::to_owned) else {
         return Some(refused("token not accepted"));
     };
     let store = state.store.clone();

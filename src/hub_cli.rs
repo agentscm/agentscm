@@ -370,6 +370,15 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
     }
 }
 
+/// A short-timeout client that ignores configured proxies and never follows redirects.
+pub(crate) fn direct_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+}
+
 pub(crate) fn map_hub_error(error: HubError) -> Error {
     match error {
         HubError::Invalid(message) => Error::Invalid(message),

@@ -1010,7 +1010,9 @@ status is always `success`, so never mark it as a required check. The separate
 
 Failures. A 401, or a 403 with no rate-limit headers, on the app JWT, an
 installation token or discovery marks the connection `auth_failed` (status code and
-endpoint kind only) and keeps all data; the next success marks it `enabled`. The same
+endpoint kind only) and keeps all data; the poller then leaves it for 10 minutes (webhooks
+are not processed meanwhile, the wait survives a restart, and an administrator's refresh retries at once), and the
+next success marks it `enabled` and ends the wait. The same
 on a repository endpoint only skips that repository for the round. Each round starts
 at a different repository. A 429, a 403 with no quota left, or a GraphQL `RATE_LIMITED` error moves the next poll
 to the latest of `Retry-After`, `X-RateLimit-Reset` and a minute away, and changes
@@ -1597,8 +1599,12 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
 - Only the same intent id is excluded from overlaps, so two intents held by one
   token can overlap and notice each other.
 - There is no cap on live intents per token and no rate limit; announces are
-  attributed to the token's owner. At most 256 notice requests wait at once per
-  process; beyond that a request answers immediately as if `wait` were 0.
+  attributed to the token's owner. Lists of a repository's live intents read at
+  most 1,000: the intent list sets `truncated`, the session-start listing says
+  coordination is unknown, and pull request overlap notices, comments and Slack
+  messages consider only those 1,000 (the Hub logs that to stderr). At most 32 notice requests and 32 inbox
+  requests wait at once per process, so long-polls cannot hold every connection;
+  beyond that a request answers immediately as if `wait` were 0.
 - The PostgreSQL connection is plaintext: this build has no TLS. Unix sockets
   and loopback IP addresses are accepted (not the name `localhost`, which the OS
   resolves); any other TCP host is refused unless the URL sets

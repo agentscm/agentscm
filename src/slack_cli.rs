@@ -112,12 +112,7 @@ pub async fn run(command: SlackCommand) -> Result<()> {
 }
 
 fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|_| invalid("Slack setup HTTP client unavailable"))
+    crate::hub_cli::direct_client().map_err(|_| invalid("Slack setup HTTP client unavailable"))
 }
 
 async fn request(request: reqwest::RequestBuilder, error: &str) -> Result<Value> {
