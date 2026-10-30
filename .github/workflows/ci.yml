@@ -30,6 +30,13 @@ jobs:
       - run: rustup toolchain install # reads rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
+      - name: Check release metadata
+        run: |
+          rustfmt --edition 2024 --check tools/release-files.rs
+          rustc --edition=2024 -D warnings --test tools/release-files.rs -o "$RUNNER_TEMP/release-files-test"
+          "$RUNNER_TEMP/release-files-test"
+          rustc --edition=2024 -D warnings tools/release-files.rs -o "$RUNNER_TEMP/release-files"
+          "$RUNNER_TEMP/release-files" --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       # Crate-level `warnings = "deny"` turns musl-only deprecations into errors; linting musl here catches
       # them on every pull request. The labelled `release-targets` job builds every non-Windows release target.

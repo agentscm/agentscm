@@ -3,7 +3,7 @@ name: Release
 # Runs when a maintainer or release automation pushes a `v*` tag. It builds and smoke-tests native amd64 and arm64
 # container children, pushes those exact tested images, assembles a verified two-platform version
 # index (no `latest` during alpha), attests the children, their SBOMs and the index, builds attested
-# provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub prerelease whose body is the
+# provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub release whose body is the
 # CHANGELOG entry. It then publishes the `agentscm` npm package unless the tag contains `-dry`
 # (for example v0.2.0-dry1); any other tag publishes with npm trusted publishing.
 # Anyone who can push a `v*` tag can start this workflow, so protect `v*` tags with a repository ruleset
@@ -357,7 +357,7 @@ jobs:
         with:
           name: release-dist
           path: dist
-      - name: Create the prerelease from the CHANGELOG entry
+      - name: Create the release from the CHANGELOG entry
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -373,13 +373,16 @@ jobs:
           [ "$(wc -l < notes.md)" -gt 2 ] || { echo "no CHANGELOG entry for $VERSION" >&2; exit 1; }
           # shellcheck disable=SC2016 # Markdown backticks are literal inside the format string
           printf '\nImage: `%s:%s` (digest `%s`)\n' "$IMAGE" "$VERSION" "$DIGEST" >> notes.md
+          # Plain versions are normal releases; suffixed versions remain prereleases.
+          release_flags=(--prerelease=false --latest)
+          case "$VERSION" in *-*) release_flags=(--prerelease --latest=false) ;; esac
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # Release Please created the release; attach only qualified artifacts.
+            # A previous attempt created the release; attach only qualified artifacts.
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
               dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md --prerelease
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md "${release_flags[@]}"
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --prerelease --verify-tag \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md "${release_flags[@]}" --verify-tag \
               dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
           fi
 
@@ -436,5 +439,6 @@ jobs:
         run: |
           case "$TAG" in *-dry*) echo "dry-run tag $TAG: not publishing to npm"; exit 0 ;; esac
           for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md SHA256SUMS; do [ -s "$f" ] || { echo "packages/npm/$f is missing" >&2; exit 1; }; done
-          # shortcut: every release is a prerelease, so it takes `latest` for `npx agentscm`; use `next` for prereleases after the first stable release
-          npm publish --provenance --access public --ignore-scripts --tag latest
+          dist_tag=latest
+          case "$TAG" in *-*) dist_tag=next ;; esac
+          npm publish --provenance --access public --ignore-scripts --tag "$dist_tag"

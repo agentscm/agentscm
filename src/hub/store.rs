@@ -605,14 +605,6 @@ pub trait Store: Send + Sync {
         pull_number: i64,
         merge_commit: Option<&str>,
     ) -> Result<bool>;
-    fn catchup_merge_highwater(&self, scope: &CatchupRepositoryScope) -> Result<i64>;
-    fn catchup_merges_through(
-        &self,
-        scope: &CatchupRepositoryScope,
-        after: i64,
-        through: i64,
-        limit: usize,
-    ) -> Result<Vec<CatchupMergeObservation>>;
     fn record_catchup_source_status(
         &self,
         scope: &CatchupRepositoryScope,
@@ -801,11 +793,8 @@ pub trait Store: Send + Sync {
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
     fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing>;
-    /// Side-effect-free current page for hooks and implicit contexts; never ackable.
-    fn work_briefing_preview(&self, token: &str, limit: usize, now: i64) -> Result<Briefing> {
-        self.work_briefing_preview_for(token, None, limit, now)
-    }
-    /// Like `work_briefing_preview`, with an isolated explicit subscriber/session cursor.
+    /// Side-effect-free current page for hooks and implicit contexts; never ackable, with an
+    /// isolated explicit subscriber/session cursor.
     fn work_briefing_preview_for(
         &self,
         token: &str,
@@ -898,6 +887,12 @@ pub trait Store: Send + Sync {
         apply: bool,
         now: i64,
     ) -> Result<WorkCompaction>;
+    /// Operator-only, transactional repair of a verified repository rename.
+    fn work_repair_repository(
+        &self,
+        repair: &super::work::WorkRepositoryRename,
+        now: i64,
+    ) -> Result<super::work::WorkRepositoryRenameResult>;
     /// Every repository scope that retains Work items or coordination requests.
     fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>>;
     /// Trusted workspace calls only: authorization is held across this transaction.

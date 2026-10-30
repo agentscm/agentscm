@@ -24,7 +24,7 @@ use super::catchup::{
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
     TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
     repository_namespace, source_name, tracked_publication_merge,
 };
@@ -96,13 +96,13 @@ use super::store::{
     validate_login,
 };
 use super::work::{
-    Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
-    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
-    WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
-    WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
-    WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
-    WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
+    Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
+    MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES,
+    WorkCheckpoint, WorkCheckpointResult, WorkCompaction, WorkConflictKind, WorkEvent, WorkItem,
+    WorkOutcome, WorkOutcomeKind, WorkOverview, WorkOverviewQuery, WorkParticipant, WorkReader,
+    WorkRepositoryScope, WorkRole, WorkScopeCheck, WorkScopeOverlap, WorkSearchItem,
+    WorkSearchPage, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState, WorkWho,
+    check_work_delivery_page, check_work_payload_capacity, claim_status, fit_json_budget,
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
     work_payload_row_bytes,
 };
@@ -110,6 +110,7 @@ use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::{HubError, Result};
 
 mod preflight;
+mod repository_rename;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -449,7 +450,11 @@ fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result
             "SELECT t.repository, t.repository_id, t.name, t.read_only,
                     u.id, u.provider, u.host, u.forge_user_id, u.login
              FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled AND NOT EXISTS (
+                 SELECT 1 FROM hub_repositories r JOIN hub_connections c ON c.id = r.connection
+                 WHERE c.provider = u.provider AND r.host = u.host
+                   AND r.repository_id = t.repository_id AND r.full_name <> t.repository
+             )
              FOR SHARE",
             &[&token, &now],
         )?
@@ -1501,7 +1506,7 @@ fn pg_insight_input(
                 publications_complete = false;
                 break;
             }
-            let found=tx.query("SELECT p.id,p.branch_state,p.pr_number,p.merge_commit,p.updated_at FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token JOIN hub_users u ON u.id=t.owner WHERE p.commit_sha=$1 AND p.repository=$2 AND t.repository=$2 AND t.repository_id=$3 AND u.provider=$4 AND u.host=$5 ORDER BY p.updated_at,p.id LIMIT $6",&[commit,&item.repository,&repository_id,&provider,&host,&((remaining+1)as i64)])?;
+            let found=tx.query("SELECT p.id,p.branch_state,p.pr_number,p.merge_commit,p.updated_at FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token JOIN hub_users u ON u.id=t.owner WHERE p.commit_sha=$1 AND p.repository=t.repository AND t.repository_id=$2 AND u.provider=$3 AND u.host=$4 ORDER BY p.updated_at,p.id LIMIT $5",&[commit,&repository_id,&provider,&host,&((remaining+1)as i64)])?;
             if found.len() > remaining {
                 publications_complete = false;
             }
@@ -1561,15 +1566,43 @@ fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i
     let active = tx
         .query_opt(
             "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled",
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled AND NOT EXISTS (
+                 SELECT 1 FROM hub_repositories r JOIN hub_connections c ON c.id = r.connection
+                 WHERE c.provider = u.provider AND r.host = u.host
+                   AND r.repository_id = t.repository_id AND r.full_name <> t.repository
+             )",
             &[&item.lead_token, &now],
         )?
         .is_some();
-    item.claim_status = if active && item.last_checkin_at >= now - CLAIM_STALE_SECONDS {
-        ClaimStatus::Active
-    } else {
-        ClaimStatus::Stale
-    };
+    item.claim_status = claim_status(item.last_checkin_at, active, now);
+    Ok(())
+}
+
+/// `project_claim` for many items with one token lookup.
+fn project_claims(
+    tx: &mut postgres::Transaction<'_>,
+    items: &mut [WorkItem],
+    now: i64,
+) -> Result<()> {
+    let leads = items
+        .iter()
+        .map(|item| item.lead_token.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let active = tx
+        .query(
+            "SELECT t.id FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+             WHERE t.id = ANY($1) AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled",
+            &[&leads, &now],
+        )?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<BTreeSet<_>>();
+    for item in items {
+        let valid = active.contains(&item.lead_token);
+        item.claim_status = claim_status(item.last_checkin_at, valid, now);
+    }
     Ok(())
 }
 
@@ -1629,8 +1662,9 @@ fn work_scope_overlaps(
     if scope.is_empty() {
         return Ok(Vec::new());
     }
+    // The scope column mirrors the snapshot's scope, so only overlapping snapshots are decoded.
     let rows = tx.query(
-        "SELECT snapshot FROM hub_work_items
+        "SELECT id, scope FROM hub_work_items
          WHERE provider = $1 AND host = $2 AND repository = $3
            AND repository_id IS NOT DISTINCT FROM $4 AND state <> 'finished'
            AND ($5::text IS NULL OR id <> $5)
@@ -1648,11 +1682,15 @@ fn work_scope_overlaps(
     }
     let mut found = Vec::new();
     for row in rows {
-        let snapshot: String = row.get(0);
-        let mut item: WorkItem = json_value(&snapshot)?;
-        project_claim(tx, &mut item, now)?;
-        let reasons = scope_overlap_reasons(scope, &item.scope);
+        let id: String = row.get(0);
+        let their_scope: String = row.get(1);
+        let reasons = scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?);
         if !reasons.is_empty() {
+            let snapshot: String = tx
+                .query_one("SELECT snapshot FROM hub_work_items WHERE id = $1", &[&id])?
+                .get(0);
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
             let their_scope = item.scope.clone();
             found.push(WorkScopeOverlap {
                 item,
@@ -1676,7 +1714,12 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     Ok(event)
 }
 
-fn save_work_version(tx: &mut postgres::Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+/// Returns the stored snapshot so callers can size it without serializing the item again.
+fn save_work_version(
+    tx: &mut postgres::Transaction<'_>,
+    item: &WorkItem,
+    seq: i64,
+) -> Result<String> {
     let snapshot = json_string(item)?;
     let current = item.current.as_ref().map(json_string).transpose()?;
     let scope = json_string(&item.scope)?;
@@ -1707,7 +1750,7 @@ fn save_work_version(tx: &mut postgres::Transaction<'_>, item: &WorkItem, seq: i
          VALUES ($1, $2, $3, $4)",
         &[&item.id, &seq, &state_name(item.state), &snapshot],
     )?;
-    Ok(())
+    Ok(snapshot)
 }
 
 fn work_payload_bytes(
@@ -2983,8 +3026,7 @@ fn start_in(
                     &now,
                 ],
             )?;
-            save_work_version(tx, &item, seq)?;
-            let snapshot = json_string(&item)?;
+            let snapshot = save_work_version(tx, &item, seq)?;
             let delta = work_transition_payload_bytes(&snapshot, &event)?
                 .checked_sub(previous_item_bytes)
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -3162,10 +3204,9 @@ fn start_in(
                 &now,
             ],
         )?;
-        save_work_version(tx, &item, seq)?;
+        let snapshot = save_work_version(tx, &item, seq)?;
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
         retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
-        let snapshot = json_string(&item)?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -5002,12 +5043,9 @@ impl PgStore {
                 .collect::<Result<Vec<_>>>()?;
             let mut current_complete = current.len() <= query.limit;
             current.truncate(query.limit);
-            for item in &mut current {
-                project_claim(&mut tx, item, now)?;
-            }
+            project_claims(&mut tx, &mut current, now)?;
             let overview_part_budget = (MAX_BRIEFING_BYTES - 4096) / 3;
-            while json_string(&current)?.len() > overview_part_budget {
-                current.pop();
+            if fit_json_budget(&mut current, overview_part_budget)? {
                 current_complete = false;
             }
 
@@ -5052,15 +5090,13 @@ impl PgStore {
             let history_retention_gap = event_floor > 0 || snapshot_floor > 0;
             let mut recent_complete = recent.len() <= query.limit && !history_retention_gap;
             recent.truncate(query.limit);
-            while json_string(&recent)?.len() > overview_part_budget {
-                recent.pop();
+            if fit_json_budget(&mut recent, overview_part_budget)? {
                 recent_complete = false;
             }
-            let mut overlaps = work_overlap_pairs(&current);
+            let mut overlaps = work_overlap_pairs(&current, query.limit + 1);
             let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
             overlaps.truncate(query.limit);
-            while json_string(&overlaps)?.len() > overview_part_budget {
-                overlaps.pop();
+            if fit_json_budget(&mut overlaps, overview_part_budget)? {
                 overlaps_complete = false;
             }
             tx.commit()?;
@@ -7502,43 +7538,6 @@ impl Store for PgStore {
         })
     }
 
-    fn catchup_merge_highwater(&self, scope: &CatchupRepositoryScope) -> Result<i64> {
-        scope.validate()?;
-        self.run(true, |client| {
-            let repository = repository_namespace(&scope.repository, scope.repository_id);
-            Ok(client
-                .query_opt(
-                    "SELECT next_merge_seq-1 FROM hub_catchup_repositories WHERE provider=$1
-            AND host=$2 AND repository=$3 AND repository_key=$4",
-                    &[
-                        &scope.provider,
-                        &scope.host,
-                        &repository,
-                        &catchup_repository_key(scope.repository_id),
-                    ],
-                )?
-                .map_or(0, |r| r.get(0)))
-        })
-    }
-
-    fn catchup_merges_through(
-        &self,
-        scope: &CatchupRepositoryScope,
-        after: i64,
-        through: i64,
-        limit: usize,
-    ) -> Result<Vec<CatchupMergeObservation>> {
-        scope.validate()?;
-        if after < 0 || through < after || !(1..=MAX_CATCHUP_PAGE).contains(&limit) {
-            return Err(HubError::Invalid("invalid catch-up merge page".into()));
-        }
-        let repository = repository_namespace(&scope.repository, scope.repository_id);
-        self.run(true,|client|client.query(&format!("SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
-            WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND seq>$5 AND seq<=$6
-            ORDER BY seq LIMIT $7"),&[&scope.provider,&scope.host,&repository,
-            &catchup_repository_key(scope.repository_id),&after,&through,&(limit as i64)])?.iter().map(pg_catchup_merge).collect())
-    }
-
     fn record_catchup_source_status(
         &self,
         scope: &CatchupRepositoryScope,
@@ -7876,14 +7875,13 @@ impl Store for PgStore {
             let event = work_event("work_checkpoint", &item)?;
             let seq = append(&mut tx, &event)?;
             item.updated_seq = seq;
-            save_work_version(&mut tx, &item, seq)?;
+            let snapshot = save_work_version(&mut tx, &item, seq)?;
             tx.execute(
                 "INSERT INTO hub_work_checkpoint_ops
                     (work, operation_id, request, event_seq)
                  VALUES ($1, $2, $3, $4)",
                 &[&item.id, &checkpoint.operation_id, &request, &seq],
             )?;
-            let snapshot = json_string(&item)?;
             let request_bytes = work_payload_row_bytes(request.len())?;
             let delta = work_transition_payload_bytes(&snapshot, &event)?
                 .checked_sub(previous_item_bytes)
@@ -9296,6 +9294,21 @@ impl Store for PgStore {
         Ok(CatchupAckResult{status,event_through,merge_through,current_event_ack:current.0,current_merge_ack:current.1})})
     }
 
+    fn work_repair_repository(
+        &self,
+        repair: &super::work::WorkRepositoryRename,
+        now: i64,
+    ) -> Result<super::work::WorkRepositoryRenameResult> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let result = repository_rename::repair(&mut tx, repair, now)?;
+            if repair.apply {
+                tx.commit()?;
+            }
+            Ok(result)
+        })
+    }
+
     fn work_compact(
         &self,
         scope: &WorkRepositoryScope,
@@ -10375,13 +10388,11 @@ impl Store for PgStore {
                 coordination_request_at(&mut tx, &who, &withdraw.request_id, i64::MAX, now)?
                     .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
             let requester = coordination_is_requester(&request, &who, &withdraw.session);
-            let requester_available = tx
-                .query_opt(
-                    "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id=t.owner
-                     WHERE t.id=$1 AND NOT t.revoked AND t.expires_at>$2 AND NOT u.disabled",
-                    &[&request.requester.token, &now],
-                )?
-                .is_some();
+            let requester_available = match work_who(&mut tx, &request.requester.token, now) {
+                Ok(_) => true,
+                Err(HubError::Unauthorized) => false,
+                Err(error) => return Err(error),
+            };
             let current_target_lead = request.targets.iter().any(|target| {
                 target.lead.token == who.token && target.lead.session == withdraw.session
             });

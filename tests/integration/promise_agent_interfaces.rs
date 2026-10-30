@@ -390,6 +390,27 @@ async fn cli_reads_exact_versions_and_keeps_agent_inputs_advisory() {
     let list_tool = mcp_tool(&env, token, "agentscm_promises_list", json!({})).await;
     assert_eq!(list_tool["isError"], false);
     assert_eq!(list_tool["structuredContent"], page);
+    // Two Authorization headers are refused on the MCP path, as on the other Hub routes.
+    let doubled = env
+        .client
+        .post(format!("{}/mcp", env.base))
+        .header("authorization", format!("Bearer {token}"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"agentscm_promises_list","arguments":{}}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = doubled.status().as_u16();
+    let reply: Value = serde_json::from_str(&doubled.text().await.unwrap()).unwrap_or(Value::Null);
+    assert!(
+        status == 401 || reply["result"]["isError"] == true,
+        "{status} {reply}"
+    );
     let show_tool = mcp_tool(
         &env,
         token,

@@ -1311,7 +1311,11 @@ fn connection_for(root: &Path) -> Result<client_config::Connection> {
     Ok(connection)
 }
 
-pub fn binding_for_payload(payload: &Value) -> Result<Option<CaptureBinding>> {
+/// The enabled binding for a native hook payload, with its namespace-checked spool and current
+/// client connection, so one hook process opens the spool and resolves the connection once.
+pub(crate) fn binding_for_payload(
+    payload: &Value,
+) -> Result<Option<(CaptureBinding, LocalSpool, client_config::Connection)>> {
     let Some(cwd) = payload.get("cwd").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -1331,8 +1335,8 @@ pub fn binding_for_payload(payload: &Value) -> Result<Option<CaptureBinding>> {
             "capture binding namespace differs from client connection",
         ));
     }
-    ensure_spool_namespace(&binding)?;
-    Ok(Some(binding))
+    let spool = ensure_spool_namespace(&binding)?;
+    Ok(Some((binding, spool, connection)))
 }
 
 pub fn capture_status(root: &Path) -> Result<Value> {
@@ -1481,13 +1485,19 @@ pub fn session_start_context(binding: &CaptureBinding) -> Result<Option<String>>
     Ok(Some(context))
 }
 
-fn ensure_spool_namespace(binding: &CaptureBinding) -> Result<()> {
-    let expected = binding.spool_identity.ok_or_else(|| {
-        invalid("capture binding lacks trusted v4 spool identity; only inspect/export is available")
-    })?;
-    let spool =
-        LocalSpool::open_with_limits_expected(&binding.spool, binding.spool_limits, expected)
-            .map_err(|error| invalid(format!("local capture: {error}")))?;
+fn ensure_spool_namespace(binding: &CaptureBinding) -> Result<LocalSpool> {
+    let spool = open_bound_spool(binding)?;
+    bind_spool_namespace(binding, &spool)?;
+    Ok(spool)
+}
+
+/// Binds an already opened spool to the binding's namespace without reopening it.
+fn bind_spool_namespace(binding: &CaptureBinding, spool: &LocalSpool) -> Result<()> {
+    if binding.spool != spool.root() || binding.spool_identity != Some(spool.identity()) {
+        return Err(invalid(
+            "capture spool differs from the configured checkout binding",
+        ));
+    }
     let outcome = spool
         .bind_namespace(SpoolNamespaceV1 {
             version: 1,
@@ -1504,19 +1514,50 @@ fn ensure_spool_namespace(binding: &CaptureBinding) -> Result<()> {
     Ok(())
 }
 
+/// A checked client connection with its bearer token and one HTTP client, built once per process.
+pub struct CaptureHub {
+    connection: client_config::Connection,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl CaptureHub {
+    pub(crate) fn new(connection: client_config::Connection) -> Result<Self> {
+        let token = crate::client_cli::read_token(&connection.token_file)?;
+        let client = forge_http::client().map_err(|_| invalid("capture Hub client unavailable"))?;
+        Ok(Self {
+            connection,
+            token,
+            client,
+        })
+    }
+}
+
 pub async fn resolve_target(
     binding: &CaptureBinding,
     session_id: &str,
 ) -> Result<Option<CaptureTargetV1>> {
     ensure_spool_namespace(binding)?;
-    let connection = connection_for(&binding.root)?;
+    let hub = CaptureHub::new(connection_for(&binding.root)?)?;
+    resolve_target_with(binding, &hub, session_id).await
+}
+
+/// Resolves the current target for a binding whose spool namespace this process already checked.
+pub async fn resolve_target_with(
+    binding: &CaptureBinding,
+    hub: &CaptureHub,
+    session_id: &str,
+) -> Result<Option<CaptureTargetV1>> {
+    let CaptureHub {
+        connection,
+        token,
+        client,
+    } = hub;
     if connection.repo != binding.repository || connection.hub != binding.hub {
         return Err(invalid(
             "capture binding namespace differs from client connection",
         ));
     }
-    let token = crate::client_cli::read_token(&connection.token_file)?;
-    let client = forge_http::client().map_err(|_| invalid("capture Hub client unavailable"))?;
     let repo = encode_path_segment(&connection.repo);
     let request = client
         .get(format!(
@@ -1524,7 +1565,7 @@ pub async fn resolve_target(
             connection.hub
         ))
         .query(&[("session_id", session_id)])
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .timeout(Duration::from_secs(2));
     let (status, body) = send(request, REPLY_BYTES)
         .await
@@ -1676,7 +1717,24 @@ pub async fn delete_conversation_body(root: &Path, work_id: &str, digest: &str) 
 }
 
 pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<DeliveryReport> {
-    let connection = connection_for(root)?;
+    deliver(root, spool, &connection_for(root)?, None).await
+}
+
+/// Delivers with the connection, token and client this process already resolved.
+pub async fn deliver_pending_with(
+    root: &Path,
+    spool: &LocalSpool,
+    hub: &CaptureHub,
+) -> Result<DeliveryReport> {
+    deliver(root, spool, &hub.connection, Some(hub)).await
+}
+
+async fn deliver(
+    root: &Path,
+    spool: &LocalSpool,
+    connection: &client_config::Connection,
+    hub: Option<&CaptureHub>,
+) -> Result<DeliveryReport> {
     let binding = load()?
         .into_iter()
         .find(|binding| binding.root == root)
@@ -1689,12 +1747,28 @@ pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<Delivery
             "capture delivery namespace differs from client connection",
         ));
     }
-    ensure_spool_namespace(&binding)?;
-    let token = crate::client_cli::read_token(&connection.token_file)?;
-    let client = forge_http::client().map_err(|_| invalid("capture Hub client unavailable"))?;
+    bind_spool_namespace(&binding, spool)?;
     let pending = spool
         .delivery_page(DELIVERY_PAGE)
         .map_err(|error| invalid(format!("local capture: {error}")))?;
+    if pending.is_empty() {
+        return Ok(DeliveryReport {
+            delivered: 0,
+            blocked: 0,
+        });
+    }
+    let built;
+    let CaptureHub {
+        connection,
+        token,
+        client,
+    } = match hub {
+        Some(hub) => hub,
+        None => {
+            built = CaptureHub::new(connection.clone())?;
+            &built
+        }
+    };
     let deadline = tokio::time::Instant::now() + DELIVERY_DEADLINE;
     let mut delivered = 0;
     let mut blocked = 0;
@@ -1737,7 +1811,7 @@ pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<Delivery
         let request = client
             .post(format!("{}{endpoint}", connection.hub))
             .header(CONTENT_TYPE, "application/json")
-            .bearer_auth(&token)
+            .bearer_auth(token)
             .timeout(remaining.min(Duration::from_secs(1)))
             .body(body);
         let (status, _) = match send(request, REPLY_BYTES).await {
@@ -1754,18 +1828,17 @@ pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<Delivery
             && binding.capture_mode == CaptureModeV1::SharedConversation
             && let CaptureEnvelopeV1::EventBatch(batch) = envelope
         {
-            uploaded =
-                match upload_shared_bodies(&client, &connection, &token, spool, batch, deadline)
-                    .await
-                {
-                    Ok(uploaded) => uploaded,
-                    Err(error) => {
-                        spool
-                            .advance_delivery_cursor(envelope)
-                            .map_err(|error| invalid(format!("local capture: {error}")))?;
-                        return Err(error);
-                    }
-                };
+            uploaded = match upload_shared_bodies(client, connection, token, spool, batch, deadline)
+                .await
+            {
+                Ok(uploaded) => uploaded,
+                Err(error) => {
+                    spool
+                        .advance_delivery_cursor(envelope)
+                        .map_err(|error| invalid(format!("local capture: {error}")))?;
+                    return Err(error);
+                }
+            };
         }
         if status == 200 && uploaded == BodyUpload::OutOfTime {
             // Neither acknowledged nor skipped: the next pass starts at this envelope again.
@@ -2680,6 +2753,27 @@ mod tests {
                 (saved[0].repository.as_str(), saved[0].hub.as_str()),
                 ("acme/widgets", "http://127.0.0.1:9")
             );
+        });
+    }
+
+    #[test]
+    fn hook_binding_opens_the_spool_once_and_delivery_checks_pending_before_the_token() {
+        client_config::in_isolated_config_home(|config| {
+            let (root, _agentscm) = connected_checkout(config);
+            shared_binding(config, &root);
+            let payload = json!({"cwd": root, "session_id": "observed"});
+            let (binding, spool, connection) =
+                super::binding_for_payload(&payload).unwrap().unwrap();
+            assert_eq!(binding.spool_identity, Some(spool.identity()));
+            assert_eq!(connection.repo, "acme/widgets");
+            // No token file exists, so any Hub setup would fail; an empty spool needs none.
+            assert!(super::CaptureHub::new(connection).is_err());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let report = runtime.block_on(deliver_pending(&root, &spool)).unwrap();
+            assert_eq!((report.delivered, report.blocked), (0, 0));
         });
     }
 

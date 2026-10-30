@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
+use agentscm::checks::sha256;
 use agentscm::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -203,8 +204,8 @@ pub(super) fn replace(
         recovery: recovery.clone(),
         descriptor: descriptor.clone(),
         prior_existed: prior.is_some(),
-        expected_sha256: sha256_hex(prior.unwrap_or_default()),
-        replacement_sha256: sha256_hex(replacement),
+        expected_sha256: sha256(prior.unwrap_or_default()),
+        replacement_sha256: sha256(replacement),
     };
     write_new_atomic(
         &location.directory,
@@ -244,9 +245,9 @@ pub(super) fn replace(
                 target: location.target_text.clone(),
                 recovery: Some(conflict),
                 prior_existed: true,
-                active_sha256: sha256_hex(&displaced),
-                recovery_sha256: Some(sha256_hex(&displaced)),
-                original_recovery_sha256: Some(sha256_hex(&displaced)),
+                active_sha256: sha256(&displaced),
+                recovery_sha256: Some(sha256(&displaced)),
+                original_recovery_sha256: Some(sha256(&displaced)),
                 late_write_observed: false,
                 kind: RecoveryKind::Conflict,
             };
@@ -282,9 +283,9 @@ pub(super) fn replace(
         target: location.target_text.clone(),
         recovery,
         prior_existed: prior.is_some(),
-        active_sha256: sha256_hex(replacement),
-        recovery_sha256: prior.map(sha256_hex),
-        original_recovery_sha256: prior.map(sha256_hex),
+        active_sha256: sha256(replacement),
+        recovery_sha256: prior.map(sha256),
+        original_recovery_sha256: prior.map(sha256),
         late_write_observed: false,
         kind: RecoveryKind::Displaced,
     };
@@ -472,13 +473,13 @@ fn recover_incomplete(
         .map(|name| read_optional(&location.directory, name))
         .transpose()?
         .flatten();
-    let target_sha = target.as_deref().map(sha256_hex);
-    let temp_sha = temp.as_deref().map(sha256_hex);
-    let recovery_sha = recovery.as_deref().map(sha256_hex);
+    let target_sha = target.as_deref().map(sha256);
+    let temp_sha = temp.as_deref().map(sha256);
+    let recovery_sha = recovery.as_deref().map(sha256);
     let conflict_name = names.conflict.clone();
     let conflict_c = cstring(conflict_name.as_bytes(), "bad conflict recovery name")?;
     let conflict = read_optional(&location.directory, &conflict_c)?;
-    let conflict_sha = conflict.as_deref().map(sha256_hex);
+    let conflict_sha = conflict.as_deref().map(sha256);
     let expected_target = if journal.prior_existed {
         Some(journal.expected_sha256.as_str())
     } else {
@@ -583,7 +584,7 @@ fn recover_incomplete(
                 .as_ref()
                 .ok_or_else(|| invalid("transaction recovery name is missing"))?,
         )?;
-        let actual_sha = sha256_hex(&actual);
+        let actual_sha = sha256(&actual);
         descriptor.late_write_observed = actual_sha != descriptor.recovery_sha256.clone().unwrap();
         descriptor.recovery_sha256 = Some(actual_sha);
     }
@@ -615,7 +616,7 @@ fn reconcile_retained_entry(location: &SettingsLocation, transaction: Option<&st
         .ok_or_else(|| invalid("Claude settings recovery bytes are missing"))?;
     let recovery_c = cstring(recovery.as_bytes(), "bad recovery name")?;
     make_private(&location.directory, &recovery_c)?;
-    let actual_sha = sha256_hex(&read_required(&location.directory, &recovery_c)?);
+    let actual_sha = sha256(&read_required(&location.directory, &recovery_c)?);
     if entry.descriptor.original_recovery_sha256.is_none() {
         entry.descriptor.original_recovery_sha256 = entry.descriptor.recovery_sha256.clone();
     }
@@ -647,7 +648,7 @@ fn restore_entry(location: &SettingsLocation, entry: &mut RecoveryEntry) -> Resu
     let current = location
         .read_target()?
         .ok_or_else(|| invalid("Claude settings target is missing"))?;
-    if sha256_hex(&current) != entry.descriptor.active_sha256 {
+    if sha256(&current) != entry.descriptor.active_sha256 {
         return Err(invalid(
             "Claude settings changed since this recovery was created; restore refused",
         ));
@@ -660,7 +661,7 @@ fn restore_entry(location: &SettingsLocation, entry: &mut RecoveryEntry) -> Resu
             .ok_or_else(|| invalid("Claude settings recovery bytes are missing"))?;
         let recovery_c = cstring(recovery_name.as_bytes(), "bad recovery name")?;
         make_private(&location.directory, &recovery_c)?;
-        let actual_sha = sha256_hex(&read_required(&location.directory, &recovery_c)?);
+        let actual_sha = sha256(&read_required(&location.directory, &recovery_c)?);
         if entry.descriptor.recovery_sha256.as_deref() != Some(actual_sha.as_str()) {
             if entry.descriptor.original_recovery_sha256.is_none() {
                 entry.descriptor.original_recovery_sha256 =
@@ -743,7 +744,7 @@ fn recovery_changed(location: &SettingsLocation, entry: &RecoveryEntry) -> Resul
                 &location.directory,
                 &cstring(name.as_bytes(), "bad recovery name")?,
             )?;
-            Ok(sha256_hex(&bytes) != *expected)
+            Ok(sha256(&bytes) != *expected)
         }
         _ => Err(invalid("Claude settings recovery descriptor is invalid")),
     }
@@ -763,7 +764,7 @@ fn remove_entry(location: &SettingsLocation, entry: &RecoveryEntry) -> Result<()
                 &location.directory,
                 &cstring(name.as_bytes(), "bad recovery name")?,
             )
-            .map(|bytes| sha256_hex(&bytes))
+            .map(|bytes| sha256(&bytes))
         })
         .transpose()?;
     write_recovery_operation(
@@ -771,7 +772,7 @@ fn remove_entry(location: &SettingsLocation, entry: &RecoveryEntry) -> Result<()
         &RecoveryOperationJournal::Prune {
             version: 1,
             descriptor: entry.descriptor.clone(),
-            descriptor_sha256: sha256_hex(&descriptor_bytes),
+            descriptor_sha256: sha256(&descriptor_bytes),
             recovery_sha256,
         },
         &entry.descriptor.transaction,
@@ -844,8 +845,8 @@ fn recover_recovery_operation(
                     .ok_or_else(|| invalid("Claude settings recovery operation is invalid"))?;
                 let target = location.read_target()?;
                 let recovery = read_optional(&location.directory, &recovery_c)?;
-                let target_sha = target.as_deref().map(sha256_hex);
-                let recovery_sha = recovery.as_deref().map(sha256_hex);
+                let target_sha = target.as_deref().map(sha256);
+                let recovery_sha = recovery.as_deref().map(sha256);
                 if target_sha.as_deref() == Some(descriptor.active_sha256.as_str()) {
                     if recovery_sha.as_deref() != Some(expected_recovery.as_str()) {
                         if reconcile_changed != Some(descriptor.transaction.as_str()) {
@@ -883,14 +884,14 @@ fn recover_recovery_operation(
                 let active = location
                     .read_target()?
                     .ok_or_else(|| invalid("Claude settings target is missing after restore"))?;
-                if sha256_hex(&active) != expected_recovery {
+                if sha256(&active) != expected_recovery {
                     return Err(invalid(
                         "Claude settings restore target differs from retained bytes",
                     ));
                 }
                 make_private(&location.directory, &recovery_c)?;
                 let displaced = read_required(&location.directory, &recovery_c)?;
-                let displaced_sha = sha256_hex(&displaced);
+                let displaced_sha = sha256(&displaced);
                 descriptor.active_sha256 = expected_recovery;
                 descriptor.recovery_sha256 = Some(displaced_sha.clone());
                 descriptor.late_write_observed |= displaced_sha != expected_displaced;
@@ -902,7 +903,7 @@ fn recover_recovery_operation(
                 make_private(&location.directory, &descriptor_c)?;
             } else {
                 match location.read_target()? {
-                    Some(active) if sha256_hex(&active) == descriptor.active_sha256 => {
+                    Some(active) if sha256(&active) == descriptor.active_sha256 => {
                         unlink_optional(&location.directory, &location.target)?;
                         sync_directory(&location.directory)?;
                     }
@@ -945,7 +946,7 @@ fn recover_recovery_operation(
             if let Some(name) = descriptor.recovery.as_deref() {
                 let recovery_c = cstring(name.as_bytes(), "bad recovery name")?;
                 if let Some(retained) = read_optional(&location.directory, &recovery_c)? {
-                    let retained_sha256 = sha256_hex(&retained);
+                    let retained_sha256 = sha256(&retained);
                     if recovery_sha256.as_deref() != Some(retained_sha256.as_str()) {
                         return Err(invalid(
                             "Claude settings retained bytes changed during prune",
@@ -959,7 +960,7 @@ fn recover_recovery_operation(
             }
             let descriptor_c = cstring(expected_descriptor.as_bytes(), "bad descriptor name")?;
             if let Some(retained) = read_optional(&location.directory, &descriptor_c)? {
-                if sha256_hex(&retained) != descriptor_sha256 {
+                if sha256(&retained) != descriptor_sha256 {
                     return Err(invalid(
                         "Claude settings recovery descriptor changed during prune",
                     ));
@@ -1315,11 +1316,6 @@ fn validate_transaction_id(value: &str) -> Result<()> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 #[cfg(target_os = "macos")]
 fn atomic_exchange(parent: &File, left: &CString, right: &CString) -> Result<()> {
     // SAFETY: descriptor and names remain live for the call.
@@ -1370,7 +1366,7 @@ fn atomic_exchange(_parent: &File, _left: &CString, _right: &CString) -> Result<
 mod tests {
     use super::{
         RecoveryDescriptor, RecoveryKind, RecoveryOperationJournal, SettingsLocation,
-        TransactionJournal, atomic_exchange, recover, recovery_entries, replace, sha256_hex,
+        TransactionJournal, atomic_exchange, recover, recovery_entries, replace, sha256,
         sync_directory, write_recovery_operation,
     };
     use std::io::{Seek, SeekFrom, Write};
@@ -1506,9 +1502,9 @@ mod tests {
             target: "settings.local.json".into(),
             recovery: Some("../outside".into()),
             prior_existed: true,
-            active_sha256: sha256_hex(b"installed"),
-            recovery_sha256: Some(sha256_hex(b"preserve")),
-            original_recovery_sha256: Some(sha256_hex(b"preserve")),
+            active_sha256: sha256(b"installed"),
+            recovery_sha256: Some(sha256(b"preserve")),
+            original_recovery_sha256: Some(sha256(b"preserve")),
             late_write_observed: false,
             kind: RecoveryKind::Displaced,
         };
@@ -1529,8 +1525,8 @@ mod tests {
             recovery: Some(names.recovery),
             descriptor: names.descriptor,
             prior_existed: true,
-            expected_sha256: sha256_hex(b"before"),
-            replacement_sha256: sha256_hex(b"installed"),
+            expected_sha256: sha256(b"before"),
+            replacement_sha256: sha256(b"installed"),
         };
         std::fs::write(
             settings.parent().unwrap().join(location.journal_name()),
@@ -1569,8 +1565,8 @@ mod tests {
             recovery: Some(names.recovery.clone()),
             descriptor: names.descriptor,
             prior_existed: true,
-            expected_sha256: sha256_hex(b"before"),
-            replacement_sha256: sha256_hex(b"installed"),
+            expected_sha256: sha256(b"before"),
+            replacement_sha256: sha256(b"installed"),
         };
         std::fs::write(
             settings.parent().unwrap().join(location.journal_name()),
@@ -1756,8 +1752,8 @@ mod tests {
             &RecoveryOperationJournal::Prune {
                 version: 1,
                 descriptor: entry.descriptor.clone(),
-                descriptor_sha256: sha256_hex(&descriptor_bytes),
-                recovery_sha256: Some(sha256_hex(&recovery_bytes)),
+                descriptor_sha256: sha256(&descriptor_bytes),
+                recovery_sha256: Some(sha256(&recovery_bytes)),
             },
             &entry.descriptor.transaction,
         )

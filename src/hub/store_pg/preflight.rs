@@ -7,7 +7,7 @@ use crate::hub::catchup::{
 };
 use crate::hub::work::{WorkStart, WorkWho, scope_overlap_reasons};
 use crate::hub::work_preflight::{
-    WorkPreflightReason, WorkPreflightResult, checked, push_reason, status,
+    WorkPreflightReason, WorkPreflightResult, checked, included, push_reason, status,
 };
 
 const MERGE_COLUMNS: &str = "id,seq,source,source_id,occurred_at,observed_at,title,branch,base,head_commit,merge_commit,pull_number,paths,paths_complete";
@@ -187,7 +187,7 @@ pub(super) fn evaluate(
                 if observed.head_commit == request.source_revision {
                     push_reason(&mut reasons, WorkPreflightReason::SourceHeadAlreadyMerged);
                 }
-                if !observed.paths_complete {
+                if !observed.paths_complete && !included(request, &observed) {
                     push_reason(&mut reasons, WorkPreflightReason::MergePathsIncomplete);
                 } else if !scope_overlap_reasons(scope, &observed.paths).is_empty()
                     && request.source_revision != observed.merge_commit
@@ -247,7 +247,7 @@ pub(super) fn evaluate(
         push_reason(&mut reasons, WorkPreflightReason::MergeWindowIncomplete);
     }
     for merge in &merges {
-        if !merge.paths_complete {
+        if !merge.paths_complete && !included(request, merge) {
             push_reason(&mut reasons, WorkPreflightReason::MergePathsIncomplete);
             continue;
         }

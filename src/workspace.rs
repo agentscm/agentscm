@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::context::ChangeId;
 use crate::model::{EntryChange, EntryKind};
-use crate::store::{Engine, SourceReader, digest, validate_id, validate_symlink_target};
+use crate::store::{
+    Engine, SourceReader, blob_id_hasher, digest, validate_id, validate_symlink_target,
+};
 use crate::sync;
 use crate::{Error, Result};
 
@@ -1402,7 +1404,8 @@ struct Snapshot {
 
 #[derive(Clone, Debug)]
 struct SourceInventory {
-    entries: BTreeMap<String, EntryKind>,
+    /// Path to kind and blob id.
+    entries: BTreeMap<String, (EntryKind, String)>,
     directories: BTreeSet<String>,
 }
 
@@ -2681,7 +2684,7 @@ fn source_inventory(engine: &Engine, revision: &str) -> Result<Option<SourceInve
             if entries.len() + directories.len() >= MAX_ENTRIES {
                 return Ok(None);
             }
-            entries.insert(entry.path, entry.kind);
+            entries.insert(entry.path, (entry.kind, entry.blob));
         }
         match page.next {
             Some(next) => {
@@ -2779,16 +2782,22 @@ fn snapshot_from_inventory_where(
     let mut files = BTreeMap::new();
     let mut directories = BTreeSet::new();
     let mut total_bytes = 0usize;
-    for (path, kind) in &inventory.entries {
+    for (path, (kind, blob)) in &inventory.entries {
         if !selected(path) {
             continue;
         }
-        let content = engine.read_file(revision, path)?;
-        if content.len() > MAX_FILE_BYTES {
+        // A blob id hashes the framed payload, so digest mode needs only its length.
+        let (length, content) = if retain_content {
+            let content = engine.read_file(revision, path)?;
+            (content.len(), content)
+        } else {
+            (engine.blob_length(blob)? as usize, blob.as_bytes().to_vec())
+        };
+        if length > MAX_FILE_BYTES {
             return Ok(None);
         }
         total_bytes = total_bytes
-            .checked_add(content.len())
+            .checked_add(length)
             .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
         if total_bytes > MAX_TOTAL_BYTES || files.len() + directories.len() >= MAX_ENTRIES {
             return Ok(None);
@@ -2799,11 +2808,6 @@ fn snapshot_from_inventory_where(
                 directories.insert(directory.to_owned());
             }
         }
-        let content = if retain_content {
-            content
-        } else {
-            Sha256::digest(&content).to_vec()
-        };
         files.insert(
             path.clone(),
             Item {
@@ -2831,7 +2835,8 @@ fn source_snapshot_scoped(
     snapshot_from_inventory(engine, revision, &inventory, scope)
 }
 
-/// `source_snapshot_scoped` with digests in place of contents, under the same limits.
+/// `source_snapshot_scoped` with blob ids in place of contents, under the same limits.
+/// Blob payloads are not read or re-verified; only their headers are checked.
 fn source_digests_scoped(
     engine: &Engine,
     revision: &str,
@@ -2952,7 +2957,7 @@ struct Scan<'a> {
     /// Everything read from directories, selected or not; bounded by `MAX_VISITED_ENTRIES`.
     visited: usize,
     report: ScanReport,
-    /// False keeps only a SHA-256 per file, so status does not hold every working byte.
+    /// False keeps only the blob id per file, so status does not hold every working byte.
     retain_content: bool,
 }
 
@@ -2980,7 +2985,7 @@ fn scan_workspace_full_scoped<'a>(
     scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata, true)
 }
 
-/// `scan_workspace_full_scoped` with digests in place of contents, under the same limits.
+/// `scan_workspace_full_scoped` with blob ids in place of contents, under the same limits.
 fn scan_workspace_digests_scoped<'a>(
     root: &Path,
     tracked: &'a Tracked,
@@ -3208,7 +3213,9 @@ impl Scan<'_> {
                     return Ok(false);
                 }
                 if !self.retain_content {
-                    item.content = Sha256::digest(&item.content).to_vec();
+                    let mut hasher = blob_id_hasher(item.content.len() as u64);
+                    hasher.update(&item.content);
+                    item.content = format!("{:x}", hasher.finalize()).into_bytes();
                 }
                 self.snapshot.files.insert(relative, item);
                 continue;
@@ -3245,11 +3252,17 @@ impl Scan<'_> {
                 let length = item.content.len();
                 (item, length)
             } else {
-                // Streamed through the hasher so no whole file is buffered.
-                let mut hasher = Sha256::new();
+                // Streamed through the hasher so no whole file is buffered; the
+                // digest is the blob id, so the base side need not read its blob.
                 let before = fs::symlink_metadata(&path)?;
+                let mut hasher = blob_id_hasher(before.len());
                 let (kind, length) = read_regular_into(&path, &relative, &before, &mut hasher)?;
-                let content = hasher.finalize().to_vec();
+                if length as u64 != before.len() {
+                    return Err(Error::Conflict(format!(
+                        "workspace file changed while it was read: {relative}"
+                    )));
+                }
+                let content = format!("{:x}", hasher.finalize()).into_bytes();
                 (Item { kind, content }, length)
             };
             self.total_bytes = self

@@ -803,12 +803,7 @@ fn verdict_for_run(view: &RunView, local_head: Option<&str>) -> Verdict {
     }
 }
 
-async fn decide(
-    root: &Path,
-    branch: &str,
-    ahead: Option<u64>,
-    local_head: Option<&str>,
-) -> std::result::Result<Verdict, String> {
+async fn decide(root: &Path, branch: &str, default: &str) -> std::result::Result<Verdict, String> {
     let hub = Hub::for_dir(root).map_err(|e| e.to_string())?;
     let (code, body) = hub
         .call(
@@ -822,7 +817,8 @@ async fn decide(
     match code {
         200 => {
             let view = decode_run(code, body).map_err(|e| e.to_string())?;
-            Ok(verdict_for_run(&view, local_head))
+            let local_head = git(root, &["rev-parse", "HEAD"]);
+            Ok(verdict_for_run(&view, local_head.as_deref()))
         }
         // No run: a lock the Hub has not adopted yet cannot have one, and must not block.
         404 if !hub
@@ -834,7 +830,8 @@ async fn decide(
                 "{DEFAULT_SKILL} is pinned in {LOCK_PATH} here but not adopted on the hub yet: adoption takes effect once the lock is on the default branch (forge connected), or run `agentscm skill report-adoption` when no forge is connected"
             ))
         }
-        404 if ahead.is_some_and(|n| n > 0) => Ok(Verdict::Block(format!(
+        // Only a missing run needs the (git-spawning) commit count.
+        404 if commits_ahead(root, default).is_some_and(|n| n > 0) => Ok(Verdict::Block(format!(
             "This repository adopted pr-gate and branch {branch} has commits but no run. Start it: agentscm skill evidence --gate branch --kind task_branch --summary \"<what this branch is for>\""
         ))),
         404 => Ok(Verdict::Allow),
@@ -882,9 +879,7 @@ pub async fn stop(data_dir: &Path, agent: StopAgent, mut stdin: impl Read) -> Va
         Ok(Prepared::Run(guard)) => guard,
         Err(e) => return allow(e),
     };
-    let ahead = commits_ahead(&root, &default);
-    let local_head = git(&root, &["rev-parse", "HEAD"]);
-    let result = match decide(&root, &branch, ahead, local_head.as_deref()).await {
+    let result = match decide(&root, &branch, &default).await {
         Ok(Verdict::Block(reason)) => json!({"failures": [], "next_action": reason}),
         Ok(Verdict::Allow) => json!({"receipt": "allow", "workspace_changed_during_run": false}),
         Err(e) => return allow(e),

@@ -1,0 +1,113 @@
+name: Release PR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preparation
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - name: Compile and check release metadata
+        run: |
+          rustc --edition=2024 -D warnings tools/release-files.rs -o "$RUNNER_TEMP/release-files"
+          "$RUNNER_TEMP/release-files" --check
+      # The musl build falsely reports a template stack limit on Linux.
+      # Keep the same tool version, using its checksum-pinned GNU build on Ubuntu.
+      - name: Install release-plz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-plz.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/release-plz/release-plz/releases/download/release-plz-v0.4.2/release-plz-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' bd7c3adc1a4ed3831e6bfde51b92b168f32ab6d15cd210ed88044e7f858f0cae "$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/release-plz-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/release-plz-bin" release-plz
+          test "$("$RUNNER_TEMP/release-plz-bin/release-plz" --version)" = 'release-plz 0.4.2'
+          echo "$RUNNER_TEMP/release-plz-bin" >> "$GITHUB_PATH"
+      - name: Create release app token
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: Iv23limrY6AmFXL04l0c # Counterbranch Releases
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+      # Only a merged release-plz-* PR may create a tag. No cargo publishing.
+      - name: Tag the merged release candidate
+        env:
+          GIT_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          release-plz release --config release-plz.toml
+          # Tags created through the API are not added to the local checkout.
+          git fetch --tags origin
+          git diff --quiet
+          git diff --cached --quiet
+          git checkout --detach "$GITHUB_SHA"
+      - name: Check for an existing candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          count=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open --limit 1000 --json headRefName --jq '[.[] | select(.headRefName | startswith("release-plz-"))] | length')
+          if [ "$count" -eq 0 ]; then echo 'prepare=true' >> "$GITHUB_OUTPUT"; fi
+      # Do not rewrite a candidate that is already being reviewed.
+      - name: Prepare version files
+        if: steps.candidate.outputs.prepare == 'true'
+        id: files
+        run: |
+          release-plz update --config release-plz.toml
+          "$RUNNER_TEMP/release-files" --sync
+          "$RUNNER_TEMP/release-files" --check
+          git diff --check
+          if ! git diff --quiet; then echo 'changed=true' >> "$GITHUB_OUTPUT"; fi
+      - name: Open release candidate
+        if: steps.files.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Only these release files may enter the bot commit.
+          while IFS= read -r path; do
+            case "$path" in
+              Cargo.toml|Cargo.lock|CHANGELOG.md|packages/npm/package.json|ui/dev-seed/mint/Cargo.lock) ;;
+              *) echo "Unexpected changed release path: $path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+          git diff --quiet --cached
+          branch="release-plz-prepare-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf '[]\n' > "$RUNNER_TEMP/release-additions.json"
+          for path in Cargo.toml Cargo.lock CHANGELOG.md packages/npm/package.json ui/dev-seed/mint/Cargo.lock; do
+            base64 -w 0 "$path" > "$RUNNER_TEMP/release-file.base64"
+            jq --arg path "$path" --rawfile contents "$RUNNER_TEMP/release-file.base64" \
+              '. + [{path: $path, contents: $contents}]' "$RUNNER_TEMP/release-additions.json" > "$RUNNER_TEMP/release-additions-next.json"
+            mv "$RUNNER_TEMP/release-additions-next.json" "$RUNNER_TEMP/release-additions.json"
+          done
+          head=$(git rev-parse HEAD)
+          # No forced updates: fail if a branch exists or its expected head moved.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$head" > /dev/null
+          # shellcheck disable=SC2016 # GraphQL variables are literal.
+          query='mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }'
+          jq -n --arg query "$query" --arg repo "$GITHUB_REPOSITORY" --arg branch "$branch" --arg head "$head" --slurpfile additions "$RUNNER_TEMP/release-additions.json" \
+            '{query: $query, variables: {input: {branch: {repositoryNameWithOwner: $repo, branchName: $branch}, expectedHeadOid: $head, message: {headline: "chore: Prepare release"}, fileChanges: {additions: $additions[0]}}}}' > "$RUNNER_TEMP/release-commit.json"
+          gh api graphql --input "$RUNNER_TEMP/release-commit.json" > "$RUNNER_TEMP/release-commit-result.json"
+          jq -e '.data.createCommitOnBranch.commit.oid | strings | length > 0' "$RUNNER_TEMP/release-commit-result.json" > /dev/null
+          printf '%s\n' 'Review the version and changelog changes in the files. Publishing begins after this candidate is merged and its release tag is created.' > "$RUNNER_TEMP/release-pr.md"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title 'chore: Prepare release' --label ci-extended --body-file "$RUNNER_TEMP/release-pr.md"

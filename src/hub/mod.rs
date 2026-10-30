@@ -418,8 +418,7 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
         .merge(workspace_agent_tasks::routes())
-        .merge(workspace_publication::status_routes())
-        .merge(workspace_source_http::routes());
+        .merge(workspace_publication::status_routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();
     let router = Router::new()
@@ -443,7 +442,25 @@ pub fn router(state: HubState) -> Router {
     let publication = workspace_publication::routes();
     #[cfg(not(unix))]
     let publication = Router::new();
-    bounded(router, publication, &state).with_state(state)
+    let router = bounded(router, publication, &state);
+    #[cfg(unix)]
+    let router = router.merge(source_bounded(workspace_source_http::routes()));
+    router.with_state(state)
+}
+
+/// Source bundles may take [`workspace_source_http::BODY_TIMEOUT`] to arrive, longer than the
+/// Hub-wide bound, so these routes get the body read plus the usual processing time.
+#[cfg(unix)]
+fn source_bounded(routes: Router<HubState>) -> Router<HubState> {
+    routes
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(|request, next| {
+            timeout_after(
+                workspace_source_http::BODY_TIMEOUT + REQUEST_TIMEOUT,
+                request,
+                next,
+            )
+        }))
 }
 
 /// Applies the Hub-wide body and time bounds to `routes`, then merges `publication` behind
@@ -468,7 +485,7 @@ fn bounded(
     routes.merge(publication)
 }
 
-/// Longest any request may run; the notices long-poll caps at 25 seconds and uploads at 8 MiB.
+/// Longest a request outside the publication and source groups may run; the notices long-poll caps at 25 seconds and uploads at 8 MiB.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn request_timeout(
@@ -518,6 +535,38 @@ mod tests {
         };
         assert_eq!(status("/slow").await, 408);
         assert_eq!(status("/fast").await, 200);
+    }
+
+    /// A source upload may read its body for 60 seconds, so the 30-second Hub bound must not
+    /// wrap it; every other route still gets 408 past 30 seconds.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn source_routes_outlast_the_hub_timeout() {
+        use tower_service::Service;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.sqlite");
+        let store = store::open(&format!("sqlite://{}", path.display())).unwrap();
+        let objects = Arc::new(LocalBackend::open(dir.path().join("objects")).unwrap());
+        let state = HubState::new(store, objects);
+        let slow = || {
+            Router::new().route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(REQUEST_TIMEOUT + std::time::Duration::from_secs(10)).await
+                }),
+            )
+        };
+        let status = |router: Router<HubState>| {
+            let mut app = router.with_state(state.clone());
+            async move {
+                let request = axum::extract::Request::get("/slow")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                app.call(request).await.unwrap().status().as_u16()
+            }
+        };
+        assert_eq!(status(bounded(slow(), Router::new(), &state)).await, 408);
+        assert_eq!(status(source_bounded(slow())).await, 200);
     }
 
     fn config(extra: &[(&str, &str)]) -> Result<Option<S3Config>> {

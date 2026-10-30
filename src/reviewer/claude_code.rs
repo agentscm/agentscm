@@ -248,7 +248,7 @@ impl ClaudeCodeTransport {
             return observation;
         }
         observation.captured_response_bytes = capture.stdout.len() as u64;
-        observation.captured_response_sha256 = hash_bytes(&capture.stdout);
+        observation.captured_response_sha256 = crate::checks::sha256(&capture.stdout);
         observation.captured_response = capture.stdout;
         observation.response_capture_complete = capture.stop.is_none();
         if let Some(stop) = capture.stop {
@@ -325,7 +325,7 @@ fn scope_digest(
     profile: &str,
     decision_schema: &str,
 ) -> Result<String> {
-    let decision_schema_sha256 = hash_bytes(decision_schema.as_bytes());
+    let decision_schema_sha256 = crate::checks::sha256(decision_schema.as_bytes());
     domain_digest(
         "agentscm.claude-code-subscription/v1",
         &Scope {
@@ -489,7 +489,7 @@ pub(super) fn decode_reply(
         model: expected_model.into(),
         usage,
         decision,
-        content_sha256: hash_bytes(&decision_bytes),
+        content_sha256: crate::checks::sha256(&decision_bytes),
         system_fingerprint: None,
         service_tier: None,
     })
@@ -761,7 +761,7 @@ mod executable_identity_tests {
         let transport = ClaudeCodeTransport::new(&executable, &work).unwrap();
         assert_eq!(
             transport.verified_executable_sha256().unwrap(),
-            hash_bytes(script)
+            crate::checks::sha256(script)
         );
         std::fs::write(&executable, b"#!/bin/sh\nexit 1\n").unwrap();
         assert!(transport.verified_executable_sha256().is_err());

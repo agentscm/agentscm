@@ -387,7 +387,7 @@ async fn session_start_flags_records_omitted_from_a_complete_preview() {
     }
     let preview = hub
         .store
-        .work_briefing_preview(&principal.token_id, 20, unix_now())
+        .work_briefing_preview_for(&principal.token_id, None, 20, unix_now())
         .unwrap();
     assert!(preview.complete);
     assert_eq!(preview.items.len(), 6);

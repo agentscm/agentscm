@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
+use crate::checks::sha256;
 
 use super::{
     CommandResult, GitValidationContext, GitValidationSubject, Services, StopReason,
@@ -38,10 +38,6 @@ const S3_VARS: [&str; 4] = [
     "AGENTSCM_TEST_S3_ACCESS_KEY_ID",
     "AGENTSCM_TEST_S3_SECRET_ACCESS_KEY",
 ];
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
 
 fn allowlisted(command: &mut Command) {
     command.env_clear();

@@ -22,7 +22,7 @@ use super::catchup::{
     CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
     MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
     MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
-    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
     TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
     repository_namespace, source_name, tracked_publication_merge,
 };
@@ -94,13 +94,13 @@ use super::store::{
     validate_login,
 };
 use super::work::{
-    Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
-    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
-    WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
-    WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
-    WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
-    WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
+    Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
+    MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES,
+    WorkCheckpoint, WorkCheckpointResult, WorkCompaction, WorkConflictKind, WorkEvent, WorkItem,
+    WorkOutcome, WorkOutcomeKind, WorkOverview, WorkOverviewQuery, WorkParticipant, WorkReader,
+    WorkRepositoryScope, WorkRole, WorkScopeCheck, WorkScopeOverlap, WorkSearchItem,
+    WorkSearchPage, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState, WorkWho,
+    check_work_delivery_page, check_work_payload_capacity, claim_status, fit_json_budget,
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
     work_payload_row_bytes,
 };
@@ -108,6 +108,7 @@ use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::{HubError, Result};
 
 mod preflight;
+mod repository_rename;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -324,7 +325,11 @@ fn work_who(tx: &Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
         "SELECT t.repository, t.repository_id, t.name, t.read_only,
                 u.id, u.provider, u.host, u.forge_user_id, u.login
          FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-         WHERE t.id = ?1 AND t.revoked = 0 AND t.expires_at > ?2 AND u.disabled = 0",
+         WHERE t.id = ?1 AND t.revoked = 0 AND t.expires_at > ?2 AND u.disabled = 0 AND NOT EXISTS (
+                 SELECT 1 FROM hub_repositories r JOIN hub_connections c ON c.id = r.connection
+                 WHERE c.provider = u.provider AND r.host = u.host
+                   AND r.repository_id = t.repository_id AND r.full_name <> t.repository
+             )",
         params![token, now],
         |row| {
             Ok(WorkWho {
@@ -1519,12 +1524,11 @@ fn sqlite_insight_input(
                     publications_complete = false;
                     break;
                 }
-                let mut s=tx.prepare("SELECT p.id,p.branch_state,p.pr_number,p.merge_commit,p.updated_at FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token JOIN hub_users u ON u.id=t.owner WHERE p.commit_sha=?1 AND p.repository=?2 AND t.repository=?2 AND t.repository_id=?3 AND u.provider=?4 AND u.host=?5 ORDER BY p.updated_at,p.id LIMIT ?6")?;
+                let mut s=tx.prepare("SELECT p.id,p.branch_state,p.pr_number,p.merge_commit,p.updated_at FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token JOIN hub_users u ON u.id=t.owner WHERE p.commit_sha=?1 AND p.repository=t.repository AND t.repository_id=?2 AND u.provider=?3 AND u.host=?4 ORDER BY p.updated_at,p.id LIMIT ?5")?;
                 let found = s
                     .query_map(
                         params![
                             commit,
-                            item.repository,
                             repository_id,
                             provider,
                             host,
@@ -1614,17 +1618,40 @@ fn project_claim(tx: &Transaction<'_>, item: &mut WorkItem, now: i64) -> Result<
     let active = tx
         .query_row(
             "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-             WHERE t.id = ?1 AND t.revoked = 0 AND t.expires_at > ?2 AND u.disabled = 0",
+             WHERE t.id = ?1 AND t.revoked = 0 AND t.expires_at > ?2 AND u.disabled = 0 AND NOT EXISTS (
+                 SELECT 1 FROM hub_repositories r JOIN hub_connections c ON c.id = r.connection
+                 WHERE c.provider = u.provider AND r.host = u.host
+                   AND r.repository_id = t.repository_id AND r.full_name <> t.repository
+             )",
             params![item.lead_token, now],
             |_| Ok(()),
         )
         .optional()?
         .is_some();
-    item.claim_status = if active && item.last_checkin_at >= now - CLAIM_STALE_SECONDS {
-        ClaimStatus::Active
-    } else {
-        ClaimStatus::Stale
-    };
+    item.claim_status = claim_status(item.last_checkin_at, active, now);
+    Ok(())
+}
+
+/// `project_claim` for many items with one token lookup.
+fn project_claims(tx: &Transaction<'_>, items: &mut [WorkItem], now: i64) -> Result<()> {
+    let leads = items
+        .iter()
+        .map(|item| item.lead_token.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut statement = tx.prepare(
+        "SELECT t.id FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+         WHERE t.id IN (SELECT value FROM json_each(?1))
+           AND t.revoked = 0 AND t.expires_at > ?2 AND u.disabled = 0",
+    )?;
+    let active = statement
+        .query_map(params![json_string(&leads)?, now], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    for item in items {
+        let valid = active.contains(&item.lead_token);
+        item.claim_status = claim_status(item.last_checkin_at, valid, now);
+    }
     Ok(())
 }
 
@@ -1679,13 +1706,14 @@ fn work_scope_overlaps(
     if scope.is_empty() {
         return Ok(Vec::new());
     }
+    // The scope column mirrors the snapshot's scope, so only overlapping snapshots are decoded.
     let mut statement = tx.prepare(
-        "SELECT snapshot FROM hub_work_items
+        "SELECT id, scope FROM hub_work_items
          WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
            AND state <> 'finished' AND (?5 IS NULL OR id <> ?5)
          ORDER BY id LIMIT 101",
     )?;
-    let snapshots = statement
+    let scopes = statement
         .query_map(
             params![
                 who.owner.identity.provider,
@@ -1694,18 +1722,23 @@ fn work_scope_overlaps(
                 who.repository_id,
                 exclude
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if snapshots.len() > 100 {
+    if scopes.len() > 100 {
         return Err(HubError::WorkOverlapIncomplete);
     }
     let mut found = Vec::new();
-    for snapshot in snapshots {
-        let mut item: WorkItem = json_value(&snapshot)?;
-        project_claim(tx, &mut item, now)?;
-        let reasons = scope_overlap_reasons(scope, &item.scope);
+    for (id, their_scope) in scopes {
+        let reasons = scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?);
         if !reasons.is_empty() {
+            let snapshot: String = tx.query_row(
+                "SELECT snapshot FROM hub_work_items WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )?;
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
             let their_scope = item.scope.clone();
             found.push(WorkScopeOverlap {
                 item,
@@ -1729,7 +1762,8 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     Ok(event)
 }
 
-fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+/// Returns the stored snapshot so callers can size it without serializing the item again.
+fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<String> {
     let snapshot = json_string(item)?;
     tx.execute(
         "UPDATE hub_work_items SET lead_token = ?2, lead_agent = ?3, lead_session = ?4,
@@ -1745,7 +1779,7 @@ fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<
             state_name(item.state),
             item.next_action,
             item.current.as_ref().map(json_string).transpose()?,
-            snapshot,
+            &snapshot,
             item.updated_at,
             seq,
             json_string(&item.scope)?,
@@ -1756,9 +1790,9 @@ fn save_work_version(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<
     tx.execute(
         "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
          VALUES (?1, ?2, ?3, ?4)",
-        params![item.id, seq, state_name(item.state), json_string(item)?],
+        params![item.id, seq, state_name(item.state), snapshot],
     )?;
-    Ok(())
+    Ok(snapshot)
 }
 
 fn work_payload_bytes(
@@ -2062,10 +2096,11 @@ fn current_capture_work_for_session(
     session: &str,
     now: i64,
 ) -> Result<Option<WorkItem>> {
+    // CROSS JOIN keeps SQLite's join order: the session's participant rows first.
     let mut statement = tx.prepare(
         "SELECT item.snapshot, item.state='active', participant.role='lead'
-         FROM hub_work_items item
-         JOIN hub_work_participants participant ON participant.work=item.id
+         FROM hub_work_participants participant
+         CROSS JOIN hub_work_items item ON participant.work=item.id
          WHERE item.provider=?1 AND item.host=?2 AND item.repository=?3
            AND item.repository_id IS ?4 AND item.state IN ('active','paused','blocked')
            AND participant.token=?5 AND participant.session=?6
@@ -3110,8 +3145,7 @@ fn start_in(
                     now
                 ],
             )?;
-            save_work_version(tx, &item, seq)?;
-            let snapshot = json_string(&item)?;
+            let snapshot = save_work_version(tx, &item, seq)?;
             let delta = work_transition_payload_bytes(&snapshot, &event)?
                 .checked_sub(previous_item_bytes)
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -3289,10 +3323,9 @@ fn start_in(
                 now
             ],
         )?;
-        save_work_version(tx, &item, seq)?;
+        let snapshot = save_work_version(tx, &item, seq)?;
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
         retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
-        let snapshot = json_string(&item)?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -3681,7 +3714,16 @@ fn publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Publication> {
         commit: row.get(7)?,
         branch: row.get(8)?,
         base: row.get(9)?,
-        manifest: row.get(10)?,
+        // PUBLICATION_SELECT returns NULL for an oversized manifest; publication_error maps it.
+        manifest: row.get::<_, Option<String>>(10)?.ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Null,
+                Box::new(HubError::Invalid(
+                    "retained publication exceeds manifest budget".into(),
+                )),
+            )
+        })?,
         branch_state: row.get(11)?,
         branch_message: row.get(12)?,
         pr_number: row.get(13)?,
@@ -3694,14 +3736,24 @@ fn publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Publication> {
     })
 }
 
+/// Surfaces `publication_row`'s oversized-manifest failure as `Invalid`, as PostgreSQL does.
+fn publication_error(error: rusqlite::Error) -> HubError {
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, inner) = &error
+        && let Some(HubError::Invalid(message)) = inner.downcast_ref::<HubError>()
+    {
+        return HubError::Invalid(message.clone());
+    }
+    error.into()
+}
+
 fn publication_by_id(tx: &Connection, id: &str) -> Result<Option<Publication>> {
-    Ok(tx
-        .query_row(
-            &format!("{PUBLICATION_SELECT} WHERE p.id = ?1"),
-            [id],
-            publication_row,
-        )
-        .optional()?)
+    tx.query_row(
+        &format!("{PUBLICATION_SELECT} WHERE p.id = ?1"),
+        [id],
+        publication_row,
+    )
+    .optional()
+    .map_err(publication_error)
 }
 
 fn connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForgeConnection> {
@@ -5134,12 +5186,9 @@ impl SqliteStore {
             .collect::<Result<Vec<_>>>()?;
         let mut current_complete = current.len() <= query.limit;
         current.truncate(query.limit);
-        for item in &mut current {
-            project_claim(&tx, item, now)?;
-        }
+        project_claims(&tx, &mut current, now)?;
         let overview_part_budget = (MAX_BRIEFING_BYTES - 4096) / 3;
-        while json_string(&current)?.len() > overview_part_budget {
-            current.pop();
+        if fit_json_budget(&mut current, overview_part_budget)? {
             current_complete = false;
         }
 
@@ -5196,15 +5245,13 @@ impl SqliteStore {
         let history_retention_gap = event_floor > 0 || snapshot_floor > 0;
         let mut recent_complete = recent.len() <= query.limit && !history_retention_gap;
         recent.truncate(query.limit);
-        while json_string(&recent)?.len() > overview_part_budget {
-            recent.pop();
+        if fit_json_budget(&mut recent, overview_part_budget)? {
             recent_complete = false;
         }
-        let mut overlaps = work_overlap_pairs(&current);
+        let mut overlaps = work_overlap_pairs(&current, query.limit + 1);
         let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
         overlaps.truncate(query.limit);
-        while json_string(&overlaps)?.len() > overview_part_budget {
-            overlaps.pop();
+        if fit_json_budget(&mut overlaps, overview_part_budget)? {
             overlaps_complete = false;
         }
         tx.commit()?;
@@ -7074,7 +7121,8 @@ impl Store for SqliteStore {
                 params![repository, after, oldest, limit as i64],
                 publication_row,
             )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7215,7 +7263,8 @@ impl Store for SqliteStore {
         ))?;
         let rows = statement
             .query_map(params![repository, before, limit as i64], publication_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7275,7 +7324,8 @@ impl Store for SqliteStore {
                 ],
                 publication_row,
             )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(PublicationSearch {
             rows,
             searched_to: Some(oldest_id),
@@ -7300,7 +7350,8 @@ impl Store for SqliteStore {
         ))?;
         let rows = statement
             .query_map(params![repository, after, limit as i64], publication_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(publication_error)?;
         Ok(rows)
     }
 
@@ -7542,54 +7593,6 @@ impl Store for SqliteStore {
             ],
             |row| row.get(0),
         )?)
-    }
-
-    fn catchup_merge_highwater(&self, scope: &CatchupRepositoryScope) -> Result<i64> {
-        scope.validate()?;
-        let conn = self.conn();
-        let repository = repository_namespace(&scope.repository, scope.repository_id);
-        Ok(conn.query_row(
-            "SELECT next_merge_seq-1 FROM hub_catchup_repositories WHERE provider=?1 AND host=?2
-             AND repository=?3 AND repository_key=?4",
-            params![scope.provider,scope.host,repository,catchup_repository_key(scope.repository_id)],
-            |row| row.get(0)).optional()?.unwrap_or(0))
-    }
-
-    fn catchup_merges_through(
-        &self,
-        scope: &CatchupRepositoryScope,
-        after: i64,
-        through: i64,
-        limit: usize,
-    ) -> Result<Vec<CatchupMergeObservation>> {
-        scope.validate()?;
-        if after < 0 || through < after || !(1..=MAX_CATCHUP_PAGE).contains(&limit) {
-            return Err(HubError::Invalid("invalid catch-up merge page".into()));
-        }
-        let conn = self.conn();
-        let repository = repository_namespace(&scope.repository, scope.repository_id);
-        let mut statement = conn.prepare(&format!(
-            "SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
-            WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4
-              AND seq>?5 AND seq<=?6 ORDER BY seq LIMIT ?7"
-        ))?;
-        statement
-            .query_map(
-                params![
-                    scope.provider,
-                    scope.host,
-                    repository,
-                    catchup_repository_key(scope.repository_id),
-                    after,
-                    through,
-                    limit as i64
-                ],
-                sqlite_catchup_merge_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(sqlite_catchup_merge)
-            .collect()
     }
 
     fn record_catchup_source_status(
@@ -7903,14 +7906,13 @@ impl Store for SqliteStore {
         let event = work_event("work_checkpoint", &item)?;
         let seq = append(&tx, &event)?;
         item.updated_seq = seq;
-        save_work_version(&tx, &item, seq)?;
+        let snapshot = save_work_version(&tx, &item, seq)?;
         tx.execute(
             "INSERT INTO hub_work_checkpoint_ops
                 (work, operation_id, request, event_seq)
              VALUES (?1, ?2, ?3, ?4)",
             params![item.id, checkpoint.operation_id, request, seq],
         )?;
-        let snapshot = json_string(&item)?;
         let request_bytes = work_payload_row_bytes(request.len())?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
@@ -10188,6 +10190,20 @@ impl Store for SqliteStore {
         })
     }
 
+    fn work_repair_repository(
+        &self,
+        repair: &super::work::WorkRepositoryRename,
+        now: i64,
+    ) -> Result<super::work::WorkRepositoryRenameResult> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = repository_rename::repair(&tx, repair, now)?;
+        if repair.apply {
+            tx.commit()?;
+        }
+        Ok(result)
+    }
+
     fn work_compact(
         &self,
         scope: &WorkRepositoryScope,
@@ -10767,10 +10783,11 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
+        // CROSS JOIN keeps SQLite's join order: the session's participant rows first.
         let snapshots = {
             let mut statement = tx.prepare(
-                "SELECT w.snapshot FROM hub_work_items w
-                 JOIN hub_work_participants p ON p.work = w.id
+                "SELECT w.snapshot FROM hub_work_participants p
+                 CROSS JOIN hub_work_items w ON p.work = w.id
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND w.state IN ('active','blocked')
                    AND p.token = ?5 AND p.session = ?6 AND p.generation = w.generation
@@ -10800,8 +10817,8 @@ impl Store for SqliteStore {
             None
         } else {
             tx.query_row(
-                "SELECT w.snapshot FROM hub_work_items w
-                 JOIN hub_work_participants p ON p.work = w.id
+                "SELECT w.snapshot FROM hub_work_participants p
+                 CROSS JOIN hub_work_items w ON p.work = w.id
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND p.token = ?5 AND p.session = ?6
                  ORDER BY w.updated_at DESC, w.id LIMIT 1",
@@ -11270,15 +11287,11 @@ impl Store for SqliteStore {
         let request = coordination_request_at(&tx, &who, &withdraw.request_id, i64::MAX, now)?
             .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
         let requester = coordination_is_requester(&request, &who, &withdraw.session);
-        let requester_available = tx
-            .query_row(
-                "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-                 WHERE t.id = ?1 AND t.revoked = 0 AND t.expires_at > ?2 AND u.disabled = 0",
-                params![request.requester.token, now],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
+        let requester_available = match work_who(&tx, &request.requester.token, now) {
+            Ok(_) => true,
+            Err(HubError::Unauthorized) => false,
+            Err(error) => return Err(error),
+        };
         let current_target_lead = request.targets.iter().any(|target| {
             target.lead.token == who.token && target.lead.session == withdraw.session
         });

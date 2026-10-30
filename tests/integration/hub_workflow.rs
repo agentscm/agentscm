@@ -868,6 +868,22 @@ async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution()
     assert_eq!(replayed_inbox["requests"][0]["id"], request_id);
     assert_eq!(replayed_inbox["requests"][0]["acknowledgements"], json!([]));
 
+    // The lead's next edit hook carries the request, read in the same store hop as its touch.
+    let edit = json!({
+        "session_id": "lead-session",
+        "cwd": "/work/repo",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/work/repo/src/shared-request.rs"},
+    });
+    let (status, hooked) = hub
+        .call(Method::POST, "/v1/hub/hook/claude", &lead, Some(edit))
+        .await;
+    assert_eq!(status, 200, "{hooked}");
+    let hooked = hooked.to_string();
+    assert!(hooked.contains(&request_id), "{hooked}");
+    assert!(hooked.contains("needs your response"), "{hooked}");
+
     let acknowledged_seq = first_inbox["requests"][0]["updated_seq"].as_i64().unwrap();
     let (status, acknowledged) = hub
         .call(
