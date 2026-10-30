@@ -53,7 +53,7 @@ export const WELCOME: TourDef = {
       title: 'This page shows what your agents are doing',
       what: 'The hub watches every coding agent connected to this repository: which files each one is editing, which task it owns, and what checks said about its work.',
       why: 'Two agents editing the same file is how work gets lost. The hub spots it first and tells you who to talk to.',
-      how: 'Most pages only read, so look around freely. Places that can change something: Setup › Access (runs, approvals, landing, members), Setup › Computers (revoke), History › Promises, Setup › Preferences (inline agent views, conversation sharing) and Catch up (Mark reviewed). Revoke, approve, land and turning sharing on ask first; Mark reviewed, the inline-view switches and turning sharing off act at once, and each is labelled.',
+      how: 'Most pages only read, so look around freely. Anything that changes something is labelled, and revoking, approving, landing and turning sharing on ask first.',
       tip: (c) => (c.d ? `Right now ${plural(c.d.agents.length, 'agent')} ${c.d.agents.length === 1 ? 'is' : 'are'} connected to this repository.` : null),
       empty: 'Once an agent connects, the count of live agents shows here.',
     },
@@ -71,9 +71,9 @@ export const WELCOME: TourDef = {
     {
       target: T('needs'),
       title: 'Needs you is your to-do list',
-      what: 'Each item names the person and agent, says what to do, and has a Copy button with the exact instruction to paste into that agent.',
+      what: 'Each row names the person and agent and has one button: Open in your agent when there is a link for it, otherwise Copy prompt. Open a row for the reason and who decides.',
       why: 'Each one stays stuck until someone decides. Blocked tasks, agents that went quiet, handovers (one agent passing a task to another) and files two agents are both editing all land here.',
-      how: 'Do what the item says, or press Copy and paste the instruction into that agent.',
+      how: 'Open the prompt in the agent, or copy it and paste it there. The agent shows it and waits for you to press Enter.',
       empty: 'When nothing needs you, this box says so in green.',
     },
     {
@@ -166,7 +166,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
         title: 'Needs you',
         what: 'Blocked tasks, agents that went quiet but still have their task, handovers (one agent passing a task to another), files two agents are both editing, tasks that plan to change the same files, and pull requests that touch files an agent is editing.',
         why: 'Each one stays stuck until someone decides.',
-        how: 'Each row names the person and agent and ends with what to do next, with a Copy button for the instruction to paste into that agent. Follow its link to the task, the file or the Inbox.',
+        how: 'Each row names the person and agent and has one button: Open in your agent when there is a link for it, otherwise Copy prompt. The ⋯ menu holds the other prompts; open the row for the reason, who decides and a box for your own words. Follow its link to the task, the file or the Inbox.',
         empty: 'When nothing needs you, this box says so in green.',
       },
       {

@@ -11,7 +11,7 @@ import { useGlide, useSwap } from './motion.ts'
 import { placeCard, type Rect } from './place.ts'
 import { Spotlight } from './Spotlight.tsx'
 import { Trail } from './Trail.tsx'
-import { TOUR_KEY, canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, shouldAutoplay, shouldWelcome, type TourPrefs } from './state.ts'
+import { TOUR_KEY, canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, shouldAutoplay, type TourPrefs } from './state.ts'
 
 interface TourApi {
   prefs: TourPrefs
@@ -27,13 +27,13 @@ const Ctx = createContext<TourApi | null>(null)
 export const useTour = (): TourApi | null => useContext(Ctx)
 
 export function TourProvider({ section, data, d, overview, signedIn = true, children }: { section: Section; /** False on the signed-out shell: nothing starts by itself there. */ signedIn?: boolean; data: HubData; d: Derived | null; overview: WorkOverview | null; children: ReactNode }) {
-  // Read once per load. Auto-play happens at most once per page open: the welcome tour first,
-  // otherwise a page tour the viewer switched on in Settings.
+  // Read once per load. Auto-play happens at most once per page open, and only for a page tour the viewer
+  // switched on in Settings. The welcome tour no longer opens by itself: the Dashboard introduces itself
+  // with coach marks (Coach.tsx), and the tour stays one click away.
   const [init] = useState(() => {
     const remember = canRemember()
     const prefs = loadPrefs()
-    // The welcome tour describes one repository's Dashboard, so it waits for one rather than covering All repositories.
-    const first: TourKey | null = !signedIn ? null : section !== 'repositories' && shouldWelcome(prefs, remember) ? 'welcome' : shouldAutoplay(prefs, section, remember) && tourFor(section) ? section : null
+    const first: TourKey | null = signedIn && shouldAutoplay(prefs, section, remember) && tourFor(section) ? section : null
     return { remember, prefs, first }
   })
   const remember = init.remember

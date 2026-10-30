@@ -104,6 +104,17 @@ export function Notice({ tone = 'warn', icon = 'exclamation-triangle', title, ch
   )
 }
 
+/** The body of a disclosure: always mounted, so its text stays findable, but it grows and shrinks in height (see `.reveal`) and is `inert` while closed. */
+export function Reveal({ open, id, children }: { open: boolean; id?: string; children: ReactNode }) {
+  return (
+    <div className="reveal" data-open={open}>
+      <div className="reveal-in" id={id} {...(open ? {} : { inert: '' })}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
 /** Row-shaped, like the lists it stands in for, so the content lands where the skeleton was. Shown only after a short delay (CSS), so a fast load never flashes it. */
 export function Skeleton({ rows = 3 }: { rows?: number }) {
   return (
@@ -167,7 +178,7 @@ export function Reported({ at }: { at: number }) {
 }
 
 /** `icon` replaces the idle clipboard glyph; `done` (e.g. "Copied, paste in Grok") replaces "Copied" and is also announced politely. `onCopy` runs synchronously in the click, so a caller can open an app inside the user gesture. */
-export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-outline-secondary', icon, done, title, onCopy }: { text: string; label?: string; className?: string; icon?: ReactNode; done?: string; title?: string; onCopy?: () => void }) {
+export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-outline-secondary', icon, done, title, role, onCopy }: { text: string; label?: string; className?: string; icon?: ReactNode; done?: string; title?: string; role?: string; onCopy?: () => void }) {
   const [state, setState] = useState<'idle' | 'ok' | 'fail'>('idle')
   const timer = useRef<number>()
   useEffect(() => () => window.clearTimeout(timer.current), [])
@@ -176,6 +187,7 @@ export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-o
       type="button"
       className={className}
       title={title}
+      role={role}
       onClick={() => {
         onCopy?.()
         // `navigator.clipboard` is missing on plain-http pages (a LAN hub), so a throw is a failed copy too.

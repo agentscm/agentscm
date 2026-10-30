@@ -209,8 +209,8 @@ separate role system.
   line of counts and the last activity. A repository with nothing unfinished, no agents and
   nothing needing you is a shorter row. Lower-bound counts read "at least N". On a phone the
   status moves under the name.
-- The Dashboard's tabs and its first-visit welcome tour do not show on this page: both describe
-  one repository. The welcome tour waits for the first Dashboard.
+- The Dashboard's tabs and its first-visit tips (coach marks) do not show on this page: both
+  describe one repository. The tips wait for the first Dashboard.
 
 ## Docs and roadmap
 

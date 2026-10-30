@@ -9,7 +9,7 @@ export function InstallOffer() {
   const { kind, hint, install } = useInstall()
   const tour = useTour()
   const [gone, setGone] = useState(loadInstallDismissed)
-  // The welcome tour plays first; this waits until it is done.
+  // The Dashboard's first-visit tips come first; this waits until they are dismissed or skipped.
   const touring = !!tour && tour.remember && !tour.prefs.welcomeSeen && !tour.prefs.welcomeOff
   if (gone || touring || kind === 'none') return null
   return (
