@@ -26,13 +26,13 @@ const Ctx = createContext<TourApi | null>(null)
 /** Null outside a signed-in shell (sign-in page, tests that render one page). */
 export const useTour = (): TourApi | null => useContext(Ctx)
 
-export function TourProvider({ section, data, d, overview, children }: { section: Section; data: HubData; d: Derived | null; overview: WorkOverview | null; children: ReactNode }) {
+export function TourProvider({ section, data, d, overview, signedIn = true, children }: { section: Section; /** False on the signed-out shell: nothing starts by itself there. */ signedIn?: boolean; data: HubData; d: Derived | null; overview: WorkOverview | null; children: ReactNode }) {
   // Read once per load. Auto-play happens at most once per page open: the welcome tour first,
   // otherwise a page tour the viewer switched on in Settings.
   const [init] = useState(() => {
     const remember = canRemember()
     const prefs = loadPrefs()
-    const first: TourKey | null = shouldWelcome(prefs, remember) ? 'welcome' : shouldAutoplay(prefs, section, remember) && tourFor(section) ? section : null
+    const first: TourKey | null = !signedIn ? null : shouldWelcome(prefs, remember) ? 'welcome' : shouldAutoplay(prefs, section, remember) && tourFor(section) ? section : null
     return { remember, prefs, first }
   })
   const remember = init.remember

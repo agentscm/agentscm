@@ -222,6 +222,13 @@ describe('TourProvider overlay', () => {
     fireEvent.click(screen.getByRole('button', { name: 'arm now' }))
     expect(stored().autoplay).toEqual(['work', 'now'])
   })
+  it('does not start by itself while signed out, and still starts by hand', () => {
+    fresh()
+    render(<TourProvider section="now" signedIn={false} data={emptyData} d={null} overview={null}><TourTrigger section="now" /></TourProvider>)
+    expect(dialog()).toBeNull()
+    fireEvent.click(screen.getByRole('button'))
+    expect(dialog()).not.toBeNull()
+  })
   it('Back keeps focus on Back', async () => {
     fresh()
     render(shell())

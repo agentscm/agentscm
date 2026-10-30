@@ -3,8 +3,10 @@ import { ApiError } from '../api.ts'
 import { deviceAuth, fetchAdmin, fetchDevices, revokeDevice, signOutBrowser, type AdminRepository, type BrowserSession, type Device, type DeviceAuth, type SignInRefusal } from '../devices.ts'
 import { reasonSentence } from '../refusal.ts'
 import { RefusalNotice } from '../Refusal.tsx'
+import { loginHref } from '../hubLogin.ts'
 import { SectionTabs } from '../TopNav.tsx'
-import { Ago, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
+import { Ago, Box, Empty, Icon, Notice, PageHead, Pill, Skeleton, Tip, localDate } from '../ui.tsx'
+import { useNow } from '../useHub.ts'
 
 export type Load<T> = { kind: 'loading' } | { kind: 'ready'; value: T } | { kind: 'error'; error: unknown }
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
@@ -39,10 +41,21 @@ function SignInHere({ provider, what }: { provider: 'github' | 'gitlab'; what: s
   return (
     <div className="computer-signin">
       <p>Sign in to this Hub in your browser to see {what}. A read-only repository token can’t.</p>
-      <a className="btn btn-primary" href={`/v1/hub/login/${provider}?web=1`}>
+      <a className="btn btn-primary" href={loginHref(provider)}>
         <Icon name={provider} /> Sign in with {FORGE[provider]}
       </a>
     </div>
+  )
+}
+
+/** The hub writes last-used at most once an hour, so a younger time would claim precision it does not have. */
+function LastUsed({ at }: { at: number }) {
+  const now = useNow()
+  if (now / 1000 - at >= 3600) return <Ago at={at} />
+  return (
+    <Tip text={`${localDate(at)}. The Hub records this at most once an hour.`} focusable>
+      <span className="ago">within the last hour</span>
+    </Tip>
   )
 }
 
@@ -59,7 +72,9 @@ function RevokeButton({ device, auth, onDone }: { device: Device; auth: DeviceAu
     )
   return (
     <div className="computer-confirm" role="group" aria-label={`Revoke ${device.name}`}>
-      <span>Its agents stop at once and their tokens are revoked.</span>
+      <span>
+        Revokes {device.owner ? `${device.owner.login}’s` : 'your'} sign-in on {device.name} and the agent tokens it made for {device.repositories.length ? device.repositories.join(', ') : 'every repository it signed in for'}. Those agents lose access to this Hub. It does not stop them running, change their GitHub or GitLab access, or release files they announced; those expire on their own. To contain an agent, also remove its access on GitHub or GitLab. To use this computer again, sign it in again.
+      </span>
       <button
         type="button"
         className="btn btn-sm btn-danger"
@@ -104,7 +119,7 @@ function ComputerList({ devices, auth, showOwner = false, onChange }: { devices:
   return (
     <>
       {notice && <Notice tone="ok" icon="check-circle" title={notice} />}
-      {active.length === 0 && <Empty icon="laptop" title="No computers are signed in" />}
+      {active.length === 0 && <Empty icon="laptop" title="No computers are signed in">Copy the set-up instructions under Setup, Agents. The computer appears here once it signs in.</Empty>}
       <ul className="plain-list computers">
         {shown.map((d) => (
           <li key={d.id} className={`computer${d.revokedAt ? ' is-revoked' : ''}`}>
@@ -124,12 +139,11 @@ function ComputerList({ devices, auth, showOwner = false, onChange }: { devices:
                   </>
                 ) : d.lastUsedAt ? (
                   <>
-                    {' '}· last used <Ago at={d.lastUsedAt} />
+                    {' '}· last used <LastUsed at={d.lastUsedAt} />
                   </>
                 ) : (
                   ' · not used yet'
                 )}
-                {d.repositories.length > 0 && <> · {plural(d.repositories.length, 'repository', 'repositories')}</>}
               </div>
               {d.repositories.length > 0 && (
                 <div className="computer-repos">
@@ -145,7 +159,7 @@ function ComputerList({ devices, auth, showOwner = false, onChange }: { devices:
                 device={d}
                 auth={auth}
                 onDone={(outcome) => {
-                  setNotice(outcome === 'revoked' ? `${d.name} was revoked. Its agents can no longer act for ${d.owner?.login ?? 'you'}.` : `${d.name} was already removed.`)
+                  setNotice(outcome === 'revoked' ? `${d.name} was revoked. Its agents can no longer reach this Hub as ${d.owner?.login ?? 'you'}. They keep running; files they announced expire on their own.` : `${d.name} was already removed.`)
                   onChange()
                 }}
               />
@@ -184,16 +198,13 @@ export function ComputersPage({ auth, provider, onSignedOut, onSignOutFailed }: 
   const session = ready?.kind === 'browser' ? ready.session : null
   return (
     <div className="page">
-      <div className="answer">
-        <h1 className="page-question">Which computers can act for me?</h1>
-        <p className="answer-text">{active === null ? `Your computers signed in to ${hub}.` : active === 0 ? `No computer is signed in as you on ${hub}.` : <><b>{plural(active, 'computer')}</b> can start agents as you on {hub}.</>}</p>
-      </div>
+      <PageHead question="Which computers can act for me?" answer={active === null ? `Your computers signed in to ${hub}.` : active === 0 ? `No computer is signed in as you on ${hub}.` : <><b>{plural(active, 'computer')}</b> can start agents as you on {hub}.</>} />
       <SectionTabs />
       <Box
         icon="laptop"
         title="Your computers"
-        count={active ?? undefined}
-        explain="Each computer signs in once and renews its own agent tokens. Revoking one stops its agents at once."
+        intro={ready ? 'Workspace access and computers stay signed in.' : undefined}
+        explain="Each computer signs in once and renews its own agent tokens. Revoking one ends its agents’ access to this Hub at once; it does not stop them running or touch their GitHub or GitLab access. A computer unused for 90 days stops working."
         actions={
           session && (
             <button
@@ -219,7 +230,6 @@ export function ComputersPage({ auth, provider, onSignedOut, onSignOutFailed }: 
           )
         }
       >
-        {ready && <p className="small muted">Workspace access and computers stay signed in.</p>}
         {signOutError && <Notice tone="bad" icon="box-arrow-right" title="This browser is still signed in">The Hub didn’t confirm the sign-out. Reload the page and try again.</Notice>}
         {auth.kind === 'loading' || (ready && devices.kind === 'loading') ? (
           <Skeleton rows={2} />
@@ -246,7 +256,8 @@ function Refusals({ rows }: { rows: SignInRefusal[] }) {
       {rows.map((r) => (
         <li key={`${r.provider}:${r.login}:${r.reason}`} className="refusal-row">
           <div>
-            <strong>{r.login}</strong> <span className="muted">· {r.provider === 'gitlab' ? 'GitLab' : 'GitHub'} · {VIA[r.via]}</span>
+            <strong>{r.login}</strong>
+            <span className="small muted d-block">{r.provider === 'gitlab' ? 'GitLab' : 'GitHub'} · {VIA[r.via]}</span>
             <p className="refusal-why">{reasonSentence(r.reason, r.provider) ?? `Refused (${r.reason}).`}</p>
           </div>
           <div className="refusal-when">
@@ -303,18 +314,10 @@ export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; p
   const v = data.kind === 'ready' ? data.value : null
   return (
     <div className="page">
-      <div className="answer">
-        <h1 className="page-question">Which repositories are connected, and who was turned away?</h1>
-        <p className="answer-text">
-          {v ? (
-            <>
-              <b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected.
-            </>
-          ) : (
-            'Connected repositories, refusals and every signed-in computer.'
-          )}
-        </p>
-      </div>
+      <PageHead
+        question="Which repositories are connected, and who was turned away?"
+        answer={v ? <><b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected.</> : 'Connected repositories, refusals and every signed-in computer.'}
+      />
       <SectionTabs />
       {auth.kind === 'loading' || (browser && data.kind === 'loading') ? (
         <Skeleton rows={4} />
@@ -335,10 +338,10 @@ export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; p
           <Box icon="person-x" tone={v.refusals.length ? 'warn' : 'ok'} title="Turned away" count={v.refusals.length} explain="Sign-ins and agent connections the Hub refused in the last 30 days, one row per person and reason.">
             <Refusals rows={v.refusals} />
           </Box>
-          <Box icon="plug" title="Connected repositories" count={v.repositories.length}>
+          <Box icon="plug" title="Connected repositories" explain="Repositories this Hub serves, with the computers and agent tokens connected to each.">
             <Repositories rows={v.repositories} />
           </Box>
-          <Box icon="laptop" title="Every signed-in computer" count={v.devices.filter((d) => !d.revokedAt).length} explain="Revoking a computer stops its agents at once and revokes the agent tokens it made.">
+          <Box icon="laptop" title="Every signed-in computer" count={v.devices.filter((d) => !d.revokedAt).length} explain="Revoking a computer revokes the agent tokens it made, so those agents lose access to this Hub at once. They keep running, and GitHub or GitLab access is unchanged. Last used is recorded at most once an hour.">
             <ComputerList devices={v.devices} auth={browser} showOwner onChange={() => setTick((t) => t + 1)} />
           </Box>
         </div>

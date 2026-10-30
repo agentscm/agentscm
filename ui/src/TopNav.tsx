@@ -5,6 +5,7 @@ import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef,
 import type { Derived } from './derive.ts'
 import { workHref, workIdFromHash, type WorkOverview } from './standup.ts'
 import { loadSingleKeys, type Density, type ThemePref } from './storage.ts'
+import { useInstall } from './install.ts'
 import { useNow, type HubData } from './useHub.ts'
 import type { Section } from './App.tsx'
 import { workTabFromHash, workTabHref } from './pages/Work.tsx'
@@ -14,7 +15,8 @@ import { workspaceRoute, workspaceRunHref } from './pages/Workspace.tsx'
 import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
 import { promiseHref, promiseIdFromHash } from './promises.ts'
 import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
-import { Icon, Tip, agentLabel, relative } from './ui.tsx'
+import { READING_CHANGES_NOTHING } from './copy.ts'
+import { Explain, Icon, Tip, agentLabel, relative } from './ui.tsx'
 import type { Refusal } from './refusal.ts'
 import { TourTrigger, useTour } from './tour/Tour.tsx'
 import { tourFor } from './tour/content.ts'
@@ -365,6 +367,7 @@ function AccountMenu({ data, onForget, web }: { data: HubData; onForget: () => v
   const ref = useDismiss(open, () => setOpen(false))
   const who = data.whoami
   const login = who?.owner.login ?? '…'
+  const { kind, hint, install } = useInstall()
   return (
     <div className="pop" ref={ref}>
       <button type="button" className={`acct-btn${open ? ' is-open' : ''}`} aria-haspopup="menu" aria-expanded={open} aria-label={`Account and settings for ${login}`} onClick={() => setOpen((o) => !o)}>
@@ -396,7 +399,7 @@ function AccountMenu({ data, onForget, web }: { data: HubData; onForget: () => v
               <Icon name="key" />
               <span>
                 Token <strong>{who.token.name}</strong>
-                <span className="muted"> · read-only{who.token.expires_at ? ` · expires ${new Date(who.token.expires_at * 1000).toLocaleDateString()}` : ''}</span>
+                <span className="muted"> · read-only{who.token.expires_at ? `, expires ${new Date(who.token.expires_at * 1000).toLocaleDateString()}` : ''}</span>
               </span>
             </div>
           )}
@@ -409,6 +412,18 @@ function AccountMenu({ data, onForget, web }: { data: HubData; onForget: () => v
             <Icon name="sliders" />
             <span className="pop-main">Preferences<span className="pop-sub">Theme, density, sidebar, token and shortcuts</span></span>
           </a>
+          {kind === 'chromium' && (
+            <button type="button" role="menuitem" className="pop-item" onClick={() => { setOpen(false); install() }}>
+              <Icon name="download" />
+              <span className="pop-main">Install as an app<span className="pop-sub">Its own window and Dock icon</span></span>
+            </button>
+          )}
+          {hint && (
+            <div className="acct-token">
+              <Icon name="download" />
+              <span>{hint}</span>
+            </div>
+          )}
           <button type="button" role="menuitem" className="pop-item pop-danger" onClick={onForget}>
             <Icon name="box-arrow-right" />
             {web ? (
@@ -636,7 +651,7 @@ function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer
           </div>
         </nav>
         <div className="side-foot">
-          <p className="side-foot-note"><Icon name="eye" /> Opening a page never changes anything for your agents.</p>
+          <p className="side-foot-note"><Icon name="eye" /> {READING_CHANGES_NOTHING} <Explain text="Places that can change things: Setup › Access (runs, approvals, landing, members), Setup › Computers (revoke), History › Promises, Setup › Preferences (inline agent views and conversation sharing) and Catch up (Mark reviewed). Revoke, approve, land and turning sharing on ask first. Mark reviewed (moves only your own position), the inline-view switches and turning sharing off act at once." /></p>
           <Tip text={collapsed ? 'Expand the sidebar' : 'Show icons only'} placement="right">
             <button type="button" className="side-collapse" onClick={onCollapse} aria-pressed={collapsed} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
               <Icon name={collapsed ? 'layout-sidebar-inset' : 'layout-sidebar'} />
@@ -692,7 +707,10 @@ export function crumbsFor(hash: string, section: SectionDef, overview: WorkOverv
     }
   } else if (section.key === 'change-record') {
     const id = changeRecordIdFromHash(hash)
-    if (id) out.push({ label: `Work ${id.slice(0, 12)}…`, href: changeRecordHref(id), mono: true })
+    if (id) {
+      const item = overview?.current.find((w) => w.id === id) ?? overview?.recent.find((o) => o.item.id === id)?.item
+      out.push(item ? { label: item.title, href: changeRecordHref(id) } : { label: `Work ${id.slice(0, 12)}…`, href: changeRecordHref(id), mono: true })
+    }
   } else if (section.key === 'landed') {
     const id = landedIdFromHash(hash)
     if (id) out.push({ label: `Change ${id.slice(0, 12)}…`, href: landedHref(id), mono: true })
@@ -873,7 +891,7 @@ export function AppChrome({ logo, token, repo, web, hubSignedOut = false, nav, s
               </a>
             </Tip>
             <TourTrigger section={section} />
-            <Tip text={inbox ? inbox.tip : 'Inbox: overlaps and requests that need a conversation'} placement="bottom">
+            <Tip text={inbox ? inbox.tip : 'Inbox: overlapping plans and agent requests'} placement="bottom">
               <a href="#inbox" data-tour="bell" className="top-icon bell" aria-label={inbox ? `Inbox, ${inbox.tip}` : 'Inbox'}>
                 <Icon name="bell" />
                 {inbox && <span className={`bell-count tone-${inbox.tone}`} aria-hidden="true">{inbox.n}</span>}

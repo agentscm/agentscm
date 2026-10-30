@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { saveToken } from '../../src/storage.ts'
 import App from '../../src/App.tsx'
-import { WorkflowsPage } from '../../src/pages/Workflows.tsx'
+import { runsHeadline, WorkflowsPage } from '../../src/pages/Workflows.tsx'
 import { fromMock, json, stubHub } from '../fixtures/mockFetch.ts'
 
 const LOAD = { timeout: 5_000 }
@@ -45,6 +45,20 @@ describe('workflow run list', () => {
     fireEvent.click(screen.getByRole('button', { name: /Newer/ }))
     await screen.findByText('retained-run-029', {}, LOAD)
     expect(sent.every((r) => r.method === 'GET')).toBe(true)
+  })
+
+  it('answers with counts from the loaded page, never a definition', async () => {
+    stubHub()
+    at('#workflows')
+    page()
+    await screen.findByText('claude-review-failed', {}, LOAD)
+    expect(document.querySelector('.answer-text')!.textContent).toMatch(/^Of the last 16 check runs on this page: 3 failed, 2 blocked\. A sample of the retained runs, not a failure rate/)
+    expect(screen.queryByText(/Every check, review and action/)).toBeNull()
+    const ok = { state: 'succeeded' as const }
+    expect(runsHeadline([], false)).toBe('No retained runs yet.')
+    expect(runsHeadline([ok, ok], false)).toBe('All 2 recent runs succeeded.')
+    expect(runsHeadline([ok, { state: 'running' }], false)).toBe('None of the last 2 check runs failed or was blocked.')
+    expect(runsHeadline([ok, { state: 'blocked' }], false)).toBe('Of the last 2 check runs: 1 blocked.')
   })
 
   it('filters the current page by text and status', async () => {

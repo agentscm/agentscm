@@ -5,7 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#17142e" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
     <title>AgentSCM Hub</title>
+    <!-- Until the app mounts, paint the frame colour (--frame) so returning from GitHub sign-in doesn't flash white. -->
+    <style>html:has(#root:empty) { background: #17142e; }</style>
   </head>
   <body>
     <div id="root"></div>

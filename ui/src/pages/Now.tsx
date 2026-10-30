@@ -1,13 +1,31 @@
 import { useMemo, useState } from 'react'
 import { type Contested, type Derived, type LiveAgent } from '../derive.ts'
-import { areas } from '../needs.ts'
+import { CONTESTED_FILE } from '../copy.ts'
+import { areas, type Area } from '../needs.ts'
 import { workHref, type WorkOverview } from '../standup.ts'
 import type { PullRequest } from '../types.ts'
 import type { HubData } from '../useHub.ts'
 import { agentLabel, Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, Via } from '../ui.tsx'
 import type { Poll } from '../usePoll.ts'
+// nextStep.ts imports Inbox, which shares a module cycle with this page: use `who` only inside render functions.
+import { who } from '../nextStep.ts'
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+/** "sam’s cursor", or just the agent when the hub did not say whose it is. */
+const whose = (owner: string, agent: string) => (owner ? who(owner, agent) : agentLabel(agent))
+/** Paths joined as "a, b and c", each one a code element. */
+function Files({ files }: { files: string[] }) {
+  return (
+    <>
+      {files.map((f, i) => (
+        <span key={f}>
+          {i > 0 && (i === files.length - 1 ? ' and ' : ', ')}
+          <Path>{f}</Path>
+        </span>
+      ))}
+    </>
+  )
+}
 
 export function AgentRow({ a, awake }: { a: LiveAgent; awake?: boolean }) {
   return (
@@ -15,8 +33,7 @@ export function AgentRow({ a, awake }: { a: LiveAgent; awake?: boolean }) {
       <Avatar name={a.name} size={36} />
       <div className="agent-main">
         <div className="agent-line">
-          <strong title={a.name}>{agentLabel(a.name)}</strong>
-          <span className="muted">{a.owner}</span>
+          <strong title={a.name}>{whose(a.owner, a.name)}</strong>
           {a.via.map((v) => (
             <Via key={v} via={v} />
           ))}
@@ -66,19 +83,19 @@ function ContestedRow({ c }: { c: Contested }) {
       <div className="contested-holders">
         {c.holders.map((x, i) => (
           <span key={x.id}>
-            {i > 0 && <Icon name="arrow-left-right" className="muted" />} <strong title={x.name}>{agentLabel(x.name)}</strong> <span className="muted">{x.owner}</span>
+            {i > 0 && <Icon name="arrow-left-right" className="muted" />} <strong title={x.name}>{whose(x.owner, x.name)}</strong>
           </span>
         ))}
       </div>
       <div className="contested-state">
         {c.refused && (
-          <Pill tone="bad" icon="slash-circle" tip="The hub refused this agent’s first edit because another agent holds the file.">
+          <Pill tone="bad" icon="slash-circle">
             {c.refused.owner}’s {agentLabel(c.refused.name)} refused <Ago at={c.refused.at} />
           </Pill>
         )}
         {c.repeated && (
-          <Pill tone="warn" icon="arrow-repeat" tip="After one refusal, repeating the same edit is let through. The hub warns; it does not block twice.">
-            Repeated and let through
+          <Pill tone="warn" icon="arrow-repeat">
+            Went ahead after a warning
           </Pill>
         )}
         {h && (
@@ -87,7 +104,7 @@ function ContestedRow({ c }: { c: Contested }) {
             icon={h.answer ? (h.answer.kind === 'granted' ? 'check2-circle' : 'lock') : h.lapsed ? 'hourglass-bottom' : 'hourglass-split'}
             tip="Experimental handoff: one agent asked the holder to hand the file over. Unanswered requests lapse after 30 minutes."
           >
-            {agentLabel(h.from.name)} asked {agentLabel(h.to.name)} · {h.answer ? (h.answer.kind === 'granted' ? 'handed over' : 'kept') : h.lapsed ? 'lapsed' : 'waiting'}
+            {whose(h.from.owner, h.from.name)} asked {whose(h.to.owner, h.to.name)} · {h.answer ? (h.answer.kind === 'granted' ? 'handed over' : 'kept') : h.lapsed ? 'lapsed' : 'waiting'}
           </Pill>
         )}
       </div>
@@ -114,7 +131,11 @@ function PrTitle({ pr }: { pr: PullRequest }) {
   )
 }
 
-/** Where: the repository as a map of areas, then the two kinds of crossing in full. */
+const clashes = (a: Area) => a.contested + a.overlaps > 0
+/** "2 contested files · 1 overlap", leaving out a zero. */
+const clashText = (a: Area) => [a.contested && plural(a.contested, 'contested file'), a.overlaps && plural(a.overlaps, 'overlap')].filter(Boolean).join(' · ')
+
+/** Where: the repository as a map of areas, then contested files and overlaps in full. */
 export function NowPage({ data, d, overview }: { data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
   const work = data.work
   const ov = overview.kind === 'ready' ? overview.value : null
@@ -132,8 +153,7 @@ export function NowPage({ data, d, overview }: { data: HubData; d: Derived | nul
           icon="exclamation-diamond"
           tone={d && d.contested.length > 0 ? 'bad' : 'ok'}
           title="Contested files"
-          count={d ? d.contested.length : undefined}
-          explain="Both agents hold this file. The hub refuses the second agent’s first edit, then lets a repeat through."
+          explain={CONTESTED_FILE}
         >
           {!d ? (
             <Skeleton rows={3} />
@@ -189,7 +209,7 @@ export function NowPage({ data, d, overview }: { data: HubData; d: Derived | nul
                   </div>
                   {p.with.map((w) => (
                     <div key={w.agent.id} className="pr-with">
-                      <Icon name="arrow-return-right" /> overlaps <strong>{w.agent.name}</strong> <span className="muted">({w.agent.owner})</span> on {w.files.map((f) => <Path key={f}>{f}</Path>)}
+                      <Icon name="arrow-return-right" /> <strong>{whose(w.agent.owner, w.agent.name)}</strong> is editing <Files files={w.files} />
                     </div>
                   ))}
                 </li>
@@ -207,7 +227,7 @@ const MAX_TILES = 12
 
 /**
  * The repository as tiles, one per top-level folder someone holds or plans to touch. Faces are the
- * agents there; a coral ring and pill mark a crossing. Picking a tile opens what is happening in it.
+ * agents there; a coral ring and pill mark a contested file or overlap. Picking a tile opens what is happening in it.
  */
 function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
   const all = useMemo(() => areas(ov, d), [ov, d])
@@ -221,9 +241,8 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
       tour="now-map"
       icon="grid-1x2"
       title="The repository"
-      count={d ? `${plural(all.length, 'area')}` : undefined}
-      tone={shown.some((a) => a.crossings > 0) ? 'bad' : 'brand'}
-      explain="One tile per top-level folder where agents hold files or plan to work. Darker means more people. Pick a tile to see who and why."
+      tone={shown.some(clashes) ? 'bad' : 'brand'}
+      explain="One tile per top-level folder where agents hold files or plan to work. Darker means more people."
     >
       {!d ? (
         <Skeleton rows={4} />
@@ -242,7 +261,7 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                 <div role="listitem" key={a.name || '(root)'} className="map-cell">
                   <button
                     type="button"
-                    className={`tile${a.crossings > 0 ? ' is-crossing' : ''}${picked === a.name ? ' is-selected' : ''}`}
+                    className={`tile${clashes(a) ? ' is-crossing' : ''}${picked === a.name ? ' is-selected' : ''}`}
                     style={{ ['--heat' as string]: heat.toFixed(2) }}
                     aria-expanded={picked === a.name}
                     aria-controls="area-drawer"
@@ -263,7 +282,7 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                         {a.holders.length > 0 ? `${a.holders.length} editing` : 'Nobody editing'}
                         {a.planned.length > 0 && ` · ${plural(a.planned.length, 'task')} planned`}
                       </span>
-                      {a.crossings > 0 && <span className="crossing">{plural(a.crossings, 'crossing')}</span>}
+                      {clashes(a) && <span className="crossing">{clashText(a)}</span>}
                     </span>
                   </button>
                 </div>
@@ -293,7 +312,7 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                           <Avatar name={h.name} size={26} />
                           <div>
                             <div className="ad-main">
-                              <span title={h.name}>{agentLabel(h.name)}</span> <span className="muted small">{h.owner}</span>
+                              <span title={h.name}>{whose(h.owner, h.name)}</span>
                             </div>
                             <div className="ad-meta">{h.files.slice(0, 4).map((f) => <Path key={f}>{f}</Path>)}{h.files.length > 4 && <span>+{h.files.length - 4} more</span>}</div>
                           </div>
@@ -314,7 +333,7 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                           <div>
                             <a className="ad-main work-link" href={workHref(item.id)}>{item.title}</a>
                             <div className="ad-meta">
-                              {item.lead_agent} · {paths.slice(0, 3).map((f) => <Path key={f}>{f}</Path>)}
+                              {whose(item.owner_login, item.lead_agent)} · {paths.slice(0, 3).map((f) => <Path key={f}>{f}</Path>)}
                               {paths.length > 3 && <span>+{paths.length - 3} more</span>}
                             </div>
                           </div>
@@ -324,12 +343,12 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                   )}
                 </section>
                 <section>
-                  <h4>Crossings</h4>
-                  {area.crossings === 0 ? (
+                  <h4>Contested files and overlaps</h4>
+                  {!clashes(area) ? (
                     <p className="muted small">None here.</p>
                   ) : (
                     <p className="small">
-                      {plural(area.crossings, 'crossing')}. <a href="#box-contested">Contested files</a> are two agents holding one path; <a href="#inbox">overlaps in the Inbox</a> are two tasks planning the same one.
+                      {clashText(area)}: see <a href="#box-contested">Contested files</a> and the <a href="#inbox">Inbox</a>.
                     </p>
                   )}
                 </section>
@@ -337,7 +356,7 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
             </div>
           ) : (
             <p className="map-hint">
-              <Icon name="hand-index" /> Pick an area to see who is editing there, which tasks plan to, and any crossings.
+              <Icon name="hand-index" /> Pick an area to see who is editing it and what is planned.
             </p>
           )}
         </>

@@ -1,10 +1,12 @@
+import { ApiError } from './api.ts'
 import { useEffect, useState, type ReactNode } from 'react'
 import { fetchNarrative, validateNarrativeTask, type NarrativeSource, type NarrativeStatement, type NarrativeView } from './narrative.ts'
-import { Ago, Icon, Notice, Skeleton, localDate } from './ui.tsx'
+import { Ago, Icon, Notice, Skeleton } from './ui.tsx'
 
 type LoadState =
   | { kind: 'loading'; token: string; task: string | undefined }
   | { kind: 'error'; token: string; task: string | undefined; message: string }
+  | { kind: 'absent'; token: string; task: string | undefined }
   | { kind: 'ready'; token: string; task: string | undefined; view: NarrativeView }
 
 const message = (error: unknown) => error instanceof Error ? error.message : 'Unknown error'
@@ -105,7 +107,7 @@ function TaskRequest({ controls }: { controls: TaskControls }) {
         <button className="btn btn-sm btn-primary" type="submit">Brief this task</button>
       </div>
       <div id="agent-briefing-task-help" className="visually-hidden">
-        Submitted text is used only for conditional implications. Typing does not make a request.
+        Describe what you’re about to start, and the briefing adds what may matter for it. Nothing is sent until you press Brief this task.
       </div>
       {controls.error !== null && <div className="small tone-text-bad" role="alert">{controls.error}</div>}
       {controls.task !== undefined && (
@@ -118,7 +120,7 @@ function TaskRequest({ controls }: { controls: TaskControls }) {
   )
 }
 
-function NarrativeBox({ state, by, controls, children }: { state: 'ready' | 'waiting' | 'writing' | 'bad'; by?: ReactNode; controls: TaskControls; children: ReactNode }) {
+function NarrativeBox({ state, by, controls, children }: { state: 'ready' | 'waiting' | 'writing' | 'bad'; by?: ReactNode; controls?: TaskControls; children: ReactNode }) {
   return (
     <section id="agent-briefing" className={`brief is-${state}`} aria-labelledby="agent-briefing-title">
       <header className="brief-head">
@@ -127,7 +129,7 @@ function NarrativeBox({ state, by, controls, children }: { state: 'ready' | 'wai
           <h2 id="agent-briefing-title">Agent briefing</h2>
           {by && <span>{by}</span>}
         </div>
-        <TaskRequest controls={controls} />
+        {controls && <TaskRequest controls={controls} />}
       </header>
       <div className="text-break brief-body">{children}</div>
     </section>
@@ -167,7 +169,7 @@ function NarrativeReady({ view, controls }: { view: NarrativeView; controls: Tas
           </ol>
         )}
         <p className="brief-caveat">
-          <Icon name="info-circle" /> This agent-generated narrative summarizes reported records. It does not authorize work, approve changes, or establish that conflicts are clear. Generated as of {view.generated_at === null ? 'an unreported time' : localDate(view.generated_at)}.
+          <Icon name="info-circle" /> Written by an agent from reported records. It does not approve work or show that conflicts are clear.
         </p>
         <details className="disclosure">
           <summary>Briefing scope</summary>
@@ -232,7 +234,8 @@ export function NarrativePanel({ token }: { token: string }) {
         else schedule(30_000)
       } catch (error) {
         if (active && !controller.signal.aborted) {
-          setState({ kind: 'error', token, task, message: message(error) })
+          // 404: this Hub predates the briefing route; the 30 s re-check below recovers silently after an upgrade.
+          setState(error instanceof ApiError && error.status === 404 ? { kind: 'absent', token, task } : { kind: 'error', token, task, message: message(error) })
           schedule(30_000)
         }
       }
@@ -271,6 +274,16 @@ export function NarrativePanel({ token }: { token: string }) {
   const current: LoadState = state.token === token && state.task === task ? state : { kind: 'loading', token, task }
   if (current.kind === 'loading') {
     return <NarrativeBox controls={controls} state="waiting"><Skeleton rows={2} /></NarrativeBox>
+  }
+  if (current.kind === 'absent') {
+    return (
+      <NarrativeBox state="waiting">
+        <p className="brief-headline is-quiet">This Hub doesn’t write agent briefings yet.</p>
+        <p className="brief-caveat mb-0">
+          Update the Hub, then a connected agent can write one with agentscm_briefing_prepare and agentscm_briefing_submit. The catch-up below is complete without it.
+        </p>
+      </NarrativeBox>
+    )
   }
   if (current.kind === 'error') {
     return (

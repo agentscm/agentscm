@@ -23,7 +23,7 @@ test('signs in from #token= and strips the token from the address bar', async ({
   await expect(page.getByRole('button', { name: 'counterbranch/agentscm' })).toBeVisible()
   for (const item of ['Dashboard', 'Inbox', 'History', 'Timeline', 'Skills', 'Setup']) await expect(rail(page).getByRole('link', { name: new RegExp(`^${item}`) })).toBeVisible()
   await expect(tab(page)).toContainText('Now')
-  await expect(main(page)).toContainText(/agents? (is|are) working on/)
+  await expect(main(page)).toContainText(/unfinished tasks?/)
 })
 
 test('every page is reachable from the rail and its tabs, each with its question', async ({ page }) => {
@@ -73,7 +73,7 @@ test('a work item opens its authenticated change-record projection', async ({ pa
   await main(page).getByRole('link', { name: 'Rebuild the hub status page shell' }).first().click()
   await main(page).getByRole('link', { name: 'Change record' }).click()
   await expect(page).toHaveURL(/#change-record\/wrk_[0-9a-f]{32}$/)
-  await expect(crumbs(page).locator('[aria-current="page"]')).toContainText('Work wrk_')
+  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(/Rebuild the hub status page shell/)
   await expect(main(page).getByRole('heading', { level: 1, name: 'Rebuild the hub status page shell' })).toBeVisible()
   await expect(main(page)).toContainText('No source-bound action has been captured.')
   await expect(main(page)).toContainText('No action captured')
@@ -250,7 +250,7 @@ test('sign-in refuses an agent token, by paste and by #token=', async ({ page })
   test.skip(!AGENT_TOKEN, 'No agent token in ui/dev-seed/.data/tokens.env')
   await page.goto('/')
   await page.locator('#token').fill(AGENT_TOKEN)
-  await page.getByRole('button', { name: /Open status/ }).click()
+  await page.getByRole('button', { name: /Open repository/ }).click()
   await expect(page.getByText('This is an agent token, which can change coordination. The status page needs a read-only token.')).toBeVisible()
   await expect(page.getByRole('button', { name: /Account and settings/ })).toHaveCount(0)
 
@@ -304,7 +304,7 @@ test('a malformed workflow address shows the run list instead of a blank page, e
 test('the local pages and After merge each answer their question', async ({ page }) => {
   await signIn(page)
   for (const [hash, question] of [
-    ['#landed', 'Did our changes land, and did checks pass after?'],
+    ['#landed', 'Were our agents’ changes merged, and what happened after?'],
     ['#templates', 'Which reusable workflows can agents configure here?'],
     ['#timeline', 'What did this workspace look like earlier?'],
   ] as const) {
@@ -322,8 +322,8 @@ test('Landed changes shows live changes to a read-only token, or says plainly th
   test.skip(!failedCi, 'No seeded publications in ui/dev-seed/.data/publications.txt')
   await signIn(page, '#landed')
   if (readable) {
-    await expect(main(page).getByRole('heading', { level: 1 })).toHaveText('Did our changes land, and did checks pass after?')
-    await expect(main(page)).toContainText('3 of 7 recent changes landed')
+    await expect(main(page).getByRole('heading', { level: 1 })).toHaveText('Were our agents’ changes merged, and what happened after?')
+    await expect(main(page)).toContainText('3 of 7 recent changes merged')
     await expect(main(page)).toContainText('agent/rune/schema-migration-lock')
     await expect(page.locator('[data-tour="pager"]')).toContainText('That’s everything.')
     // The picker searches the hub: type part of a branch, pick it, land on that change.
@@ -343,7 +343,7 @@ test('Landed changes shows live changes to a read-only token, or says plainly th
     expect(probe.status()).toBe(403)
     await expect(main(page)).toContainText(/needs a newer hub/)
     await page.evaluate((h) => (window.location.hash = h), `#landed/${failedCi}`)
-    await expect(main(page).getByText('Landed changes aren’t readable here yet')).toBeVisible()
+    await expect(main(page).getByText('Published changes aren’t readable here yet')).toBeVisible()
   }
   await expect(page.getByLabel(/token/i)).toHaveCount(0)
 })

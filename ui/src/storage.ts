@@ -44,8 +44,9 @@ export function clearToken(): void {
 }
 
 /**
- * Whether a `#token=` in the URL may replace what is stored: only `agentscm demo` produces such
- * links, so outside demo mode a stored token stays, and a link cannot swap it for someone else's.
+ * Whether a `#token=` in the URL may replace what is stored without asking the hub: on the demo hub
+ * or with nothing stored. Otherwise a link cannot swap a saved token for someone else's; the caller
+ * lets it through only when the hub no longer accepts the saved one.
  */
 export function fragmentTokenAllowed(stored: string | null, demo: boolean): boolean {
   return demo || stored === null
@@ -125,6 +126,25 @@ export function saveSingleKeys(on: boolean): void {
   try {
     if (on) window.localStorage.removeItem(KEYS_KEY)
     else window.localStorage.setItem(KEYS_KEY, 'off')
+  } catch {
+    /* ignore */
+  }
+}
+
+const INSTALL_KEY = 'agentscm.install-offer'
+
+/** Whether the "install as an app" offer was dismissed in this browser. */
+export function loadInstallDismissed(): boolean {
+  try {
+    return window.localStorage.getItem(INSTALL_KEY) === 'dismissed'
+  } catch {
+    return false
+  }
+}
+
+export function saveInstallDismissed(): void {
+  try {
+    window.localStorage.setItem(INSTALL_KEY, 'dismissed')
   } catch {
     /* ignore */
   }

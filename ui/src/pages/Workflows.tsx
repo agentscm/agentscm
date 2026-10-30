@@ -3,7 +3,7 @@ import { SectionTabs } from '../TopNav.tsx'
 import { fetchSkillWorkflow, fetchSkillWorkflows } from '../api.ts'
 import { validSkillWorkflowRunId, validSkillWorkflowStepId } from '../skillWorkflow.ts'
 import type { SkillWorkflowProjection, SkillWorkflowRunState, SkillWorkflowStep, SkillWorkflowStepState } from '../types.ts'
-import { Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
+import { Box, Empty, Explain, Icon, Notice, PageHead, Path, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
@@ -14,7 +14,7 @@ const STATE: Record<SkillWorkflowRunState, { label: string; tone: Tone; icon: st
   pending: { label: 'Pending', tone: 'muted', icon: 'hourglass' },
   running: { label: 'Running', tone: 'brand', icon: 'arrow-repeat' },
   succeeded: { label: 'Succeeded', tone: 'ok', icon: 'check-circle' },
-  completed_with_omissions: { label: 'Completed with omissions', tone: 'warn', icon: 'check2-square' },
+  completed_with_omissions: { label: 'Finished, some steps skipped', tone: 'warn', icon: 'check2-square' },
   failed: { label: 'Failed', tone: 'bad', icon: 'x-circle' },
   blocked: { label: 'Blocked', tone: 'bad', icon: 'sign-stop' },
   cancelled: { label: 'Cancelled', tone: 'muted', icon: 'slash-circle' },
@@ -181,7 +181,7 @@ export function RunView({ projection: p, stepId, stepHref }: { projection: Skill
   return (
     <div className="stack">
       <header className="detail-head">
-        <h1 className="page-question">Run <code>{run.run_id}</code></h1>
+        <h1 className="page-question">Workflow run</h1>
         <div className="pills">
           <Pill tone={st.tone} icon={st.icon}>{st.label}</Pill>
           <Pill tone="muted" icon="git" tip="The immutable source revision this run checked.">{run.source.revision.slice(0, 12)}</Pill>
@@ -210,6 +210,7 @@ export function RunView({ projection: p, stepId, stepHref }: { projection: Skill
       <details className="disclosure box">
         <summary><Icon name="code-square" /> Technical details</summary>
         <dl className="tech">
+          <dt>Run ID</dt><dd><code>{run.run_id}</code></dd>
           <dt>Repository</dt><dd>{run.source.repository}</dd>
           <dt>Revision</dt><dd><code>{run.source.revision}</code></dd>
           <dt>Policy epoch</dt><dd>{run.source.policy_epoch}</dd>
@@ -266,6 +267,20 @@ function RunPicker({ token }: { token: string }) {
   )
 }
 
+/** The headline from the loaded page: how many runs failed or were blocked, or that all succeeded. */
+export function runsHeadline(runs: { state: SkillWorkflowRunState }[], partial: boolean): string {
+  const n = runs.length
+  if (n === 0) return 'No retained runs yet.'
+  const where = partial ? ' on this page' : ''
+  const f = runs.filter((r) => r.state === 'failed').length
+  const b = runs.filter((r) => r.state === 'blocked').length
+  const last = `${n} check run${n === 1 ? '' : 's'}`
+  if (f > 0) return `Of the last ${last}${where}: ${f} failed${b ? `, ${b} blocked` : ''}.`
+  if (b > 0) return `Of the last ${last}${where}: ${b} blocked.`
+  if (runs.every((r) => r.state === 'succeeded')) return n === 1 ? `The one recent run${where} succeeded.` : `All ${n} recent runs${where} succeeded.`
+  return `None of the last ${last}${where} failed or was blocked.`
+}
+
 function List({ token }: { token: string }) {
   const pager = useHashCursor()
   const [query, setQuery] = useState('')
@@ -274,19 +289,18 @@ function List({ token }: { token: string }) {
   const load = usePoll((signal) => fetchSkillWorkflows(token, signal, cursor ?? undefined), 0, String(cursor))
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Did the checks pass?</h1>
-        <p className="answer-text">Every check, review and action, each tied to one exact revision.</p>
-        <p className="answer-fact">Producing an artifact does not verify its content or permit landing. <a href="#templates?view=workflows">Build a reusable workflow</a>.</p>
-      </div>
+      <PageHead
+        question="Did the checks pass?"
+        answer={load.kind === 'loading' ? 'Looking…' : load.kind === 'error' ? 'Could not load the runs.' : load.value.availability === 'unavailable' ? 'Workflow lookup is unavailable on this hub.' : <>{runsHeadline(load.value.runs, cursor !== null || load.value.next_cursor !== null)}{load.value.runs.length > 0 && <> <Explain text="A sample of the retained runs, not a failure rate for the codebase. Runs are not linked to tasks yet." /></>}</>}
+        fact={<>AgentSCM checks on exact revisions, separate from GitHub or GitLab CI. <a href="#templates?view=workflows">Build a reusable workflow</a></>}
+      />
       <SectionTabs />
       <Box
         tour="workflows-runs"
         tone={load.kind === 'ready' && load.value.availability === 'available' && load.value.runs.some((r) => r.state === 'failed' || r.state === 'blocked') ? 'bad' : 'brand'}
         icon="diagram-3"
         title="Workflow runs"
-        explain="Each run is a set of checks, reviews and other steps. Open one to see what each step recorded."
-        count={load.kind === 'ready' && load.value.availability === 'available' ? load.value.runs.length : undefined}
+        explain="Checks, reviews and other steps on one exact revision. Making an artifact doesn’t verify it or permit landing. Runs aren’t linked to tasks yet."
         actions={
           <RunPicker token={token} />
         }
@@ -311,7 +325,7 @@ function List({ token }: { token: string }) {
               </div>
               {runs.length === 0 ? (
                 <Empty icon="inbox" title={load.value.runs.length ? 'No run on this page matches' : 'No retained runs yet'}>
-                  {!load.value.runs.length && 'Runs appear here after a skill workflow records its result on the hub.'}
+                  {!load.value.runs.length && 'Runs appear after a skill workflow records its result on the hub. Build one under Reusable workflows to start.'}
                 </Empty>
               ) : (
                 <ul className="run-list">
@@ -321,11 +335,11 @@ function List({ token }: { token: string }) {
                       <li key={r.run_id}>
                         <a href={runHref(r.run_id)} className="run-row">
                           <span className={`run-icon tone-${st.tone}`}><Icon name={st.icon} /></span>
+                          <Pill tone={st.tone}>{st.label}</Pill>
                           <span className="run-main">
                             <strong>{r.name}</strong>
-                            <span className="small muted"><code>{r.run_id}</code> · rev <code>{r.revision.slice(0, 10)}</code> · #{r.sequence}</span>
+                            <span className="small muted" title={`Sequence ${r.sequence}`}><code>{r.run_id}</code> · rev <code>{r.revision.slice(0, 10)}</code></span>
                           </span>
-                          <Pill tone={st.tone}>{st.label}</Pill>
                           <Icon name="chevron-right" className="muted" />
                         </a>
                       </li>
@@ -338,7 +352,7 @@ function List({ token }: { token: string }) {
           )
         })()}
       </Box>
-      <p className="small muted"><Explain text="AgentSCM can also record workflows started from the Workspace; those open from the Workspace page." /> Landing admission is never decided on this page.</p>
+      <p className="small muted"><Explain text="AgentSCM can also record workflows started from the Workspace; those open from the Workspace page." /> Nothing here decides whether a change can merge.</p>
     </div>
   )
 }

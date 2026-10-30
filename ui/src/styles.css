@@ -370,13 +370,8 @@ kbd {
   text-decoration: none;
 }
 .health-chip.is-bad { color: var(--hub-warn); background: var(--hub-warn-soft); }
-.health-chip.is-bad .live-dot { background: var(--hub-warn); animation: none; }
-.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--hub-ok); animation: pulse 2.4s ease-out infinite; }
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--hub-ok) 45%, transparent); }
-  70% { box-shadow: 0 0 0 7px transparent; }
-  100% { box-shadow: 0 0 0 0 transparent; }
-}
+.health-chip.is-bad .live-dot { background: var(--hub-warn); }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--hub-ok); }
 
 /* Popover menus: repository switcher and account */
 .acct-btn {
@@ -2010,84 +2005,46 @@ a.run-row:hover {
 .caps li.is-on > i:first-child { color: var(--hub-ok); }
 .caps li.is-off { color: var(--hub-text-3); }
 
-/* Signed out */
-.signin {
-  min-height: 100dvh;
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(360px, 480px);
-  gap: clamp(28px, 6vw, 96px);
-  align-items: center;
-  --signin-pad: clamp(24px, 6vw, 88px);
-  padding: var(--signin-pad);
-  max-width: 1280px;
-  margin: 0 auto;
-}
-/* Centre the intro in the first screen, not the row, so a growing panel does not move it. */
-.signin-intro {
-  align-self: start;
-  min-height: calc(100dvh - 2 * var(--signin-pad));
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: flex-start;
-}
-.signin-intro h1 {
-  font-size: clamp(2rem, 4vw, 3rem);
-  font-weight: 750;
-  letter-spacing: -0.03em;
-  line-height: 1.08;
-  margin: 28px 0 16px;
-  text-wrap: balance;
-}
-.signin-intro .lead {
-  font-size: 1.05rem;
-  color: var(--hub-text-2);
-  max-width: 52ch;
-}
-.signin-points {
-  list-style: none;
-  padding: 0;
-  margin: 28px 0 0;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.signin-points li {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  font-weight: 600;
-}
-.signin-points i {
-  width: 36px;
-  height: 36px;
-  display: grid;
-  place-items: center;
-  border-radius: 10px;
-  background: var(--hub-brand-soft);
-  color: var(--hub-brand-ink);
-  font-size: 1.05rem;
-}
-.signin-panel .box-body {
-  padding: 22px;
+/* Signed out: three groups read in order (headline, the card, the agent row); wide gaps between them, tight ones inside. */
+.signin { position: relative; min-height: 100dvh; display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; padding: clamp(88px, 12vh, 120px) 16px clamp(48px, 8vh, 96px); }
+.signin-logo { position: absolute; top: 18px; left: 20px; }
+.signin-column { width: min(100%, 480px); }
+.signin-intro h1 { font-size: clamp(34px, 4.6vw, 52px); line-height: 1.1; margin: 0 0 16px; text-wrap: balance; }
+.signin-intro .lead { margin: 0 0 48px; max-width: 38ch; }
+.signin-card .box-body { padding: 30px 30px 28px; }
+.signin-providers { display: grid; gap: 12px; }
+.signin-providers .btn { display: inline-flex; justify-content: center; align-items: center; gap: 8px; }
+.signin-fine { font-size: 13px; line-height: 1.55; color: var(--hub-text-3); margin: 14px 0 0; }
+.signin-rule { border-top: 1px solid var(--hub-rule); padding-top: 20px; margin-top: 24px; }
+.signin-label { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.signin-label .form-label { font-size: 14px; font-weight: 600; margin: 0; }
+.signin-keep { margin: 16px 0 20px; }
+.signin-make { margin-top: 10px; }
+.signin-agents { margin-top: 48px; }
+.signin-agents-title { font-size: 15px; font-weight: 500; margin: 0 0 14px; }
+.signin-agents-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.signin-agents-actions .signin-agent { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.signin-agents-note { font-size: 13px; line-height: 1.55; margin: 12px 0 0; text-wrap: pretty; }
+.signin-agents-miss, .signin-agents-copy { font-size: 13px; line-height: 1.55; margin: 12px 0 0; text-wrap: pretty; }
+.signin-agents-miss a { color: inherit; text-decoration: underline; }
+/* A link-style copy button: it reads as part of the sentence, not as another pill. */
+.signin-agents-copy .signin-agents-copylink { display: inline; padding: 0; border: 0; font-size: inherit; line-height: inherit; vertical-align: baseline; text-decoration: underline; color: inherit; }
+.signin-split { display: inline-flex; position: relative; }
+/* Two classes, to outrank the pill radius every .btn gets. */
+.signin-split .signin-split-main { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.signin-split .signin-split-toggle { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; padding-inline: 8px; }
+/* The row sits at the foot of the page, so its menu opens upward. */
+.signin-split .pop-menu { top: auto; bottom: calc(100% + 8px); }
+@media (max-width: 640px) {
+  /* Deep links need the agent installed on this computer; the copy pills work from a phone. */
+  .signin-agent-open, .signin-agents-note { display: none; }
+  .signin-logo { left: 16px; }
+  .signin-card .box-body { padding: 24px 20px 22px; }
 }
 .field-error {
   color: var(--hub-bad);
   margin: 8px 0 0;
   font-size: 0.85rem;
-}
-.create-token {
-  margin-top: 20px;
-  padding-top: 16px;
-  border-top: 1px solid var(--hub-rule);
-}
-.signin-alt {
-  display: flex;
-  gap: 10px;
-  margin-top: 14px;
-}
-.signin-alt > * {
-  flex: 1;
 }
 .signed-out-workspace {
   max-width: 980px;
@@ -2141,12 +2098,6 @@ a.run-row:hover {
   .side.is-compact .side-badge { position: static; box-shadow: none; }
   .side.is-compact .side-group:first-child .side-head { display: flex; }
   .side-foot { display: none; }
-  .signin {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .signin-intro {
-    min-height: 0;
-  }
 }
 @media (max-width: 640px) {
   .main {
@@ -2557,7 +2508,8 @@ a.run-row:hover {
 .gate-step-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-height: 26px; }
 .gate-step-head strong { font-size: 0.94rem; }
 .gate-who { display: inline-flex; align-items: center; gap: 5px; font-size: 0.8rem; color: var(--hub-text-3); }
-.gate-step-head .pill { margin-left: auto; }
+/* The enforcement label is a sentence: let it wrap, or its nowrap width widens the whole page past a phone and the fixed tour card with it. */
+.gate-step-head .pill { margin-left: auto; white-space: normal; }
 .gate-plain { margin: 2px 0 0; font-size: 0.88rem; line-height: 1.5; color: var(--hub-text); overflow-wrap: anywhere; }
 .gate-note { display: flex; gap: 6px; align-items: baseline; margin: 12px 0 0; font-size: 0.8rem; color: var(--hub-text-3); }
 .gate-needs { margin: 2px 0 0; font-size: 0.8rem; line-height: 1.45; color: var(--hub-text-3); overflow-wrap: anywhere; }
@@ -2628,6 +2580,9 @@ a.run-row:hover {
   .health-chip { min-width: 44px; min-height: 44px; justify-content: center; }
   .btn:not(.btn-link) { min-height: 44px; }
   .form-control, .form-select { min-height: 44px; }
+  .box-actions .form-switch { min-height: 44px; display: flex; align-items: center; }
+  .box-actions .btn { min-width: 44px; }
+  .overlap-side a, .plain-list .work-link { display: inline-block; padding-block: 11px; }
 }
 .lane-title { margin: 0; font: inherit; color: inherit; }
 .ws-grid .combo { min-width: min(100%, 18rem); }

@@ -690,7 +690,7 @@ export function decodeExplorerConversation(value: unknown): ExplorerConversation
 
 function adviceFor(status: number): string {
   if (status === 400) return 'The local explorer could not use that request. Return to the current source and try again.'
-  if (status === 401) return 'The local explorer needs its read token. Add it in Settings → This computer.'
+  if (status === 401) return 'The local explorer needs its read token. Add it in Setup › Preferences › This computer.'
   if (status === 403) return 'The local explorer refused this page’s origin. Open the Hub through its configured browser origin.'
   if (status === 404) return 'The source is not available. Start agentscm serve with --explorer-repo and --explorer-repository, or choose another retained item.'
   if (status === 409) return 'The source changed while the explorer opened it. Refresh the source identity and try again.'
@@ -738,7 +738,7 @@ async function boundedJson(response: Response): Promise<unknown> {
 
 async function explorerRead<T>(endpoint: string, params: Record<string, string | number | undefined>, decode: (value: unknown) => T, signal: AbortSignal): Promise<T> {
   const configured = loadLocalBase()
-  if (!validLocalBase(configured)) throw new ExplorerResponseError('The saved local server address is not a loopback address. Update it in Settings → This computer.')
+  if (!validLocalBase(configured)) throw new ExplorerResponseError('The saved local server address is not a loopback address. Update it in Setup › Preferences › This computer.')
   const crossOrigin = configured !== ''
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) if (value !== undefined) query.set(key, String(value))

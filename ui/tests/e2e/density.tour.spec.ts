@@ -4,7 +4,8 @@ import { expect, test, type Page } from '@playwright/test'
 
 test.beforeAll(async ({ request }) => {
   const up = await request.get('/__mock/up').catch(() => null)
-  test.skip(!up?.ok(), 'Needs the mock hub: run with MOCK=1 so vite serves it.')
+  // Without MOCK=1, vite's SPA fallback answers this path with index.html, so check the mock's own reply.
+  test.skip(!up?.ok() || !(await up.text()).includes('hub is now healthy'), 'Needs the mock hub: run with MOCK=1 so vite serves it.')
 })
 
 const dialog = (page: Page) => page.getByRole('dialog')
@@ -83,7 +84,7 @@ for (const density of ['spacious', 'condensed'] as const) {
       await walk(page)
     })
 
-    for (const [hash, name] of [['#home', 'Dashboard › Now'], ['#now', 'Dashboard › Where'], ['#work/finished', 'History']] as const) {
+    for (const [hash, name] of [['#home', 'Now'], ['#now', 'Where'], ['#work/finished', 'Finished']] as const) {
       test(`the ${name} page tour stays on screen with its spotlight on target`, async ({ page }) => {
         await signIn(page, hash)
         await page.getByRole('button', { name: 'Tour this page' }).click()

@@ -1,14 +1,14 @@
 import type { Health } from '../types.ts'
 import { SectionTabs } from '../TopNav.tsx'
-import { Box, Explain, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
+import { Box, Explain, Icon, Notice, PageHead, Skeleton } from '../ui.tsx'
 
 const BUDGET_MS = 250
 const STORAGE: Record<string, string> = { sqlite: 'SQLite', postgres: 'PostgreSQL' }
 
 const COUNTERS = [
-  ['denied', 'slash-circle', 'Refused first edits', 'Edits refused because another agent holds the file. A session is refused once per file; repeating the same edit is let through.'],
-  ['repeated', 'arrow-repeat', 'Repeated after refusal', 'Refused edits an agent repeated, which the hub then let through.'],
-  ['fail_open', 'door-open', 'Let through when unsure', 'Hook calls where the hub could not decide (an error or timeout). A failure never refuses, so the edit went ahead.'],
+  ['denied', 'slash-circle', 'Refused first edits', 'Edits refused because another agent holds the file. A session is warned once per file; repeating the same edit goes ahead.'],
+  ['repeated', 'arrow-repeat', 'Went ahead after a warning', 'Edits an agent repeated after the one warning. They go ahead by design; the hub never locks files.'],
+  ['fail_open', 'door-open', 'Hub could not decide; edit went ahead', 'Hook calls where the hub could not decide (an error or timeout). A failure never refuses, so the edit went ahead (by design).'],
   ['rate_limited', 'speedometer', 'Rate-limited refusals', 'Edits that passed with only a note, because a session had already been refused 3 times in 10 minutes.'],
 ] as const
 
@@ -19,24 +19,19 @@ export function HealthPage({ health }: { health: Health | null }) {
   const pct = Math.min(p95 / BUDGET_MS, 1) * 100
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Is the hub OK?</h1>
-        <p className="answer-text">{!health ? 'Checking…' : ok ? <>The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'The hub reports it is unavailable. This page keeps trying.'}</p>
-      </div>
+      <PageHead
+        question="Is the hub OK?"
+        answer={!health ? 'Checking…' : ok ? <>The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'The hub reports it is unavailable. This page keeps trying.'}
+        fact={health && ok ? `${health.demo ? 'Demo hub. ' : ''}Checked every 15 seconds.` : undefined}
+      />
       <SectionTabs />
       {!health ? (
         <Skeleton rows={4} />
       ) : !ok ? (
-        <Notice tone="bad" icon="heartbreak" title="Hub unavailable">The database did not answer the last health check. Agents fall back to letting edits through until it recovers.</Notice>
+        <Notice tone="bad" icon="heartbreak" title="Hub unavailable">The database did not answer the last health check. Edits go ahead unchecked until it recovers.</Notice>
       ) : (
         <div className="stack">
-          <Box icon="heart-pulse" tone="ok" title="Status" explain="Polled every 15 seconds from /v1/hub/health.">
-            <div className="pills">
-              <Pill tone="ok" icon="check-circle">Healthy</Pill>
-              {health.storage && <Pill tone="muted" icon="database">{STORAGE[health.storage] ?? health.storage}</Pill>}
-              {health.demo && <Pill tone="brand" icon="play-circle">Demo hub</Pill>}
-            </div>
-          </Box>
+          {!c && <Notice tone="muted" icon="info-circle" title="No coordination counters reported yet">They appear once agents start editing through the hook.</Notice>}
           {c && (
             <>
               <Box icon="shield-check" title="Coordination since the hub started" explain="How often the edit hook stepped in. Counters reset when the hub restarts.">

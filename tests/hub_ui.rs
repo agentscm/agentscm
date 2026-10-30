@@ -55,8 +55,8 @@ async fn ui_is_served_with_a_content_security_policy() {
     assert_eq!(
         csp,
         "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-         img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; \
-         form-action 'none'; frame-ancestors 'none'"
+         img-src 'self' data:; font-src 'self' data:; connect-src 'self'; manifest-src 'self'; \
+         base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
     assert_eq!(header("x-content-type-options"), "nosniff");
     assert_eq!(header("referrer-policy"), "no-referrer");
@@ -70,5 +70,27 @@ async fn ui_is_served_with_a_content_security_policy() {
     // Without the feature the page is a notice and there are no assets.
     let script = get("/ui/app.js").await.unwrap().status();
     assert_eq!(script, if cfg!(feature = "ui") { 200 } else { 404 });
+    // The install manifest and its icons ship with the page.
+    for (path, kind) in [
+        ("/ui/manifest.webmanifest", "application/manifest+json"),
+        ("/ui/icon-192.png", "image/png"),
+        ("/ui/icon-512.png", "image/png"),
+    ] {
+        let asset = get(path).await.unwrap();
+        assert_eq!(
+            asset.status(),
+            if cfg!(feature = "ui") { 200 } else { 404 },
+            "{path}"
+        );
+        if cfg!(feature = "ui") {
+            assert_eq!(asset.headers()["content-type"], kind, "{path}");
+            assert!(
+                asset.headers()["content-security-policy"]
+                    .to_str()
+                    .unwrap()
+                    .contains("manifest-src 'self'")
+            );
+        }
+    }
     assert_eq!(get("/ui/other").await.unwrap().status(), 404);
 }

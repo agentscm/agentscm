@@ -102,6 +102,10 @@ describe('crumbsFor', () => {
       { label: `Work ${ID.slice(0, 12)}…`, href: `#change-record/${ID}`, mono: true },
     ])
   })
+  it('change record crumb names the task when the overview has it', () => {
+    expect(crumbsFor(`#change-record/${ID}`, section('change-record'), overview).at(-1)).toEqual({ label: 'Rebuild the hub shell', href: `#change-record/${ID}` })
+    expect(crumbsFor(`#change-record/wrk_${'b'.repeat(32)}`, section('change-record'), overview).at(-1)!.label).toBe('Finished thing')
+  })
   it('other sections are a single crumb', () => {
     expect(crumbsFor('#health', section('health'), null)).toEqual([{ label: 'Hub', href: '#health', icon: 'heart-pulse' }])
   })

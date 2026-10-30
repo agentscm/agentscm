@@ -23,7 +23,8 @@ import {
   type ExplorerSessionPage,
   type ExplorerSummary,
 } from '../repoExplorer.ts'
-import { Ago, CopyButton, Empty, Icon, Notice, OnThisComputer, Pill, Reported, Skeleton, type Tone } from '../ui.tsx'
+import { Ago, CopyButton, Empty, Explain, Icon, Notice, OnThisComputer, PageHead, Pill, Reported, Skeleton, type Tone } from '../ui.tsx'
+import { READING_CHANGES_NOTHING } from '../copy.ts'
 import { localReachable } from '../localApi.ts'
 import { onFrontDoor } from '../frontDoor.ts'
 import '../explorer.css'
@@ -216,7 +217,7 @@ function ConversationsView({ load, pager, repository, hubRepository, onConversat
   const coverage = page.projection_coverage
   return (
     <>
-      <p className="explorer-conversations-intro">Saved on this computer for <code>{page.repository}</code>, newest first. Each conversation belongs to its Work and session; it is not tied to the commit you are viewing unless the Evidence tab shows a recorded action for it.</p>
+      <p className="explorer-conversations-intro">Saved on this computer for <code>{page.repository}</code>, newest first. Each belongs to its Work and session. <Explain text="A conversation is not tied to the commit you are viewing unless the Evidence tab shows a recorded action for it." /></p>
       {(coverage.unavailable_bodies > 0 || coverage.capture_gaps > 0 || coverage.compacted_event_batches_unattributed > 0) && <Notice tone="warn" icon="archive-fill" title="Some saved capture is missing">Across all saved conversations for this repository: {coverage.unavailable_bodies > 0 ? `${coverage.unavailable_bodies} visible ${coverage.unavailable_bodies === 1 ? 'body is' : 'bodies are'} unavailable. ` : ''}{coverage.capture_gaps > 0 ? `${coverage.capture_gaps} capture ${coverage.capture_gaps === 1 ? 'gap is' : 'gaps are'} retained. ` : ''}{coverage.compacted_event_batches_unattributed > 0 ? `${coverage.compacted_event_batches_unattributed} compacted event ${coverage.compacted_event_batches_unattributed === 1 ? 'batch is' : 'batches are'} no longer attributable to a session. ` : ''}Missing content stays missing.</Notice>}
       {coverage.unverified_bodies > 0 && <p className="small muted">Saved text is checked when you open a conversation.</p>}
       {page.sessions.length === 0 ? <Empty icon="chat-square" title="No saved conversations on this computer">Conversations appear here only when capture was turned on for an agent session in this repository. Connecting a computer never starts capture.</Empty> : <ol className="explorer-evidence-list">{page.sessions.map((entry) => <SessionRow key={`${entry.work_id}|${entry.generation}|${entry.session_id}`} entry={entry} repository={repository} hubRepository={hubRepository} onConversation={onConversation} />)}</ol>}
@@ -522,11 +523,7 @@ export function ExplorerPage({ hubRepository }: { hubRepository?: string | null 
   const summary = useResource(reachable ? `summary|${selectedRef}|${refresh}` : null, (signal) => fetchExplorerSummary(selectedRef, signal))
   return (
     <div className="page explorer-page">
-      <div className="answer">
-        <h1 className="page-question">What happened around this code?</h1>
-        <p className="answer-text">Files, history and the evidence behind them.</p>
-        <p className="answer-fact"><Icon name="laptop" /> Read-only from your local checkout. Refresh never changes your files.</p>
-      </div>
+      <PageHead question="What happened around this code?" answer="Files, history and the evidence behind them." fact={<><Icon name="laptop" /> Read from your local checkout. {READING_CHANGES_NOTHING}</>} />
       <SectionTabs />
       {!reachable && <OnThisComputer what="The file explorer" />}
       {summary.kind === 'loading' && <Skeleton rows={6} />}

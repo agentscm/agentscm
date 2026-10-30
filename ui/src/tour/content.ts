@@ -51,62 +51,64 @@ export const WELCOME: TourDef = {
   steps: [
     {
       title: 'This page shows what your agents are doing',
-      what: 'The hub watches every coding agent connected to this repository: which files each one holds, which task it owns, and what checks said about its work.',
+      what: 'The hub watches every coding agent connected to this repository: which files each one is editing, which task it owns, and what checks said about its work.',
       why: 'Two agents editing the same file is how work gets lost. The hub spots it first and tells you who to talk to.',
-      how: 'Most pages only read, so look around freely. Two places can change things, and both say so: Setup › Access, after you sign in with GitHub or GitLab, and the inline agent views in Setup › Preferences.',
+      how: 'Most pages only read, so look around freely. Places that can change something: Setup › Access (runs, approvals, landing, members), Setup › Computers (revoke), History › Promises, Setup › Preferences (inline agent views, conversation sharing) and Catch up (Mark reviewed). Revoke, approve, land and turning sharing on ask first; Mark reviewed, the inline-view switches and turning sharing off act at once, and each is labelled.',
       tip: (c) => (c.d ? `Right now ${plural(c.d.agents.length, 'agent')} ${c.d.agents.length === 1 ? 'is' : 'are'} connected to this repository.` : null),
       empty: 'Once an agent connects, the count of live agents shows here.',
     },
     {
-      target: T('repo'),
-      title: 'Your repository',
-      what: 'The repository this page is about. Your sign-in token decides which one you see.',
-      why: 'Every number on every page belongs to this one repository, so check it before you act on what you read.',
-      how: 'To look at another repository, open this menu and use a token made for it.',
-      tip: (c) => (c.data?.whoami ? `You are looking at ${c.data.whoami.token.repository}.` : null),
+      target: T('answer'),
+      title: 'Start with the sentence',
+      what: 'One line: how many tasks are unfinished, how many are moving or stuck, and how many things need you.',
+      why: 'You know in two seconds how busy the repository is and whether it needs a person.',
+      how: 'The tabs and cards below hold the detail behind each number.',
+      tip: (c) => {
+        const t = c.text('[data-tour="answer"] .answer-text')
+        return t ? `This page’s sentence reads: “${t}”` : null
+      },
     },
     {
-      target: T('search'),
-      title: 'Search everything with ⌘K',
-      what: 'One box that finds pages, agents, held files and work items.',
-      why: 'It is the fastest way to answer “who has this file?” without clicking through pages.',
-      how: 'Press ⌘K (Ctrl K on Windows and Linux) or / from anywhere. Type a file name, an agent or a task. Try “walk me through” to replay a page tour.',
+      target: T('needs'),
+      title: 'Needs you is your to-do list',
+      what: 'Each item names the person and agent, says what to do, and has a Copy button with the exact instruction to paste into that agent.',
+      why: 'Each one stays stuck until someone decides. Blocked tasks, agents that went quiet, handovers (one agent passing a task to another) and files two agents are both editing all land here.',
+      how: 'Do what the item says, or press Copy and paste the instruction into that agent.',
+      empty: 'When nothing needs you, this box says so in green.',
     },
     {
-      target: T('live'),
-      title: 'Live means the numbers are fresh',
-      what: 'A green dot says the hub answered the last refresh. Pages refresh every few seconds while this tab is open.',
-      why: 'If the hub stops answering, the page keeps the last data it had and says so. You will never act on stale numbers without a warning.',
-      how: 'When it turns coral or says Reconnecting, open it to see the hub’s health.',
-      tip: (c) => (!c.data?.health ? null : c.data.failing ? 'The hub did not answer the last refresh, so you are seeing older data.' : c.data.health.status === 'ok' ? 'The hub is answering right now.' : 'The hub reports a problem. Open it for details.'),
-    },
-    {
-      target: NAV('home'),
-      title: 'Dashboard: what is happening',
-      what: 'One sentence on top, then four tabs. Now lists what needs you and every task as a lane. Where maps the repository. Catch up shows what happened while you were away. Team shows who is working.',
-      why: 'This is where you catch two agents about to collide, before either one wastes an afternoon.',
-      how: 'Start your day here. A coral number in the sentence or on the rail counts the things that need a person.',
-      tip: (c) => (!c.d ? null : c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file is', 'files are')} contested right now. Open Where to see who holds each one.` : 'No contested files right now: every held path has exactly one agent.'),
+      target: T('work-lanes'),
+      title: 'Every unfinished task on one track',
+      what: 'Where each task is now, which agent has it, and its next step.',
+      why: 'A coral segment is blocked and an amber one went quiet. A quiet task is still assigned, so ask whoever leads it before taking it over.',
+      how: 'Click a task for its full story and proof.',
+      tip: (c) => {
+        const cur = c.overview?.current
+        if (!cur) return null
+        const blocked = cur.filter((i) => i.state === 'blocked').length
+        return blocked > 0 ? `${plural(blocked, 'task is', 'tasks are')} blocked right now. Open one to read the blocker the agent wrote.` : cur.length > 0 ? `${plural(cur.length, 'task')} assigned and none blocked.` : null
+      },
+      empty: 'The tasks appear here on the Dashboard once agents announce them.',
     },
     {
       target: NAV('inbox'),
       title: 'Inbox: the conversations to have',
-      what: 'Tasks that declared overlapping files, and the requests agents sent each other to split, join or hand over.',
-      why: 'An overlap is a signal to talk, not proof of a conflict. Reading the Inbox never answers a request for anyone.',
+      what: 'Tasks that plan to change the same files, and the requests agents sent each other to split the work, join it or pass it on.',
+      why: 'An overlap (two tasks plan to change the same file) is a signal to talk, not proof of a conflict. Reading the Inbox never answers a request for anyone.',
       how: 'Open a request to see who asked whom, and whether they received and replied.',
-      tip: (c) => (c.overview ? (c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'overlap')} waiting in the Inbox.` : 'No declared scopes overlap right now.') : null),
+      tip: (c) => (c.overview ? (c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'overlap')} waiting in the Inbox.` : 'No two tasks plan to change the same file right now.') : null),
     },
     {
       target: NAV('history'),
       title: 'History: what happened before',
-      what: 'What agents reported finished, every change to Work page by page, change records ready to hand off, and the files behind them.',
+      what: 'What agents reported finished, every change to each task, page by page, change records ready to hand off, and the files behind them.',
       why: 'An agent saying “done” is not proof. History keeps the record so you can check before you trust it.',
       how: 'Open a finished task, then its change record, before you build on it.',
     },
     {
       target: NAV('skills'),
       title: 'Skills: did the agreed steps run',
-      what: 'The workflows agents here must follow, the checks that ran on each exact revision, what CI and deploys did after a merge, and reusable recipes.',
+      what: 'The workflows agents here are expected to follow, the checks that ran on each exact version of the code, what CI and deploys did after a merge, and the Library of reusable workflows.',
       why: 'A passing check only proves those exact files passed. These pages keep that honest.',
       how: 'Before you trust a finished task, look for its check run or its landed change.',
       tip: (c) => {
@@ -123,30 +125,31 @@ export const WELCOME: TourDef = {
       tip: (c) => (c.d ? (c.d.agents.length > 0 ? `${plural(c.d.agents.length, 'agent is', 'agents are')} already reporting here.` : 'No agents are reporting yet, so Setup is the place to start.') : null),
     },
     {
-      target: T('view', 'menu'),
-      title: 'Light or dark, spacious or condensed',
-      what: 'This menu switches the sheet between light and dark, or follows your device, and between Spacious and Condensed.',
-      why: 'Condensed fits more on screen without moving anything: every page keeps the same parts in the same places.',
-      how: 'Both choices stay in this browser only. Setup › Preferences has them too.',
+      target: T('repo'),
+      title: 'Your repository',
+      what: 'The repository this page is about. Your hub token (or your GitHub or GitLab sign-in) decides which one you see.',
+      why: 'Every number on every page belongs to this one repository, so check it before you act on what you read.',
+      how: 'To look at another repository, open this menu. With a GitHub or GitLab sign-in you switch here; with a pasted hub token, use a token made for that repository.',
+      tip: (c) => (c.data?.whoami ? `You are looking at ${c.data.whoami.token.repository}.` : null),
     },
     {
       target: T('tour-trigger'),
-      title: 'Lost? Each page has its own tour',
-      what: 'The question mark walks you through the page you are on, pointing at the real numbers on screen.',
+      title: 'Lost? Most pages have their own tour',
+      what: 'The question mark walks you through the page you are on, pointing at the real numbers on screen. Pages without their own tour replay this one.',
       why: 'Each page answers one question. A short tour shows how to read the answer.',
-      how: 'Use it whenever a page is unclear, or press ⌘K and choose “Walk me through this page”. Setup › Preferences turns tours on or off.',
+      how: 'Press ⌘K (Ctrl K on Windows and Linux) or / to search pages, agents, files being edited and tasks, and choose “Walk me through this page”. The View menu in the top bar switches the page between light and dark and between Spacious and Condensed; both stay in this browser. Setup › Preferences chooses which page tours play automatically.',
     },
   ],
 }
 
 export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   home: {
-    title: 'Dashboard › Now',
+    title: 'Now',
     steps: [
       {
         target: T('answer'),
         title: 'The answer comes first',
-        what: 'One sentence: how many agents are working on how many tasks.',
+        what: 'One sentence in this shape: “N unfinished tasks: a moving, b stuck. k things need you.”',
         why: 'You should know in two seconds how busy the repository is. The tabs below count what needs you and where agents cross.',
         how: 'The sentence stays on top of every dashboard tab.',
         tip: (c) => (c.d && c.overview ? `${plural(c.d.agents.length, 'agent')} on ${plural(c.overview.current.length, 'task')} right now.` : null),
@@ -161,15 +164,15 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('needs'),
         title: 'Needs you',
-        what: 'Blocked tasks, agents that went quiet but still hold their task, handovers, files two agents both hold, tasks planning the same files, and pull requests that touch files an agent holds.',
+        what: 'Blocked tasks, agents that went quiet but still have their task, handovers (one agent passing a task to another), files two agents are both editing, tasks that plan to change the same files, and pull requests that touch files an agent is editing.',
         why: 'Each one stays stuck until someone decides.',
-        how: 'Each row ends with what to do next. Follow its link to the task, the file or the Inbox.',
+        how: 'Each row names the person and agent and ends with what to do next, with a Copy button for the instruction to paste into that agent. Follow its link to the task, the file or the Inbox.',
         empty: 'When nothing needs you, this box says so in green.',
       },
       {
         target: T('work-lanes'),
         title: 'The track',
-        what: 'Every unfinished task as one lane: claimed, where it is now with the face of the agent holding it, its next step, then finished.',
+        what: 'Every unfinished task as one row: taken by an agent, where it is now with the face of the agent that has it, its next step, then finished.',
         why: 'A coral segment is blocked and an amber one went quiet. A quiet task is still assigned, so ask its lead before taking it over.',
         how: 'Click any segment to open the task. When a task moves, its new segment sweeps in with the agent riding it.',
         tip: (c) => {
@@ -178,21 +181,21 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
           const blocked = cur.filter((i) => i.state === 'blocked').length
           return blocked > 0 ? `${plural(blocked, 'task is', 'tasks are')} blocked right now. Open one to read the blocker the agent wrote.` : cur.length > 0 ? `${plural(cur.length, 'task')} assigned and none blocked.` : null
         },
-        empty: 'When agents announce tasks, each appears here as a lane.',
+        empty: 'When agents announce tasks, each appears here as a row.',
       },
     ],
   },
   team: {
-    title: 'Dashboard › Team',
+    title: 'Team',
     steps: [
       {
         target: T('now-agents'),
         title: 'Who is working',
-        what: 'Live agents grouped by the person who owns them. A green dot means the agent reported in the last five minutes; amber means it is quieter but still holds its files.',
-        why: 'Before you start something, check nobody already holds those files.',
-        how: 'Each chip is a file or folder the agent holds. A coral chip is contested.',
-        tip: (c) => (c.d && c.d.agents.length > 0 ? `${c.d.agents[0]!.name} (${c.d.agents[0]!.owner}) holds ${plural(c.d.agents[0]!.holdings.length, 'path')}.` : null),
-        empty: 'No agents are active. When a connected agent starts editing, it appears here with the files it holds.',
+        what: 'Live agents grouped by the person who owns them. A green dot means the agent reported in the last five minutes; amber means it is quieter but is still editing its files.',
+        why: 'Before you start something, check nobody is already editing those files.',
+        how: 'Each chip is a file or folder the agent is editing. A coral chip is two agents both editing it.',
+        tip: (c) => (c.d && c.d.agents.length > 0 ? `${c.d.agents[0]!.name} (${c.d.agents[0]!.owner}) is editing ${plural(c.d.agents[0]!.holdings.length, 'path')}.` : null),
+        empty: 'No agents are active. When a connected agent starts editing, it appears here with the files it is editing.',
       },
     ],
   },
@@ -202,48 +205,56 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('answer'),
         title: 'What needs a conversation',
-        what: 'How many declared-scope overlaps and open requests there are, with a bar showing where each one stands.',
-        why: 'Overlaps are a signal to talk before two agents write the same code. Detecting one sends nothing.',
-        how: 'Coral is an overlap nobody has raised yet, amber a request waiting for an answer, violet one that settled.',
+        what: 'How many overlapping plans and open requests there are.',
+        why: 'An overlap (two tasks plan to change the same file) is a signal to talk before two agents write the same code. Detecting one sends nothing.',
+        how: 'Open an overlap to see both agents and their files. Open a request to see who asked whom, and whether they received and replied.',
         tip: (c) => (c.overview ? (c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'overlap')} right now.` : 'No overlaps right now.') : null),
+      },
+      {
+        target: T('inbox-talk'),
+        title: 'What to tell their agents',
+        what: 'Each overlap says who to talk to and gives a Copy button with the message to paste into each agent.',
+        why: 'The hub sends nothing itself. The message is ready so you only have to paste it.',
+        how: 'Press Copy prompt for the agent you are about to talk to, then paste it into that agent.',
+        empty: 'When two tasks plan to change the same file, the person to talk to and the Copy buttons appear here.',
       },
     ],
   },
   now: {
-    title: 'Dashboard › Where',
+    title: 'Where',
     steps: [
       {
         target: T('now-map'),
         title: 'The repository as a map',
-        what: 'One tile per top-level folder an agent holds files in or a task plans to touch. Faces are the agents there; a deeper colour means more people.',
-        why: 'A coral ring and pill mark a crossing: two agents holding one file, or two tasks planning the same one.',
-        how: 'Pick a tile to see who is editing there, which tasks plan to, and why it crosses.',
-        tip: (c) => (c.d ? (c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file')} contested. Look for the coral tile.` : 'No contested files right now.') : null),
+        what: 'One tile per top-level folder an agent is editing files in or a task plans to touch. Faces are the agents there; a deeper colour means more people.',
+        why: 'A coral ring and pill mark a clash: two agents both editing one file, or two tasks that plan to change the same one.',
+        how: 'Pick a tile to see who is editing there, which tasks plan to, and what clashes there.',
+        tip: (c) => (c.d ? (c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file')} with two agents editing it. Look for the coral tile.` : 'No file has two agents editing it right now.') : null),
         empty: 'Tiles appear when an agent starts editing or a task declares its scope.',
       },
       {
         target: T('now-contested'),
         title: 'Contested files',
-        what: 'Files that two agents hold at the same time.',
+        what: 'Files that two agents are both editing at the same time.',
         why: 'The hub refuses the second agent’s first edit to one of these. If nobody steps in, one agent’s work gets thrown away.',
-        how: 'Each row says who holds it and whether a handoff was asked for. Then tell one agent to wait or hand it over.',
+        how: 'Each row says who is editing it and whether one agent asked the other to hand the file over. Then tell one agent to wait or hand it over.',
         tip: (c) => (!c.d ? null : c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file')} two agents are editing at once.` : null),
-        empty: 'Nothing is contested now. When two agents claim the same path, the file appears here with both holders.',
+        empty: 'Nothing has two agents editing it now. When two agents edit the same path, the file appears here with both of them.',
       },
       {
         target: T('now-prs'),
-        title: 'Pull requests touching held files',
-        what: 'Open pull requests whose changes overlap files a live agent is editing.',
+        title: 'Pull requests touching files being edited',
+        what: 'Open pull requests whose changes touch files a live agent is editing.',
         why: 'A merge that lands under an agent’s feet makes its work conflict.',
-        how: 'If an overlap shows up, merge the pull request first or ask the agent to rebase after it.',
-        tip: (c) => (!c.d || !c.data?.work ? null : !c.data.work.connected ? null : c.d.prOverlaps.length > 0 ? `${plural(c.d.prOverlaps.length, 'pull request overlaps', 'pull requests overlap')} with a live agent.` : null),
-        empty: 'Pull requests appear here once GitHub or GitLab is connected to the hub and one touches a held file.',
+        how: 'If one shows up, merge the pull request first or ask the agent to rebase after it.',
+        tip: (c) => (!c.d || !c.data?.work ? null : !c.data.work.connected ? null : c.d.prOverlaps.length > 0 ? `${plural(c.d.prOverlaps.length, 'pull request touches', 'pull requests touch')} files a live agent is editing.` : null),
+        empty: 'Pull requests appear here once GitHub or GitLab is connected to the hub and one touches a file an agent is editing.',
       },
     ],
   },
 
   work: {
-    title: 'History',
+    title: 'Finished',
     steps: [
       {
         target: T('answer'),
@@ -258,8 +269,8 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       },
       {
         target: T('tabs'),
-        title: 'Four views of what happened',
-        what: 'Finished, Changes, Change records and Files.',
+        title: 'Five views of what happened',
+        what: 'Finished, Changes, Promises, Change records and Files.',
         why: 'Each answers a different question, so you do not have to hunt through one long list.',
         how: 'Files reads from your own checkout on this computer; the rest come from the hub.',
       },
@@ -267,14 +278,14 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   activity: {
-    title: 'Dashboard › Catch up',
+    title: 'Catch up',
     steps: [
       {
         target: ['#since-last-checked'],
         title: 'Since you last checked',
-        what: 'A sentence about the time you were away, then three lanes of dots: merges, work updates and messages between agents. A coral dot needs a look.',
+        what: 'A sentence about the time you were away, then three rows of dots: merges, work updates and messages between agents. A coral dot needs a look.',
         why: 'You can see at a glance whether anything happened, and when.',
-        how: 'Pick a lane name to narrow the list below. Mark reviewed moves your own review position; opening or paging never does.',
+        how: 'Pick a row name to narrow the list below. Mark reviewed moves your own review position; opening or paging never does.',
         empty: 'When records arrive after your last review, they appear here as dots.',
       },
       {
@@ -285,9 +296,9 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
         how: 'Pick Refusals & handoffs to see only collisions and who gave a file to whom.',
         tip: (c) => {
           const n = c.count('[data-tour="activity-feed"] .event.tone-bad')
-          return n > 0 ? `${plural(n, 'event')} below ${n === 1 ? 'is a' : 'are'} refusal${n === 1 ? '' : 's'}: an agent tried to edit a file another agent holds.` : null
+          return n > 0 ? `${plural(n, 'event')} below ${n === 1 ? 'is a' : 'are'} refusal${n === 1 ? '' : 's'}: an agent tried to edit a file another agent is editing.` : null
         },
-        empty: 'Refusals appear when an agent is refused an edit because another agent holds the file.',
+        empty: 'Refusals appear when an agent is refused an edit because another agent is editing the file.',
       },
       {
         target: T('activity-load-older'),
@@ -301,19 +312,19 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   workflows: {
-    title: 'Skills › Checks',
+    title: 'Checks',
     steps: [
       {
         target: T('answer'),
         title: 'Checks are evidence, not approval',
-        what: 'Tests and reviews that ran on a specific revision and were recorded on the hub.',
+        what: 'Tests and reviews that ran on an exact version of the code and were recorded on the hub.',
         why: 'A passing run only proves those exact files passed. If the code moved on, the proof no longer applies.',
-        how: 'Match the revision shown on a run to the one you plan to land.',
+        how: 'Match the version shown on a run to the one you plan to land.',
       },
       {
         target: T('workflows-runs'),
         title: 'Workflow runs',
-        what: 'Each row is one run: its name, ID, the revision it tested and its result.',
+        what: 'Each row is one run: its name, ID, the version of the code it tested and its result.',
         why: 'A Failed or Blocked pill is the fastest way to see which work should not land yet.',
         how: 'Open a run to see each step, its findings and the files it read.',
         tip: (c) => {
@@ -355,9 +366,9 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('change-record-picker'),
         title: 'Find a work item',
-        what: 'A search box for work items by title, agent or branch. It also takes a work ID, which starts with wrk_.',
+        what: 'A search box for work items by title, agent or branch. It also takes a task ID, which starts with wrk_.',
         why: 'You can reach any record from what you remember about the task, without first finding its ID.',
-        how: 'Type part of the task title or the agent’s name and pick the item. A work ID from an agent works too.',
+        how: 'Type part of the task title or the agent’s name and pick the item. A task ID from an agent works too.',
         empty: 'Once a record is open, this page shows its details instead of the lookup box.',
       },
       {
@@ -385,19 +396,19 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   landed: {
-    title: 'Skills › After merge',
+    title: 'After merge',
     steps: [
       {
         target: T('answer'),
-        title: 'Did it land, and did main stay green',
-        what: 'How many recent published changes were merged, and how many broke something after landing.',
+        title: 'Was it merged, and did main stay green',
+        what: 'How many recent published changes were merged, and how many broke something after merging. If CI and deploys are not tracked, it says so.',
         why: 'A merge can go in and still break the main branch. This is where you hear about it.',
         how: 'If the sentence mentions a failure, open the change it points at.',
         tip: (c) => {
           const n = c.count('[data-tour="landed-list"] .landed-row .pill.tone-bad')
-          return n > 0 ? `${plural(n, 'change')} failed after landing. Open one to see which check.` : null
+          return n > 0 ? `${plural(n, 'change')} failed after merging. Open one to see which check.` : null
         },
-        empty: 'When agents publish changes through the hub, this sentence counts how many landed and how many failed after.',
+        empty: 'When agents publish changes through the hub, this sentence counts how many merged and how many failed after.',
       },
       {
         target: T('landed-picker'),
@@ -411,12 +422,12 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
         target: T('landed-list'),
         title: 'Recent changes',
         what: 'One row per published change, newest first. The five dots show how far it got: branch, pull request, merge, CI and deploys.',
-        why: '“Landed, CI failed after” means the merge went in but the base branch broke. “Waiting to merge” means nothing has landed yet.',
+        why: '“Merged, CI failed after” means the merge went in but the base branch broke. “Waiting to merge” means nothing has merged yet.',
         how: 'Open a row to see the CI runs and deployments for the merge commit.',
         tip: (c) => {
           const n = c.count('[data-tour="landed-list"] .landed-row')
           const bad = c.count('[data-tour="landed-list"] .landed-row .pill.tone-bad')
-          return n === 0 ? null : bad > 0 ? `${plural(bad, 'row')} here ${bad === 1 ? 'is' : 'are'} red. Landed, CI failed after means the merge went in but main broke; open it to see which check.` : `${plural(n, 'change')} listed and none red.`
+          return n === 0 ? null : bad > 0 ? `${plural(bad, 'row')} here ${bad === 1 ? 'is' : 'are'} red. Merged, CI failed after means the merge went in but main broke; open it to see which check.` : `${plural(n, 'change')} listed and none red.`
         },
         empty: 'Changes appear here once an agent publishes one through the hub. The hub may also be too old to show them.',
       },
@@ -428,16 +439,16 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
     steps: [
       {
         target: T('answer'),
-        title: 'Which workflows agents must follow',
+        title: 'Which workflows agents are expected to follow',
         what: 'The skills this repository asks agents to follow, such as the pull request gate, and where that choice was read from.',
         why: 'A skill turns “run the tests and get a review” from a habit into steps the hub can track for each branch.',
-        how: 'Check the adoption line first. A skill only counts once the lock file is committed.',
+        how: 'Check the adoption line first. A skill only counts once the repository’s skills list (agentscm-skills.lock.json) is committed.',
         tip: (c) => c.text('[data-tour="answer"] .answer-text'),
       },
       {
         target: T('skills-adopted'),
         title: 'Adopted skills',
-        what: 'Skills pinned in this repository’s lock file, with how many runs are open, waiting at a stop gate or done.',
+        what: 'Skills pinned in the skills list, with how many runs are open, waiting on a check or done.',
         why: 'These are the workflows agents here are expected to follow on every pull request.',
         how: 'Open View runs to see where each pull request is in its workflow.',
         tip: (c) => {
@@ -448,15 +459,15 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       },
       {
         target: T('skills-head'),
-        title: 'What is enforced and what is planned',
-        what: 'Each skill says which gates are enforced now and which are only planned. “Enforced: Stop hook” means an opt-in Stop hook can keep the author’s session from finishing at tests, review and fix. “Planned: merge check” is not built yet.',
+        title: 'What can stop an agent, and what is planned',
+        what: 'Each skill says which steps can stop an agent and which are only planned. “Available: Stop hook (opt-in, fails open)” means an opt-in Stop hook (a check that can stop an agent finishing) can keep the author’s session from finishing at tests, review and fix, where it is installed. “Planned: merge check” is not built yet.',
         why: 'So you know which steps the hub checks at all, and which rely only on the agent following along.',
         how: 'Treat the hook as a reminder, not a lock. It is off unless installed, lets the agent finish when the hub cannot be reached or the checkout is detached, and accepts evidence the agents report themselves.',
         tip: (c) => {
           const t = c.text('[data-tour="skills-head"]')
           return t ? `The first skill on screen reads: ${t}.` : null
         },
-        empty: 'Each skill shows its version, its hash and its Enforced and Planned labels here.',
+        empty: 'Each skill shows its version and its Available and Planned labels here.',
       },
       {
         target: T('skills-how'),
@@ -475,7 +486,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
         title: 'Adopt or remove with a command',
         what: 'The exact command to run in the repository, with a copy button.',
         why: 'This page never writes. Adoption is a change to agentscm-skills.lock.json that you commit and review like any other.',
-        how: 'Copy the command, run it in your checkout, then commit the lock file.',
+        how: 'Copy the command, run it in your checkout, then commit the skills list.',
         tip: (c) => {
           const t = c.text('[data-tour="skills-command"] code')
           return t ? `Copy this: ${t}` : null
@@ -485,7 +496,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
     ],
   },
   templates: {
-    title: 'Skills › Library',
+    title: 'Library',
     steps: [
       {
         target: T('answer'),
@@ -563,14 +574,14 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   workspace: {
-    title: 'Workspace',
+    title: 'Access',
     steps: [
       {
         target: T('answer'),
-        title: 'The one page where you can change things',
-        what: 'The workspace is the shared place for repositories, members and workflow runs. It uses your GitHub or GitLab account, not your hub token.',
+        title: 'Where runs are started, approved and landed',
+        what: 'The workspace is the shared place for repositories, members and workflow runs. This uses your GitHub or GitLab sign-in. Your hub token (Preferences) only reads this hub.',
         why: 'Starting runs and managing members need a person who is allowed to. This is how the hub knows who you are.',
-        how: 'Sign in with your forge account. The other pages stay read-only.',
+        how: 'Sign in with your GitHub or GitLab account.',
       },
       {
         target: T('workspace-you', 'workspace-signin'),
@@ -605,15 +616,15 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
         target: T('workspace-change-picker'),
         title: 'Pick the change to run',
         what: 'A search box for current native changes. It also takes the ID of any existing change.',
-        why: 'Loading a change shows the exact revision and review context before anything runs.',
-        how: 'Search for the change, check the revision it shows, then start the run. Starting a run is a real action.',
+        why: 'Loading a change shows the exact version of the code and review context before anything runs.',
+        how: 'Search for the change, check the version it shows, then start the run. Starting a run is a real action.',
         empty: 'This box appears when you can start runs on a repository with a workflow profile.',
       },
     ],
   },
 
   setup: {
-    title: 'Setup › Agents',
+    title: 'Agents',
     steps: [
       {
         target: T('answer'),
@@ -655,7 +666,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   health: {
-    title: 'Setup › Hub',
+    title: 'Hub',
     steps: [
       {
         target: T('answer'),
@@ -669,8 +680,8 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('health-counters'),
         title: 'How often the hook stepped in',
-        what: 'Counts since the hub started: refused first edits, repeated edits, edits let through when unsure and rate-limited refusals.',
-        why: 'Many “let through when unsure” means the hub could not decide. Protection was weaker than it looked.',
+        what: 'Counts since the hub started: refused first edits, repeated edits, edits that went ahead because the hub could not decide and rate-limited refusals.',
+        why: 'Many “hub could not decide” edits means the hub could not decide. Protection was weaker than it looked.',
         how: 'Hover the (i) beside each number. The counts reset when the hub restarts.',
         tip: (c) => {
           const n = c.count('[data-tour="health-counters"] .counter:not(.is-zero)')
@@ -694,12 +705,12 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   settings: {
-    title: 'Setup › Preferences',
+    title: 'Preferences',
     steps: [
       {
         target: T('answer'),
         title: 'Mostly yours, saved in this browser',
-        what: 'Theme, sidebar, tours and your token are saved in this browser only. Inline agent views are saved on the hub.',
+        what: 'Theme, sidebar, tours and your hub token are saved in this browser only. Inline agent views are saved on the hub.',
         why: 'Browser choices affect only you. The inline views default changes what everyone on this hub sees.',
         how: 'Change browser settings freely. Changing your own inline views needs a workspace sign-in, and the hub default needs an administrator.',
       },
@@ -728,10 +739,10 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('settings-token'),
         title: 'Your token',
-        what: 'Who you are signed in as, the repository, and when the token expires. Forget this token removes it from this browser.',
-        why: 'The token decides which repository you see. It is read-only here.',
+        what: 'Your hub token is the token that signs you in to this hub. This box shows who you are signed in as, the repository, and when it expires. Forget this token removes it from this browser.',
+        why: 'The hub token decides which repository you see. It is read-only here.',
         how: 'If pages say you lack access, check the repository and expiry first.',
-        tip: (c) => (c.data?.whoami ? `Your token ${c.data.whoami.token.name} is for ${c.data.whoami.token.repository}.` : null),
+        tip: (c) => (c.data?.whoami ? `Your hub token ${c.data.whoami.token.name} is for ${c.data.whoami.token.repository}.` : null),
         empty: 'Your token details appear as soon as the hub answers.',
       },
     ],

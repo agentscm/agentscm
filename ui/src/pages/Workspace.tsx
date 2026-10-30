@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
 import { decodeSkillWorkflowEnvelope, validSkillWorkflowStepId } from '../skillWorkflow.ts'
 import {
@@ -20,7 +20,8 @@ import {
 } from '../workspace.ts'
 import { Combobox } from '../Combobox.tsx'
 import { Pager, useHashCursor } from '../Pager.tsx'
-import { Box, CopyButton, Empty, Explain, Icon, Notice, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
+import { Box, CopyButton, Empty, Explain, Icon, Notice, PageHead, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
+import { loginHref, knownProviders, PROVIDER_NAMES } from '../hubLogin.ts'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { RunView } from './Workflows.tsx'
 
@@ -88,7 +89,8 @@ function useWorkspaceRoute(): WorkspaceRoute {
 
 // ---------- A two-step confirmation that stays in the keyboard flow (no modal)
 
-function Confirm({ label, icon, question, confirm, disabled, busy, onConfirm, tone = 'outline-secondary' }: { label: ReactNode; icon: string; question: string; confirm: string; disabled?: boolean; busy?: boolean; onConfirm: () => void; tone?: string }) {
+function Confirm({ label, icon, question, detail, confirm, disabled, busy, onConfirm, tone = 'outline-secondary' }: { label: ReactNode; icon: string; question: string; detail?: ReactNode; confirm: string; disabled?: boolean; busy?: boolean; onConfirm: () => void; tone?: string }) {
+  const detailId = useId()
   const [asking, setAsking] = useState(false)
   const returning = useRef(false)
   const yes = useRef<HTMLButtonElement>(null)
@@ -109,8 +111,9 @@ function Confirm({ label, icon, question, confirm, disabled, busy, onConfirm, to
       </button>
     )
   return (
-    <span className="confirm-inline" role="group" aria-label={question} onKeyDown={(e) => e.key === 'Escape' && back()}>
+    <span className="confirm-inline" role="group" aria-label={question} aria-describedby={detail ? detailId : undefined} onKeyDown={(e) => e.key === 'Escape' && back()}>
       <span className="small">{question}</span>
+      {detail && <span className="small d-block w-100" id={detailId}>{detail}</span>}
       <button
         ref={yes}
         type="button"
@@ -139,15 +142,14 @@ function Login() {
       {load.kind === 'loading' && <Skeleton rows={1} />}
       {load.kind === 'error' && <Notice title={pollError(load)} action={<button className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>} />}
       {load.kind === 'ready' &&
-        (load.value.providers.filter((p) => p === 'github' || p === 'gitlab').length === 0 ? (
+        (knownProviders(load.value.providers).length === 0 ? (
           <Notice tone="muted" icon="info-circle" title="Workspace sign-in is not configured on this hub." />
         ) : (
           <div className="d-flex flex-wrap gap-2">
-            {load.value.providers
-              .filter((p) => p === 'github' || p === 'gitlab')
+            {knownProviders(load.value.providers)
               .map((p) => (
-                <a key={p} className="btn btn-primary" href={`/v1/hub/login/${p}?workspace=1`}>
-                  <Icon name={p} /> Continue with {p === 'github' ? 'GitHub' : 'GitLab'}
+                <a key={p} className="btn btn-primary" href={loginHref(p, 'workspace')}>
+                  <Icon name={p} /> Continue with {PROVIDER_NAMES[p]}
                 </a>
               ))}
           </div>
@@ -211,7 +213,7 @@ function PendingOperations({ session }: { session: WorkspaceSession }) {
   // Stay mounted while a retry is in flight: its success clears the entry before the outcome is shown.
   if (entries.length === 0 && !done && !error && busy === null) return null
   return (
-    <Box icon="arrow-repeat" tone="warn" title="Pending operation recovery" count={entries.length} explain="Requests that may have reached the hub, but we don’t know if they worked. Only their request IDs and non-secret fields are kept, in this tab. Nothing is retried for you.">
+    <Box icon="arrow-repeat" tone="warn" title="Pending operation recovery" count={entries.length} intro="These may or may not have worked. Retry sends the exact same request." explain="Requests that may have reached the hub, but we don’t know if they worked. Only their request IDs and non-secret fields are kept, in this tab. Nothing is retried for you.">
       {error && <Notice tone="bad" title={error} />}
       {done && (
         <div ref={result} tabIndex={-1}>
@@ -238,7 +240,7 @@ function PendingOperations({ session }: { session: WorkspaceSession }) {
                 </div>
                 <div className="small muted">{allowed ? action.capability === null ? 'Retry sends the exact retained promise body. The hub rechecks current authority and repository scope.' : 'Retry sends the exact retained body with your current security token.' : `Your current roles do not allow this ${action.label.toLowerCase()} retry.`}</div>
               </div>
-              <button type="button" className="btn btn-sm btn-primary" disabled={!allowed || busy !== null} onClick={() => void retry(entry)}>
+              <button type="button" className="btn btn-sm btn-outline-secondary" disabled={!allowed || busy !== null} onClick={() => void retry(entry)}>
                 {busy === entry.requestId ? <span className="spinner-border spinner-border-sm" aria-hidden="true" /> : <Icon name="arrow-clockwise" />} Retry exact request
               </button>
             </li>
@@ -278,6 +280,10 @@ function Execution({ session }: { session: WorkspaceSession }) {
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const pendingCancels = useRef(new Map<string, Record<string, unknown>>())
+  // A passed run to load into the composer; a fresh object per click so the same run can be loaded again.
+  const [review, setReview] = useState<{ run: WorkspaceRun } | null>(null)
+  const canAdmit = session.capabilities.approve_revisions || session.capabilities.integrate_revisions
+  const passed = runs.kind === 'ready' ? runs.value.runs.filter((r) => r.state === 'succeeded') : []
 
   const cancel = async (run: WorkspaceRun) => {
     setBusy(run.run_id)
@@ -307,11 +313,33 @@ function Execution({ session }: { session: WorkspaceSession }) {
       {error && <Notice tone="bad" title={error} />}
       {notice && <Notice tone="brand" icon="info-circle" title={notice} />}
       {!canExecute && <Notice tone="muted" icon="info-circle" title="You can inspect these repositories. Starting or cancelling runs requires the contributor role." />}
+      {canAdmit && (
+        <Box icon="patch-check" title="Passed runs" explain="Runs on this page that finished successfully. This page can’t tell whether each one is already approved or landed; the hub checks again when you act.">
+          {runs.kind === 'loading' && <Skeleton rows={1} />}
+          {runs.kind === 'ready' && (passed.length === 0 ? (
+            <Empty icon="patch-check" title="No passed runs on this page." />
+          ) : (
+            <ul className="run-list" aria-label="Passed runs">
+              {passed.map((r) => (
+                <li key={r.run_id} className="run-row">
+                  <span className="run-icon tone-ok"><Icon name="patch-check" /></span>
+                  <span className="run-main">{r.profile_id} on {r.subject.change_id} v{r.subject.change_version} · rev <code>{r.subject.revision.slice(0, 10)}</code></span>
+                  <span className="ws-actions">
+                    <button type="button" className="btn btn-sm btn-outline-secondary" disabled={!repository?.profiles.some((p) => p.profile_id === r.profile_id)} onClick={() => setReview({ run: r })}>
+                      <Icon name="patch-check" /> Review and approve
+                    </button>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ))}
+        </Box>
+      )}
       <Box
         tour="workspace-runs"
         icon="folder2-open"
         title="Recent runs"
-        explain="Runs in this workspace, newest first, 20 per page. Have an operator look at unknown or stale runs before you try again."
+        explain="Runs in this workspace, newest first, 20 per page. Have an operator look at unknown or stale runs before you try again. Configuration readiness does not prove runtime availability or a passing admission receipt."
         actions={
           <>
             <select
@@ -321,6 +349,7 @@ function Execution({ session }: { session: WorkspaceSession }) {
               disabled={busy !== null}
               onChange={(e) => {
                 setChosenRepo(e.target.value)
+                setReview(null)
                 runPager.first()
               }}
             >
@@ -342,9 +371,9 @@ function Execution({ session }: { session: WorkspaceSession }) {
               <li key={r.run_id} className="run-row ws-run">
                 <span className={`run-icon tone-${runTone(r.state)}`}><Icon name="diagram-3" /></span>
                 <span className="run-main">
-                  <strong>{r.profile_id}</strong>
+                  <strong>{r.profile_id} on {r.subject.change_id} v{r.subject.change_version}</strong>
                   <span className="small muted">
-                    <code>{r.run_id}</code> · change {r.subject.change_id} v{r.subject.change_version} · rev <Tip text={r.subject.revision} focusable><code>{r.subject.revision.slice(0, 10)}</code></Tip>
+                    Run <code>{r.run_id}</code> · revision <Tip text={r.subject.revision} focusable><code>{r.subject.revision.slice(0, 10)}</code></Tip>
                   </span>
                   {r.detail && <span className="small">{r.detail}</span>}
                 </span>
@@ -352,7 +381,7 @@ function Execution({ session }: { session: WorkspaceSession }) {
                 <span className="ws-actions">
                   {r.native_run_id && <a className="btn btn-sm btn-outline-secondary" href={workspaceRunHref(r.repository_id, r.run_id)}><Icon name="search" /> Inspect</a>}
                   {canExecute && activeRun(r.state) && (
-                    <Confirm label="Cancel" icon="stop-circle" question={`Cancel run ${r.run_id}?`} confirm="Cancel run" busy={busy === r.run_id} disabled={busy !== null} onConfirm={() => void cancel(r)} />
+                    <Confirm label="Cancel" icon="stop-circle" question={`Cancel ${r.profile_id} on ${r.subject.change_id} v${r.subject.change_version}?`} detail={<>Asks the hub to stop run <code>{r.run_id}</code>. It shows Cancelled once the hub has stopped it.</>} confirm="Cancel run" busy={busy === r.run_id} disabled={busy !== null} onConfirm={() => void cancel(r)} />
                   )}
                 </span>
               </li>
@@ -360,14 +389,13 @@ function Execution({ session }: { session: WorkspaceSession }) {
           </ul>
         ))}
         <Pager newerLabel="Newer runs" olderLabel="Older runs" onNewer={runPager.canNewer ? runPager.newer : undefined} onOlder={runs.kind === 'ready' && runs.value.next_cursor ? () => runPager.older(runs.value.next_cursor!) : undefined} />
-        <p className="small muted mb-0">Configuration readiness does not prove runtime availability or a passing admission receipt.</p>
       </Box>
-      {repository && <Composer key={repository.repository_id} session={session} repository={repository} onStarted={() => { runPager.first(); setRefresh((n) => n + 1) }} />}
+      {repository && <Composer key={repository.repository_id} session={session} repository={repository} review={review} onStarted={() => { runPager.first(); setRefresh((n) => n + 1) }} />}
     </div>
   )
 }
 
-function Composer({ session, repository, onStarted }: { session: WorkspaceSession; repository: WorkspaceRepository; onStarted: () => void }) {
+function Composer({ session, repository, review, onStarted }: { session: WorkspaceSession; repository: WorkspaceRepository; review: { run: WorkspaceRun } | null; onStarted: () => void }) {
   const canExecute = session.capabilities.execute_workflows
   const [profileId, setProfileId] = useState('')
   const profile = repository.profiles.find((p) => p.profile_id === profileId)
@@ -388,6 +416,27 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
   const [pendingStart, setPendingStart] = useState<Record<string, unknown> | null>(null)
   const selection = useRef(0)
   const locked = pendingStart !== null || busy !== null
+  const details = useRef<HTMLDetailsElement>(null)
+  // Load a passed run's exact subject and profile ("Review and approve"); ignored while a request is in flight or unresolved.
+  const [reviewed, setReviewed] = useState<typeof review>(null)
+  const [picker, setPicker] = useState(0)
+  if (review !== reviewed) {
+    setReviewed(review)
+    if (review && !locked) {
+      setProfileId(review.run.profile_id)
+      setSubject(review.run.subject)
+      setError(null)
+      setNotice(null)
+      setPicker((n) => n + 1)
+    }
+  }
+  useEffect(() => {
+    const el = details.current
+    if (!reviewed || !el) return
+    el.open = true
+    el.scrollIntoView?.({ block: 'start' })
+    el.querySelector<HTMLElement>('.ws-subject')?.focus()
+  }, [reviewed])
 
   const clearSubject = () => {
     selection.current += 1
@@ -444,7 +493,7 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
   }
 
   return (
-    <details className="box ws-composer" open={pendingStart !== null || undefined}>
+    <details ref={details} className="box ws-composer" open={pendingStart !== null || undefined}>
       <summary className="box-head">
         <span className="box-badge tone-brand"><Icon name="play-circle" /></span>
         <span className="box-title">New run & native admission{pendingStart ? ' · request outcome unknown' : ''}</span>
@@ -486,6 +535,7 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
             <span className="form-label">Native Change <Explain text="Pick a current change, or paste the ID of any existing one. Loading it shows the revision, review context and requirement the run will use." /></span>
             <div className="d-flex gap-2 flex-wrap align-items-start">
               <Combobox
+                key={picker}
                 id="ws-change"
                 data-tour="workspace-change-picker"
                 label="Native Change"
@@ -509,9 +559,10 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
           </div>
         )}
         {subject && profile && (
-          <section className="ws-subject" aria-label="Revision to execute">
+          <section className="ws-subject" aria-label="Revision to execute" tabIndex={-1}>
             <h3 className="h6">Revision to execute</h3>
             <dl className="tech">
+              <dt>Change</dt><dd>{subject.change_id}</dd>
               <dt>Revision</dt><dd><code>{subject.revision}</code></dd>
               <dt>Change version</dt><dd>{subject.change_version}</dd>
               <dt>Review context <Explain text="Digest of the review context the approval and landing are bound to." /></dt><dd><code>{subject.context_digest}</code></dd>
@@ -579,41 +630,44 @@ function NativeAdmission({ session, repositoryId, profile, subject, blocked }: {
             <Confirm
               label={pending?.action === 'approve' ? 'Retry same approval' : 'Approve revision'}
               icon="patch-check"
-              question={`Approve revision ${subject.revision.slice(0, 12)} in this review context?`}
+              question={`Approve ${subject.change_id} v${subject.change_version} for ${profile.target}?`}
+              detail={`You approve as ${session.actor.user.login}. This records an AgentSCM approval of revision ${subject.revision.slice(0, 12)} and its review context. It does not approve or merge anything on GitHub or GitLab. An approval is used once: a new revision, context or rule change needs a new one.`}
               confirm="Approve"
               busy={busy === 'approve'}
               disabled={blocked || busy !== null || (pending !== null && pending.action !== 'approve') || landing !== null}
               onConfirm={() => void submit('approve')}
             />
           ) : null}
-          <p className="small muted">{canApprove ? 'Records a native approval for this revision and context.' : 'Reviewer role required to approve.'}</p>
+          <p className="small muted">{canApprove ? 'Records an AgentSCM approval for this exact revision and context.' : 'Reviewer role required to approve.'}</p>
         </div>
         <div>
-          <label className="form-label" htmlFor="ws-approval">Native approval ID</label>
+          <label className="form-label" htmlFor="ws-approval">Approval ID</label>
           <input
             id="ws-approval"
-            className="form-control mb-2"
+            className="form-control"
             value={approvalId}
             placeholder="Approval from the reviewer"
+            aria-describedby="ws-approval-help"
             disabled={blocked || busy !== null || pending !== null || !canIntegrate}
             onChange={(e) => {
               setApprovalId(e.target.value)
               setLanding(null)
             }}
           />
+          <div id="ws-approval-help" className="form-text mb-2">Filled in when you approve above. To land someone else’s approval, paste the ID they shared.</div>
           {canIntegrate ? (
             <Confirm
-              tone="primary"
               label={pending?.action === 'integrate' ? 'Retry same landing' : `Land revision to ${profile.target}`}
               icon="sign-merge-right"
-              question={`Land revision ${subject.revision.slice(0, 12)} on ${profile.target}? This updates the protected target.`}
+              question={`Land ${subject.change_id} v${subject.change_version} on ${profile.target}?`}
+              detail={`This moves AgentSCM’s protected target ${profile.target} to revision ${subject.revision.slice(0, 12)} with approval ${approvalId.trim()}, only if ${profile.target} hasn’t moved since. It doesn’t push to GitHub or GitLab or merge a pull request. You can’t undo it from this page.`}
               confirm={`Land to ${profile.target}`}
               busy={busy === 'integrate'}
               disabled={blocked || !approvalId.trim() || busy !== null || (pending !== null && pending.action !== 'integrate') || landing !== null}
               onConfirm={() => void submit('integrate')}
             />
           ) : null}
-          <p className="small muted">{canIntegrate ? 'Updates the native target only after its current gate passes. Use the approval above or paste one issued for this exact subject.' : 'Integrator role required to land.'}</p>
+          <p className="small muted">{canIntegrate ? 'Moves AgentSCM’s target only after its current gate passes. GitHub and GitLab are not touched.' : 'Integrator role required to land.'}</p>
         </div>
       </div>
     </section>
@@ -693,7 +747,7 @@ function Members({ session, onChanged }: { session: WorkspaceSession; onChanged:
       title="Members"
       count={members.length}
       explain="Each role grants its own permissions. An administrator can’t read repositories or run workflows without those roles too."
-      actions={<button type="button" className="btn btn-sm btn-primary" disabled={editing !== null} onClick={() => edit(null)}><Icon name="person-plus" /> Add member</button>}
+      actions={<button type="button" className="btn btn-sm btn-outline-secondary" disabled={editing !== null} onClick={() => edit(null)}><Icon name="person-plus" /> Add member</button>}
     >
       {error && <Notice tone="bad" title={error} />}
       {f && editing && (
@@ -880,10 +934,7 @@ export function WorkspacePage() {
   const activeTab = route.tab === 'workflow' ? 'repositories' : route.tab
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Who can run what?</h1>
-        <p className="answer-text">{s ? <>You’re signed in to <strong>{s.workspace.name}</strong> as {s.actor.user.login}.</> : 'The workspace holds shared repositories, members and workflow execution.'}</p>
-      </div>
+      <PageHead question="Who can run what?" answer={s ? <>You’re signed in to <strong>{s.workspace.name}</strong> as {s.actor.user.login}.</> : 'The workspace holds shared repositories, members and workflow execution.'} />
       <SectionTabs />
       {s?.synthetic_fixture && <Notice tone="brand" icon="flask" title="Synthetic workspace fixture">These records are examples, not live coding sessions.</Notice>}
       {signOutError && <Notice title={signOutError} />}
@@ -927,9 +978,9 @@ export function WorkspacePage() {
             </ul>
           </Box>
           <PendingOperations session={s} />
-          <nav className="tabbar" data-tour="workspace-tabs" aria-label="Workspace sections">
+          <nav className="seg ws-seg" data-tour="workspace-tabs" aria-label="Workspace sections">
             {TABS.map((t) => (
-              <a key={t.key} href={t.href} className={`tab${activeTab === t.key ? ' active' : ''}`} aria-current={activeTab === t.key ? 'page' : undefined}>
+              <a key={t.key} href={t.href} className={activeTab === t.key ? 'on' : undefined} aria-current={activeTab === t.key ? 'page' : undefined}>
                 <Icon name={t.icon} /> {t.label}
               </a>
             ))}

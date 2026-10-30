@@ -180,6 +180,7 @@ describe('capability gating', () => {
     )
     const subject = await openComposerWithSubject()
     expect(screen.getByText('No server-executed runs yet')).toBeTruthy()
+    expect(screen.getByText('No passed runs on this page.')).toBeTruthy()
     expect(screen.getByText(/Task qualification is recorded through agent-owned tasks/)).toBeTruthy()
     expect(within(subject).queryByRole('button', { name: /Start workflow/ })).toBeNull()
     expect(within(subject).getByText(/agent-owned task qualification only/)).toBeTruthy()
@@ -297,12 +298,13 @@ describe('cancel a run', () => {
     })
     render(<WorkspacePage />)
     fireEvent.click(await screen.findByRole('button', { name: /^Cancel$/ }, LOAD))
-    const group = screen.getByRole('group', { name: 'Cancel run active-run?' })
+    const group = screen.getByRole('group', { name: 'Cancel quality-gate on change-invoice-rounding v3?' })
+    expect(document.getElementById(group.getAttribute('aria-describedby')!)!.textContent).toBe('Asks the hub to stop run active-run. It shows Cancelled once the hub has stopped it.')
     expect(document.activeElement).toBe(within(group).getByRole('button', { name: 'Cancel run' }))
     fireEvent.click(within(group).getByRole('button', { name: 'Keep' }))
     expect(writes(sent)).toEqual([])
     fireEvent.click(screen.getByRole('button', { name: /^Cancel$/ }))
-    fireEvent.click(within(screen.getByRole('group', { name: 'Cancel run active-run?' })).getByRole('button', { name: 'Cancel run' }))
+    fireEvent.click(within(screen.getByRole('group', { name: 'Cancel quality-gate on change-invoice-rounding v3?' })).getByRole('button', { name: 'Cancel run' }))
     expect(await screen.findByText(/Cancellation requested for active-run/, {}, LOAD)).toBeTruthy()
     expect(writes(sent)).toMatchObject([{ method: 'POST', url: `/v1/hub/workspace/repositories/${REPO}/runs/active-run/cancel`, body: { expected_generation: 4 } }])
     expectAllowedWrites(sent)
@@ -313,8 +315,8 @@ describe('cancel a run', () => {
     const sent = stubHub((url, init) => (path(url) === `/repositories/${REPO}/runs` && !isWrite(init) ? json(200, { runs: [queued], next_cursor: null }) : undefined))
     render(<WorkspacePage />)
     fireEvent.click(await screen.findByRole('button', { name: /^Cancel$/ }, LOAD))
-    fireEvent.keyDown(screen.getByRole('group', { name: 'Cancel run queued-run?' }), { key: 'Escape' })
-    expect(screen.queryByRole('group', { name: 'Cancel run queued-run?' })).toBeNull()
+    fireEvent.keyDown(screen.getByRole('group', { name: 'Cancel quality-gate on change-invoice-rounding v3?' }), { key: 'Escape' })
+    expect(screen.queryByRole('group', { name: 'Cancel quality-gate on change-invoice-rounding v3?' })).toBeNull()
     expect(document.activeElement).toBe(screen.getByRole('button', { name: /^Cancel$/ }))
     expect(writes(sent)).toEqual([])
   })
@@ -339,13 +341,19 @@ describe('approve and land', () => {
     expect(land.disabled).toBe(true) // no approval ID yet
 
     fireEvent.click(within(subject).getByRole('button', { name: /Approve revision/ }))
+    const ask = within(subject).getByRole('group', { name: 'Approve change-invoice-rounding v3 for main?' })
+    expect(ask.textContent).toContain('You approve as synthetic-maintainer.')
+    expect(ask.textContent).toContain('It does not approve or merge anything on GitHub or GitLab.')
     fireEvent.click(within(subject).getByRole('button', { name: 'Approve' }))
     expect(await within(subject).findByText('Native approval recorded', {}, LOAD)).toBeTruthy()
-    const approvalId = (within(subject).getByRole('textbox', { name: 'Native approval ID' }) as HTMLInputElement).value
+    const approvalId = (within(subject).getByRole('textbox', { name: 'Approval ID' }) as HTMLInputElement).value
     expect(approvalId).toMatch(new RegExp(`^ws-approve-${ACTOR}-`))
 
     fireEvent.click(within(subject).getByRole('button', { name: /Land revision to main/ }))
-    const confirm = within(subject).getByRole('group', { name: /Land revision 222222222222 on main\?/ })
+    const confirm = within(subject).getByRole('group', { name: 'Land change-invoice-rounding v3 on main?' })
+    expect(confirm.textContent).toContain(`to revision 222222222222 with approval ${approvalId}`)
+    expect(confirm.textContent).toContain('doesn’t push to GitHub or GitLab')
+    expect(confirm.textContent).toContain('You can’t undo it from this page.')
     fireEvent.click(within(confirm).getByRole('button', { name: 'Land to main' }))
     expect(await within(subject).findByText('Landed to main', {}, LOAD)).toBeTruthy()
     expect(within(subject).getByText(/Native target version 9/)).toBeTruthy()
@@ -356,11 +364,35 @@ describe('approve and land', () => {
     expectAllowedWrites(sent)
   })
 
+  it('Passed runs lists succeeded runs for approvers and loads one into the composer without writing', async () => {
+    const failed = { ...startRun(SUBJECT, 'failed'), run_id: 'failed-run' }
+    const passed = { ...startRun({ ...SUBJECT, change_version: 4 }, 'succeeded'), run_id: 'passed-run' }
+    const sent = stubHub(withCaps({ approve_revisions: true }), (url, init) => (path(url) === `/repositories/${REPO}/runs` && !isWrite(init) ? json(200, { runs: [failed, passed], next_cursor: null }) : undefined))
+    render(<WorkspacePage />)
+    const list = await screen.findByRole('list', { name: 'Passed runs' }, LOAD)
+    expect([...list.querySelectorAll('li')].map((li) => li.querySelector('.run-main')!.textContent)).toEqual(['quality-gate on change-invoice-rounding v4 · rev 2222222222'])
+    fireEvent.click(within(list).getByRole('button', { name: /Review and approve/ }))
+    const subject = await screen.findByRole('region', { name: 'Revision to execute' }, LOAD)
+    expect((subject.closest('details') as HTMLDetailsElement).open).toBe(true)
+    expect(document.activeElement).toBe(subject)
+    expect((screen.getByRole('combobox', { name: 'Workflow profile' }) as HTMLSelectElement).value).toBe('quality-gate')
+    fireEvent.click(within(subject).getByRole('button', { name: /Approve revision/ }))
+    expect(within(subject).getByRole('group', { name: 'Approve change-invoice-rounding v4 for main?' })).toBeTruthy()
+    expect(writes(sent)).toEqual([])
+  })
+
+  it('Passed runs stays hidden without approve or integrate', async () => {
+    stubHub()
+    render(<WorkspacePage />)
+    await screen.findByText('synthetic-workspace-run', {}, LOAD)
+    expect(screen.queryByRole('heading', { name: 'Passed runs' })).toBeNull()
+  })
+
   it('an unknown landing outcome offers "Retry same landing" with the retained request', async () => {
     let fail = true
     const sent = stubHub(withCaps({ integrate_revisions: true }), (url, init) => (fail && isWrite(init) && path(url).endsWith('/integrate') ? json(503, { error: 'unavailable' }) : admission(url, init)))
     const subject = await openComposerWithSubject()
-    fireEvent.change(within(subject).getByRole('textbox', { name: 'Native approval ID' }), { target: { value: 'appr-from-reviewer' } })
+    fireEvent.change(within(subject).getByRole('textbox', { name: 'Approval ID' }), { target: { value: 'appr-from-reviewer' } })
     fireEvent.click(within(subject).getByRole('button', { name: /Land revision to main/ }))
     fireEvent.click(within(subject).getByRole('button', { name: 'Land to main' }))
     expect(await within(subject).findByText('Landing outcome unknown', {}, LOAD)).toBeTruthy()

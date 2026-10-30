@@ -66,6 +66,15 @@ describe('Agent briefing', () => {
     expect(fetchMock.mock.calls.every((call) => call[1]?.method === 'GET')).toBe(true)
   })
 
+  it('a hub without the briefing route explains itself and offers no retry', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('{}', { status: 404 }))
+    render(<NarrativePanel token="read-token" />)
+    expect(await screen.findByText('This Hub doesn’t write agent briefings yet.')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Retry briefing' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Brief this task' })).toBeNull()
+    expect(screen.queryByText(/HTTP 404/)).toBeNull()
+  })
+
   it('keeps polling a failed job so a recovered result becomes visible', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const fetchMock = vi.spyOn(globalThis, 'fetch')

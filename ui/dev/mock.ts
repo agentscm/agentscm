@@ -26,7 +26,7 @@ function intents() {
   const base = { repository: REPO, base: 'main', expires_at: ago(-3600) }
   return [
     { ...base, id: 'int_dev_codex', task: 'Fix invoice rounding when a customer has multiple currencies', branch: 'dev/invoice-rounding', machine: 'synthetic-laptop-2', paths: ['src/billing.rs', 'tests/billing_test.rs'], via: ['hook:codex'], created_at: ago(1500), updated_at: ago(40), agent: A.devCodex, owner: dev },
-    { ...base, id: 'int_maria_claude', task: 'Refactor the billing module to split tax calculation from invoice totals, keeping the public interface intact and adding focused unit tests for each rounding mode we support today', branch: 'maria/billing-split', machine: 'synthetic-laptop-1', paths: ['src/billing.rs', 'src/invoice/**', 'src/tax.rs', 'src/currency.rs', 'src/ledger.rs', 'src/receipts.rs'], via: ['hook:claude'], created_at: ago(900), updated_at: ago(12), agent: A.mariaClaude, owner: maria },
+    { ...base, id: 'int_maria_claude', task: 'Refactor the billing module to split tax calculation from invoice totals, keeping the public interface intact and adding focused unit tests for each rounding mode we support today', branch: 'feat/sync-retry-budget', machine: 'synthetic-laptop-1', paths: ['src/billing.rs', 'src/invoice/**', 'src/tax.rs', 'src/currency.rs', 'src/ledger.rs', 'src/receipts.rs'], via: ['hook:claude'], created_at: ago(900), updated_at: ago(12), agent: A.mariaClaude, owner: maria },
     { ...base, id: 'int_maria_codex', task: 'Write the webhook retry documentation', branch: 'maria/docs-webhooks', machine: 'synthetic-laptop-1', paths: ['docs/webhooks.md'], via: ['hook:codex'], created_at: ago(700), updated_at: ago(260), agent: A.mariaCodex, owner: maria },
     { ...base, id: 'int_dev_cursor', task: 'Tidy the settings page layout', branch: null, machine: null, paths: ['web/settings/**'], via: [], created_at: ago(400), updated_at: ago(380), agent: A.devCursor, owner: dev },
   ]
@@ -81,12 +81,13 @@ function overview() {
     scope, branch: null, worktree: null, next_action: null, current: null, blocker: null, depends_on: [], related_work: [],
     created_at: ago(secs + 3600), updated_at: ago(secs), created_seq: 1, updated_seq: 2, ...extra,
   })
-  const billing = item('a', 'Refactor the billing module', 'active', 'maria', 'claude-code', ['src/billing.rs', 'src/tax.rs'], 60, { next_action: 'Split tax calculation out of invoice totals', current: cp('progress', 'Tax module extracted; tests green', 'Split tax calculation out of invoice totals', 60, 'claude-code') })
-  const rounding = item('b', 'Fix invoice rounding', 'active', 'dev', 'codex', ['src/billing.rs'], 300, { next_action: 'Add a regression test for JPY totals' })
+  const billing = item('a', 'Refactor the billing module', 'active', 'maria', 'claude-code', ['src/billing.rs', 'src/tax.rs'], 60, { branch: 'feat/sync-retry-budget', next_action: 'Split tax calculation out of invoice totals', current: cp('progress', 'Tax module extracted; tests green', 'Split tax calculation out of invoice totals', 60, 'claude-code') })
+  const rounding = item('b', 'Fix invoice rounding', 'active', 'dev', 'codex', ['src/billing.rs'], 300, { branch: 'dev/invoice-rounding', next_action: 'Add a regression test for JPY totals' })
   const docs = item('c', 'Write the webhook retry documentation', 'blocked', 'maria', 'codex', ['docs/webhooks.md'], 900, { blocker: cp('blocker', 'Waiting on the retry policy decision from the API team', null, 900, 'codex') })
   const settings = item('d', 'Tidy the settings page layout', 'handover', 'dev', 'cursor', ['web/settings/**'], 1800, { next_action: 'Pick up the responsive pass from the handover note' })
   const ledger = item('e', 'Reconcile ledger exports', 'paused', 'sam', 'copilot', ['src/ledger.rs'], 7200, { next_action: 'Resume after the quarter-end freeze' })
-  const shipped = item('f', 'Round invoice totals per currency', 'finished', 'sam', 'copilot', ['src/invoice/totals.rs'], 1200)
+  // Branches match skill run run_41 and PUBLICATIONS[0] (merged, PR #220), so the task page's lifecycle strip has evidence.
+  const shipped = item('f', 'Round invoice totals per currency', 'finished', 'sam', 'copilot', ['src/invoice/totals.rs'], 1200, { branch: 'agent/claude-code/invoice-rounding-120' })
   return {
     recent_since: ago(86400), until: ago(0),
     current: [billing, rounding, docs, settings, ledger],
@@ -467,6 +468,13 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         res.end(down ? 'hub is now failing\n' : 'hub is now healthy\n')
       })
       server.middlewares.use('/v1/hub', async (req, res) => {
+        // MOCK_SLOW=1500 holds each sign-in step that long, so the opening screen can be seen and screenshotted.
+        const slow = Number(process.env['MOCK_SLOW'] ?? 0)
+        if (slow > 0 && /^\/(session|tokens|session\/read-token)$/.test(new URL(req.url ?? '/', 'http://localhost').pathname)) {
+          await new Promise((r) => setTimeout(r, slow))
+          // The page may have cancelled meanwhile (React runs effects twice); reading its body now would crash the server.
+          if (req.destroyed) return
+        }
         const url = new URL(req.url ?? '/', 'http://localhost')
         const send = (status: number, body: unknown) => {
           res.statusCode = status
@@ -504,6 +512,8 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         }
         // Synthetic browser session (an HttpOnly cookie in production) and the computer routes.
         // Like the Hub: the web sign-in starts only with ?web=1; without it a sign-in expects the CLI's loopback port.
+        // MOCK_PROVIDERS=1 makes the mock advertise forge sign-in so the gated front door can be seen.
+        if (url.pathname === '/login' && req.method === 'GET') return send(200, { providers: process.env['MOCK_PROVIDERS'] === '1' ? ['github', 'gitlab'] : [], browser_only: [] })
         if (url.pathname.startsWith('/login/') && req.method === 'GET' && url.searchParams.get('web') === '1') {
           browserSignedIn = true
           res.statusCode = 302

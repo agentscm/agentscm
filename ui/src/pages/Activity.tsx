@@ -46,7 +46,7 @@ function describe(e: HubEvent, d: Derived): Row | null {
       return { icon: 'slash-circle', tone: 'bad', text: <>was refused an edit to <Files paths={pathsOf(e)} /> (held by {holders.length ? holders.join(', ') : 'another agent'})</> }
     }
     case 'edit_repeated':
-      return { icon: 'arrow-repeat', tone: 'warn', text: <>repeated an edit to <Files paths={pathsOf(e)} /> and was let through</> }
+      return { icon: 'arrow-repeat', tone: 'warn', text: <>repeated an edit to <Files paths={pathsOf(e)} /> and it went ahead after the warning</> }
     case 'handoff_request': {
       const to = rec(data['to'])
       const note = typeof data['note'] === 'string' && data['note'] ? data['note'] : null

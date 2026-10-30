@@ -7,9 +7,10 @@ use axum::routing::get;
 
 // `'unsafe-inline'` for styles only: React sets inline `style` attributes, which `style-src` governs.
 // Fonts and images are inlined into app.css as `data:` URIs, hence `font-src` and `img-src` allow `data:`.
+// `manifest-src` lets the browser fetch /ui/manifest.webmanifest, which makes the page installable as an app.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-    img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; \
-    form-action 'none'; frame-ancestors 'none'";
+    img-src 'self' data:; font-src 'self' data:; connect-src 'self'; manifest-src 'self'; \
+    base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[cfg(feature = "ui")]
 const INDEX: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/index.html"));
@@ -17,6 +18,17 @@ const INDEX: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dis
 const SCRIPT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/app.js"));
 #[cfg(feature = "ui")]
 const STYLE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/app.css"));
+#[cfg(feature = "ui")]
+const MANIFEST: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/ui/dist/manifest.webmanifest"
+));
+#[cfg(feature = "ui")]
+const ICON_192: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/icon-192.png"));
+#[cfg(feature = "ui")]
+const ICON_512: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dist/icon-512.png"));
 
 #[cfg(not(feature = "ui"))]
 const INDEX: &[u8] = b"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -48,6 +60,18 @@ pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route(
             "/ui/app.css",
             get(|| async { secured("text/css; charset=utf-8", STYLE) }),
+        )
+        .route(
+            "/ui/manifest.webmanifest",
+            get(|| async { secured("application/manifest+json", MANIFEST) }),
+        )
+        .route(
+            "/ui/icon-192.png",
+            get(|| async { secured("image/png", ICON_192) }),
+        )
+        .route(
+            "/ui/icon-512.png",
+            get(|| async { secured("image/png", ICON_512) }),
         );
     router
 }
