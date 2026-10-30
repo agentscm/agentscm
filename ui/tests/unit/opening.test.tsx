@@ -21,6 +21,19 @@ describe('Opening roll call', () => {
     expect(within(screen.getByRole('status', { name: 'Opening the Hub' })).getAllByRole('listitem')).toHaveLength(3)
   })
 
+  it('greets by the first word of the profile name and keeps the login in the roll call', () => {
+    render(<Opening login="maria" name="  María José  Ruiz " />)
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Welcome back, María')
+    expect(screen.getByText(/Signed in as maria/)).toBeTruthy()
+  })
+
+  it('greets by the login when the name is missing or only whitespace', () => {
+    const { rerender } = render(<Opening login="maria" name={undefined} />)
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Welcome back, maria')
+    rerender(<Opening login="maria" name={' \t '} />)
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Welcome back, maria')
+  })
+
   it('puts the trouble on the current step with its buttons', () => {
     const onRetry = vi.fn()
     render(<Opening login="maria" repos={1} trouble={{ title: 'Hub connection unavailable', message: 'Try again.', onRetry, retryLabel: 'Retry Hub connection', onSignOut: vi.fn(), signOutLabel: 'Sign out of Hub pages' }} />)

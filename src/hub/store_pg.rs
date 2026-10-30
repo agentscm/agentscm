@@ -93,7 +93,7 @@ use super::store::{
     HubEvent, LIST_LIMIT, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal,
     PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit,
     like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
-    validate_login,
+    validate_display_name, validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
@@ -473,6 +473,7 @@ fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result
                 user_id: row.get(7),
             },
             login: row.get(8),
+            name: None,
             disabled: false,
         },
     })
@@ -3565,6 +3566,7 @@ fn active_token(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Re
                 user_id: row.get(5),
             },
             login: row.get(6),
+            name: None,
             disabled: false,
         },
     })
@@ -3744,6 +3746,7 @@ fn intent_row(row: &postgres::Row) -> (Intent, String, Option<String>) {
                     user_id: row.get(12),
                 },
                 login: row.get(13),
+                name: None,
                 disabled: false,
             },
             via: Vec::new(),
@@ -5144,13 +5147,13 @@ impl Store for PgStore {
                     &unix_now(),
                 ],
             )?;
-            let (id, disabled) = if inserted > 0 {
+            let (id, name, disabled) = if inserted > 0 {
                 append(&mut tx, &Event::user_created(&id, identity, login)?)?;
-                (id, false)
+                (id, None, false)
             } else {
                 // The lock serializes concurrent logins for the same identity.
                 let row = tx.query_one(
-                    "SELECT id, login, disabled FROM hub_users
+                    "SELECT id, login, disabled, display_name FROM hub_users
                      WHERE provider = $1 AND host = $2 AND forge_user_id = $3 FOR UPDATE",
                     &[&identity.provider, &identity.host, &identity.user_id],
                 )?;
@@ -5162,15 +5165,30 @@ impl Store for PgStore {
                     )?;
                     append(&mut tx, &Event::user_login_changed(&id, &previous, login)?)?;
                 }
-                (id, row.get(2))
+                (id, row.get(3), row.get(2))
             };
             tx.commit()?;
             Ok(User {
                 id,
                 identity: identity.clone(),
                 login: login.to_owned(),
+                name,
                 disabled,
             })
+        })
+    }
+
+    fn set_user_name(&self, user: &str, name: Option<&str>) -> Result<()> {
+        validate_display_name(name)?;
+        self.run(false, |client| {
+            let changed = client.execute(
+                "UPDATE hub_users SET display_name = $2 WHERE id = $1",
+                &[&user, &name],
+            )?;
+            if changed == 0 {
+                return Err(HubError::Invalid("unknown user".into()));
+            }
+            Ok(())
         })
     }
 
@@ -5248,7 +5266,7 @@ impl Store for PgStore {
     fn list_users(&self) -> Result<Vec<User>> {
         self.run(true, |client| {
             let rows = client.query(
-                "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users
+                "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users
                  ORDER BY created_at, id LIMIT $1",
                 &[&LIST_LIMIT],
             )?;
@@ -5262,6 +5280,7 @@ impl Store for PgStore {
                         user_id: row.get(3),
                     },
                     login: row.get(4),
+                    name: row.get(6),
                     disabled: row.get(5),
                 })
                 .collect())
@@ -5271,12 +5290,12 @@ impl Store for PgStore {
     fn user_by_id(&self, id: &str) -> Result<Option<User>> {
         self.run(true, |client| {
             Ok(client.query_opt(
-                "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE id = $1",
+                "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users WHERE id = $1",
                 &[&id],
             )?.map(|row| User {
                 id: row.get(0),
                 identity: ForgeIdentity { provider: row.get(1), host: row.get(2), user_id: row.get(3) },
-                login: row.get(4), disabled: row.get(5),
+                login: row.get(4), name: row.get(6), disabled: row.get(5),
             }))
         })
     }
@@ -5285,9 +5304,9 @@ impl Store for PgStore {
         identity.validate()?;
         self.run(true, |client| {
             Ok(client.query_opt(
-                "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE provider=$1 AND host=$2 AND forge_user_id=$3",
+                "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users WHERE provider=$1 AND host=$2 AND forge_user_id=$3",
                 &[&identity.provider,&identity.host,&identity.user_id],
-            )?.map(|row|User { id:row.get(0),identity:ForgeIdentity{provider:row.get(1),host:row.get(2),user_id:row.get(3)},login:row.get(4),disabled:row.get(5) }))
+            )?.map(|row|User { id:row.get(0),identity:ForgeIdentity{provider:row.get(1),host:row.get(2),user_id:row.get(3)},login:row.get(4),name:row.get(6),disabled:row.get(5) }))
         })
     }
 
@@ -5330,6 +5349,7 @@ impl Store for PgStore {
                         user_id: row.get(7),
                     },
                     login: row.get(8),
+                    name: None,
                     disabled: false,
                 },
             }))
@@ -5396,6 +5416,7 @@ impl Store for PgStore {
                             user_id: row.get(7),
                         },
                         login: row.get(8),
+                        name: None,
                         disabled: row.get(9),
                     },
                 });
@@ -5445,6 +5466,7 @@ impl Store for PgStore {
                             user_id: row.get(8),
                         },
                         login: row.get(9),
+                        name: None,
                         disabled: row.get(10),
                     },
                     repositories: row.get(11),
@@ -5652,7 +5674,7 @@ impl Store for PgStore {
     ) -> Result<Option<(User, i64)>> {
         self.run(false, |client| {
             let Some(row) = client.query_opt(
-                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at
+                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at, u.display_name
                  FROM hub_browser_sessions s JOIN hub_users u ON u.id = s.owner
                  WHERE s.digest = $1 AND s.expires_at > $2 AND s.created_at > $3",
                 &[&digest.as_str(), &now, &(now - BROWSER_SESSION_MAX_SECONDS)],
@@ -5669,6 +5691,7 @@ impl Store for PgStore {
                     user_id: row.get(3),
                 },
                 login: row.get(4),
+                name: row.get(7),
                 disabled: row.get(5),
             };
             if slide_to <= expires_at + SLIDE_STEP_SECONDS {
@@ -10317,6 +10340,7 @@ impl Store for PgStore {
                         id: request.requester.owner.clone(),
                         identity: who.owner.identity.clone(),
                         login: request.requester.login.clone(),
+                        name: None,
                         disabled: false,
                     },
                 };

@@ -333,7 +333,11 @@ status shown; clients show `message` as is.
   device starts). A session secret is returned once, at `exchange` or `signed_in`.
 - Human session (`Authorization: Bearer <session>`; an agent token is refused
   here and a session is refused on `whoami`): `GET /v1/hub/session`,
-  `DELETE /v1/hub/session` (204; ends this session),
+  `DELETE /v1/hub/session` (204; ends this session). The `user` object has `id`,
+  `provider`, `host`, `user_id`, `login` and `name`: the forge profile name, or `null` when the
+  profile has none. Each sign-in trims it, drops control characters, keeps at most 100
+  characters and replaces the stored copy (named migration `user_display_name`); it is for
+  display only and never decides access. `GET /v1/hub/users` returns it too.
   `POST /v1/hub/tokens` (`name`, `repository`, `ttl_seconds`; 201 with the
   token secret, shown only here; 403 `forbidden` if the forge says no; 401 if
   the session's forge token no longer works), `GET /v1/hub/tokens`,
