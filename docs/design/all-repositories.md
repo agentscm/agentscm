@@ -205,11 +205,16 @@ separate role system.
   its own two-minute poll. Rows do not stream in as each role check finishes.
 - The local development mock (`ui/dev/mock.ts`) does not serve the route; the page shows its
   error there.
-- The page is one hairline-ruled row per repository, not a table: the name, one status as a dot
-  and words (coral "N need you", else amber "N stuck", else green "Nothing needs you"), then a
-  line of counts and the last activity. A repository with nothing unfinished, no agents and
-  nothing needing you is a shorter row. Lower-bound counts read "at least N". On a phone the
-  status moves under the name.
+- Active repositories lead, as hairline-ruled rows: one with an agent connected, unfinished
+  work, something needing the person or activity in the last seven days. Each row is the name,
+  a status only when there is one (coral "N need you", else amber "N stuck"), then only the
+  counts that are there and the last activity. Lower-bound counts read "at least N". On a phone
+  the status moves under the name.
+- The quiet rest fold into one line, "N quiet repositories", that opens to a compact list of
+  names with a filter. The headline counts the active ones; the line under it counts the quiet.
+- When no repository has an agent, the page leads with "No agent is working in any of these
+  yet.", then a repository picker and the sign-in page's agent row (`ui/src/AskAgent.tsx`),
+  which opens the person's agent with the setup prompt naming that repository.
 - The Dashboard's tabs and its first-visit welcome tour do not show on this page: both describe
   one repository. The welcome tour waits for the first Dashboard.
 
