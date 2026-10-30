@@ -270,6 +270,21 @@ describe('useWebRead', () => {
     expect(screen.getByText('retry sign out')).toBeTruthy()
   })
 
+  it('a tab left signed out opens the app when it regains focus after a sign-in elsewhere', async () => {
+    let signedIn = false
+    const calls = hub({ 'GET /v1/hub/session': () => (signedIn ? { status: 200, body: SESSION_BODY } : { status: 401 }) })
+    render(<Probe />)
+    expect((await screen.findByTestId('none')).textContent).toBe('signed out')
+    // Still signed out: focus asks only for the session, and nothing changes.
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    await waitFor(() => expect(calls.filter((c) => c.url === '/v1/hub/session')).toHaveLength(2))
+    expect(screen.getByTestId('none')).toBeTruthy()
+    expect(minted(calls)).toHaveLength(0)
+    signedIn = true
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    expect((await screen.findByTestId('repo')).textContent).toBe('acme/docs')
+  })
+
   it('ignores a mint response from before web sign-in was disabled and reopened', async () => {
     let mintNumber = 0
     let releaseOld!: (reply: Reply) => void

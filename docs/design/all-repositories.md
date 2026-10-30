@@ -156,9 +156,10 @@ Setup › Admin for that).
 each, sorted on the Hub in the page's order. Attention-first order needs every row, so a cursor by
 name would not help. Role checks run with a small fixed concurrency (8) and an overall deadline;
 repositories not checked in time count as `unchecked`. The page refreshes the summary every two
-minutes while visible and on demand, not at Dashboard polling speed, because each refresh is one
-forge call per repository. A short per-session cache of role answers would cut that and is left as
-an open question: mint deliberately has none.
+minutes while visible and on demand, not at Dashboard polling speed, because a refresh can cost one
+forge call per repository. The Hub keeps each person's role answer for a repository for 90 seconds
+for this list only (never shared across people, never a failure, forgotten at sign-out), so a
+granted or lost access shows within that long; mint deliberately has none.
 
 **Store.** The work counts need `work_overview`'s query keyed by provider, host, repository and
 repository id instead of by token (`work_who`). The change is to resolve that key from the
@@ -200,8 +201,8 @@ separate role system.
 - The page's list of repositories to open is the readable list first, then the ones the person
   has tokens or computers for (`useWebRead`), so a first-time person can open a repository.
   Someone who can read more than one lands on `#repositories` when the page opens on `#home`.
-  At landing the list is fetched twice (once to choose, once by the page): one forge request per
-  repository each time.
+  At landing the list is fetched once, to choose; the page shows that list and refreshes it on
+  its own two-minute poll. Rows do not stream in as each role check finishes.
 - The local development mock (`ui/dev/mock.ts`) does not serve the route; the page shows its
   error there.
 - The page is one hairline-ruled row per repository, not a table: the name, one status as a dot
@@ -226,8 +227,6 @@ separate role system.
 
 ## Open questions
 
-1. Whether to cache role answers per session for a short time, given every refresh costs one forge
-   request per repository.
-2. Whether the empty-repository case for a single readable repository should also show the page,
+1. Whether the empty-repository case for a single readable repository should also show the page,
    so the person sees it is empty rather than broken.
-3. Whether pull-request overlaps belong in the first version's *Needs you* count.
+2. Whether pull-request overlaps belong in the first version's *Needs you* count.
