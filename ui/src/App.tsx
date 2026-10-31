@@ -198,7 +198,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
   }, [])
 
   const shell = (
-    <TourProvider key={section === 'promises' || section === 'workspace' || section === 'repositories' ? 'independent' : web ? token : 'hub'} signedIn={!hubSignedOut} section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
+    <TourProvider key={section === 'promises' || section === 'workspace' || section === 'repositories' ? 'independent' : web ? token : 'hub'} signedIn={!hubSignedOut} joinedAt={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session.joinedAt : undefined} section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
       <AppChrome
         // The frame is deep violet in both themes, so the top bar always carries the light-on-dark logo.
         logo={<Logo dark height={26} />}
@@ -229,7 +229,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
           {hubSessionKnown && onHubSignOut && <button type="button" className="btn btn-link" onClick={onHubSignOut}>{hubSignOutError ? 'Retry Hub sign-out' : 'Sign out of Hub pages'}</button>}
           {hubUnavailable && onHubRetry && <button type="button" className="btn btn-link" onClick={onHubRetry}>{hubUnavailable.retryLabel}</button>}
         </Notice>}
-        {!hubSignedOut && <InstallOffer />}
+        {!hubSignedOut && <InstallOffer tipsHere={section === 'home'} />}
         <ComputerNotices />
         {data.health?.demo && (
           <Notice tone="brand" icon="play-circle" title="Demo hub">
@@ -249,7 +249,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
         {section === 'explorer' && <ExplorerPage hubRepository={data.whoami?.token.repository ?? null} />}
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
-        {section === 'repositories' && <RepositoriesPage auth={device.auth} web={web} current={data.whoami?.token.repository ?? null} />}
+        {section === 'repositories' && <RepositoriesPage auth={device.auth} web={web} token={token} current={data.whoami?.token.repository ?? null} overview={overview.kind === 'ready' ? overview.value : null} />}
         {section === 'health' && <HealthPage health={data.health} />}
         {section === 'computers' && <ComputersPage auth={device.auth} provider={provider} onSignedOut={(session) => { device.reload(); onHubSignedOut?.(session) }} onSignOutFailed={onHubSignOutFailed} />}
         {section === 'admin' && <AdminPage auth={device.auth} provider={provider} />}

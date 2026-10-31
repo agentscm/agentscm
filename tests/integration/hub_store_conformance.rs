@@ -252,6 +252,8 @@ fn display_name_is_stored_and_cleared(db: &Db) {
         named
     );
     assert_eq!(store.list_users().unwrap()[0].name, named);
+    assert!(store.user_created_at(&alice.id).unwrap().unwrap() > 0);
+    assert_eq!(store.user_created_at("usr_missing").unwrap(), None);
     let digest = store::browser_session_digest(&format!("{:064}", 1)).unwrap();
     let now = unix_now();
     store

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { dockTip, isStandalone, useInstall } from './install.ts'
 import { loadDockTipDismissed, loadInstallDismissed, saveDockTipDismissed, saveInstallDismissed } from './storage.ts'
+import { coachLeft } from './tour/state.ts'
 import { useTour } from './tour/Tour.tsx'
 import { Icon } from './ui.tsx'
 
@@ -8,11 +9,10 @@ import { Icon } from './ui.tsx'
  * One quiet line at the top of the page, once: in a browser that can install the Hub as an app,
  * the offer; in the installed app, how to keep it in the Dock or on the taskbar.
  */
-export function InstallOffer() {
+export function InstallOffer({ tipsHere = false }: { /** The page shows the Dashboard's tips (the home view). */ tipsHere?: boolean }) {
   const tour = useTour()
-  // The Dashboard's first-visit tips come first; this waits until they are dismissed or skipped.
-  const touring = !!tour && tour.remember && !tour.prefs.welcomeSeen && !tour.prefs.welcomeOff
-  if (touring) return null
+  // When the introduction is on, the Dashboard's tips come first; this waits only while some are on this page, so it never waits for tips that are not showing.
+  if (tipsHere && tour && coachLeft(tour.prefs, tour.remember).length > 0) return null
   return isStandalone() ? <DockTip /> : <Offer />
 }
 

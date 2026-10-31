@@ -408,3 +408,59 @@
 .lb-seg.is-here .lb-label:last-child::after {
   content: none;
 }
+
+/* ---------- agent briefing, compact: the Dashboard's first tab ---------- */
+.brief-compact {
+  padding: 16px 22px 12px;
+  gap: 10px;
+  margin-top: 16px;
+}
+.brief-compact::before {
+  height: 64px;
+}
+.brief-compact .brief-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.brief-compact .brief-headline {
+  max-width: 70ch;
+  margin-bottom: 10px;
+  font-size: 17px;
+}
+.brief-compact .brief-list li {
+  padding: 4px 0 4px 16px;
+}
+.brief-compact .brief-list li::before {
+  top: 11px;
+}
+.brief-compact .disclosure {
+  margin: 0;
+}
+.brief-compact .disclosure > .notice,
+.brief-compact .disclosure > .brief-sources {
+  margin: 8px 0;
+}
+/* Nothing to read yet: the same dot and name, then one quiet sentence. */
+.brief-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  padding: 10px 22px;
+}
+.brief-line::before {
+  display: none;
+}
+.brief-line-text {
+  min-width: 0;
+  font-size: 13.5px;
+  color: var(--hub-text-2);
+}
+.brief-line-text .btn-link {
+  padding: 0;
+  vertical-align: baseline;
+}

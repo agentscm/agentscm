@@ -5462,6 +5462,17 @@ impl Store for SqliteStore {
         ).optional()?)
     }
 
+    fn user_created_at(&self, id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT created_at FROM hub_users WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>> {
         identity.validate()?;
         Ok(self.conn().query_row(

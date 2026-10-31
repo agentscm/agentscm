@@ -5308,6 +5308,14 @@ impl Store for PgStore {
         })
     }
 
+    fn user_created_at(&self, id: &str) -> Result<Option<i64>> {
+        self.run(true, |client| {
+            Ok(client
+                .query_opt("SELECT created_at FROM hub_users WHERE id = $1", &[&id])?
+                .map(|row| row.get(0)))
+        })
+    }
+
     fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>> {
         identity.validate()?;
         self.run(true, |client| {

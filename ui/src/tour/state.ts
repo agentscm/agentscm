@@ -13,9 +13,12 @@ export interface TourPrefs {
   autoplay: string[]
   /** The Dashboard's coach marks dismissed one by one, as `coach:<id>`. Older saved prefs held page names here; they are ignored. */
   sectionsSeen: string[]
+  /** The "?" help trigger's first-sign-in pulse was answered (the trigger was used or a tour opened) in this browser. */
+  helpSeen: boolean
 }
 
-export const DEFAULT_PREFS: TourPrefs = { welcomeSeen: false, welcomeOff: false, autoplay: [], sectionsSeen: [] }
+// The introduction (coach marks) is off until someone switches it on in Settings; only the "?" invites a tour, once (see helpPulse).
+export const DEFAULT_PREFS: TourPrefs = { welcomeSeen: true, welcomeOff: true, autoplay: [], sectionsSeen: [], helpSeen: false }
 
 // Fresh arrays each time: a shallow copy of DEFAULT_PREFS would share (and let callers mutate) its lists.
 const defaults = (): TourPrefs => ({ ...DEFAULT_PREFS, autoplay: [], sectionsSeen: [] })
@@ -38,7 +41,10 @@ export function loadPrefs(s: Store | null = store()): TourPrefs {
     const raw = s?.getItem(KEY)
     if (!raw) return defaults()
     const v = JSON.parse(raw) as Record<string, unknown>
-    return { welcomeSeen: v['welcomeSeen'] === true, welcomeOff: v['welcomeOff'] === true, autoplay: strings(v['autoplay']), sectionsSeen: strings(v['sectionsSeen']) }
+    // The introduction is on only when a saved record says so outright (the Settings switch writes false). A record from before
+    // this default flipped has no helpSeen: it is read as off, so nobody gets tips they did not ask for.
+    const on = 'helpSeen' in v && v['welcomeSeen'] === false && v['welcomeOff'] === false
+    return { welcomeSeen: !on, welcomeOff: !on, autoplay: strings(v['autoplay']), sectionsSeen: strings(v['sectionsSeen']), helpSeen: v['helpSeen'] === true }
   } catch {
     return defaults()
   }
@@ -75,6 +81,19 @@ export function canRemember(s: Store | null = store()): boolean {
 export const shouldWelcome = (p: TourPrefs, remember: boolean): boolean => remember && !p.welcomeSeen && !p.welcomeOff
 
 export const shouldAutoplay = (p: TourPrefs, section: string, remember: boolean): boolean => remember && p.autoplay.includes(section)
+
+/** A first sign-in is the first 24 hours of the account on this Hub; a few minutes of clock skew either way are allowed. */
+const NEW_ACCOUNT_S = 24 * 60 * 60
+const SKEW_S = 300
+
+/**
+ * Whether the "?" help trigger should pulse: the account (`joinedAt`, unix seconds from the Hub; absent on older Hubs) is under a day
+ * old and this browser has not used the trigger or opened a tour. Keyed on the account, so a new browser or Hub does not start it again.
+ */
+export const helpPulse = (p: TourPrefs, joinedAt: number | null | undefined, nowSeconds: number, remember: boolean): boolean =>
+  remember && !p.helpSeen && typeof joinedAt === 'number' && nowSeconds - joinedAt < NEW_ACCOUNT_S && joinedAt - nowSeconds < SKEW_S
+
+export const seeHelp = (p: TourPrefs): TourPrefs => (p.helpSeen ? p : { ...p, helpSeen: true })
 
 const COACH = 'coach:'
 const toggle = (list: string[], v: string, on: boolean): string[] => (on ? [...new Set([...list, v])] : list.filter((x) => x !== v))

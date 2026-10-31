@@ -24,7 +24,7 @@ export interface Device {
 }
 export interface AdminRepository { fullName: string; provider: string; host: string; devices: number; agentTokens: number }
 export interface SignInRefusal { at: number; count: number; provider: string; login: string; reason: string; via: 'sign_in' | 'device_mint' | 'web_read_token' }
-export interface BrowserSession { login: string; /** The forge profile name, when the person has one. */ name?: string; provider: string; admin: boolean; csrf: string }
+export interface BrowserSession { login: string; /** The forge profile name, when the person has one. */ name?: string; /** Unix seconds of the account's first sign-in to this Hub; absent on older Hubs. */ joinedAt?: number; provider: string; admin: boolean; csrf: string }
 
 /** How this page may reach the computer routes, or null when it can't. */
 export type DeviceAuth = { kind: 'local'; token: string } | { kind: 'browser'; session: BrowserSession }
@@ -114,7 +114,8 @@ export async function fetchBrowserSession(signal?: AbortSignal): Promise<Browser
   const login = typeof u['login'] === 'string' && LOGIN.test(u['login']) ? u['login'] : null
   const csrf = typeof j['csrf_token'] === 'string' && /^[A-Za-z0-9_-]{16,200}$/.test(j['csrf_token']) ? j['csrf_token'] : null
   const name = typeof u['name'] === 'string' && u['name'].trim() && u['name'].length <= 100 ? u['name'].trim() : undefined
-  return login && csrf ? { login, ...(name ? { name } : {}), provider: typeof u['provider'] === 'string' && PROVIDER.test(u['provider']) ? u['provider'] : 'github', admin: j['admin'] === true, csrf } : null
+  const joinedAt = unix(u['joined_at'])
+  return login && csrf ? { login, ...(name ? { name } : {}), ...(joinedAt ? { joinedAt } : {}), provider: typeof u['provider'] === 'string' && PROVIDER.test(u['provider']) ? u['provider'] : 'github', admin: j['admin'] === true, csrf } : null
 }
 
 /** How this page reaches the computer routes: the local page's grant, else a browser session. */

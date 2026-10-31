@@ -1,7 +1,7 @@
 // The feature walkthrough against the mock hub: MOCK=1 AGENTSCM_UI_PORT=<free port> npx playwright test tour
 import { expect, test, type Page } from '@playwright/test'
 
-// Start as a first-time viewer; the config default marks the welcome tour as seen for every other spec.
+// Start as a first-time viewer. The introduction is off by default; `introOn` is a viewer who switched it on in Settings.
 test.use({ storageState: { cookies: [], origins: [] } })
 
 test.beforeAll(async ({ request }) => {
@@ -26,6 +26,11 @@ const welcome = async (page: Page) => {
   await page.keyboard.press('Enter')
   await expect(dialog(page)).toBeVisible()
 }
+/** Before the page loads: the Settings switch is on (kept if the page already saved something, so reloads keep their dismissals). */
+const introOn = (page: Page) =>
+  page.addInitScript(() => {
+    if (!localStorage.getItem('agentscm.tour.v1')) localStorage.setItem('agentscm.tour.v1', JSON.stringify({ welcomeSeen: false, welcomeOff: false, autoplay: [], sectionsSeen: [], helpSeen: false }))
+  })
 const coach = (page: Page) => page.locator('[data-coach]')
 const reload = async (page: Page) => {
   await page.reload()
@@ -43,7 +48,27 @@ const withinViewport = async (page: Page) => {
     .toBe(true)
 }
 
-test('first sign-in shows three coach marks in the page, and no modal', async ({ page }) => {
+test('first sign-in shows nothing tour-like by default, and the ? button invites a first look', async ({ page, baseURL }) => {
+  await page.context().addCookies([{ name: 'mock_new', value: '1', url: baseURL! }]) // the mock's account is an hour old
+  await signIn(page)
+  await expect(coach(page)).toHaveCount(0)
+  await expect(dialog(page)).toHaveCount(0)
+  await expect(trigger(page)).toHaveClass(/is-pulsing/)
+  await trigger(page).click()
+  await expect(dialog(page)).toBeVisible()
+  expect(await stored(page)).toMatchObject({ helpSeen: true })
+  await page.keyboard.press('Escape')
+  await reload(page)
+  await expect(trigger(page)).not.toHaveClass(/is-pulsing/) // answered in this browser
+})
+
+test('an established account never sees the pulse', async ({ page }) => {
+  await signIn(page)
+  await expect(trigger(page)).not.toHaveClass(/is-pulsing/)
+})
+
+test('with the introduction switched on, first sign-in shows three coach marks in the page, and no modal', async ({ page }) => {
+  await introOn(page)
   await signIn(page)
   await expect(coach(page)).toHaveCount(3)
   await expect(dialog(page)).toHaveCount(0)
@@ -53,6 +78,7 @@ test('first sign-in shows three coach marks in the page, and no modal', async ({
 })
 
 test('a coach mark is dismissed on its own, and Skip tips ends the set; both stay gone after a reload', async ({ page }) => {
+  await introOn(page)
   await signIn(page)
   await coach(page).first().getByRole('button', { name: 'Got it' }).click()
   await expect(coach(page)).toHaveCount(2)
@@ -109,6 +135,7 @@ test('Esc closes the tour and focus returns to the page', async ({ page }) => {
 })
 
 test('"Don’t show again" on the welcome tour persists across a reload, and takes the coach marks with it', async ({ page }) => {
+  await introOn(page)
   await signIn(page)
   await welcome(page)
   await dialog(page).getByRole('checkbox', { name: 'Don’t show again' }).check()
@@ -121,6 +148,7 @@ test('"Don’t show again" on the welcome tour persists across a reload, and tak
 })
 
 test('Skip on the welcome tour without the checkbox leaves the coach marks for the next visit', async ({ page }) => {
+  await introOn(page)
   await signIn(page)
   await welcome(page)
   await dialog(page).getByRole('button', { name: 'Skip' }).click()
@@ -129,9 +157,8 @@ test('Skip on the welcome tour without the checkbox leaves the coach marks for t
   await expect(coach(page)).toHaveCount(3)
 })
 
-test('the Settings switch brings the coach marks back after a reload', async ({ page }) => {
+test('the Settings switch is off by default, and turning it on brings the coach marks after a reload', async ({ page }) => {
   await signIn(page)
-  await coach(page).first().getByRole('button', { name: 'Skip tips' }).click()
   await expect(coach(page)).toHaveCount(0)
   await page.evaluate(() => (window.location.hash = 'settings'))
   const sw = page.getByRole('switch', { name: 'Show the welcome tour next time' })
@@ -202,7 +229,6 @@ test('a Settings "Run now" starts that page’s tour', async ({ page }) => {
 
 test('a page tour switched on in Settings plays until finished or turned off', async ({ page }) => {
   await signIn(page)
-  await coach(page).first().getByRole('button', { name: 'Skip tips' }).click()
   await page.evaluate(() => (window.location.hash = 'settings'))
   await page.getByText(/^Page tours ·/).click()
   await page.getByRole('switch', { name: 'Play the Now tour on my next visit' }).check()

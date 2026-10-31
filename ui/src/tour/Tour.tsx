@@ -8,15 +8,17 @@ import { tourFor, type TourContext, type TourKey } from './content.ts'
 import './tour.css'
 import { Glyph, TourArt, WelcomeHero } from './art.tsx'
 import { useGlide, useSwap } from './motion.ts'
-import { placeCard, type Rect } from './place.ts'
+import { WIDE_FROM, placeCard, type Rect } from './place.ts'
 import { Spotlight } from './Spotlight.tsx'
 import { Trail } from './Trail.tsx'
-import { TOUR_KEY, canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, shouldAutoplay, type TourPrefs } from './state.ts'
+import { TOUR_KEY, canRemember, closeSection, closeWelcome, helpPulse, loadPrefs, savePrefs, seeHelp, shouldAutoplay, shouldWelcome, type TourPrefs } from './state.ts'
 
 interface TourApi {
   prefs: TourPrefs
   /** False when this browser cannot store preferences; tours then only start by hand. */
   remember: boolean
+  /** The "?" trigger invites a first look: a new account that has not used it yet. */
+  pulse: boolean
   start: (key: TourKey) => void
   update: (f: (p: TourPrefs) => TourPrefs) => void
 }
@@ -26,7 +28,7 @@ const Ctx = createContext<TourApi | null>(null)
 /** Null outside a signed-in shell (sign-in page, tests that render one page). */
 export const useTour = (): TourApi | null => useContext(Ctx)
 
-export function TourProvider({ section, data, d, overview, signedIn = true, children }: { section: Section; /** False on the signed-out shell: nothing starts by itself there. */ signedIn?: boolean; data: HubData; d: Derived | null; overview: WorkOverview | null; children: ReactNode }) {
+export function TourProvider({ section, data, d, overview, signedIn = true, joinedAt, children }: { section: Section; /** Unix seconds of the account's first sign-in to this Hub (BrowserSession.joinedAt); unknown means no pulse. */ joinedAt?: number | null; /** False on the signed-out shell: nothing starts by itself there. */ signedIn?: boolean; data: HubData; d: Derived | null; overview: WorkOverview | null; children: ReactNode }) {
   // Read once per load. Auto-play happens at most once per page open, and only for a page tour the viewer
   // switched on in Settings. The welcome tour no longer opens by itself: the Dashboard introduces itself
   // with coach marks (Coach.tsx), and the tour stays one click away.
@@ -56,9 +58,18 @@ export function TourProvider({ section, data, d, overview, signedIn = true, chil
     window.addEventListener('storage', on)
     return () => window.removeEventListener('storage', on)
   }, [])
-  const start = useCallback((key: TourKey) => {
-    if (tourFor(key)) setActive(key)
-  }, [])
+  // Using the trigger (or ⌘K, or a Settings button) to open a tour answers the invitation to look around, for this browser.
+  const start = useCallback(
+    (key: TourKey) => {
+      if (!tourFor(key)) return
+      update(seeHelp)
+      setActive(key)
+    },
+    [update],
+  )
+  // Read once per load: the pulse ends at the next page load once the account is a day old.
+  const [openedAt] = useState(() => Date.now() / 1000)
+  const pulse = signedIn && helpPulse(prefs, joinedAt, openedAt, remember)
 
   const [visited, setVisited] = useState(section)
   if (visited !== section) {
@@ -70,16 +81,16 @@ export function TourProvider({ section, data, d, overview, signedIn = true, chil
 
   const close = useCallback(
     (dontShow: boolean) => {
-      if (active) update((p) => (active === 'welcome' ? closeWelcome(p, dontShow) : closeSection(p, active, dontShow)))
+      if (active) update((p) => seeHelp(active === 'welcome' ? closeWelcome(p, dontShow) : closeSection(p, active, dontShow)))
       setActive(null)
     },
     [active, update],
   )
-  const api = useMemo(() => ({ prefs, remember, start, update }), [prefs, remember, start, update])
+  const api = useMemo(() => ({ prefs, remember, pulse, start, update }), [prefs, remember, pulse, start, update])
   return (
     <Ctx.Provider value={api}>
       {children}
-      {active && <TourOverlay key={active} tourKey={active} data={data} d={d} overview={overview} onClose={close} autoplayOn={active !== 'welcome' && prefs.autoplay.includes(active)} />}
+      {active && <TourOverlay key={active} tourKey={active} data={data} d={d} overview={overview} onClose={close} stoppable={active === 'welcome' ? shouldWelcome(prefs, remember) : prefs.autoplay.includes(active)} />}
     </Ctx.Provider>
   )
 }
@@ -94,7 +105,7 @@ export function TourTrigger({ section }: { section: Section }) {
   const key: TourKey = tourFor(section) ? section : 'welcome'
   const label = key === 'welcome' ? 'Tour the hub' : 'Tour this page'
   return (
-    <button type="button" data-tour="tour-trigger" className="tour-trigger" onClick={() => tour.start(key)} aria-label={label} title={label}>
+    <button type="button" data-tour="tour-trigger" className={`tour-trigger${tour.pulse ? ' is-pulsing' : ''}`} onClick={() => tour.start(key)} aria-label={label} title={label}>
       <Icon name="question-lg" />
       <span className="tour-trigger-text">{label}</span>
     </button>
@@ -136,7 +147,7 @@ const firstText = (selector: string): string | null => {
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
 
-function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tourKey: TourKey; data: HubData; d: Derived | null; overview: WorkOverview | null; onClose: (dontShow: boolean) => void; autoplayOn: boolean }) {
+function TourOverlay({ tourKey, data, d, overview, onClose, stoppable }: { tourKey: TourKey; data: HubData; d: Derived | null; overview: WorkOverview | null; onClose: (dontShow: boolean) => void; /** "Don’t show again" means something: the tour is set to open by itself. */ stoppable: boolean }) {
   const tour = tourFor(tourKey)!
   const steps = tour.steps
   const [i, setI] = useState(0)
@@ -272,9 +283,9 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
       {/* Clicks behind the tour are blocked; the scrim itself is a picture. */}
       <div className="tour-block" onMouseDown={(e) => e.preventDefault()} />
       <Spotlight rect={rect} step={i} />
-      <div ref={card} className={`tour-card${place.sheet ? ' is-sheet' : ''}${compact ? ' is-compact' : ''}`} style={place.style} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={`${ids}-body`}>
+      <div ref={card} className={`tour-card${place.sheet ? ' is-sheet' : ''}${compact ? ' is-compact' : ''}${!compact && (place.style.width ?? 0) >= WIDE_FROM ? ' is-wide' : ''}`} style={place.style} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={`${ids}-body`}>
         <div className="tour-scroll">
-        {!compact && <div className={`tour-band${hero ? ' is-hero' : ''}`}>{isWelcome ? <WelcomeHero still={!hero} key={hero ? 'hero' : 'still'} /> : <TourArt tourKey={tourKey} key={i} />}</div>}
+        {!compact && <div className={`tour-band${hero ? ' is-hero' : ''}`}>{hero ? <WelcomeHero /> : <TourArt tourKey={tourKey} step={i} key={i} />}</div>}
         <div className="tour-main">
           <div className="tour-head">
             <span className="tour-kicker">{tour.title}</span>
@@ -288,7 +299,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
           </p>
           <div ref={swap} className="tour-swap">
             <h2 id={titleId} className="tour-title">{step.title}</h2>
-            <div id={`${ids}-body`} className="tour-swap">
+            <div id={`${ids}-body`} className="tour-swap tour-cols">
               <p className="tour-what">{step.what}</p>
               {compact && (
                 <button type="button" className="tour-more" aria-expanded={more} aria-controls={`${ids}-more`} onClick={() => setMoreAt(more ? null : i)}>
@@ -312,7 +323,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
         </div>
         </div>
         <div className="tour-foot">
-          {(isWelcome || autoplayOn) && (
+          {stoppable && (
             <label className="tour-check">
               <input type="checkbox" checked={dontShow} onChange={(e) => setDontShow(e.target.checked)} /> Don’t show again
             </label>
