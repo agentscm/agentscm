@@ -1598,11 +1598,6 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0020_unchecked_holds.sqlite.sql"),
         postgres: include_str!("migrations/0020_unchecked_holds.pg.sql"),
     },
-    Migration {
-        version: 21,
-        sqlite: include_str!("migrations/0021_hub_answers.sqlite.sql"),
-        postgres: include_str!("migrations/0021_hub_answers.pg.sql"),
-    },
 ];
 
 #[derive(Debug)]
@@ -1725,7 +1720,7 @@ mod tests {
             count - 14
         );
         let after_hub_settings = pending(&(1..=18).collect::<Vec<_>>()).unwrap();
-        assert_eq!(after_hub_settings.len(), 3);
+        assert_eq!(after_hub_settings.len(), 2);
         assert_eq!(after_hub_settings[0].version, 19);
         assert!(
             after_hub_settings[0]
@@ -1738,15 +1733,10 @@ mod tests {
                 .contains("hub_work_model_usage")
         );
         let after_work_insights = pending(&(1..=19).collect::<Vec<_>>()).unwrap();
-        assert_eq!(after_work_insights.len(), 2);
+        assert_eq!(after_work_insights.len(), 1);
         assert_eq!(after_work_insights[0].version, 20);
         assert!(after_work_insights[0].sqlite.contains("unchecked"));
         assert!(after_work_insights[0].postgres.contains("unchecked"));
-        let after_holds = pending(&(1..=20).collect::<Vec<_>>()).unwrap();
-        assert_eq!(after_holds.len(), 1);
-        assert_eq!(after_holds[0].version, 21);
-        assert!(after_holds[0].sqlite.contains("answered_via_hub"));
-        assert!(after_holds[0].postgres.contains("answered_via_hub"));
         assert!(
             pending(&(1..=i64::try_from(count).unwrap()).collect::<Vec<_>>())
                 .unwrap()
