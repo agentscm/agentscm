@@ -2170,6 +2170,10 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     assert_eq!(device_list["repositories"][0]["work_complete"], true);
     assert_eq!(device_list["repositories"][0]["live_complete"], true);
     assert_eq!(
+        device_list["repositories"][0]["attention_categories"],
+        json!({"work": 0, "overlaps": 0, "contested_files": 0})
+    );
+    assert_eq!(
         device_list["repositories"][0]["attention_revision"],
         Value::Null
     );
@@ -2186,6 +2190,42 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .unwrap()
             .iter()
             .all(|row| row["repository"] != "acme/secret")
+    );
+    let (status, second) = env
+        .mint_at(
+            &env.hub,
+            &device,
+            json!({"name": "client-other", "repository": REPO}),
+        )
+        .await;
+    assert_eq!(status, 201, "{second}");
+    let (status, announced) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            &format!("/v1/hub/repos/{}/intents", REPO.replace('/', "%2F")),
+            second["token"].as_str(),
+            Some(
+                json!({"intent_id": format!("int_{}", "d".repeat(32)), "task": "review",
+                "branch": null, "base": null, "machine": null,
+                "paths": ["src/lib.rs"], "ttl_s": 600}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "{announced}");
+    let (status, with_contested_file) = env
+        .call(
+            &env.hub,
+            Method::GET,
+            "/v1/hub/device/repositories",
+            Some(&device),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{with_contested_file}");
+    assert_eq!(
+        with_contested_file["repositories"][0]["attention_categories"],
+        json!({"work": 0, "overlaps": 0, "contested_files": 1})
     );
     let (status, _) = env
         .call(

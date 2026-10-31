@@ -32,6 +32,7 @@ pub(super) struct RepositoryRow {
     pub local_agents: String,
     pub hub_state: String,
     pub attention: usize,
+    pub attention_summary: String,
     pub work_note: String,
     pub local: Vec<LocalAgentRow>,
     pub work: Vec<WorkRow>,
@@ -997,7 +998,12 @@ impl CompanionPanel {
                     return 90.0;
                 }
                 if !self.expanded.contains(&(row.hub.clone(), row.name.clone())) {
-                    return if row.local.is_empty() { 92.0 } else { 112.0 };
+                    return if row.local.is_empty() { 92.0 } else { 112.0 }
+                        + if row.attention_summary.is_empty() {
+                            0.0
+                        } else {
+                            20.0
+                        };
                 }
                 86.0 + if row.local.is_empty() {
                     0.0
@@ -1008,6 +1014,11 @@ impl CompanionPanel {
                 } else {
                     23.0 + 52.0 * row.work.len() as f64
                 } + 30.0
+                    + if row.attention_summary.is_empty() {
+                        0.0
+                    } else {
+                        22.0
+                    }
             })
             .collect();
         let viewport_height = self.work_scroll.frame().size.height;
@@ -1162,6 +1173,27 @@ impl CompanionPanel {
                     summary.setTextColor(Some(&color(0x48415d)));
                     document.addSubview(&summary);
                 }
+                if !row.attention_summary.is_empty() {
+                    let summary = label(
+                        mtm,
+                        &format!("In Hub · {}", row.attention_summary),
+                        12.0,
+                        true,
+                    );
+                    summary.setFrame(rect(
+                        20.0,
+                        top - if row.local.is_empty() { 99.0 } else { 119.0 },
+                        WIDTH - 82.0,
+                        18.0,
+                    ));
+                    summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                    summary.setTextColor(Some(&color(if row.attention > 0 {
+                        0xa23c2e
+                    } else {
+                        0x5f50bd
+                    })));
+                    document.addSubview(&summary);
+                }
                 let title = if row.overflow > 0 {
                     format!("Details (+{})", row.overflow)
                 } else {
@@ -1184,6 +1216,23 @@ impl CompanionPanel {
             }
 
             let mut cursor = top - 86.0;
+            if !row.attention_summary.is_empty() {
+                let summary = label(
+                    mtm,
+                    &format!("In Hub · {}", row.attention_summary),
+                    12.0,
+                    true,
+                );
+                summary.setFrame(rect(20.0, cursor + 7.0, WIDTH - 82.0, 18.0));
+                summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                summary.setTextColor(Some(&color(if row.attention > 0 {
+                    0xa23c2e
+                } else {
+                    0x5f50bd
+                })));
+                document.addSubview(&summary);
+                cursor -= 22.0;
+            }
             let section = label(mtm, "WHAT THEY'RE DOING IN HUB", 11.0, true);
             section.setFrame(rect(20.0, cursor - 3.0, 300.0, 16.0));
             section.setTextColor(Some(&color(0x656177)));
@@ -1603,6 +1652,7 @@ fn prompt_drafts_on_tab_change(
 /// The work view keeps the whole bounded roster; the attention view only narrows it.
 fn is_quiet_row(row: &RepositoryRow) -> bool {
     row.attention == 0
+        && row.attention_summary.is_empty()
         && row.hub_state == "Hub current"
         && row.work.is_empty()
         && row
@@ -1789,6 +1839,7 @@ mod tests {
             local_agents: "Connected checkout on this Mac".into(),
             hub_state: "Hub current".into(),
             attention: 0,
+            attention_summary: String::new(),
             work_note: "No current Hub work reported".into(),
             local: vec![LocalAgentRow {
                 agent: "Claude Code".into(),
@@ -1799,6 +1850,14 @@ mod tests {
             work: Vec::new(),
             overflow: 0,
         }
+    }
+
+    #[test]
+    fn inbox_only_repository_keeps_its_summary_visible() {
+        let mut row = repository("example/project");
+        assert!(is_quiet_row(&row));
+        row.attention_summary = "1 agent Inbox request".into();
+        assert!(!is_quiet_row(&row));
     }
 
     #[test]

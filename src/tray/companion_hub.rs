@@ -62,6 +62,8 @@ pub(super) struct Signal {
     pub count: usize,
     /// Human-facing Work decisions; Inbox requests remain in `count` only.
     pub needs_you: usize,
+    pub decisions: usize,
+    pub overlaps: usize,
     pub work: Vec<Work>,
 }
 
@@ -90,6 +92,7 @@ pub(super) struct CatalogRepository {
     pub last_activity_at: Option<i64>,
     pub agents: usize,
     pub attention: usize,
+    pub attention_summary: String,
     pub attention_revision: String,
     pub attention_complete: bool,
     pub complete: bool,
@@ -286,6 +289,7 @@ async fn read_catalog(
                 last_activity_at: row["last_activity_at"].as_i64(),
                 agents: row["agents"].as_u64().unwrap_or(0).min(500) as usize,
                 attention: row["needs_you"].as_u64().unwrap_or(0).min(500) as usize,
+                attention_summary: attention_summary(&row["attention_categories"]),
                 attention_revision: bounded_text(&row["attention_revision"], 64, ""),
                 attention_complete: row["complete"] == true,
                 complete,
@@ -355,6 +359,8 @@ async fn read_one(
         complete: false,
         count: 0,
         needs_you: 0,
+        decisions: 0,
+        overlaps: 0,
         work: Vec::new(),
     };
     if OpenRequest::from_status(connection).is_err() {
@@ -536,6 +542,8 @@ fn summarize(
             complete: false,
             count: 0,
             needs_you: 0,
+            decisions: 0,
+            overlaps: 0,
             work: Vec::new(),
         };
     };
@@ -623,6 +631,8 @@ fn summarize(
         complete,
         count,
         needs_you,
+        decisions: blocked + quiet + handovers,
+        overlaps: overlaps.len(),
         work,
     }
 }
@@ -640,10 +650,41 @@ fn bounded_text(value: &Value, max_chars: usize, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+fn attention_summary(value: &Value) -> String {
+    let mut parts = Vec::new();
+    for (key, noun) in [
+        ("work", "work decision"),
+        ("overlaps", "task overlap"),
+        ("contested_files", "contested file"),
+    ] {
+        let count = value[key].as_u64().unwrap_or(0).min(500);
+        if count > 0 {
+            parts.push(format!(
+                "{count} {noun}{}",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn attention_categories_have_bounded_plain_language() {
+        assert_eq!(
+            attention_summary(&json!({"work": 1, "overlaps": 2, "contested_files": 1})),
+            "1 work decision · 2 task overlaps · 1 contested file"
+        );
+        assert_eq!(attention_summary(&Value::Null), "");
+        assert_eq!(
+            attention_summary(&json!({"overlaps": 9999})),
+            "500 task overlaps"
+        );
+    }
 
     #[test]
     fn hub_signals_match_work_and_inbox_categories() {

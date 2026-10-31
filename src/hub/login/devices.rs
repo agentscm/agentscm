@@ -686,6 +686,7 @@ async fn repositories_for_owner(
                 owner.identity.provider.clone(),
                 &facts,
             );
+            let attention_categories = json!(summary.attention_categories);
             let revision = if include_work && summary.needs_you > 0 {
                 revision_key
                     .as_deref()
@@ -693,13 +694,21 @@ async fn repositories_for_owner(
             } else {
                 None
             };
-            rows.push((summary, work, live, work_complete, live_complete, revision));
+            rows.push((
+                summary,
+                work,
+                live,
+                work_complete,
+                live_complete,
+                revision,
+                attention_categories,
+            ));
         }
         Ok(rows)
     })
     .await?;
     // What needs a person first, then stuck work, then the newest activity.
-    rows.sort_by(|(a, _, _, _, _, _), (b, _, _, _, _, _)| {
+    rows.sort_by(|(a, _, _, _, _, _, _), (b, _, _, _, _, _, _)| {
         (b.needs_you > 0)
             .cmp(&(a.needs_you > 0))
             .then((b.unfinished.stuck > 0).cmp(&(a.unfinished.stuck > 0)))
@@ -709,7 +718,15 @@ async fn repositories_for_owner(
     let rows = rows
         .into_iter()
         .map(
-            |(summary, work, live, work_complete, live_complete, revision)| {
+            |(
+                summary,
+                work,
+                live,
+                work_complete,
+                live_complete,
+                revision,
+                attention_categories,
+            )| {
                 let mut value =
                     serde_json::to_value(summary).expect("repository summary serializes");
                 if include_work {
@@ -718,6 +735,7 @@ async fn repositories_for_owner(
                     value["live"] = json!(live);
                     value["live_complete"] = json!(live_complete);
                     value["attention_revision"] = json!(revision);
+                    value["attention_categories"] = attention_categories;
                 }
                 value
             },

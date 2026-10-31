@@ -2668,6 +2668,7 @@ fn companion_rows(
                         .filter(|signal| signal.available)
                         .map_or(0, |signal| signal.needs_you),
                 ),
+                attention_summary: panel_attention_summary(catalog_row, signal),
                 work_note,
                 local,
                 work,
@@ -2685,6 +2686,7 @@ fn companion_rows(
                 local_agents: "Observed on this Mac · not connected to Hub".into(),
                 hub_state: "Local only".into(),
                 attention: 0,
+                attention_summary: String::new(),
                 work_note: "Connect this checkout to see Hub work".into(),
                 local: row
                     .agents
@@ -2721,6 +2723,7 @@ fn companion_rows(
                 }
                 .into(),
                 attention: row.attention,
+                attention_summary: panel_attention_summary(Some(row), None),
                 work_note: if row.complete && row.agents > 0 {
                     format!("{} · no current task reported", hub_agent_count_label(row))
                 } else if row.complete {
@@ -2789,6 +2792,67 @@ fn companion_live_row(item: &companion_hub::LiveAgent) -> companion_panel::WorkR
         detail: format!("Active in Hub · seen through {}", item.source),
         needs_you: false,
     }
+}
+
+fn panel_attention_summary(
+    catalog: Option<&companion_hub::CatalogRepository>,
+    signal: Option<&companion_hub::Signal>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(catalog_summary) = catalog
+        .map(|catalog| catalog.attention_summary.as_str())
+        .filter(|summary| !summary.is_empty())
+    {
+        parts.push(catalog_summary.to_owned());
+        let newer = signal
+            .filter(|signal| signal.available)
+            .map_or(0, |signal| {
+                signal
+                    .needs_you
+                    .saturating_sub(catalog.map_or(0, |row| row.attention))
+            });
+        if newer > 0 {
+            parts.push(format!(
+                "{newer} more Hub alert{}",
+                if newer == 1 { "" } else { "s" }
+            ));
+        }
+    } else if let Some(signal) = signal.filter(|signal| signal.available) {
+        for (count, noun) in [
+            (signal.decisions, "work decision"),
+            (signal.overlaps, "task overlap"),
+        ] {
+            if count > 0 {
+                parts.push(format!(
+                    "{count} {noun}{}",
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        let unknown_signal = signal
+            .needs_you
+            .saturating_sub(signal.decisions.saturating_add(signal.overlaps));
+        let catalog_extra = catalog.map_or(0, |row| row.attention.saturating_sub(signal.needs_you));
+        let additional = unknown_signal.saturating_add(catalog_extra);
+        if additional > 0 {
+            parts.push(format!(
+                "{additional} more Hub alert{}",
+                if additional == 1 { "" } else { "s" }
+            ));
+        }
+    } else if catalog.is_some_and(|row| row.attention > 0) {
+        parts.push("More attention in Hub".into());
+    }
+    if let Some(signal) = signal.filter(|signal| signal.available) {
+        let inbox = signal.count.saturating_sub(signal.needs_you);
+        if inbox > 0 {
+            parts.push(format!(
+                "{inbox} agent Inbox request{}",
+                if inbox == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    parts.join(" · ")
 }
 
 fn hub_agent_count_label(row: &companion_hub::CatalogRepository) -> String {
@@ -3845,6 +3909,8 @@ mod tests {
             complete,
             count: keys.len(),
             needs_you: 0,
+            decisions: 0,
+            overlaps: 0,
             work: Vec::new(),
         }
     }
@@ -4011,6 +4077,7 @@ mod tests {
                     last_activity_at: Some(200),
                     agents: 1,
                     attention: 0,
+                    attention_summary: String::new(),
                     attention_revision: String::new(),
                     attention_complete: true,
                     complete: true,
@@ -4027,6 +4094,7 @@ mod tests {
                     last_activity_at: Some(100),
                     agents: 1,
                     attention: 2,
+                    attention_summary: "2 work decisions".into(),
                     attention_revision: "revision".into(),
                     attention_complete: true,
                     complete: true,
@@ -4087,6 +4155,7 @@ mod tests {
             last_activity_at,
             agents: 1,
             attention: 0,
+            attention_summary: String::new(),
             attention_revision: String::new(),
             attention_complete: true,
             complete: true,
@@ -4134,6 +4203,7 @@ mod tests {
                 last_activity_at: None,
                 agents: 0,
                 attention: 0,
+                attention_summary: String::new(),
                 attention_revision: String::new(),
                 attention_complete: false,
                 complete: false,
@@ -4200,6 +4270,61 @@ mod tests {
     }
 
     #[test]
+    fn panel_names_hub_warning_categories_and_agent_inbox_separately() {
+        let signal = signal("/synthetic/project", &["request:open"], true);
+        let catalog = companion_hub::CatalogRepository {
+            hub: "https://hub.example".into(),
+            repository: "example/project".into(),
+            last_activity_at: None,
+            agents: 0,
+            attention: 2,
+            attention_summary: "1 task overlap · 1 contested file".into(),
+            attention_revision: String::new(),
+            attention_complete: true,
+            complete: true,
+            work: vec![],
+            live: vec![],
+        };
+        assert_eq!(
+            panel_attention_summary(Some(&catalog), Some(&signal)),
+            "1 task overlap · 1 contested file · 1 agent Inbox request"
+        );
+        let mut signal_only = signal;
+        signal_only.needs_you = 1;
+        signal_only.count = 2;
+        signal_only.overlaps = 1;
+        signal_only.work.clear();
+        assert_eq!(
+            panel_attention_summary(None, Some(&signal_only)),
+            "1 task overlap · 1 agent Inbox request"
+        );
+        let older_catalog = companion_hub::CatalogRepository {
+            attention: 3,
+            attention_summary: String::new(),
+            ..catalog.clone()
+        };
+        assert_eq!(
+            panel_attention_summary(Some(&older_catalog), Some(&signal_only)),
+            "1 task overlap · 2 more Hub alerts · 1 agent Inbox request"
+        );
+        assert_eq!(
+            panel_attention_summary(Some(&older_catalog), None),
+            "More attention in Hub"
+        );
+        let newer_signal = companion_hub::Signal {
+            needs_you: 3,
+            count: 3,
+            decisions: 2,
+            overlaps: 1,
+            ..signal_only
+        };
+        assert_eq!(
+            panel_attention_summary(Some(&catalog), Some(&newer_signal)),
+            "1 task overlap · 1 contested file · 1 more Hub alert"
+        );
+    }
+
+    #[test]
     fn connected_catalog_decision_is_in_attention_with_agent_inbox() {
         let signal = signal("/synthetic/project", &["request:open"], true);
         let snapshot = Snapshot {
@@ -4214,6 +4339,7 @@ mod tests {
                 last_activity_at: None,
                 agents: 0,
                 attention: 1,
+                attention_summary: String::new(),
                 attention_revision: String::new(),
                 attention_complete: true,
                 complete: true,
