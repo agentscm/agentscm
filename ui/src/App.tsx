@@ -339,7 +339,7 @@ export default function App() {
     const warning = web.signOutError ? `${web.signOutError} ${unavailable?.message ?? ''}` : unavailable?.message ?? null
     if (!compact) {
       const trouble = warning === null ? null : { title, message: warning, onRetry: unavailable ? web.retry : undefined, retryLabel: unavailable?.retryLabel, onSignOut: state.session ? () => void web.signOut() : undefined, signOutLabel: warning.startsWith('Hub sign-out') ? 'Retry Hub sign-out' : 'Sign out of Hub pages' }
-      return <Opening login={state.session?.login} repos={state.repos} trouble={trouble} />
+      return <Opening login={state.session?.login} name={state.session?.name} repos={state.repos} trouble={trouble} />
     }
     return <>
       <div className="opening opening-inline" role="status" aria-label={title}>
