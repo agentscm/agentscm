@@ -2356,6 +2356,7 @@ fn companion_attention(
     for row in &catalog.repositories {
         let key = (row.hub.clone(), row.repository.clone());
         let entry = by_repository.entry(key).or_default();
+        entry.0 = entry.0.max(row.inbox_requests);
         entry.1 = entry.1.max(row.attention);
     }
     let total: usize = by_repository
@@ -2587,6 +2588,7 @@ fn companion_rows(
                             needs_you: item.state == "blocked"
                                 || item.state == "handover"
                                 || item.claim_status != "active",
+                            live: false,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2688,6 +2690,7 @@ fn companion_rows(
                             needs_you: item.state == "blocked"
                                 || item.state == "handover"
                                 || item.claim_status != "active",
+                            live: false,
                         })
                         .collect::<Vec<_>>();
                     append_live_work(&mut work, &row.live);
@@ -2698,8 +2701,19 @@ fn companion_rows(
             }),
     );
     rows.sort_by(|left, right| {
-        (right.attention > 0)
-            .cmp(&(left.attention > 0))
+        right
+            .work
+            .iter()
+            .any(|work| work.live)
+            .cmp(&left.work.iter().any(|work| work.live))
+            .then(
+                right
+                    .local
+                    .iter()
+                    .any(|agent| agent.observed)
+                    .cmp(&left.local.iter().any(|agent| agent.observed)),
+            )
+            .then((right.attention > 0).cmp(&(left.attention > 0)))
             .then(
                 right
                     .local
@@ -2714,6 +2728,7 @@ fn companion_rows(
                     .any(|work| work.needs_you)
                     .cmp(&left.work.iter().any(|work| work.needs_you)),
             )
+            .then((!right.attention_summary.is_empty()).cmp(&(!left.attention_summary.is_empty())))
             .then((!right.work.is_empty()).cmp(&(!left.work.is_empty())))
             .then(
                 right
@@ -2736,6 +2751,7 @@ fn companion_live_row(item: &companion_hub::LiveAgent) -> companion_panel::WorkR
         title: item.task.clone(),
         detail: format!("Active in Hub · seen through {}", item.source),
         needs_you: false,
+        live: true,
     }
 }
 
@@ -2788,14 +2804,16 @@ fn panel_attention_summary(
     } else if catalog.is_some_and(|row| row.attention > 0) {
         parts.push("More attention in Hub".into());
     }
-    if let Some(signal) = signal.filter(|signal| signal.available) {
-        let inbox = signal.count.saturating_sub(signal.needs_you);
-        if inbox > 0 {
-            parts.push(format!(
-                "{inbox} agent Inbox request{}",
-                if inbox == 1 { "" } else { "s" }
-            ));
-        }
+    let inbox = catalog.map_or(0, |row| row.inbox_requests).max(
+        signal
+            .filter(|signal| signal.available)
+            .map_or(0, |signal| signal.count.saturating_sub(signal.needs_you)),
+    );
+    if inbox > 0 {
+        parts.push(format!(
+            "{inbox} agent Inbox request{}",
+            if inbox == 1 { "" } else { "s" }
+        ));
     }
     parts.join(" · ")
 }
@@ -2852,10 +2870,12 @@ fn merge_local_run(local: &mut Vec<companion_panel::LocalAgentRow>, agent: &str,
 
 fn append_live_work(work: &mut Vec<companion_panel::WorkRow>, live: &[companion_hub::LiveAgent]) {
     for item in live {
-        if !work.iter().any(|reported| {
+        if let Some(reported) = work.iter_mut().find(|reported| {
             reported.agent.eq_ignore_ascii_case(&item.agent)
                 && reported.title.eq_ignore_ascii_case(&item.task)
         }) {
+            reported.live = true;
+        } else {
             work.push(companion_live_row(item));
         }
     }
@@ -4026,6 +4046,7 @@ mod tests {
                     last_activity_at: Some(200),
                     agents: 1,
                     attention: 0,
+                    inbox_requests: 0,
                     attention_summary: String::new(),
                     attention_revision: String::new(),
                     attention_complete: true,
@@ -4043,6 +4064,7 @@ mod tests {
                     last_activity_at: Some(100),
                     agents: 1,
                     attention: 2,
+                    inbox_requests: 0,
                     attention_summary: "2 work decisions".into(),
                     attention_revision: "revision".into(),
                     attention_complete: true,
@@ -4068,19 +4090,20 @@ mod tests {
             None,
         );
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].name, "example/remote");
-        assert!(rows[0].work[0].needs_you);
-        assert_eq!(rows[0].work[0].title, "Prepare release");
-        assert!(rows[0].work[0].detail.contains("Files not stated"));
-        assert_eq!(rows[1].name, "example/project");
-        assert_eq!(rows[1].work[0].title, "Inspect changes");
+        assert_eq!(rows[0].name, "example/project");
+        assert!(rows[0].work[0].live);
+        assert_eq!(rows[0].work[0].title, "Inspect changes");
+        assert_eq!(rows[1].name, "example/remote");
+        assert!(rows[1].work[0].needs_you);
+        assert_eq!(rows[1].work[0].title, "Prepare release");
+        assert!(rows[1].work[0].detail.contains("Files not stated"));
         assert_eq!(
-            rows[1].local_agents,
+            rows[0].local_agents,
             "Hub: Claude Code · 1 checkout on this Mac"
         );
-        assert_eq!(rows[1].local.len(), 2);
-        assert!(rows[1].local.iter().all(|agent| !agent.observed));
-        assert!(rows[0].local.is_empty());
+        assert_eq!(rows[0].local.len(), 2);
+        assert!(rows[0].local.iter().all(|agent| !agent.observed));
+        assert!(rows[1].local.is_empty());
         assert_eq!(
             companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot).as_deref(),
             Some("2 need your attention")
@@ -4131,6 +4154,7 @@ mod tests {
             last_activity_at,
             agents: 1,
             attention: 0,
+            inbox_requests: 0,
             attention_summary: String::new(),
             attention_revision: String::new(),
             attention_complete: true,
@@ -4179,6 +4203,7 @@ mod tests {
                 last_activity_at: None,
                 agents: 0,
                 attention: 0,
+                inbox_requests: 0,
                 attention_summary: String::new(),
                 attention_revision: String::new(),
                 attention_complete: false,
@@ -4205,6 +4230,7 @@ mod tests {
             title: "Prepare release".into(),
             detail: "Working".into(),
             needs_you: false,
+            live: false,
         }];
         append_live_work(
             &mut work,
@@ -4222,6 +4248,7 @@ mod tests {
             ],
         );
         assert_eq!(work.len(), 2);
+        assert!(work.iter().all(|item| item.live));
         assert_eq!(work[1].title, "Review patch");
     }
 
@@ -4254,6 +4281,7 @@ mod tests {
             last_activity_at: None,
             agents: 0,
             attention: 2,
+            inbox_requests: 0,
             attention_summary: "1 task overlap · 1 contested file".into(),
             attention_revision: String::new(),
             attention_complete: true,
@@ -4276,6 +4304,7 @@ mod tests {
         );
         let older_catalog = companion_hub::CatalogRepository {
             attention: 3,
+            inbox_requests: 0,
             attention_summary: String::new(),
             ..catalog.clone()
         };
@@ -4315,6 +4344,7 @@ mod tests {
                 last_activity_at: None,
                 agents: 0,
                 attention: 1,
+                inbox_requests: 0,
                 attention_summary: String::new(),
                 attention_revision: String::new(),
                 attention_complete: true,
@@ -4369,6 +4399,7 @@ mod tests {
                 last_activity_at: None,
                 agents: 0,
                 attention: 1,
+                inbox_requests: 0,
                 attention_summary: "1 work decision".into(),
                 attention_revision: "revision".into(),
                 attention_complete: true,
@@ -4387,6 +4418,50 @@ mod tests {
             companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot).as_deref(),
             Some("No Work or Inbox signals across the checked repositories.")
         );
+    }
+
+    #[test]
+    fn hub_only_repository_inbox_reaches_panel_attention() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![],
+        };
+        let mut catalog = companion_hub::Catalog {
+            repositories: vec![companion_hub::CatalogRepository {
+                hub: "https://hub.example".into(),
+                repository: "example/remote".into(),
+                last_activity_at: None,
+                agents: 0,
+                attention: 0,
+                inbox_requests: 2,
+                attention_summary: String::new(),
+                attention_revision: String::new(),
+                attention_complete: true,
+                complete: true,
+                work: vec![],
+                live: vec![],
+            }],
+            ..Default::default()
+        };
+        let mut routine = catalog.repositories[0].clone();
+        routine.repository = "example/routine".into();
+        routine.inbox_requests = 0;
+        catalog.repositories.insert(0, routine);
+        assert_eq!(
+            companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot).as_deref(),
+            Some("2 agent-to-agent Inbox requests · follow in Hub")
+        );
+        let rows = companion_rows(
+            &snapshot,
+            &crate::client_activity::ActivityStore::default(),
+            &[],
+            &catalog,
+            None,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "example/remote");
+        assert_eq!(rows[0].attention_summary, "2 agent Inbox requests");
     }
 
     #[test]

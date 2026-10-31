@@ -2173,6 +2173,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     );
     assert_eq!(device_list["repositories"][0]["work_complete"], true);
     assert_eq!(device_list["repositories"][0]["live_complete"], true);
+    assert_eq!(device_list["repositories"][0]["inbox_requests"], 0);
     assert_eq!(
         device_list["repositories"][0]["attention_categories"],
         json!({"work": 0, "overlaps": 0, "contested_files": 0})

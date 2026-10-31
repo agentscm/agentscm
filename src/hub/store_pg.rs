@@ -10086,6 +10086,31 @@ impl Store for PgStore {
         self.overview_for(&reader, query, now)
     }
 
+    fn repository_open_coordination_count(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+    ) -> Result<usize> {
+        self.run(true, |client| {
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_coordination_requests
+                     WHERE provider=$1 AND host=$2 AND repository=$3
+                       AND repository_id IS NOT DISTINCT FROM $4
+                       AND status IN ('pending','responded')",
+                    &[
+                        &owner.identity.provider,
+                        &owner.identity.host,
+                        &repository,
+                        &repository_id,
+                    ],
+                )?
+                .get(0);
+            Ok(usize::try_from(count).unwrap_or(usize::MAX))
+        })
+    }
+
     fn work_scope_check(
         &self,
         token: &str,

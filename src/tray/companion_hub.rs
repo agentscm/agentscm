@@ -93,6 +93,7 @@ pub(super) struct CatalogRepository {
     pub last_activity_at: Option<i64>,
     pub agents: usize,
     pub attention: usize,
+    pub inbox_requests: usize,
     pub attention_summary: String,
     pub attention_revision: String,
     pub attention_complete: bool,
@@ -277,9 +278,7 @@ async fn read_catalog(
                         .collect()
                 })
                 .unwrap_or_default();
-            let complete = row["complete"] == true
-                && row["work_complete"] == true
-                && row["live_complete"] == true;
+            let (complete, attention_complete) = catalog_coverage(row);
             incomplete |= !complete;
             catalog.repositories.push(CatalogRepository {
                 hub: hub.clone(),
@@ -291,9 +290,10 @@ async fn read_catalog(
                 last_activity_at: row["last_activity_at"].as_i64(),
                 agents: row["agents"].as_u64().unwrap_or(0).min(500) as usize,
                 attention: row["needs_you"].as_u64().unwrap_or(0).min(500) as usize,
+                inbox_requests: row["inbox_requests"].as_u64().unwrap_or(0).min(500) as usize,
                 attention_summary: attention_summary(&row["attention_categories"]),
                 attention_revision: bounded_text(&row["attention_revision"], 64, ""),
-                attention_complete: row["complete"] == true,
+                attention_complete,
                 complete,
                 work,
                 live,
@@ -653,6 +653,16 @@ fn bounded_text(value: &Value, max_chars: usize, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+fn catalog_coverage(row: &Value) -> (bool, bool) {
+    // Older Hubs lack the Inbox count. Do not present that gap as a
+    // verified zero or mark the repository current.
+    let attention_complete = row["complete"] == true && row["inbox_requests"].is_u64();
+    (
+        attention_complete && row["work_complete"] == true && row["live_complete"] == true,
+        attention_complete,
+    )
+}
+
 fn attention_summary(value: &Value) -> String {
     let mut parts = Vec::new();
     for (key, noun) in [
@@ -675,6 +685,20 @@ fn attention_summary(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn old_hub_catalog_without_inbox_count_is_partial() {
+        let legacy = json!({"complete": true, "work_complete": true, "live_complete": true});
+        assert_eq!(catalog_coverage(&legacy), (false, false));
+        for value in [Value::Null, json!("0"), json!(-1)] {
+            let mut malformed = legacy.clone();
+            malformed["inbox_requests"] = value;
+            assert_eq!(catalog_coverage(&malformed), (false, false));
+        }
+        let current = json!({"complete": true, "work_complete": true, "live_complete": true,
+            "inbox_requests": 0});
+        assert_eq!(catalog_coverage(&current), (true, true));
+    }
 
     #[test]
     fn attention_categories_have_bounded_plain_language() {

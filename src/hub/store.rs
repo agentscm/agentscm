@@ -849,6 +849,14 @@ pub trait Store: Send + Sync {
         query: &WorkOverviewQuery,
         now: i64,
     ) -> Result<WorkOverview>;
+    /// Current open coordination requests for a role-checked repository. The caller must
+    /// establish the person's read role, as for `repository_work_overview`.
+    fn repository_open_coordination_count(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+    ) -> Result<usize>;
     /// Check whether one lead session's durable claim covers requested paths. Never writes.
     fn work_scope_check(
         &self,

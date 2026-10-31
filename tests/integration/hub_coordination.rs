@@ -254,6 +254,28 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
     let request = first.coordination_request.unwrap();
     assert!(!first.created);
     assert!(first.conflict.is_some());
+    let owner = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 1,
+            },
+            "user1",
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .repository_open_coordination_count(&owner, REPOSITORY, REPOSITORY_ID)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .repository_open_coordination_count(&owner, "acme/other", REPOSITORY_ID)
+            .unwrap(),
+        0
+    );
 
     let replay = store
         .work_start(
@@ -338,6 +360,12 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
         )
         .unwrap();
     assert_eq!(resolved.status, CoordinationStatus::Resolved);
+    assert_eq!(
+        store
+            .repository_open_coordination_count(&owner, REPOSITORY, REPOSITORY_ID)
+            .unwrap(),
+        0
+    );
 
     let withdrawing = token(&*store, 3, "withdrawing");
     let withdraw_request = store
