@@ -6032,6 +6032,26 @@ impl Store for PgStore {
         })
     }
 
+    fn live_intents_scoped(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<Intent>> {
+        self.run(true, |client| {
+            let rows = client.query(
+                &format!(
+                    "{INTENT_SELECT} WHERE {TOKEN_SCOPE} AND i.released_at IS NULL
+                     AND i.expires_at > $5 ORDER BY i.id LIMIT $6"
+                ),
+                &[
+                    &who.repository,
+                    &who.repository_id,
+                    &who.owner.identity.host,
+                    &who.owner.identity.provider,
+                    &now,
+                    &(limit as i64),
+                ],
+            )?;
+            finish(rows.iter().map(intent_row).collect())
+        })
+    }
+
     fn notices_after(&self, token: &str, after: i64, limit: usize) -> Result<Vec<HubEvent>> {
         self.run(true, |client| {
             let rows = client.query(
@@ -6251,6 +6271,20 @@ impl Store for PgStore {
                 &[&key, &value, &now, &actor],
             )?;
             Ok(())
+        })
+    }
+
+    fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String> {
+        let now = unix_now();
+        self.run(false, |client| {
+            client.execute(
+                "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (key) DO NOTHING",
+                &[&key, &value, &now, &actor],
+            )?;
+            Ok(client
+                .query_one("SELECT value FROM hub_settings WHERE key = $1", &[&key])?
+                .get(0))
         })
     }
 

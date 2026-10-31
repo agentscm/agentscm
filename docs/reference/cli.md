@@ -299,10 +299,39 @@ Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes not
 
 ### Status-bar companion and client status
 
-`agentscm tray` opens the optional macOS status-bar companion and returns after its background
-process is ready. It reads the same checkout connections as the CLI. **Start at Login** is off by
-default and can be changed from the menu. This alpha has no separate app install or updater; the
-binary is currently unsigned and unnotarized. Linux and Windows retain the CLI status fallback:
+`agentscm tray` opens the optional macOS status-bar app and returns after its background
+process is ready. A primary click on its icon opens the AgentSCM work panel with Now, Agents and
+Start views; right click opens
+the setup and troubleshooting menu. The panel groups locally connected checkouts, recent local
+agent sightings and current Hub Work by repository. A signed-in computer can also list other
+repositories it can read on the same Hub, after a fresh role check for each. The panel orders
+repositories needing attention first and marks partial or unavailable Hub reads. Local agent
+integrations are labelled as configured unless AgentSCM recently observed a hook or MCP call;
+Hub Work state and next actions are reported by agents, not verified execution.
+
+The panel's quick prompt sends one prompt to installed Claude Code or Codex CLI in an explicitly
+selected, still-current connected checkout. The prompt goes to the
+client on standard input; the panel does not save the prompt or read client credentials. Native
+defaults remain the default; the additional modes are Claude Code Plan and Codex read only. A
+client exit is a process fact, not proof that its task completed. The panel separates that local
+process from recent hook/MCP sightings, whose live task state is unknown. Existing checkout
+attention appears with an action to use its tray menu. When a saved Hub sign-in permits it, the
+tray checks connected checkouts about once a minute with short-lived read-only tokens and
+shows Hub Work and Inbox signals: blocked or quiet tasks, handovers, declared-scope overlaps and
+active coordination requests. It refreshes the cross-repository list about every two minutes.
+A newly observed signal opens a small attention notice, or marks **New attention** when the
+Now card is fully visible; a partial
+read may reveal an older signal later. The summary marks incomplete reads and does not include
+the Dashboard's live file or pull-request
+crossings; open Hub for those and for full context. The cross-repository list requires a Hub with
+`GET /v1/hub/device/repositories`; older Hubs leave that portion unavailable. **Pin** keeps the same panel on top until
+dismissed or unpinned. **Start at Login** is off by default and can be changed from the menu. This
+alpha has no separate app install or updater; the binary is unsigned and unnotarized.
+
+On Linux, `agentscm tray` provides a terminal companion. It lists connected checkouts and
+reported participation, then optionally asks for a checkout, installed agent, supported mode and
+one-line prompt. A Linux status icon and pinned native window are not yet qualified. Windows
+retains the CLI status fallback:
 
 ```sh
 agentscm client status [--root PATH] [--check] [--json]

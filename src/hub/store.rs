@@ -330,6 +330,8 @@ pub trait Store: Send + Sync {
     ) -> Result<Answered>;
     /// Live intents in `repository`, ordered by id, at most `limit`.
     fn live_intents(&self, repository: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
+    /// Live intents in the principal's repository and forge scope, ordered by id.
+    fn live_intents_scoped(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// `intent_notice` and `pr_notice` events addressed to the token's intents with seq > `after`, oldest first, at most `limit`.
     fn notices_after(&self, token: &str, after: i64, limit: usize) -> Result<Vec<HubEvent>>;
     /// Sessions of the active tokens in `who`'s scope (same repository name and forge id, same
@@ -359,6 +361,8 @@ pub trait Store: Send + Sync {
     fn get_setting(&self, key: &str) -> Result<Option<String>>;
     /// Upserts a hub-wide setting; no event, `updated_by` records the actor.
     fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()>;
+    /// Insert a hub-wide setting once across replicas and return its retained value.
+    fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String>;
     /// Unix seconds; no event.
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()>;
     /// Keyed by (host, repository_id): a rename updates the row. A repository already held by

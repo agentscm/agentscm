@@ -25,7 +25,7 @@ use super::super::store::{
     NewAgentToken, Principal, User, agent_token_digest, device_digest, mint_web_read_token,
     unix_now, validate_agent_name, validate_repository,
 };
-use super::super::work::WorkOverviewQuery;
+use super::super::work::{ClaimStatus, WorkOverviewQuery, WorkState};
 use super::super::{HubError, HubState};
 use super::{ApiResult, Human, Login, random_hex, session_digest};
 use crate::team::auth::generate_secret;
@@ -38,6 +38,7 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/device/tokens/{id}", delete(revoke_token))
         .route("/v1/hub/session/read-token", post(web_read_token))
         .route("/v1/hub/session/repositories", get(session_repositories))
+        .route("/v1/hub/device/repositories", get(device_repositories))
         .route("/v1/hub/devices", get(list).post(enroll))
         .route("/v1/hub/devices/{id}", delete(revoke))
         .route("/v1/hub/admin/devices", get(admin_devices))
@@ -532,8 +533,33 @@ async fn session_repositories(
             "Only the Hub's web pages ask for this; agents get tokens through this computer's sign-in",
         ));
     }
-    let owner = human.user;
-    allow_listed(&state, &owner, "session_repositories").await?;
+    repositories_for_owner(state, human.user, false).await
+}
+
+/// A signed-in computer can inspect the same repositories for its tray work view. The server
+/// checks each repository's current forge role before returning any names or work details.
+async fn device_repositories(
+    State(state): State<HubState>,
+    DeviceAuth(device): DeviceAuth,
+) -> ApiResult<Json<Value>> {
+    repositories_for_owner(state, device.owner, true).await
+}
+
+async fn repositories_for_owner(
+    state: HubState,
+    owner: User,
+    include_work: bool,
+) -> ApiResult<Json<Value>> {
+    allow_listed(
+        &state,
+        &owner,
+        if include_work {
+            "device_repositories"
+        } else {
+            "session_repositories"
+        },
+    )
+    .await?;
     let (store, host) = (state.store.clone(), owner.identity.host.clone());
     let mut candidates = blocking(&state, move || {
         store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
@@ -541,10 +567,24 @@ async fn session_repositories(
     .await?;
     let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
     candidates.truncate(super::MAX_SIGN_IN_PROBES);
-    let (readable, unchecked) = readable(&state, &owner, candidates).await;
+    let (readable, unchecked) = readable(&state, &owner, candidates, !include_work).await;
     let store = state.store.clone();
     let mut rows = blocking(&state, move || {
         let now = unix_now();
+        let revision_key = if include_work {
+            const KEY: &str = "device_attention_revision_key_v1";
+            let key = match store.get_setting(KEY)? {
+                Some(key) => key,
+                None => {
+                    let candidate = generate_secret()
+                        .map_err(|_| HubError::Unavailable("attention marker key".into()))?;
+                    store.get_or_create_setting(KEY, candidate.expose(), "system")?
+                }
+            };
+            (key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(key)
+        } else {
+            None
+        };
         let mut rows = Vec::with_capacity(readable.len());
         for repo in readable {
             let overview = store.repository_work_overview(
@@ -554,7 +594,6 @@ async fn session_repositories(
                 &WorkOverviewQuery::default(),
                 now,
             )?;
-            let intents = store.live_intents(&repo.full_name, now, LIST_LIVE_LIMIT + 1)?;
             // `live_sessions` and `repository_events` read only the repository and forge of a
             // principal: this one names the repository the role check just allowed, with no token.
             let scope = Principal {
@@ -566,6 +605,7 @@ async fn session_repositories(
                 read_only: true,
                 owner: owner.clone(),
             };
+            let intents = store.live_intents_scoped(&scope, now, LIST_LIVE_LIMIT + 1)?;
             let sessions = store.live_sessions(&scope, now, LIST_LIVE_LIMIT + 1)?;
             let last_event_at = store
                 .repository_events(&scope, None, 1)?
@@ -579,26 +619,136 @@ async fn session_repositories(
                 sessions,
                 last_event_at,
             };
-            rows.push(summarize(
+            const PANEL_WORK_LIMIT: usize = 20;
+            const PANEL_LIVE_LIMIT: usize = 40;
+            let work_complete =
+                facts.overview.current_complete && facts.overview.current.len() <= PANEL_WORK_LIMIT;
+            let live_complete = facts.live_complete
+                && facts.sessions.len().saturating_add(facts.intents.len()) <= PANEL_LIVE_LIMIT;
+            let work = if include_work {
+                facts
+                    .overview
+                    .current
+                    .iter()
+                    .take(PANEL_WORK_LIMIT)
+                    .map(|item| {
+                        json!({
+                            "agent": item.lead_agent,
+                            "title": item.title,
+                            "state": item.state,
+                            "claim_status": item.claim_status,
+                            "next_action": item.next_action,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let live = if include_work {
+                let held: std::collections::BTreeSet<&str> = facts
+                    .sessions
+                    .iter()
+                    .filter_map(|session| session.intent.as_deref())
+                    .collect();
+                let mut live = facts
+                    .sessions
+                    .iter()
+                    .take(PANEL_LIVE_LIMIT)
+                    .map(|session| {
+                        json!({
+                            "agent": session.agent,
+                            "task": session.task,
+                            "source": "session",
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                live.extend(
+                    facts
+                        .intents
+                        .iter()
+                        .filter(|intent| !held.contains(intent.id.as_str()))
+                        .take(PANEL_LIVE_LIMIT.saturating_sub(live.len()))
+                        .map(|intent| {
+                            json!({
+                                "agent": intent.agent,
+                                "task": intent.task,
+                                "source": "intent",
+                            })
+                        }),
+                );
+                live
+            } else {
+                Vec::new()
+            };
+            let summary = summarize(
                 repo.full_name,
                 repo.repository_id,
                 owner.identity.provider.clone(),
                 &facts,
-            ));
+            );
+            let revision = if include_work && summary.needs_you > 0 {
+                revision_key
+                    .as_deref()
+                    .map(|key| attention_revision(&facts, &summary.contested_markers, key))
+            } else {
+                None
+            };
+            rows.push((summary, work, live, work_complete, live_complete, revision));
         }
         Ok(rows)
     })
     .await?;
     // What needs a person first, then stuck work, then the newest activity.
-    rows.sort_by(|a, b| {
+    rows.sort_by(|(a, _, _, _, _, _), (b, _, _, _, _, _)| {
         (b.needs_you > 0)
             .cmp(&(a.needs_you > 0))
             .then((b.unfinished.stuck > 0).cmp(&(a.unfinished.stuck > 0)))
             .then(b.last_activity_at.cmp(&a.last_activity_at))
             .then(a.repository.cmp(&b.repository))
     });
+    let rows = rows
+        .into_iter()
+        .map(
+            |(summary, work, live, work_complete, live_complete, revision)| {
+                let mut value =
+                    serde_json::to_value(summary).expect("repository summary serializes");
+                if include_work {
+                    value["work"] = json!(work);
+                    value["work_complete"] = json!(work_complete);
+                    value["live"] = json!(live);
+                    value["live_complete"] = json!(live_complete);
+                    value["attention_revision"] = json!(revision);
+                }
+                value
+            },
+        )
+        .collect::<Vec<_>>();
     Ok(Json(json!({"repositories": rows, "unchecked": unchecked,
         "complete": complete, "checked_at": unix_now()})))
+}
+
+/// A stable change marker for actionable items, without returning paths or token values.
+fn attention_revision(facts: &Facts, contested_markers: &[String], key: &str) -> String {
+    let mut keys = Vec::new();
+    for item in &facts.overview.current {
+        if matches!(item.state, WorkState::Blocked | WorkState::Handover)
+            || item.claim_status != ClaimStatus::Active
+        {
+            keys.push(format!("work:{}", item.id));
+        }
+    }
+    for pair in &facts.overview.overlaps {
+        keys.push(format!("overlap:{}:{}", pair.left.id, pair.right.id));
+    }
+    // Only contested pairs and their overlapping keys affect this revision.
+    for marker in contested_markers {
+        keys.push(format!("intent-pair:{marker}"));
+    }
+    keys.sort();
+    crate::hmac::hmac_sha256(key.as_bytes(), keys.join("\0").as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The candidates `owner` may read now by [`repository_role`], and how many could not be checked
@@ -607,6 +757,7 @@ async fn readable(
     state: &HubState,
     owner: &User,
     candidates: Vec<ConnectedRepository>,
+    use_role_cache: bool,
 ) -> (Vec<ConnectedRepository>, usize) {
     let deadline = tokio::time::Instant::now() + LIST_DEADLINE;
     let mut pending = candidates.into_iter();
@@ -617,7 +768,10 @@ async fn readable(
         while checks.len() < LIST_CONCURRENCY
             && let Some(repo) = pending.next()
         {
-            match cached_role(&state.login, &owner.id, &repo, now) {
+            let cached = use_role_cache
+                .then(|| cached_role(&state.login, &owner.id, &repo, now))
+                .flatten();
+            match cached {
                 Some(true) => allowed.push(repo),
                 Some(false) => {}
                 None => {
@@ -632,11 +786,15 @@ async fn readable(
         match tokio::time::timeout_at(deadline, checks.join_next()).await {
             Ok(None) => break,
             Ok(Some(Ok((repo, Ok(()))))) => {
-                remember_role(&state.login, &owner.id, &repo, true, unix_now());
+                if use_role_cache {
+                    remember_role(&state.login, &owner.id, &repo, true, unix_now());
+                }
                 allowed.push(repo);
             }
             Ok(Some(Ok((repo, Err(Denial::Role(_)))))) => {
-                remember_role(&state.login, &owner.id, &repo, false, unix_now());
+                if use_role_cache {
+                    remember_role(&state.login, &owner.id, &repo, false, unix_now());
+                }
             }
             Ok(Some(Ok((_, Err(Denial::Kind("not_connected")))))) => {}
             Ok(Some(_)) => unchecked += 1,

@@ -15,7 +15,7 @@ use agentscm::change_record::CaptureModeV1;
 use agentscm::{Error, Result};
 use sha2::{Digest, Sha256};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -25,6 +25,10 @@ use winit::window::WindowId;
 use crate::client_activity::{ActivityOutcome, ActivityPath};
 use crate::client_status::{BindingState, CredentialState, HubCheck, Snapshot};
 
+#[path = "companion_hub.rs"]
+mod companion_hub;
+#[path = "companion_panel.rs"]
+mod companion_panel;
 #[path = "hub_open.rs"]
 mod hub_open;
 #[path = "native_feedback.rs"]
@@ -32,12 +36,33 @@ mod native_feedback;
 #[path = "native_menu.rs"]
 mod native_menu;
 
+use super::companion_launch;
+
 const READY: &str = "AGENTSCM_TRAY_READY";
 const ALREADY_RUNNING: &str = "AGENTSCM_TRAY_ALREADY_RUNNING";
 const RECENT_HUB_CHECK_SECONDS: i64 = 60;
 
 enum UserEvent {
     Menu(String),
+    TrayClick,
+    CompanionTab(usize),
+    CompanionSubmit {
+        prompt: String,
+        checkout_index: usize,
+        agent_index: usize,
+        option_index: usize,
+    },
+    CompanionPin(bool),
+    CompanionOpenHub(usize),
+    CompanionOpenRepository {
+        hub: String,
+        repository: String,
+    },
+    CompanionSelection(usize),
+    CompanionHubSignals(Vec<companion_hub::Signal>),
+    CompanionHubCatalog(companion_hub::Catalog),
+    CompanionRun(companion_launch::Event),
+    CompanionQuitTimeout(u32),
     LaunchLogin(bool),
     LoginResult(bool, std::result::Result<(), String>),
     MenuTrackingEnded,
@@ -114,23 +139,23 @@ struct ConfigStamp(Vec<(std::path::PathBuf, Option<FileSignature>)>);
 
 type FileSignature = (u64, u64, i64, i64, u64);
 
-pub(super) async fn run(foreground: bool) -> Result<()> {
+pub(super) async fn run(foreground: bool, panel: bool) -> Result<()> {
     if foreground {
         let initial = Snapshot {
             version: 1,
             snapshot_at: 0,
             connections: Vec::new(),
         };
-        run_foreground(initial)
+        run_foreground(initial, panel)
     } else {
-        launch()
+        launch(panel)
     }
 }
 
-fn launch() -> Result<()> {
+fn launch(panel: bool) -> Result<()> {
     let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
-        .args(super::foreground_argv())
+        .args(super::foreground_argv(panel))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -149,7 +174,11 @@ fn launch() -> Result<()> {
         let _ = sender.send(result);
     });
     match receiver.recv_timeout(Duration::from_secs(8)) {
-        Ok(Ok(line)) if matches!(line.trim(), READY | ALREADY_RUNNING) => Ok(()),
+        Ok(Ok(line)) if line.trim() == READY => Ok(()),
+        Ok(Ok(line)) if line.trim() == ALREADY_RUNNING && !panel => Ok(()),
+        Ok(Ok(line)) if line.trim() == ALREADY_RUNNING => Err(Error::Invalid(
+            "tray is already running; click its icon to open AgentSCM".into(),
+        )),
         failure => {
             let _ = child.kill();
             let _ = child.wait();
@@ -166,7 +195,7 @@ fn launch() -> Result<()> {
     }
 }
 
-fn run_foreground(initial: Snapshot) -> Result<()> {
+fn run_foreground(initial: Snapshot, panel: bool) -> Result<()> {
     let _instance = match InstanceLock::acquire()? {
         Some(lock) => lock,
         None => {
@@ -191,6 +220,19 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
     let proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let _ = proxy.send_event(UserEvent::Menu(event.id.0));
+    }));
+    let click_proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        ) {
+            let _ = click_proxy.send_event(UserEvent::TrayClick);
+        }
     }));
 
     let login_enabled = super::login::enabled();
@@ -221,6 +263,9 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         native_menu::NativeMenuBridge::attach(&menu, refresh_proxy.clone(), login_enabled)
             .filter(native_menu::NativeMenuBridge::is_installed)
             .ok_or_else(|| Error::Invalid("cannot install native tray menu controls".into()))?;
+    let companion = companion_panel::CompanionPanel::new(refresh_proxy.clone())
+        .ok_or_else(|| Error::Invalid("cannot create companion panel".into()))?;
+    let hub_worker = companion_hub::spawn(refresh_proxy.clone());
     let mut app = TrayApp {
         activity_receiver,
         activity,
@@ -241,6 +286,21 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         native_menu: Some(native_menu),
         feedback: native_feedback::NativeFeedback::new()
             .ok_or_else(|| Error::Invalid("cannot create tray action feedback".into()))?,
+        hub_feedback: native_feedback::NativeFeedback::new()
+            .ok_or_else(|| Error::Invalid("cannot create Hub attention feedback".into()))?,
+        companion,
+        _hub_worker: hub_worker,
+        local_run: None,
+        launching: false,
+        quit_run_confirmed: false,
+        quit_after_run: false,
+        companion_roots: Vec::new(),
+        companion_selected: 0,
+        hub_signals: Vec::new(),
+        hub_catalog: companion_hub::Catalog::default(),
+        seen_catalog_attention: std::collections::HashMap::new(),
+        seen_hub_signal_keys: std::collections::HashMap::new(),
+        open_panel_on_start: panel,
         opening_hub: false,
         login_changing: false,
         menu_dirty: false,
@@ -276,6 +336,20 @@ struct TrayApp {
     tray: Option<tray_icon::TrayIcon>,
     native_menu: Option<native_menu::NativeMenuBridge>,
     feedback: native_feedback::NativeFeedback,
+    hub_feedback: native_feedback::NativeFeedback,
+    companion: companion_panel::CompanionPanel,
+    _hub_worker: companion_hub::Worker,
+    local_run: Option<LocalRun>,
+    launching: bool,
+    quit_run_confirmed: bool,
+    quit_after_run: bool,
+    companion_roots: Vec<std::path::PathBuf>,
+    companion_selected: usize,
+    hub_signals: Vec<companion_hub::Signal>,
+    hub_catalog: companion_hub::Catalog,
+    seen_catalog_attention: std::collections::HashMap<(String, String), (usize, String)>,
+    seen_hub_signal_keys: SeenHubSignals,
+    open_panel_on_start: bool,
     opening_hub: bool,
     login_changing: bool,
     menu_dirty: bool,
@@ -285,6 +359,17 @@ struct TrayApp {
     pending_share: Option<PendingShare>,
     /// The connected checkout the person was asked to confirm forgetting, and when.
     pending_forget: Option<(String, std::time::Instant)>,
+}
+
+struct LocalRun {
+    root: std::path::PathBuf,
+    repository: String,
+    agent: companion_launch::Agent,
+    started: std::time::Instant,
+    state: &'static str,
+    pid: Option<u32>,
+    finished_after: Option<Duration>,
+    session: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,8 +399,114 @@ fn clear_refresh_notice(notice: &mut Option<Notice>) {
 }
 
 impl TrayApp {
+    fn show_companion(&mut self) {
+        self.companion_selected = 0;
+        self.companion_roots = self
+            .snapshot
+            .connections
+            .iter()
+            .map(|connection| connection.root.clone())
+            .collect();
+        let checkouts: Vec<String> = self
+            .snapshot
+            .connections
+            .iter()
+            .enumerate()
+            .map(|(index, connection)| format!("{}. {}", index + 1, connection.repository))
+            .collect();
+        let agents = ["Claude Code", "Codex CLI"].map(str::to_owned);
+        let options = [
+            companion_launch::OptionSet::NativeDefault.label(),
+            companion_launch::OptionSet::Plan.label(),
+            companion_launch::OptionSet::ReadOnly.label(),
+        ]
+        .map(str::to_owned);
+        let extras = MenuExtras::load(&self.snapshot);
+        let mut highest_attention = 0;
+        for (index, connection) in self.snapshot.connections.iter().enumerate() {
+            let count = self
+                .hub_signals
+                .iter()
+                .find(|signal| signal.root == connection.root)
+                .map_or(0, |signal| signal.count)
+                + usize::from(extras.attention(&connection.root).is_some());
+            if count > highest_attention {
+                highest_attention = count;
+                self.companion_selected = index;
+            }
+        }
+        let status = companion_status(&self.snapshot, &self.activity, self.local_run.as_ref());
+        self.companion.show(
+            &status,
+            companion_attention(
+                &extras,
+                &self.hub_signals,
+                &self.hub_catalog,
+                &self.snapshot,
+            )
+            .as_deref(),
+            &checkouts,
+            &agents,
+            &options,
+            self.companion_selected,
+        );
+        self.companion.set_rows(&companion_rows(
+            &self.snapshot,
+            &self.activity,
+            &self.hub_signals,
+            &self.hub_catalog,
+            self.local_run.as_ref(),
+        ));
+    }
+
     fn replace_menu(&mut self, notice: Option<&str>) {
         update_refresh_notice(&mut self.notice, notice);
+        if self.companion.is_visible() {
+            let roots: Vec<_> = self
+                .snapshot
+                .connections
+                .iter()
+                .map(|connection| connection.root.clone())
+                .collect();
+            if roots != self.companion_roots {
+                let selected_root = self.companion_roots.get(self.companion_selected);
+                self.companion_selected = selected_root
+                    .and_then(|root| roots.iter().position(|candidate| candidate == root))
+                    .unwrap_or(0);
+                self.companion_roots = roots;
+                let checkouts: Vec<_> = self
+                    .snapshot
+                    .connections
+                    .iter()
+                    .enumerate()
+                    .map(|(index, connection)| format!("{}. {}", index + 1, connection.repository))
+                    .collect();
+                let agents = ["Claude Code", "Codex CLI"].map(str::to_owned);
+                let options = [
+                    companion_launch::OptionSet::NativeDefault.label(),
+                    companion_launch::OptionSet::Plan.label(),
+                    companion_launch::OptionSet::ReadOnly.label(),
+                ]
+                .map(str::to_owned);
+                let extras = MenuExtras::load(&self.snapshot);
+                let status =
+                    companion_status(&self.snapshot, &self.activity, self.local_run.as_ref());
+                self.companion.refresh_options(
+                    &status,
+                    companion_attention(
+                        &extras,
+                        &self.hub_signals,
+                        &self.hub_catalog,
+                        &self.snapshot,
+                    )
+                    .as_deref(),
+                    &checkouts,
+                    &agents,
+                    &options,
+                    self.companion_selected,
+                );
+            }
+        }
         self.pending_share = self.pending_share.take().filter(|pending| {
             pending_share_current(pending, &self.snapshot, std::time::Instant::now())
         });
@@ -343,6 +534,26 @@ impl TrayApp {
         );
         let login_enabled = super::login::enabled();
         let extras = MenuExtras::load(&self.snapshot);
+        if self.companion.is_visible() {
+            let status = companion_status(&self.snapshot, &self.activity, self.local_run.as_ref());
+            self.companion.set_status(
+                &status,
+                companion_attention(
+                    &extras,
+                    &self.hub_signals,
+                    &self.hub_catalog,
+                    &self.snapshot,
+                )
+                .as_deref(),
+            );
+            self.companion.set_rows(&companion_rows(
+                &self.snapshot,
+                &self.activity,
+                &self.hub_signals,
+                &self.hub_catalog,
+                self.local_run.as_ref(),
+            ));
+        }
         let mut key = menu_projection_key(
             &self.snapshot,
             &self.activity,
@@ -430,6 +641,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     .expect("tray icon is initialized once"),
             )
             .with_autosave_name("com.counterbranch.agentscm.tray")
+            .with_menu_on_left_click(false)
             .with_menu(Box::new(
                 self.initial_menu
                     .take()
@@ -439,6 +651,10 @@ impl ApplicationHandler<UserEvent> for TrayApp {
         match built {
             Ok(icon) => {
                 self.tray = Some(icon);
+                if self.open_panel_on_start {
+                    self.open_panel_on_start = false;
+                    self.show_companion();
+                }
                 println!("{READY}");
                 let _ = std::io::stdout().flush();
                 discard_stdout();
@@ -453,6 +669,242 @@ impl ApplicationHandler<UserEvent> for TrayApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::CompanionTab(index) => self.companion.set_tab(index),
+            UserEvent::TrayClick => {
+                if self.companion.is_visible() && !self.companion.is_pinned() {
+                    self.companion.hide();
+                } else {
+                    self.show_companion();
+                }
+            }
+            UserEvent::Menu(id) if id == "companion" => self.show_companion(),
+            UserEvent::CompanionOpenHub(index) => {
+                if let Some(connection) = self.companion_roots.get(index).and_then(|root| {
+                    self.snapshot
+                        .connections
+                        .iter()
+                        .find(|connection| &connection.root == root)
+                }) {
+                    let id = format!("hub:{}", connection_identity(connection));
+                    self.user_event(event_loop, UserEvent::Menu(id));
+                }
+            }
+            UserEvent::CompanionOpenRepository { hub, repository } => {
+                if let Some(connection) =
+                    self.snapshot.connections.iter().find(|connection| {
+                        connection.hub == hub && connection.repository == repository
+                    })
+                {
+                    let id = format!("hub:{}", connection_identity(connection));
+                    self.user_event(event_loop, UserEvent::Menu(id));
+                } else if self
+                    .hub_catalog
+                    .repositories
+                    .iter()
+                    .any(|row| row.hub == hub && row.repository == repository)
+                {
+                    let url = format!("{}/ui/#repositories", hub.trim_end_matches('/'));
+                    if let Err(error) = native_feedback::open_url(&url) {
+                        self.feedback.show("Could not open Hub", error, false);
+                    }
+                }
+            }
+            UserEvent::CompanionSelection(index) => {
+                self.companion_selected = index;
+                self.replace_menu(None);
+            }
+            UserEvent::CompanionHubSignals(signals) => {
+                let fresh = fresh_hub_signals(&signals, &self.seen_hub_signal_keys, None);
+                if !fresh.is_empty() {
+                    if self.companion.is_attention_visible() {
+                        self.companion.mark_new_attention();
+                    } else {
+                        let message = if fresh.len() == 1 {
+                            "Newly observed Hub signal. Open AgentSCM to review it.".to_owned()
+                        } else {
+                            format!(
+                                "Newly observed signals in {} checkouts. Open AgentSCM to review them.",
+                                fresh.len()
+                            )
+                        };
+                        self.hub_feedback.show_passive("Hub needs you", &message);
+                    }
+                }
+                remember_hub_signals(&mut self.seen_hub_signal_keys, &signals);
+                self.hub_signals = signals;
+                self.replace_menu(None);
+            }
+            UserEvent::CompanionHubCatalog(catalog) => {
+                let mut increased = 0usize;
+                let mut next = std::collections::HashMap::new();
+                for row in &catalog.repositories {
+                    let key = (row.hub.clone(), row.repository.clone());
+                    if !row.attention_complete {
+                        if let Some(before) = self.seen_catalog_attention.get(&key) {
+                            next.insert(key, before.clone());
+                        }
+                        continue;
+                    }
+                    if !self.snapshot.connections.iter().any(|connection| {
+                        connection.hub == row.hub && connection.repository == row.repository
+                    }) && self.seen_catalog_attention.get(&key).is_some_and(|before| {
+                        catalog_attention_changed(row.attention, &row.attention_revision, before)
+                    }) {
+                        increased += 1;
+                    }
+                    next.insert(key, (row.attention, row.attention_revision.clone()));
+                }
+                retain_unverified_baselines(
+                    &mut next,
+                    &self.seen_catalog_attention,
+                    &catalog.unverified_hubs,
+                );
+                if increased > 0 {
+                    if self.companion.is_attention_visible() {
+                        self.companion.mark_new_attention();
+                    } else {
+                        self.hub_feedback.show_passive(
+                            "Hub needs you",
+                            &format!(
+                                "New attention in {increased} Hub repositories. Open AgentSCM to review it."
+                            ),
+                        );
+                    }
+                }
+                self.seen_catalog_attention = next;
+                self.hub_catalog = catalog;
+                self.replace_menu(None);
+            }
+            UserEvent::CompanionPin(pinned) => {
+                if self.companion.is_pinned() != pinned {
+                    self.companion.set_pinned(pinned);
+                }
+            }
+            UserEvent::CompanionSubmit {
+                prompt,
+                checkout_index,
+                agent_index,
+                option_index,
+            } => {
+                if self.launching {
+                    self.notice = Some(Notice::Action("A local agent run is still active".into()));
+                } else if let (Some(root), Some(agent), Some(option)) = (
+                    self.companion_roots.get(checkout_index),
+                    [
+                        companion_launch::Agent::ClaudeCode,
+                        companion_launch::Agent::Codex,
+                    ]
+                    .get(agent_index),
+                    [
+                        companion_launch::OptionSet::NativeDefault,
+                        companion_launch::OptionSet::Plan,
+                        companion_launch::OptionSet::ReadOnly,
+                    ]
+                    .get(option_index),
+                ) {
+                    if let Some(connection) = self
+                        .snapshot
+                        .connections
+                        .iter()
+                        .find(|connection| &connection.root == root)
+                    {
+                        self.launching = true;
+                        self.local_run = Some(LocalRun {
+                            root: root.clone(),
+                            repository: connection.repository.clone(),
+                            agent: *agent,
+                            started: std::time::Instant::now(),
+                            state: "launch requested",
+                            pid: None,
+                            finished_after: None,
+                            session: None,
+                        });
+                        let request = companion_launch::Request {
+                            root: root.clone(),
+                            agent: *agent,
+                            option: *option,
+                            prompt,
+                        };
+                        let proxy = self.refresh_proxy.clone();
+                        companion_launch::run(request, move |event| {
+                            let _ = proxy.send_event(UserEvent::CompanionRun(event));
+                        });
+                    } else {
+                        self.notice = Some(Notice::Action(
+                            "The selected checkout changed; reopen AgentSCM".into(),
+                        ));
+                    }
+                } else {
+                    self.notice = Some(Notice::Action(
+                        "Select a connected checkout, agent and supported option".into(),
+                    ));
+                }
+                self.replace_menu(None);
+            }
+            UserEvent::CompanionRun(event) => {
+                if let Some(run) = &mut self.local_run {
+                    match event {
+                        companion_launch::Event::Started(pid) => {
+                            run.state = "client process running";
+                            run.pid = Some(pid);
+                        }
+                        companion_launch::Event::Exited {
+                            success,
+                            session,
+                            preview,
+                        } => {
+                            self.launching = false;
+                            self.quit_run_confirmed = false;
+                            run.state = if success {
+                                "client exited; task outcome unverified"
+                            } else {
+                                "client exited with an error"
+                            };
+                            run.finished_after = Some(run.started.elapsed());
+                            run.session = session;
+                            let handoff = run.session.as_ref().map_or_else(
+                                || "Open this checkout in the native client to inspect its recent session.".to_owned(),
+                                |id| {
+                                    let command = match run.agent {
+                                        companion_launch::Agent::ClaudeCode => "claude --resume",
+                                        companion_launch::Agent::Codex => "codex resume",
+                                    };
+                                    format!(
+                                        "In Terminal: cd {} && {command} {id}",
+                                        shell_quote(&run.root.to_string_lossy())
+                                    )
+                                },
+                            );
+                            let body = format!(
+                                "{}\n{}",
+                                preview.unwrap_or_else(|| {
+                                    "No bounded response preview was available.".into()
+                                }),
+                                handoff
+                            );
+                            self.feedback.show("Native agent returned", &body, false);
+                            if self.quit_after_run {
+                                event_loop.exit();
+                            }
+                            if !success {
+                                self.notice =
+                                    Some(Notice::Action("Local agent run needs attention".into()));
+                            }
+                        }
+                        companion_launch::Event::Failed(message) => {
+                            self.launching = false;
+                            self.quit_run_confirmed = false;
+                            run.state = "launch or status failed";
+                            run.finished_after = Some(run.started.elapsed());
+                            self.notice = Some(Notice::Action(message));
+                            if self.quit_after_run {
+                                event_loop.exit();
+                            }
+                        }
+                    }
+                }
+                self.replace_menu(None);
+            }
             UserEvent::Menu(id) if id == "refresh" => {
                 self.notice = None;
                 if !self.refreshing.swap(true, Ordering::AcqRel) {
@@ -460,7 +912,71 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 }
                 self.replace_menu(None);
             }
-            UserEvent::Menu(id) if id == "quit" => event_loop.exit(),
+            UserEvent::Menu(id) if id == "quit" => {
+                if self.launching {
+                    if self.quit_after_run {
+                        self.feedback.show(
+                            "Stopping agent…",
+                            "Waiting for the client process to exit.",
+                            true,
+                        );
+                    } else if !self.quit_run_confirmed {
+                        self.quit_run_confirmed = true;
+                        self.feedback.show(
+                            "Agent still running",
+                            "Choose Quit AgentSCM Tray again to stop the local agent and quit.",
+                            false,
+                        );
+                    } else if let Some(pid) = self.local_run.as_ref().and_then(|run| run.pid) {
+                        let Ok(group) = i32::try_from(pid) else {
+                            self.feedback.show(
+                                "Cannot stop agent",
+                                "The process ID is invalid.",
+                                false,
+                            );
+                            return;
+                        };
+                        // SAFETY: the launched child starts in its own process group; a negative
+                        // PID addresses that group without invoking a shell.
+                        // A process group can already be gone while an inherited output pipe
+                        // remains open. Bound Quit regardless of the signal result.
+                        let _ = unsafe { libc::kill(-group, libc::SIGTERM) };
+                        self.quit_after_run = true;
+                        self.feedback.show(
+                            "Stopping agent…",
+                            "The tray will quit after the client exits or a short timeout.",
+                            true,
+                        );
+                        let proxy = self.refresh_proxy.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(5));
+                            let _ = proxy.send_event(UserEvent::CompanionQuitTimeout(pid));
+                        });
+                    } else {
+                        self.feedback.show(
+                            "Agent starting",
+                            "Wait for the client to start, then choose Quit again.",
+                            false,
+                        );
+                    }
+                } else {
+                    event_loop.exit();
+                }
+            }
+            UserEvent::CompanionQuitTimeout(pid) => {
+                if self.quit_after_run
+                    && self.launching
+                    && self.local_run.as_ref().and_then(|run| run.pid) == Some(pid)
+                    && let Ok(group) = i32::try_from(pid)
+                {
+                    // SAFETY: the agent's PID is its process group ID; SIGKILL ends a client
+                    // that did not respond to the earlier stop request.
+                    let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+                    // A detached helper can retain the output pipe after the direct child has
+                    // been stopped. Bound Quit even when that pipe never reaches EOF.
+                    event_loop.exit();
+                }
+            }
             UserEvent::Menu(id) if id == "launch-login" => {
                 let desired = !super::login::enabled();
                 let _ = self
@@ -1772,6 +2288,338 @@ fn agent_choices() -> [(crate::client_setup::Agent, &'static str); 5] {
     ]
 }
 
+type SeenHubSignals =
+    std::collections::HashMap<std::path::PathBuf, std::collections::HashSet<String>>;
+
+fn fresh_hub_signals<'a>(
+    signals: &'a [companion_hub::Signal],
+    seen: &SeenHubSignals,
+    visible_root: Option<&Path>,
+) -> Vec<&'a companion_hub::Signal> {
+    signals
+        .iter()
+        .filter(|signal| {
+            signal.available
+                && seen.contains_key(&signal.root)
+                && Some(signal.root.as_path()) != visible_root
+                && signal.keys.iter().any(|key| {
+                    !seen
+                        .get(&signal.root)
+                        .is_some_and(|known| known.contains(key))
+                })
+        })
+        .collect()
+}
+
+fn remember_hub_signals(seen: &mut SeenHubSignals, signals: &[companion_hub::Signal]) {
+    for signal in signals.iter().filter(|signal| signal.available) {
+        let current = signal.keys.iter().cloned().collect();
+        if signal.complete {
+            seen.insert(signal.root.clone(), current);
+        } else {
+            seen.entry(signal.root.clone()).or_default().extend(current);
+        }
+    }
+}
+
+fn companion_attention(
+    extras: &MenuExtras,
+    hub_signals: &[companion_hub::Signal],
+    catalog: &companion_hub::Catalog,
+    snapshot: &Snapshot,
+) -> Option<String> {
+    let mut alerts: Vec<_> = hub_signals
+        .iter()
+        .filter(|signal| signal.available && signal.count > 0)
+        .collect();
+    alerts.sort_by_key(|signal| std::cmp::Reverse(signal.count));
+    let remote = catalog
+        .repositories
+        .iter()
+        .filter(|row| {
+            !snapshot.connections.iter().any(|connection| {
+                connection.hub == row.hub && connection.repository == row.repository
+            })
+        })
+        .collect::<Vec<_>>();
+    let total: usize = alerts.iter().map(|signal| signal.count).sum::<usize>()
+        + remote.iter().map(|row| row.attention).sum::<usize>();
+    let local = extras.attention.len();
+    if total + local > 0 {
+        let leading = alerts
+            .iter()
+            .take(2)
+            .map(|signal| format!("{} ({})", signal.repository, signal.count))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut text = format!("{} Work / Inbox signals", total);
+        if local > 0 {
+            text.push_str(&format!(" · {local} local setup alerts"));
+        }
+        if !leading.is_empty() {
+            text.push_str(&format!(" · {leading}"));
+        }
+        if catalog.unavailable_hubs > 0 || catalog.incomplete_hubs > 0 {
+            text.push_str(" · some Hub data unavailable");
+        }
+        return Some(text);
+    }
+    if hub_signals.len() < snapshot.connections.len() {
+        return Some("Checking Hub Work and Inbox…".into());
+    }
+    if hub_signals.iter().any(|signal| !signal.available) || catalog.unavailable_hubs > 0 {
+        return Some("Some Hub work is unavailable. Open Hub to check.".into());
+    }
+    if hub_signals.iter().any(|signal| !signal.complete) || catalog.incomplete_hubs > 0 {
+        return Some("No signal in the partial Hub snapshot. Open Hub to check.".into());
+    }
+    Some("No Work or Inbox signals across the checked repositories.".into())
+}
+
+fn companion_status(
+    snapshot: &Snapshot,
+    activity: &crate::client_activity::ActivityStore,
+    run: Option<&LocalRun>,
+) -> String {
+    let now = std::time::Instant::now();
+    let observed = snapshot
+        .connections
+        .iter()
+        .filter_map(|connection| connection.binding.activity_generation.as_deref())
+        .flat_map(|binding| activity.snapshot(binding, now))
+        .count();
+    let mut summary = format!(
+        "{} connected checkouts · {} recent local sightings",
+        snapshot.connections.len(),
+        observed
+    );
+    if let Some(run) = run {
+        summary.push_str(&format!(
+            " · {} on {}: {}",
+            run.agent.label(),
+            run.repository,
+            run.state
+        ));
+    }
+    summary
+}
+
+fn companion_rows(
+    snapshot: &Snapshot,
+    activity: &crate::client_activity::ActivityStore,
+    signals: &[companion_hub::Signal],
+    catalog: &companion_hub::Catalog,
+    run: Option<&LocalRun>,
+) -> Vec<companion_panel::RepositoryRow> {
+    let now = std::time::Instant::now();
+    let mut rows: Vec<_> = snapshot
+        .connections
+        .iter()
+        .map(|connection| {
+            let observed = connection
+                .binding
+                .activity_generation
+                .as_deref()
+                .map(|binding| activity.snapshot(binding, now))
+                .unwrap_or_default();
+            let mut agent_names = observed
+                .iter()
+                .filter_map(|item| item.agent.as_deref())
+                .map(agent_label)
+                .collect::<Vec<_>>();
+            agent_names.sort_unstable();
+            agent_names.dedup();
+            let local_agents = if !agent_names.is_empty() {
+                format!("On this Mac · recently seen: {}", agent_names.join(", "))
+            } else if connection.agents.is_empty() {
+                "On this Mac · no agent seen yet".to_owned()
+            } else {
+                let configured = connection
+                    .agents
+                    .iter()
+                    .map(|agent| agent_label(agent))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("On this Mac · {configured} configured; no recent activity")
+            };
+            let signal = signals.iter().find(|signal| signal.root == connection.root);
+            let catalog_row = catalog
+                .repositories
+                .iter()
+                .find(|row| row.hub == connection.hub && row.repository == connection.repository);
+            let hub_state = match (signal.filter(|signal| signal.available), catalog_row) {
+                (Some(signal), _) if signal.complete => "Hub current",
+                (Some(_), _) => "Hub partial",
+                (None, Some(row)) if row.complete => "Hub current",
+                (None, Some(_)) => "Hub partial",
+                (None, None) if signal.is_some() => "Hub unavailable",
+                (None, None) => "Checking Hub",
+            }
+            .to_owned();
+            let work_note = match hub_state.as_str() {
+                "Hub current" => "No current Hub work reported",
+                "Hub partial" => "No work in this partial Hub snapshot",
+                "Hub unavailable" => "Hub work unavailable; open Hub to check",
+                _ => "Checking Hub work…",
+            }
+            .to_owned();
+            let work_source = signal
+                .filter(|signal| signal.available)
+                .map(|signal| signal.work.as_slice())
+                .or_else(|| catalog_row.map(|row| row.work.as_slice()));
+            let mut work = work_source
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| companion_panel::WorkRow {
+                            agent: item.agent.clone(),
+                            title: item.title.clone(),
+                            detail: companion_work_detail(item),
+                            needs_you: item.state == "blocked"
+                                || item.state == "handover"
+                                || item.claim_status != "active",
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(catalog_row) = catalog_row {
+                work.extend(catalog_row.live.iter().map(companion_live_row));
+            }
+            if let Some(run) = run.filter(|run| run.root == connection.root) {
+                work.insert(
+                    0,
+                    companion_panel::WorkRow {
+                        agent: run.agent.label().into(),
+                        title: "Prompt started on this computer".into(),
+                        detail: format!("Local CLI · {}", run.state),
+                        needs_you: run.state == "launch or status failed",
+                    },
+                );
+            }
+            companion_panel::RepositoryRow {
+                name: connection.repository.clone(),
+                hub: Some(connection.hub.clone()),
+                local_agents,
+                hub_state,
+                attention: signal.filter(|signal| signal.available).map_or_else(
+                    || catalog_row.map_or(0, |row| row.attention),
+                    |signal| signal.count,
+                ),
+                work_note,
+                work,
+                overflow: 0,
+            }
+        })
+        .collect();
+    rows.extend(
+        unconnected_rows(snapshot, activity, now)
+            .into_iter()
+            .map(|row| companion_panel::RepositoryRow {
+                name: row.repo,
+                hub: None,
+                local_agents: format!(
+                    "On this Mac · recently seen: {} · not connected to Hub",
+                    row.agents
+                        .iter()
+                        .map(|agent| agent_label(agent))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                hub_state: "Local only".into(),
+                attention: 0,
+                work_note: "Connect this checkout to see Hub work".into(),
+                work: Vec::new(),
+                overflow: 0,
+            }),
+    );
+    rows.extend(
+        catalog
+            .repositories
+            .iter()
+            .filter(|row| {
+                !snapshot.connections.iter().any(|connection| {
+                    connection.hub == row.hub && connection.repository == row.repository
+                })
+            })
+            .map(|row| companion_panel::RepositoryRow {
+                name: row.repository.clone(),
+                hub: Some(row.hub.clone()),
+                local_agents: format!("In Hub · {} agents · no checkout on this Mac", row.agents),
+                hub_state: if row.complete {
+                    "Hub current"
+                } else {
+                    "Hub partial"
+                }
+                .into(),
+                attention: row.attention,
+                work_note: if row.complete {
+                    "No current Hub work reported"
+                } else {
+                    "No work in this partial Hub snapshot"
+                }
+                .into(),
+                work: row
+                    .work
+                    .iter()
+                    .map(|item| companion_panel::WorkRow {
+                        agent: item.agent.clone(),
+                        title: item.title.clone(),
+                        detail: companion_work_detail(item),
+                        needs_you: item.state == "blocked"
+                            || item.state == "handover"
+                            || item.claim_status != "active",
+                    })
+                    .chain(row.live.iter().map(companion_live_row))
+                    .collect(),
+                overflow: 0,
+            }),
+    );
+    rows.sort_by(|left, right| {
+        (right.attention > 0)
+            .cmp(&(left.attention > 0))
+            .then(right.work.len().cmp(&left.work.len()))
+            .then(left.name.cmp(&right.name))
+    });
+    rows
+}
+
+fn companion_live_row(item: &companion_hub::LiveAgent) -> companion_panel::WorkRow {
+    companion_panel::WorkRow {
+        agent: item.agent.clone(),
+        title: item.task.clone(),
+        detail: format!("Active in Hub · seen through {}", item.source),
+        needs_you: false,
+    }
+}
+
+fn catalog_attention_changed(attention: usize, revision: &str, before: &(usize, String)) -> bool {
+    attention > before.0
+        || (attention > 0 && attention == before.0 && !revision.is_empty() && revision != before.1)
+}
+
+fn retain_unverified_baselines(
+    next: &mut std::collections::HashMap<(String, String), (usize, String)>,
+    previous: &std::collections::HashMap<(String, String), (usize, String)>,
+    unverified_hubs: &[String],
+) {
+    for (key, baseline) in previous {
+        if unverified_hubs.contains(&key.0) {
+            next.entry(key.clone()).or_insert_with(|| baseline.clone());
+        }
+    }
+}
+
+fn companion_work_detail(item: &companion_hub::Work) -> String {
+    let status = match (item.state.as_str(), item.claim_status.as_str()) {
+        ("blocked", _) => "Needs your attention",
+        ("handover", _) => "Ready for handoff",
+        (_, "active") => "Working",
+        (_, "stale") => "Agent may need attention",
+        _ => "Check in Hub",
+    };
+    format!("{status} · Next: {}", item.next_action)
+}
+
 fn build_menu(
     snapshot: &Snapshot,
     activity: &crate::client_activity::ActivityStore,
@@ -1784,6 +2632,13 @@ fn build_menu(
     let menu = Menu::new();
     menu.append(&PredefinedMenuItem::section_header("AgentSCM"))
         .map_err(menu_error)?;
+    menu.append(&MenuItem::with_id(
+        "companion",
+        "Open AgentSCM…",
+        true,
+        None,
+    ))
+    .map_err(menu_error)?;
     if !extras.signed_in.is_empty() {
         menu.append(&native_text_item("signed-in", &extras.signed_in.join("\n")))
             .map_err(menu_error)?;
@@ -2694,6 +3549,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_attention_detects_same_count_replacements() {
+        let before = (2, "old-revision".to_owned());
+        assert!(catalog_attention_changed(2, "new-revision", &before));
+        assert!(!catalog_attention_changed(2, "old-revision", &before));
+        assert!(!catalog_attention_changed(2, "", &before));
+        assert!(catalog_attention_changed(3, "", &before));
+        assert!(!catalog_attention_changed(1, "new-revision", &before));
+    }
+
+    #[test]
+    fn remote_attention_baseline_survives_one_unavailable_hub() {
+        let hub = "https://hub.example".to_owned();
+        let repo = "example/project".to_owned();
+        let previous = std::collections::HashMap::from([(
+            (hub.clone(), repo.clone()),
+            (1, "old-revision".to_owned()),
+        )]);
+        let mut next = std::collections::HashMap::new();
+        retain_unverified_baselines(&mut next, &previous, std::slice::from_ref(&hub));
+        assert!(catalog_attention_changed(
+            1,
+            "new-revision",
+            next.get(&(hub, repo)).unwrap()
+        ));
+    }
+
+    fn signal(root: &str, keys: &[&str], complete: bool) -> companion_hub::Signal {
+        companion_hub::Signal {
+            root: root.into(),
+            repository: root.into(),
+            text: root.into(),
+            keys: keys.iter().map(|key| (*key).into()).collect(),
+            available: true,
+            complete,
+            count: keys.len(),
+            work: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hub_alerts_keep_other_checkout_and_partial_items() {
+        let mut seen = SeenHubSignals::new();
+        remember_hub_signals(&mut seen, &[signal("/a", &["old"], false)]);
+        assert!(fresh_hub_signals(&[signal("/a", &["old"], true)], &seen, None).is_empty());
+        remember_hub_signals(
+            &mut seen,
+            &[signal("/a", &["old"], true), signal("/b", &[], true)],
+        );
+        let changed = [
+            signal("/a", &["old", "new-a"], true),
+            signal("/b", &["new-b"], true),
+        ];
+        let fresh = fresh_hub_signals(&changed, &seen, Some(Path::new("/a")));
+        assert_eq!(
+            fresh
+                .iter()
+                .map(|item| item.root.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("/b")]
+        );
+        assert_eq!(fresh_hub_signals(&changed, &seen, None).len(), 2);
+
+        remember_hub_signals(&mut seen, &[signal("/a", &["old", "new-a"], true)]);
+        remember_hub_signals(&mut seen, &[signal("/a", &["old"], false)]);
+        assert!(
+            fresh_hub_signals(&[signal("/a", &["old", "new-a"], true)], &seen, None).is_empty()
+        );
+    }
+
+    #[test]
     fn menu_sign_in_names_the_hub_host_and_forge() {
         assert_eq!(
             hub_host("https://dogfood.agentscm.dev"),
@@ -2806,6 +3731,71 @@ mod tests {
             capture_mode: mode,
             capture_mismatch: None,
         }
+    }
+
+    #[test]
+    fn panel_joins_local_checkouts_and_other_hub_repositories() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![share_connection("/synthetic/project", None)],
+        };
+        let catalog = companion_hub::Catalog {
+            repositories: vec![
+                companion_hub::CatalogRepository {
+                    hub: "https://hub.example".into(),
+                    repository: "example/project".into(),
+                    agents: 1,
+                    attention: 0,
+                    attention_revision: String::new(),
+                    attention_complete: true,
+                    complete: true,
+                    work: vec![],
+                    live: vec![companion_hub::LiveAgent {
+                        agent: "Claude Code".into(),
+                        task: "Inspect changes".into(),
+                        source: "session".into(),
+                    }],
+                },
+                companion_hub::CatalogRepository {
+                    hub: "https://hub.example".into(),
+                    repository: "example/remote".into(),
+                    agents: 1,
+                    attention: 2,
+                    attention_revision: "revision".into(),
+                    attention_complete: true,
+                    complete: true,
+                    work: vec![companion_hub::Work {
+                        agent: "Codex".into(),
+                        title: "Prepare release".into(),
+                        state: "blocked".into(),
+                        next_action: "Ask for review".into(),
+                        claim_status: "active".into(),
+                    }],
+                    live: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let rows = companion_rows(
+            &snapshot,
+            &crate::client_activity::ActivityStore::default(),
+            &[],
+            &catalog,
+            None,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "example/remote");
+        assert!(rows[0].work[0].needs_you);
+        assert_eq!(rows[0].work[0].title, "Prepare release");
+        assert_eq!(rows[1].name, "example/project");
+        assert_eq!(rows[1].work[0].title, "Inspect changes");
+        assert_eq!(rows[1].local_agents, "On this Mac · no agent seen yet");
+        assert!(
+            companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot)
+                .unwrap()
+                .contains("2 Work / Inbox signals")
+        );
     }
 
     #[test]
