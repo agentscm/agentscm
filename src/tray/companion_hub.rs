@@ -23,16 +23,28 @@ const CATALOG_POLL_SECONDS: u64 = 120;
 const TOKEN_NAME: &str = "agentscm-tray-attention";
 
 pub(super) struct Worker {
-    stop: std::sync::mpsc::Sender<()>,
+    command: std::sync::mpsc::Sender<WorkerCommand>,
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+enum WorkerCommand {
+    Refresh,
+    Stop,
+}
+
+impl Worker {
+    /// Recheck Hub work when the panel opens, unless the last worker pass was very recent.
+    pub(super) fn refresh(&self) {
+        let _ = self.command.send(WorkerCommand::Refresh);
+    }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::Release);
-        let _ = self.stop.send(());
+        let _ = self.command.send(WorkerCommand::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -100,7 +112,7 @@ struct CachedToken {
 }
 
 pub(super) fn spawn(proxy: winit::event_loop::EventLoopProxy<super::UserEvent>) -> Worker {
-    let (stop, stopped) = std::sync::mpsc::channel();
+    let (command, commands) = std::sync::mpsc::channel();
     let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_stopping = stopping.clone();
     let thread = std::thread::spawn(move || {
@@ -115,7 +127,10 @@ pub(super) fn spawn(proxy: winit::event_loop::EventLoopProxy<super::UserEvent>) 
         let Ok(client) = agentscm::hub::forge_http::client() else {
             return;
         };
-        loop {
+        'worker: loop {
+            if worker_stopping.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
             let signals = runtime.block_on(read(&client, &mut cache, &worker_stopping));
             if worker_stopping.load(std::sync::atomic::Ordering::Acquire) {
                 break;
@@ -137,11 +152,30 @@ pub(super) fn spawn(proxy: winit::event_loop::EventLoopProxy<super::UserEvent>) 
                     break;
                 }
             }
-            if stopped
-                .recv_timeout(Duration::from_secs(POLL_SECONDS))
-                .is_ok()
-            {
-                break;
+            let last_pass = std::time::Instant::now();
+            let next_poll = last_pass + Duration::from_secs(POLL_SECONDS);
+            loop {
+                let wait = next_poll.saturating_duration_since(std::time::Instant::now());
+                match commands.recv_timeout(wait) {
+                    Ok(WorkerCommand::Stop)
+                    | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'worker,
+                    Ok(WorkerCommand::Refresh) => {
+                        // Coalesce panel opens while a read is running; Stop always wins.
+                        while let Ok(command) = commands.try_recv() {
+                            if matches!(command, WorkerCommand::Stop) {
+                                break 'worker;
+                            }
+                        }
+                        if worker_stopping.load(std::sync::atomic::Ordering::Acquire) {
+                            break 'worker;
+                        }
+                        if last_pass.elapsed() >= Duration::from_secs(20) {
+                            last_catalog_read = None;
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                }
             }
         }
         let _ = runtime.block_on(async {
@@ -161,7 +195,7 @@ pub(super) fn spawn(proxy: winit::event_loop::EventLoopProxy<super::UserEvent>) 
         });
     });
     Worker {
-        stop,
+        command,
         stopping,
         thread: Some(thread),
     }

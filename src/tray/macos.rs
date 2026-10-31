@@ -46,6 +46,8 @@ enum UserEvent {
     Menu(String),
     TrayClick,
     CompanionTab(usize),
+    CompanionExpandRepository(usize),
+    CompanionShowMoreRepositories,
     CompanionSubmit {
         prompt: String,
         checkout_index: usize,
@@ -400,6 +402,12 @@ fn clear_refresh_notice(notice: &mut Option<Notice>) {
 
 impl TrayApp {
     fn show_companion(&mut self) {
+        if agentscm::hub::store::unix_now().saturating_sub(self.snapshot.snapshot_at) >= 20
+            && !self.refreshing.swap(true, Ordering::AcqRel)
+        {
+            spawn_refresh(self.refresh_proxy.clone(), true);
+        }
+        self._hub_worker.refresh();
         self.companion_selected = 0;
         self.companion_roots = self
             .snapshot
@@ -670,6 +678,10 @@ impl ApplicationHandler<UserEvent> for TrayApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::CompanionTab(index) => self.companion.set_tab(index),
+            UserEvent::CompanionExpandRepository(index) => {
+                self.companion.toggle_repository(index);
+            }
+            UserEvent::CompanionShowMoreRepositories => self.companion.show_more_repositories(),
             UserEvent::TrayClick => {
                 if self.companion.is_visible() && !self.companion.is_pinned() {
                     self.companion.hide();
@@ -2404,6 +2416,57 @@ fn companion_status(
     summary
 }
 
+fn local_agent_rows(
+    configured: &[String],
+    observations: &[crate::client_activity::ActivityObservation],
+) -> Vec<companion_panel::LocalAgentRow> {
+    let mut by_agent = std::collections::BTreeMap::new();
+    for agent in configured {
+        by_agent.insert(agent_label(agent).to_owned(), (false, None));
+    }
+    // ActivityStore snapshots are oldest first. A later reply supersedes an earlier failure;
+    // session-end telemetry is not itself a contact result.
+    for observation in observations {
+        let Some(agent) = observation.agent.as_deref() else {
+            continue;
+        };
+        let state = by_agent
+            .entry(agent_label(agent).to_owned())
+            .or_insert((false, None));
+        state.0 = true;
+        if observation.outcome != ActivityOutcome::SessionEnded {
+            state.1 = Some(observation.outcome);
+        }
+    }
+    by_agent
+        .into_iter()
+        .map(|(agent, (observed, outcome))| {
+            let (detail, needs_you) = match outcome {
+                Some(ActivityOutcome::TokenRejected) => {
+                    ("Sign-in rejected · reconnect this checkout", true)
+                }
+                Some(ActivityOutcome::Unavailable) => {
+                    ("Recent request unconfirmed · check Hub", true)
+                }
+                Some(ActivityOutcome::InvalidResponse) => {
+                    ("Recent reply was invalid · check Hub", true)
+                }
+                Some(ActivityOutcome::BindingChanged) => {
+                    ("Connection changed · reconnect this checkout", true)
+                }
+                _ if observed => ("Seen on this Mac · task not reported locally", false),
+                _ => ("Connected on this Mac · no recent activity observed", false),
+            };
+            companion_panel::LocalAgentRow {
+                agent,
+                detail: detail.into(),
+                observed,
+                needs_you,
+            }
+        })
+        .collect()
+}
+
 fn companion_rows(
     snapshot: &Snapshot,
     activity: &crate::client_activity::ActivityStore,
@@ -2422,26 +2485,8 @@ fn companion_rows(
                 .as_deref()
                 .map(|binding| activity.snapshot(binding, now))
                 .unwrap_or_default();
-            let mut agent_names = observed
-                .iter()
-                .filter_map(|item| item.agent.as_deref())
-                .map(agent_label)
-                .collect::<Vec<_>>();
-            agent_names.sort_unstable();
-            agent_names.dedup();
-            let local_agents = if !agent_names.is_empty() {
-                format!("On this Mac · recently seen: {}", agent_names.join(", "))
-            } else if connection.agents.is_empty() {
-                "On this Mac · no agent seen yet".to_owned()
-            } else {
-                let configured = connection
-                    .agents
-                    .iter()
-                    .map(|agent| agent_label(agent))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("On this Mac · {configured} configured; no recent activity")
-            };
+            let mut local = local_agent_rows(&connection.agents, &observed);
+            let local_agents = "Connected checkout on this Mac".to_owned();
             let signal = signals.iter().find(|signal| signal.root == connection.root);
             let catalog_row = catalog
                 .repositories
@@ -2457,12 +2502,17 @@ fn companion_rows(
             }
             .to_owned();
             let work_note = match hub_state.as_str() {
-                "Hub current" => "No current Hub work reported",
-                "Hub partial" => "No work in this partial Hub snapshot",
-                "Hub unavailable" => "Hub work unavailable; open Hub to check",
-                _ => "Checking Hub work…",
-            }
-            .to_owned();
+                "Hub current" if catalog_row.is_some_and(|row| row.agents > 0) => {
+                    format!(
+                        "Connected agents: {} · no current task reported",
+                        catalog_row.map_or(0, |row| row.agents)
+                    )
+                }
+                "Hub current" => "No current Hub work reported".into(),
+                "Hub partial" => "No work in this partial Hub snapshot".into(),
+                "Hub unavailable" => "Hub work unavailable; open Hub to check".into(),
+                _ => "Checking Hub work…".into(),
+            };
             let work_source = signal
                 .filter(|signal| signal.available)
                 .map(|signal| signal.work.as_slice())
@@ -2486,12 +2536,12 @@ fn companion_rows(
                 work.extend(catalog_row.live.iter().map(companion_live_row));
             }
             if let Some(run) = run.filter(|run| run.root == connection.root) {
-                work.insert(
+                local.insert(
                     0,
-                    companion_panel::WorkRow {
+                    companion_panel::LocalAgentRow {
                         agent: run.agent.label().into(),
-                        title: "Prompt started on this computer".into(),
-                        detail: format!("Local CLI · {}", run.state),
+                        detail: format!("Quick prompt · {}", run.state),
+                        observed: true,
                         needs_you: run.state == "launch or status failed",
                     },
                 );
@@ -2506,6 +2556,7 @@ fn companion_rows(
                     |signal| signal.count,
                 ),
                 work_note,
+                local,
                 work,
                 overflow: 0,
             }
@@ -2517,17 +2568,20 @@ fn companion_rows(
             .map(|row| companion_panel::RepositoryRow {
                 name: row.repo,
                 hub: None,
-                local_agents: format!(
-                    "On this Mac · recently seen: {} · not connected to Hub",
-                    row.agents
-                        .iter()
-                        .map(|agent| agent_label(agent))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                local_agents: "Observed on this Mac · not connected to Hub".into(),
                 hub_state: "Local only".into(),
                 attention: 0,
                 work_note: "Connect this checkout to see Hub work".into(),
+                local: row
+                    .agents
+                    .iter()
+                    .map(|agent| companion_panel::LocalAgentRow {
+                        agent: agent_label(agent).into(),
+                        detail: "Seen on this Mac · checkout not connected to Hub".into(),
+                        observed: true,
+                        needs_you: false,
+                    })
+                    .collect(),
                 work: Vec::new(),
                 overflow: 0,
             }),
@@ -2544,7 +2598,7 @@ fn companion_rows(
             .map(|row| companion_panel::RepositoryRow {
                 name: row.repository.clone(),
                 hub: Some(row.hub.clone()),
-                local_agents: format!("In Hub · {} agents · no checkout on this Mac", row.agents),
+                local_agents: "Hub repository · no checkout on this Mac".into(),
                 hub_state: if row.complete {
                     "Hub current"
                 } else {
@@ -2552,12 +2606,17 @@ fn companion_rows(
                 }
                 .into(),
                 attention: row.attention,
-                work_note: if row.complete {
-                    "No current Hub work reported"
+                work_note: if row.complete && row.agents > 0 {
+                    format!(
+                        "Connected agents: {} · no current task reported",
+                        row.agents
+                    )
+                } else if row.complete {
+                    "No current Hub work reported".into()
                 } else {
-                    "No work in this partial Hub snapshot"
-                }
-                .into(),
+                    "No work in this partial Hub snapshot".into()
+                },
+                local: Vec::new(),
                 work: row
                     .work
                     .iter()
@@ -2577,7 +2636,29 @@ fn companion_rows(
     rows.sort_by(|left, right| {
         (right.attention > 0)
             .cmp(&(left.attention > 0))
+            .then(
+                right
+                    .local
+                    .iter()
+                    .any(|agent| agent.needs_you)
+                    .cmp(&left.local.iter().any(|agent| agent.needs_you)),
+            )
+            .then(
+                right
+                    .work
+                    .iter()
+                    .any(|work| work.needs_you)
+                    .cmp(&left.work.iter().any(|work| work.needs_you)),
+            )
             .then(right.work.len().cmp(&left.work.len()))
+            .then(
+                right
+                    .local
+                    .iter()
+                    .filter(|agent| agent.observed)
+                    .count()
+                    .cmp(&left.local.iter().filter(|agent| agent.observed).count()),
+            )
             .then(left.name.cmp(&right.name))
     });
     rows
@@ -3735,10 +3816,12 @@ mod tests {
 
     #[test]
     fn panel_joins_local_checkouts_and_other_hub_repositories() {
+        let mut local_connection = share_connection("/synthetic/project", None);
+        local_connection.agents = vec!["claude".into(), "codex".into()];
         let snapshot = Snapshot {
             version: 1,
             snapshot_at: 0,
-            connections: vec![share_connection("/synthetic/project", None)],
+            connections: vec![local_connection],
         };
         let catalog = companion_hub::Catalog {
             repositories: vec![
@@ -3790,12 +3873,51 @@ mod tests {
         assert_eq!(rows[0].work[0].title, "Prepare release");
         assert_eq!(rows[1].name, "example/project");
         assert_eq!(rows[1].work[0].title, "Inspect changes");
-        assert_eq!(rows[1].local_agents, "On this Mac · no agent seen yet");
+        assert_eq!(rows[1].local_agents, "Connected checkout on this Mac");
+        assert_eq!(rows[1].local.len(), 2);
+        assert!(rows[1].local.iter().all(|agent| !agent.observed));
+        assert!(rows[0].local.is_empty());
         assert!(
             companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot)
                 .unwrap()
                 .contains("2 Work / Inbox signals")
         );
+    }
+
+    #[test]
+    fn panel_local_attention_uses_latest_contact_result() {
+        let observation = |outcome| crate::client_activity::ActivityObservation {
+            binding: "synthetic-binding".into(),
+            agent: Some("claude".into()),
+            path: ActivityPath::Hook,
+            outcome,
+            observed_at: std::time::Instant::now(),
+        };
+        let configured = vec!["claude".into()];
+        let rows = local_agent_rows(
+            &configured,
+            &[
+                observation(ActivityOutcome::Unavailable),
+                observation(ActivityOutcome::Acknowledged),
+            ],
+        );
+        assert!(rows[0].observed);
+        assert!(!rows[0].needs_you);
+        assert_eq!(
+            rows[0].detail,
+            "Seen on this Mac · task not reported locally"
+        );
+
+        let rows = local_agent_rows(
+            &configured,
+            &[
+                observation(ActivityOutcome::Acknowledged),
+                observation(ActivityOutcome::TokenRejected),
+                observation(ActivityOutcome::SessionEnded),
+            ],
+        );
+        assert!(rows[0].needs_you);
+        assert_eq!(rows[0].detail, "Sign-in rejected · reconnect this checkout");
     }
 
     #[test]
