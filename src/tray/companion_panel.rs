@@ -1897,9 +1897,10 @@ fn selected_rows(
                     row.work_note = "More attention in Hub · open this repository".into();
                 }
             } else {
-                // The opening Work view leads with what is actually live. The Attention
-                // view keeps its separate attention filter.
-                row.work.sort_by_key(|work| (!work.live, !work.needs_you));
+                // Surface work needing a decision before routine live activity, including
+                // when the collapsed card can only show the first few items.
+                row.work
+                    .sort_by_key(|work| (!work.needs_you, !work.needs_you && !work.live));
             }
             row.local
                 .sort_by_key(|agent| (!agent.needs_you, !agent.observed));
@@ -2089,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_view_leads_with_live_work_and_shows_local_agents() {
+    fn opening_view_leads_with_actionable_work_and_shows_local_agents() {
         let mut row = repository("example/project");
         row.local.push(LocalAgentRow {
             agent: "Codex".into(),
@@ -2117,12 +2118,60 @@ mod tests {
             },
         ];
         let (rows, _) = selected_rows(&[row], 0, REPOSITORY_LIMIT, &HashSet::new());
-        assert_eq!(rows[0].work[0].title, "Implement change");
+        assert_eq!(rows[0].work[0].title, "Needs review");
         assert_eq!(rows[0].local[0].agent, "Codex");
         assert!(collapsed_row_height(&rows[0]) > 200.0);
         let (attention, _) = selected_rows(&rows, 1, REPOSITORY_LIMIT, &HashSet::new());
         assert_eq!(attention[0].work.len(), 1);
         assert_eq!(attention[0].work[0].title, "Needs review");
+    }
+
+    #[test]
+    fn collapsed_card_keeps_a_blocked_task_ahead_of_routine_live_tasks() {
+        let mut row = repository("example/project");
+        row.work = (0..HUB_ACTIVITY_LIMIT)
+            .map(|index| WorkRow {
+                agent: "Codex".into(),
+                title: format!("Routine task {index}"),
+                detail: "Active in Hub".into(),
+                needs_you: false,
+                live: true,
+            })
+            .chain(std::iter::once(WorkRow {
+                agent: "Claude Code".into(),
+                title: "Needs review".into(),
+                detail: "Handover".into(),
+                needs_you: true,
+                live: false,
+            }))
+            .collect();
+        let (rows, _) = selected_rows(&[row], 0, REPOSITORY_LIMIT, &HashSet::new());
+        assert_eq!(rows[0].work[0].title, "Needs review");
+        assert_eq!(rows[0].work.len(), HUB_ACTIVITY_LIMIT);
+        assert_eq!(rows[0].overflow, 1);
+    }
+
+    #[test]
+    fn collapsed_card_keeps_blocked_work_ahead_of_live_stale_claims() {
+        let mut row = repository("example/project");
+        row.work.push(WorkRow {
+            agent: "Claude Code".into(),
+            title: "Blocked".into(),
+            detail: "Needs your attention".into(),
+            needs_you: true,
+            live: false,
+        });
+        row.work
+            .extend((0..HUB_ACTIVITY_LIMIT).map(|index| WorkRow {
+                agent: "Codex".into(),
+                title: format!("Stale claim {index}"),
+                detail: "Agent may need attention".into(),
+                needs_you: true,
+                live: true,
+            }));
+        let (rows, _) = selected_rows(&[row], 0, REPOSITORY_LIMIT, &HashSet::new());
+        assert_eq!(rows[0].work[0].title, "Blocked");
+        assert_eq!(rows[0].overflow, 1);
     }
 
     #[test]

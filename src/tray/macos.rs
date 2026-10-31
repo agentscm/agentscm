@@ -2630,22 +2630,7 @@ fn companion_rows(
                 .filter(|signal| signal.available)
                 .map(|signal| signal.work.as_slice())
                 .or_else(|| catalog_row.map(|row| row.work.as_slice()));
-            let mut work = work_source
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| companion_panel::WorkRow {
-                            agent: item.agent.clone(),
-                            title: item.title.clone(),
-                            detail: companion_work_detail(item),
-                            needs_you: item.state == "blocked"
-                                || item.state == "handover"
-                                || item.claim_status != "active",
-                            live: false,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let mut work = work_source.map(companion_work_rows).unwrap_or_default();
             if let Some(catalog_row) = catalog_row {
                 append_live_work(&mut work, &catalog_row.live);
             }
@@ -2745,19 +2730,7 @@ fn companion_rows(
                 },
                 local: Vec::new(),
                 work: {
-                    let mut work = row
-                        .work
-                        .iter()
-                        .map(|item| companion_panel::WorkRow {
-                            agent: item.agent.clone(),
-                            title: item.title.clone(),
-                            detail: companion_work_detail(item),
-                            needs_you: item.state == "blocked"
-                                || item.state == "handover"
-                                || item.claim_status != "active",
-                            live: false,
-                        })
-                        .collect::<Vec<_>>();
+                    let mut work = companion_work_rows(&row.work);
                     append_live_work(&mut work, &row.live);
                     work.sort_by_key(|item| !item.needs_you);
                     work
@@ -2766,19 +2739,8 @@ fn companion_rows(
             }),
     );
     rows.sort_by(|left, right| {
-        right
-            .work
-            .iter()
-            .any(|work| work.live)
-            .cmp(&left.work.iter().any(|work| work.live))
-            .then(
-                right
-                    .local
-                    .iter()
-                    .any(|agent| agent.observed)
-                    .cmp(&left.local.iter().any(|agent| agent.observed)),
-            )
-            .then((right.attention > 0).cmp(&(left.attention > 0)))
+        (right.attention > 0)
+            .cmp(&(left.attention > 0))
             .then(
                 right
                     .local
@@ -2794,6 +2756,20 @@ fn companion_rows(
                     .cmp(&left.work.iter().any(|work| work.needs_you)),
             )
             .then((!right.attention_summary.is_empty()).cmp(&(!left.attention_summary.is_empty())))
+            .then(
+                right
+                    .work
+                    .iter()
+                    .any(|work| work.live)
+                    .cmp(&left.work.iter().any(|work| work.live)),
+            )
+            .then(
+                right
+                    .local
+                    .iter()
+                    .any(|agent| agent.observed)
+                    .cmp(&left.local.iter().any(|agent| agent.observed)),
+            )
             .then((!right.work.is_empty()).cmp(&(!left.work.is_empty())))
             .then(
                 right
@@ -2818,6 +2794,28 @@ fn companion_live_row(item: &companion_hub::LiveAgent) -> companion_panel::WorkR
         needs_you: false,
         live: true,
     }
+}
+
+fn companion_work_rows(items: &[companion_hub::Work]) -> Vec<companion_panel::WorkRow> {
+    let mut ordered = items.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|item| match item.state.as_str() {
+        "blocked" => 0,
+        "handover" => 1,
+        _ if item.claim_status != "active" => 2,
+        _ => 3,
+    });
+    ordered
+        .into_iter()
+        .map(|item| companion_panel::WorkRow {
+            agent: item.agent.clone(),
+            title: item.title.clone(),
+            detail: companion_work_detail(item),
+            needs_you: item.state == "blocked"
+                || item.state == "handover"
+                || item.claim_status != "active",
+            live: false,
+        })
+        .collect()
 }
 
 fn panel_attention_summary(
@@ -4214,20 +4212,20 @@ mod tests {
             None,
         );
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].name, "example/project");
-        assert!(rows[0].work[0].live);
-        assert_eq!(rows[0].work[0].title, "Inspect changes");
-        assert_eq!(rows[1].name, "example/remote");
-        assert!(rows[1].work[0].needs_you);
-        assert_eq!(rows[1].work[0].title, "Prepare release");
-        assert!(rows[1].work[0].detail.contains("Files not stated"));
+        assert_eq!(rows[0].name, "example/remote");
+        assert!(rows[0].work[0].needs_you);
+        assert_eq!(rows[0].work[0].title, "Prepare release");
+        assert!(rows[0].work[0].detail.contains("Files not stated"));
+        assert_eq!(rows[1].name, "example/project");
+        assert!(rows[1].work[0].live);
+        assert_eq!(rows[1].work[0].title, "Inspect changes");
         assert_eq!(
-            rows[0].local_agents,
+            rows[1].local_agents,
             "Hub: Claude Code · 1 checkout on this Mac"
         );
-        assert_eq!(rows[0].local.len(), 2);
-        assert!(rows[0].local.iter().all(|agent| !agent.observed));
-        assert!(rows[1].local.is_empty());
+        assert_eq!(rows[1].local.len(), 2);
+        assert!(rows[1].local.iter().all(|agent| !agent.observed));
+        assert!(rows[0].local.is_empty());
         assert_eq!(
             companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot).as_deref(),
             Some("2 need your attention")
@@ -4308,6 +4306,27 @@ mod tests {
             rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
             vec!["example/newer", "example/older"]
         );
+    }
+
+    #[test]
+    fn panel_puts_explicitly_blocked_work_before_stale_claims() {
+        let work = |title: &str, state: &str, claim_status: &str| companion_hub::Work {
+            agent: "Codex".into(),
+            title: title.into(),
+            state: state.into(),
+            next_action: "Check in Hub".into(),
+            claim_status: claim_status.into(),
+            scope_unknown: false,
+        };
+        let items = vec![
+            work("Stale A", "active", "stale"),
+            work("Stale B", "active", "stale"),
+            work("Stale C", "active", "stale"),
+            work("Blocked", "blocked", "active"),
+        ];
+        let rows = companion_work_rows(&items);
+        assert_eq!(rows[0].title, "Blocked");
+        assert!(rows.iter().all(|row| row.needs_you));
     }
 
     #[test]
@@ -4571,6 +4590,11 @@ mod tests {
         let mut routine = catalog.repositories[0].clone();
         routine.repository = "example/routine".into();
         routine.inbox_requests = 0;
+        routine.live.push(companion_hub::LiveAgent {
+            agent: "Codex".into(),
+            task: "Inspect source".into(),
+            source: "session".into(),
+        });
         catalog.repositories.insert(0, routine);
         assert_eq!(
             companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot).as_deref(),
@@ -4586,6 +4610,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "example/remote");
         assert_eq!(rows[0].attention_summary, "2 agent Inbox requests");
+        assert_eq!(rows[1].name, "example/routine");
+        assert!(rows[1].work[0].live);
     }
 
     #[test]
