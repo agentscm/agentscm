@@ -90,3 +90,17 @@ Productive action metadata can be inspected with `MOCK=1` at
 `#workflows/runs/productive-artifacts/steps/draft`. This synthetic fixture shows
 separate productive execution, output identity and unverified content; it starts
 no agent and performs no publication. Artifact bodies remain on the local runner.
+
+## Change walkthroughs
+
+Repository explorer's **Walkthrough** tab reads immutable locally authored committed-Git cases.
+It uses authenticated bounded local GETs only. CLI creation/amendment, exact before/after source,
+declared relationships, unassigned paths, source applicability and retained checks are described in
+[Change walkthroughs](../docs/change-walkthrough.md).
+
+For a synthetic browser preview, run `MOCK=walkthrough npm run dev`, open the printed loopback URL
+with `#token=synthetic-preview`, then open Files → Walkthrough and choose an immutable version.
+The repository label and authored purpose explicitly identify synthetic data. This fixture includes
+a deleted-side anchor, an unchanged supporting file, an unassigned changed path, history and
+unavailable evidence. It does not qualify real Git objects, persistence or capture ingestion.
+The focused behavioral tests are `tests/unit/walkthrough.test.tsx`.

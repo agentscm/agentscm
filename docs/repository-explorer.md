@@ -71,6 +71,14 @@ are Git's similarity interpretation. Symlinks and submodules are
 shown as entries and never followed. Binary and oversized files are identified without rendering
 their content. Source search matches literal, case-sensitive text.
 
+## Follow a change walkthrough
+
+The **Walkthrough** tab opens immutable, locally authored versions for this checkout and repository.
+Choose a version to follow steps into exact base/head source, inspect declared relationships,
+review unassigned changed paths and copy bounded agent context. Different selected source remains
+explicit. Creation and amendment use the CLI; browsing never writes or calls a model. See
+[Change walkthroughs](change-walkthrough.md) for the draft format, commands and limits.
+
 ## Read evidence and conversation
 
 An action receipt records its own source binding, recipe, result and coverage. Matching a clean
@@ -135,6 +143,10 @@ use an explicitly allowed origin. Unknown or duplicate query fields are rejected
 | `diff` | `left`, `right` | `path`, `cursor`, `limit` |
 | `search` | `commit`, `q` | `cursor`, `limit` |
 | `evidence` | `commit` | `path`, `work_id`, `cursor`, `limit` |
+| `walkthroughs` | — | `limit` |
+| `walkthrough` | `id` | `current_head` |
+| `walkthrough-source` | `id`, `anchor` | — |
+| `walkthrough-context` | `id` | `current_head` |
 | `sessions` | — | `cursor`, `limit` |
 | `conversation` | `work_id`, `session_id` | `cursor`, `limit` |
 

@@ -736,7 +736,7 @@ async function boundedJson(response: Response): Promise<unknown> {
   }
 }
 
-async function explorerRead<T>(endpoint: string, params: Record<string, string | number | undefined>, decode: (value: unknown) => T, signal: AbortSignal): Promise<T> {
+export async function explorerRead<T>(endpoint: string, params: Record<string, string | number | undefined>, decode: (value: unknown) => T, signal: AbortSignal): Promise<T> {
   const configured = loadLocalBase()
   if (!validLocalBase(configured)) throw new ExplorerResponseError('The saved local server address is not a loopback address. Update it in Setup › Preferences › This computer.')
   const crossOrigin = configured !== ''

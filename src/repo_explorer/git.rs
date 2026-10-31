@@ -362,6 +362,15 @@ impl FilePin {
 }
 
 impl GitExplorer {
+    /// Canonical operator-selected checkout; never chosen by an HTTP request.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
     pub fn open(root: &Path, repository_id: &str) -> Result<Self> {
         validate_repository_id(repository_id)?;
         if !root.is_absolute() {

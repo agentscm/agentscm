@@ -5,6 +5,7 @@
 
 pub mod evidence;
 pub mod git;
+pub mod walkthrough;
 
 /// The local service pins both capabilities at startup. Requests never choose
 /// a repository or spool directory.

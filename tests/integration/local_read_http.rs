@@ -278,6 +278,15 @@ struct Server {
 
 impl Server {
     fn start(data: &Path, token: Option<&str>, extra: &[&str]) -> Self {
+        Self::start_with_data_home(data, token, extra, None)
+    }
+
+    fn start_with_data_home(
+        data: &Path,
+        token: Option<&str>,
+        extra: &[&str],
+        home: Option<&Path>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
         command
             .arg("--no-telemetry")
@@ -290,6 +299,9 @@ impl Server {
             .stderr(Stdio::piped());
         if let Some(token) = token {
             command.env("AGENTSCM_SERVE_READ_TOKEN", token);
+        }
+        if let Some(home) = home {
+            command.env("XDG_DATA_HOME", home);
         }
         let mut child = command.spawn().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -776,4 +788,185 @@ fn serve_refuses_unsafe_local_read_configuration() {
         let status = command.status().unwrap();
         assert!(!status.success(), "{token:?} {args:?}");
     }
+}
+
+#[test]
+fn walkthrough_cli_and_authenticated_explorer_share_immutable_local_records() {
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let repo = root.join("repo");
+    let head = explorer_checkout(&repo);
+    let home = root.join("operator-data");
+    let server = Server::start_with_data_home(
+        &root.join("authority"),
+        Some(TOKEN),
+        &[
+            "--explorer-repo",
+            repo.to_str().unwrap(),
+            "--explorer-repository",
+            "owner/example",
+            "--browser-origin",
+            ORIGIN,
+        ],
+        Some(&home),
+    );
+    let list = "/v1/local/explorer/walkthroughs?limit=100";
+    assert_eq!(server.request("GET", list, &[]).0, 401);
+    assert_eq!(server.get(list).0, 200);
+    assert!(
+        !home.exists(),
+        "HTTP reads must not create a walkthrough store"
+    );
+    let draft = root.join("draft.json");
+    fs::write(&draft,serde_json::to_vec(&json!({"title":"Inspect source", "author":"Synthetic author", "purpose":"Review exact committed source", "steps":[{"id":"read","title":"Read source","body":"An authored explanation <script> is data", "anchors":[{"id":"source","side":"head","path":"source.txt","start_line":1,"end_line":1}]}]})).unwrap()).unwrap();
+    let cli = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(["--no-telemetry", "walkthrough"])
+            .args(args)
+            .args([
+                "--root",
+                repo.to_str().unwrap(),
+                "--repository",
+                "owner/example",
+            ])
+            .env("XDG_DATA_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let created = cli(&[
+        "create",
+        "--change-id",
+        "case",
+        "--base",
+        &head,
+        "--head",
+        &head,
+        "--draft",
+        draft.to_str().unwrap(),
+    ]);
+    let id = created["id"].as_str().unwrap();
+    assert_eq!(cli(&["list"])["walkthroughs"][0]["id"], id);
+    let detail_path = format!("/v1/local/explorer/walkthrough?id={id}&current_head={head}");
+    let (status, detail) = server.get(&detail_path);
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["record"], created["record"]);
+    assert_eq!(detail["applicability"], "same_source");
+    assert_eq!(detail["evidence"]["state"], "not_connected");
+    assert_eq!(cli(&["show", "--id", id])["record"], detail["record"]);
+    let context_path = format!("/v1/local/explorer/walkthrough-context?id={id}");
+    let (status, context) = server.get(&context_path);
+    assert_eq!(status, 200, "{context}");
+    assert_eq!(context, cli(&["context", "--id", id]));
+    assert!(serde_json::to_vec(&context).unwrap().len() <= 32 * 1024);
+    let source_path = format!("/v1/local/explorer/walkthrough-source?id={id}&anchor=source");
+    let (status, source) = server.get(&source_path);
+    assert_eq!(status, 200, "{source}");
+    assert_eq!(source["content"], "first source\n");
+    assert_eq!(source, cli(&["source", "--id", id, "--anchor", "source"]));
+    assert_eq!(server.get(list).1["walkthroughs"][0]["id"], id);
+    assert_eq!(server.get(&format!("{detail_path}&id={id}")).0, 400);
+    assert_eq!(server.get(&format!("{detail_path}&store=/etc")).0, 400);
+    assert_eq!(server.get(&format!("{source_path}&root=/etc")).0, 400);
+    let auth = format!("Bearer {TOKEN}");
+    assert_eq!(
+        server
+            .request("POST", &detail_path, &[("Authorization", &auth)])
+            .0,
+        405
+    );
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                &detail_path,
+                &[
+                    ("Authorization", &auth),
+                    ("Origin", "https://untrusted.invalid")
+                ]
+            )
+            .0,
+        403
+    );
+    for path in [&detail_path, &context_path, &source_path] {
+        let (_, _, body) = server.request("GET", path, &[]);
+        assert!(!body.contains("An authored explanation"));
+        assert!(!body.contains("first source"));
+    }
+    // A second namespace in the same checkout cannot read the first namespace's store.
+    let wrong = Server::start_with_data_home(
+        &root.join("other-authority"),
+        Some(TOKEN),
+        &[
+            "--explorer-repo",
+            repo.to_str().unwrap(),
+            "--explorer-repository",
+            "other/project",
+        ],
+        Some(&home),
+    );
+    assert_eq!(wrong.get(&detail_path).0, 404);
+    assert_eq!(wrong.get(list).1["walkthroughs"], json!([]));
+    assert!(
+        !serde_json::to_string(&detail)
+            .unwrap()
+            .contains(root.to_str().unwrap())
+    );
+    // Supplied boundary drafts must remain authored content; CLI adds no 33rd question.
+    fs::write(&draft,serde_json::to_vec(&json!({"title":"Boundary", "open_questions":(0..32).map(|n|format!("Question {n}")).collect::<Vec<_>>()})).unwrap()).unwrap();
+    let boundary = cli(&[
+        "create",
+        "--change-id",
+        "boundary",
+        "--base",
+        &head,
+        "--head",
+        &head,
+        "--draft",
+        draft.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        boundary["record"]["draft"]["open_questions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        32
+    );
+    // WAL is unsupported: HTTP rejects it before SQLite can create read bookkeeping.
+    let data = home.join("agentscm-walkthroughs");
+    let store_dir = fs::read_dir(&data)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            let connection = rusqlite::Connection::open(p.join("store.sqlite")).unwrap();
+            connection
+                .query_row("SELECT repository FROM metadata", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+                == "owner/example"
+        })
+        .unwrap();
+    let connection = rusqlite::Connection::open(store_dir.join("store.sqlite")).unwrap();
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    connection.close().unwrap();
+    let inventory = || {
+        fs::read_dir(&store_dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), fs::read(e.path()).unwrap())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = inventory();
+    assert_eq!(server.get(list).0, 400);
+    assert_eq!(before, inventory());
 }

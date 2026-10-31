@@ -108,6 +108,8 @@ mod team_cli;
 mod telemetry;
 mod telemetry_cli;
 mod tray;
+#[cfg(unix)]
+mod walkthrough_cli;
 mod work_cli;
 #[cfg(unix)]
 mod workflow_cli;
@@ -138,6 +140,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Author and inspect durable local source-bound change walkthroughs.
+    #[cfg(unix)]
+    Walkthrough {
+        #[command(subcommand)]
+        command: walkthrough_cli::WalkthroughCommand,
+    },
     /// Open the optional native status-bar companion (macOS).
     Tray(tray::TrayArgs),
     /// Open this checkout's Hub page in your browser, connected to this computer's files and
@@ -987,6 +995,8 @@ async fn run(cli: Cli) -> Result<RunExit> {
         }
         Command::Team { command } => team_cli::run(command).await?,
         Command::Hub { command } => hub_cli::run(command, &cli.data_dir).await?,
+        #[cfg(unix)]
+        Command::Walkthrough { command } => print_json(&walkthrough_cli::run(command)?),
         Command::Hook(args) => hook_cli::run(args).await,
         Command::InitRepo(args) => init_cli::run(args)?,
         Command::Client { command } => client_cli::run(command).await?,
