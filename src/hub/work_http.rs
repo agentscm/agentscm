@@ -35,8 +35,40 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/usage", post(usage))
         .route("/v1/hub/standup/insights", get(insights))
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
+        .route("/v1/hub/standup/work/{id}/pr-link", get(pr_link))
+        .route("/v1/hub/standup/pr-link", post(set_pr_link))
         .route("/v1/hub/standup/work/{id}", get(work))
         .route("/v1/hub/standup/work", get(work_search))
+}
+
+async fn pr_link(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<super::work_links::WorkPrLinkQuery>, QueryRejection>,
+) -> Result<Json<super::work_links::WorkPrLinkView>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    let store = state.store.clone();
+    blocking(&state, move || {
+        store.work_pr_link_get(&principal.token_id, &id, &query, unix_now())
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "work_not_found"))
+}
+
+async fn set_pr_link(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_links::WorkPrLinkUpdate>,
+) -> Result<Json<super::work_links::WorkPrLinkResult>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.work_pr_link_set(&principal.token_id, &request, unix_now())
+        })
+        .await?,
+    ))
 }
 
 /// Evaluates the same exact-subject, declared-scope and fixed merge-window facts as admission,

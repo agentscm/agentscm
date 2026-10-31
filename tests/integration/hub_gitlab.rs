@@ -992,6 +992,11 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
     );
     assert_eq!(env.observed("pull_request").len(), 1);
     assert_eq!(env.event_count(), events + 1);
+    assert!(
+        env.observed("provider_context").is_empty(),
+        "GitHub evidence health does not apply to GitLab"
+    );
+    assert!(env.events("provider_context_observed").is_empty());
     // The failed credential waits out a backoff; a refresh does not wait.
     let requests = env.requests();
     assert!(env.poll().await.is_empty(), "skipped while backing off");
@@ -1054,6 +1059,11 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
     assert!(env.refresh().await.is_empty());
     assert_eq!(env.connection_status().await.0, "enabled");
     assert_eq!(env.observed("pull_request").len(), 1);
+    assert!(
+        env.observed("provider_context").is_empty(),
+        "all GitLab failure paths leave GitHub evidence untouched"
+    );
+    assert!(env.events("provider_context_observed").is_empty());
 }
 
 // ---- 4. recent and intent-named branches ----

@@ -550,3 +550,345 @@ fn text_mode_reports_a_bad_base_as_one_plain_line() {
         "{err}"
     );
 }
+
+fn advisory(repo: &Path) -> agentscm::git_collisions::AdvisorySnapshot {
+    agentscm::git_collisions::advisory_snapshot(
+        &git_path(),
+        repo,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap()
+}
+
+#[test]
+fn durable_branch_advisory_survives_claim_lifetime_and_includes_dirty_peers() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("shared.rs"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let peer = dir.path().join("peer");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "old-work",
+            peer.to_str().unwrap(),
+        ],
+    );
+    fs::write(peer.join("shared.rs"), "peer\n").unwrap();
+    // A committed path remains visible long after any live claim TTL has elapsed.
+    let out = Command::new(git_path())
+        .current_dir(&peer)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qam",
+            "old work",
+        ])
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let clean = advisory(&repo);
+    assert!(clean.valid(clean.observed_at));
+    assert_eq!(clean.touching("shared.rs").len(), 1);
+    assert_eq!(clean.touching("shared.rs")[0].name, "old-work");
+    assert!(clean.touching("shared.rs")[0].fork.is_some());
+    assert_eq!(clean.touching("unrelated.rs").len(), 0);
+    // The peer's own clean checkout does not collide with its own branch.
+    assert!(advisory(&peer).touching("shared.rs").is_empty());
+    fs::write(peer.join("shared.rs"), "dirty peer\n").unwrap();
+    let dirty = advisory(&repo);
+    assert!(
+        dirty
+            .touching("shared.rs")
+            .iter()
+            .any(|item| item.kind == "worktree")
+    );
+    assert!(
+        dirty
+            .touching("shared.rs")
+            .iter()
+            .any(|item| item.kind == "ref")
+    );
+    for path in [
+        "../shared.rs",
+        "/shared.rs",
+        "a//b",
+        "a/./b",
+        "a\nfile",
+        "a\\file",
+    ] {
+        assert!(dirty.touching(path).is_empty(), "{path:?}");
+    }
+    // A cache is historical: later peer paths do not silently become covered.
+    fs::write(peer.join("later.rs"), "later\n").unwrap();
+    assert!(dirty.touching("later.rs").is_empty());
+    assert_eq!(advisory(&repo).touching("later.rs").len(), 1);
+    assert!(!dirty.valid(dirty.observed_at + 4 * 60 * 60 + 1));
+}
+
+#[test]
+fn branch_advisory_reports_unknown_base_and_honors_deadline() {
+    let dir = TempDir::new().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+    git(dir.path(), &["checkout", "-qb", "master"]);
+    fs::write(dir.path().join("x"), "x").unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "other base"]);
+    assert!(
+        agentscm::git_collisions::advisory_snapshot(
+            &git_path(),
+            dir.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous")
+    );
+    assert!(
+        agentscm::git_collisions::advisory_snapshot(
+            &git_path(),
+            dir.path(),
+            std::time::Instant::now(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn branch_advisory_bounds_the_version_probe_and_rejects_non_utf8_paths() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let slow = dir.path().join("git");
+    fs::write(&slow, "#!/bin/sh\nexec /bin/sleep 10\n").unwrap();
+    fs::set_permissions(&slow, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = std::time::Instant::now();
+    assert!(
+        agentscm::git_collisions::advisory_snapshot(
+            &slow,
+            dir.path(),
+            start + std::time::Duration::from_millis(50),
+        )
+        .is_err()
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    let peer = dir.path().join("peer");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "peer",
+            peer.to_str().unwrap(),
+        ],
+    );
+    // Some Unix filesystems reject invalid UTF-8 filenames. Feed the actual Git
+    // status parser byte output through a wrapper so this boundary is exercised
+    // on those filesystems too, while all other Git operations remain real.
+    let invalid_status = dir.path().join("git-invalid-status");
+    let real_git = git_path().to_string_lossy().replace('\'', "'\\''");
+    fs::write(
+        &invalid_status,
+        format!(
+            "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = status ]; then\n    printf '?? bad\\377\\000?? valid.txt\\000'\n    exit 0\n  fi\ndone\nexec '{real_git}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&invalid_status, fs::Permissions::from_mode(0o700)).unwrap();
+    let snapshot = agentscm::git_collisions::advisory_snapshot(
+        &invalid_status,
+        &repo,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(snapshot.incomplete);
+    assert_eq!(snapshot.peers.len(), 1);
+    assert_eq!(snapshot.peers[0].kind, "worktree");
+    assert_eq!(
+        snapshot.peers[0].paths,
+        std::collections::BTreeSet::from(["valid.txt".to_owned()])
+    );
+    assert_eq!(snapshot.touching("valid.txt").len(), 1);
+    assert!(snapshot.touching("bad\u{fffd}").is_empty());
+}
+
+#[test]
+fn branch_advisory_prioritizes_dirty_worktrees_and_newest_refs_under_cap() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("shared.rs"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(&repo, &["checkout", "-qb", "seed"]);
+    commit_file(&repo, "seed", "shared.rs", "branch\n");
+    let text = |args: &[&str]| {
+        let out = Command::new(git_path())
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let tree = text(&["rev-parse", "seed^{tree}"]);
+    let base = text(&["rev-parse", "main"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["branch", "-D", "seed"]);
+    for index in 0..41 {
+        let date = format!("2020-01-01T00:00:{index:02}Z");
+        let out = Command::new(git_path())
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                "branch",
+            ])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let oid = String::from_utf8(out.stdout).unwrap();
+        git(
+            &repo,
+            &[
+                "update-ref",
+                &format!("refs/heads/branch-{index:02}"),
+                oid.trim(),
+            ],
+        );
+    }
+    let peer = dir.path().join("dirty-peer");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "dirty-peer",
+            peer.to_str().unwrap(),
+        ],
+    );
+    fs::write(peer.join("shared.rs"), "dirty\n").unwrap();
+    let snapshot = advisory(&repo);
+    assert!(snapshot.incomplete);
+    assert!(snapshot.peers.len() <= 40);
+    assert_eq!(snapshot.peers[0].kind, "worktree");
+    assert!(snapshot.peers[0].paths.contains("shared.rs"));
+    let refs: Vec<_> = snapshot
+        .peers
+        .iter()
+        .filter(|peer| peer.kind == "ref")
+        .collect();
+    assert!(!refs.is_empty(), "at least the newest ref must be observed");
+    // A deadline may stop this real-Git scan early, but every observed ref must
+    // be a prefix of newest-first order after the dirty worktree takes priority.
+    for (peer, index) in refs.iter().zip((2..=40).rev()) {
+        assert_eq!(peer.name, format!("branch-{index:02}"));
+    }
+    assert!(!snapshot.peers.iter().any(|peer| peer.name == "branch-00"));
+    assert_eq!(snapshot.touching("shared.rs")[0].kind, "worktree");
+}
+
+#[test]
+fn branch_advisory_skips_own_status_without_changing_full_collision_scan() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("shared.rs"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let peer = dir.path().join("peer");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "peer",
+            peer.to_str().unwrap(),
+        ],
+    );
+    fs::write(repo.join("shared.rs"), "own dirty\n").unwrap();
+    fs::write(peer.join("shared.rs"), "peer dirty\n").unwrap();
+    let status_log = dir.path().join("status-paths");
+    let wrapper = dir.path().join("git-status-log");
+    let real_git = git_path().to_string_lossy().replace('\'', "'\\''");
+    let quoted_log = status_log.to_string_lossy().replace('\'', "'\\''");
+    fs::write(&wrapper, format!(
+        "#!/bin/sh\ncwd=\nprevious=\nstatus=\nfor arg do\n  if [ \"$previous\" = '-C' ]; then cwd=$arg; fi\n  if [ \"$arg\" = status ]; then status=1; fi\n  previous=$arg\ndone\nif [ \"$status\" = 1 ]; then printf '%s\\n' \"$cwd\" >> '{quoted_log}'; fi\nexec '{real_git}' \"$@\"\n"
+    )).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let snapshot = agentscm::git_collisions::advisory_snapshot(
+        &wrapper,
+        &repo,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(snapshot.touching("shared.rs")[0].kind, "worktree");
+    let checked: Vec<_> = fs::read_to_string(&status_log)
+        .unwrap()
+        .lines()
+        .map(|path| PathBuf::from(path).canonicalize().unwrap())
+        .collect();
+    assert_eq!(checked, vec![peer.canonicalize().unwrap()]);
+    // The explicit full collision command still includes the current dirty tree.
+    let full = agentscm::git_collisions::collisions(&agentscm::git_collisions::Request {
+        git: wrapper,
+        repository: repo.clone(),
+        base: Some("main".into()),
+        refs: Vec::new(),
+        worktrees: true,
+        active_days: None,
+        include_merged: false,
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+        max_bytes: None,
+    })
+    .unwrap();
+    assert_eq!(full["collisions"].as_array().unwrap().len(), 1);
+    let checked: Vec<_> = fs::read_to_string(&status_log)
+        .unwrap()
+        .lines()
+        .map(|path| PathBuf::from(path).canonicalize().unwrap())
+        .collect();
+    assert!(checked.contains(&repo.canonicalize().unwrap()));
+}

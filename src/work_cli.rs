@@ -13,6 +13,7 @@ use agentscm::hub::store::{self, unix_now};
 use agentscm::hub::work::{
     BriefingAck, WorkCheckpoint, WorkRepositoryScope, WorkStart, WorkStartResult,
 };
+use agentscm::hub::work_links::WorkPrLinkUpdate;
 use agentscm::{Error, Result};
 use clap::Subcommand;
 use reqwest::Method;
@@ -65,6 +66,20 @@ pub enum WorkCommand {
         through: Option<i64>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Read an explicitly linked PR and its recorded source revision for a Work item.
+    PrLink {
+        id: String,
+        #[arg(long)]
+        expected_updated_seq: Option<i64>,
+        #[arg(long)]
+        expected_head: Option<String>,
+    },
+    /// Explicitly set or remove a PR relationship as the current Work lead.
+    PrLinkSet {
+        /// Strict WorkPrLinkUpdate JSON; link:null removes. Use - for standard input.
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
     },
     /// Read durable requests addressed to an agent session; does not acknowledge receipt.
     Inbox {
@@ -247,6 +262,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Briefing { .. }
         | WorkCommand::Catchup { .. }
         | WorkCommand::Preflight { .. }
+        | WorkCommand::PrLink { .. }
         | WorkCommand::Insight { .. }
         | WorkCommand::Insights { .. } => false,
         WorkCommand::Compact { apply, .. }
@@ -258,6 +274,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::CoordinationWithdraw { .. }
         | WorkCommand::Start { .. }
         | WorkCommand::Usage { .. }
+        | WorkCommand::PrLinkSet { .. }
         | WorkCommand::Checkpoint { .. }
         | WorkCommand::Ack { .. } => true,
         WorkCommand::CatchupAck { .. } => true,
@@ -362,6 +379,39 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                     Method::POST,
                     "/v1/hub/standup/usage",
                     Some(serde_json::to_value(request)?),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::PrLink {
+            id,
+            expected_updated_seq,
+            expected_head,
+        } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
+                .map_err(|_| invalid("cannot construct Work PR link URL"))?;
+            url.path_segments_mut()
+                .map_err(|_| invalid("cannot construct Work PR link URL"))?
+                .push(&id)
+                .push("pr-link");
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct Work PR link URL"))?;
+            let path = query_path(
+                path,
+                json!({"expected_updated_seq":expected_updated_seq,"expected_head":expected_head}),
+            )?;
+            (hub.call(Method::GET, &path, None).await?, false)
+        }
+        WorkCommand::PrLinkSet { request } => {
+            let request: WorkPrLinkUpdate = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/pr-link",
+                    Some(json!(request)),
                 )
                 .await?,
                 false,

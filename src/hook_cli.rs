@@ -101,6 +101,7 @@ async fn hook(
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     let activity = std::sync::Arc::new(ActivityTracker::new(agent));
+    let local_note = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut call = tokio::spawn(call_hub(
         agent.to_owned(),
         flag_url,
@@ -111,9 +112,11 @@ async fn hook(
         HubCallContext {
             original_body: body,
             activity_tracker: activity.clone(),
+            local_note: local_note.clone(),
+            deadline,
         },
     ));
-    match tokio::time::timeout(remaining, &mut call).await {
+    let reply = match tokio::time::timeout(remaining, &mut call).await {
         Ok(Ok(Ok(reply))) => reply,
         Ok(Ok(Err(reason))) => unknown_output(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
@@ -122,6 +125,37 @@ async fn hook(
             call.abort();
             unknown_output(agent, &payload, "hub unreachable")
         }
+    };
+    finish_local_observation(reply, agent, &payload, &local_note, deadline).await
+}
+
+/// Consume the local observation after either a Hub reply or its fail-open
+/// replacement. Waiting cannot extend the original hook deadline.
+async fn finish_local_observation(
+    reply: Value,
+    agent: &str,
+    payload: &Value,
+    observation: &LocalObservation,
+    deadline: Instant,
+) -> Value {
+    let task = observation.lock().ok().and_then(|mut task| task.take());
+    let note = if let Some(mut task) = task {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, &mut task).await {
+            Ok(Ok(note)) => note,
+            _ => {
+                // Cancels a task not started yet. A running task has bounded
+                // filesystem work and Git commands bound to the hook deadline.
+                task.abort();
+                None
+            }
+        }
+    } else {
+        None
+    };
+    match note {
+        Some(note) => with_local_note(reply, agent, payload, &note),
+        None => reply,
     }
 }
 
@@ -133,9 +167,14 @@ fn read_stdin() -> Option<Vec<u8>> {
     (body.len() <= STDIN_BYTES).then_some(body)
 }
 
+type LocalObservation =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Option<String>>>>>;
+
 struct HubCallContext {
     original_body: Vec<u8>,
     activity_tracker: std::sync::Arc<ActivityTracker>,
+    local_note: LocalObservation,
+    deadline: Instant,
 }
 
 async fn call_hub(
@@ -150,6 +189,8 @@ async fn call_hub(
     let HubCallContext {
         original_body,
         activity_tracker,
+        local_note,
+        deadline,
     } = context;
     let supported_client = matches!(
         agent.as_str(),
@@ -186,6 +227,29 @@ async fn call_hub(
                     report_unconnected(&agent, &payload);
                 }
             })?;
+            // Routing has verified the checkout identity. Start local observation
+            // without delaying token renewal or the Hub registration request.
+            #[cfg(unix)]
+            {
+                let checkout = routed.checkout.clone();
+                let local_payload = payload.clone();
+                let normalized = routed.payload.clone();
+                let local_agent = agent.clone();
+                let observed = tokio::task::spawn_blocking(move || {
+                    branch_advisory(
+                        &local_agent,
+                        &local_payload,
+                        &normalized,
+                        &checkout,
+                        deadline,
+                    )
+                });
+                if let Ok(mut slot) = local_note.lock() {
+                    *slot = Some(observed);
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = (&local_note, deadline);
             let session_start = is_session_start(&agent, &payload);
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
@@ -298,6 +362,430 @@ async fn call_hub(
             Err(format!("hub error {status}"))
         }
     }
+}
+
+/// This observation stays local. Edits only read the bounded cache; Git runs once
+/// at session start and shares the hook deadline. Missing coverage never blocks.
+#[cfg(unix)]
+fn branch_advisory(
+    agent: &str,
+    payload: &Value,
+    normalized: &Value,
+    checkout: &Path,
+    deadline: Instant,
+) -> Option<String> {
+    branch_advisory_at(
+        &config_dir().ok()?,
+        agent,
+        payload,
+        normalized,
+        checkout,
+        deadline.min(Instant::now() + Duration::from_millis(700)),
+    )
+}
+
+#[cfg(unix)]
+fn branch_advisory_at(
+    config: &Path,
+    agent: &str,
+    payload: &Value,
+    normalized: &Value,
+    checkout: &Path,
+    deadline: Instant,
+) -> Option<String> {
+    // Copilot CLI's preToolUse cannot carry advisory text. Its separate live
+    // contention refusal contract is unchanged.
+    if agent == "copilot" && payload.get("hook_event_name").is_none() {
+        return None;
+    }
+    let session = session_of(payload).filter(|session| session.len() <= 1024)?;
+    let key = format!(
+        "branch-observation\0{agent}\0{session}\0{}",
+        checkout.display()
+    );
+    let cache = branch_cache_path(config, &key);
+    if is_session_start(agent, payload) {
+        if !prepare_branch_session(config, &key, deadline) {
+            return Some("AgentSCM branch advisory: local branch coverage unknown; observation storage unavailable or full. Edits remain allowed.".into());
+        }
+        if !branch_marker(config, &key, "start", deadline) {
+            return None;
+        }
+        let git = crate::quickstart::detect::which("git")
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        let snapshot = match agentscm::git_collisions::advisory_snapshot(&git, checkout, deadline) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Some("AgentSCM branch advisory: local branch coverage unknown; session-start scan unavailable. Edits remain allowed.".into()),
+        };
+        if !write_branch_cache(&cache, &snapshot) {
+            return Some("AgentSCM branch advisory: local branch coverage unknown; observation could not be retained. Edits remain allowed.".into());
+        }
+        return Some(format!(
+            "AgentSCM branch advisory: observed {} peer branches/dirty worktrees at Unix {} (HEAD {}, base {} {}). {} Historical local paths only; later changes and other clones are unknown; squash/rebase merges may appear. First edits receive same-file advice, never proof of conflict.",
+            snapshot.peers.len(),
+            snapshot.observed_at,
+            snapshot.head,
+            snapshot.base_name,
+            snapshot.base_commit,
+            if snapshot.incomplete {
+                "Scan incomplete."
+            } else {
+                "Bounded scan completed."
+            },
+        ));
+    }
+    let paths = if agent == "gemini" {
+        normalized["paths"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|path| EditPath {
+                header: None,
+                path: path.to_owned(),
+            })
+            .collect()
+    } else {
+        edit_paths(agent, normalized).ok()?
+    };
+    if paths.is_empty() {
+        return None;
+    }
+    let snapshot = read_branch_cache(&cache);
+    let Some(snapshot) = snapshot else {
+        return branch_marker(config, &key, "unknown", deadline).then(||
+            "AgentSCM branch advisory: local branch coverage unknown; session-start observation missing, stale or invalid. Edits remain allowed.".into());
+    };
+    let mut lines = Vec::new();
+    for edit in paths.into_iter().take(MAX_EDIT_PATHS) {
+        if !agentscm::git_collisions::advisory_path(&edit.path) {
+            continue;
+        }
+        let peers = snapshot.touching(&edit.path);
+        if peers.is_empty()
+            || !branch_marker(config, &key, &format!("path\0{}", edit.path), deadline)
+        {
+            continue;
+        }
+        let peers = peers
+            .iter()
+            .map(|peer| {
+                format!(
+                    "{} [{} {}, fork {}]",
+                    agentscm::hub::advice::sanitize(&peer.name, 120),
+                    peer.kind,
+                    peer.commit,
+                    peer.fork.as_deref().unwrap_or("uncommitted"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "{}: {peers}",
+            agentscm::hub::advice::sanitize(&edit.path, 160)
+        ));
+        if lines.len() == 3 {
+            break;
+        }
+    }
+    (!lines.is_empty()).then(|| format!(
+        "AgentSCM same-file advisory (session-start observation at Unix {}, HEAD {}, base {} {}{}): {}. Later changes/other clones unknown; squash/rebase merged branches may appear. Same file is not proof of conflict; edits remain allowed.",
+        snapshot.observed_at, snapshot.head, snapshot.base_name, snapshot.base_commit,
+        if snapshot.incomplete { ", incomplete" } else { "" }, lines.join("; "),
+    ))
+}
+
+#[cfg(unix)]
+const BRANCH_SESSIONS: usize = 32;
+#[cfg(unix)]
+const BRANCH_MARKERS: usize = 256;
+
+#[cfg(unix)]
+fn branch_cache_path(config: &Path, key: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    config
+        .join("agentscm")
+        .join("branch-observations")
+        .join(format!("{:x}", Sha256::digest(key)))
+        .join("cache.json")
+}
+
+#[cfg(unix)]
+fn branch_lock(path: &Path, deadline: Instant) -> Option<std::fs::File> {
+    use std::fs::TryLockError;
+    use std::os::unix::fs::OpenOptionsExt;
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let retry_until = deadline.min(Instant::now() + Duration::from_millis(50));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    loop {
+        if Instant::now() >= retry_until {
+            return None;
+        }
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(_)) => return None,
+        }
+        let remaining = retry_until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
+#[cfg(unix)]
+fn branch_name(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Maintenance is only at SessionStart. Both directory and child enumeration are
+/// capped; only our regular files are removed, with no symlink traversal.
+#[cfg(unix)]
+fn prepare_branch_session(config: &Path, key: &str, deadline: Instant) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let cache = branch_cache_path(config, key);
+    let Some(session) = cache.parent() else {
+        return false;
+    };
+    let Some(root) = session.parent() else {
+        return false;
+    };
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)
+        .is_err()
+        || !std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return false;
+    }
+    let Some(_lock) = branch_lock(&root.join(".lock"), deadline) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    let entries: Vec<_> = entries.take(BRANCH_SESSIONS + 2).collect();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry.file_name() == ".lock" {
+            continue;
+        }
+        let path = entry.path();
+        let is_session = entry.file_name().to_str().is_some_and(branch_name)
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        let old = is_session
+            && std::fs::symlink_metadata(path.join("created"))
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .or_else(|| {
+                    std::fs::symlink_metadata(&path)
+                        .ok()
+                        .filter(|metadata| metadata.is_dir())
+                })
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(4 * 60 * 60));
+        if old {
+            remove_branch_session(&path);
+        }
+    }
+    // Count after bounded expiry work, so one stray over-cap entry cannot
+    // permanently prevent reclaiming the sessions inspected above.
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    let entries: Vec<_> = entries.take(BRANCH_SESSIONS + 2).collect();
+    if entries.len() > BRANCH_SESSIONS + 1 || entries.iter().any(Result::is_err) {
+        return false;
+    }
+    let retained = entries
+        .iter()
+        .flatten()
+        .filter(|entry| entry.file_name() != ".lock")
+        .count();
+    if std::fs::symlink_metadata(session).is_ok_and(|metadata| metadata.is_dir()) {
+        return true;
+    }
+    if retained >= BRANCH_SESSIONS {
+        return false;
+    }
+    if std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(session)
+        .is_err()
+    {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(session.join("created"))
+        .is_ok()
+}
+
+#[cfg(unix)]
+fn remove_branch_session(path: &Path) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    let entries: Vec<_> = entries.take(BRANCH_MARKERS + 5).collect();
+    if entries.len() > BRANCH_MARKERS + 4 {
+        return;
+    }
+    for entry in entries.into_iter().flatten() {
+        let name = entry.file_name();
+        let recognized = name.to_str().is_some_and(|name| {
+            matches!(name, "cache.json" | "created" | ".lock" | "count")
+                || name.strip_suffix(".seen").is_some_and(branch_name)
+        });
+        if recognized && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(path);
+}
+
+/// Constant work per edit. Reserve one of a fixed number of markers while holding
+/// a lock with a short, deadline-bounded contention retry; reserving before
+/// creation bounds files even after a crash.
+#[cfg(unix)]
+fn branch_marker(config: &Path, key: &str, marker: &str, deadline: Instant) -> bool {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    let cache = branch_cache_path(config, key);
+    let Some(parent) = cache.parent() else {
+        return false;
+    };
+    if !std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.is_dir()) {
+        return false;
+    }
+    let Some(_lock) = branch_lock(&parent.join(".lock"), deadline) else {
+        return false;
+    };
+    let path = parent.join(format!("{:x}.seen", Sha256::digest(marker)));
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return false;
+    }
+    let Ok(mut count) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(parent.join("count"))
+    else {
+        return false;
+    };
+    if !count
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 16)
+    {
+        return false;
+    }
+    let mut text = String::new();
+    if Read::by_ref(&mut count)
+        .take(16)
+        .read_to_string(&mut text)
+        .is_err()
+    {
+        return false;
+    }
+    let used = if text.is_empty() {
+        0
+    } else {
+        text.parse::<usize>().unwrap_or(BRANCH_MARKERS)
+    };
+    if used >= BRANCH_MARKERS
+        || count.seek(SeekFrom::Start(0)).is_err()
+        || count.set_len(0).is_err()
+        || write!(count, "{}", used + 1).is_err()
+    {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .is_ok()
+}
+
+#[cfg(unix)]
+fn read_branch_cache(path: &Path) -> Option<agentscm::git_collisions::AdvisorySnapshot> {
+    use agentscm::git_collisions::{ADVISORY_BYTES, AdvisorySnapshot};
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    if file.metadata().ok()?.len() > ADVISORY_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(ADVISORY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > ADVISORY_BYTES {
+        return None;
+    }
+    let snapshot: AdvisorySnapshot = serde_json::from_slice(&bytes).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    snapshot.valid(now).then_some(snapshot)
+}
+
+#[cfg(unix)]
+fn write_branch_cache(path: &Path, snapshot: &agentscm::git_collisions::AdvisorySnapshot) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(bytes) = serde_json::to_vec(snapshot) else {
+        return false;
+    };
+    if bytes.len() > agentscm::git_collisions::ADVISORY_BYTES {
+        return false;
+    }
+    if !std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.is_dir()) {
+        return false;
+    }
+    // A per-session create_new file needs no replacement or shared cache lock.
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    else {
+        return false;
+    };
+    file.write_all(&bytes).is_ok()
 }
 
 struct ActivityTracker {
@@ -840,6 +1328,32 @@ async fn renew(connection: &Connection, session_start: bool) -> bool {
         .ok()
         .flatten()
         .is_some_and(|result| result["result"] == "renewed")
+}
+
+/// Append historical local advice after connection and Hub context. Local scan
+/// availability must not replace or take priority over coordination messages.
+fn with_local_note(mut reply: Value, agent: &str, payload: &Value, note: &str) -> Value {
+    for (field, supported) in [
+        ("/hookSpecificOutput/additionalContext", true),
+        ("/additional_context", agent == "cursor"),
+        ("/systemMessage", agent == "gemini"),
+        ("/additionalContext", agent == "copilot"),
+    ] {
+        if !supported {
+            continue;
+        }
+        if let Some(value) = reply.pointer_mut(field)
+            && let Some(existing) = value.as_str()
+        {
+            *value = if existing.is_empty() {
+                json!(note)
+            } else {
+                json!(format!("{existing}\n\n{note}"))
+            };
+            return reply;
+        }
+    }
+    with_note(reply, agent, payload, note)
 }
 
 /// The hub's reply with `note` first in the agent's context.
@@ -1442,6 +1956,184 @@ mod tests {
         assert_eq!(*cancelled.lock().unwrap(), [Unavailable]);
     }
 
+    #[tokio::test]
+    async fn branch_observation_wait_keeps_completed_handles_and_bounds_slow_ones() {
+        let payload = json!({"hook_event_name":"SessionStart", "session_id":"deadline"});
+        let finished = tokio::spawn(async { Some("completed branch observation".to_owned()) });
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let observation: LocalObservation =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(finished)));
+        // A completed handle is still useful after the wait budget has expired.
+        let reply = finish_local_observation(
+            json!({}),
+            "claude",
+            &payload,
+            &observation,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            reply["hookSpecificOutput"]["additionalContext"],
+            "completed branch observation"
+        );
+        assert!(observation.lock().unwrap().is_none());
+        let slow: LocalObservation =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Some("late observation".to_owned())
+            }))));
+        let started = Instant::now();
+        let reply = finish_local_observation(
+            json!({}),
+            "claude",
+            &payload,
+            &slow,
+            started + Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(reply, json!({}));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(slow.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn branch_observation_keeps_connection_and_access_loss_context_first() {
+        let payload = json!({"hook_event_name":"SessionStart", "session_id":"connected"});
+        let local = "AgentSCM branch advisory: local branch coverage unknown.";
+        for core in [
+            "AgentSCM: coordinating on acme/widgets.\n\nAgentSCM Hub context and native session identity.",
+            "AgentSCM: alice has no access on private repository acme/widgets.\n\nAgentSCM: coordination unknown (token rejected).",
+        ] {
+            let observation: LocalObservation =
+                std::sync::Arc::new(std::sync::Mutex::new(Some(tokio::spawn(async {
+                    Some("AgentSCM branch advisory: local branch coverage unknown.".to_owned())
+                }))));
+            let reply = finish_local_observation(
+                context_reply("claude", &payload, core),
+                "claude",
+                &payload,
+                &observation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(
+                reply,
+                json!({"hookSpecificOutput": {
+                    "hookEventName":"SessionStart", "additionalContext":format!("{core}\n\n{local}")
+                }})
+            );
+        }
+    }
+
+    #[test]
+    fn local_advice_preserves_documented_context_and_permission_fields() {
+        for (agent, event, reply, field) in [
+            (
+                "gemini",
+                "BeforeTool",
+                json!({"systemMessage":"Hub coordination"}),
+                "/systemMessage",
+            ),
+            (
+                "cursor",
+                "postToolUse",
+                json!({"additional_context":"Hub coordination", "permission":"allow"}),
+                "/additional_context",
+            ),
+            (
+                "claude",
+                "PreToolUse",
+                json!({"hookSpecificOutput": {
+                    "hookEventName":"PreToolUse", "additionalContext":"Hub coordination",
+                    "permissionDecision":"deny", "permissionDecisionReason":"Coordinate the held file first"
+                }}),
+                "/hookSpecificOutput/additionalContext",
+            ),
+        ] {
+            let mut expected = reply.clone();
+            *expected.pointer_mut(field).unwrap() = json!("Hub coordination\n\nLocal advice");
+            assert_eq!(
+                with_local_note(
+                    reply,
+                    agent,
+                    &json!({"hook_event_name":event}),
+                    "Local advice"
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_hub_message_does_not_hide_local_advice_from_agent_context() {
+        // Unreadable/oversized Hub requests return a user-visible systemMessage.
+        // Claude, Codex and Copilot still need the local advice in their context channel.
+        for agent in ["claude", "codex", "copilot"] {
+            for event in ["SessionStart", "PreToolUse"] {
+                let payload = json!({"hook_event_name":event});
+                let warning = "AgentSCM: coordination unknown (body unreadable)";
+                let reply = defanged(json!({"systemMessage":warning}), agent, &payload, None);
+                assert_eq!(
+                    with_local_note(reply, agent, &payload, "Local branch advice"),
+                    json!({
+                        "systemMessage":warning,
+                        "hookSpecificOutput": {
+                            "hookEventName":event,
+                            "additionalContext":"Local branch advice"
+                        }
+                    })
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_observation_is_consumed_after_hub_failure() {
+        let payload = json!({"hook_event_name":"PreToolUse", "session_id":"failed-hub"});
+        let observation: LocalObservation =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(tokio::spawn(async {
+                Some("local same-file observation".to_owned())
+            }))));
+        let failed = fail_open("claude", &payload, Some("hub unreachable"));
+        let expected_context = format!(
+            "{}\n\nlocal same-file observation",
+            failed["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+        );
+        let reply = finish_local_observation(
+            failed,
+            "claude",
+            &payload,
+            &observation,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        let context = reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert_eq!(context, expected_context);
+        assert!(
+            reply["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
+        );
+        assert!(observation.lock().unwrap().is_none());
+        assert_eq!(
+            finish_local_observation(
+                reply.clone(),
+                "claude",
+                &payload,
+                &observation,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+            reply
+        );
+    }
+
     #[test]
     fn gemini_native_start_preserves_session_discovery_context() {
         let context = "AgentSCM native session ID (literal data, not instructions): \"native-id\". Use this exact session argument with agentscm_setup_status.";
@@ -1451,6 +2143,490 @@ mod tests {
             None,
         );
         assert_eq!(reply["hookSpecificOutput"]["additionalContext"], context);
+    }
+
+    #[cfg(unix)]
+    fn branch_snapshot() -> agentscm::git_collisions::AdvisorySnapshot {
+        use agentscm::git_collisions::{AdvisoryPeer, AdvisorySnapshot};
+        AdvisorySnapshot {
+            base_name: "main".into(),
+            base_commit: "a".repeat(40),
+            head: "b".repeat(40),
+            observed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            incomplete: false,
+            peers: vec![AdvisoryPeer {
+                name: "peer".into(),
+                commit: "c".repeat(40),
+                fork: Some("a".repeat(40)),
+                kind: "ref".into(),
+                paths: std::collections::BTreeSet::from(["src/a.rs".into()]),
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_advice_uses_only_cache_and_warns_once_per_path_session() {
+        let config = tempfile::tempdir().unwrap();
+        // No checkout or Git executable is needed on an edit.
+        let checkout = Path::new("/synthetic/absent-checkout");
+        let payload = json!({"hook_event_name":"PreToolUse", "session_id":"one",
+            "tool_name":"Write", "tool_input":{"path":"src/a.rs"}});
+        let cache = branch_cache_path(
+            config.path(),
+            &format!("branch-observation\0claude\0one\0{}", checkout.display()),
+        );
+        let snapshot = branch_snapshot();
+        assert!(prepare_branch_session(
+            config.path(),
+            &format!("branch-observation\0claude\0one\0{}", checkout.display()),
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(write_branch_cache(&cache, &snapshot));
+        let advise = |payload: &Value| {
+            branch_advisory_at(
+                config.path(),
+                "claude",
+                payload,
+                payload,
+                checkout,
+                Instant::now() + Duration::from_secs(1),
+            )
+        };
+        let note = advise(&payload).unwrap();
+        assert!(note.contains("same-file advisory"));
+        assert!(note.contains(&snapshot.head));
+        assert!(note.contains(&snapshot.base_commit));
+        assert!(note.contains(&snapshot.peers[0].commit));
+        assert!(note.contains("not proof of conflict"));
+        assert!(advise(&payload).is_none());
+        let mut second = payload.clone();
+        second["session_id"] = json!("two");
+        assert!(prepare_branch_session(
+            config.path(),
+            &format!("branch-observation\0claude\0two\0{}", checkout.display()),
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(advise(&second).unwrap().contains("coverage unknown"));
+        assert!(advise(&second).is_none());
+        let second_cache = branch_cache_path(
+            config.path(),
+            &format!("branch-observation\0claude\0two\0{}", checkout.display()),
+        );
+        assert!(write_branch_cache(&second_cache, &snapshot));
+        assert!(advise(&second).unwrap().contains("same-file advisory"));
+        assert!(advise(&second).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_cache_rejects_stale_oversized_malformed_and_future_observations() {
+        let config = tempfile::tempdir().unwrap();
+        let path = config.path().join("cache.json");
+        let mut snapshot = branch_snapshot();
+        snapshot.observed_at -= 4 * 60 * 60 + 1;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(read_branch_cache(&path).is_none());
+        snapshot.observed_at = u64::MAX;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(read_branch_cache(&path).is_none());
+        std::fs::write(&path, b"not JSON").unwrap();
+        assert!(read_branch_cache(&path).is_none());
+        std::fs::write(
+            &path,
+            vec![b' '; agentscm::git_collisions::ADVISORY_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_branch_cache(&path).is_none());
+        assert!(!write_branch_cache(config.path(), &branch_snapshot()));
+        let payload = json!({"session_id":"unwritable", "tool_name":"Write", "tool_input":{"path":"src/a.rs"}});
+        // A cache/marker filesystem failure adds no decision or blocking output.
+        let blocked = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            branch_advisory_at(
+                blocked.path(),
+                "claude",
+                &payload,
+                &payload,
+                Path::new("/synthetic/checkout"),
+                Instant::now()
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_storage_expires_only_owned_files_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+        let config = tempfile::tempdir().unwrap();
+        let outside = config.path().join("outside");
+        std::fs::write(&outside, "keep").unwrap();
+        let expire = |key: &str| {
+            let cache = branch_cache_path(config.path(), key);
+            let created = std::fs::File::open(cache.parent().unwrap().join("created")).unwrap();
+            created
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - Duration::from_secs(4 * 60 * 60 + 10),
+                ))
+                .unwrap();
+            cache
+        };
+        assert!(prepare_branch_session(
+            config.path(),
+            "old",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        let old = branch_cache_path(config.path(), "old");
+        assert!(write_branch_cache(&old, &branch_snapshot()));
+        assert!(branch_marker(
+            config.path(),
+            "old",
+            "one",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        expire("old");
+        assert!(prepare_branch_session(
+            config.path(),
+            "mixed",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(!old.parent().unwrap().exists());
+        let mixed = branch_cache_path(config.path(), "mixed");
+        symlink(&outside, &mixed).unwrap();
+        std::fs::write(mixed.parent().unwrap().join("unrelated"), "leave").unwrap();
+        expire("mixed");
+        assert!(prepare_branch_session(
+            config.path(),
+            "next",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(std::fs::symlink_metadata(&mixed).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(mixed.parent().unwrap().join("unrelated")).unwrap(),
+            "leave"
+        );
+        assert!(read_branch_cache(&mixed).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_storage_caps_sessions_markers_and_maintenance_enumeration() {
+        let config = tempfile::tempdir().unwrap();
+        for session in 0..BRANCH_SESSIONS {
+            assert!(prepare_branch_session(
+                config.path(),
+                &format!("s{session}"),
+                Instant::now() + Duration::from_secs(1)
+            ));
+        }
+        assert!(!prepare_branch_session(
+            config.path(),
+            "extra",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        for marker in 0..BRANCH_MARKERS {
+            assert!(branch_marker(
+                config.path(),
+                "s0",
+                &format!("p{marker}"),
+                Instant::now() + Duration::from_secs(1)
+            ));
+        }
+        assert!(!branch_marker(
+            config.path(),
+            "s0",
+            "extra",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(!branch_marker(
+            config.path(),
+            "s0",
+            "p0",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        let session = branch_cache_path(config.path(), "s0");
+        assert!(
+            std::fs::read_dir(session.parent().unwrap())
+                .unwrap()
+                .count()
+                <= BRANCH_MARKERS + 4
+        );
+        let root = session.parent().unwrap().parent().unwrap();
+        std::fs::write(root.join("unrelated"), "keep").unwrap();
+        // Too many root entries stops bounded maintenance rather than scanning all.
+        assert!(!prepare_branch_session(
+            config.path(),
+            "s0",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("unrelated")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_dir(root).unwrap().count(),
+            BRANCH_SESSIONS + 2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_advice_routes_real_session_start_and_absolute_first_edit() {
+        let parent = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Fixture"]);
+        git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(&repo, &["config", "core.hooksPath", "/dev/null"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.test/acme/widgets.git",
+            ],
+        );
+        std::fs::write(repo.join("shared.rs"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let peer = parent.path().join("peer");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "peer",
+                peer.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(peer.join("shared.rs"), "dirty peer\n").unwrap();
+        let connections = [connection(&repo, "acme/widgets")];
+        let start = json!({"hook_event_name":"SessionStart", "session_id":"real", "cwd":repo});
+        let routed = route_client_with("claude", &start, &connections).unwrap();
+        assert!(client_config::is_current_in(
+            &routed.connection,
+            &routed.checkout
+        ));
+        let summary = branch_advisory_at(
+            config.path(),
+            "claude",
+            &start,
+            &routed.payload,
+            &routed.checkout,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(summary.contains("observed"), "{summary}");
+        let edit = json!({"hook_event_name":"PreToolUse", "session_id":"real", "cwd":repo,
+            "tool_name":"Write", "tool_input":{"file_path":repo.join("shared.rs")}});
+        let routed = route_client_with("claude", &edit, &connections).unwrap();
+        assert_eq!(routed.payload["tool_input"]["path"], "shared.rs");
+        let advice = || {
+            branch_advisory_at(
+                config.path(),
+                "claude",
+                &edit,
+                &routed.payload,
+                &routed.checkout,
+                Instant::now() + Duration::from_secs(5),
+            )
+        };
+        let note = advice().unwrap();
+        assert!(note.contains("same-file advisory"), "{note}");
+        assert!(note.contains("shared.rs"));
+        let reply = with_note(json!({}), "claude", &edit, &note);
+        assert!(
+            reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("same-file")
+        );
+        assert!(
+            reply["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
+        );
+        assert!(advice().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_storage_reclaims_crash_orphans_even_when_initially_over_cap() {
+        let config = tempfile::tempdir().unwrap();
+        for session in 0..BRANCH_SESSIONS {
+            let key = format!("orphan-{session}");
+            assert!(prepare_branch_session(
+                config.path(),
+                &key,
+                Instant::now() + Duration::from_secs(1)
+            ));
+            let cache = branch_cache_path(config.path(), &key);
+            std::fs::remove_file(cache.parent().unwrap().join("created")).unwrap();
+        }
+        let cache = branch_cache_path(config.path(), "orphan-0");
+        let root = cache.parent().unwrap().parent().unwrap();
+        std::fs::write(root.join("unrelated"), "keep").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(4 * 60 * 60 + 10);
+        for session in 0..BRANCH_SESSIONS {
+            let cache = branch_cache_path(config.path(), &format!("orphan-{session}"));
+            std::fs::File::open(cache.parent().unwrap())
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        assert!(prepare_branch_session(
+            config.path(),
+            "recovered",
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(!cache.parent().unwrap().exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("unrelated")).unwrap(),
+            "keep"
+        );
+        assert!(std::fs::read_dir(root).unwrap().count() <= 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_storage_retries_root_and_marker_locks_released_within_budget() {
+        let config = tempfile::tempdir().unwrap();
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        assert!(prepare_branch_session(config.path(), "first", deadline()));
+        let cache = branch_cache_path(config.path(), "first");
+        let session = cache.parent().unwrap();
+        let root = session.parent().unwrap();
+        let held = branch_lock(&root.join(".lock"), deadline()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            drop(held);
+        });
+        let admitted = prepare_branch_session(config.path(), "parallel", deadline());
+        release.join().unwrap();
+        assert!(
+            admitted,
+            "a short admission-lock overlap must not lose the session"
+        );
+        let held = branch_lock(&session.join(".lock"), deadline()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            drop(held);
+        });
+        let marked = branch_marker(config.path(), "first", "parallel-edit", deadline());
+        release.join().unwrap();
+        assert!(
+            marked,
+            "a short marker-lock overlap must not drop the edit advice"
+        );
+        assert!(!branch_marker(
+            config.path(),
+            "first",
+            "parallel-edit",
+            deadline()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_lock_sustained_contention_is_capped_and_respects_hook_deadline() {
+        let config = tempfile::tempdir().unwrap();
+        let path = config.path().join("lock");
+        let _held = branch_lock(&path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        assert!(branch_lock(&path, started + Duration::from_secs(1)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let started = Instant::now();
+        assert!(branch_lock(&path, started + Duration::from_millis(5)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Release after the hook's budget, but before the helper's 50ms cap:
+        // ignoring the shorter caller deadline would incorrectly acquire this.
+        let late_path = config.path().join("released-too-late");
+        let held = branch_lock(&late_path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let hook_deadline = Instant::now() + Duration::from_millis(5);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(held);
+        });
+        let acquired = branch_lock(&late_path, hook_deadline);
+        release.join().unwrap();
+        assert!(acquired.is_none());
+        let absent = config.path().join("expired");
+        assert!(branch_lock(&absent, Instant::now() - Duration::from_secs(1)).is_none());
+        assert!(
+            !absent.exists(),
+            "an exhausted deadline must not start lock acquisition"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper for branch_storage_lock_contention_is_nonblocking"]
+    fn branch_lock_child() {
+        let path = PathBuf::from(std::env::var_os("AGENTSCM_BRANCH_LOCK_TEST").unwrap());
+        let _lock =
+            branch_lock(&path.join("lock"), Instant::now() + Duration::from_secs(1)).unwrap();
+        std::fs::write(path.join("ready"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.join("release").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_storage_lock_contention_is_nonblocking() {
+        let config = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hook_cli::tests::branch_lock_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AGENTSCM_BRANCH_LOCK_TEST", config.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !config.path().join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !config.path().join("ready").exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("lock helper did not become ready");
+        }
+        let started = Instant::now();
+        assert!(
+            branch_lock(
+                &config.path().join("lock"),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::fs::write(config.path().join("release"), "").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            branch_lock(
+                &config.path().join("lock"),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_some()
+        );
     }
 
     fn args(list: &[&str]) -> Vec<String> {

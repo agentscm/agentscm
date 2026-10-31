@@ -1,5 +1,5 @@
 // The task page against the synthetic hub (dev/mock.ts): the lifecycle strip, the Change record button and agent reports.
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WorkDetail } from '../../src/pages/WorkDetail.tsx'
 import { fetchOverview, type WorkOverview } from '../../src/standup.ts'
@@ -29,6 +29,24 @@ async function open(c: string, ...overrides: Override[]) {
 }
 
 describe('WorkDetail', () => {
+  it('mounts the explicit PR relationship and reloads the detail when its Work sequence changed', async () => {
+    let detailReads = 0
+    const id = wid('b')
+    const { strip } = await open('b', (url) => {
+      if (url.pathname === `/v1/hub/standup/work/${id}`) detailReads++
+      if (url.pathname === `/v1/hub/standup/work/${id}/pr-link`) return json(200, {
+        work_id: id, repository: 'acme/widgets', repository_id: 100, generation: 1,
+        updated_seq: Number(url.searchParams.get('expected_updated_seq')) + 1,
+        snapshot_status: 'work_changed', head_status: 'not_compared', link: null,
+      })
+      return undefined
+    })
+    expect(within(strip).getAllByRole('listitem')).toHaveLength(6)
+    expect(await screen.findByRole('heading', { name: 'Linked pull request' }, LOAD)).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: 'Reload Work detail' }, LOAD))
+    await waitFor(() => expect(detailReads).toBe(2), LOAD)
+  })
+
   it('draws six steps with evidence links for an active task', async () => {
     const { strip, step } = await open('a')
     expect(within(strip).getAllByRole('listitem')).toHaveLength(6)

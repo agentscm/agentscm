@@ -376,9 +376,11 @@ on no others:
   a caller their own entries; see [shared conversations](#shared-conversation-reads))
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
+- `GET /v1/hub/repos/{repo}/pr-context?number=…` ([retained PR context](advanced/pr-context.md), no provider refresh)
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
-  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`,
+  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`, `agentscm_pr_context`,
+  `agentscm_work_pr_link`, `agentscm_work_pr_link_set`,
   `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
   `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
 

@@ -361,6 +361,15 @@ impl Env {
             .collect()
     }
 
+    fn events_without_provider_observations(&self) -> Vec<agentscm::hub::HubEvent> {
+        self.store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind != "provider_context_observed")
+            .collect()
+    }
+
     fn event_count(&self) -> usize {
         self.store.events_after(0, 1000).unwrap().len()
     }
@@ -1054,11 +1063,21 @@ async fn polling_converges_without_webhooks_and_does_not_rewrite_what_is_unchang
         BTreeSet::from(["feat/a".into(), "feat/b".into()])
     );
 
-    // Nothing changed: the list answers 304 and nothing is written.
-    let events = env.event_count();
+    // PR/branch data is unchanged on 304; bounded provider rotation observes PR3
+    // for the first time without rewriting the existing coordination events.
+    let events = env.events_without_provider_observations();
+    let provider_events = env.events("provider_context_observed").len();
     let reports = env.poll().await;
     assert!(reports[0].not_modified);
-    assert_eq!(env.event_count(), events);
+    assert_eq!(env.events_without_provider_observations(), events);
+    let added: Vec<_> = env
+        .events("provider_context_observed")
+        .into_iter()
+        .skip(provider_events)
+        .collect();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0]["scope"], "pull_request");
+    assert_eq!(added[0]["number"], 3);
     env.fake.with(|s| {
         let pulls: Vec<_> = s
             .requests
@@ -1150,16 +1169,31 @@ async fn more_than_300_open_pull_requests_are_cut_short_and_said_so() {
     let observed = env.observed("pull_request");
     assert_eq!(observed.len(), 300);
     assert!(observed.contains("350") && observed.contains("51") && !observed.contains("50"));
-    // The view says so too, and the cut survives a poll that changes nothing.
+    // The cut survives unchanged PR metadata while provider rotation reaches the next pair.
     let agent = env.agent(1, "alice", "agent");
     assert_eq!(
         env.work(&agent).await["truncated"],
         json!({"pull_requests": 1})
     );
-    let events = env.event_count();
+    let events = env.events_without_provider_observations();
+    let provider_events = env.events("provider_context_observed").len();
     let again = env.poll().await;
     assert_eq!(again[0].truncated, json!({"pull_requests": 1}));
-    assert_eq!(env.event_count(), events);
+    assert_eq!(env.events_without_provider_observations(), events);
+    let added: Vec<_> = env
+        .events("provider_context_observed")
+        .into_iter()
+        .skip(provider_events)
+        .collect();
+    assert!(added.iter().all(|event| event["scope"] == "pull_request"));
+    assert_eq!(
+        added
+            .iter()
+            .map(|event| event["number"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(53), json!(54)],
+        "only the next bounded provider pair is newly observed"
+    );
     assert_eq!(
         env.work(&agent).await["truncated"],
         json!({"pull_requests": 1})
@@ -1761,6 +1795,7 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
         });
     });
     let events = env.event_count();
+    let pull_request = env.pr_data(1);
     assert!(env.poll().await.is_empty());
     let (state, detail) = status().await;
     assert_eq!(
@@ -1768,7 +1803,36 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
         ("auth_failed", json!("401 from app"))
     );
     assert_eq!(env.observed("pull_request").len(), 1);
-    assert_eq!(env.event_count(), events + 1);
+    assert_eq!(env.pr_data(1), pull_request);
+    let added: Vec<_> = env
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .skip(events)
+        .collect();
+    let mut kinds: Vec<_> = added.iter().map(|event| event.kind.as_str()).collect();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        vec!["connection_status", "provider_context_observed"]
+    );
+    let health_event = added
+        .iter()
+        .find(|event| event.kind == "provider_context_observed")
+        .unwrap();
+    let health_event: Value = serde_json::from_str(&health_event.data).unwrap();
+    assert_eq!(health_event["scope"], "repository_health");
+    assert_eq!(health_event["health_availability"], "unavailable");
+    assert!(health_event["number"].is_null());
+    let health = env
+        .store
+        .observation(&env.repo().id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    let health: Value = serde_json::from_str(&health.data).unwrap();
+    assert_eq!(health["availability"], "unavailable");
+    let events_after_failure = env.event_count();
     // The failed credential is not retried every round.
     let next = env
         .store
@@ -1792,7 +1856,7 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
         });
     });
     env.refresh(&connection).await;
-    assert_eq!(env.event_count(), events + 1);
+    assert_eq!(env.event_count(), events_after_failure);
     // A working call (an administrator's refresh does not wait) puts it back.
     assert_eq!(env.refresh(&connection).await.len(), 1);
     assert_eq!(status().await, ("enabled".to_owned(), Value::Null));
@@ -3124,4 +3188,1130 @@ async fn connecting_the_forge_drops_a_checkout_adoption_when_the_default_branch_
     assert_eq!(status, 200, "{library}");
     assert_eq!(library["adoption"]["source"], "none", "{library}");
     assert_eq!(library["adoption"]["pins"], json!([]), "{library}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pr_context_http_and_mcp_share_retained_scope_and_head_contract() {
+    let env = Env::start().await;
+    let agent = env.agent(1, "alice", "context-reader");
+    let path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5";
+    assert_eq!(env.get(path, None).await.0, 401);
+    assert_eq!(
+        env.get(path, Some(&agent)).await.1["availability"],
+        "not_connected"
+    );
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 5, &["src/a.rs"]);
+    add_pull(&env, 6, &["src/a.rs"]);
+    env.poll().await;
+    let (status, result) = env.get(path, Some(&agent)).await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["pull_request"]["number"], 5);
+    assert_eq!(result["pull_request_overlaps"][0]["number"], 6);
+    assert_eq!(result["coverage"]["checks"], "see_provider_evidence");
+    assert_eq!(
+        env.get(
+            "/v1/hub/repos/acme%2Fother/pr-context?number=5",
+            Some(&agent)
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        env.get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=-1",
+            Some(&agent)
+        )
+        .await
+        .0,
+        400
+    );
+    let (_, mcp) = env
+        .post(
+            "/mcp",
+            Some(&agent),
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"agentscm_pr_context", "arguments":{"number":5}}
+            }),
+        )
+        .await;
+    // Time of the Work read can advance; the PR and its revision/provenance must be identical.
+    assert_eq!(
+        mcp["result"]["structuredContent"]["pull_request"], result["pull_request"],
+        "{mcp}"
+    );
+    assert_eq!(
+        mcp["result"]["structuredContent"]["pull_request_overlaps"],
+        result["pull_request_overlaps"]
+    );
+    let (_, missing) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=500",
+            Some(&agent),
+        )
+        .await;
+    assert_eq!(missing["availability"], "not_observed");
+    assert_eq!(missing["coverage"]["last_sync_partial"], false);
+    let head = "f".repeat(40);
+    let (_, changed) = env
+        .get(&format!("{path}&expected_head={head}"), Some(&agent))
+        .await;
+    assert_eq!(changed["head_relation"], "changed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
+    use agentscm::hub::skills::SkillAdoption;
+    use agentscm::skill_workflow::supported::{SkillLock, SkillPin, catalog_entry};
+
+    let env = Env::start().await;
+    // Work is partitioned by immutable repository identity. The writer and reader
+    // must both use the bound repository, not a legacy name-only token.
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: env.host(),
+                user_id: 1,
+            },
+            "alice",
+        )
+        .unwrap();
+    let (_, writer, _) = mint_bound_agent_token(
+        &*env.store,
+        &owner.id,
+        "context-author",
+        REPO,
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let agent = writer.expose().to_owned();
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 5, &["src/a.rs"]);
+    env.poll().await;
+    let path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5";
+    let (_, initial) = env.get(path, Some(&agent)).await;
+    let head = initial["pull_request"]["head_sha"].as_str().unwrap();
+    let (status, started) = env.post("/v1/hub/standup/start", Some(&agent), json!({
+        "request_key":"synthetic-context", "session":"context-session", "title":"Synthetic overlapping task",
+        "scope":["src/**", "src/a.rs"], "branch":"different-branch", "next_action":"Inspect shared files"
+    })).await;
+    assert_eq!(status, 200, "{started}");
+    let lock = SkillLock {
+        version: 1,
+        skills: vec![SkillPin::first_party(
+            catalog_entry("pr-gate", 1).unwrap(),
+            None,
+        )],
+    };
+    env.store
+        .skill_adoption_put(&SkillAdoption {
+            repository: REPO.into(),
+            source: "default_branch".into(),
+            lock_json: serde_json::to_string(&lock).unwrap(),
+            default_branch: Some("main".into()),
+            observed_at: unix_now(),
+            reported_by: None,
+        })
+        .unwrap();
+    let (status, evidence) = env.post("/v1/hub/repos/acme%2Fwidgets/skills/evidence", Some(&agent), json!({
+        "skill":"pr-gate", "gate":"branch", "kind":"task_branch", "head_sha":head, "assurance":"self_reported",
+        "summary":"Synthetic task branch", "branch":"different-branch", "session":"context-session", "pull_request":5
+    })).await;
+    assert_eq!(status, 200, "{evidence}");
+
+    let (reader_id, reader, _) = mint_bound_agent_token(
+        &*env.store,
+        &owner.id,
+        "context-viewer",
+        REPO,
+        REPO_ID,
+        3600,
+        true,
+    )
+    .unwrap();
+    let (status, context) = env.get(path, Some(reader.expose())).await;
+    assert_eq!(status, 200, "{context}");
+    assert_eq!(
+        context["work_overlaps"][0]["title"],
+        "Synthetic overlapping task"
+    );
+    assert_eq!(context["work_overlaps"][0]["paths"], json!(["src/a.rs"]));
+    assert_eq!(
+        context["workflows"][0]["applicability"],
+        "matches_observed_head"
+    );
+    assert_eq!(context["workflows"][0]["basis"], "self_reported");
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_pr_context","arguments":{"number":5}}});
+    let (_, mcp) = env.post("/mcp", Some(reader.expose()), call.clone()).await;
+    assert_eq!(
+        mcp["result"]["structuredContent"]["workflows"],
+        context["workflows"]
+    );
+    let (_, foreign) = env
+        .post(
+            "/mcp?repo=acme%2Fother",
+            Some(reader.expose()),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"agentscm_pr_context","arguments":{"number":5}}}),
+        )
+        .await;
+    assert_eq!(foreign["result"]["isError"], true);
+    assert!(foreign["result"]["structuredContent"].is_null());
+    assert!(
+        foreign["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("another repository")
+    );
+    env.store.revoke_agent_token(&reader_id).unwrap();
+    assert_eq!(env.get(path, Some(reader.expose())).await.0, 401);
+    assert_eq!(env.post("/mcp", Some(reader.expose()), call).await.0, 401);
+
+    env.fake.with(|s| {
+        s.repos
+            .get_mut(&REPO_ID)
+            .unwrap()
+            .pulls
+            .get_mut(&5)
+            .unwrap()
+            .state = "closed".into();
+    });
+    env.poll().await;
+    assert_eq!(
+        env.get(path, Some(&agent)).await.1["availability"],
+        "not_observed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_context_refreshes_on_304_and_hides_revoked_or_changed_evidence() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 5, &["src/a.rs"]);
+    add_branch(&env, "main", 0);
+    let head = env.fake.with(|state| {
+        state.installation_permissions = Some(json!({"pull_requests":"write","checks":"read","statuses":"write"}));
+        let head = state.repos[&REPO_ID].pulls[&5].head_sha.clone();
+        state.context_reviews.insert((REPO_ID,5), vec![json!({"id":1,"state":"APPROVED","commit_id":head,"submitted_at":"2026-10-30T10:00:00Z","html_url":"https://github.com/acme/widgets/pull/5#pullrequestreview-1"})]);
+        state.context_checks.insert((REPO_ID,head.clone()), vec![json!({"id":2,"name":"test","status":"completed","conclusion":"success","head_sha":head,"completed_at":"2026-10-30T10:01:00Z","html_url":"https://github.com/acme/widgets/runs/2"})]);
+        head
+    });
+    let reader = env.agent(1, "reader", "context-reader");
+    let path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5";
+    env.poll().await;
+    let (_, context) = env.get(path, Some(&reader)).await;
+    let evidence = &context["provider_evidence"];
+    assert_eq!(evidence["availability"], "observed", "{context}");
+    assert_eq!(
+        evidence["snapshot"]["reviews"]["items"][0]["state"],
+        "APPROVED"
+    );
+    assert_eq!(
+        evidence["snapshot"]["check_runs"]["items"][0]["commit_sha"],
+        head
+    );
+    assert_eq!(evidence["live_requester_access"], "not_revalidated");
+    let event_count = env.events("provider_context_observed").len();
+    env.poll().await;
+    assert_eq!(
+        env.events("provider_context_observed").len(),
+        event_count,
+        "unchanged reads must not manufacture events"
+    );
+    env.fake.with(|state| {
+        state.context_reviews.get_mut(&(REPO_ID, 5)).unwrap()[0]["state"] = json!("DISMISSED");
+        state.installation_permissions = Some(json!({"pull_requests":"write","statuses":"write"}));
+    });
+    let reports = env.poll().await;
+    assert!(reports.iter().any(|report| report.not_modified));
+    let (_, context) = env.get(path, Some(&reader)).await;
+    assert_eq!(
+        context["provider_evidence"]["snapshot"]["reviews"]["items"][0]["state"],
+        "DISMISSED"
+    );
+    assert!(
+        context["provider_evidence"]["snapshot"]["check_runs"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // A retained provider result cannot follow a head move before its rotating reread.
+    let repo = env.repo();
+    let rows = env.store.observations(&repo.id, "pull_request").unwrap();
+    let row = rows.iter().find(|row| row.key == "5").unwrap();
+    let mut pr: Value = serde_json::from_str(&row.data).unwrap();
+    pr["head_sha"] = json!("f".repeat(40));
+    env.store
+        .observe(
+            &repo.id,
+            "pull_request",
+            "5",
+            &pr.to_string(),
+            row.observed_at + 1,
+        )
+        .unwrap();
+    let (_, context) = env.get(path, Some(&reader)).await;
+    assert_eq!(
+        context["provider_evidence"]["availability"],
+        "different_or_unknown_revision"
+    );
+    env.store
+        .observe(
+            &repo.id,
+            "provider_context",
+            "_health",
+            r#"{"availability":"unavailable"}"#,
+            env.store.observation_floor(&repo.id).unwrap() + 1,
+        )
+        .unwrap();
+    let (_, context) = env.get(path, Some(&reader)).await;
+    assert_eq!(context["provider_evidence"]["availability"], "unavailable");
+    env.fake.with(|state| {
+        state
+            .repos
+            .get_mut(&REPO_ID)
+            .unwrap()
+            .pulls
+            .get_mut(&5)
+            .unwrap()
+            .state = "closed".into();
+    });
+    env.poll().await;
+    assert!(
+        env.store
+            .observations(&repo.id, "provider_context")
+            .unwrap()
+            .iter()
+            .all(|row| row.key != "5"),
+        "closed PR evidence follows normal tombstone retention"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_timeout_clears_one_pr_across_other_pr_recovery_and_direct_reads_ignore_list_cap()
+{
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_branch(&env, "main", 0);
+    for number in 1..=4 {
+        add_pull(&env, number, &["src/a.rs"]);
+    }
+    env.fake.with(|state| {
+        let head=state.repos[&REPO_ID].pulls[&1].head_sha.clone();
+        state.context_reviews.insert((REPO_ID,1),vec![json!({"id":1,"state":"APPROVED","commit_id":head,"submitted_at":"2026-10-30T10:00:00Z","html_url":"https://github.com/acme/widgets/pull/1#pullrequestreview-1"})]);
+    });
+    let reader = env.agent(1, "reader", "bounded-context");
+    let path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=1";
+    env.poll().await; // 1,2
+    env.poll().await; // 3,4
+    let (_, initial) = env.get(path, Some(&reader)).await;
+    assert_eq!(
+        initial["provider_evidence"]["snapshot"]["reviews"]["items"][0]["state"],
+        "APPROVED"
+    );
+    let repo = env.repo();
+    let confirmed_health = env
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    let stalled = Arc::new(tokio::sync::Semaphore::new(0));
+    env.fake
+        .with(|state| state.stall_next = Some(("/pulls/1/reviews".into(), stalled.clone())));
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/pulls/2".into(),
+            status: 502,
+            headers: vec![],
+        })
+    });
+    env.poll().await; // PR1 collection times out; PR2 identity reread fails ordinarily.
+    stalled.add_permits(1);
+    let health = env
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        health.data, confirmed_health.data,
+        "ordinary PR failures retain confirmed grant contents"
+    );
+    assert_eq!(
+        health.observed_at, confirmed_health.observed_at,
+        "retained grants were not refreshed"
+    );
+    let health: Value = serde_json::from_str(&health.data).unwrap();
+    assert_eq!(health["availability"], "available");
+    let (_, peer) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=3",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(
+        peer["provider_evidence"]["availability"], "observed",
+        "a failed peer must not hide healthy PRs"
+    );
+    let (_, failed) = env.get(path, Some(&reader)).await;
+    assert_eq!(
+        failed["provider_evidence"]["snapshot"]["reviews"]["availability"],
+        "timed_out"
+    );
+    env.poll().await; // 3,4 confirm grants again; failed PRs must stay cleared.
+    let (_, failed) = env.get(path, Some(&reader)).await;
+    assert_eq!(
+        failed["provider_evidence"]["snapshot"]["reviews"]["availability"], "timed_out",
+        "{failed}"
+    );
+    assert_eq!(
+        failed["provider_evidence"]["snapshot"]["reviews"]["items"],
+        json!([])
+    );
+    let (_, failed_peer) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=2",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(
+        failed_peer["provider_evidence"]["snapshot"]["reviews"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(
+        failed_peer["provider_evidence"]["snapshot"]["reviews"]["items"],
+        json!([])
+    );
+    for number in 10_000..11_005 {
+        env.store
+            .observe(
+                &repo.id,
+                "provider_context",
+                &number.to_string(),
+                r#"{"availability":"synthetic-unused"}"#,
+                1,
+            )
+            .unwrap();
+    }
+    let (_, bounded) = env.get(path, Some(&reader)).await;
+    assert_eq!(
+        bounded["provider_evidence"], failed["provider_evidence"],
+        "exact reads must not lose health or selected evidence at list cap"
+    );
+    // A missing latest grant also suppresses snapshots for PRs outside this round.
+    env.fake
+        .with(|state| state.installation_permissions = Some(json!({"statuses":"write"})));
+    env.poll().await; // 1,2 lose review grant
+    let (_, peer) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=3",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(
+        peer["provider_evidence"]["snapshot"]["reviews"]["availability"],
+        "permission_unconfirmed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_context_keeps_latest_chronological_reviews_with_two_bounded_pages() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 5, &["src/a.rs"]);
+    add_branch(&env, "main", 0);
+    env.fake.with(|state| {
+        state.installation_permissions = Some(json!({"pull_requests":"write"}));
+        let head = state.repos[&REPO_ID].pulls[&5].head_sha.clone();
+        let rows = (1..=41).map(|id| json!({
+            "id": id, "state": if id == 41 { "CHANGES_REQUESTED" } else { "APPROVED" },
+            "commit_id": head, "user": {"login": "reviewer-fixture"},
+            "submitted_at": format!("2026-10-30T10:00:{id:02}Z"),
+            "html_url": format!("https://github.com/acme/widgets/pull/5#pullrequestreview-{id}")
+        })).collect();
+        state.context_reviews.insert((REPO_ID, 5), rows);
+    });
+    let reader = env.agent(1, "reader", "bounded-reviews");
+    env.poll().await;
+    let (_, context) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5",
+            Some(&reader),
+        )
+        .await;
+    let reviews = &context["provider_evidence"]["snapshot"]["reviews"];
+    assert_eq!(reviews["view"], "latest_observed", "{context}");
+    assert_eq!(reviews["items"][0]["provider_id"], 41);
+    assert_eq!(reviews["items"][0]["state"], "CHANGES_REQUESTED");
+    assert_eq!(reviews["items"][7]["provider_id"], 34);
+    assert_eq!(reviews["items"][0]["reviewer"], "reviewer-fixture");
+    assert_eq!(reviews["pages_read"], 2);
+    assert_eq!(reviews["unread_pages"], 1);
+    assert_eq!(reviews["complete"], false);
+    let requests = env.fake.with(|state| {
+        state
+            .requests
+            .iter()
+            .filter(|request| {
+                request
+                    .path_and_query
+                    .starts_with("/repos/acme/widgets/pulls/5/reviews?")
+            })
+            .map(|request| request.path_and_query.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        requests,
+        vec![
+            "/repos/acme/widgets/pulls/5/reviews?per_page=16&page=1",
+            "/repos/acme/widgets/pulls/5/reviews?per_page=16&page=3",
+        ]
+    );
+    // A known authorization refusal must replace, rather than preserve, the old reviews.
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/pulls/5/reviews?".into(),
+            status: 403,
+            headers: vec![("x-ratelimit-remaining".into(), "10".into())],
+        })
+    });
+    env.poll().await;
+    let (_, denied) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5",
+            Some(&reader),
+        )
+        .await;
+    let evidence = &denied["provider_evidence"];
+    assert_eq!(evidence["availability"], "unavailable");
+    let repo = env.repo();
+    let retained = || -> Value {
+        let row = env
+            .store
+            .observation(&repo.id, "provider_context", "5")
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&row.data).unwrap()
+    };
+    let health = || -> Value {
+        let row = env
+            .store
+            .observation(&repo.id, "provider_context", "_health")
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&row.data).unwrap()
+    };
+    assert_eq!(retained()["reviews"]["availability"], "permission_denied");
+    assert_eq!(retained()["reviews"]["items"], json!([]));
+    assert_eq!(health()["availability"], "unavailable");
+    // Confirmed grants recover peer health, but a failed final review page must
+    // not revive reviews saved before the refusal or expose only its old first page.
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/reviews?per_page=16&page=3".into(),
+            status: 502,
+            headers: vec![],
+        })
+    });
+    env.poll().await;
+    assert_eq!(health()["availability"], "available");
+    let (_, partial_failure) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(
+        partial_failure["provider_evidence"]["availability"],
+        "observed"
+    );
+    assert_eq!(
+        partial_failure["provider_evidence"]["snapshot"]["reviews"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(
+        partial_failure["provider_evidence"]["snapshot"]["reviews"]["items"],
+        json!([])
+    );
+    env.poll().await;
+    let (_, recovered) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(recovered["provider_evidence"]["availability"], "observed");
+    assert_eq!(
+        recovered["provider_evidence"]["snapshot"]["reviews"]["items"][0]["provider_id"],
+        41
+    );
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/pulls/5/reviews?".into(),
+            status: 401,
+            headers: vec![],
+        })
+    });
+    env.poll().await;
+    let (_, unauthorized) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(
+        unauthorized["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(health()["availability"], "unavailable");
+    assert_eq!(
+        retained()["reviews"]["availability"],
+        "authentication_failed"
+    );
+    assert_eq!(retained()["reviews"]["items"], json!([]));
+    env.poll().await;
+    let (_, recovered) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(health()["availability"], "available");
+    assert_eq!(recovered["provider_evidence"]["availability"], "observed");
+    assert_eq!(
+        recovered["provider_evidence"]["snapshot"]["reviews"]["items"][0]["provider_id"],
+        41
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_context_repairs_legacy_retained_identity_after_pull_list_304() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 5, &["src/a.rs"]);
+    add_branch(&env, "main", 0);
+    let reader = env.agent(1, "reader", "legacy-context");
+    env.poll().await;
+    let repo = env.repo();
+    assert!(repo.pulls_etag.is_some());
+    let row = env
+        .store
+        .observation(&repo.id, "pull_request", "5")
+        .unwrap()
+        .unwrap();
+    let mut legacy: Value = serde_json::from_str(&row.data).unwrap();
+    legacy.as_object_mut().unwrap().remove("repository_id");
+    legacy.as_object_mut().unwrap().remove("base_sha");
+    env.store
+        .observe(
+            &repo.id,
+            "pull_request",
+            "5",
+            &legacy.to_string(),
+            env.store.observation_floor(&repo.id).unwrap() + 1,
+        )
+        .unwrap();
+    let reports = env.poll().await;
+    assert!(reports.iter().any(|report| report.not_modified));
+    let (_, context) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(context["availability"], "available");
+    assert_eq!(
+        context["provider_evidence"]["availability"], "observed",
+        "{context}"
+    );
+    assert!(
+        context["pull_request"]["base_sha"]
+            .as_str()
+            .is_some_and(|sha| sha.len() == 40)
+    );
+    let repaired = env
+        .store
+        .observation(&repo.id, "pull_request", "5")
+        .unwrap()
+        .unwrap();
+    let repaired: Value = serde_json::from_str(&repaired.data).unwrap();
+    assert_eq!(repaired["repository_id"], REPO_ID);
+    assert_eq!(repaired["base_sha"], context["pull_request"]["base_sha"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_identity_reread_completes_refreshed_head_overlap_notice_before_collection() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 5, &["src/unrelated.rs"]);
+    add_branch(&env, "main", 0);
+    env.poll().await;
+    let reader = env.agent(1, "alice", "overlap-context");
+    env.announce(&reader, 1, &["src/a.rs"], None).await;
+    assert!(
+        notices(&env, &reader, 0).await["notices"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    env.pull(5, |pull| {
+        pull.head_sha = "f".repeat(40);
+        pull.files = vec!["src/a.rs".into()];
+    });
+    let stalled = Arc::new(tokio::sync::Semaphore::new(0));
+    env.fake.with(|state| {
+        // A stale list leaves the selected identity reread to observe this head.
+        // The files read exceeds the old shared five-second collection deadline,
+        // but remains within the provider HTTP client's ten-second request limit.
+        state.fail.push_back(Failure {
+            path_contains: "/pulls?state=open".into(),
+            status: 304,
+            headers: vec![],
+        });
+        state.stall_next = Some(("/pulls/5/files".into(), stalled.clone()));
+    });
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        stalled.add_permits(1);
+    });
+    let reports = env.poll().await;
+    release.await.unwrap();
+    assert!(reports.iter().any(|report| report.not_modified));
+    let delivered = notices(&env, &reader, 0).await;
+    assert_eq!(delivered["notices"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        delivered["notices"][0]["notice"]["head_sha"],
+        "f".repeat(40)
+    );
+    assert_eq!(
+        delivered["notices"][0]["notice"]["their_paths"],
+        json!(["src/a.rs"])
+    );
+    let repo = env.repo();
+    let row = env
+        .store
+        .observation(&repo.id, "provider_context", "5")
+        .unwrap()
+        .unwrap();
+    let snapshot: Value = serde_json::from_str(&row.data).unwrap();
+    assert_eq!(snapshot["reviews"]["availability"], "available");
+    assert_eq!(snapshot["reviews"]["items"], json!([]));
+    env.poll().await;
+    assert_eq!(
+        notices(&env, &reader, 0).await["notices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_grant_inspection_and_identity_reread_refusals_hide_evidence_until_recovery() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 5, &["src/a.rs"]);
+    add_branch(&env, "main", 0);
+    let reader = env.agent(1, "reader", "grant-controls");
+    let path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5";
+    env.poll().await;
+    assert_eq!(
+        env.get(path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "observed"
+    );
+    let repo = env.repo();
+    let retained = |key: &str| -> Value {
+        let row = env
+            .store
+            .observation(&repo.id, "provider_context", key)
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&row.data).unwrap()
+    };
+    // Installation 404 is a failed permission inspection, distinct from a PR
+    // transport failure whose last confirmed grants are left untouched.
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/app/installations/7".into(),
+            status: 404,
+            headers: vec![],
+        })
+    });
+    env.poll().await;
+    assert_eq!(retained("5")["permissions"]["inspection"], "failed");
+    assert_eq!(retained("5")["reviews"]["items"], json!([]));
+    assert_eq!(retained("_health")["availability"], "unavailable");
+    let grant_floor = retained("_health")["invalidated_through"].as_i64().unwrap();
+    assert!(grant_floor > 0);
+    assert_eq!(
+        env.get(path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    env.poll().await;
+    assert_eq!(retained("_health")["availability"], "available");
+    assert_eq!(retained("_health")["invalidated_through"], grant_floor);
+    assert_eq!(
+        env.get(path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "observed"
+    );
+    // Non-exhausted rate-limit headers do not turn a known reread 403 into an
+    // ordinary transport failure. No grant read can repair that PR in this round.
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/repos/acme/widgets/pulls/5".into(),
+            status: 403,
+            headers: vec![("x-ratelimit-remaining".into(), "10".into())],
+        })
+    });
+    env.poll().await;
+    assert_eq!(
+        retained("5")["reviews"]["availability"],
+        "permission_denied"
+    );
+    assert_eq!(retained("5")["reviews"]["items"], json!([]));
+    assert_eq!(retained("5")["permissions"]["inspection"], "not_observed");
+    assert_eq!(retained("_health")["availability"], "unavailable");
+    let reread_floor = retained("_health")["invalidated_through"].as_i64().unwrap();
+    assert!(reread_floor > grant_floor);
+    assert_eq!(
+        env.get(path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    env.poll().await;
+    assert_eq!(retained("_health")["availability"], "available");
+    assert_eq!(retained("_health")["invalidated_through"], reread_floor);
+    assert_eq!(
+        env.get(path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "observed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_failure_floor_survives_peer_recovery_and_reopened_store_until_pr_recollection() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_branch(&env, "main", 0);
+    for number in 1..=6 {
+        add_pull(&env, number, &["src/a.rs"]);
+    }
+    let reader = env.agent(1, "reader", "failure-floor");
+    let peer_path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=5";
+    let failed_path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=1";
+    env.poll().await; // 1,2
+    env.poll().await; // 3,4
+    env.poll().await; // 5,6
+    assert_eq!(
+        env.get(peer_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "observed"
+    );
+    let repo = env.repo();
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/pulls/1/reviews?".into(),
+            status: 403,
+            headers: vec![],
+        })
+    });
+    env.poll().await; // 1 fails; 2 cannot clear the same-round known failure.
+    let failure_health = env
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    let failure_health: Value = serde_json::from_str(&failure_health.data).unwrap();
+    let floor = failure_health["invalidated_through"].as_i64().unwrap();
+    assert_eq!(failure_health["availability"], "unavailable");
+    let old_peer = env
+        .store
+        .observation(&repo.id, "provider_context", "5")
+        .unwrap()
+        .unwrap();
+    assert!(old_peer.observed_at <= floor);
+    assert_eq!(
+        env.get(peer_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    env.poll().await; // 3,4 confirm grants, but pre-failure rows 1,5,6 stay hidden.
+    let recovered_health = env
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    let recovered_health: Value = serde_json::from_str(&recovered_health.data).unwrap();
+    assert_eq!(recovered_health["availability"], "available");
+    assert_eq!(recovered_health["invalidated_through"], floor);
+    assert_eq!(
+        env.get(peer_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(
+        env.get(failed_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    // Reopen persistent storage with an empty sync/cache instance. Reads must
+    // enforce the durable floor without depending on the original poller's memory.
+    let mut reopened = env.state.clone().with_sync(Sync::unconfigured());
+    reopened.store = store::open(&format!(
+        "sqlite://{}",
+        env._dir.path().join("hub.sqlite").display()
+    ))
+    .unwrap();
+    let principal = reopened
+        .store
+        .authenticate(&store::agent_token_digest(&reader).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    let retained = agentscm::hub::pr_context::read(
+        &reopened,
+        &principal,
+        agentscm::hub::pr_context::Request {
+            number: 5,
+            expected_head: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|_| panic!("reopened PR context read failed"));
+    assert_eq!(retained["provider_evidence"]["availability"], "unavailable");
+    let durable = reopened
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    let durable: Value = serde_json::from_str(&durable.data).unwrap();
+    assert_eq!(durable["invalidated_through"], floor);
+    env.poll().await; // Only recollecting 5,6 makes those rows newer than the floor.
+    let fresh_peer = env
+        .store
+        .observation(&repo.id, "provider_context", "5")
+        .unwrap()
+        .unwrap();
+    assert!(fresh_peer.observed_at > floor);
+    assert_eq!(
+        env.get(peer_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "observed"
+    );
+    assert_eq!(
+        env.get(failed_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    let fresh = agentscm::hub::pr_context::read(
+        &reopened,
+        &principal,
+        agentscm::hub::pr_context::Request {
+            number: 5,
+            expected_head: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|_| panic!("reopened PR context read failed"));
+    assert_eq!(fresh["provider_evidence"]["availability"], "observed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consecutive_provider_failures_do_not_append_health_events_and_recovery_uses_latest_failure()
+ {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_branch(&env, "main", 0);
+    for number in 1..=6 {
+        add_pull(&env, number, &["src/a.rs"]);
+    }
+    let reader = env.agent(1, "reader", "health-event-controls");
+    env.poll().await; // 1,2
+    env.poll().await; // 3,4
+    env.poll().await; // 5,6
+    let repo = env.repo();
+    let health_events = || {
+        env.events("provider_context_observed")
+            .iter()
+            .filter(|event| event["scope"] == "repository_health")
+            .count()
+    };
+    let initial_events = health_events();
+    let refuse = |number| {
+        env.fake.with(|state| {
+            state.fail.push_back(Failure {
+                path_contains: format!("/pulls/{number}/reviews?"),
+                status: 403,
+                headers: vec![],
+            })
+        })
+    };
+    refuse(1);
+    env.poll().await; // fail1: PR1 refuses; PR2 confirms unchanged grants.
+    let first = env
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    let first_value: Value = serde_json::from_str(&first.data).unwrap();
+    assert_eq!(first_value["availability"], "unavailable");
+    assert_eq!(health_events(), initial_events + 1);
+    refuse(4);
+    env.poll().await; // PR3 succeeds after fail1, but PR4 creates fail2 in the same round.
+    let second = env
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.data, first.data,
+        "consecutive failure contents remain unchanged"
+    );
+    assert!(second.observed_at > first.observed_at);
+    assert_eq!(
+        health_events(),
+        initial_events + 1,
+        "no event is appended for the repeated unavailable state"
+    );
+    let intermediate = env
+        .store
+        .observation(&repo.id, "provider_context", "3")
+        .unwrap()
+        .unwrap();
+    assert!(intermediate.observed_at > first.observed_at);
+    assert!(intermediate.observed_at < second.observed_at);
+    env.poll().await; // 5,6 recover health; PR3 must still be invalidated through fail2.
+    let recovered = env
+        .store
+        .observation(&repo.id, "provider_context", "_health")
+        .unwrap()
+        .unwrap();
+    let recovered: Value = serde_json::from_str(&recovered.data).unwrap();
+    assert_eq!(recovered["availability"], "available");
+    assert_eq!(recovered["invalidated_through"], second.observed_at);
+    assert_eq!(health_events(), initial_events + 2);
+    let peer_path = "/v1/hub/repos/acme%2Fwidgets/pr-context?number=3";
+    assert_eq!(
+        env.get(peer_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(
+        env.get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=1",
+            Some(&reader)
+        )
+        .await
+        .1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    env.poll().await; // 1,2 cannot revive the old PR3 row.
+    assert_eq!(
+        env.get(peer_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "unavailable"
+    );
+    env.poll().await; // 3,4 are now individually recollected after fail2.
+    assert_eq!(
+        env.get(peer_path, Some(&reader)).await.1["provider_evidence"]["availability"],
+        "observed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pat_sync_skips_provider_evidence_reads_and_observations() {
+    let env = Env::start_with(true).await;
+    env.fake.with(|state| {
+        state.repos.insert(REPO_ID, Repo::new(REPO_ID, REPO));
+    });
+    let connection = env
+        .store
+        .connections()
+        .unwrap()
+        .into_iter()
+        .find(|connection| connection.kind == "pat")
+        .unwrap();
+    let (status, _) = env
+        .post(
+            &format!("/v1/hub/connections/{}/repositories", connection.id),
+            Some(&env.admin),
+            json!({"full_name": REPO}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    add_pull(&env, 3, &["src/a.rs"]);
+    add_branch(&env, "main", 0);
+    let reports = env.poll().await;
+    assert_eq!(reports.len(), 1);
+    let repo = env.repo();
+    let original = env
+        .store
+        .observation(&repo.id, "pull_request", "3")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        detail_reads(&env, 3),
+        0,
+        "PAT evidence must not reread mirrored PRs"
+    );
+    assert!(
+        env.store
+            .observations(&repo.id, "provider_context")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(env.events("provider_context_observed").is_empty());
+    let reports = env.poll().await;
+    assert!(reports.iter().any(|report| report.not_modified));
+    let unchanged = env
+        .store
+        .observation(&repo.id, "pull_request", "3")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged, original,
+        "a PAT list 304 must not trigger evidence rereads or PR writes"
+    );
+    assert_eq!(detail_reads(&env, 3), 0);
+    assert!(
+        env.store
+            .observations(&repo.id, "provider_context")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(env.events("provider_context_observed").is_empty());
+    env.fake.with(|state| {
+        assert!(
+            state.requests.iter().all(|request| {
+                !(request.path_and_query.contains("/reviews")
+                    || request.path_and_query.contains("/check-runs")
+                    || request.path_and_query.contains("/commits/")
+                        && request.path_and_query.contains("/statuses"))
+            }),
+            "PAT polling must not spend requests on unavailable provider evidence"
+        );
+    });
+    let reader = env.agent(1, "reader", "pat-context");
+    let requests = env.fake.with(|state| state.requests.len());
+    let (status, context) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/pr-context?number=3",
+            Some(&reader),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(context["availability"], "available");
+    assert_eq!(context["provider_evidence"]["availability"], "unavailable");
+    assert_eq!(env.fake.with(|state| state.requests.len()), requests);
+    assert!(
+        env.store
+            .observations(&repo.id, "provider_context")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(env.events("provider_context_observed").is_empty());
 }

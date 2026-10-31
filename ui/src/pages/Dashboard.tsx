@@ -447,7 +447,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
           <Track ov={ov} />
         </>
       ))}
-      {section === 'now' && <NowPage data={data} d={d} overview={overview} />}
+      {section === 'now' && <NowPage data={data} d={d} overview={overview} token={token} />}
       {section === 'activity' && (
         <>
           <NarrativePanel token={token} />

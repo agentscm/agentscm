@@ -21,6 +21,7 @@ import { usePoll, type Poll } from '../usePoll.ts'
 import { localCredential } from '../localApi.ts'
 import { onFrontDoor } from '../frontDoor.ts'
 import { IntentReviewPanel } from '../IntentReviewPanel.tsx'
+import { WorkPrContext } from '../WorkPrContext.tsx'
 import { ClaimPill, lead, Source, StatePill, WorkLink } from './workParts.tsx'
 
 function Ref({ r, item }: { r: WorkSourceRef; item: WorkItem }) {
@@ -86,12 +87,12 @@ export function WorkDetail({ id, token, overview, handoff }: { id: string; token
           {load.message}
         </Notice>
       )}
-      {load.kind === 'ready' && <Task item={load.value} token={token} overview={overview.kind === 'ready' ? overview.value : null} handoff={handoff} />}
+      {load.kind === 'ready' && <Task item={load.value} token={token} overview={overview.kind === 'ready' ? overview.value : null} handoff={handoff} refreshWork={load.retry} />}
     </div>
   )
 }
 
-function Task({ item, token, overview, handoff }: { item: WorkItem; token: string; overview: WorkOverview | null; handoff?: Handoff }) {
+function Task({ item, token, overview, handoff, refreshWork }: { item: WorkItem; token: string; overview: WorkOverview | null; handoff?: Handoff; refreshWork: () => void }) {
   const l = lead(item)
   const branch = item.branch
   const record = usePoll((s) => fetchChangeRecord(item.repository, item.id, token, s), 0, item.id)
@@ -194,6 +195,7 @@ function Task({ item, token, overview, handoff }: { item: WorkItem; token: strin
         )}
         {item.blocker && item.blocker !== item.current && <Report c={item.blocker} item={item} title="Open blocker" />}
       </Box>
+      <WorkPrContext item={item} token={token} refreshWork={refreshWork} />
       {onFrontDoor() && localCredential() && <IntentReviewPanel workId={item.id} />}
       <details className="disclosure">
         <summary>

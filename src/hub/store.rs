@@ -44,6 +44,7 @@ use super::work::{
     WorkItem, WorkOverview, WorkOverviewQuery, WorkRepositoryScope, WorkScopeCheck, WorkSearchPage,
     WorkStart, WorkStartResult,
 };
+use super::work_links::{WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView};
 use super::work_preflight::WorkPreflightResult;
 use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
@@ -409,6 +410,8 @@ pub trait Store: Send + Sync {
         data: &str,
         event: &str,
     ) -> Result<bool>;
+    /// Read one current observation by its exact key, independent of list pagination.
+    fn observation(&self, repo: &str, kind: &str, key: &str) -> Result<Option<Observation>>;
     /// Present (not forgotten) observations of `kind`, ordered by key, at most 1000.
     fn observations(&self, repo: &str, kind: &str) -> Result<Vec<Observation>>;
     /// Drops forgotten markers last read before `before` (unix ms); no event. Returns how many.
@@ -632,6 +635,22 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// Read the single explicit PR relationship; comparison statuses confer no approval.
+    fn work_pr_link_get(
+        &self,
+        token: &str,
+        id: &str,
+        query: &WorkPrLinkQuery,
+        now: i64,
+    ) -> Result<Option<WorkPrLinkView>>;
+    /// Set or remove a caller-asserted relationship, fenced by current Work ownership.
+    fn work_pr_link_set(
+        &self,
+        token: &str,
+        update: &WorkPrLinkUpdate,
+        now: i64,
+    ) -> Result<WorkPrLinkResult>;
+
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
     /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, lead agent,

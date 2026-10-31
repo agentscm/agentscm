@@ -29,6 +29,7 @@ const WORK_LABEL: Record<string, string> = {
   work_joined: 'Agent joined',
   work_takeover: 'Work taken over',
   work_checkpoint: 'Checkpoint reported',
+  work_pr_link: 'Relationship changed',
 }
 
 const COORDINATION_LABEL: Record<string, string> = {
@@ -38,11 +39,12 @@ const COORDINATION_LABEL: Record<string, string> = {
   coordination_withdrawn: 'Coordination withdrawn',
 }
 
-function WorkUpdate({ event }: { event: CatchupWorkEvent }) {
-  const summary = event.item.current?.summary
+export function WorkUpdate({ event }: { event: CatchupWorkEvent }) {
+  const relationshipChanged = event.kind === 'work_pr_link'
+  const summary = relationshipChanged ? 'Explicit PR relationship updated; inspect Work for the current link.' : event.item.current?.summary
   return (
-    <li className={event.item.state === 'finished' ? 'tone-ok' : undefined}>
-      <Icon name={event.item.state === 'finished' ? 'check2-circle' : 'chat-square-text'} />
+    <li className={!relationshipChanged && event.item.state === 'finished' ? 'tone-ok' : undefined}>
+      <Icon name={relationshipChanged ? 'git' : event.item.state === 'finished' ? 'check2-circle' : 'chat-square-text'} />
       <div><strong>{WORK_LABEL[event.kind] ?? 'Work updated'}</strong> · <a href={`#work/${encodeURIComponent(event.work_id)}`}>{event.item.title}</a></div>
       <div className="small muted">{event.item.lead_agent} · {summary ?? <span className="muted">No summary reported</span>} · <Ago at={event.at} /></div>
       <details className="disclosure">
@@ -115,7 +117,7 @@ const clock = (at: number) => new Date(at * 1000).toLocaleTimeString([], { hour:
 function records(page: CatchupPage): Rec[] {
   return [
     ...page.merges.map((m) => ({ lane: 'merge' as const, at: m.observed_at, key: `m${m.id}`, bad: false, node: <MergeUpdate key={`m${m.id}`} merge={m} /> })),
-    ...page.work_events.map((e) => ({ lane: 'work' as const, at: e.at, key: `w${e.seq}`, bad: e.item.state === 'blocked', node: <WorkUpdate key={`w${e.seq}`} event={e} /> })),
+    ...page.work_events.map((e) => ({ lane: 'work' as const, at: e.at, key: `w${e.seq}`, bad: e.kind !== 'work_pr_link' && e.item.state === 'blocked', node: <WorkUpdate key={`w${e.seq}`} event={e} /> })),
     ...page.coordination_events.map((e) => ({ lane: 'coord' as const, at: e.at, key: `c${e.seq}`, bad: false, node: <CoordinationUpdate key={`c${e.seq}`} event={e} /> })),
   ].sort((x, y) => y.at - x.at)
 }

@@ -646,3 +646,55 @@ fn preflight_reports_missing_source_without_creating_work() {
             .is_empty()
     );
 }
+
+#[test]
+fn explicit_pr_link_cli_uses_work_service_and_stale_fence() {
+    let hub = Hub::start();
+    let client = hub.bound_client(1, "alice", 42);
+    let started = client
+        .start(r#"{"request_key":"linked-task","title":"A linked task","session":"link-session"}"#);
+    assert!(started.status.success(), "{started:?}");
+    let start: WorkStartResult = serde_json::from_slice(&started.stdout).unwrap();
+    let request = serde_json::json!({"work_id":start.item.id,"generation":start.item.generation,"session":"link-session","operation_id":"link-1","expected_updated_seq":start.item.updated_seq,"link":{"repository_id":42,"number":7,"head_sha":"a".repeat(40)}});
+    let set = client.request("pr-link-set", &request.to_string());
+    assert!(set.status.success(), "{set:?}");
+    let result: serde_json::Value = serde_json::from_slice(&set.stdout).unwrap();
+    assert_eq!(result["view"]["link"]["target"]["number"], 7);
+    let get = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args([
+            "work",
+            "pr-link",
+            &start.item.id,
+            "--expected-updated-seq",
+            &start.item.updated_seq.to_string(),
+        ])
+        .env_clear()
+        .env("HOME", client.config.path())
+        .env("XDG_CONFIG_HOME", client.config.path())
+        .env("AGENTSCM_HUB_URL", &client.url)
+        .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+        .output()
+        .unwrap();
+    assert!(get.status.success(), "{get:?}");
+    let view: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(view["snapshot_status"], "work_changed");
+    let mut stale = request.clone();
+    stale["operation_id"] = serde_json::json!("remove-stale");
+    stale["link"] = serde_json::Value::Null;
+    assert!(
+        !client
+            .request("pr-link-set", &stale.to_string())
+            .status
+            .success()
+    );
+    let mut missing = request.clone();
+    missing["operation_id"] = serde_json::json!("missing-link");
+    missing["expected_updated_seq"] = result["view"]["updated_seq"].clone();
+    missing.as_object_mut().unwrap().remove("link");
+    assert!(
+        !client
+            .request("pr-link-set", &missing.to_string())
+            .status
+            .success()
+    );
+}
