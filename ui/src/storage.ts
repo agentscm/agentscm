@@ -149,3 +149,22 @@ export function saveInstallDismissed(): void {
     /* ignore */
   }
 }
+
+const DOCK_TIP_KEY = 'agentscm.dock-tip'
+
+/** Whether the installed app's "keep it in your Dock" tip was dismissed. */
+export function loadDockTipDismissed(): boolean {
+  try {
+    return window.localStorage.getItem(DOCK_TIP_KEY) === 'dismissed'
+  } catch {
+    return false
+  }
+}
+
+export function saveDockTipDismissed(): void {
+  try {
+    window.localStorage.setItem(DOCK_TIP_KEY, 'dismissed')
+  } catch {
+    /* ignore */
+  }
+}

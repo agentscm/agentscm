@@ -65,7 +65,8 @@ describe('StartTask', () => {
     expect(screen.getByRole('button', { name: /Open in Cursor/ })).toBeTruthy()
     expect(screen.queryByText(/Open in Codex/)).toBeNull()
     expect(screen.queryByText(/Open in Copilot/)).toBeNull()
-    for (const b of screen.getAllByRole('button')) expect((b as HTMLButtonElement).disabled).toBe(true)
+    // Everything but the line's own open/close toggle.
+    for (const b of screen.getAllByRole('button').filter((b) => !b.hasAttribute('aria-expanded'))) expect((b as HTMLButtonElement).disabled).toBe(true)
     fireEvent.change(screen.getByLabelText('What should the agent do?'), { target: { value: 'fix login' } })
     const link = screen.getByRole('link', { name: /Open in Claude Code/ })
     expect(link.getAttribute('href')).toMatch(/^claude-cli:\/\/open\?repo=acme\/widgets&q=.*agentscm_work_preflight.*fix%20login/)

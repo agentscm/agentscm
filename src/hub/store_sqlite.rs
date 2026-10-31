@@ -91,7 +91,7 @@ use super::store::{
     HubEvent, LIST_LIMIT, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal,
     PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit,
     like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
-    validate_login,
+    validate_display_name, validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
@@ -103,6 +103,9 @@ use super::work::{
     check_work_delivery_page, check_work_payload_capacity, claim_status, fit_json_budget,
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
     work_payload_row_bytes,
+};
+use super::work_links::{
+    self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::{HubError, Result};
@@ -346,6 +349,7 @@ fn work_who(tx: &Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
                         user_id: row.get(7)?,
                     },
                     login: row.get(8)?,
+                    name: None,
                     disabled: false,
                 },
             })
@@ -1812,6 +1816,11 @@ fn work_payload_bytes(
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
              UNION ALL
+             SELECT length(CAST(l.snapshot AS BLOB)) + 256 FROM hub_work_pr_links l
+              JOIN hub_work_items w ON w.id = l.work
+              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
+                AND w.repository_id IS ?4
+             UNION ALL
              SELECT length(CAST(o.request AS BLOB)) + 256 FROM hub_work_checkpoint_ops o
               JOIN hub_work_items w ON w.id = o.work
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
@@ -1832,7 +1841,7 @@ fn work_payload_bytes(
                FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
-                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
              UNION ALL
              SELECT length(CAST(r.proposed_scope AS BLOB))
                     + length(CAST(r.proposed_title AS BLOB)) + 256
@@ -3691,6 +3700,7 @@ fn active_token(tx: &Transaction<'_>, token: &str, now: i64) -> Result<Who> {
                         user_id: row.get(5)?,
                     },
                     login: row.get(6)?,
+                    name: None,
                     disabled: false,
                 },
             })
@@ -3892,6 +3902,7 @@ fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Intent, String, Opti
                     user_id: row.get(12)?,
                 },
                 login: row.get(13)?,
+                name: None,
                 disabled: false,
             },
             via: Vec::new(),
@@ -5303,15 +5314,17 @@ impl Store for SqliteStore {
                 id,
                 identity: identity.clone(),
                 login: login.to_owned(),
+                name: None,
                 disabled: false,
             }
         } else {
-            let (id, previous, disabled): (String, String, bool) = tx.query_row(
-                "SELECT id, login, disabled FROM hub_users
-                 WHERE provider = ?1 AND host = ?2 AND forge_user_id = ?3",
-                params![identity.provider, identity.host, identity.user_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+            let (id, previous, name, disabled): (String, String, Option<String>, bool) = tx
+                .query_row(
+                    "SELECT id, login, display_name, disabled FROM hub_users
+                     WHERE provider = ?1 AND host = ?2 AND forge_user_id = ?3",
+                    params![identity.provider, identity.host, identity.user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
             if previous != login {
                 tx.execute(
                     "UPDATE hub_users SET login = ?2 WHERE id = ?1",
@@ -5323,11 +5336,24 @@ impl Store for SqliteStore {
                 id,
                 identity: identity.clone(),
                 login: login.to_owned(),
+                name,
                 disabled,
             }
         };
         tx.commit()?;
         Ok(user)
+    }
+
+    fn set_user_name(&self, user: &str, name: Option<&str>) -> Result<()> {
+        validate_display_name(name)?;
+        let changed = self.conn().execute(
+            "UPDATE hub_users SET display_name = ?2 WHERE id = ?1",
+            params![user, name],
+        )?;
+        if changed == 0 {
+            return Err(HubError::Invalid("unknown user".into()));
+        }
+        Ok(())
     }
 
     fn set_user_disabled(&self, user: &str, disabled: bool) -> Result<()> {
@@ -5403,7 +5429,7 @@ impl Store for SqliteStore {
     fn list_users(&self) -> Result<Vec<User>> {
         let conn = self.conn();
         let mut statement = conn.prepare(
-            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users
+            "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users
              ORDER BY created_at, id LIMIT ?1",
         )?;
         let users = statement
@@ -5416,6 +5442,7 @@ impl Store for SqliteStore {
                         user_id: row.get(3)?,
                     },
                     login: row.get(4)?,
+                    name: row.get(6)?,
                     disabled: row.get(5)?,
                 })
             })?
@@ -5425,12 +5452,12 @@ impl Store for SqliteStore {
 
     fn user_by_id(&self, id: &str) -> Result<Option<User>> {
         Ok(self.conn().query_row(
-            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE id = ?1",
+            "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users WHERE id = ?1",
             [id],
             |row| Ok(User {
                 id: row.get(0)?,
                 identity: ForgeIdentity { provider: row.get(1)?, host: row.get(2)?, user_id: row.get(3)? },
-                login: row.get(4)?, disabled: row.get(5)?,
+                login: row.get(4)?, name: row.get(6)?, disabled: row.get(5)?,
             }),
         ).optional()?)
     }
@@ -5438,9 +5465,9 @@ impl Store for SqliteStore {
     fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>> {
         identity.validate()?;
         Ok(self.conn().query_row(
-            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE provider=?1 AND host=?2 AND forge_user_id=?3",
+            "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users WHERE provider=?1 AND host=?2 AND forge_user_id=?3",
             params![identity.provider,identity.host,identity.user_id],
-            |row| Ok(User { id:row.get(0)?, identity:ForgeIdentity {provider:row.get(1)?,host:row.get(2)?,user_id:row.get(3)?}, login:row.get(4)?,disabled:row.get(5)? }),
+            |row| Ok(User { id:row.get(0)?, identity:ForgeIdentity {provider:row.get(1)?,host:row.get(2)?,user_id:row.get(3)?}, login:row.get(4)?,name:row.get(6)?,disabled:row.get(5)? }),
         ).optional()?)
     }
 
@@ -5484,6 +5511,7 @@ impl Store for SqliteStore {
                                 user_id: row.get(7)?,
                             },
                             login: row.get(8)?,
+                            name: None,
                             disabled: false,
                         },
                     })
@@ -5548,6 +5576,7 @@ impl Store for SqliteStore {
                                 user_id: row.get(7)?,
                             },
                             login: row.get(8)?,
+                            name: None,
                             disabled: row.get(9)?,
                         },
                     })
@@ -5593,6 +5622,7 @@ impl Store for SqliteStore {
                             user_id: row.get(8)?,
                         },
                         login: row.get(9)?,
+                        name: None,
                         disabled: row.get(10)?,
                     },
                     repositories: Vec::new(),
@@ -5801,7 +5831,7 @@ impl Store for SqliteStore {
         let conn = self.conn();
         let found = conn
             .query_row(
-                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at
+                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at, u.display_name
                  FROM hub_browser_sessions s JOIN hub_users u ON u.id = s.owner
                  WHERE s.digest = ?1 AND s.expires_at > ?2 AND s.created_at > ?3",
                 params![digest.as_str(), now, now - BROWSER_SESSION_MAX_SECONDS],
@@ -5815,6 +5845,7 @@ impl Store for SqliteStore {
                                 user_id: row.get(3)?,
                             },
                             login: row.get(4)?,
+                            name: row.get(7)?,
                             disabled: row.get(5)?,
                         },
                         row.get::<_, i64>(6)?,
@@ -6102,6 +6133,28 @@ impl Store for SqliteStore {
         finish(rows)
     }
 
+    fn live_intents_scoped(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<Intent>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "{INTENT_SELECT} WHERE {TOKEN_SCOPE} AND i.released_at IS NULL AND i.expires_at > ?5
+             ORDER BY i.id LIMIT ?6"
+        ))?;
+        let rows = statement
+            .query_map(
+                params![
+                    who.repository,
+                    who.repository_id,
+                    who.owner.identity.host,
+                    who.owner.identity.provider,
+                    now,
+                    limit as i64
+                ],
+                intent_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        finish(rows)
+    }
+
     fn notices_after(&self, token: &str, after: i64, limit: usize) -> Result<Vec<HubEvent>> {
         let conn = self.conn();
         let mut statement = conn.prepare(
@@ -6324,6 +6377,20 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (key) DO NOTHING",
+            params![key, value, unix_now(), actor],
+        )?;
+        Ok(conn.query_row(
+            "SELECT value FROM hub_settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )?)
+    }
+
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE hub_connections SET next_poll_at = ?2 WHERE id = ?1",
@@ -6518,7 +6585,10 @@ impl Store for SqliteStore {
                  observed_at = excluded.observed_at, deleted = 0",
             params![repo, kind, key, data, observed_at],
         )?;
-        append(&tx, &Event::observation(observed_kind, &repository, data)?)?;
+        append(
+            &tx,
+            &Event::observation(observed_kind, &repository, key, data)?,
+        )?;
         tx.commit()?;
         Ok(Observed::Changed { previous })
     }
@@ -6560,10 +6630,18 @@ impl Store for SqliteStore {
         )?;
         // An already-forgotten row only moves its read time forward.
         if !gone {
-            append(&tx, &Event::observation(gone_kind, &repository, data)?)?;
+            append(&tx, &Event::observation(gone_kind, &repository, key, data)?)?;
         }
         tx.commit()?;
         Ok(!gone)
+    }
+
+    fn observation(&self, repo: &str, kind: &str, key: &str) -> Result<Option<Observation>> {
+        observation_kinds(kind)?;
+        Ok(self.conn().query_row(
+            "SELECT kind,key,data,observed_at FROM hub_observations WHERE repository=?1 AND kind=?2 AND key=?3 AND deleted=0",
+            params![repo,kind,key], |row| Ok(Observation {kind:row.get(0)?,key:row.get(1)?,data:row.get(2)?,observed_at:row.get(3)?})
+        ).optional()?)
     }
 
     fn observations(&self, repo: &str, kind: &str) -> Result<Vec<Observation>> {
@@ -7942,6 +8020,169 @@ impl Store for SqliteStore {
         let item = scoped_work(&tx, &who, id, now)?;
         tx.commit()?;
         Ok(item)
+    }
+
+    fn work_pr_link_get(
+        &self,
+        token: &str,
+        id: &str,
+        query: &WorkPrLinkQuery,
+        now: i64,
+    ) -> Result<Option<WorkPrLinkView>> {
+        query.validate()?;
+        super::work::validate_id("work", id, "wrk")?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let repository_id = work_links::trusted_repository_id(&who)?;
+        let Some(item) = scoped_work(&tx, &who, id, now)? else {
+            return Ok(None);
+        };
+        let snapshot: Option<String> = tx
+            .query_row(
+                "SELECT snapshot FROM hub_work_pr_links WHERE work=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let link = snapshot
+            .as_deref()
+            .map(json_value::<WorkPrLink>)
+            .transpose()?;
+        let view = work_links::view(&item, repository_id, link, query);
+        tx.commit()?;
+        Ok(Some(view))
+    }
+
+    fn work_pr_link_set(
+        &self,
+        token: &str,
+        update: &WorkPrLinkUpdate,
+        now: i64,
+    ) -> Result<WorkPrLinkResult> {
+        update.validate()?;
+        // A distinct envelope prevents cross-operation idempotency-key reuse.
+        let request = json_string(&json!({"operation": "work_pr_link", "update": update}))?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let mut item = scoped_work(&tx, &who, &update.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        let old_link: Option<String> = tx
+            .query_row(
+                "SELECT snapshot FROM hub_work_pr_links WHERE work=?1",
+                [&item.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some((previous, committed_snapshot, event_seq)) = tx
+            .query_row(
+                "SELECT o.request,v.snapshot,o.event_seq FROM hub_work_checkpoint_ops o
+             JOIN hub_work_versions v ON v.work=o.work AND v.event_seq=o.event_seq
+             WHERE o.work=?1 AND o.operation_id=?2",
+                params![item.id, update.operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if previous != request {
+                return Err(HubError::Invalid(
+                    "operation_id was already used for another request".into(),
+                ));
+            }
+            // An exact retry belongs to the committing lead, even after a takeover.
+            let committed: WorkItem = json_value(&committed_snapshot)?;
+            let repository_id = update.authorize(&who, &committed)?;
+            let link = old_link
+                .as_deref()
+                .map(json_value::<WorkPrLink>)
+                .transpose()?;
+            let view = work_links::view(&item, repository_id, link, &WorkPrLinkQuery::default());
+            tx.commit()?;
+            return Ok(WorkPrLinkResult {
+                view,
+                receipt: CheckpointReceipt {
+                    work_id: item.id,
+                    operation_id: update.operation_id.clone(),
+                    generation: committed.generation,
+                    event_seq,
+                    replayed: true,
+                },
+            });
+        }
+        let repository_id = update.authorize(&who, &item)?;
+        if item.updated_seq != update.expected_updated_seq {
+            return Err(HubError::Invalid(
+                "PR link receipt expired or Work changed".into(),
+            ));
+        }
+        let previous_link = old_link
+            .as_deref()
+            .map(json_value::<WorkPrLink>)
+            .transpose()?;
+        if previous_link.as_ref().map(|link| &link.target) == update.link.as_ref() {
+            return Err(HubError::Invalid("PR relationship is unchanged".into()));
+        }
+        let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
+        item.updated_at = now;
+        let event = work_links::mutation_event(&item, &who, update, now)?;
+        let seq = append(&tx, &event)?;
+        item.updated_seq = seq;
+        let snapshot = save_work_version(&tx, &item, seq)?;
+        let link = work_links::asserted_link(&who, update, seq, now);
+        let new_link = link.as_ref().map(json_string).transpose()?;
+        if let Some(snapshot) = &new_link {
+            tx.execute(
+                "INSERT INTO hub_work_pr_links (work,snapshot) VALUES (?1,?2)
+                        ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",
+                params![item.id, snapshot],
+            )?;
+        } else {
+            tx.execute("DELETE FROM hub_work_pr_links WHERE work=?1", [&item.id])?;
+        }
+        tx.execute(
+            "INSERT INTO hub_work_checkpoint_ops (work,operation_id,request,event_seq)
+                    VALUES (?1,?2,?3,?4)",
+            params![item.id, update.operation_id, request, seq],
+        )?;
+        let old_bytes = old_link
+            .as_ref()
+            .map(|s| work_payload_row_bytes(s.len()))
+            .transpose()?
+            .unwrap_or(0);
+        let new_bytes = new_link
+            .as_ref()
+            .map(|s| work_payload_row_bytes(s.len()))
+            .transpose()?
+            .unwrap_or(0);
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
+            .and_then(|v| v.checked_add(new_bytes))
+            .and_then(|v| v.checked_sub(old_bytes))
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        let view = work_links::view(&item, repository_id, link, &WorkPrLinkQuery::default());
+        tx.commit()?;
+        Ok(WorkPrLinkResult {
+            view,
+            receipt: CheckpointReceipt {
+                work_id: item.id,
+                operation_id: update.operation_id.clone(),
+                generation: update.generation,
+                event_seq: seq,
+                replayed: false,
+            },
+        })
     }
 
     fn work_search(
@@ -10491,7 +10732,7 @@ impl Store for SqliteStore {
                  JOIN hub_work_items w ON w.id = e.subject
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at < ?5
-                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
                    AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                    AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                 params![
@@ -10509,7 +10750,7 @@ impl Store for SqliteStore {
                      JOIN hub_work_items w ON w.id = e.subject
                      WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                        AND w.repository_id IS ?4 AND e.at < ?5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)
                  )",
@@ -11221,6 +11462,7 @@ impl Store for SqliteStore {
                     id: request.requester.owner.clone(),
                     identity: who.owner.identity.clone(),
                     login: request.requester.login.clone(),
+                    name: None,
                     disabled: false,
                 },
             };

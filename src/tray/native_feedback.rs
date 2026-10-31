@@ -109,6 +109,17 @@ impl NativeFeedback {
         self.render(title, body, busy);
     }
 
+    /// Show a new signal without making this app's window key over the user's current work.
+    pub(super) fn show_passive(&mut self, title: &str, body: &str) {
+        self.dismissed = false;
+        self.render(title, body, false);
+        if !self.shown {
+            self.panel.center();
+        }
+        self.shown = true;
+        self.panel.orderFrontRegardless();
+    }
+
     fn render(&self, title: &str, body: &str, busy: bool) {
         self.heading.setStringValue(&NSString::from_str(title));
         self.heading

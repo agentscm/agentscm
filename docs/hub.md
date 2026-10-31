@@ -235,6 +235,16 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   the forge. Answers are never shared between people, a forge that could not answer is never kept,
   at most 1,024 answers are held, and signing out forgets that person's. A call past those 90
   seconds makes one forge request per repository, so the page asks every two minutes.
+- `GET /v1/hub/device/repositories` (computer credential only) makes the same allow-list and
+  fresh forge-role checks on every call for the macOS work panel; it does not use the web list's
+  90-second role cache. It returns the same bounded repository
+  summaries plus each repository's current Work title, lead agent, reported state, claim status
+  and next action, plus bounded live session or intent agent/task labels. Unreadable repositories
+  are omitted; failed access checks are counted in `unchecked` without naming the repository.
+  At most 20 Work rows and 40 live rows are returned per repository; `work_complete` or
+  `live_complete` is false when that list was cut short. `attention_revision` is an opaque marker
+  for changes to actionable items and is null without attention. This route does not return
+  conversation bodies, source paths or agent tokens.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 
@@ -337,7 +347,11 @@ status shown; clients show `message` as is.
   device starts). A session secret is returned once, at `exchange` or `signed_in`.
 - Human session (`Authorization: Bearer <session>`; an agent token is refused
   here and a session is refused on `whoami`): `GET /v1/hub/session`,
-  `DELETE /v1/hub/session` (204; ends this session),
+  `DELETE /v1/hub/session` (204; ends this session). The `user` object has `id`,
+  `provider`, `host`, `user_id`, `login` and `name`: the forge profile name, or `null` when the
+  profile has none. Each sign-in trims it, drops control characters, keeps at most 100
+  characters and replaces the stored copy (named migration `user_display_name`); it is for
+  display only and never decides access. `GET /v1/hub/users` returns it too.
   `POST /v1/hub/tokens` (`name`, `repository`, `ttl_seconds`; 201 with the
   token secret, shown only here; 403 `forbidden` if the forge says no; 401 if
   the session's forge token no longer works), `GET /v1/hub/tokens`,
@@ -372,9 +386,11 @@ on no others:
   a caller their own entries; see [shared conversations](#shared-conversation-reads))
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
+- `GET /v1/hub/repos/{repo}/pr-context?number=…` ([retained PR context](advanced/pr-context.md), no provider refresh)
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
-  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`,
+  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`, `agentscm_pr_context`,
+  `agentscm_work_pr_link`, `agentscm_work_pr_link_set`,
   `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
   `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
 

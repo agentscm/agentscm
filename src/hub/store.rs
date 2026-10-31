@@ -44,6 +44,7 @@ use super::work::{
     WorkItem, WorkOverview, WorkOverviewQuery, WorkRepositoryScope, WorkScopeCheck, WorkSearchPage,
     WorkStart, WorkStartResult,
 };
+use super::work_links::{WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView};
 use super::work_preflight::WorkPreflightResult;
 use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
@@ -53,6 +54,7 @@ const WEB_READ_TOKEN_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.web-read-token.v1\0";
 const DEVICE_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.device.v1\0";
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LOGIN_BYTES: usize = 255;
+const MAX_DISPLAY_NAME_CHARS: usize = 100;
 const MAX_REPOSITORY_BYTES: usize = 255;
 const MAX_AGENT_NAME_BYTES: usize = 64;
 const MAX_EVENTS_PER_READ: usize = 1000;
@@ -74,6 +76,9 @@ pub struct User {
     pub id: String,
     pub identity: ForgeIdentity,
     pub login: String,
+    /// The forge profile name, cached and refreshed at each sign-in. Read by the user lookups,
+    /// `list_users` and `browser_session`; `None` in the owner joins of other records.
+    pub name: Option<String>,
     pub disabled: bool,
 }
 
@@ -196,6 +201,9 @@ pub trait Store: Send + Sync {
     fn ping(&self) -> Result<()>;
     /// Insert, or update the cached login of an existing identity. Never changes the id.
     fn upsert_user(&self, identity: &ForgeIdentity, login: &str) -> Result<User>;
+    /// Replace the cached profile name (`None` clears it). A display value, not an audited
+    /// fact, so no event records it. Unknown user is `Invalid`.
+    fn set_user_name(&self, user: &str, name: Option<&str>) -> Result<()>;
     fn set_user_disabled(&self, user: &str, disabled: bool) -> Result<()>;
     /// The owner must exist and be enabled, and `expires_at` must be in the future.
     fn insert_agent_token(&self, token: &NewAgentToken) -> Result<String>;
@@ -322,6 +330,8 @@ pub trait Store: Send + Sync {
     ) -> Result<Answered>;
     /// Live intents in `repository`, ordered by id, at most `limit`.
     fn live_intents(&self, repository: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
+    /// Live intents in the principal's repository and forge scope, ordered by id.
+    fn live_intents_scoped(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// `intent_notice` and `pr_notice` events addressed to the token's intents with seq > `after`, oldest first, at most `limit`.
     fn notices_after(&self, token: &str, after: i64, limit: usize) -> Result<Vec<HubEvent>>;
     /// Sessions of the active tokens in `who`'s scope (same repository name and forge id, same
@@ -351,6 +361,8 @@ pub trait Store: Send + Sync {
     fn get_setting(&self, key: &str) -> Result<Option<String>>;
     /// Upserts a hub-wide setting; no event, `updated_by` records the actor.
     fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()>;
+    /// Insert a hub-wide setting once across replicas and return its retained value.
+    fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String>;
     /// Unix seconds; no event.
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()>;
     /// Keyed by (host, repository_id): a rename updates the row. A repository already held by
@@ -402,6 +414,8 @@ pub trait Store: Send + Sync {
         data: &str,
         event: &str,
     ) -> Result<bool>;
+    /// Read one current observation by its exact key, independent of list pagination.
+    fn observation(&self, repo: &str, kind: &str, key: &str) -> Result<Option<Observation>>;
     /// Present (not forgotten) observations of `kind`, ordered by key, at most 1000.
     fn observations(&self, repo: &str, kind: &str) -> Result<Vec<Observation>>;
     /// Drops forgotten markers last read before `before` (unix ms); no event. Returns how many.
@@ -625,6 +639,22 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// Read the single explicit PR relationship; comparison statuses confer no approval.
+    fn work_pr_link_get(
+        &self,
+        token: &str,
+        id: &str,
+        query: &WorkPrLinkQuery,
+        now: i64,
+    ) -> Result<Option<WorkPrLinkView>>;
+    /// Set or remove a caller-asserted relationship, fenced by current Work ownership.
+    fn work_pr_link_set(
+        &self,
+        token: &str,
+        update: &WorkPrLinkUpdate,
+        now: i64,
+    ) -> Result<WorkPrLinkResult>;
+
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
     /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, lead agent,
@@ -1369,6 +1399,24 @@ pub fn validate_login(login: &str) -> Result<()> {
     Ok(())
 }
 
+/// A forge profile name for display: trimmed, control characters removed, at most
+/// `MAX_DISPLAY_NAME_CHARS` characters. `None` when nothing is left.
+pub fn clean_display_name(raw: &str) -> Option<String> {
+    let name: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let name: String = name.trim().chars().take(MAX_DISPLAY_NAME_CHARS).collect();
+    let name = name.trim_end();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+pub(super) fn validate_display_name(name: Option<&str>) -> Result<()> {
+    match name {
+        Some(name) if clean_display_name(name).as_deref() != Some(name) => {
+            Err(invalid("name must be cleaned with clean_display_name"))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn validate_agent_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > MAX_AGENT_NAME_BYTES || !name.bytes().all(name_byte) {
         return Err(invalid("agent name must be 1-64 bytes of [A-Za-z0-9._-]"));
@@ -1707,6 +1755,26 @@ mod tests {
         let registry = [named("aaa", &[])];
         let newer = plan_named(&registry, &["later"]).unwrap_err().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");
+    }
+
+    #[test]
+    fn display_names_are_trimmed_stripped_and_capped() {
+        assert_eq!(
+            clean_display_name("  Jonny Hawley "),
+            Some("Jonny Hawley".into())
+        );
+        assert_eq!(clean_display_name("A\u{7}\nB\u{1b}"), Some("AB".into()));
+        assert_eq!(clean_display_name(" \t\n "), None);
+        assert_eq!(clean_display_name(""), None);
+        assert_eq!(clean_display_name(&"é".repeat(150)), Some("é".repeat(100)));
+        // The cap never leaves trailing whitespace behind.
+        assert_eq!(
+            clean_display_name(&format!("{} tail", "é".repeat(99))),
+            Some("é".repeat(99))
+        );
+        assert!(validate_display_name(Some(" padded")).is_err());
+        assert!(validate_display_name(Some("Jonny")).is_ok());
+        assert!(validate_display_name(None).is_ok());
     }
 
     #[test]

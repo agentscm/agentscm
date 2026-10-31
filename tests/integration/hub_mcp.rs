@@ -553,6 +553,9 @@ async fn protocol_basics() {
             "agentscm_work_preflight",
             "agentscm_coordination_inbox",
             "agentscm_change_record",
+            "agentscm_pr_context",
+            "agentscm_work_pr_link",
+            "agentscm_work_pr_link_set",
             "agentscm_shared_conversation",
             "agentscm_work_insight",
             "agentscm_work_insights",
@@ -716,6 +719,7 @@ async fn protocol_basics() {
     );
     for name in [
         "agentscm_workflow_status",
+        "agentscm_pr_context",
         "agentscm_work_overview",
         "agentscm_work_briefing",
         "agentscm_change_record",
@@ -2240,7 +2244,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (33, 36, 41));
+    assert_eq!((before.len(), listed.len(), all.len()), (36, 39, 44));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
@@ -2277,4 +2281,98 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         }
     }
     assert!(checked > 20, "{checked}");
+}
+
+#[tokio::test]
+async fn explicit_work_pr_links_share_http_mcp_scope_and_read_only_fences() {
+    let hub = Hub::start().await;
+    let user = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 42,
+            },
+            "synthetic-owner",
+        )
+        .unwrap();
+    let (id, secret, _) =
+        mint_bound_agent_token(&*hub.store, &user.id, "link-lead", REPO, 100, 3600, false).unwrap();
+    let (_, reader, _) =
+        mint_bound_agent_token(&*hub.store, &user.id, "link-reader", REPO, 100, 3600, true)
+            .unwrap();
+    let start = hub.store.work_start(&id,&serde_json::from_value(json!({"request_key":"link-scope","title":"Explicit task","session":"test-session"})).unwrap(),unix_now()).unwrap();
+    let request = json!({"work_id":start.item.id,"operation_id":"link-v1","generation":start.item.generation,"session":"test-session","expected_updated_seq":start.item.updated_seq,"link":{"repository_id":100,"number":9,"head_sha":"a".repeat(40)}});
+    let call = |name: &str, args: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}});
+    let set = hub
+        .rpc(
+            secret.expose(),
+            &call("agentscm_work_pr_link_set", request.clone()),
+        )
+        .await
+        .json();
+    assert_ne!(set["result"]["isError"], true, "{set}");
+    let seq = set["result"]["structuredContent"]["view"]["updated_seq"]
+        .as_i64()
+        .unwrap();
+    let args = json!({"work_id":start.item.id,"expected_updated_seq":seq});
+    let mcp = hub
+        .rpc(reader.expose(), &call("agentscm_work_pr_link", args))
+        .await
+        .json();
+    let response = hub
+        .client
+        .get(format!(
+            "{}/v1/hub/standup/work/{}/pr-link?expected_updated_seq={seq}",
+            hub.base, start.item.id
+        ))
+        .bearer_auth(reader.expose())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let http: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(mcp["result"]["structuredContent"], http);
+    assert_eq!(http["link"]["target"]["number"], 9);
+    assert_eq!(http["snapshot_status"], "matches_work");
+    assert_eq!(
+        hub.rpc(
+            reader.expose(),
+            &call("agentscm_work_pr_link_set", request.clone())
+        )
+        .await
+        .status,
+        403
+    );
+    assert_eq!(
+        hub.client
+            .post(format!("{}/v1/hub/standup/pr-link", hub.base))
+            .bearer_auth(reader.expose())
+            .header("content-type", "application/json")
+            .body(request.to_string())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let (_, foreign, _) = mint_bound_agent_token(
+        &*hub.store,
+        &user.id,
+        "other-identity",
+        REPO,
+        999,
+        3600,
+        false,
+    )
+    .unwrap();
+    let foreign = hub
+        .rpc(
+            foreign.expose(),
+            &call("agentscm_work_pr_link", json!({"work_id":start.item.id})),
+        )
+        .await
+        .json();
+    assert_eq!(foreign["result"]["isError"], true);
 }

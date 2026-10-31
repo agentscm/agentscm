@@ -230,7 +230,7 @@ function Walkthrough() {
       <div className="settings-row">
         <div>
           <div className="settings-label">Welcome tour</div>
-          <div className="muted small">Shows the top bar and what each section is for. Turn it on to see it again the next time you open the hub.</div>
+          <div className="muted small">Walks the top bar and what each section is for. The switch brings back the short tips on the Dashboard the next time you open it.</div>
         </div>
         <div className="d-flex align-items-center gap-2">
           <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => tour.start('welcome')}>Run now</button>

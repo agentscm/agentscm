@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use super::forge_http::{Forge, check_base_url};
 use super::http::{ApiError, JsonBody, Reader, bearer, blocking};
 use super::store::{
-    ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, User, mint_bound_agent_token, unix_now,
-    validate_agent_name, validate_login, validate_repository,
+    ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, User, clean_display_name, mint_bound_agent_token,
+    unix_now, validate_agent_name, validate_login, validate_repository,
 };
 use super::{HubError, HubState, Result};
 use crate::team::auth::{generate_secret, token_digest};
@@ -692,7 +692,7 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 
 fn user_json(user: &User) -> Value {
     json!({"id": user.id, "provider": user.identity.provider, "host": user.identity.host,
-        "user_id": user.identity.user_id, "login": user.login})
+        "user_id": user.identity.user_id, "login": user.login, "name": user.name})
 }
 
 impl Signed {
@@ -1199,6 +1199,8 @@ async fn sign_in(
         host: provider.host.clone(),
         user_id: id,
     };
+    // The profile name is display only: cleaned here, and never used to decide anything.
+    let name = body["name"].as_str().and_then(clean_display_name);
     let admin = state.login.is_admin(provider.name, id, &login);
     // No user, event or session is stored for anyone refused; administrators see a bounded,
     // deduplicated refusal row.
@@ -1206,6 +1208,7 @@ async fn sign_in(
         id: String::new(),
         identity: identity.clone(),
         login: login.clone(),
+        name: None,
         disabled: false,
     };
     let refuse =
@@ -1235,8 +1238,12 @@ async fn sign_in(
     }
     let store = state.store.clone();
     let user = blocking(state, move || {
-        let user = store.upsert_user(&identity, &login)?;
+        let mut user = store.upsert_user(&identity, &login)?;
         if !user.disabled {
+            if user.name != name {
+                store.set_user_name(&user.id, name.as_deref())?;
+                user.name = name;
+            }
             store.record_sign_in(
                 &user.id,
                 if method == "workspace" {
@@ -1759,6 +1766,7 @@ mod tests {
                     user_id: 1,
                 },
                 login: "x".into(),
+                name: None,
                 disabled: false,
             },
             admin: false,

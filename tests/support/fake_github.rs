@@ -383,6 +383,9 @@ pub struct FakeState {
     pub installation_permissions: Option<Value>,
     /// `events` of `GET /app/installations/{id}`. Default: `merge_group` among the others.
     pub installation_events: Option<Vec<String>>,
+    /// Ordinary provider metadata used only by context fixtures.
+    pub context_reviews: HashMap<(i64, u64), Vec<Value>>,
+    pub context_checks: HashMap<(i64, String), Vec<Value>>,
 }
 
 impl FakeState {
@@ -707,7 +710,7 @@ fn pull_json(ctx: &Ctx, repo: &Repo, p: &Pull) -> Value {
         "number": p.number, "node_id": p.node_id, "title": p.title, "body": p.body, "state": p.state,
         "merged": p.merged, "merge_commit_sha": p.merge_commit_sha, "draft": p.draft,
         "head": {"ref": p.head_ref, "sha": p.head_sha, "repo": head_repo},
-        "base": {"ref": p.base_ref, "repo": repo_ref(p.base_repo_id.unwrap_or(repo.id))},
+        "base": {"ref": p.base_ref, "sha": repo.branches.iter().find(|b| b.name == p.base_ref).map(|b| &b.sha), "repo": repo_ref(p.base_repo_id.unwrap_or(repo.id))},
         "user": {"login": p.author_login, "id": p.author_id},
         "updated_at": p.updated_at,
         "html_url": format!("{}/{}/pull/{}", ctx.base, repo.full_name, p.number),
@@ -1421,6 +1424,25 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         ),
                         None => not_found(),
                     }
+                }
+                (&Method::GET, ["pulls", number, "reviews"]) => {
+                    let rows = number
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|n| state.context_reviews.get(&(id, n)))
+                        .cloned()
+                        .unwrap_or_default();
+                    let (page, link) = paginate(ctx, uri, &query, rows);
+                    reply(200, &link, Some(Value::Array(page)))
+                }
+                (&Method::GET, ["commits", sha, "check-runs"]) => {
+                    let rows = state
+                        .context_checks
+                        .get(&(id, sha.to_string()))
+                        .cloned()
+                        .unwrap_or_default();
+                    let (page, link) = paginate(ctx, uri, &query, rows);
+                    reply(200, &link, Some(json!({"check_runs":page})))
                 }
                 (&Method::GET, ["commits", sha, "statuses"]) => {
                     let repo = &state.repos[&id];

@@ -2,6 +2,7 @@
 //! unfinished work, what needs a person, live agents and the last activity. Counts only: titles,
 //! paths and people stay behind each repository's own read token. The rules mirror the status
 //! page's (`ui/src/needs.ts` and `ui/src/derive.ts`), so a row and its Dashboard count alike.
+//! The separate device catalog adds bounded role-checked Work and live-agent details.
 use std::collections::BTreeSet;
 
 use serde::Serialize;
@@ -33,6 +34,9 @@ pub struct RepositorySummary {
     pub last_activity_at: Option<i64>,
     /// False when a list was cut short, so the counts are lower bounds.
     pub complete: bool,
+    /// Only used to form the computer catalog's change marker; never serialized.
+    #[serde(skip)]
+    pub(crate) contested_markers: Vec<String>,
 }
 
 /// What the Hub read for one repository.
@@ -54,7 +58,8 @@ pub(super) fn summarize(
     let current = &facts.overview.current;
     let (unfinished, decisions) =
         work_counts(current.iter().map(|item| (&item.state, &item.claim_status)));
-    let needs_you = decisions + facts.overview.overlaps.len() + contested_files(&facts.intents);
+    let (contested_count, contested_markers) = contested_files_and_markers(&facts.intents);
+    let needs_you = decisions + facts.overview.overlaps.len() + contested_count;
     let last_activity_at = current
         .iter()
         .map(|item| item.updated_at)
@@ -73,6 +78,7 @@ pub(super) fn summarize(
         complete: facts.overview.current_complete
             && facts.overview.overlaps_complete
             && facts.live_complete,
+        contested_markers,
     }
 }
 
@@ -99,7 +105,7 @@ fn work_counts<'a>(
 }
 
 /// Files held by two different agents now, each counted once by its more specific key.
-fn contested_files(intents: &[Intent]) -> usize {
+fn contested_files_and_markers(intents: &[Intent]) -> (usize, Vec<String>) {
     let mut found = BTreeSet::new();
     for (i, a) in intents.iter().enumerate() {
         for b in &intents[i + 1..] {
@@ -109,13 +115,15 @@ fn contested_files(intents: &[Intent]) -> usize {
             for x in a.paths.iter().map(|path| key_of(path)) {
                 for y in b.paths.iter().map(|path| key_of(path)) {
                     if overlaps(x, y) {
-                        found.insert(if y.len() > x.len() { y } else { x });
+                        let key = if y.len() > x.len() { y } else { x };
+                        found.insert(key);
                     }
                 }
             }
         }
     }
-    found.len()
+    let count = found.len();
+    (count, found.into_iter().map(str::to_owned).collect())
 }
 
 /// One per live session, plus one per live intent no session holds, as the status page lists them.
@@ -158,6 +166,7 @@ mod tests {
                     user_id: 1,
                 },
                 login: "example-user".into(),
+                name: None,
                 disabled: false,
             },
             via: via.iter().map(|v| (*v).into()).collect(),
@@ -219,8 +228,31 @@ mod tests {
         );
         // The same token over MCP and a hook is one agent, as the hub's own refusals judge it.
         let same = intent("int_c", "tok_a", &["mcp"], &["src/lib.rs"]);
-        assert_eq!(contested_files(&[a.clone(), b]), 2);
-        assert_eq!(contested_files(&[a, same]), 0);
+        let unrelated = intent("int_d", "tok_d", &["hook:codex"], &["other.rs"]);
+        let result = contested_files_and_markers(&[a.clone(), b, unrelated]);
+        assert_eq!(result.0, 2);
+        assert!(
+            result
+                .1
+                .iter()
+                .all(|marker| marker.starts_with("src/") || marker.starts_with("docs/"))
+        );
+        assert_eq!(result.1.len(), 2);
+        assert_eq!(contested_files_and_markers(&[a, same]), (0, Vec::new()));
+    }
+
+    #[test]
+    fn contested_marker_changes_when_the_same_agents_move_their_overlap() {
+        let pair = |path| {
+            contested_files_and_markers(&[
+                intent("int_a", "tok_a", &["hook:claude"], &[path]),
+                intent("int_b", "tok_b", &["hook:codex"], &[path]),
+            ])
+        };
+        let before = pair("src/old.rs");
+        let after = pair("src/new.rs");
+        assert_eq!((before.0, after.0), (1, 1));
+        assert_ne!(before.1, after.1);
     }
 
     #[test]

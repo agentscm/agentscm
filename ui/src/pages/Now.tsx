@@ -1,3 +1,4 @@
+import { PrContextPanel } from '../PrContextPanel.tsx'
 import { useMemo, useState } from 'react'
 import { type Contested, type Derived, type LiveAgent } from '../derive.ts'
 import { CONTESTED_FILE } from '../copy.ts'
@@ -136,7 +137,7 @@ const clashes = (a: Area) => a.contested + a.overlaps > 0
 const clashText = (a: Area) => [a.contested && plural(a.contested, 'contested file'), a.overlaps && plural(a.overlaps, 'overlap')].filter(Boolean).join(' · ')
 
 /** Where: the repository as a map of areas, then contested files and overlaps in full. */
-export function NowPage({ data, d, overview }: { data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
+export function NowPage({ data, d, overview, token }: { token?: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
   const work = data.work
   const ov = overview.kind === 'ready' ? overview.value : null
   return (
@@ -144,6 +145,7 @@ export function NowPage({ data, d, overview }: { data: HubData; d: Derived | nul
       {data.failing && d && (
         <Notice title="The hub is not answering">Showing the last data that loaded. This page keeps retrying.</Notice>
       )}
+      {token && data.whoami && work && <PrContextPanel repo={data.whoami.token.repository} token={token} pulls={work.pull_requests} />}
       <AreaMap d={d} ov={ov} />
       {work?.intents_truncated && <Notice title="Some agents are not shown">The hub returned its maximum number of intents. More agents may be active.</Notice>}
       <div className="grid-2">

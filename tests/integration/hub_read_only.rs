@@ -52,6 +52,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/whoami".into(), "".into(), Allowed);
     row(&get, format!("{REPO}/intents"), "".into(), Allowed);
     row(&get, format!("{REPO}/work"), "".into(), Allowed);
+    row(&get, format!("{REPO}/pr-context?number=1"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity"), "".into(), Allowed);
     row(&get, format!("{REPO}/change-records/wrk_missing"), "".into(), Status(404));
     row(&get, "/v1/hub/skill-workflows".into(), "".into(), Allowed);
@@ -71,6 +72,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
         row(&post, format!("/v1/hub/standup/{path}"), "{}".into(), AgentOnly);
     }
     row(&post, "/v1/hub/standup/usage".into(), "{}".into(), AgentOnly);
+    row(&post, "/v1/hub/standup/pr-link".into(), "{}".into(), AgentOnly);
+    row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/pr-link".into(), "".into(), Status(404));
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_insights","arguments":{}}}"#.into(), Allowed);
     // Agent-token routes.
@@ -105,6 +108,9 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_change_record","arguments":{"work_id":"wrk_missing"}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_shared_conversation","arguments":{"work_id":"wrk_missing"}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_pr_context","arguments":{"number":1}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_pr_link","arguments":{"work_id":"wrk_00000000000000000000000000000001"}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_pr_link_set","arguments":{}}}"#.into(), AgentOnly);
     // Coordination and checkpoint tools mutate state.
     for tool in [
         "agentscm_start",
@@ -138,6 +144,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&delete, "/v1/hub/session".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/session/read-token".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/session/repositories".into(), "".into(), HumanOnly);
+    row(&get, "/v1/hub/device/repositories".into(), "".into(), HumanOnly);
     row(&get, "/v1/hub/users".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/users/usr_x/disable".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/users/usr_x/enable".into(), "".into(), HumanOnly);

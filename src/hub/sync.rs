@@ -263,6 +263,8 @@ pub struct Sync {
     /// Per repository id, where the external run pass left off: the last pull request number
     /// checked for a merge and the last merged publication id read.
     external_cursors: Mutex<HashMap<String, (i64, String)>>,
+    /// Rotating bounded provider evidence reads; no request handler performs forge I/O.
+    provider_cursors: Mutex<HashMap<String, i64>>,
     /// Per repository id, the unix second the skills lock file was last read.
     skill_reads: Mutex<HashMap<String, i64>>,
     /// Files already noticed per (intent, repository, pull request number).
@@ -440,10 +442,20 @@ impl Sync {
             #[cfg(unix)]
             forge_cursors: Mutex::default(),
             external_cursors: Mutex::default(),
+            provider_cursors: Mutex::default(),
             skill_reads: Mutex::default(),
             noticed: Mutex::default(),
             pulls: Mutex::default(),
         }
+    }
+
+    /// Last successful sync's PR gaps; absent after restart or before a completed sync.
+    /// This is not a current provider completeness guarantee.
+    pub(super) fn last_pr_sync_partial(&self, repo: &str) -> Option<bool> {
+        lock(&self.truncated).get(repo).map(|gaps| {
+            gaps["pull_requests"].as_u64().unwrap_or(0) > 0
+                || gaps["rereads_deferred"].as_u64().unwrap_or(0) > 0
+        })
     }
 
     fn configured(&self) -> std::result::Result<(&SyncConfig, &Api), ApiError> {
@@ -860,6 +872,9 @@ async fn catchup_connection_status(
     let id = conn.id.clone();
     for repo in db(state, move |store| store.repositories(&id)).await? {
         let _guard = state.sync.lock_repo(&repo.id).await;
+        if coverage == super::catchup::CatchupCoverageState::Unavailable {
+            provider_health(state, conn, &repo, "unavailable", None).await?;
+        }
         super::catchup_sync::source_status(
             state,
             conn,
@@ -1004,6 +1019,7 @@ async fn sync_repo(
     }
     .await;
     if result.is_err() {
+        provider_health(state, conn, repo, "unavailable", None).await?;
         super::catchup_sync::unavailable(state, conn, repo).await?;
     }
     result
@@ -1119,10 +1135,212 @@ async fn read_repo(
     #[cfg(unix)]
     super::forge_check::reconcile_repo(state, conn, repo, token, None).await?;
     super::external_runs::reconcile_repo(state, conn, repo, token).await?;
+    reconcile_provider_context(state, conn, repo, token).await?;
     if sync.skill_read_due(&repo.id) {
         super::skills::sync_adoption(state, api, repo, token).await;
     }
     Ok(report)
+}
+
+/// Provider health is retained separately so a failed repository/discovery read hides
+/// earlier evidence without erasing its provenance. Callers hold the repository sync
+/// lock; both discovery failure and repository reconciliation use that same lock.
+/// This never acknowledges Catch up.
+async fn provider_health(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    availability: &str,
+    permissions: Option<&Value>,
+) -> Result<()> {
+    if conn.provider != "github" || conn.kind != "app" {
+        return Ok(());
+    }
+    let stamp = observation_stamp(state, &repo.id)
+        .await
+        .map_err(gh_to_hub)?;
+    let id = repo.id.clone();
+    let availability = availability.to_owned();
+    let permissions = permissions.cloned();
+    db(state, move |store| {
+        let previous = store.observation(&id, "provider_context", "_health")?;
+        let previous_data = previous
+            .as_ref()
+            .and_then(|row| serde_json::from_str::<Value>(&row.data).ok());
+        // Preserve the failure floor across recovery and process restarts. Legacy
+        // unavailable rows already identify a known failure at their stored timestamp.
+        // Malformed floors fail closed by invalidating through that observation too.
+        let old_floor = previous_data
+            .as_ref()
+            .and_then(|value| value["invalidated_through"].as_i64())
+            .filter(|floor| *floor >= 0)
+            .unwrap_or_else(|| {
+                let legacy_or_malformed = previous_data.as_ref().is_none_or(|value| {
+                    value["availability"] != "available"
+                        || value.get("invalidated_through").is_some()
+                });
+                previous
+                    .as_ref()
+                    .filter(|_| legacy_or_malformed)
+                    .map_or(0, |row| row.observed_at)
+            });
+        let previous_unavailable = previous_data
+            .as_ref()
+            .is_some_and(|value| value["availability"] == "unavailable");
+        // While unavailable, the reader hides every row. Its observation timestamp
+        // still advances without changing serialized contents or appending an event.
+        // On recovery, include that latest persisted failure timestamp so a peer
+        // collected between consecutive failures cannot reappear as current evidence.
+        let invalidated_through = if availability == "available" {
+            if previous_unavailable {
+                old_floor.max(previous.as_ref().map_or(0, |row| row.observed_at))
+            } else {
+                old_floor
+            }
+        } else if previous_unavailable {
+            old_floor
+        } else {
+            old_floor.max(stamp)
+        };
+        // Unavailable health never makes prior confirmed grant contents fresh.
+        let permissions = permissions.or_else(|| {
+            previous_data
+                .as_ref()
+                .and_then(|value| value.get("permissions").cloned())
+                .filter(|value| value["availability"] == "observed")
+        });
+        let data = json!({"availability": availability, "permissions": permissions,
+            "invalidated_through": invalidated_through})
+        .to_string();
+        store.observe(&id, "provider_context", "_health", &data, stamp)?;
+        Ok(())
+    })
+    .await
+}
+
+/// Reuses the repository reconciliation lock and retained PR identities, including after
+/// a PR-list 304. Two PRs per round rotate fairly. Identity rereads complete their
+/// observation/notices before the separate five-second read-only collection deadline.
+/// The context request path never spends provider credentials or fetches data.
+async fn reconcile_provider_context(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+) -> Gh<()> {
+    if conn.provider != "github" || conn.kind != "app" {
+        return Ok(());
+    }
+    let pulls = stored_pulls(state, repo).await?;
+    let after = lock(&state.sync.provider_cursors)
+        .get(&repo.id)
+        .copied()
+        .unwrap_or(0);
+    let open: Vec<_> = pulls
+        .iter()
+        .filter(|(_, pr)| pr["state"] == "open")
+        .collect();
+    let selected: Vec<_> = open
+        .iter()
+        .filter(|(number, _)| **number > after)
+        .chain(open.iter().filter(|(number, _)| **number <= after))
+        .take(2)
+        .collect();
+    let mut permissions = None;
+    let mut grants_confirmed = false;
+    let mut health_failed = false;
+    for (number, pr) in selected {
+        // This path stores observations, invalidates caches and sends notices. Await
+        // all of it: dropping it at the collection deadline can lose those side effects.
+        // Provider HTTP calls already have their own client deadline.
+        let reread = reread_pull(state, conn, repo, token, **number, &pulls).await;
+        let stamp = observation_stamp(state, &repo.id).await?;
+        let (id, key) = (repo.id.clone(), number.to_string());
+        let current = db(state, move |store| {
+            store.observation(&id, "pull_request", &key)
+        })
+        .await?;
+        let Some(current) = current else {
+            lock(&state.sync.provider_cursors).insert(repo.id.clone(), **number);
+            continue;
+        };
+        let current = serde_json::from_str::<Value>(&current.data).ok();
+        let mut snapshot = match reread {
+            Err(error) => super::provider_context::unavailable_snapshot(
+                repo,
+                current.as_ref().unwrap_or(pr),
+                stamp,
+                super::provider_context::error_availability(&error),
+            ),
+            Ok(_) => match current {
+                None => {
+                    super::provider_context::unavailable_snapshot(repo, pr, stamp, "unavailable")
+                }
+                Some(current) => match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    super::provider_context::collect(state, conn, repo, token, &current, stamp),
+                )
+                .await
+                {
+                    Ok(Ok(snapshot)) => snapshot,
+                    result => super::provider_context::unavailable_snapshot(
+                        repo,
+                        &current,
+                        stamp,
+                        if result.is_err() {
+                            "timed_out"
+                        } else {
+                            "unavailable"
+                        },
+                    ),
+                },
+            },
+        };
+        let inspection = snapshot["permissions"]["inspection"].as_str();
+        if inspection == Some("confirmed") {
+            grants_confirmed = true;
+            permissions = snapshot.get("permissions").cloned();
+        }
+        health_failed |= inspection == Some("failed")
+            || ["reviews", "check_runs", "commit_statuses"]
+                .iter()
+                .any(|kind| {
+                    matches!(
+                        snapshot[kind]["availability"].as_str(),
+                        Some("authentication_failed" | "permission_denied" | "rate_limited")
+                    )
+                });
+        // The row's timestamp advances on identical observations. Excluding it from the
+        // value keeps an unchanged poll from manufacturing a new event every time.
+        snapshot
+            .as_object_mut()
+            .expect("provider snapshot")
+            .remove("observed_at");
+        let (id, key, data) = (repo.id.clone(), number.to_string(), snapshot.to_string());
+        db(state, move |store| {
+            store.observe(&id, "provider_context", &key, &data, stamp)?;
+            Ok(())
+        })
+        .await?;
+        lock(&state.sync.provider_cursors).insert(repo.id.clone(), **number);
+    }
+    // A generic failed PR read is already replaced above. Without a confirmed grant
+    // observation or known authorization failure, leave health and its timestamp intact.
+    if grants_confirmed || health_failed {
+        provider_health(
+            state,
+            conn,
+            repo,
+            if health_failed {
+                "unavailable"
+            } else {
+                "available"
+            },
+            permissions.as_ref(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Observes a pull request from its API JSON; true when the observation changed.
@@ -1164,7 +1382,9 @@ async fn observe_pull(
     };
     let data = json!({"number": number, "node_id": item["node_id"], "title": item["title"],
         "state": item["state"], "draft": item["draft"].as_bool().unwrap_or(false),
+        "repository_id": repo.repository_id,
         "head_ref": item["head"]["ref"], "head_sha": head_sha, "base_ref": item["base"]["ref"],
+        "base_sha": item["base"]["sha"],
         "author": {"login": item["user"]["login"], "id": item["user"]["id"]},
         "html_url": item["html_url"],
         "files": files, "files_truncated": truncated});
@@ -1212,14 +1432,25 @@ async fn reread_pull(
     .to_string();
     let (id, key) = (repo.id.clone(), number.to_string());
     let forgotten = db(state, move |store| {
-        store.forget(
+        let forgotten = store.forget(
             &id,
             "pull_request",
             &key,
             started,
             &data,
             "pull_request_closed",
-        )
+        )?;
+        // Evidence follows the owning PR's lifecycle; normal tombstone pruning
+        // removes the retained value after closure instead of accumulating it.
+        store.forget(
+            &id,
+            "provider_context",
+            &key,
+            started,
+            &json!({"number": number, "availability": "closed_or_gone"}).to_string(),
+            "provider_context_removed",
+        )?;
+        Ok(forgotten)
     })
     .await?;
     if forgotten {

@@ -110,6 +110,33 @@ describe('Since you last checked', () => {
     expect(screen.getByText(/connection refused/)).toBeTruthy()
   })
 
+  it('keeps a blocked relationship event neutral while a blocked checkpoint stays red in the Work lane', async () => {
+    const id = `wrk_${'2'.repeat(32)}`
+    const item = {
+      id, repository: 'acme/widgets', owner: 'owner-1', owner_login: 'octocat',
+      source: { kind: 'native', request_key: 'request-1' }, title: 'Blocked fixture Work',
+      state: 'blocked', claim_status: 'active', last_checkin_at: 1_798_000_000, generation: 1,
+      lead_token: 'token-1', lead_agent: 'agent-1', lead_session: 'session-1',
+      participants: [{ owner: 'owner-1', login: 'octocat', token: 'token-1', agent: 'agent-1', session: 'session-1', role: 'lead' }],
+      scope: ['src/**'], branch: null, worktree: null, next_action: null, current: null, blocker: null,
+      depends_on: [], related_work: [], created_at: 1_798_000_000, updated_at: 1_798_000_000, created_seq: 1, updated_seq: 4,
+    }
+    mockCatchup(response(page({
+      event_from: 2, event_after: 2, event_through: 4, next_event_after: 4,
+      work_events: [
+        { seq: 3, at: 1_798_000_000, kind: 'work_pr_link', work_id: id, item },
+        { seq: 4, at: 1_798_000_001, kind: 'work_checkpoint', work_id: id, item },
+      ],
+    })))
+    render(<CatchupPanel token="blocked-relation-token" />)
+    await screen.findByText('Relationship changed')
+    const dots = document.querySelectorAll('.sl-work .sl-dot')
+    expect(dots).toHaveLength(2)
+    // Newest first: the checkpoint is bad, the earlier relationship is neutral.
+    expect(dots[0]!.classList.contains('tone-bad')).toBe(true)
+    expect(dots[1]!.classList.contains('tone-bad')).toBe(false)
+  })
+
   it('renders the exact server-sanitized merge title as text', async () => {
     const sanitizedTitle = 'Family 👨👩👧👦'
     mockCatchup(response(page({

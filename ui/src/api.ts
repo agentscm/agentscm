@@ -138,6 +138,7 @@ export async function fetchWork(repo: string, token: string, signal: AbortSignal
     connected: j['connected'] === true,
     pull_requests: list(j['pull_requests']).map((p) => ({
       number: num(p['number']),
+      head_sha: strOrNull(p['head_sha']),
       title: str(p['title']),
       state: str(p['state']),
       draft: p['draft'] === true,

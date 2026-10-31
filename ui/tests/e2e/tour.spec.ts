@@ -19,6 +19,14 @@ const signIn = async (page: Page, hash = '') => {
   if (hash) await page.evaluate((h) => (window.location.hash = h), hash)
   await expect(page.locator('[data-tour="live"]')).toBeVisible()
 }
+/** The welcome tour no longer opens by itself; ⌘K replays it. */
+const welcome = async (page: Page) => {
+  await page.keyboard.press('ControlOrMeta+k')
+  await page.getByRole('dialog', { name: 'Search the hub' }).locator('input').fill('replay the welcome')
+  await page.keyboard.press('Enter')
+  await expect(dialog(page)).toBeVisible()
+}
+const coach = (page: Page) => page.locator('[data-coach]')
 const reload = async (page: Page) => {
   await page.reload()
   await expect(page.locator('[data-tour="live"]')).toBeVisible()
@@ -35,8 +43,31 @@ const withinViewport = async (page: Page) => {
     .toBe(true)
 }
 
-test('first sign-in shows the welcome tour; Next, Back and the counter work', async ({ page }) => {
+test('first sign-in shows three coach marks in the page, and no modal', async ({ page }) => {
   await signIn(page)
+  await expect(coach(page)).toHaveCount(3)
+  await expect(dialog(page)).toHaveCount(0)
+  // Nothing is blocked: the page behind them still works.
+  await page.locator('.need-chev').first().click()
+  await expect(page.locator('.need-chev').first()).toHaveAttribute('aria-expanded', 'true')
+})
+
+test('a coach mark is dismissed on its own, and Skip tips ends the set; both stay gone after a reload', async ({ page }) => {
+  await signIn(page)
+  await coach(page).first().getByRole('button', { name: 'Got it' }).click()
+  await expect(coach(page)).toHaveCount(2)
+  await reload(page)
+  await expect(coach(page)).toHaveCount(2)
+  await coach(page).first().getByRole('button', { name: 'Skip tips' }).click()
+  await expect(coach(page)).toHaveCount(0)
+  expect(await stored(page)).toMatchObject({ welcomeSeen: true, welcomeOff: true })
+  await reload(page)
+  await expect(coach(page)).toHaveCount(0)
+})
+
+test('the welcome tour: Next, Back and the counter work', async ({ page }) => {
+  await signIn(page)
+  await welcome(page)
   await expect(dialog(page)).toBeVisible()
   await expect(dialog(page)).toHaveAttribute('aria-modal', 'true')
   await expect(count(page)).toHaveText(/^1 \/ \d+$/)
@@ -54,6 +85,7 @@ test('first sign-in shows the welcome tour; Next, Back and the counter work', as
 
 test('every welcome step stays inside the viewport with reachable buttons', async ({ page }) => {
   await signIn(page)
+  await welcome(page)
   const total = Number((await count(page).textContent())!.split('/')[1])
   for (let n = 1; n <= total; n++) {
     await expect(count(page)).toHaveText(`${n} / ${total}`)
@@ -68,7 +100,7 @@ test('every welcome step stays inside the viewport with reachable buttons', asyn
 
 test('Esc closes the tour and focus returns to the page', async ({ page }) => {
   await signIn(page)
-  await expect(dialog(page)).toBeVisible()
+  await welcome(page)
   await page.keyboard.press('Escape')
   await expect(dialog(page)).toBeHidden()
   await expect(page.locator('.tour-layer')).toHaveCount(0)
@@ -76,35 +108,38 @@ test('Esc closes the tour and focus returns to the page', async ({ page }) => {
   expect(await page.evaluate(() => !document.activeElement?.closest('.tour-layer'))).toBe(true)
 })
 
-test('"Don’t show again" persists across a reload', async ({ page }) => {
+test('"Don’t show again" on the welcome tour persists across a reload, and takes the coach marks with it', async ({ page }) => {
   await signIn(page)
+  await welcome(page)
   await dialog(page).getByRole('checkbox', { name: 'Don’t show again' }).check()
   await dialog(page).getByRole('button', { name: 'Skip' }).click()
   await expect(dialog(page)).toBeHidden()
   expect(await stored(page)).toMatchObject({ welcomeSeen: true, welcomeOff: true })
   await reload(page)
   await expect(dialog(page)).toHaveCount(0)
+  await expect(coach(page)).toHaveCount(0)
 })
 
-test('Skip without the checkbox brings the welcome tour back on the next visit', async ({ page }) => {
+test('Skip on the welcome tour without the checkbox leaves the coach marks for the next visit', async ({ page }) => {
   await signIn(page)
+  await welcome(page)
   await dialog(page).getByRole('button', { name: 'Skip' }).click()
   await expect(dialog(page)).toHaveCount(0)
   await reload(page)
-  await expect(dialog(page)).toBeVisible()
+  await expect(coach(page)).toHaveCount(3)
 })
 
-test('the Settings switch brings the welcome tour back after a reload', async ({ page }) => {
+test('the Settings switch brings the coach marks back after a reload', async ({ page }) => {
   await signIn(page)
-  await dialog(page).getByRole('checkbox', { name: 'Don’t show again' }).check()
-  await page.keyboard.press('Escape')
+  await coach(page).first().getByRole('button', { name: 'Skip tips' }).click()
+  await expect(coach(page)).toHaveCount(0)
   await page.evaluate(() => (window.location.hash = 'settings'))
   const sw = page.getByRole('switch', { name: 'Show the welcome tour next time' })
-  await expect(sw).not.toBeChecked() // the checkbox and the switch are the same setting
+  await expect(sw).not.toBeChecked() // skipping and the switch are the same setting
   await sw.check()
   expect(await stored(page)).toMatchObject({ welcomeSeen: false, welcomeOff: false })
   await reload(page)
-  await expect(dialog(page)).toBeVisible()
+  await expect(coach(page)).toHaveCount(3)
 })
 
 test('the Tour this page trigger runs the Now tour', async ({ page }) => {
@@ -167,8 +202,7 @@ test('a Settings "Run now" starts that page’s tour', async ({ page }) => {
 
 test('a page tour switched on in Settings plays until finished or turned off', async ({ page }) => {
   await signIn(page)
-  await dialog(page).getByRole('checkbox', { name: 'Don’t show again' }).check()
-  await page.keyboard.press('Escape')
+  await coach(page).first().getByRole('button', { name: 'Skip tips' }).click()
   await page.evaluate(() => (window.location.hash = 'settings'))
   await page.getByText(/^Page tours ·/).click()
   await page.getByRole('switch', { name: 'Play the Now tour on my next visit' }).check()

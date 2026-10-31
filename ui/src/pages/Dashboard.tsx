@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useId, useState, type MouseEvent, type ReactNode } from 'react'
 import { CatchupPanel } from '../Catchup.tsx'
 import { NarrativePanel } from '../Narrative.tsx'
 import type { Derived, LiveAgent } from '../derive.ts'
@@ -6,14 +6,15 @@ import { HideButton, isStale, ShowHidden, useHidden, useHideable } from '../dism
 import { Gloss } from '../Gloss.tsx'
 import { needHideKey, needsYou, needUpdatedAt, type Need } from '../needs.ts'
 import { blockedStep, contestedStep, handoverStep, overlapSteps, prStep, quietStep, who, type NextStep } from '../nextStep.ts'
-import { NextStepView } from '../NextStep.tsx'
+import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
 import { handoffOf, type Handoff } from '../launchLink.ts'
 import { StartTask } from '../StartTask.tsx'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
-import { SectionTabs } from '../TopNav.tsx'
+import { SectionTabs, useDismiss } from '../TopNav.tsx'
+import { Coach } from '../tour/Coach.tsx'
 import type { HubEvent } from '../types.ts'
 import { FINISHED_MEANS_AGENT_SAID } from '../copy.ts'
-import { Ago, Box, Empty, Icon, Notice, PageHead, Path, Skeleton, relative } from '../ui.tsx'
+import { Ago, Box, Empty, Icon, Notice, PageHead, Path, Reveal, Skeleton, relative } from '../ui.tsx'
 import { useNow, type HubData } from '../useHub.ts'
 import type { Poll } from '../usePoll.ts'
 import { ActivityPage } from './Activity.tsx'
@@ -92,30 +93,63 @@ function leadName(i: WorkItem) {
 }
 const person = (p: { owner: string; name: string }) => ({ login: p.owner, agent: p.name })
 
+/** The actions that do not fit on the row: a small menu beside the primary one. */
+function MoreActions({ items, describedBy }: { items: ReturnType<typeof useStepActions>['more']; describedBy: string }) {
+  const [open, setOpen] = useState(false)
+  const ref = useDismiss(open, () => setOpen(false))
+  if (items.length === 0) return null
+  return (
+    <div className="pop need-pop" ref={ref}>
+      <button type="button" className="need-btn" aria-haspopup="menu" aria-expanded={open} aria-label="More actions" aria-describedby={describedBy} onClick={() => setOpen((o) => !o)}>
+        <Icon name="three-dots" />
+      </button>
+      {open && (
+        <div className="pop-menu need-menu" role="menu">
+          {items.map((a) => (
+            <StepAction key={a.key} a={a} className="pop-item" role="menuitem" onDone={() => setOpen(false)} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Clicks on the row's own text open it; clicks on a link, button or input inside it do what they say. */
+const plainClick = (e: MouseEvent) => !(e.target as HTMLElement).closest('a, button, input, label, .gloss, time')
+
+/**
+ * One decision for a person, as one line: who and what, one primary action, a small menu for the rest. Opening it
+ * (the chevron, or the row's text) shows the reason, who decides and the box for the person's own words.
+ */
 function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
   const now = useNow() / 1000
+  const [open, setOpen] = useState(false)
+  const id = useId()
   const i = n.item
   let icon = 'exclamation-circle'
   let title: ReactNode = null
+  /** One line under the title while closed: the task, when, or where to look. */
+  let gist: ReactNode = null
+  /** The reason, shown when open. */
   let body: ReactNode = null
-  let then: ReactNode = null
   let step: NextStep | null = null
   if (n.kind === 'blocked' && i) {
     icon = 'sign-stop'
     title = <>{leadName(i)} is blocked</>
-    body = <>“{i.blocker?.summary ?? 'No blocker summary reported'}” on <a className="work-link" href={workHref(i.id)}>{i.title}</a>.</>
-    then = <>reported {i.blocker ? <Ago at={i.blocker.at} /> : 'recently'}</>
+    gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · reported {i.blocker ? <Ago at={i.blocker.at} /> : 'recently'}</>
+    body = <>“{i.blocker?.summary ?? 'No blocker summary reported'}”</>
     step = blockedStep(i)
   } else if (n.kind === 'quiet' && i) {
     icon = 'hourglass-split'
     title = <>{leadName(i)} has gone quiet</>
-    body = <>{i.claim_status === 'stale' ? <>Last check-in <Ago at={i.last_checkin_at} />.</> : <>Its last check-in is unknown.</>} <a className="work-link" href={workHref(i.id)}>{i.title}</a> is still assigned, so it isn’t free to take.</>
+    gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · still assigned</>
+    body = <>{i.claim_status === 'stale' ? <>Last check-in <Ago at={i.last_checkin_at} />.</> : <>Its last check-in is unknown.</>} It is still assigned, so it isn’t free to take.</>
     step = quietStep(i, me)
   } else if (n.kind === 'handover' && i) {
     icon = 'arrow-left-right'
     title = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> is ready for another agent</>
+    gist = <>offered <Ago at={i.updated_at} /></>
     body = i.next_action ?? i.current?.summary ?? `${leadName(i)} reported it ready to hand over.`
-    then = <>offered <Ago at={i.updated_at} /></>
     step = handoverStep(i)
   } else if (n.kind === 'contested') {
     const c = d.contested.find((x) => x.path === n.path)
@@ -132,13 +166,13 @@ function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview;
     const asker = wanter ?? holders[1]
     const holder = holders.find((h) => !asker || h.owner !== asker.owner || h.name !== asker.name) ?? c?.handoff?.to
     if (c && asker && holder) step = contestedStep(c, person(asker), person(holder))
-    then = <>{!step && <>Agree who keeps it · </>}<a href="#box-contested">see the contested file</a></>
+    gist = <a href="#box-contested">see the contested file</a>
   } else if (n.kind === 'overlap') {
     const o = ov.overlaps.find((x) => `overlap:${x.left.id}:${x.right.id}` === n.key)
     icon = 'sign-intersection-y'
     title = <><Gloss term="overlap">Two tasks plan to touch</Gloss> <Path>{n.path ?? 'the same files'}</Path></>
     body = o ? <><a className="work-link" href={workHref(o.left.id)}>{o.left.title}</a> and <a className="work-link" href={workHref(o.right.id)}>{o.right.title}</a> declared overlapping scope.</> : null
-    then = <a href="#inbox">open the Inbox</a>
+    gist = <a href="#inbox">open the Inbox</a>
     if (o) step = overlapSteps(o)
   } else if (n.kind === 'pr') {
     const p = d.prOverlaps.find((x) => `pr:${x.pr.number}` === n.key)
@@ -146,23 +180,39 @@ function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview;
     title = <>PR #{p?.pr.number} touches files an agent holds</>
     body = p ? <>“{p.pr.title}” overlaps {p.with.map((w) => who(w.agent.owner, w.agent.name)).join(', ')}.</> : null
     if (p) step = prStep(p)
-    then = <>{!step && <>Check before merging · </>}<a href="#box-prs">see the pull request</a></>
+    gist = <a href="#box-prs">see the pull request</a>
   }
+  const acts = useStepActions(step, { viewer: handoff.me, repo: handoff.repo, originUrl: handoff.originUrl })
+  const canHide = !hidden && isStale(needUpdatedAt(n), now)
   return (
-    <li className={`attn-item tone-${n.tone}${hidden ? ' is-hidden' : ''}`}>
+    <li className={`attn-item need tone-${n.tone}${open ? ' is-open' : ''}${hidden ? ' is-hidden' : ''}`}>
       <span className="attn-icon" aria-hidden="true">
         <Icon name={icon} />
       </span>
-      <div className="attn-main">
-        <div className="attn-title">{title}</div>
-        {step && n.kind === 'contested' && <NextStepView step={step} viewer={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />}
-        {body && <p>{body}</p>}
-        <div className="attn-status">
-          {then}
-          {(hidden || isStale(needUpdatedAt(n), now)) && <HideButton k={needHideKey(n)} hidden={hidden} what="this item" />}
-        </div>
-        {step && n.kind !== 'contested' && <NextStepView step={step} viewer={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />}
+      <div className="need-main" onClick={(e) => plainClick(e) && setOpen((o) => !o)}>
+        <div className="attn-title" id={`${id}-t`}>{title}</div>
+        {gist && <div className="need-gist">{gist}</div>}
       </div>
+      <div className="need-acts">
+        {hidden && <HideButton k={needHideKey(n)} hidden what="this item" />}
+        {acts.primary && <StepAction a={acts.primary} className="btn btn-sm btn-outline-secondary need-primary" />}
+        <MoreActions items={acts.more} describedBy={`${id}-t`} />
+        <button type="button" className="need-btn need-chev" aria-expanded={open} aria-controls={id} aria-describedby={`${id}-t`} onClick={() => setOpen((o) => !o)}>
+          <Icon name="chevron-down" />
+          <span className="visually-hidden">{open ? 'Hide details' : 'Show details'}</span>
+        </button>
+      </div>
+      <Reveal open={open} id={id}>
+        <div className="need-more">
+          {body && <p>{body}</p>}
+          {step && <StepDetail step={step} blanks={acts.blanks} words={acts.words} setWord={acts.setWord} />}
+          {canHide && (
+            <div className="attn-status">
+              <HideButton k={needHideKey(n)} hidden={false} what="this item" />
+            </div>
+          )}
+        </div>
+      </Reveal>
     </li>
   )
 }
@@ -217,6 +267,7 @@ function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkO
       tour="needs"
       icon="bell"
       title="Needs you"
+      count={needs.length > 0 ? needs.length : undefined}
       tone={you.some((n) => n.tone === 'bad' && !isHidden(n)) ? 'bad' : 'brand'}
       explain="Things a person can act on now. Agent-to-agent requests sit under “Agents are sorting it out” and join this list only when the hub records a change, such as a file request lapsing or the same edit being refused again."
     >
@@ -298,7 +349,7 @@ function Track({ ov }: { ov: WorkOverview }) {
                     <div className="lane-meta">
                       <StatePill state={i.state} />
                       <span className="muted">{leadName(i)}</span>
-                      {i.branch && <>on <code className="lane-branch">{i.branch}</code></>}
+                      {i.branch && <span className="lane-on">on <code className="lane-branch">{i.branch}</code></span>}
                     </div>
                     <div className={`start-check tone-${i.claim_status === 'active' ? 'ok' : 'warn'}`}>
                       <i aria-hidden="true" />
@@ -430,9 +481,11 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
   const all = needsYou(ov, d)
   const needs = all.filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   const handoff = handoffOf(data.whoami)
+  const start = <StartTask token={token} me={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />
   return (
     <div className="page">
       <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />
+      {section === 'home' && ov && d && <Coach id="answer" side="below">This sentence is the page in brief: how many tasks are unfinished, how many are moving or stuck, and how many need you.</Coach>}
       <SectionTabs label="Dashboard views" />
       {overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
@@ -442,12 +495,16 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
       {ov && overview.kind === 'ready' && overview.refreshError && <Notice title="Showing the last overview that loaded">{overview.refreshError}</Notice>}
       {section === 'home' && (!ov || !d ? <Skeleton rows={6} /> : (
         <>
-          <StartTask token={token} me={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />
+          {/* What waits on a person comes first; starting a task is one quiet line until asked for. With nothing waiting, it leads. */}
+          {needs.length === 0 && start}
+          <Coach id="needs" side="above">These wait on a person. Open a row for the reason and who decides; its button opens or copies the prompt for the agent.</Coach>
           <NeedsYou needs={all} ov={ov} d={d} me={handoff.me} handoff={handoff} />
+          {needs.length > 0 && start}
+          <Coach id="track" side="above">Every unfinished task, left to right: claimed, now, next, finished. Open a task for its full story.</Coach>
           <Track ov={ov} />
         </>
       ))}
-      {section === 'now' && <NowPage data={data} d={d} overview={overview} />}
+      {section === 'now' && <NowPage data={data} d={d} overview={overview} token={token} />}
       {section === 'activity' && (
         <>
           <NarrativePanel token={token} />

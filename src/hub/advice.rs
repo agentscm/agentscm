@@ -558,6 +558,7 @@ pub(super) fn test_intent(id: &str, task: &str, paths: &[&str]) -> Intent {
                 user_id: 1,
             },
             login: "bob".into(),
+            name: None,
             disabled: false,
         },
         via: Vec::new(),

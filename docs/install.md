@@ -126,7 +126,7 @@ The download and verification steps do not send product telemetry. After verific
 ```sh
 npx agentscm            # setup guide; flags go to `agentscm quickstart`
 npx agentscm uninstall  # any other subcommand is passed through as given
-npx agentscm tray       # optional macOS status-bar companion
+npx agentscm tray       # macOS status-bar companion; Linux terminal companion
 ```
 
 Needs Node 18 or later. The package has no dependencies and no install scripts. On Windows, run the same command in PowerShell:
@@ -195,6 +195,7 @@ delete the folder when no AgentSCM command is running.
 
 The optional macOS tray is part of this same binary; no separate app install is needed. Run
 `npx agentscm tray` to open it, or add `--tray` to quickstart to open it after successful setup.
+Click its menu-bar icon to see the work panel; right click for setup and troubleshooting actions.
 Quickstart no longer prompts to enable the tray or Start at Login. Without `--tray`, it prints
 the command for opening the menu-bar app. Opening the tray does not change Start at Login;
 you can enable or disable that option in the tray menu. When quickstart connects agents on macOS it also writes a small

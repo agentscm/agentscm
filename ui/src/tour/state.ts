@@ -11,7 +11,7 @@ export interface TourPrefs {
   welcomeOff: boolean
   /** Sections whose page tour plays by itself the first time the page opens. */
   autoplay: string[]
-  /** Unused since the checkbox decides; kept so older saved prefs still parse. */
+  /** The Dashboard's coach marks dismissed one by one, as `coach:<id>`. Older saved prefs held page names here; they are ignored. */
   sectionsSeen: string[]
 }
 
@@ -76,13 +76,31 @@ export const shouldWelcome = (p: TourPrefs, remember: boolean): boolean => remem
 
 export const shouldAutoplay = (p: TourPrefs, section: string, remember: boolean): boolean => remember && p.autoplay.includes(section)
 
+const COACH = 'coach:'
 const toggle = (list: string[], v: string, on: boolean): string[] => (on ? [...new Set([...list, v])] : list.filter((x) => x !== v))
 
 /** `done`: finished, or closed with "Don't show again" ticked. Closing it any other way brings it back next time. */
 export const closeWelcome = (p: TourPrefs, done: boolean): TourPrefs => (done ? { ...p, welcomeSeen: true, welcomeOff: true } : p)
 
-/** Settings switch: on brings the welcome tour back at the next page load. */
-export const setWelcome = (p: TourPrefs, on: boolean): TourPrefs => (on ? { ...p, welcomeSeen: false, welcomeOff: false } : { ...p, welcomeSeen: true, welcomeOff: true })
+/** Settings switch: on brings the first-visit introduction back at the next page load (the Dashboard's coach marks, all of them); off turns it off. */
+export const setWelcome = (p: TourPrefs, on: boolean): TourPrefs => (on ? { ...p, welcomeSeen: false, welcomeOff: false, sectionsSeen: p.sectionsSeen.filter((s) => !s.startsWith(COACH)) } : { ...p, welcomeSeen: true, welcomeOff: true })
+
+// The Dashboard's coach marks replaced the welcome modal. They follow its flags, so a viewer who finished or switched off
+// the old tour never sees them, and skipping them is the same switch as "Don't show again" was.
+export const COACH_IDS = ['answer', 'needs', 'track'] as const
+export type CoachId = (typeof COACH_IDS)[number]
+
+/** The coach marks still to show, in page order; none once the introduction is off or this browser cannot remember that. */
+export const coachLeft = (p: TourPrefs, remember: boolean): CoachId[] => (shouldWelcome(p, remember) ? COACH_IDS.filter((id) => !p.sectionsSeen.includes(COACH + id)) : [])
+
+/** One mark dismissed; the last one dismissed turns the introduction off for good. */
+export function dismissCoach(p: TourPrefs, id: CoachId): TourPrefs {
+  const seen = toggle(p.sectionsSeen, COACH + id, true)
+  return COACH_IDS.every((c) => seen.includes(COACH + c)) ? { ...p, sectionsSeen: seen, welcomeSeen: true, welcomeOff: true } : { ...p, sectionsSeen: seen }
+}
+
+/** "Skip tips": the whole set, and it stays gone. */
+export const skipCoach = (p: TourPrefs): TourPrefs => setWelcome(p, false)
 
 /** Same rule for a page tour that plays by itself: finishing it or ticking the box switches its auto-play off (the Settings switch follows). */
 export const closeSection = (p: TourPrefs, section: string, done: boolean): TourPrefs => (done ? { ...p, autoplay: toggle(p.autoplay, section, false) } : p)

@@ -5,7 +5,7 @@ import { SECTIONS } from '../../src/App.tsx'
 import { derive } from '../../src/derive.ts'
 import type { WorkOverview } from '../../src/standup.ts'
 import { SECTION_TOURS, WELCOME, tourFor, type TourContext, type TourDef } from '../../src/tour/content.ts'
-import { DEFAULT_PREFS, canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, setAutoplay, setWelcome, shouldAutoplay, shouldWelcome } from '../../src/tour/state.ts'
+import { COACH_IDS, DEFAULT_PREFS, canRemember, closeSection, closeWelcome, coachLeft, dismissCoach, loadPrefs, savePrefs, setAutoplay, setWelcome, shouldAutoplay, shouldWelcome, skipCoach } from '../../src/tour/state.ts'
 import { TourProvider, TourTrigger, useTour } from '../../src/tour/Tour.tsx'
 import type { HubData } from '../../src/useHub.ts'
 import { stubHub } from '../fixtures/mockFetch.ts'
@@ -16,6 +16,31 @@ const memory = (init: Record<string, string> = {}) => {
   return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v), removeItem: (k: string) => void m.delete(k), m }
 }
 const throwing = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('blocked') } }
+
+describe('coach marks', () => {
+  it('follow the welcome flags: all three for a new viewer, none once the old tour was finished or switched off', () => {
+    expect(coachLeft(DEFAULT_PREFS, true)).toEqual([...COACH_IDS])
+    expect(coachLeft(DEFAULT_PREFS, false)).toEqual([]) // nowhere to remember a dismissal
+    expect(coachLeft(closeWelcome(DEFAULT_PREFS, true), true)).toEqual([])
+    expect(coachLeft({ ...DEFAULT_PREFS, welcomeSeen: true }, true)).toEqual([])
+  })
+  it('are dismissed one at a time, and the last one turns the introduction off', () => {
+    const one = dismissCoach(DEFAULT_PREFS, 'answer')
+    expect(coachLeft(one, true)).toEqual(['needs', 'track'])
+    expect(shouldWelcome(one, true)).toBe(true)
+    expect(dismissCoach(one, 'answer')).toEqual(one) // no duplicates
+    const all = dismissCoach(dismissCoach(one, 'needs'), 'track')
+    expect(coachLeft(all, true)).toEqual([])
+    expect(all).toMatchObject({ welcomeSeen: true, welcomeOff: true })
+  })
+  it('Skip tips is the old “Don’t show again”, and the Settings switch brings every mark back', () => {
+    const skipped = skipCoach(dismissCoach(DEFAULT_PREFS, 'needs'))
+    expect(skipped).toMatchObject({ welcomeSeen: true, welcomeOff: true })
+    expect(coachLeft(skipped, true)).toEqual([])
+    expect(coachLeft(setWelcome(skipped, true), true)).toEqual([...COACH_IDS])
+    expect(setWelcome({ ...skipped, sectionsSeen: ['now', 'coach:needs'] }, true).sectionsSeen).toEqual(['now']) // page names saved by older versions stay
+  })
+})
 
 describe('tour preferences', () => {
   it('loads the default for missing, empty, garbage or wrongly typed data', () => {
@@ -154,20 +179,33 @@ afterEach(() => {
   window.localStorage.setItem(KEY, JSON.stringify({ welcomeSeen: true, welcomeOff: true, autoplay: [], sectionsSeen: [] }))
 })
 
+const Welcome = () => {
+  const tour = useTour()
+  return <button onClick={() => tour!.start('welcome')}>welcome</button>
+}
 const shell = () => (
   <TourProvider section="now" data={emptyData} d={null} overview={null}>
     <button>opener</button>
+    <Welcome />
     <TourTrigger section="now" />
   </TourProvider>
 )
+/** The welcome tour never opens by itself any more; replay it by hand. */
+const open = () => fireEvent.click(screen.getByRole('button', { name: 'welcome' }))
 const fresh = () => window.localStorage.removeItem(KEY)
 const stored = () => JSON.parse(window.localStorage.getItem(KEY) ?? 'null')
 const dialog = () => screen.queryByRole('dialog')
 
 describe('TourProvider overlay', () => {
-  it('opens the welcome tour on first render and steps with Next and Back', () => {
+  it('does not open the welcome tour by itself, for a first-time viewer or anyone else', () => {
     fresh()
     render(shell())
+    expect(dialog()).toBeNull()
+  })
+  it('opens the welcome tour by hand and steps with Next and Back', () => {
+    fresh()
+    render(shell())
+    open()
     const d = screen.getByRole('dialog')
     expect(d.getAttribute('aria-modal')).toBe('true')
     expect(within(d).getByRole('heading', { level: 2 }).textContent).toBe(WELCOME.steps[0]!.title)
@@ -187,18 +225,21 @@ describe('TourProvider overlay', () => {
   it('announces the step politely', () => {
     fresh()
     const { container } = render(shell())
+    open()
     const live = container.ownerDocument.querySelector('[aria-live="polite"]')!
     expect(live.textContent).toContain(`Step 1 of ${WELCOME.steps.length}`)
   })
-  it('Escape or Skip without the box closes the tour, and it comes back next time', () => {
+  it('Escape or Skip without the box closes the tour and leaves the coach marks for next time', () => {
     fresh()
     const first = render(shell())
+    open()
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(dialog()).toBeNull()
     expect(shouldWelcome(loadPrefs(), true)).toBe(true)
     first.unmount()
     render(shell())
-    expect(dialog()).not.toBeNull()
+    expect(dialog()).toBeNull()
+    open()
     fireEvent.click(screen.getByRole('button', { name: 'Skip' }))
     expect(dialog()).toBeNull()
     expect(shouldWelcome(loadPrefs(), true)).toBe(true)
@@ -206,6 +247,7 @@ describe('TourProvider overlay', () => {
   it('Done on the last step finishes the tour for good', () => {
     fresh()
     render(shell())
+    open()
     for (let n = 1; n < WELCOME.steps.length; n++) fireEvent.keyDown(document, { key: 'ArrowRight' })
     fireEvent.click(screen.getByRole('button', { name: 'Done' }))
     expect(stored()).toMatchObject({ welcomeSeen: true, welcomeOff: true })
@@ -232,6 +274,7 @@ describe('TourProvider overlay', () => {
   it('Back keeps focus on Back', async () => {
     fresh()
     render(shell())
+    open()
     fireEvent.keyDown(document, { key: 'ArrowRight' })
     fireEvent.keyDown(document, { key: 'ArrowRight' })
     const back = screen.getByRole('button', { name: /Back/ })
@@ -243,6 +286,7 @@ describe('TourProvider overlay', () => {
   it('“Don’t show again” persists as welcomeOff', () => {
     fresh()
     render(shell())
+    open()
     fireEvent.click(screen.getByRole('checkbox', { name: 'Don’t show again' }))
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(stored()).toMatchObject({ welcomeSeen: true, welcomeOff: true })
@@ -268,6 +312,7 @@ describe('TourProvider overlay', () => {
   it('traps Tab inside the card', () => {
     fresh()
     render(shell())
+    open()
     const d = screen.getByRole('dialog')
     const buttons = [...d.querySelectorAll<HTMLElement>('button, input')]
     buttons[buttons.length - 1]!.focus()

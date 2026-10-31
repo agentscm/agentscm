@@ -1330,6 +1330,7 @@ mod tests {
                     user_id: 7,
                 },
                 login: "owner".into(),
+                name: None,
                 disabled: false,
             },
         }

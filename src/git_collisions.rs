@@ -15,6 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::git_snapshot::Git;
@@ -261,6 +262,7 @@ fn ref_item(
     refs: Vec<String>,
     skip_merged: bool,
     base_ids: &mut BasePatchIds,
+    output: u64,
 ) -> Result<Scanned> {
     let range = format!("{base}..{commit}");
     if git.text(&["rev-list", "--count", &range, "--"])? == "0" {
@@ -268,7 +270,7 @@ fn ref_item(
     }
     let range = format!("{base}...{commit}");
     let args = ["diff", "--name-only", "-z", "--no-renames", &range, "--"];
-    let paths: BTreeSet<String> = nul_fields(&git.run(&args, None, OUTPUT)?).collect();
+    let paths: BTreeSet<String> = nul_fields(&git.run(&args, None, output)?).collect();
     if skip_merged && already_in_base(git, base, commit, &paths, base_ids) {
         return Ok(Scanned::Merged);
     }
@@ -282,8 +284,14 @@ fn ref_item(
     }))
 }
 
-fn worktree_items(git: &Git, items: &mut Vec<Item>, skipped: &mut Vec<Value>) -> Result<()> {
-    let out = git.run(&["worktree", "list", "--porcelain", "-z"], None, OUTPUT)?;
+fn worktree_items(
+    git: &Git,
+    items: &mut Vec<Item>,
+    skipped: &mut Vec<Value>,
+    output: u64,
+    exclude: Option<&Path>,
+) -> Result<()> {
+    let out = git.run(&["worktree", "list", "--porcelain", "-z"], None, output)?;
     // (path, HEAD, bare, prunable)
     let mut listed: Vec<(PathBuf, String, bool, bool)> = Vec::new();
     for field in out.split(|b| *b == 0) {
@@ -310,6 +318,16 @@ fn worktree_items(git: &Git, items: &mut Vec<Item>, skipped: &mut Vec<Value>) ->
         if bare {
             continue;
         }
+        // Advisory scans need only other worktrees. Skip this checkout before
+        // status can consume the deadline; the full collision scan passes None.
+        if exclude.is_some_and(|exclude| {
+            path.as_path() == exclude
+                || path
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical == exclude)
+        }) {
+            continue;
+        }
         let name = format!("worktree:{}", path.display());
         if prunable || !path.is_dir() {
             skipped.push(json!({"name": name, "reason": "worktree directory is missing"}));
@@ -327,7 +345,7 @@ fn worktree_items(git: &Git, items: &mut Vec<Item>, skipped: &mut Vec<Value>) ->
             "--untracked-files=all",
             "--no-renames",
         ];
-        let paths = match inside.run(&args, None, OUTPUT) {
+        let paths = match inside.run(&args, None, output) {
             // Each record is "XY path"; paths are relative to the worktree root.
             Ok(out) => nul_fields(&out)
                 .filter_map(|record| record.get(3..).map(str::to_owned))
@@ -519,7 +537,15 @@ pub fn collisions(request: &Request) -> Result<Value> {
     for (commit, refs) in by_commit {
         let name = refs[0].clone();
         let count = refs.len();
-        match ref_item(&git, &base, &commit, refs, skip_merged, &mut base_ids) {
+        match ref_item(
+            &git,
+            &base,
+            &commit,
+            refs,
+            skip_merged,
+            &mut base_ids,
+            OUTPUT,
+        ) {
             Ok(Scanned::Item(item)) => items.push(item),
             Ok(Scanned::Merged) => merged += count,
             Ok(Scanned::NothingNew) => {}
@@ -532,7 +558,7 @@ pub fn collisions(request: &Request) -> Result<Value> {
             .is_some_and(|deadline| Instant::now() >= deadline)
     };
     if request.worktrees && !past() {
-        worktree_items(&git, &mut items, &mut skipped)?;
+        worktree_items(&git, &mut items, &mut skipped, OUTPUT, None)?;
     }
     items.sort_by(|a, b| a.id.cmp(&b.id));
     if items.len() > MAX_ITEMS {
@@ -626,6 +652,238 @@ pub fn collisions(request: &Request) -> Result<Value> {
             "Only branches and worktrees visible to this repository are checked; clones, branches or uncommitted work elsewhere are invisible.",
         ],
     }))
+}
+
+/// A deliberately incomplete, path-only observation for command hooks. It never runs
+/// merge-tree, patch-id, or fetch. Exact commits describe the observation, not current refs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisorySnapshot {
+    pub base_name: String,
+    pub base_commit: String,
+    pub head: String,
+    pub observed_at: u64,
+    pub peers: Vec<AdvisoryPeer>,
+    pub incomplete: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisoryPeer {
+    /// Exact unique merge base used to select a branch's changed paths.
+    pub fork: Option<String>,
+    pub name: String,
+    pub commit: String,
+    pub kind: String,
+    pub paths: BTreeSet<String>,
+}
+
+/// These limits also bound cache parsing and first-edit lookup.
+pub const ADVISORY_BYTES: usize = 256 * 1024;
+const ADVISORY_ITEMS: usize = 40;
+
+/// Hook paths are UTF-8, relative, normalized and free of display controls. Reject
+/// lossy Git names here rather than confusing two distinct paths in an advisory.
+pub fn advisory_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.contains('\\')
+        && !path.chars().any(|c| c.is_control() || c == '\u{fffd}')
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+}
+
+impl AdvisorySnapshot {
+    /// A cache is only a bounded historical observation. There is no negative
+    /// assurance: unseen branches, later commits and later dirty work are unknown.
+    pub fn valid(&self, now: u64) -> bool {
+        let oid = |value: &str| {
+            matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+        };
+        self.observed_at <= now
+            && now - self.observed_at <= 4 * 60 * 60
+            && oid(&self.base_commit)
+            && oid(&self.head)
+            && matches!(self.base_name.as_str(), "origin/HEAD" | "main")
+            && self.peers.len() <= ADVISORY_ITEMS
+            && self.peers.iter().all(|peer| {
+                oid(&peer.commit)
+                    && match peer.kind.as_str() {
+                        "ref" => peer.fork.as_deref().is_some_and(oid),
+                        "worktree" => peer.fork.is_none(),
+                        _ => false,
+                    }
+                    && peer.name.len() <= 1024
+                    && peer.paths.iter().all(|path| advisory_path(path))
+            })
+    }
+
+    pub fn touching(&self, path: &str) -> Vec<&AdvisoryPeer> {
+        if !advisory_path(path) {
+            return Vec::new();
+        }
+        let mine = BTreeSet::from([path.to_owned()]);
+        self.peers
+            .iter()
+            .filter(|peer| !overlap(&mine, &peer.paths).is_empty())
+            .take(3)
+            .collect()
+    }
+}
+
+/// Bounded session-start variant of the existing detector. Unlike the full
+/// collision report, it compares future edit paths with each peer's changed paths,
+/// so pairwise merge simulation would be both wasteful and misleading.
+pub fn advisory_snapshot(
+    git_path: &Path,
+    repository: &Path,
+    deadline: Instant,
+) -> Result<AdvisorySnapshot> {
+    let git = Git {
+        exe: git_path,
+        repository,
+        deadline: Some(deadline),
+    };
+    let version = git.text(&["--version"])?;
+    if parse_version(&version).is_none_or(|found| found < MIN_GIT) {
+        return Err(Error::Invalid("Git 2.43 or newer is required".into()));
+    }
+    let head = resolve(&git, "HEAD")?;
+    let (base_name, base_commit) = if let Ok(base) = resolve(&git, "origin/HEAD") {
+        ("origin/HEAD".to_owned(), base)
+    } else {
+        let main = resolve(&git, "main")?;
+        if resolve(&git, "master").is_ok_and(|master| master != main) {
+            return Err(Error::Invalid(
+                "ambiguous default base; configure origin/HEAD".into(),
+            ));
+        }
+        ("main".to_owned(), main)
+    };
+    let repository = repository.canonicalize()?;
+    let mut items = Vec::new();
+    let mut skipped = Vec::new();
+    // Dirty linked worktrees are the strongest local signal. Scan and retain
+    // those before branches consume the shared deadline or peer budget.
+    let mut incomplete = worktree_items(
+        &git,
+        &mut items,
+        &mut skipped,
+        ADVISORY_BYTES as u64,
+        Some(&repository),
+    )
+    .is_err();
+    let listing = git.run(
+        &[
+            "for-each-ref",
+            "--sort=refname",
+            "--sort=-committerdate",
+            "--count=41",
+            "--no-merged",
+            &base_commit,
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+        None,
+        ADVISORY_BYTES as u64,
+    );
+    let mut named: Vec<(String, Vec<String>)> = Vec::new();
+    let mut positions = HashMap::new();
+    match listing {
+        Ok(listing) => {
+            let listing = lossy(&listing);
+            incomplete |= listing.lines().count() > ADVISORY_ITEMS;
+            for line in listing.lines().take(ADVISORY_ITEMS) {
+                if let Some((commit, name)) = line.split_once(' ')
+                    && !(name.starts_with("refs/remotes/") && name.ends_with("/HEAD"))
+                {
+                    if let Some(&index) = positions.get(commit) {
+                        let (_, refs): &mut (String, Vec<String>) = &mut named[index];
+                        refs.push(name.to_owned());
+                    } else {
+                        positions.insert(commit.to_owned(), named.len());
+                        named.push((commit.to_owned(), vec![name.to_owned()]));
+                    }
+                }
+            }
+        }
+        Err(_) => incomplete = true,
+    }
+    let mut ids = BasePatchIds::default();
+    let mut forks = BTreeMap::new();
+    for (commit, refs) in named {
+        if items.len() >= ADVISORY_ITEMS {
+            incomplete = true;
+            break;
+        }
+        // A peer already contained in this checkout cannot introduce new work.
+        if is_ancestor(&git, &commit, &head) {
+            continue;
+        }
+        let fork = match git.text(&["merge-base", "--all", &base_commit, &commit]) {
+            Ok(fork) if fork.lines().count() == 1 => fork,
+            _ => {
+                incomplete = true;
+                continue;
+            }
+        };
+        forks.insert(commit.clone(), fork.clone());
+        match ref_item(
+            &git,
+            &fork,
+            &commit,
+            refs,
+            false,
+            &mut ids,
+            ADVISORY_BYTES as u64,
+        ) {
+            Ok(Scanned::Item(item)) => items.push(item),
+            Ok(_) => {}
+            Err(_) => incomplete = true,
+        }
+        if Instant::now() >= deadline {
+            incomplete = true;
+            break;
+        }
+    }
+    incomplete |= !skipped.is_empty() || Instant::now() >= deadline;
+    let mut peers = Vec::new();
+    for item in items {
+        if peers.len() >= ADVISORY_ITEMS {
+            incomplete = true;
+            break;
+        }
+        if !item.paths.iter().all(|path| advisory_path(path)) {
+            incomplete = true;
+        }
+        let peer = AdvisoryPeer {
+            fork: (item.kind == "ref").then(|| forks[&item.commit].clone()),
+            name: item.id,
+            commit: item.commit,
+            kind: item.kind.to_owned(),
+            paths: item
+                .paths
+                .into_iter()
+                .filter(|path| advisory_path(path))
+                .collect(),
+        };
+        peers.push(peer);
+        if serde_json::to_vec(&peers)?.len() > ADVISORY_BYTES / 2 {
+            peers.pop();
+            incomplete = true;
+            break;
+        }
+    }
+    Ok(AdvisorySnapshot {
+        base_name,
+        base_commit,
+        head,
+        observed_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |time| time.as_secs()),
+        peers,
+        incomplete,
+    })
 }
 
 #[cfg(test)]

@@ -215,8 +215,8 @@ separate role system.
 - When no repository has an agent, the page leads with "No agent is working in any of these
   yet.", then a repository picker and the sign-in page's agent row (`ui/src/AskAgent.tsx`),
   which opens the person's agent with the setup prompt naming that repository.
-- The Dashboard's tabs and its first-visit welcome tour do not show on this page: both describe
-  one repository. The welcome tour waits for the first Dashboard.
+- The Dashboard's tabs and its first-visit tips (coach marks) do not show on this page: both
+  describe one repository. The tips wait for the first Dashboard.
 
 ## Docs and roadmap
 
