@@ -1,65 +1,111 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Work overview</title>
 <style>
-:root{--bg:#fff;--card:#fff;--fg:#1c1b22;--mut:#5d5b6b;--bd:#e3e1ec;--acc:#6d4aff;--accbg:#efeaff;--ok:#1b7a43;--okbg:#e5f5ec;--warn:#8a5a00;--warnbg:#fff3d6;--bad:#b3261e;--badbg:#fde8e6;color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#15141a;--card:#1d1b25;--fg:#ececf3;--mut:#a9a6b8;--bd:#34314a;--acc:#a28cff;--accbg:#2c2550;--ok:#6fd49a;--okbg:#17301f;--warn:#f1c36a;--warnbg:#38290a;--bad:#ff8f87;--badbg:#3d1916;color-scheme:dark}}
-:root[data-theme=dark]{--bg:#15141a;--card:#1d1b25;--fg:#ececf3;--mut:#a9a6b8;--bd:#34314a;--acc:#a28cff;--accbg:#2c2550;--ok:#6fd49a;--okbg:#17301f;--warn:#f1c36a;--warnbg:#38290a;--bad:#ff8f87;--badbg:#3d1916;color-scheme:dark}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
-.card{margin:8px;padding:14px;background:var(--card);border:.5px solid var(--bd);border-radius:12px}
-.catchup{margin:10px 0 14px;padding:10px 12px;border:.5px solid var(--bd);border-radius:10px;background:var(--bg)}
-.catchup h2{margin:0;color:var(--fg);text-transform:none;letter-spacing:0}.catchup-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.catchup-head button{margin-left:auto}.group{border-top:.5px solid var(--bd);padding-top:6px}.catchup .att{overflow-wrap:anywhere}
-.source dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:3px 10px;margin:6px 0}.source dt{color:var(--mut);font-weight:600}.source dd{margin:0;min-width:0;overflow-wrap:anywhere}.source code{overflow-wrap:anywhere;word-break:break-all}
-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
-h1{font-size:15px;margin:0;font-weight:650}h2{font-size:13px;margin:16px 0 6px;color:var(--mut);font-weight:650;text-transform:uppercase;letter-spacing:.04em}
-.sp{flex:1}.mut{color:var(--mut)}button{font:inherit;color:var(--acc);background:var(--accbg);border:.5px solid var(--acc);border-radius:8px;padding:4px 12px;cursor:pointer}
-button:focus-visible,summary:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
-.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.tile{border:.5px solid var(--bd);border-radius:10px;padding:8px 10px}
-.num{font-size:28px;font-weight:650;line-height:1.1}.warn{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:6px 10px;margin:8px 0}
-.note{color:var(--mut);margin:4px 0}ul{margin:0;padding:0;list-style:none}li.att{padding:5px 0;border-bottom:.5px solid var(--bd)}
-.row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:.5px solid var(--bd)}.row:last-child{border:0}
-.av{flex:none;width:30px;height:30px;border-radius:50%;background:var(--accbg);color:var(--acc);display:grid;place-items:center;font-weight:650;font-size:13px}
-.main{flex:1;min-width:0}.t{font-size:15px;font-weight:600;overflow-wrap:anywhere}.s{color:var(--mut);overflow-wrap:anywhere}
-.right{flex:none;text-align:right}.pill{display:inline-block;border-radius:999px;padding:1px 9px;font-size:13px;background:var(--accbg);color:var(--acc);white-space:nowrap}
-.pill.ok{background:var(--okbg);color:var(--ok)}.pill.warn{background:var(--warnbg);color:var(--warn)}.pill.bad{background:var(--badbg);color:var(--bad)}
-.dots{display:inline-flex;gap:4px;vertical-align:middle;margin-right:6px}.dot{width:9px;height:9px;border-radius:50%;border:1px solid var(--acc)}.dot.on{background:var(--acc)}
-input[type=search]{font:inherit;color:var(--fg);background:var(--bg);border:.5px solid var(--bd);border-radius:8px;padding:6px 10px;width:100%}input[type=search]:focus-visible{outline:2px solid var(--acc);outline-offset:2px}.id{font-family:ui-monospace,monospace;font-size:12px;color:var(--mut)}
-details{margin-top:6px}summary{cursor:pointer;color:var(--acc)}footer{margin-top:14px;color:var(--mut)}.quiet{margin-top:8px;font-size:13px;color:var(--mut)}
-@media (max-width:420px){.tiles{grid-template-columns:1fr}.row{flex-wrap:wrap}.right{text-align:left}.source dl{grid-template-columns:minmax(0,1fr)}.source dt:not(:first-child){margin-top:4px}}
-</style></head><body><div class="card" id="app"></div><div class="card" id="find"></div>
+:root{--frame:#17142e;--ink:#ece9ff;--dim:#aaa5d2;--hi:#b3abff;--coral:#ff9c84;--green:#6fdba6;--amber:#f6bd7a;--line:rgba(255,255,255,.08)}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark}}:root[data-theme=dark]{color-scheme:dark}:root[data-theme=light]{color-scheme:light}
+*{box-sizing:border-box}body{margin:0;padding:4px;background:transparent;color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+.c{position:relative;overflow:hidden;background:var(--frame);border-radius:20px;padding:16px 18px 12px}
+.c::before{content:"";position:absolute;right:-80px;top:-120px;width:300px;height:300px;border-radius:50%;background:radial-gradient(closest-side,rgba(109,92,224,.45),transparent);pointer-events:none}
+.c>*{position:relative}
+.i{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.bad{color:var(--coral)}.warn{color:var(--amber)}.go{color:var(--hi)}.ok{color:var(--green)}
+.top{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--dim)}.top .sp{flex:1}.top>span:nth-child(2){overflow-wrap:anywhere}.top>span:nth-child(4){white-space:nowrap}
+.live{width:7px;height:7px;flex:none;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(111,219,166,.15)}.live.off{background:var(--amber);box-shadow:0 0 0 4px rgba(246,189,122,.15)}
+.ib{display:inline-grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:9px;background:transparent;color:var(--dim);cursor:pointer}.ib:hover{background:rgba(255,255,255,.08);color:#fff}
+.btn{font:inherit;font-size:12.5px;color:var(--ink);background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);border-radius:999px;height:28px;padding:0 12px;cursor:pointer}.btn:hover:not(:disabled){border-color:var(--hi)}.btn:disabled{opacity:.5;cursor:default}
+button:focus-visible,summary:focus-visible{outline:2px solid var(--hi);outline-offset:2px;border-radius:6px}
+.msg{display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-size:12.5px;color:var(--dim)}.msg .i{width:14px;height:14px;margin-top:2px}.msg.warn{color:var(--amber)}.msg.bad{color:var(--coral)}
+.note{margin:6px 0;font-size:12.5px;color:var(--dim)}.mut{color:var(--dim)}
+ul{margin:0;padding:0;list-style:none}
+details.f{border-top:1px solid var(--line)}details.f>summary{display:flex;align-items:center;gap:8px;padding:10px 0;cursor:pointer;list-style:none;font-weight:500;font-size:13.5px}details.f>summary::-webkit-details-marker{display:none}
+.chev{color:var(--dim);transition:transform .2s}details[open]>summary>.chev{transform:rotate(90deg)}
+.n{margin-left:auto;font-size:12px;font-weight:400;color:var(--dim);text-align:right}
+.sd summary{cursor:pointer;color:var(--hi);font-size:12px}.sd dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:3px 10px;margin:6px 0;font-size:12px}.sd dt{color:var(--dim)}.sd dd{margin:0;min-width:0;overflow-wrap:anywhere}.sd code{font:11.5px ui-monospace,Menlo,monospace;word-break:break-all}
+.foot{display:flex;flex-wrap:wrap;align-items:center;gap:4px 14px;margin-top:2px;padding-top:10px;border-top:1px solid var(--line);font-size:12px;color:var(--dim)}.foot span{display:inline-flex;gap:5px;align-items:center}.foot .i{width:13px;height:13px}
+@media (max-width:420px){.c{padding:14px 14px 10px}.sd dl{grid-template-columns:minmax(0,1fr)}.sd dt{margin-top:4px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+.big{margin:12px 0 6px;font-size:24px;font-weight:300;letter-spacing:-.02em;line-height:1.25}.big em{font-style:normal;color:var(--coral);font-weight:400}
+.needs li{display:grid;grid-template-columns:16px minmax(0,1fr);gap:0 10px;padding:9px 0;border-top:1px solid var(--line)}.needs .i{margin-top:3px}.needs .t{font-weight:500;overflow-wrap:anywhere}.needs .s{grid-column:2;font-size:12.5px;color:var(--dim);overflow-wrap:anywhere}
+.w li{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:1px 10px;align-items:center;padding:7px 0;border-top:1px solid var(--line)}.w li:first-child{border-top:0}
+.ag{width:10px;height:10px;border-radius:3px;background:var(--c)}.w .t{font-size:13.5px;font-weight:500;overflow-wrap:anywhere}.w .s{grid-column:2/-1;font-size:12px;color:var(--dim);overflow-wrap:anywhere}.w .st{font-size:12px;font-weight:500;color:var(--dim)}
+.sh{margin:10px 0 2px;font-size:12px;color:var(--dim)}
+.hl{flex:1;min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-weight:400;color:var(--dim)}
+details[open]>summary>.hl{display:none}
+.b p{margin:0 0 8px}.b .h{font-weight:500}.b ul{margin:0 0 8px;padding-left:18px;list-style:disc}.b li{margin-bottom:6px}.src{display:block;font-size:11.5px;color:var(--dim);overflow-wrap:anywhere}
+.cu .head{display:flex;justify-content:flex-end;margin-bottom:4px}.cu .item{padding:7px 0;border-top:1px solid var(--line)}.cu .t{font-weight:500;overflow-wrap:anywhere}.cu .s{font-size:12px;color:var(--dim);overflow-wrap:anywhere}
+</style></head><body><div class="c" id="app"></div>
 <script>
 "use strict";
 var TOOL='agentscm_work_overview',CATCHUP_TOOL='agentscm_work_catchup',CATCHUP_ACK_TOOL='agentscm_work_catchup_ack';
-var STATE={active:['In progress','▶',''],blocked:['Blocked','⊘','bad'],handover:['Handover','⇄','warn'],paused:['Paused','‖','warn']};
-function who(i){return i.lead_agent||i.owner_login||'unknown agent'}
-function initials(n){var p=String(n).split(/[\s._-]+/).filter(Boolean);return ((p[0]||'?')[0]+(p[1]?p[1][0]:'')).toUpperCase()}
+var NS='http://www.w3.org/2000/svg',OPEN={};
+var IC={alert:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M8 5v3.4','M8 11h.01'],block:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M4 12 12 4'],hand:['M2.5 6h9M9 3.5 11.5 6 9 8.5','M13.5 10h-9M7 7.5 4.5 10 7 12.5'],pause:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M6.6 6v4M9.4 6v4'],overlap:['M2.4 8a3.6 3.6 0 1 0 7.2 0a3.6 3.6 0 1 0-7.2 0','M6.4 8a3.6 3.6 0 1 0 7.2 0a3.6 3.6 0 1 0-7.2 0'],move:['M2.5 8h8M8 4.5 11.5 8 8 11.5'],refresh:['M13 8a5 5 0 1 1-1.5-3.6','M13 2.5v3h-3'],chev:['M6 3.5 10.5 8 6 12.5'],check:['M3.5 8.5 6.5 11.5 12.5 4.5'],reply:['M6.5 4 2.5 8l4 4','M2.5 8H9a4.5 4.5 0 0 1 4.5 4.5'],arrow:['M3 8h9M9 5l3 3-3 3'],clock:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M8 5v3l2 1.5']};
+function ic(k,cls){var s=document.createElementNS(NS,'svg');s.setAttribute('viewBox','0 0 16 16');s.setAttribute('class','i'+(cls?' '+cls:''));s.setAttribute('aria-hidden','true');IC[k].forEach(function(d){var p=document.createElementNS(NS,'path');p.setAttribute('d',d);s.appendChild(p)});return s}
+function h(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=String(text);return e}
+function add(p){for(var i=1;i<arguments.length;i++){var a=arguments[i];if(a)p.appendChild(typeof a==='string'?document.createTextNode(a):a)}return p}
+function clip(s){s=String(s==null?'':s);return s.length>300?s.slice(0,300)+'…':s}
+function pad(n){return n<10?'0'+n:''+n}
+function hms(d){return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
+function ago(at){var s=Math.max(0,Math.floor(Date.now()/1000-at));if(s<60)return 'just now';var m=Math.floor(s/60);if(m<60)return m+' min ago';var x=Math.floor(m/60);return x<24?x+' h ago':Math.floor(x/24)+' d ago'}
+function msg(tone,text){return add(h('p','msg '+tone),ic('alert'),h('span',null,text))}
+function fold(key,label,meta,hl){var d=h('details','f'),s=h('summary');d.open=!!OPEN[key];d.addEventListener('toggle',function(){OPEN[key]=d.open;size()});add(s,ic('chev','chev'),h('span',null,label),hl?h('span','hl',hl):null,meta?h('span','n',meta):null);d.appendChild(s);return d}
+function bar(label,meta){var t=h('div','top');add(t,h('span','live'+(failedAt?' off':'')),h('span',null,label),h('span','sp'),meta?h('span',null,meta):null,refreshBtn());return t}
+function refreshBtn(){var b=h('button','ib');b.type='button';b.setAttribute('aria-label','Refresh');b.title='Refresh';b.appendChild(ic('refresh'));b.addEventListener('click',onRefresh);return b}
+function failNote(){return failedAt?msg('warn','Could not refresh. Showing data from '+hms(failedAt)):null}
+var nextId=1,pending={},last=null,lastAt=null,lastH=0,failedAt=null;
+function send(m){window.parent.postMessage(m,'*')}
+function rpc(method,params){return new Promise(function(ok,no){var id=nextId++;pending[id]={ok:ok,no:no};send({jsonrpc:'2.0',id:id,method:method,params:params})})}
+function parse(r){if(!r||r.isError)return null;var s=r.structuredContent;if(s&&typeof s==='object')return s;var c=r.content;if(c&&c[0]&&typeof c[0].text==='string'){try{var v=JSON.parse(c[0].text);if(v&&typeof v==='object')return v}catch(e){}}return null}
+function theme(c){if(c&&(c.theme==='dark'||c.theme==='light'))document.documentElement.setAttribute('data-theme',c.theme)}
+function size(){var v=Math.ceil(document.body.scrollHeight);if(v!==lastH){lastH=v;send({jsonrpc:'2.0',method:'ui/notifications/size-changed',params:{height:v}})}}
+function paint(){var root=document.getElementById('app');root.textContent='';if(!last){add(root,h('p','note','No data returned.'))}else render(root,last,lastAt);size()}
+function take(r,silent){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint();return}if(silent){if(!last)paint();return}fail()}
+function fail(){failedAt=lastAt;paint()}
+function call(args){return rpc('tools/call',{name:TOOL,arguments:args}).then(function(r){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint()}else fail()},fail)}
+window.addEventListener('message',function(e){if(e.source!==window.parent)return;var m=e.data;if(!m||m.jsonrpc!=='2.0')return;
+if(m.id!=null&&pending[m.id]&&!m.method){var p=pending[m.id];delete pending[m.id];if(m.error)p.no(m.error);else p.ok(m.result);return}
+if(m.method==='ui/notifications/tool-result')take(m.params,true);
+else if(m.method==='ui/notifications/host-context-changed')theme(m.params&&(m.params.theme?m.params:m.params.hostContext))});
+var manage='Manage these views: ask your agent to run agentscm_view_settings, or open Settings in the hub.';
+function start(){if(typeof ResizeObserver==='function')new ResizeObserver(size).observe(document.body);
+rpc('ui/initialize',{appInfo:{name:TOOL+'-view',version:'1.0.0'},appCapabilities:{},protocolVersion:'2026-01-26'}).then(function(r){theme(r&&r.hostContext);send({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}})},function(){});
+paint();narrativeCall();catchCall({subscriber:'human',delivery_client:CATCH_CLIENT},false)}
+var STATE={active:['Working','move','go'],blocked:['Blocked','block','bad'],handover:['Handover','hand','warn'],paused:['Paused','pause','']};
+var NAMES={'claude-code':'Claude Code',codex:'Codex',cursor:'Cursor',copilot:'Copilot',gemini:'Gemini'},AGC={'claude-code':'#e8896a',codex:'#ece9ff',cursor:'#9a97b8',copilot:'#8b7cf0',gemini:'#6aa0ff'};
+function own(o,k){return typeof k==='string'&&Object.prototype.hasOwnProperty.call(o,k)}
+function who(i){var a=i.lead_agent;return a?own(NAMES,a)?NAMES[a]:a:i.owner_login||'unknown agent'}
+function agc(i){return own(AGC,i.lead_agent)?AGC[i.lead_agent]:'#aaa5d2'}
+function plural(n,a,b){return n+' '+(n===1?a:b||a+'s')}
+function needs(cur,ov){var rows=[];
+ov.forEach(function(p){var ps=(p.reasons||[]).map(function(r){return r.left_path===r.right_path?r.left_path:r.left_path+' / '+r.right_path}),shown=ps.slice(0,3).map(clip).join(', ')||'a path',more=ps.length>3?' and '+(ps.length-3)+' more':'';
+rows.push({icon:'overlap',tone:'warn',t:who(p.left)+' and '+who(p.right)+' both declare '+shown+more+(p.reasons_complete===false?' (more paths not shown)':''),s:'Coordination signal, not a Git conflict.'})});
+cur.forEach(function(i){var w=who(i),t='“'+clip(i.title)+'”';
+if(i.state==='blocked')rows.push({icon:'block',tone:'bad',t:t+' is blocked',s:w+(i.blocker&&i.blocker.summary?': '+clip(i.blocker.summary):' has not said why')+'.'});
+else if(i.state==='paused'||i.state==='handover')rows.push({icon:i.state==='paused'?'pause':'hand',tone:'warn',t:t+' is still assigned to '+w,s:'They '+(i.state==='paused'?'paused':'handed it over')+'. The claim stays claimed.'});
+else if(i.claim_status==='stale'||i.claim_status==='unknown')rows.push({icon:'clock',tone:'warn',t:t+' has a '+i.claim_status+' claim by '+w,s:'The claim stays claimed.'})});
+return rows}
+function workRow(i,word,tone,sub){var li=h('li'),sw=h('span','ag');sw.style.setProperty('--c',agc(i));add(li,sw,h('span','t',clip(i.title)),h('span','st '+tone,word),h('span','s',sub));return li}
 function render(root,d,at){
 var cur=Array.isArray(d.current)?d.current:[],ov=Array.isArray(d.overlaps)?d.overlaps:[],rec=Array.isArray(d.recent)?d.recent:[];
-var n=function(s){return cur.filter(function(i){return i.state===s}).length};
-var hd=h('header');add(hd,h('h1',null,'Work overview'),h('span','sp'),h('span','mut','Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),refreshBtn());add(root,hd,failNote());
+var working=cur.filter(function(i){return i.state==='active'}).length,rows=needs(cur,ov),repo=cur[0]&&cur[0].repository;
+add(root,bar('AgentSCM · '+(repo?clip(repo):'Work overview'),'Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),failNote());
+if(d.current_complete===false)add(root,msg('warn','Showing a partial list.'));
+var big=h('p','big');add(big,plural(working,'agent')+' working. ');
+if(rows.length)add(big,h('em',null,plural(rows.length,'thing needs','things need')+' a person.'));else add(big,d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing needs a person.');
+add(root,big);
+if(rows.length){var ul=h('ul','needs');rows.forEach(function(x){var li=h('li');add(li,ic(x.icon,x.tone),h('span','t',x.t),h('span','s',x.s));ul.appendChild(li)});add(root,ul)}
+var all=fold('all','All work',plural(cur.length,'task')+' · '+rec.length+' finished recently'),wl=h('ul','w');
+if(!cur.length)add(all,h('p','note','No current work reported.'));
+cur.forEach(function(i){var st=own(STATE,i.state)?STATE[i.state]:[String(i.state),'move',''];wl.appendChild(workRow(i,st[0],st[2],who(i)+(i.owner_login?' for '+clip(i.owner_login):'')+(i.next_action?' · Next: '+clip(i.next_action):'')+(i.claim_status!=='active'?' · Claim '+i.claim_status+', stays claimed':'')+' · '+ago(i.last_checkin_at)))});
+if(cur.length)add(all,wl);
+if(d.history_retention_gap)add(all,msg('warn','Some history is no longer retained, so recently finished work may be missing.'));
+if(rec.length){var rl=h('ul','w');add(all,h('p','sh','Recently finished ('+rec.length+')'));rec.forEach(function(o){var i=o.item||{};rl.appendChild(workRow(i,o.kind==='decision'?'Decision':'Completed','ok',who(i)+' · '+ago(o.at)))});add(all,rl)}
+if(d.recent_complete===false)add(all,h('p','note','This list may be partial.'));
+add(root,all);
 renderNarrative(root);
 renderCatchup(root);
-if(d.current_complete===false)add(root,h('div','warn','⚠ Showing a partial list.'));
-var tl=h('div','tiles');
-[['Working',n('active'),'▶',''],['Blocked',n('blocked'),'⊘',''],['Overlap to settle',ov.length+(d.overlaps_complete===false?'+':''),'≠',d.overlaps_complete===false?'Check incomplete':'']].forEach(function(t){var x=h('div','tile');add(x,h('div','num',t[1]),h('div','mut',t[2]+' '+t[0]),t[3]?h('div','mut',t[3]):null);tl.appendChild(x)});add(root,tl);
-add(root,h('h2',null,'Needs attention'));var ul=h('ul'),k=0;
-ov.forEach(function(p){var ps=(p.reasons||[]).map(function(r){return r.left_path===r.right_path?r.left_path:r.left_path+' / '+r.right_path});
-var shown=ps.slice(0,3).map(clip).join(', ')||'a path';var more=ps.length>3?' and '+(ps.length-3)+' more':'';
-var li=h('li','att','≠ '+who(p.left)+' and '+who(p.right)+' both declare '+shown+more+(p.reasons_complete===false?' (more paths not shown)':'')+'. ');add(li,h('span','mut','Coordination signal, not a Git conflict.'));ul.appendChild(li);k++});
-cur.forEach(function(i){var w=who(i),t=clip(i.title),s=null;
-if(i.state==='blocked')s='⊘ '+w+' is blocked on “'+t+'”'+(i.blocker&&i.blocker.summary?': '+clip(i.blocker.summary):'')+'.';
-else if(i.state==='paused'||i.state==='handover')s='⇄ “'+t+'” is still assigned to '+w+', who '+(i.state==='paused'?'paused':'handed over')+'. The claim stays claimed.';
-else if(i.claim_status==='stale'||i.claim_status==='unknown')s='⏱ “'+t+'” has a '+i.claim_status+' claim by '+w+'. The claim stays claimed.';
-if(s){ul.appendChild(h('li','att',s));k++}});
-if(!k)ul.appendChild(h('li','att',d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing needs attention.'));add(root,ul,h('h2',null,'All work'));
-if(!cur.length)add(root,h('p','note','No current work reported.'));
-cur.forEach(function(i){var st=STATE[i.state]||[String(i.state),'●',''],w=who(i),r=h('div','row'),m=h('div','main'),x=h('div','right');
-add(m,h('div','t',clip(i.title)),h('div','s',clip(w)+' · Next: '+(i.next_action?clip(i.next_action):'none reported')),i.claim_status!=='active'?h('div','s','Claim '+i.claim_status+' · stays claimed'):null);
-add(x,pill(st[2],st[1],st[0]),h('div','s',ago(i.last_checkin_at)));add(r,h('div','av',initials(w)),m,x);root.appendChild(r)});
-if(d.history_retention_gap)add(root,h('div','warn','⚠ Some history is no longer retained, so recently finished work may be missing.'));
-var dt=h('details');add(dt,h('summary',null,'Recently finished ('+rec.length+')'));
-rec.forEach(function(o){var i=o.item||{},r=h('div','row'),m=h('div','main');add(m,h('div','t',clip(i.title)),h('div','s',clip(who(i))+' · '+(o.kind==='decision'?'Decision':'Completed')));add(r,m,h('div','s',ago(o.at)));dt.appendChild(r)});
-if(d.recent_complete===false)add(dt,h('p','note','This list may be partial.'));add(root,dt);
-add(root,h('footer',null,'Read-only. Stale claims stay claimed. '+(d.overlaps_complete===false?'⚠ Overlap check incomplete':'✓ Overlap check complete')),h('div','quiet',manage))}
+var f=h('div','foot'),oc=d.overlaps_complete===false;add(f,add(h('span','mut'),ic(oc?'alert':'check',oc?'warn':'ok'),oc?'Overlap check incomplete':'Overlap check complete'),h('span',null,'Read-only. Stale claims stay claimed.'));
+add(root,f,h('p','note',manage))}
+function onRefresh(){call({});narrativeCall()}
 function when(at){return new Date(at*1000).toLocaleString()}
 function pair(dl,label,value){var dd=h('dd');add(dd,h('code',null,value));add(dl,h('dt',null,label),dd)}
 var NARRATIVE={value:null,busy:false,error:false,timer:null};
@@ -71,13 +117,15 @@ if(v.generated_at!==null&&nat(v.generated_at)===null||v.generated_by!==null&&!sa
 var ids={};for(var i=0;i<v.sources.length;i++){var x=v.sources[i];if(!x||!safeText(x.id,200)||ids[x.id]||!safeText(x.label,600)||x.work_id!==null&&!/^wrk_[0-9a-f]{32}$/.test(x.work_id)||x.commit!==null&&!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(x.commit)||x.pull_number!==null&&(nat(x.pull_number)===null||x.pull_number<1))return null;ids[x.id]=true}
 if(v.status==='ready'){var o=v.output,sourceFree=v.sources.length===0;if(!o||!safeText(o.headline,240)||!Array.isArray(o.facts)||!Array.isArray(o.implications)||!narrativeReferences(o.headline_references,ids,sourceFree)||sourceFree&&(o.facts.length||o.implications.length)||o.facts.length<1&&!sourceFree||o.facts.length>6||o.implications.length>4||o.facts.concat(o.implications).some(function(t){return !t||!safeText(t.text,600)||!narrativeReferences(t.references,ids,false)}))return null}else if(v.output!==null)return null;
 return v}
-function narrativeSource(v,id){var source=v.sources.find(function(x){return x.id===id}),d=h('details','source');add(d,h('summary',null,source.label),h('p','id',id+(source.work_id?' · Work '+source.work_id:'')+(source.commit?' · Commit '+source.commit:'')+(source.pull_number?' · PR #'+source.pull_number:'')));return d}
-function renderNarrative(root){var box=h('section','catchup'),v=NARRATIVE.value;add(box,h('h2',null,'Agent briefing'));if(NARRATIVE.error)add(box,h('p','warn','Agent briefing unavailable. Refresh to retry; source records remain below.'));
-if(!v){if(!NARRATIVE.error)add(box,h('p','note','Loading agent briefing…'));add(root,box);return}
-v.warnings.forEach(function(w){add(box,h('p','warn',w))});if(!v.window.complete)add(box,h('p','warn','This briefing covers a bounded portion of the catch-up window; more records may exist.'));
-if(v.status==='ready'){add(box,h('p','t',v.output.headline));v.output.headline_references.forEach(function(id){add(box,narrativeSource(v,id))});[['Reported facts',v.output.facts],['What this may mean for your work',v.output.implications]].forEach(function(group){if(!group[1].length)return;add(box,h('h3',null,group[0]));var list=h('ul');group[1].forEach(function(t){var row=h('li','att',t.text);t.references.forEach(function(id){add(row,narrativeSource(v,id))});add(list,row)});add(box,list)});add(box,h('p','note','Reported by '+(v.generated_by||'connected agent')+(v.generated_at===null?'':' · '+when(v.generated_at))))}
-else add(box,h('p','note',v.status==='failed'?'No generated briefing is available for this window. Check the reported warning; this page keeps checking for recovery.':v.status==='generating'?'A connected agent is writing this briefing.':'Waiting for a connected agent to write this briefing. The Hub does not launch a model.'));
-add(box,h('p','note','Work events '+v.window.event_from+' → '+v.window.event_through+' · Merge observations '+v.window.merge_from+' → '+v.window.merge_through+'. Agent reporting is not independent verification or edit authority. Reading never marks review complete.'));add(root,box)}
+function srcText(v,id){var s=v.sources.find(function(x){return x.id===id});return s.label+(s.work_id?' · Work '+s.work_id:'')+(s.commit?' · Commit '+s.commit.slice(0,12):'')+(s.pull_number?' · PR #'+s.pull_number:'')}
+function srcs(el,v,refs){refs.forEach(function(id){add(el,h('span','src',srcText(v,id)))});return el}
+function renderNarrative(root){var v=NARRATIVE.value,ready=!!v&&v.status==='ready',meta=ready?null:!v?(NARRATIVE.error?'Unavailable':'Loading…'):v.status==='failed'?'Unavailable':v.status==='generating'?'Being written':'Waiting for an agent',d=fold('brief','Briefing',meta,ready?v.output.headline:null);d.classList.add('b');
+if(NARRATIVE.error)add(d,msg('warn','Agent briefing unavailable. Refresh to retry; source records remain below.'));
+if(!v){if(!NARRATIVE.error)add(d,h('p','note','Loading agent briefing…'));add(root,d);return}
+v.warnings.forEach(function(w){add(d,msg('warn',w))});if(!v.window.complete)add(d,msg('warn','This briefing covers a bounded portion of the catch-up window; more records may exist.'));
+if(ready){add(d,srcs(h('p','h',v.output.headline),v,v.output.headline_references));[['Reported facts',v.output.facts],['What this may mean for your work',v.output.implications]].forEach(function(group){if(!group[1].length)return;add(d,h('p','sh',group[0]));var list=h('ul');group[1].forEach(function(t){add(list,srcs(h('li',null,t.text),v,t.references))});add(d,list)});add(d,h('p','note','Reported by '+(v.generated_by||'connected agent')+(v.generated_at===null?'':' · '+when(v.generated_at))))}
+else add(d,h('p','note',v.status==='failed'?'No generated briefing is available for this window. Check the reported warning; this page keeps checking for recovery.':v.status==='generating'?'A connected agent is writing this briefing.':'Waiting for a connected agent to write this briefing. The Hub does not launch a model.'));
+add(d,h('p','note','Work events '+v.window.event_from+' → '+v.window.event_through+' · Merge observations '+v.window.merge_from+' → '+v.window.merge_through+'. Agent reporting is not independent verification or edit authority. Reading never marks review complete.'));add(root,d)}
 function narrativeCall(){if(NARRATIVE.busy)return;clearTimeout(NARRATIVE.timer);NARRATIVE.busy=true;rpc('tools/call',{name:'agentscm_briefing_read',arguments:{subscriber:'human'}}).then(function(r){NARRATIVE.value=narrativeValue(parse(r));NARRATIVE.error=!NARRATIVE.value},function(){NARRATIVE.value=null;NARRATIVE.error=true}).finally(function(){NARRATIVE.busy=false;paint();NARRATIVE.timer=setTimeout(function(){if(!document.hidden)narrativeCall()},30000)})}
 function catchClient(){var c=window.crypto;if(c&&typeof c.randomUUID==='function')return'mcp_'+c.randomUUID();if(c&&typeof c.getRandomValues==='function'){var b=c.getRandomValues(new Uint8Array(16)),s='';for(var i=0;i<b.length;i++)s+=b[i].toString(16).padStart(2,'0');return'mcp_'+s}return'mcp_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2)+'_'+Math.random().toString(36).slice(2)}
 var CATCH_CLIENT=catchClient(),CATCH={page:null,busy:false,err:null,note:null};
@@ -89,61 +137,24 @@ function catchCoord(v){if(!v||typeof v!=='object'||Array.isArray(v)||nat(v.seq)=
 function catchCoverage(v){if(!v||typeof v!=='object'||Array.isArray(v))return null;var source=v.source==='forge_pull'||v.source==='tracked_publication'?v.source:null,state=v.state==='observed_only'||v.state==='incomplete'||v.state==='unavailable'?v.state:null;if(!source||!state||v.checked_at!==null&&nat(v.checked_at)===null||nat(v.unread_pages)===null||nat(v.deferred)===null)return null;return{source:source,state:state,checked_at:v.checked_at,unread_pages:v.unread_pages,deferred:v.deferred}}
 function catchupValue(v){if(!v||typeof v!=='object'||Array.isArray(v)||!/^cup_[0-9a-f]{32}$/.test(v.delivery)||!safeText(v.subscriber,255)||!safeText(v.delivery_client,200))return null;var ef=nat(v.event_from),et=nat(v.event_through),ea=nat(v.event_after),en=nat(v.next_event_after),mf=nat(v.merge_from),mt=nat(v.merge_through),ma=nat(v.merge_after),mn=nat(v.next_merge_after);if(ef===null||et===null||ea===null||en===null||mf===null||mt===null||ma===null||mn===null||ef>ea||ea>en||en>et||mf>ma||ma>mn||mn>mt)return null;if(!Array.isArray(v.work_events)||v.work_events.length>50||!Array.isArray(v.coordination_events)||v.coordination_events.length>50||!Array.isArray(v.merges)||v.merges.length>50||!Array.isArray(v.source_coverage)||v.source_coverage.length>2)return null;var work=v.work_events.map(catchWork),coord=v.coordination_events.map(catchCoord),merges=v.merges.map(catchMerge),coverage=v.source_coverage.map(catchCoverage);if(work.indexOf(null)>=0||coord.indexOf(null)>=0||merges.indexOf(null)>=0||coverage.indexOf(null)>=0)return null;var r=v.retention;if(!r||typeof r!=='object'||Array.isArray(r)||typeof r.work_gap!=='boolean'||typeof r.coordination_gap!=='boolean'||typeof r.merge_gap!=='boolean'||nat(r.event_available_from)===null||nat(r.merge_available_from)===null||typeof v.complete!=='boolean'||v.complete!==(en===et&&mn===mt))return null;var es=work.concat(coord).map(function(x){return x.seq}).sort(function(a,b){return a-b}),ms=merges.map(function(x){return x.seq});for(var i=0;i<es.length;i++)if(es[i]<=ea||es[i]>en||i&&es[i-1]>=es[i])return null;for(var j=0;j<ms.length;j++)if(ms[j]<=ma||ms[j]>mn||j&&ms[j-1]>=ms[j])return null;return{subscriber:v.subscriber,delivery_client:v.delivery_client,delivery:v.delivery,event_from:ef,event_through:et,event_after:ea,next_event_after:en,merge_from:mf,merge_through:mt,merge_after:ma,next_merge_after:mn,work_events:work,coordination_events:coord,merges:merges,retention:r,source_coverage:coverage,complete:v.complete}}
 function appendCatch(a,b){if(!a||a.complete||!b||a.delivery!==b.delivery||a.subscriber!==b.subscriber||a.delivery_client!==b.delivery_client||a.event_from!==b.event_from||a.event_through!==b.event_through||a.merge_from!==b.merge_from||a.merge_through!==b.merge_through||a.next_event_after!==b.event_after||a.next_merge_after!==b.merge_after||JSON.stringify(a.retention)!==JSON.stringify(b.retention))return null;b.event_after=a.event_after;b.merge_after=a.merge_after;b.work_events=a.work_events.concat(b.work_events);b.coordination_events=a.coordination_events.concat(b.coordination_events);b.merges=a.merges.concat(b.merges);return b}
-function catchMergeRow(m){var x=h('li','att'),label=m.title||'Pull request #'+m.pull_number,src=h('details','source'),dl=h('dl');add(x,h('div','t',label),h('div','s','PR #'+m.pull_number+' · '+m.merge_commit.slice(0,12)+' · observed '+ago(m.observed_at)+(m.occurred_at===null?'':' · occurred '+ago(m.occurred_at))));pair(dl,'Observation',m.id);pair(dl,'Source',m.source+' · '+m.source_id);pair(dl,'Branch → base',m.branch+' → '+m.base);pair(dl,'Head commit',m.head_commit);pair(dl,'Merge commit',m.merge_commit);add(src,h('summary',null,'Source details'),dl);add(x,src);return x}
-function catchWorkRow(e){var x=h('li','att'),summary=e.item.current&&e.item.current.summary?e.item.current.summary:e.item.title,src=h('details','source'),dl=h('dl');add(x,h('div','t',e.item.title),h('div','s',(e.item.lead_agent||'unknown agent')+' · '+summary+' · '+ago(e.at)));pair(dl,'Work',e.work_id);pair(dl,'Event',e.seq+' · '+e.kind);add(src,h('summary',null,'Source details'),dl);add(x,src);return x}
-function catchCoordRow(e){var x=h('li','att'),src=h('details','source'),dl=h('dl');add(x,h('div','t',e.title),h('div','s',e.status+' · '+ago(e.at)));pair(dl,'Request',e.request_id);pair(dl,'Event',e.seq+' · '+e.kind);add(src,h('summary',null,'Source details'),dl);add(x,src);return x}
-function catchGroup(box,label,items,row,open){if(!items.length)return;var d=h('details','group'),u=h('ul');d.open=open;add(d,h('summary',null,items.length+' '+label+(items.length===1?'':'s')));items.forEach(function(item){u.appendChild(row(item))});add(d,u);box.appendChild(d)}
-function catchButton(p){var gap=p&&(p.retention.work_gap||p.retention.coordination_gap||p.retention.merge_gap),label=p&&p.complete?(gap?'Mark available records reviewed':'Mark reviewed'):'Load more',b=h('button',null,label);b.type='button';b.disabled=CATCH.busy||!p;b.addEventListener('click',function(){if(!p)return;if(p.complete)catchAck(p);else catchCall({subscriber:p.subscriber,delivery_client:CATCH_CLIENT,delivery:p.delivery,event_after:p.next_event_after,event_through:p.event_through,merge_after:p.next_merge_after,merge_through:p.merge_through},true)});return b}
-function catchCoverageNote(box,c){if(c.state==='observed_only')return;var name=c.source==='forge_pull'?'Forge pull request':'Tracked publication',checked=c.checked_at===null?'No successful source check is recorded.':'Last checked '+when(c.checked_at)+'.',unread=c.unread_pages?' '+c.unread_pages+' source pages remain unread.':'',deferred=c.deferred?' '+c.deferred+' observations were deferred.':'';add(box,h('div',c.state==='unavailable'?'warn':'note',name+' source '+c.state+'. '+checked+unread+deferred))}
-function renderCatchup(root){var p=CATCH.page,box=h('section','catchup'),head=h('div','catchup-head');add(head,h('h2',null,'Since you last checked'+(p?' ('+(p.work_events.length+p.coordination_events.length+p.merges.length)+')':'')),catchButton(p));add(box,head);if(CATCH.note)add(box,h('div',CATCH.note.bad?'warn':'note',CATCH.note.text));if(CATCH.err)add(box,h('div','warn',(p?'Could not refresh catch-up. Showing the loaded delivery. ':'Catch-up unavailable. Current Work remains below; this is not an empty result or an all-clear. ')+CATCH.err));if(!p){if(!CATCH.err)add(box,h('p','note','Loading personal catch-up…'));root.appendChild(box);return}var gap=p.retention.work_gap||p.retention.coordination_gap||p.retention.merge_gap;if(gap)add(box,h('div','warn','Earlier records are no longer retained. Review current Work and source details before acting.'));if(!p.complete)add(box,h('div','warn','More changes remain. Load every page before this fixed delivery can be marked reviewed.'));p.source_coverage.forEach(function(c){catchCoverageNote(box,c)});if(!p.work_events.length&&!p.coordination_events.length&&!p.merges.length)add(box,h('p',null,p.complete?'No new retained AgentSCM records are in this delivery.':'No records are shown on this page; later pages remain.'));catchGroup(box,'merge observation',p.merges,catchMergeRow,true);catchGroup(box,'work update',p.work_events,catchWorkRow,!p.merges.length);catchGroup(box,'coordination update',p.coordination_events,catchCoordRow,!p.merges.length&&!p.work_events.length);add(box,h('p','note','Merge entries are immutable observations recorded by AgentSCM. Source status is observational and does not claim all forge history. Current unfinished Work and coordination warnings remain below.'));var d=h('details','source'),dl=h('dl');pair(dl,'Delivery',p.delivery);pair(dl,'Work events',p.event_from+' → '+p.event_through);pair(dl,'Merge observations',p.merge_from+' → '+p.merge_through);add(d,h('summary',null,'Delivery details'),dl);add(box,d);root.appendChild(box)}
+function catchButton(p){var gap=p&&(p.retention.work_gap||p.retention.coordination_gap||p.retention.merge_gap),label=p&&p.complete?(gap?'Mark available records reviewed':'Mark reviewed'):'Load more',b=h('button','btn',label);b.type='button';b.disabled=CATCH.busy||!p;b.addEventListener('click',function(){if(!p)return;if(p.complete)catchAck(p);else catchCall({subscriber:p.subscriber,delivery_client:CATCH_CLIENT,delivery:p.delivery,event_after:p.next_event_after,event_through:p.event_through,merge_after:p.next_merge_after,merge_through:p.merge_through},true)});return b}
+function sd(rows,label){var src=h('details','sd'),dl=h('dl');rows.forEach(function(r){pair(dl,r[0],r[1])});add(src,h('summary',null,label||'Source details'),dl);return src}
+function catchMergeRow(m){var x=h('li','item');add(x,h('div','t',m.title||'Pull request #'+m.pull_number),h('div','s','PR #'+m.pull_number+' · '+m.merge_commit.slice(0,12)+' · observed '+ago(m.observed_at)+(m.occurred_at===null?'':' · occurred '+ago(m.occurred_at))),sd([['Observation',m.id],['Source',m.source+' · '+m.source_id],['Branch → base',m.branch+' → '+m.base],['Head commit',m.head_commit],['Merge commit',m.merge_commit]]));return x}
+function catchWorkRow(e){var x=h('li','item'),summary=e.item.current&&e.item.current.summary?e.item.current.summary:e.item.title;add(x,h('div','t',e.item.title),h('div','s',(e.item.lead_agent||'unknown agent')+' · '+summary+' · '+ago(e.at)),sd([['Work',e.work_id],['Event',e.seq+' · '+e.kind]]));return x}
+function catchCoordRow(e){var x=h('li','item');add(x,h('div','t',e.title),h('div','s',e.status+' · '+ago(e.at)),sd([['Request',e.request_id],['Event',e.seq+' · '+e.kind]]));return x}
+function catchGroup(box,label,items,row){if(!items.length)return;var u=h('ul');add(box,h('p','sh',items.length+' '+label+(items.length===1?'':'s')));items.forEach(function(item){u.appendChild(row(item))});add(box,u)}
+function catchCoverageNote(box,c){if(c.state==='observed_only')return;var name=c.source==='forge_pull'?'Forge pull request':'Tracked publication',checked=c.checked_at===null?'No successful source check is recorded.':'Last checked '+when(c.checked_at)+'.',unread=c.unread_pages?' '+c.unread_pages+' source pages remain unread.':'',deferred=c.deferred?' '+c.deferred+' observations were deferred.':'';add(box,msg(c.state==='unavailable'?'warn':'',name+' source '+c.state+'. '+checked+unread+deferred))}
+function renderCatchup(root){var p=CATCH.page,n=p?p.work_events.length+p.coordination_events.length+p.merges.length:0,box=fold('catch','Since you last checked',p?n+(p.complete?'':'+'):null),head=h('div','head');box.classList.add('cu');add(head,catchButton(p));add(box,head);
+if(CATCH.note)add(box,CATCH.note.bad?msg('warn',CATCH.note.text):h('p','note',CATCH.note.text));
+if(CATCH.err)add(box,msg('warn',(p?'Could not refresh catch-up. Showing the loaded delivery. ':'Catch-up unavailable. Current Work remains above; this is not an empty result or an all-clear. ')+CATCH.err));
+if(!p){if(!CATCH.err)add(box,h('p','note','Loading personal catch-up…'));add(root,box);return}
+if(p.retention.work_gap||p.retention.coordination_gap||p.retention.merge_gap)add(box,msg('warn','Earlier records are no longer retained. Review current Work and source details before acting.'));
+if(!p.complete)add(box,msg('warn','More changes remain. Load every page before this fixed delivery can be marked reviewed.'));
+p.source_coverage.forEach(function(c){catchCoverageNote(box,c)});
+if(!n)add(box,h('p','note',p.complete?'No new retained AgentSCM records are in this delivery.':'No records are shown on this page; later pages remain.'));
+catchGroup(box,'merge observation',p.merges,catchMergeRow);catchGroup(box,'work update',p.work_events,catchWorkRow);catchGroup(box,'coordination update',p.coordination_events,catchCoordRow);
+add(box,h('p','note','Merge entries are immutable observations recorded by AgentSCM. Source status is observational and does not claim all forge history. Current unfinished Work and coordination warnings remain above.'),sd([['Delivery',p.delivery],['Work events',p.event_from+' → '+p.event_through],['Merge observations',p.merge_from+' → '+p.merge_through]],'Delivery details'));add(root,box)}
 function catchCall(args,append){if(CATCH.busy)return;CATCH.busy=true;CATCH.err=null;paint();rpc('tools/call',{name:CATCHUP_TOOL,arguments:args}).then(function(r){var p=catchupValue(parse(r));if(!p||p.delivery_client!==CATCH_CLIENT){CATCH.err='The tool returned an invalid delivery.'}else if(append){var joined=appendCatch(CATCH.page,p);if(joined)CATCH.page=joined;else CATCH.err='The continuation did not match the fixed delivery.'}else CATCH.page=p;CATCH.busy=false;paint()},function(){CATCH.busy=false;CATCH.err='The catch-up tool call failed.';paint()})}
 function catchAck(p){if(CATCH.busy||!p.complete)return;CATCH.busy=true;CATCH.err=null;paint();rpc('tools/call',{name:CATCHUP_ACK_TOOL,arguments:{delivery:p.delivery,expected_event_from:p.event_from,expected_merge_from:p.merge_from}}).then(function(r){var a=parse(r),ok=a&&['advanced','already_acknowledged','conflict'].indexOf(a.status)>=0&&nat(a.event_through)!==null&&nat(a.merge_through)!==null&&nat(a.current_event_ack)!==null&&nat(a.current_merge_ack)!==null;if(!ok||a.event_through!==p.event_through||a.merge_through!==p.merge_through){CATCH.busy=false;CATCH.err='The acknowledgement returned an invalid result.';paint();return}CATCH.note={bad:a.status==='conflict',text:a.status==='conflict'?'Another device advanced this review position. Reloading without moving it backwards.':'Marked the retained records in this fixed delivery reviewed.'};CATCH.busy=false;catchCall({subscriber:'human',delivery_client:CATCH_CLIENT},false)},function(){CATCH.busy=false;CATCH.err='Could not mark reviewed. The review position was not assumed to move.';paint()})}
-function h(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=String(text);return e}
-function add(p){for(var i=1;i<arguments.length;i++)if(arguments[i])p.appendChild(arguments[i]);return p}
-function clip(s){s=String(s==null?'':s);return s.length>300?s.slice(0,300)+'…':s}
-function pad(n){return n<10?'0'+n:''+n}
-function hms(d){return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
-function ago(at){var s=Math.max(0,Math.floor(Date.now()/1000-at));if(s<60)return 'just now';var m=Math.floor(s/60);if(m<60)return m+' min ago';var x=Math.floor(m/60);return x<24?x+' h ago':Math.floor(x/24)+' d ago'}
-function pill(cls,icon,label){return h('span','pill '+cls,icon+' '+label)}
-var nextId=1,pending={},last=null,lastAt=null,lastH=0;
-function send(m){window.parent.postMessage(m,'*')}
-function rpc(method,params){return new Promise(function(ok,no){var id=nextId++;pending[id]={ok:ok,no:no};send({jsonrpc:'2.0',id:id,method:method,params:params})})}
-function parse(r){if(!r||r.isError)return null;var s=r.structuredContent;if(s&&typeof s==='object')return s;var c=r.content;if(c&&c[0]&&typeof c[0].text==='string'){try{var v=JSON.parse(c[0].text);if(v&&typeof v==='object')return v}catch(e){}}return null}
-function theme(c){if(c&&(c.theme==='dark'||c.theme==='light'))document.documentElement.setAttribute('data-theme',c.theme)}
-function size(){var v=Math.ceil(document.body.scrollHeight);if(v!==lastH){lastH=v;send({jsonrpc:'2.0',method:'ui/notifications/size-changed',params:{height:v}})}}
-function paint(){var root=document.getElementById('app');root.textContent='';if(!last){add(root,h('p','note','No data returned.'))}else render(root,last,lastAt);size()}
-function take(r,silent){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint();return}if(silent){if(!last)paint();return}fail()}
-var failedAt=null;
-function fail(){failedAt=lastAt;paint()}
-function call(args,keep){return rpc('tools/call',{name:TOOL,arguments:args}).then(function(r){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint()}else fail()},fail)}
-function refreshBtn(){var b=h('button',null,'Refresh');b.type='button';b.addEventListener('click',function(){call({});narrativeCall()});return b}
-function failNote(){return failedAt?h('div','warn','Could not refresh. Showing data from '+hms(failedAt)):null}
-window.addEventListener('message',function(e){if(e.source!==window.parent)return;var m=e.data;if(!m||m.jsonrpc!=='2.0')return;
-if(m.id!=null&&pending[m.id]&&!m.method){var p=pending[m.id];delete pending[m.id];if(m.error)p.no(m.error);else p.ok(m.result);return}
-if(m.method==='ui/notifications/tool-result')take(m.params,true);
-else if(m.method==='ui/notifications/host-context-changed')theme(m.params&&(m.params.theme?m.params:m.params.hostContext))});
-var manage='Manage these views: ask your agent to run agentscm_view_settings, or open Settings in the hub.';
-function start(){if(typeof ResizeObserver==='function')new ResizeObserver(size).observe(document.body);
-rpc('ui/initialize',{appInfo:{name:TOOL+'-view',version:'1.0.0'},appCapabilities:{},protocolVersion:'2026-01-26'}).then(function(r){theme(r&&r.hostContext);send({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}})},function(){});
-paint();narrativeCall();catchCall({subscriber:'human',delivery_client:CATCH_CLIENT},false)}
-var FIND={q:'',items:[],cursor:null,more:false,busy:false,err:false,seq:0,timer:0,box:null,list:null,note:null,btn:null};
-function findBuild(){var root=document.getElementById('find');root.textContent='';
-var i=h('input');i.type='search';i.maxLength=200;i.placeholder='Title, branch, agent, issue number';i.setAttribute('aria-label','Find work');
-i.addEventListener('input',function(){clearTimeout(FIND.timer);FIND.timer=setTimeout(function(){FIND.q=i.value.trim();findRun(false)},250)});
-FIND.box=i;FIND.list=h('div');FIND.note=h('p','note');FIND.note.setAttribute('role','status');
-FIND.btn=h('button',null,'Load more');FIND.btn.type='button';FIND.btn.addEventListener('click',function(){findRun(true)});
-add(root,h('h2',null,'Find work'),i,FIND.note,FIND.list,FIND.btn);findPaint()}
-function findPaint(){FIND.list.textContent='';
-FIND.items.forEach(function(w){var r=h('div','row'),m=h('div','main'),x=h('div','right');
-add(m,h('div','t',clip(w.title)),h('div','s',[w.lead_agent,w.branch,w.state].filter(Boolean).map(clip).join(' · ')),h('div','id',w.id));
-add(x,h('div','s',ago(w.updated_at)));add(r,m,x);FIND.list.appendChild(r)});
-FIND.btn.hidden=!FIND.more||FIND.busy;FIND.btn.disabled=FIND.busy;
-FIND.note.textContent=FIND.err?'Could not search. Try again.':FIND.busy?'Searching…':FIND.items.length?'':FIND.asked?'No matching work.':'Search all work in this repository, finished work included.';size()}
-function findRun(append){var tok=++FIND.seq,a={};FIND.asked=true;FIND.busy=true;FIND.err=false;if(!append){FIND.items=[];FIND.cursor=null;FIND.more=false}findPaint();
-if(FIND.q)a.q=FIND.q;if(append&&FIND.cursor)a.cursor=FIND.cursor;
-rpc('tools/call',{name:'agentscm_work_search',arguments:a}).then(function(r){if(tok!==FIND.seq)return;var d=parse(r);FIND.busy=false;
-if(!d||!Array.isArray(d.items))FIND.err=true;else{FIND.items=append?FIND.items.concat(d.items):d.items;FIND.cursor=d.next_cursor||null;FIND.more=d.complete===false&&!!d.next_cursor}findPaint()},function(){if(tok!==FIND.seq)return;FIND.busy=false;FIND.err=true;findPaint()})}
-FIND.asked=false;
-findBuild();
 start();
 </script></body></html>
