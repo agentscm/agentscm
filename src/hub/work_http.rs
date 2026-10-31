@@ -34,6 +34,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/ack", post(acknowledge))
         .route("/v1/hub/standup/usage", post(usage))
         .route("/v1/hub/standup/insights", get(insights))
+        .route("/v1/hub/standup/value-metrics", get(value_metrics))
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
         .route("/v1/hub/standup/work/{id}/pr-link", get(pr_link))
         .route("/v1/hub/standup/pr-link", post(set_pr_link))
@@ -172,6 +173,28 @@ async fn usage(
     Ok(Json(
         blocking(&state, move || {
             store.work_usage(&principal.token_id, &request, unix_now())
+        })
+        .await?,
+    ))
+}
+
+async fn value_metrics(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    query: std::result::Result<Query<super::value_metrics::ValueMetricsQuery>, QueryRejection>,
+) -> Result<Json<super::value_metrics::ValueMetrics>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    if query
+        .repository
+        .as_ref()
+        .is_some_and(|name| name != &principal.repository)
+    {
+        return Err(ApiError::invalid());
+    }
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.value_metrics(&principal.token_id, &query, unix_now())
         })
         .await?,
     ))

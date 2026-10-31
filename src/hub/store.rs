@@ -806,6 +806,41 @@ pub trait Store: Send + Sync {
         run_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RunHead>>;
+    fn receipt_mode_get(&self, token: &str, session: &str, now: i64) -> Result<Option<String>>;
+    fn receipt_mode_set(&self, token: &str, session: &str, mode: &str, now: i64) -> Result<()>;
+    fn receipt_work_remember(&self, token: &str, session: &str, work: &str, now: i64)
+    -> Result<()>;
+    fn receipt_work_ids(&self, token: &str, session: &str, now: i64) -> Result<Vec<String>>;
+    fn receipt_announce(
+        &self,
+        token: &str,
+        session: &str,
+        work: &str,
+        generation: i64,
+        version: &str,
+        now: i64,
+    ) -> Result<bool>;
+    /// Repository token reads always recheck the live credential, including cached callers.
+    fn value_scope(&self, token: &str, now: i64) -> Result<super::value_metrics::ValueScope>;
+    fn value_metrics(
+        &self,
+        token: &str,
+        query: &super::value_metrics::ValueMetricsQuery,
+        now: i64,
+    ) -> Result<super::value_metrics::ValueMetrics>;
+    /// Caller must have just checked the person's current repository role, as for repository_work_overview.
+    fn repository_value_facts(
+        &self,
+        who: &Principal,
+        query: &super::value_metrics::ValueMetricsQuery,
+        now: i64,
+    ) -> Result<super::value_metrics::ValueFacts>;
+    fn value_observe(
+        &self,
+        token: &str,
+        observation: &super::value_metrics::ValueObservation,
+        now: i64,
+    ) -> Result<()>;
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;

@@ -4,6 +4,7 @@ import { RefusalNotice } from '../Refusal.tsx'
 import { SectionTabs, type WebChoice } from '../TopNav.tsx'
 import { Ago, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
+import { ValueMetricsSection } from '../ValueMetrics.tsx'
 import type { Load } from './Computers.tsx'
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
@@ -65,6 +66,7 @@ export function RepositoriesPage({ auth, web, current }: { auth: Load<DeviceAuth
           <Box icon="collection" tone={needing > 0 ? 'bad' : 'brand'} title="All repositories" count={v.rows.length} explain="Counts only, checked against your role on the forge when this page refreshes (every two minutes; the Hub reuses an answer for up to 90 seconds). Needs you counts blockers, quiet leads, handovers, overlapping declared work and files two agents hold; pull-request overlaps show on each Dashboard.">
             {v.rows.length === 0 ? <Empty icon="plug" title="No connected repository you can read">Ask a repository owner for access, or connect an agent to a repository first.</Empty> : <Rows rows={v.rows} current={current} onOpen={web ? open : undefined} opening={refused ? null : opening} />}
           </Box>
+          <ValueMetricsSection session={session} repositories={v.rows} onOpen={web ? open : undefined} />
           {!v.complete && <p className="muted small">Only the first 200 connected repositories are checked.</p>}
         </div>
       ) : null}

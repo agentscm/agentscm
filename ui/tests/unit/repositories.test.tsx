@@ -9,7 +9,7 @@ const ROW = (repository: string, extra: Record<string, unknown> = {}) => ({ repo
 function stubList(body: unknown) {
   const calls: string[] = []
   vi.stubGlobal('fetch', async (url: string) => {
-    calls.push(url)
+    if (url === '/v1/hub/session/repositories') calls.push(url)
     return new Response(JSON.stringify(body), { status: url === '/v1/hub/session/repositories' ? 200 : 404, headers: { 'content-type': 'application/json' } })
   })
   return calls
@@ -24,7 +24,7 @@ describe('All repositories', () => {
     stubList({ repositories: [ROW('example-org/api', { needs_you: 2, unfinished: { total: 3, moving: 1, stuck: 2 }, agents: 4, last_activity_at: 1_790_000_000 }), ROW('example-org/docs', { complete: false, agents: 1 }), ROW('not a repo')], unchecked: 1, complete: true })
     render(<RepositoriesPage auth={AUTH} current={null} />)
     await screen.findByText('api')
-    const rows = screen.getAllByRole('listitem')
+    const rows = Array.from(document.querySelectorAll('.repo-list > li'))
     expect(rows.map((r) => r.querySelector('.repo-row-name')?.textContent)).toEqual(['example-org/api', 'example-org/docs'])
     expect(rows[0]!.textContent).toContain('2 need you')
     expect(rows[0]!.textContent).toContain('3 unfinished · 1 moving · 2 stuck · 4 agents connected')

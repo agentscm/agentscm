@@ -8859,6 +8859,209 @@ impl Store for PgStore {
             let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now);tx.commit()?;Ok(Some(summary))})
     }
 
+    fn receipt_mode_get(&self, token: &str, session: &str, now: i64) -> Result<Option<String>> {
+        super::intent::text("receipt session", session, 255)?;
+        let key = super::value_metrics::identity(&[session]);
+        self.run(true,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;
+            tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",&[&format!("receipt-preference:{token}")])?;
+            tx.execute("DELETE FROM hub_value_receipt_preferences WHERE updated_at<$1",&[&now.saturating_sub(30*86400)])?;
+            let _=who;
+            let result=tx.query_opt("SELECT mode FROM hub_value_receipt_preferences WHERE token=$1 AND session_key=$2",&[&token,&key])?.map(|r|r.get(0));
+            tx.commit()?;Ok(result)})
+    }
+    fn receipt_mode_set(&self, token: &str, session: &str, mode: &str, now: i64) -> Result<()> {
+        if !matches!(mode, "automatic" | "requested_only" | "disabled") {
+            return Err(HubError::Invalid("invalid receipt mode".into()));
+        }
+        super::intent::text("receipt session", session, 255)?;
+        let key = super::value_metrics::identity(&[session]);
+        self.run(true,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;
+            tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",&[&format!("receipt-preference:{token}")])?;
+            tx.execute("DELETE FROM hub_value_receipt_preferences WHERE updated_at<$1",&[&now.saturating_sub(30*86400)])?;
+            if who.read_only{return Err(HubError::Unauthorized);}
+            let (count,exists):(i64,bool)={let row=tx.query_one("SELECT COUNT(*)::bigint,COALESCE(bool_or(session_key=$2),false) FROM hub_value_receipt_preferences WHERE token=$1",&[&token,&key])?;(row.get(0),row.get(1))};
+            if count>=32 && !exists{return Err(HubError::Unavailable("receipt preference capacity reached".into()));}
+            tx.execute("INSERT INTO hub_value_receipt_preferences(token,session_key,mode,updated_at) VALUES($1,$2,$3,$4) ON CONFLICT(token,session_key) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at",&[&token,&key,&mode,&now])?;
+            tx.commit()?;Ok(())})
+    }
+
+    fn receipt_work_remember(
+        &self,
+        token: &str,
+        session: &str,
+        work: &str,
+        now: i64,
+    ) -> Result<()> {
+        super::intent::text("receipt session", session, 255)?;
+        let key = super::value_metrics::identity(&[session]);
+        self.run(true, |client|{ let mut tx=client.transaction()?; let who=work_who(&mut tx,token,now)?;
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",&[&format!("value-receipt:{token}")])?;
+        tx.execute("DELETE FROM hub_value_receipt_announcements WHERE announced_at<$1",&[&now.saturating_sub(30*86400)])?;
+        tx.execute("DELETE FROM hub_value_receipt_work WHERE updated_at<$1",&[&now.saturating_sub(30*86400)])?;
+        let item=scoped_work(&mut tx,&who,work,now,false)?.ok_or_else(||HubError::Invalid("unknown receipt Work".into()))?;
+        if !(item.participants.iter().any(|p|p.token==token && p.session==session) || item.lead_token==token && item.lead_session==session) {return Err(HubError::Unauthorized);}
+        tx.execute("INSERT INTO hub_value_receipt_work(token,session_key,work,updated_at) VALUES($1,$2,$3,$4) ON CONFLICT(token,session_key,work) DO UPDATE SET updated_at=excluded.updated_at",&[&token,&key,&work,&now])?;
+        tx.execute("DELETE FROM hub_value_receipt_work WHERE token=$1 AND session_key=$2 AND work IN (SELECT work FROM hub_value_receipt_work WHERE token=$1 AND session_key=$2 ORDER BY updated_at DESC,work DESC LIMIT 100000 OFFSET 32)",&[&token,&key])?;
+        tx.execute("DELETE FROM hub_value_receipt_work WHERE token=$1 AND (session_key,work) IN (SELECT session_key,work FROM hub_value_receipt_work WHERE token=$1 ORDER BY updated_at DESC,work DESC LIMIT 100000 OFFSET 128)",&[&token])?;
+        let result=();
+        tx.commit()?; Ok(result)
+        })
+    }
+
+    fn receipt_work_ids(&self, token: &str, session: &str, now: i64) -> Result<Vec<String>> {
+        super::intent::text("receipt session", session, 255)?;
+        let key = super::value_metrics::identity(&[session]);
+        self.run(true, |client|{ let mut tx=client.transaction()?; let who=work_who(&mut tx,token,now)?;
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",&[&format!("value-receipt:{token}")])?;
+        tx.execute("DELETE FROM hub_value_receipt_announcements WHERE announced_at<$1",&[&now.saturating_sub(30*86400)])?;
+        tx.execute("DELETE FROM hub_value_receipt_work WHERE updated_at<$1",&[&now.saturating_sub(30*86400)])?;
+        let _=who;
+        let result=tx.query("SELECT work FROM hub_value_receipt_work WHERE token=$1 AND session_key=$2 ORDER BY updated_at DESC,work DESC LIMIT 32",&[&token,&key])?.iter().map(|r|r.get::<_,String>(0)).collect();
+        tx.commit()?; Ok(result)
+        })
+    }
+
+    fn receipt_announce(
+        &self,
+        token: &str,
+        session: &str,
+        work: &str,
+        generation: i64,
+        version: &str,
+        now: i64,
+    ) -> Result<bool> {
+        super::intent::text("receipt version", version, 128)?;
+        super::intent::text("receipt session", session, 255)?;
+        let key = super::value_metrics::identity(&[session]);
+        self.run(true, |client|{ let mut tx=client.transaction()?; let who=work_who(&mut tx,token,now)?;
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",&[&format!("value-receipt:{token}")])?;
+        tx.execute("DELETE FROM hub_value_receipt_announcements WHERE announced_at<$1",&[&now.saturating_sub(30*86400)])?;
+        tx.execute("DELETE FROM hub_value_receipt_work WHERE updated_at<$1",&[&now.saturating_sub(30*86400)])?;
+        let item=scoped_work(&mut tx,&who,work,now,false)?.ok_or_else(||HubError::Invalid("unknown receipt Work".into()))?;
+        if !(item.participants.iter().any(|p|p.token==token && p.session==session) || item.lead_token==token && item.lead_session==session) {return Err(HubError::Unauthorized);}
+        if item.generation!=generation{return Err(HubError::Invalid("receipt generation changed".into()));}
+        tx.execute("INSERT INTO hub_value_receipt_work(token,session_key,work,updated_at) VALUES($1,$2,$3,$4) ON CONFLICT(token,session_key,work) DO UPDATE SET updated_at=excluded.updated_at",&[&token,&key,&work,&now])?;
+        let count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_value_receipt_announcements WHERE token=$1 AND session_key=$2 AND work=$3 AND generation=$4",&[&token,&key,&work,&generation])?.get(0);
+        if count>=64 { let exists:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM hub_value_receipt_announcements WHERE token=$1 AND session_key=$2 AND work=$3 AND generation=$4 AND version=$5)",&[&token,&key,&work,&generation,&version])?.get(0);tx.commit()?;return if exists{Ok(false)}else{Err(HubError::Unavailable("receipt announcement capacity reached".into()))}; }
+        let result=tx.execute("INSERT INTO hub_value_receipt_announcements(token,session_key,work,generation,version,announced_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",&[&token,&key,&work,&generation,&version,&now])?==1;
+        tx.commit()?; Ok(result)
+        })
+    }
+
+    fn value_scope(&self, token: &str, now: i64) -> Result<super::value_metrics::ValueScope> {
+        let who = self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            work_who(&mut tx, token, now)
+        })?;
+        Ok(super::value_metrics::ValueScope {
+            provider: who.owner.identity.provider,
+            host: who.owner.identity.host,
+            repository: who.repository,
+            repository_id: who.repository_id,
+        })
+    }
+
+    fn value_metrics(
+        &self,
+        token: &str,
+        query: &super::value_metrics::ValueMetricsQuery,
+        now: i64,
+    ) -> Result<super::value_metrics::ValueMetrics> {
+        let who = self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            work_who(&mut tx, token, now)
+        })?;
+        let principal = Principal {
+            token_id: token.into(),
+            name: who.agent,
+            repository: who.repository,
+            repository_id: who.repository_id,
+            expires_at: now + 1,
+            read_only: who.read_only,
+            owner: who.owner,
+        };
+        let facts = self.repository_value_facts(&principal, query, now)?;
+        super::value_metrics::project_cached(vec![facts], query, now, token)
+    }
+
+    fn repository_value_facts(
+        &self,
+        who: &Principal,
+        query: &super::value_metrics::ValueMetricsQuery,
+        now: i64,
+    ) -> Result<super::value_metrics::ValueFacts> {
+        use super::value_metrics::*;
+        let (since, until) = query.window(now)?;
+        self.run(false,|client|{let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).start()?;
+        if !who.token_id.is_empty(){let live=work_who(&mut tx,&who.token_id,now)?;if live.repository!=who.repository || live.repository_id!=who.repository_id || live.owner.id!=who.owner.id{return Err(HubError::Unauthorized);}}
+        let lock:Option<String>=tx.query_opt("SELECT lock_json FROM hub_skill_adoptions WHERE repository=$1",&[&who.repository])?.map(|r|r.get(0));
+        let current_configuration=configuration(lock.as_deref());
+        let scope=ValueScope{provider:who.owner.identity.provider.clone(),host:who.owner.identity.host.clone(),repository:who.repository.clone(),repository_id:who.repository_id};
+        let provider=&scope.provider;let host=&scope.host;let repository=&scope.repository;let repository_id=&scope.repository_id;
+        let cap=(MAX_FACTS+1) as i64;let work_id=query.work_id.as_deref();
+        let own_request_limit=MAX_OBSERVATIONS as i64;let usage_limit=if work_id.is_some(){MAX_OBSERVATIONS}else{MAX_FACTS};let usage_cap=(usage_limit+1) as i64;
+        let usage_rows=tx.query("SELECT u.request,u.work,u.received_at,t.owner FROM hub_work_model_usage u JOIN hub_work_items w ON w.id=u.work JOIN hub_agent_tokens t ON t.id=u.author_token WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4 AND ($5::text IS NULL OR u.work=$5) AND u.received_at>=$6 AND u.received_at<=$7 ORDER BY u.received_at DESC,u.work DESC,u.observation_id DESC LIMIT $8",&[&provider,&host,&repository,&repository_id,&work_id,&since,&until,&usage_cap])?.iter().map(|r|(r.get::<_,String>(0),r.get::<_,String>(1),r.get::<_,i64>(2),r.get::<_,String>(3))).collect::<Vec<_>>();
+        let mut complete=usage_rows.len()<=usage_limit;
+        let usage=usage_rows.into_iter().take(usage_limit).map(|(s,work,at,owner)|Ok(ValueUsage{owner,work,at,request:json_value::<UsageRecord>(&s)?})).collect::<Result<Vec<_>>>()?;
+        // Membership scans retained history only for this authorized Work's bounded in-window request identities.
+        // The outer history has no time bound; relevant metadata cap hits still fail closed.
+        let membership_rows=if work_id.is_some(){tx.query("SELECT u.work,u.model_provider,u.request::jsonb->>'provider_request_id' FROM hub_work_model_usage u JOIN hub_work_items w ON w.id=u.work WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4 AND (u.model_provider,u.request::jsonb->>'provider_request_id') IN (SELECT own.model_provider,own.request::jsonb->>'provider_request_id' FROM hub_work_model_usage own JOIN hub_work_items subject ON subject.id=own.work WHERE subject.provider=$1 AND subject.host=$2 AND subject.repository=$3 AND subject.repository_id IS NOT DISTINCT FROM $4 AND own.work=$5 AND own.received_at>=$6 AND own.received_at<=$7 AND own.request::jsonb->>'measurement_scope'='request' AND own.request::jsonb->>'provider_request_id' IS NOT NULL ORDER BY own.received_at DESC,own.observation_id DESC LIMIT $9) LIMIT $8",&[&provider,&host,&repository,&repository_id,&work_id,&since,&until,&cap,&own_request_limit])?.iter().map(|r|(r.get::<_,String>(0),r.get::<_,String>(1),r.get::<_,String>(2))).collect::<Vec<_>>()}else{Vec::new()};
+        let request_membership_complete=membership_rows.len()<=MAX_FACTS;
+        let mut request_membership:BTreeMap<String,BTreeSet<String>>=BTreeMap::new();
+        for (work,provider,request) in membership_rows.into_iter().take(MAX_FACTS){request_membership.entry(identity(&[&provider,&request])).or_default().insert(work);}
+        let key=repository_id.unwrap_or(-1);
+        let observation_rows=tx.query("SELECT seq,payload,observed_at FROM hub_value_observations WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND ($5::text IS NULL OR payload::jsonb->>'work_id'=$5 OR (payload::jsonb->>'kind'='issue' AND payload::jsonb->>'state'='resolved' AND payload::jsonb->>'identity' IN (SELECT payload::jsonb->>'identity' FROM hub_value_observations WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND payload::jsonb->>'work_id'=$5 AND payload::jsonb->>'state'='unresolved'))) AND observed_at<=$6 ORDER BY seq DESC LIMIT $7",&[&provider,&host,&repository,&key,&work_id,&until,&cap])?.iter().map(|r|(r.get::<_,i64>(0),r.get::<_,String>(1),r.get::<_,i64>(2))).collect::<Vec<_>>();
+        complete &= observation_rows.len()<=MAX_FACTS;
+        let mut observations=observation_rows.into_iter().take(MAX_FACTS).map(|(sequence,s,at)|Ok(StoredValueObservation{sequence,at,observation:json_value::<ValueObservation>(&s)?})).collect::<Result<Vec<_>>>()?;
+        observations.sort_by_key(|o|o.sequence);
+        let namespace=repository_namespace(repository,*repository_id);
+        let token=(!who.token_id.is_empty()).then_some(who.token_id.as_str());
+        let delivery_rows=tx.query("SELECT id,created_at,acknowledged,page,COALESCE(subscriber_token,'human') FROM hub_catchup_deliveries WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND created_at>=$5 AND created_at<=$6 AND owner=$7 AND ($8::text IS NULL OR subscriber_token=$8) ORDER BY created_at DESC,id DESC LIMIT $9",&[&provider,&host,&namespace,&key,&since,&until,&who.owner.id,&token,&cap])?.iter().map(|r|(r.get::<_,String>(0),r.get::<_,i64>(1),r.get::<_,bool>(2),r.get::<_,String>(3),r.get::<_,String>(4))).collect::<Vec<_>>();
+        complete &= delivery_rows.len()<=MAX_FACTS;
+        let deliveries=delivery_rows.into_iter().take(MAX_FACTS).map(|(id,at,ack,s,namespace)|Ok(ValueDelivery{token_namespace:identity(&[&namespace]),id,at,acknowledged:ack,page:json_value::<CatchupPage>(&s)?})).collect::<Result<Vec<_>>>()?;
+        let merge_rows=tx.query("SELECT id,observed_at,head_commit,merge_commit,source,pull_number FROM hub_catchup_merges WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND observed_at>=$5 AND observed_at<=$6 ORDER BY seq DESC LIMIT $7",&[&provider,&host,&namespace,&key,&since,&until,&cap])?.iter().map(|r|(r.get::<_,String>(0),r.get::<_,i64>(1),r.get::<_,String>(2),r.get::<_,String>(3),r.get::<_,String>(4),r.get::<_,i64>(5))).collect::<Vec<_>>();
+        complete &= merge_rows.len()<=MAX_FACTS;
+        let merges=merge_rows.into_iter().take(MAX_FACTS).map(|(id,at,head,merge_commit,source,pull_number)|ValueMerge{id,at,head,merge_commit,source,pull_number}).collect::<Vec<_>>();
+        let merge_heads=merges.iter().map(|merge|merge.head.clone()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        // Only the eligible cohort and bounded source references need current metadata.
+        // Unrelated finished history must not consume the Work metadata cap.
+        let referenced_work_ids=observations.iter().filter_map(|stored|stored.observation.work_id.clone())
+            .chain(usage.iter().map(|usage|usage.work.clone()))
+            .chain(deliveries.iter().flat_map(|delivery|delivery.page.work_events.iter().map(|event|event.work_id.clone())))
+            .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let work_rows=tx.query("SELECT w.snapshot FROM hub_work_items w WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4 AND (($5::text IS NOT NULL AND w.id=$5) OR ($5::text IS NULL AND w.created_at<=$6 AND ((w.updated_at>=$8 AND w.updated_at<=$6) OR w.state<>'finished' OR w.id=ANY($9::text[]) OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(w.snapshot::jsonb->'current'->'source_refs','[]'::jsonb)) ref WHERE ref->>'kind'='commit' AND ref->>'oid'=ANY($10::text[]))))) ORDER BY w.updated_at DESC,w.id DESC LIMIT $7",&[&provider,&host,&repository,&repository_id,&work_id,&until,&cap,&since,&referenced_work_ids,&merge_heads])?.iter().map(|r|(r.get::<_,String>(0),)).collect::<Vec<_>>();
+        if work_id.is_some() && work_rows.is_empty() && !who.token_id.is_empty(){return Err(HubError::Invalid("unknown Work in value metrics scope".into()));}
+        complete &= work_rows.len()<=MAX_FACTS;
+        let works=work_rows.into_iter().take(MAX_FACTS).map(|(s,)|json_value::<WorkItem>(&s)).collect::<Result<Vec<_>>>()?;
+        let gap_rows=tx.query("SELECT g.rejected FROM hub_value_capture_gaps g JOIN hub_work_items w ON w.id=g.work WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3 AND w.repository_id IS NOT DISTINCT FROM $4",&[&provider,&host,&repository,&repository_id])?.iter().map(|r|(r.get::<_,i64>(0),)).collect::<Vec<_>>();
+        let cap_rejections=gap_rows.into_iter().filter(|(n,)|*n>0).count();
+        let pruning_rows=tx.query("SELECT first_pruned_at,last_pruned_at FROM hub_value_delivery_pruning WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",&[&provider,&host,&namespace,&key])?.iter().map(|r|(r.get::<_,i64>(0),r.get::<_,i64>(1))).collect::<Vec<_>>();
+        let delivery_pruned_range=pruning_rows.into_iter().next();
+        let capture_failures=capture_failed(&scope);
+        let context_population=if token.is_some(){"calling repository token's structured catch-up deliveries"}else{"signed-in owner's own structured catch-up deliveries"}.into();
+        tx.commit()?;
+        Ok(ValueFacts{scope,current_configuration,works,usage,deliveries,observations,merges,capture_failures,delivery_retained_from:Some(now.saturating_sub(86400)),cap_rejections,complete,request_membership,request_membership_complete,delivery_pruned_range,context_population})
+        })
+    }
+
+    fn value_observe(
+        &self,
+        token: &str,
+        observation: &super::value_metrics::ValueObservation,
+        now: i64,
+    ) -> Result<()> {
+        observation.validate()?;
+        let payload = json_string(observation)?;
+        let id = super::value_metrics::identity(&[&payload]);
+        self.run(true, |client| { let mut tx=client.transaction()?; let who=work_who(&mut tx,token,now)?;
+        if who.read_only {return Err(HubError::Unauthorized);}
+        lock_work_repository_shared(&mut tx,&who.owner.identity.provider,&who.owner.identity.host,&who.repository,who.repository_id)?;
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",&[&format!("value-observations:{}:{}:{}:{}",who.owner.identity.provider,who.owner.identity.host,who.repository,who.repository_id.unwrap_or(-1))])?;
+        let changed=tx.execute("INSERT INTO hub_value_observations(provider,host,repository,repository_key,observation_id,payload,observed_at) SELECT $1,$2,$3,$4,$5,$6,$7 WHERE (SELECT COUNT(*) FROM hub_value_observations WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4)<10000 ON CONFLICT DO NOTHING",&[&who.owner.identity.provider,&who.owner.identity.host,&who.repository,&who.repository_id.unwrap_or(-1),&id,&payload,&now])?;
+        if changed==0 {let exists:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM hub_value_observations WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND observation_id=$5)",&[&who.owner.identity.provider,&who.owner.identity.host,&who.repository,&who.repository_id.unwrap_or(-1),&id])?.get(0);if !exists{return Err(HubError::Unavailable("value observation capacity reached".into()));}}
+        tx.commit()?; Ok(()) })
+    }
+
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt> {
         usage.validate()?;
         let request = json_string(usage)?;
@@ -8866,7 +9069,10 @@ impl Store for PgStore {
             let item=scoped_work(&mut tx,&who,&usage.work_id,now,true)?.ok_or_else(||HubError::Invalid("unknown work".into()))?;
             if let Some(r)=tx.query_opt("SELECT author_token,request,received_at FROM hub_work_model_usage WHERE work=$1 AND observation_id=$2",&[&usage.work_id,&usage.observation_id])? {let author:String=r.get(0);let existing:String=r.get(1);let received:i64=r.get(2);if author==token&&existing==request{tx.commit()?;return Ok(UsageReceipt{work_id:usage.work_id.clone(),observation_id:usage.observation_id.clone(),received_at:received,replayed:true});}return Err(HubError::Invalid("observation_id is already used by different usage".into()));}
             let authorized=if item.state==WorkState::Finished{item.lead_token==token&&item.lead_session==usage.session&&item.generation==usage.generation}else{item.generation==usage.generation&&tx.query_opt("SELECT 1 FROM hub_work_participants WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",&[&usage.work_id,&token,&usage.session,&usage.generation])?.is_some()};if !authorized{return Err(HubError::Invalid("usage author is not a current work participant".into()));}
-            let count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1",&[&usage.work_id])?.get(0);if count>=MAX_OBSERVATIONS as i64{return Err(HubError::Invalid("work has reached the usage observation limit".into()));}
+            let count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1",&[&usage.work_id])?.get(0);if count>=MAX_OBSERVATIONS as i64{
+                tx.execute("INSERT INTO hub_value_capture_gaps(work,kind,rejected,updated_at) VALUES($1,'usage_cap',1,$2) ON CONFLICT(work,kind) DO UPDATE SET rejected=LEAST(hub_value_capture_gaps.rejected+1,1000000000),updated_at=excluded.updated_at",&[&usage.work_id,&now])?;
+                tx.commit()?;
+                return Err(HubError::Invalid("work has reached the usage observation limit".into()));}
             let phase=enum_name(&usage.phase)?;let outcome=enum_name(&usage.outcome)?;let basis=enum_name(&usage.usage_basis)?;let cost_kind=usage.cost.as_ref().map(|c|enum_name(&c.kind)).transpose()?;let currency=usage.cost.as_ref().map(|c|c.currency.as_str());let amount=usage.cost.as_ref().map(|c|c.amount_micros);let cost_basis=usage.cost.as_ref().map(|c|c.basis.as_str());
             tx.execute("INSERT INTO hub_work_model_usage (work,observation_id,author_token,request,generation,session,phase,outcome,agent,model_provider,model,usage_basis,source_commit,input_tokens,output_tokens,cost_kind,cost_currency,cost_amount_micros,cost_basis,received_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",&[&usage.work_id,&usage.observation_id,&token,&request,&usage.generation,&usage.session,&phase,&outcome,&usage.agent,&usage.provider,&usage.model,&basis,&usage.source_commit,&usage.input_tokens,&usage.output_tokens,&cost_kind,&currency,&amount,&cost_basis,&now])?;
             adjust_work_payload_capacity(&mut tx,&who,work_payload_row_bytes(request.len())?,now)?;tx.commit()?;Ok(UsageReceipt{work_id:usage.work_id.clone(),observation_id:usage.observation_id.clone(),received_at:now,replayed:false})})
@@ -9483,15 +9689,19 @@ impl Store for PgStore {
         }else{tx.execute("UPDATE hub_catchup_deliveries SET page_event_after=$2,page_merge_after=$3,
             next_event_after=$4,next_merge_after=$5,page=$6,complete=$7,updated_at=$8 WHERE id=$1",
             &[&delivery,&event_from,&merge_from,&page.next_event_after,&page.next_merge_after,&serialized,&page.complete,&now])?;}
-        tx.execute("DELETE FROM hub_catchup_deliveries WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2
+        let pruned=tx.query("DELETE FROM hub_catchup_deliveries WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2
             AND subscriber=$3 AND delivery_client=$4 AND provider=$5 AND host=$6 AND repository=$7
             AND repository_key=$8 AND (acknowledged OR superseded) AND id NOT IN
               (SELECT id FROM hub_catchup_deliveries WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2
                AND subscriber=$3 AND delivery_client=$4 AND provider=$5 AND host=$6 AND repository=$7
                AND repository_key=$8 AND (acknowledged OR superseded)
-               ORDER BY updated_at DESC,id DESC LIMIT 8)",
+               ORDER BY updated_at DESC,id DESC LIMIT 8) RETURNING created_at",
             &[&who.owner.id,&subscriber_token,&query.subscriber,&query.delivery_client,
               &who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?;
+        let times=pruned.iter().map(|row|row.get::<_,i64>(0)).collect::<Vec<_>>();
+        if let (Some(first),Some(last))=(times.iter().min(),times.iter().max()){
+            tx.execute("INSERT INTO hub_value_delivery_pruning(provider,host,repository,repository_key,first_pruned_at,last_pruned_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(provider,host,repository,repository_key) DO UPDATE SET first_pruned_at=LEAST(hub_value_delivery_pruning.first_pruned_at,excluded.first_pruned_at),last_pruned_at=GREATEST(hub_value_delivery_pruning.last_pruned_at,excluded.last_pruned_at)",&[&who.owner.identity.provider,&who.owner.identity.host,&repository,&key,first,last])?;
+        }
         tx.commit()?;Ok(page)})
     }
 

@@ -86,3 +86,44 @@ Layout: header (open count, updated time, Refresh); one row per request with a s
 ## Not verified
 
 Per-host size limits, whether any host adds app-initiated results to model context, and Claude Code behaviour.
+
+## Observed contribution view
+
+`ui://agentscm/value-metrics` extends the resource set above. It uses the same
+`agentscm.observed.v1` structured projection as `agentscm_value_metrics` and the Hub's
+observed contribution section. It is enabled with the existing Work overview view setting.
+Repository-token reads remain repository-scoped. The HTML contains no credentials,
+external assets or additional data requests; refresh and evidence pagination use only
+`agentscm_value_metrics` through the host.
+
+The view follows the Hub's Twilight palette with host-provided light/dark appearance.
+A human-readable repository and UTC period lead the page. Aligned contribution counts
+and recorded resources follow, while one coverage statement keeps uncertainty visible.
+Coverage reasons, exact source and evidence identities, assurance/applicability, accounting
+bases, raw micros and projection identity are available in native keyboard-accessible
+`details` disclosures. Charge and reference-price amounts remain separate, with exact
+integer-micro decimal formatting even below one cent. Missing values remain unknown.
+Evidence summaries use the evidence type and state; long identities appear in detail.
+At narrow iframe widths, the sections follow the same reading order in one column.
+
+The currently unsupported outcome categories—dismissed episodes, false-trigger classifications,
+failed follow-ups and cancelled follow-ups—display `Not captured` when their fields are null.
+Other missing observations remain `Unknown`; a supported recorded zero remains `0`.
+
+The contribution view clears earlier evidence on a refused or incompatible read. Each
+app-initiated request has a monotonically increasing epoch; older success and failure
+responses cannot overwrite the current request or Work filter. MCP tool results carry
+`_meta["agentscm/value-metrics-scope"]` with their original `work_id`, `since` and `until`
+arguments so a different scope cannot replace the current view.
+
+Unsolicited host tool-result notifications do not carry a correlated request generation.
+The app therefore accepts only its initial host delivery. An explicit refresh, pagination,
+or subsequent tool-input notification permanently fences earlier unsolicited host results
+for that iframe. A new input clears the old display; the user can refresh to retrieve the
+new scope through an epoch-bound request. Repeating the same input after a refusal cannot
+make a late old host result current again. This preference for an explicit read preserves
+the access boundary when notification ordering is ambiguous.
+
+The view makes no read solely because it rendered, never acknowledges context and never
+changes receipt preferences, Work or merge authority. Local bridge rendering and transport
+tests do not establish qualification in an installed native MCP app host.

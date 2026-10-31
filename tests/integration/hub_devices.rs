@@ -2430,3 +2430,139 @@ async fn web_read_tokens_cannot_cross_workspace_authentication_and_hub_sign_out_
         200
     );
 }
+
+#[tokio::test]
+async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    env.connect_repo("acme/docs", 4343, ALICE);
+    env.connect_repo("acme/secret", 4444, BOB);
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles
+            .insert(("acme/docs".into(), ALICE), ("write", "write"));
+        fake.roles
+            .insert(("acme/secret".into(), BOB), ("write", "write"));
+    }
+    let cookie = web_sign_in(&env, ALICE).await;
+    let host = env.base.trim_start_matches("http://");
+    let create = |user_id, login: &str, repository: &str, repository_id, key: &str, title: &str| {
+        let owner = env
+            .store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: host.into(),
+                    user_id,
+                },
+                login,
+            )
+            .unwrap();
+        let (token, secret, _) = mint_bound_agent_token(
+            &*env.store,
+            &owner.id,
+            "metrics-fixture",
+            repository,
+            repository_id,
+            600,
+            false,
+        )
+        .unwrap();
+        let item = env
+            .store
+            .work_start(
+                &token,
+                &WorkStart {
+                    work_id: None,
+                    source: None,
+                    request_key: Some(key.into()),
+                    title: title.into(),
+                    session: key.into(),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("src/{key}.rs")],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: vec![],
+                    related_work: vec![],
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap()
+            .item;
+        (item, secret.expose().to_owned())
+    };
+    let (other, _) = create(
+        ALICE,
+        "alice",
+        REPO,
+        REPO_ID,
+        "other-visible",
+        "Other visible Work",
+    );
+    let (target, target_secret) = create(
+        ALICE,
+        "alice",
+        "acme/docs",
+        4343,
+        "docs-target",
+        "Visible docs target",
+    );
+    let (hidden, _) = create(
+        BOB,
+        "bob",
+        "acme/secret",
+        4444,
+        "hidden-target",
+        "Private target sentinel",
+    );
+    let path = format!("/v1/hub/session/value-metrics?work_id={}", target.id);
+    let (status, metrics) = with_cookie(&env.hub, Method::GET, &path, &cookie, None).await;
+    assert_eq!(status, 200, "{metrics}");
+    let scopes = metrics["scope"].as_array().unwrap();
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(scopes[0]["repository"], "acme/docs");
+    let serialized = metrics.to_string();
+    for marker in [
+        other.id.as_str(),
+        hidden.id.as_str(),
+        "acme/secret",
+        "Private target sentinel",
+    ] {
+        assert!(!serialized.contains(marker), "{serialized}");
+    }
+    let unknown_path = "/v1/hub/session/value-metrics?work_id=wrk_ffffffffffffffffffffffffffffffff";
+    let (unknown_status, unknown) =
+        with_cookie(&env.hub, Method::GET, unknown_path, &cookie, None).await;
+    let (hidden_status, inaccessible) = with_cookie(
+        &env.hub,
+        Method::GET,
+        &format!("/v1/hub/session/value-metrics?work_id={}", hidden.id),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(unknown_status, 404);
+    assert_eq!(hidden_status, 404);
+    assert_eq!(unknown, inaccessible);
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::GET,
+            &format!("/v1/hub/standup/value-metrics?work_id={}", other.id),
+            Some(&target_secret),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400);
+    env.fake
+        .lock()
+        .unwrap()
+        .roles
+        .remove(&("acme/docs".into(), ALICE));
+    let (revoked_status, revoked) = with_cookie(&env.hub, Method::GET, &path, &cookie, None).await;
+    assert_eq!(revoked_status, 404);
+    assert_eq!(revoked, unknown);
+}
