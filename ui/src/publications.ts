@@ -209,7 +209,7 @@ const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`
 export function outcomeStep(key: 'ci' | 'deploys', p: Publication): Step {
   const label = key === 'ci' ? 'CI' : 'Deploys'
   const icon = key === 'ci' ? 'gear-wide-connected' : 'cloud-upload'
-  if (p.pr.state !== 'merged') return { key, label, icon, tone: 'muted', word: 'After merge', detail: 'Checked only once the change has merged.' }
+  if (p.pr.state !== 'merged') return { key, label, icon, tone: 'muted', word: 'Not yet', detail: 'Watched after merge: checked only once the change has merged.' }
   const x = p.external
   if (!x) return { key, label, icon, tone: 'muted', word: 'Not tracked', detail: 'This hub is not watching CI and deployments for this repository.' }
   if (x.state === 'unobserved') return { key, label, icon, tone: 'muted', word: 'Not checked yet', detail: 'The hub has not read this merge yet. An empty list does not mean success.' }
@@ -259,9 +259,18 @@ export function track(p: Publication): Step[] {
         : { key: 'pr', label: 'Pull request', icon: 'arrow-left-right', tone: 'muted', word: p.pr.state === 'pending' ? 'Pending' : 'Unknown' }
   const merged: Step =
     p.pr.state === 'merged'
-      ? { key: 'merged', label: 'Merged', icon: 'sign-merge-right', tone: 'ok', word: 'Merged' }
-      : { key: 'merged', label: 'Merged', icon: 'sign-merge-right', tone: 'muted', word: rejected ? 'Not started' : 'Not yet' }
+      ? { key: 'merged', label: 'Merge', icon: 'sign-merge-right', tone: 'ok', word: 'Merged' }
+      : { key: 'merged', label: 'Merge', icon: 'sign-merge-right', tone: 'muted', word: rejected ? 'Not started' : 'Not yet' }
   return [branch, pr, merged, outcomeStep('ci', p), outcomeStep('deploys', p)]
+}
+
+/** "12 Oct to 30 Oct": the dates the listed changes were published (or last updated), oldest to newest; null when none has a time. */
+export function dateSpan(pubs: Publication[]): string | null {
+  const at = pubs.map((p) => p.createdAt ?? p.updatedAt).filter((t): t is number => t !== null && t > 0)
+  if (at.length === 0) return null
+  const day = (t: number) => new Date(t * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+  const [from, to] = [day(Math.min(...at)), day(Math.max(...at))]
+  return from === to ? from : `${from} to ${to}`
 }
 
 /** How far a change got, in one phrase, for list rows and the answer sentence. */
@@ -270,11 +279,11 @@ export function headline(p: Publication): { tone: Tone; text: string } {
   if (p.branchState === 'rejected') return { tone: 'bad', text: 'Branch rejected' }
   if (p.pr.state !== 'merged') return p.pr.state === 'opened' ? { tone: 'brand', text: 'Waiting to merge' } : { tone: 'muted', text: 'Getting ready' }
   const bad = steps.find((s) => s.tone === 'bad')
-  if (bad) return { tone: 'bad', text: `Landed, ${bad.label === 'CI' ? 'CI' : 'a deploy'} failed after` }
-  if (steps.some((s) => s.tone === 'brand')) return { tone: 'brand', text: 'Landed, checks still running' }
-  if (steps.some((s) => s.tone === 'warn')) return { tone: 'warn', text: 'Landed, only partly checked' }
-  if (steps.slice(3).every((s) => s.tone === 'ok')) return { tone: 'ok', text: 'Landed and passed' }
-  return { tone: 'muted', text: 'Landed' }
+  if (bad) return { tone: 'bad', text: `Merged, ${bad.label === 'CI' ? 'CI' : 'a deploy'} failed after` }
+  if (steps.some((s) => s.tone === 'brand')) return { tone: 'brand', text: 'Merged, checks still running' }
+  if (steps.some((s) => s.tone === 'warn')) return { tone: 'warn', text: 'Merged, only partly checked' }
+  if (steps.slice(3).every((s) => s.tone === 'ok')) return { tone: 'ok', text: 'Merged and passed' }
+  return { tone: 'muted', text: 'Merged' }
 }
 
 // ---------- Recently opened ids (this browser only)
@@ -288,7 +297,26 @@ export function loadRecent(): string[] {
     return []
   }
 }
-export function rememberRecent(id: string): string[] {
+const RECENT_LABELS_KEY = 'agentscm.hub.recentPublicationLabels'
+/** Title or branch remembered per opened id, so the chips can name the change and keep the id in a tooltip. */
+export function recentLabels(): Record<string, string> {
+  try {
+    const v: unknown = JSON.parse(window.localStorage.getItem(RECENT_LABELS_KEY) ?? '{}')
+    return v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).filter((e): e is [string, string] => typeof e[1] === 'string')) : {}
+  } catch {
+    return {}
+  }
+}
+export function rememberRecent(id: string, label?: string): string[] {
+  if (label) {
+    try {
+      const next = { ...recentLabels(), [id]: label.slice(0, 120) }
+      const keep = Object.fromEntries(loadRecent().concat(id).map((k) => [k, next[k]]).filter((e) => e[1]))
+      window.localStorage.setItem(RECENT_LABELS_KEY, JSON.stringify(keep))
+    } catch {
+      /* label not remembered */
+    }
+  }
   const next = [id, ...loadRecent().filter((x) => x !== id)].slice(0, 8)
   try {
     window.localStorage.setItem(RECENT_KEY, JSON.stringify(next))

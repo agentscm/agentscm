@@ -140,6 +140,29 @@ describe('promise authorization and exact retries', () => {
     expect(fetch.mock.calls.filter(([input]) => String(input).includes('/promises?'))).toHaveLength(2)
   })
 
+  it('leads with the list and keeps the form open only when there are no promises', async () => {
+    window.location.hash = '#promises'
+    let promises: unknown[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.endsWith('/session')) return response(200, session)
+      if (path.includes('/promises?')) return response(200, { promises, next: null })
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const empty = render(<PromisesPage />)
+    await screen.findByText('No promises yet.')
+    expect(screen.getByText('Create a promise', { selector: 'summary' }).closest('details')!.open).toBe(true)
+    expect(screen.getByText('Incoming proposals (suggested by agents)').closest('details')!.open).toBe(false)
+    empty.unmount()
+    promises = [{ current: version(1, DIGEST_A) }]
+    render(<PromisesPage />)
+    await screen.findByText('1 promise')
+    expect(screen.getByText('Create a promise', { selector: 'summary' }).closest('details')!.open).toBe(false)
+    expect(screen.getByText(/A promise is an owner-confirmed commitment/)).toBeTruthy()
+    const list = screen.getByText('Existing settings stay unchanged.')
+    expect(list.compareDocumentPosition(screen.getByText('Create a promise', { selector: 'summary' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
   it('initializes adoption editing from the exact fetched proposal', async () => {
     window.location.hash = '#promises'
     const input = { input_id: 'inp_01', repository_id: 'repo_01', actor_user: 'usr_owner', submitted_by_agent: true, payload: { kind: 'proposal', operation_id: 'op_01', repository_id: 'repo_01', original_request: 'Keep the saved preference.', commitment: 'Existing preference remains.', criteria: definition.criteria, constraints: [] }, adopted_promise: null, created_at: 1 }
@@ -154,6 +177,7 @@ describe('promise authorization and exact retries', () => {
     render(<PromisesPage />)
     await screen.findByText('No readable promises on this page')
     fireEvent.change(screen.getByLabelText('Workspace repository key'), { target: { value: 'repo_01' } })
+    fireEvent.click(screen.getByText('Incoming proposals (suggested by agents)'))
     fireEvent.click(screen.getByRole('button', { name: 'Load proposals' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Existing preference remains.' }))
     await screen.findByText('Inspect and adopt proposal')

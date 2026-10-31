@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use agentscm::hub::HubError;
+use agentscm::hub::catchup::{CatchupPreviewQuery, CatchupQuery};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
 };
@@ -14,6 +15,9 @@ use agentscm::hub::work::{
     BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, CheckpointKind, ClaimStatus, ForgeWorkRef,
     SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint,
     WorkConflictKind, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
+};
+use agentscm::hub::work_links::{
+    WorkPrHeadStatus, WorkPrLinkQuery, WorkPrLinkTarget, WorkPrLinkUpdate, WorkPrSnapshotStatus,
 };
 use hub_pg::PgSchema;
 use postgres::NoTls;
@@ -64,6 +68,7 @@ impl Db {
             "work_joined",
             "work_takeover",
             "work_checkpoint",
+            "work_pr_link",
         ];
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
@@ -162,6 +167,11 @@ impl Db {
                        WHERE w.provider = 'github' AND w.host = 'github.com'
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                      UNION ALL
+                     SELECT octet_length(l.snapshot)::bigint + 256 FROM hub_work_pr_links l
+                       JOIN hub_work_items w ON w.id = l.work
+                       WHERE w.provider = 'github' AND w.host = 'github.com'
+                         AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
+                     UNION ALL
                      SELECT octet_length(o.request)::bigint + 256 FROM hub_work_checkpoint_ops o
                        JOIN hub_work_items w ON w.id = o.work
                        WHERE w.provider = 'github' AND w.host = 'github.com'
@@ -179,7 +189,7 @@ impl Db {
                        WHERE w.provider = 'github' AND w.host = 'github.com'
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                          AND e.kind IN
-                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')";
+                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')";
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
             let used: i64 = client
@@ -221,6 +231,10 @@ impl Db {
                           FROM hub_work_versions v JOIN hub_work_items w ON w.id = v.work
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
+                         UNION ALL SELECT length(CAST(l.snapshot AS BLOB)) + 256
+                          FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
+                          WHERE w.provider = 'github' AND w.host = 'github.com'
+                            AND w.repository = ?1 AND w.repository_id IS ?2
                          UNION ALL SELECT length(CAST(o.request AS BLOB)) + 256
                           FROM hub_work_checkpoint_ops o JOIN hub_work_items w ON w.id = o.work
                           WHERE w.provider = 'github' AND w.host = 'github.com'
@@ -235,7 +249,7 @@ impl Db {
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
                             AND e.kind IN ('work_started', 'work_joined', 'work_takeover',
-                                           'work_checkpoint')
+                                           'work_checkpoint', 'work_pr_link')
                      )",
                     rusqlite::params![REPO, REPOSITORY_ID],
                     |row| row.get(0),
@@ -2010,6 +2024,13 @@ macro_rules! conformance {
 }
 
 conformance!(
+    pr_links_are_explicit_durable_and_snapshot_compared,
+    pr_links_require_trusted_repository_and_current_lead,
+    pr_links_fence_stale_updates_and_idempotency_collisions,
+    pr_link_receipts_replay_after_takeover_changes_and_removal,
+    pr_links_survive_compaction_with_correct_capacity,
+    pr_link_noops_leave_no_mutation_or_receipt,
+    concurrent_pr_link_updates_fence_and_replay,
     concurrent_forge_start_has_one_work_and_one_lead,
     native_and_automatic_starts_have_explicit_retry_rules,
     authorization_and_claim_projection_keep_old_claims_visible,
@@ -2026,3 +2047,713 @@ conformance!(
     concurrent_delivery_reservations_enforce_capacity_and_roll_back,
     briefing_sessions_on_one_token_have_independent_cursors,
 );
+
+fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
+    WorkPrLinkUpdate {
+        work_id: item.id.clone(),
+        operation_id: operation_id.into(),
+        generation: item.generation,
+        session: item.lead_session.clone(),
+        expected_updated_seq: item.updated_seq,
+        link: Some(WorkPrLinkTarget {
+            repository_id: REPOSITORY_ID,
+            number: 17,
+            head_sha: "a".repeat(40),
+        }),
+    }
+}
+
+fn pr_links_are_explicit_durable_and_snapshot_compared(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let lead = agent(&*store, 1);
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start("pr-link", "Explicit PR", "lead"),
+            now,
+        )
+        .unwrap()
+        .item;
+    assert!(
+        store
+            .work_pr_link_get(&lead.token, &item.id, &WorkPrLinkQuery::default(), now)
+            .unwrap()
+            .unwrap()
+            .link
+            .is_none()
+    );
+    let update = pr_link_update(&item, "link-first");
+    let result = store
+        .work_pr_link_set(&lead.token, &update, now + 1)
+        .unwrap();
+    let retained = result.view.link.as_ref().unwrap();
+    assert_eq!(retained.author, lead.owner);
+    assert_eq!(retained.token, lead.token);
+    assert_eq!(retained.linked_at, now + 1);
+    assert_eq!(retained.event_seq, result.receipt.event_seq);
+    assert_eq!(retained.target, update.link.clone().unwrap());
+    let events = store.events_after(item.updated_seq, 20).unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.kind == "work_pr_link")
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(data["operation"], "pr_link_set");
+    assert_eq!(data["relation"]["head_sha"], "a".repeat(40));
+    let preview_query = CatchupPreviewQuery {
+        subscriber: "human".into(),
+    };
+    let before = store
+        .work_catchup_preview(&lead.token, &preview_query, now + 2)
+        .unwrap();
+    let page = store
+        .work_catchup(&lead.token, &CatchupQuery::default(), now + 2)
+        .unwrap();
+    assert!(
+        page.work_events
+            .iter()
+            .any(|event| event.kind == "work_pr_link" && event.seq == result.receipt.event_seq)
+    );
+    let query = WorkPrLinkQuery {
+        expected_updated_seq: Some(item.updated_seq),
+        expected_head: Some("b".repeat(40)),
+    };
+    let current = store
+        .work_pr_link_get(&lead.token, &item.id, &query, now + 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.snapshot_status, WorkPrSnapshotStatus::WorkChanged);
+    assert_eq!(current.head_status, WorkPrHeadStatus::DiffersFromLink);
+    let after = store
+        .work_catchup_preview(&lead.token, &preview_query, now + 2)
+        .unwrap();
+    assert_eq!(before.event_ack, after.event_ack);
+    assert_eq!(after.event_ack, 0);
+    let exact = WorkPrLinkQuery {
+        expected_updated_seq: Some(result.view.updated_seq),
+        expected_head: Some("a".repeat(40)),
+    };
+    let reopened = db
+        .open()
+        .work_pr_link_get(&lead.token, &item.id, &exact, now + 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.snapshot_status, WorkPrSnapshotStatus::MatchesWork);
+    assert_eq!(reopened.head_status, WorkPrHeadStatus::MatchesLink);
+    assert_eq!(reopened.link, result.view.link);
+}
+
+fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let lead = agent(&*store, 1);
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start("pr-auth", "PR authorization", "lead"),
+            now,
+        )
+        .unwrap()
+        .item;
+    let update = pr_link_update(&item, "link-auth");
+    let reader = agent_with(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 2,
+            repository: REPO,
+            repository_id: Some(REPOSITORY_ID),
+            read_only: true,
+            ttl: TTL,
+        },
+    );
+    assert!(
+        store
+            .work_pr_link_get(&reader.token, &item.id, &WorkPrLinkQuery::default(), now)
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        store.work_pr_link_set(&reader.token, &update, now),
+        Err(HubError::Unauthorized)
+    ));
+    let other = agent(&*store, 3);
+    assert_invalid(
+        store.work_pr_link_set(&other.token, &update, now),
+        "only the current Work owner and lead session may change a PR link",
+    );
+    let wrong = agent_with(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 4,
+            repository: REPO,
+            repository_id: Some(REPOSITORY_ID + 1),
+            read_only: false,
+            ttl: TTL,
+        },
+    );
+    assert!(
+        store
+            .work_pr_link_get(&wrong.token, &item.id, &WorkPrLinkQuery::default(), now)
+            .unwrap()
+            .is_none()
+    );
+    assert_invalid(
+        store.work_pr_link_set(&wrong.token, &update, now),
+        "unknown work item",
+    );
+    let mut wrong_target = update.clone();
+    wrong_target.link.as_mut().unwrap().repository_id += 1;
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &wrong_target, now),
+        "PR link repository_id is outside the authorized Work repository",
+    );
+    let unbound = agent_with(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 5,
+            repository: REPO,
+            repository_id: None,
+            read_only: false,
+            ttl: TTL,
+        },
+    );
+    let mut unbound_start = native_start("unbound", "Missing identity", "unbound");
+    unbound_start.scope.clear();
+    let unbound_item = store
+        .work_start(&unbound.token, &unbound_start, now)
+        .unwrap()
+        .item;
+    assert_invalid(
+        store.work_pr_link_get(
+            &unbound.token,
+            &unbound_item.id,
+            &WorkPrLinkQuery::default(),
+            now,
+        ),
+        "PR relationships require a trusted stable repository ID",
+    );
+    assert_invalid(
+        store.work_pr_link_set(
+            &unbound.token,
+            &pr_link_update(&unbound_item, "unbound-link"),
+            now,
+        ),
+        "PR relationships require a trusted stable repository ID",
+    );
+    let first = store
+        .work_pr_link_set(&lead.token, &update, now + 1)
+        .unwrap();
+    assert!(
+        store
+            .work_pr_link_get(
+                &reader.token,
+                &item.id,
+                &WorkPrLinkQuery::default(),
+                now + 1
+            )
+            .unwrap()
+            .unwrap()
+            .link
+            .is_some()
+    );
+    let successor = agent(&*store, 6);
+    let taken = store
+        .work_start(
+            &successor.token,
+            &takeover(&item.id, "successor", Some(1)),
+            now + CLAIM_STALE_SECONDS + 2,
+        )
+        .unwrap();
+    assert!(taken.took_over);
+    let after_takeover = store
+        .work_pr_link_get(
+            &successor.token,
+            &item.id,
+            &WorkPrLinkQuery::default(),
+            now + CLAIM_STALE_SECONDS + 3,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_takeover.generation, 2);
+    assert_eq!(after_takeover.link, first.view.link);
+    let original_link = after_takeover.link.as_ref().unwrap();
+    assert_eq!(original_link.author, lead.owner);
+    assert_eq!(original_link.token, lead.token);
+    assert_eq!(original_link.session, "lead");
+    assert_eq!(original_link.generation, 1);
+    assert_eq!(original_link.linked_at, now + 1);
+    assert_eq!(original_link.event_seq, first.receipt.event_seq);
+    let replayed = store
+        .work_pr_link_set(&lead.token, &update, now + CLAIM_STALE_SECONDS + 3)
+        .unwrap();
+    assert!(replayed.receipt.replayed);
+    assert_eq!(replayed.receipt.generation, 1);
+    assert_eq!(replayed.receipt.event_seq, first.receipt.event_seq);
+    assert_eq!(replayed.view, after_takeover);
+    let mut old_lead_new_operation = update.clone();
+    old_lead_new_operation.operation_id = "old-lead-new-operation".into();
+    assert_invalid(
+        store.work_pr_link_set(
+            &lead.token,
+            &old_lead_new_operation,
+            now + CLAIM_STALE_SECONDS + 3,
+        ),
+        "PR link generation is fenced",
+    );
+    let mut removal = pr_link_update(&taken.item, "successor-remove");
+    removal.link = None;
+    let removed = store
+        .work_pr_link_set(&successor.token, &removal, now + CLAIM_STALE_SECONDS + 3)
+        .unwrap();
+    assert!(removed.view.link.is_none());
+    assert!(removed.view.updated_seq > first.view.updated_seq);
+}
+
+fn pr_links_fence_stale_updates_and_idempotency_collisions(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let lead = agent(&*store, 1);
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start("pr-fence", "PR fencing", "lead"),
+            now,
+        )
+        .unwrap()
+        .item;
+    let update = pr_link_update(&item, "link-fence");
+    let first = store
+        .work_pr_link_set(&lead.token, &update, now + 1)
+        .unwrap();
+    let replay = store
+        .work_pr_link_set(&lead.token, &update, now + 2)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, first.receipt.event_seq);
+    assert_eq!(work_event_count(&*store, "work_pr_link"), 1);
+    let mut conflict = update.clone();
+    conflict.link.as_mut().unwrap().number += 1;
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &conflict, now + 2),
+        "operation_id was already used for another request",
+    );
+    conflict.operation_id = "stale".into();
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &conflict, now + 2),
+        "PR link receipt expired or Work changed",
+    );
+    conflict.expected_updated_seq = first.view.updated_seq;
+    conflict.generation += 1;
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &conflict, now + 2),
+        "PR link generation is fenced",
+    );
+    let mut cp = checkpoint(
+        &item.id,
+        "link-fence",
+        item.generation,
+        "lead",
+        CheckpointKind::Progress,
+        "progress",
+    );
+    cp.expected_updated_seq = Some(first.view.updated_seq);
+    assert_invalid(
+        store.work_checkpoint(&lead.token, &cp, now + 2),
+        "checkpoint operation_id was already used for another request",
+    );
+    cp.operation_id = "checkpoint-key".into();
+    let progress = store.work_checkpoint(&lead.token, &cp, now + 2).unwrap();
+    let mut second = pr_link_update(&progress.item, "checkpoint-key");
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &second, now + 3),
+        "operation_id was already used for another request",
+    );
+    second.operation_id = "new-head".into();
+    second.link.as_mut().unwrap().head_sha = "b".repeat(40);
+    let updated = store
+        .work_pr_link_set(&lead.token, &second, now + 3)
+        .unwrap();
+    assert_eq!(
+        updated.view.link.as_ref().unwrap().target.head_sha,
+        "b".repeat(40)
+    );
+    let old_replay = store
+        .work_pr_link_set(&lead.token, &update, now + 4)
+        .unwrap();
+    assert_eq!(old_replay.view.link, updated.view.link);
+    assert_eq!(old_replay.receipt.event_seq, first.receipt.event_seq);
+    let mut removal = second.clone();
+    removal.operation_id = "remove".into();
+    removal.expected_updated_seq = updated.view.updated_seq;
+    removal.link = None;
+    let removed = store
+        .work_pr_link_set(&lead.token, &removal, now + 4)
+        .unwrap();
+    assert!(removed.view.link.is_none());
+    assert!(
+        store
+            .work_pr_link_set(&lead.token, &removal, now + 5)
+            .unwrap()
+            .receipt
+            .replayed
+    );
+    let event = store
+        .events_after(updated.view.updated_seq, 10)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "work_pr_link")
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(data["operation"], "pr_link_remove");
+    assert!(data["relation"].is_null());
+}
+
+fn pr_links_survive_compaction_with_correct_capacity(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let old = now - 3 * 86_400;
+    let lead = agent(&*store, 1);
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start("pr-retain", "PR retention", "lead"),
+            old,
+        )
+        .unwrap()
+        .item;
+    let update = pr_link_update(&item, "retained-link");
+    let linked = store
+        .work_pr_link_set(&lead.token, &update, old + 1)
+        .unwrap();
+    let mut cp = checkpoint(
+        &item.id,
+        "retained-progress",
+        1,
+        "lead",
+        CheckpointKind::Progress,
+        "new baseline",
+    );
+    cp.expected_updated_seq = Some(linked.view.updated_seq);
+    let progress = store.work_checkpoint(&lead.token, &cp, old + 2).unwrap();
+    let (charged, aggregate) = db.work_usage_and_aggregate();
+    assert_eq!(charged, aggregate);
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    store
+        .work_compact(&scope, now - 2 * 86_400, true, now)
+        .unwrap();
+    let current = store
+        .work_pr_link_get(&lead.token, &item.id, &WorkPrLinkQuery::default(), now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.link, linked.view.link);
+    assert_eq!(current.updated_seq, progress.item.updated_seq);
+    assert!(
+        !store
+            .events_after(0, 100)
+            .unwrap()
+            .iter()
+            .any(|e| e.seq == linked.receipt.event_seq)
+    );
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &update, now),
+        "PR link receipt expired or Work changed",
+    );
+    let (charged, aggregate) = db.work_usage_and_aggregate();
+    assert_eq!(charged, aggregate);
+    let mut removal = pr_link_update(&progress.item, "retained-remove");
+    removal.link = None;
+    store.work_pr_link_set(&lead.token, &removal, now).unwrap();
+    let (charged, aggregate) = db.work_usage_and_aggregate();
+    assert_eq!(charged, aggregate);
+}
+
+fn pr_link_noops_leave_no_mutation_or_receipt(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let lead = agent(&*store, 1);
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start("pr-noop", "PR no-op", "lead"),
+            now,
+        )
+        .unwrap()
+        .item;
+    let mut update = pr_link_update(&item, "noop-absent");
+    update.link = None;
+    let before_event = store.latest_event_seq().unwrap();
+    let before_usage = db.work_usage_and_aggregate();
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &update, now + 1),
+        "PR relationship is unchanged",
+    );
+    assert_eq!(store.latest_event_seq().unwrap(), before_event);
+    assert_eq!(
+        store.work_get(&lead.token, &item.id, now).unwrap().unwrap(),
+        item
+    );
+    assert_eq!(db.work_usage_and_aggregate(), before_usage);
+
+    // A rejected operation key has no receipt and remains usable for a real change.
+    update.link = pr_link_update(&item, "unused").link;
+    let linked = store
+        .work_pr_link_set(&lead.token, &update, now + 2)
+        .unwrap();
+    assert!(!linked.receipt.replayed);
+    let current_item = store
+        .work_get(&lead.token, &item.id, now + 2)
+        .unwrap()
+        .unwrap();
+    let before_event = store.latest_event_seq().unwrap();
+    let before_usage = db.work_usage_and_aggregate();
+    let mut repeated = update.clone();
+    repeated.operation_id = "noop-present".into();
+    repeated.expected_updated_seq = linked.view.updated_seq;
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &repeated, now + 3),
+        "PR relationship is unchanged",
+    );
+    assert_eq!(store.latest_event_seq().unwrap(), before_event);
+    assert_eq!(
+        store
+            .work_get(&lead.token, &item.id, now + 2)
+            .unwrap()
+            .unwrap(),
+        current_item
+    );
+    assert_eq!(db.work_usage_and_aggregate(), before_usage);
+
+    let replay = store
+        .work_pr_link_set(&lead.token, &update, now + 3)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, linked.receipt.event_seq);
+    repeated.link.as_mut().unwrap().number += 1;
+    assert!(
+        !store
+            .work_pr_link_set(&lead.token, &repeated, now + 4)
+            .unwrap()
+            .receipt
+            .replayed
+    );
+}
+
+fn concurrent_pr_link_updates_fence_and_replay(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let lead = agent(&*store, 1);
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start("pr-race", "Concurrent PR links", "lead"),
+            now,
+        )
+        .unwrap()
+        .item;
+    let first = pr_link_update(&item, "racing-first");
+    let mut second = pr_link_update(&item, "racing-second");
+    second.link.as_mut().unwrap().number += 1;
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [first, second]
+        .into_iter()
+        .zip([db.open(), db.open()])
+        .map(|(update, connection)| {
+            let barrier = barrier.clone();
+            let token = lead.token.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                connection.work_pr_link_set(&token, &update, now + 1)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| matches!(result, Err(HubError::Invalid(message)) if message == "PR link receipt expired or Work changed")).count(), 1);
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    assert_eq!(work_event_count(&*store, "work_pr_link"), 1);
+    let current_item = store
+        .work_get(&lead.token, &item.id, now + 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current_item.updated_seq, winner.view.updated_seq);
+
+    let mut identical = pr_link_update(&current_item, "racing-same-operation");
+    identical.link.as_mut().unwrap().head_sha = "b".repeat(40);
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [db.open(), db.open()]
+        .into_iter()
+        .map(|connection| {
+            let barrier = barrier.clone();
+            let token = lead.token.clone();
+            let update = identical.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                connection.work_pr_link_set(&token, &update, now + 2)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results[0].receipt.event_seq, results[1].receipt.event_seq);
+    assert_eq!(
+        results[0].receipt.operation_id,
+        results[1].receipt.operation_id
+    );
+    assert_eq!(results[0].view, results[1].view);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.receipt.replayed)
+            .count(),
+        1
+    );
+    assert_eq!(work_event_count(&*store, "work_pr_link"), 2);
+    let (charged, aggregate) = db.work_usage_and_aggregate();
+    assert_eq!(charged, aggregate);
+}
+
+fn pr_link_receipts_replay_after_takeover_changes_and_removal(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let lead = agent(&*store, 1);
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start(
+                "pr-replay-takeover",
+                "PR replay after takeover",
+                "original-session",
+            ),
+            now,
+        )
+        .unwrap()
+        .item;
+    let original_request = pr_link_update(&item, "original-link");
+    let original = store
+        .work_pr_link_set(&lead.token, &original_request, now + 1)
+        .unwrap();
+    let successor = agent(&*store, 2);
+    let takeover_at = now + CLAIM_STALE_SECONDS + 2;
+    let taken = store
+        .work_start(
+            &successor.token,
+            &takeover(&item.id, "successor-session", Some(1)),
+            takeover_at,
+        )
+        .unwrap();
+    assert!(taken.took_over);
+    let verify_original_replay = |expected_link: Option<agentscm::hub::work_links::WorkPrLink>,
+                                  expected_updated_seq: i64,
+                                  replay_at: i64| {
+        let before_seq = store.latest_event_seq().unwrap();
+        let before_usage = db.work_usage_and_aggregate();
+        let replay = store
+            .work_pr_link_set(&lead.token, &original_request, replay_at)
+            .unwrap();
+        assert!(replay.receipt.replayed);
+        assert_eq!(replay.receipt.work_id, original.receipt.work_id);
+        assert_eq!(replay.receipt.operation_id, original.receipt.operation_id);
+        assert_eq!(replay.receipt.event_seq, original.receipt.event_seq);
+        assert_eq!(replay.receipt.generation, 1);
+        assert_eq!(replay.view.generation, 2);
+        assert_eq!(replay.view.updated_seq, expected_updated_seq);
+        assert_eq!(replay.view.link, expected_link);
+        assert_eq!(store.latest_event_seq().unwrap(), before_seq);
+        assert_eq!(db.work_usage_and_aggregate(), before_usage);
+    };
+    verify_original_replay(
+        original.view.link.clone(),
+        taken.item.updated_seq,
+        takeover_at + 1,
+    );
+
+    // Exact content alone is insufficient: the committing token must still be valid.
+    let same_owner_other_token = another_token(&*store, &lead, "another-original-owner-token");
+    for token in [&same_owner_other_token.token, &successor.token] {
+        assert_invalid(
+            store.work_pr_link_set(token, &original_request, takeover_at + 1),
+            "only the current Work owner and lead session may change a PR link",
+        );
+    }
+    let mut wrong_session = original_request.clone();
+    wrong_session.session = "unrelated-session".into();
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &wrong_session, takeover_at + 1),
+        "operation_id was already used for another request",
+    );
+    let mut wrong_target = original_request.clone();
+    wrong_target.link.as_mut().unwrap().repository_id += 1;
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &wrong_target, takeover_at + 1),
+        "operation_id was already used for another request",
+    );
+    let mut old_lead_new_operation = original_request.clone();
+    old_lead_new_operation.operation_id = "old-lead-new-key".into();
+    assert_invalid(
+        store.work_pr_link_set(&lead.token, &old_lead_new_operation, takeover_at + 1),
+        "PR link generation is fenced",
+    );
+    assert!(matches!(
+        store.work_pr_link_set(&lead.token, &original_request, lead.expires_at),
+        Err(HubError::Unauthorized)
+    ));
+
+    let mut changed_request = pr_link_update(&taken.item, "successor-change-link");
+    changed_request.link.as_mut().unwrap().head_sha = "b".repeat(40);
+    let changed = store
+        .work_pr_link_set(&successor.token, &changed_request, takeover_at + 2)
+        .unwrap();
+    verify_original_replay(
+        changed.view.link.clone(),
+        changed.view.updated_seq,
+        takeover_at + 3,
+    );
+
+    let mut remove_request = changed_request.clone();
+    remove_request.operation_id = "successor-remove-link".into();
+    remove_request.expected_updated_seq = changed.view.updated_seq;
+    remove_request.link = None;
+    let removed = store
+        .work_pr_link_set(&successor.token, &remove_request, takeover_at + 3)
+        .unwrap();
+    verify_original_replay(None, removed.view.updated_seq, takeover_at + 4);
+
+    let reader = agent_with(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 3,
+            repository: REPO,
+            repository_id: Some(REPOSITORY_ID),
+            read_only: true,
+            ttl: TTL,
+        },
+    );
+    assert!(matches!(
+        store.work_pr_link_set(&reader.token, &original_request, takeover_at + 4),
+        Err(HubError::Unauthorized)
+    ));
+    assert!(store.revoke_agent_token(&lead.token).unwrap());
+    assert!(matches!(
+        store.work_pr_link_set(&lead.token, &original_request, takeover_at + 4),
+        Err(HubError::Unauthorized)
+    ));
+}

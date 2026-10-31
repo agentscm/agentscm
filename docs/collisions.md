@@ -105,6 +105,60 @@ One JSON value on stdout, `{"ok": true, "collisions": {...}}`. The exit status i
 - `--active-days` uses the tip's committer date, which whoever writes the branch controls; a backdated branch drops out of the default scan (it is still counted in `inactive_refs_excluded`).
 - `merge-tree` failures (timeout, unwritable object database) appear as `git_merge.result: "error"` with the pair still reported `same-file`; the command's exit status stays 0.
 
+## Local branch advice in connected command hooks
+
+On Unix, `agentscm hook <agent> --client-connection` also retains a bounded local
+path observation at SessionStart. It reports the observed HEAD, chosen base and
+observation time, then warns once per edited path and session when another visible
+branch or dirty linked worktree had changed that path. Committed branch changes
+remain visible after live file claims expire. This advice never denies an edit;
+existing live contention behavior remains separate. Cursor receives advice after
+its first edit. Copilot CLI's camelCase hook format cannot carry these notes; the
+VS Code format is supported. Windows and legacy explicit Hub routing do not run
+this observation.
+
+The scan reuses the collision detector's Git command layer and path comparison.
+It runs concurrently with Hub registration after local checkout routing succeeds,
+using at most 700 milliseconds of the existing SessionStart hook deadline. Dirty
+worktrees take priority (the current checkout is skipped before `git status`),
+followed by the newest visible branch refs (committer date);
+ref listing asks Git for at most 41 rows to identify the 40-ref coverage cap.
+It retains at most 40 peers and caps Git path output
+and the cache at 256 KiB. It does not fetch, run merge simulations or inspect PR
+source. First-edit advice only reads the local cache and creates hashed deduplication
+markers; it starts no additional Git command or network request. At most three
+paths and three peers per path are shown, with exact observed peer commits and
+branch merge bases. Missing or ambiguous bases, command failures, excluded paths
+and budget cuts preserve unknown or incomplete coverage. The base is `origin/HEAD`,
+otherwise `main`; different `main` and `master` tips without `origin/HEAD` are
+ambiguous. Branches with multiple best merge bases are skipped as incomplete.
+
+This is historical, local advice. Later commits, new branches and later dirty work
+are unknown until a new session; no warning is not a clean result. Cached observations
+expire after four hours. An expired or missing observation can produce an
+unknown-coverage note once while its session folder is still retained and has
+marker capacity. If another session’s maintenance has already removed that folder,
+no expiry note can be retained or shown. Advice requires a supported SessionStart event;
+an unobserved session has unknown coverage. Squash and
+rebase merge equivalence checks are deliberately omitted from this bounded path,
+so already-landed branches may still warn. Same-file advice is never proof that
+Git would conflict. Git `status` still executes repository-configured clean filters;
+run connected hooks only in trusted repositories.
+
+Observations and markers remain under the user's configuration directory in
+`agentscm/branch-observations`, with private directory/file permissions when created.
+They contain local branch names, paths and commit IDs; they are not sent to Hub.
+At SessionStart, bounded maintenance removes expired owned regular files without
+following symlinks or removing unrelated files. Crash-orphan directories expire
+using their own modification time when no regular creation marker exists. Expiry
+runs before storage-cap refusal. Storage admits at most 32 sessions,
+with at most 256 deduplication markers per session; further sessions or paths have
+unknown coverage until capacity is available. Root admission and per-session marker
+locks retry contention for at most 50 milliseconds, within the remaining hook
+deadline; other lock errors fail open immediately. Edits perform no directory sweep.
+Remove that directory to clear retained observations and deduplication markers. These hooks have synthetic
+fixture coverage; live behavior across agent versions is not qualified here.
+
 ## Running in a container
 
 The published image runs the same scan, so nothing needs installing. Choose a version from

@@ -5,18 +5,20 @@
 // expires, or after a 401, and never twice at once.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from './api.ts'
-import { fetchBrowserSession, fetchRepositoryList, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type WebReadToken } from './devices.ts'
+import { fetchBrowserSession, fetchRepositoryList, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type RepositoryList, type WebReadToken } from './devices.ts'
 import type { Refusal } from './refusal.ts'
+import { fetchOverview } from './standup.ts'
 
 export type WebRead =
   | { kind: 'off' }
-  | { kind: 'checking'; session?: BrowserSession }
+  /** `repos` is how many repositories the session can see, once that is known. */
+  | { kind: 'checking'; session?: BrowserSession; repos?: number }
   /** A known browser session may lack a usable repository; a failed check leaves identity unknown. */
-  | { kind: 'unavailable'; session: BrowserSession | null; reason: 'connection' | 'empty' | 'refused'; refusal: Refusal | null }
+  | { kind: 'unavailable'; session: BrowserSession | null; reason: 'connection' | 'empty' | 'refused'; refusal: Refusal | null; /** How far a failed check got: the repositories seen so far. */ repos?: number }
   /** No browser session, or a confirmed sign-out. */
   | { kind: 'none'; refusal: Refusal | null; empty: boolean }
-  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. `readable` counts the repositories the Hub listed as readable now. */
-  | { kind: 'ready'; session: BrowserSession; repos: string[]; readable: number; read: WebReadToken; refusal: Refusal | null; restarts: number }
+  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. `readable` counts the repositories the Hub listed as readable now; `list` is that list, for All repositories to show at once. */
+  | { kind: 'ready'; session: BrowserSession; repos: string[]; readable: number; list: { value: RepositoryList; fetchedAt: number } | null; read: WebReadToken; refusal: Refusal | null; restarts: number }
 
 const PICKED_KEY = 'agentscm.web.repository'
 export const RENEW_BEFORE_SECONDS = 120
@@ -42,30 +44,55 @@ export const tryOrder = (repos: string[], last: string | null): string[] => (las
 const sameSession = (a: BrowserSession, b: BrowserSession): boolean => a.csrf === b.csrf && a.login === b.login && a.provider === b.provider
 const sessionKey = (s: BrowserSession): string => `${s.provider}\0${s.login}\0${s.csrf}`
 
-/** Mints for the first repository the Hub allows, dropping the ones it refuses. */
-export async function firstAllowed(session: BrowserSession, order: string[], signal?: AbortSignal): Promise<{ read: WebReadToken | null; refused: string[]; refusal: Refusal | null; ended: boolean }> {
+/** Repositories probed for unfinished work when nothing was picked before; bounds the first-sign-in requests. */
+export const PROBE_LIMIT = 5
+
+/**
+ * Mints for the first repository the Hub allows, dropping the ones it refuses. With `probe`, walks on through
+ * the first PROBE_LIMIT allowed ones and opens the first with unfinished work, else the first allowed one.
+ */
+export async function firstAllowed(session: BrowserSession, order: string[], signal?: AbortSignal, probe = false): Promise<{ read: WebReadToken | null; refused: string[]; refusal: Refusal | null; ended: boolean }> {
   const refused: string[] = []
   let refusal: Refusal | null = null
+  let first: WebReadToken | null = null
+  let allowed = 0
   for (const repo of order) {
+    if (allowed >= PROBE_LIMIT) break
+    let read: WebReadToken
     try {
-      return { read: await mintWebReadToken(session, repo, signal), refused, refusal, ended: false }
+      read = await mintWebReadToken(session, repo, signal)
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) return { read: null, refused, refusal, ended: true }
-      if (!(e instanceof ApiError) || e.status >= 500) throw e
+      if (!(e instanceof ApiError) || e.status >= 500) {
+        if (first && !signal?.aborted) break
+        throw e
+      }
       refused.push(repo)
       refusal = e.refusal ?? refusal
+      continue
+    }
+    if (!probe) return { read, refused, refusal, ended: false }
+    allowed += 1
+    first ??= read
+    try {
+      if ((await fetchOverview(read.token, signal ?? new AbortController().signal, { limit: 1 })).current.length > 0) return { read, refused, refusal, ended: false }
+    } catch {
+      if (signal?.aborted) throw new DOMException('aborted', 'AbortError')
     }
   }
-  return { read: null, refused, refusal, ended: false }
+  return { read: first, refused, refusal, ended: false }
 }
 
-export function useWebRead(enabled: boolean) {
+/** `commit` lets the page wrap the change from the opening screen to the app (a view transition); the default applies it at once. */
+export function useWebRead(enabled: boolean, commit: (apply: () => void) => void = (apply) => apply()) {
   const [state, setState] = useState<WebRead>({ kind: 'checking' })
   const [failures, setFailures] = useState<Map<string, BrowserSession>>(() => new Map())
   const [attempt, setAttempt] = useState(0)
   const flight = useRef<Promise<void> | null>(null)
   const signOutFlight = useRef(new Map<string, Promise<void>>())
   const current = useRef(state)
+  const commitRef = useRef(commit)
+  useEffect(() => { commitRef.current = commit })
   const active = useRef(enabled)
   const generation = useRef(0)
   const bootstrap = useRef<{ generation: number; session: BrowserSession | null; controller: AbortController } | null>(null)
@@ -156,7 +183,7 @@ export function useWebRead(enabled: boolean) {
     if (confirmedGone.current.size > 0 && current.current.kind === 'none') return
     // A cancelled check (React runs effects twice in development) must not ask the Hub for a token.
     const ctl = new AbortController()
-    const run = { generation: generation.current, session: null as BrowserSession | null, controller: ctl }
+    const run = { generation: generation.current, session: null as BrowserSession | null, repos: undefined as number | undefined, controller: ctl }
     bootstrap.current = run
     const valid = () => !ctl.signal.aborted && active.current && generation.current === run.generation && bootstrap.current === run
     const allowed = (session: BrowserSession) => {
@@ -190,11 +217,18 @@ export function useWebRead(enabled: boolean) {
         keepFailuresFor(session)
         if (!allowed(session)) return
         const [known, list] = await Promise.all([sessionRepositories(session, ctl.signal), fetchRepositoryList(session, ctl.signal).catch(() => null)])
+        const listedAt = Date.now()
         if (!allowed(session)) return
         // What the Hub says this sign-in can read now comes first; what it only knew of may still be refused.
         const readable = list?.rows.map((r) => r.repository) ?? []
         const repos = [...new Set([...readable, ...known])]
-        const { read, refused, refusal, ended } = await firstAllowed(session, tryOrder(repos, picked()), ctl.signal)
+        run.repos = repos.length
+        const counted = { kind: 'checking', session, repos: repos.length } as const
+        current.current = counted
+        setState(counted)
+        const last = picked()
+        // First sign-in on this browser: prefer a repository with unfinished work over an empty one.
+        const { read, refused, refusal, ended } = await firstAllowed(session, tryOrder(repos, last), ctl.signal, !(last && repos.includes(last)))
         if (!allowed(session)) return
         if (ended) return endSession(session)
         if (!read) {
@@ -203,14 +237,18 @@ export function useWebRead(enabled: boolean) {
           return setState(unavailable)
         }
         remember(read.repository)
-        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), readable: readable.length, read, refusal: null, restarts: 0 } as const
-        current.current = ready
-        bootstrap.current = null
-        setState(ready)
-      } catch {
+        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), readable: readable.length, list: list && { value: list, fetchedAt: listedAt }, read, refusal, restarts: 0 } as const
+        commitRef.current(() => {
+          if (!valid()) return
+          current.current = ready
+          bootstrap.current = null
+          setState(ready)
+        })
+      } catch (e) {
         if (!valid()) return
         if (run.session && confirmedGone.current.has(sessionKey(run.session))) return endSession(run.session)
-        const unavailable = { kind: 'unavailable', session: run.session, reason: 'connection', refusal: null } as const
+        // Keep the Hub's own sentence when it gave one (e.g. "GitHub didn't answer the Hub's access check").
+        const unavailable = { kind: 'unavailable', session: run.session, reason: 'connection', refusal: e instanceof ApiError ? e.refusal : null, repos: run.repos } as const
         current.current = unavailable
         setState(unavailable)
       }
@@ -261,6 +299,32 @@ export function useWebRead(enabled: boolean) {
     const timer = window.setTimeout(() => void ask(), ms)
     return () => window.clearTimeout(timer)
   }, [expiresAt, ask])
+
+  // A tab left signed out notices a sign-in made in another tab when it comes back into view.
+  const signedOut = enabled && state.kind === 'none'
+  useEffect(() => {
+    if (!signedOut) return
+    let ctl: AbortController | null = null
+    const recheck = () => {
+      if (document.hidden || ctl) return
+      const mine = (ctl = new AbortController())
+      fetchBrowserSession(mine.signal)
+        .then((session) => {
+          if (!session || mine.signal.aborted || confirmedGone.current.has(sessionKey(session)) || current.current.kind !== 'none') return
+          // A new session: the ones signed out before can no longer come back under it.
+          confirmedGone.current.clear()
+          setAttempt((n) => n + 1)
+        }, () => {})
+        .finally(() => { if (ctl === mine) ctl = null })
+    }
+    window.addEventListener('focus', recheck)
+    document.addEventListener('visibilitychange', recheck)
+    return () => {
+      ctl?.abort()
+      window.removeEventListener('focus', recheck)
+      document.removeEventListener('visibilitychange', recheck)
+    }
+  }, [signedOut])
 
   const signOut = useCallback(() => {
     const s = current.current

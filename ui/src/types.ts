@@ -26,6 +26,7 @@ export interface Intent {
   owner: Owner
 }
 export interface PullRequest {
+  head_sha?: string | null
   number: number
   title: string
   state: string

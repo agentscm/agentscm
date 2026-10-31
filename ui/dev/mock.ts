@@ -1,3 +1,4 @@
+import { CONTEXT_PULLS, contextFixture, expandedContextFixture } from './prContext.ts'
 // Dev-only: answers status and workspace GET endpoints from synthetic fixtures.
 // Workspace fixtures are visibly labelled; mutations return 501 and never execute.
 // Used by `MOCK=1 npm run dev`; never imported by app code.
@@ -26,20 +27,26 @@ function intents() {
   const base = { repository: REPO, base: 'main', expires_at: ago(-3600) }
   return [
     { ...base, id: 'int_dev_codex', task: 'Fix invoice rounding when a customer has multiple currencies', branch: 'dev/invoice-rounding', machine: 'synthetic-laptop-2', paths: ['src/billing.rs', 'tests/billing_test.rs'], via: ['hook:codex'], created_at: ago(1500), updated_at: ago(40), agent: A.devCodex, owner: dev },
-    { ...base, id: 'int_maria_claude', task: 'Refactor the billing module to split tax calculation from invoice totals, keeping the public interface intact and adding focused unit tests for each rounding mode we support today', branch: 'maria/billing-split', machine: 'synthetic-laptop-1', paths: ['src/billing.rs', 'src/invoice/**', 'src/tax.rs', 'src/currency.rs', 'src/ledger.rs', 'src/receipts.rs'], via: ['hook:claude'], created_at: ago(900), updated_at: ago(12), agent: A.mariaClaude, owner: maria },
+    { ...base, id: 'int_maria_claude', task: 'Refactor the billing module to split tax calculation from invoice totals, keeping the public interface intact and adding focused unit tests for each rounding mode we support today', branch: 'feat/sync-retry-budget', machine: 'synthetic-laptop-1', paths: ['src/billing.rs', 'src/invoice/**', 'src/tax.rs', 'src/currency.rs', 'src/ledger.rs', 'src/receipts.rs'], via: ['hook:claude'], created_at: ago(900), updated_at: ago(12), agent: A.mariaClaude, owner: maria },
     { ...base, id: 'int_maria_codex', task: 'Write the webhook retry documentation', branch: 'maria/docs-webhooks', machine: 'synthetic-laptop-1', paths: ['docs/webhooks.md'], via: ['hook:codex'], created_at: ago(700), updated_at: ago(260), agent: A.mariaCodex, owner: maria },
     { ...base, id: 'int_dev_cursor', task: 'Tidy the settings page layout', branch: null, machine: null, paths: ['web/settings/**'], via: [], created_at: ago(400), updated_at: ago(380), agent: A.devCursor, owner: dev },
   ]
 }
 
-function work() {
+function work(context = false) {
   return {
     intents: intents(),
     intents_truncated: false,
     connected: true,
     branches: [],
     truncated: {},
-    pull_requests: [
+    pull_requests: context ? CONTEXT_PULLS.map((p) => ({
+      number: p.number, title: p.title, state: 'open', draft: false,
+      head_ref: `feature/context-${p.number}`, head_sha: p.head.repeat(40), base_ref: 'main',
+      author: { login: 'sam', id: 1003 }, html_url: `https://example.invalid/acme/widgets/pull/${p.number}`,
+      files: p.number === 42 || p.number === 45 ? ['src/billing.rs'] : ['docs/signing.md'],
+      files_truncated: false,
+    })) : [
       { number: 42, title: 'Round invoice totals per currency', state: 'open', draft: false, head_ref: 'sam/round-per-currency', head_sha: 'a'.repeat(40), base_ref: 'main', author: { login: 'sam', id: 1003 }, html_url: 'https://example.invalid/acme/widgets/pull/42', files: ['src/billing.rs', 'src/invoice/totals.rs'], files_truncated: false },
       { number: 43, title: 'Document webhook signing', state: 'open', draft: true, head_ref: 'sam/webhook-docs', head_sha: 'b'.repeat(40), base_ref: 'main', author: { login: 'sam', id: 1003 }, html_url: 'https://example.invalid/acme/widgets/pull/43', files: ['docs/signing.md'], files_truncated: false },
       { number: 40, title: 'Bump synthetic dependency', state: 'closed', draft: false, head_ref: 'bot/bump', head_sha: 'c'.repeat(40), base_ref: 'main', author: { login: 'sam', id: 1003 }, html_url: 'https://example.invalid/acme/widgets/pull/40', files: ['Cargo.toml'], files_truncated: false },
@@ -81,12 +88,13 @@ function overview() {
     scope, branch: null, worktree: null, next_action: null, current: null, blocker: null, depends_on: [], related_work: [],
     created_at: ago(secs + 3600), updated_at: ago(secs), created_seq: 1, updated_seq: 2, ...extra,
   })
-  const billing = item('a', 'Refactor the billing module', 'active', 'maria', 'claude-code', ['src/billing.rs', 'src/tax.rs'], 60, { next_action: 'Split tax calculation out of invoice totals', current: cp('progress', 'Tax module extracted; tests green', 'Split tax calculation out of invoice totals', 60, 'claude-code') })
-  const rounding = item('b', 'Fix invoice rounding', 'active', 'dev', 'codex', ['src/billing.rs'], 300, { next_action: 'Add a regression test for JPY totals' })
+  const billing = item('a', 'Refactor the billing module', 'active', 'maria', 'claude-code', ['src/billing.rs', 'src/tax.rs'], 60, { branch: 'feat/sync-retry-budget', next_action: 'Split tax calculation out of invoice totals', current: cp('progress', 'Tax module extracted; tests green', 'Split tax calculation out of invoice totals', 60, 'claude-code') })
+  const rounding = item('b', 'Fix invoice rounding', 'active', 'dev', 'codex', ['src/billing.rs'], 300, { branch: 'dev/invoice-rounding', next_action: 'Add a regression test for JPY totals' })
   const docs = item('c', 'Write the webhook retry documentation', 'blocked', 'maria', 'codex', ['docs/webhooks.md'], 900, { blocker: cp('blocker', 'Waiting on the retry policy decision from the API team', null, 900, 'codex') })
   const settings = item('d', 'Tidy the settings page layout', 'handover', 'dev', 'cursor', ['web/settings/**'], 1800, { next_action: 'Pick up the responsive pass from the handover note' })
   const ledger = item('e', 'Reconcile ledger exports', 'paused', 'sam', 'copilot', ['src/ledger.rs'], 7200, { next_action: 'Resume after the quarter-end freeze' })
-  const shipped = item('f', 'Round invoice totals per currency', 'finished', 'sam', 'copilot', ['src/invoice/totals.rs'], 1200)
+  // Branches match skill run run_41 and PUBLICATIONS[0] (merged, PR #220), so the task page's lifecycle strip has evidence.
+  const shipped = item('f', 'Round invoice totals per currency', 'finished', 'sam', 'copilot', ['src/invoice/totals.rs'], 1200, { branch: 'agent/claude-code/invoice-rounding-120' })
   return {
     recent_since: ago(86400), until: ago(0),
     current: [billing, rounding, docs, settings, ledger],
@@ -427,15 +435,36 @@ const SKILL_RUNS = (() => {
       stale_evidence: [], updated_at: ago(2 * 3600) },
   ]
 })()
+const CONTEXT_RUNS = CONTEXT_PULLS.map((p) => {
+  const template = SKILL_RUNS[0]!
+  const fixture = contextFixture(p.number).workflows![0]!
+  return { ...template, run_id: fixture.run_id, pull_request: p.number,
+    head_sha: fixture.head_sha!, branch: `feature/context-${p.number}`,
+    next_action: fixture.next_action, blocks_finish: fixture.blocks_finish,
+    current_gate: fixture.current_gate, updated_at: fixture.updated_at,
+    gates: template.gates.map((gate, i) => {
+      const current = template.gates.findIndex((g) => g.id === fixture.current_gate)
+      const done = i < current
+      return { ...gate, state: done ? 'done' : i === current ? 'current' : 'not_reached',
+        assurance: done ? 'self_reported' : null,
+        evidence: done ? [{ id: `context-evidence-${p.number}-${gate.id}`, kind: gate.id,
+          head_sha: fixture.head_sha!, assurance: 'self_reported', summary: `Synthetic ${gate.id} report`,
+          url: null, session: 'synthetic-session', agent: 'synthetic-agent', recorded_at: fixture.updated_at, detail: null }] : [] }
+    }), stale_evidence: [] }
+})
 const LOCK_PIN = (over: Record<string, unknown> = {}) => ({ name: 'pr-gate', workflow_version: 1, path: null, sha256: SHA_PR_GATE, status: 'adopted', params: { merge_method: 'squash' }, walkthrough: walk(' (squash)'), source: { kind: 'first_party' }, ...over })
 
-export type Scenario = 'full' | 'empty' | 'down' | 'demo'
+export type Scenario = 'full' | 'empty' | 'down' | 'demo' | 'context'
 
 export function mockHub(scenario: Scenario = 'full'): Plugin {
   let down = scenario === 'down'
   return {
     name: 'agentscm-mock-hub',
     apply: 'serve',
+    transformIndexHtml(html) {
+      if (scenario !== 'context') return html
+      return html.replace('<body>', '<body><div role="status" style="padding:10px 20px;background:#fff0c2;color:#342900;font:14px sans-serif">Synthetic local preview · Not live-qualified. No live GitHub reads or permission changes. #42: context + overlap; #43: context head differs from the PR list; #44: context request denied (simulated 403); #45: reported blocker.</div>')
+    },
     configureServer(server) {
       server.middlewares.use('/__mock', (req, res) => {
         if (req.url?.startsWith('/reject-next-agent-read')) {
@@ -467,6 +496,13 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         res.end(down ? 'hub is now failing\n' : 'hub is now healthy\n')
       })
       server.middlewares.use('/v1/hub', async (req, res) => {
+        // MOCK_SLOW=1500 holds each sign-in step that long, so the opening screen can be seen and screenshotted.
+        const slow = Number(process.env['MOCK_SLOW'] ?? 0)
+        if (slow > 0 && /^\/(session|tokens|session\/read-token)$/.test(new URL(req.url ?? '/', 'http://localhost').pathname)) {
+          await new Promise((r) => setTimeout(r, slow))
+          // The page may have cancelled meanwhile (React runs effects twice); reading its body now would crash the server.
+          if (req.destroyed) return
+        }
         const url = new URL(req.url ?? '/', 'http://localhost')
         const send = (status: number, body: unknown) => {
           res.statusCode = status
@@ -504,6 +540,8 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         }
         // Synthetic browser session (an HttpOnly cookie in production) and the computer routes.
         // Like the Hub: the web sign-in starts only with ?web=1; without it a sign-in expects the CLI's loopback port.
+        // MOCK_PROVIDERS=1 makes the mock advertise forge sign-in so the gated front door can be seen.
+        if (url.pathname === '/login' && req.method === 'GET') return send(200, { providers: process.env['MOCK_PROVIDERS'] === '1' ? ['github', 'gitlab'] : [], browser_only: [] })
         if (url.pathname.startsWith('/login/') && req.method === 'GET' && url.searchParams.get('web') === '1') {
           browserSignedIn = true
           res.statusCode = 302
@@ -590,6 +628,15 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           return send(200, { delivery: null, from: 0, through: 40, after: 0, work_after: null, next_after: 40, next_work_after: null, next_work_done: true, items, events, retention_gap: false, complete: true })
         }
         if (url.pathname === '/standup/coordination') return send(200, { from: 0, through: 40, next_after: 0, requests: [], complete: true, retention_gap: false })
+        if (url.pathname.startsWith('/standup/work/') && url.pathname.endsWith('/pr-link')) {
+          const id = decodeURIComponent(url.pathname.slice('/standup/work/'.length, -'/pr-link'.length))
+          const item = overview().current.find((w) => w.id === id)
+          if (!item || empty) return send(404, { error: 'work_not_found' })
+          const target = { repository_id: 100, number: 42, head_sha: 'a'.repeat(40) }
+          return send(200, { work_id: id, repository: REPO, repository_id: 100, generation: item.generation, updated_seq: item.updated_seq,
+            snapshot_status: Number(url.searchParams.get('expected_updated_seq')) === item.updated_seq ? 'matches_work' : 'work_changed', head_status: 'not_compared',
+            link: scenario === 'context' && id === `wrk_${'b'.repeat(32)}` ? { target, author: 'synthetic-user', agent: 'codex', token: 'synthetic-token-id', session: 'synthetic-session', generation: 1, linked_at: ago(300), event_seq: 2 } : null })
+        }
         if (url.pathname.startsWith('/standup/work/')) {
           const id = decodeURIComponent(url.pathname.slice('/standup/work/'.length))
           const ov = overview()
@@ -603,7 +650,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         if (url.pathname === '/standup/catchup') {
           const ov = overview()
           const quiet = empty || catchupAcked
-          const work_events = quiet ? [] : ov.current.map((item, i) => ({ seq: 30 + i, at: item.updated_at, kind: i === 0 ? 'work_started' : 'work_checkpoint', work_id: item.id, item }))
+          const work_events = quiet ? [] : ov.current.map((item, i) => ({ seq: 30 + i, at: item.updated_at, kind: scenario === 'context' && i === 1 ? 'work_pr_link' : i === 0 ? 'work_started' : 'work_checkpoint', work_id: item.id, item }))
           const coordination_events = quiet ? [] : [
             { seq: 28, at: ago(5400), kind: 'coordination_requested', request_id: 'crq_synthetic_1', title: 'Split the invoice scope', status: 'pending' },
             { seq: 29, at: ago(3000), kind: 'coordination_responded', request_id: 'crq_synthetic_1', title: 'Split the invoice scope', status: 'responded' },
@@ -637,10 +684,17 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
             counts: { 'pr-gate': { open: 2, at_stop_gate: 1, completed: 1 } },
           })
         }
+        if (url.pathname === `/repos/${encodeURIComponent(REPO)}/pr-context`) {
+          if (scenario !== 'context') return send(200, contextFixture(0))
+          const number = Number(url.searchParams.get('number'))
+          if (number === 44) return send(403, { error: 'permission_unavailable' })
+          return send(200, expandedContextFixture(empty ? 0 : number))
+        }
         if (url.pathname.startsWith(`/repos/${encodeURIComponent(REPO)}/skills/runs`)) {
           const rest = url.pathname.slice(`/repos/${encodeURIComponent(REPO)}/skills/runs`.length)
-          if (rest === '') return send(200, { runs: empty ? [] : SKILL_RUNS, truncated: false })
-          const found = SKILL_RUNS.find((r) => `/${r.run_id}` === rest)
+          const runs = scenario === 'context' ? [...SKILL_RUNS, ...CONTEXT_RUNS] : SKILL_RUNS
+          if (rest === '') return send(200, { runs: empty ? [] : runs, truncated: false })
+          const found = runs.find((r) => `/${r.run_id}` === rest)
           return found && !empty ? send(200, found) : send(404, { error: 'not_found' })
         }
         if (url.pathname === '/skill-workflows') {
@@ -694,7 +748,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         // Any repository a read token names gets the synthetic team's work, so switching repositories shows a page.
         if (/^\/repos\/[^/]+\/work$/.test(url.pathname)) {
           if (scenario === 'demo') return send(200, { ...work(), pull_requests: [], connected: false })
-          return send(200, empty || billingDocs ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work())
+          return send(200, empty || billingDocs ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work(scenario === 'context'))
         }
         if (/^\/repos\/[^/]+\/activity$/.test(url.pathname)) {
           if (empty || billingDocs) return send(200, { sessions: [], events: [], next_before: null })

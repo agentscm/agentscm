@@ -11,23 +11,18 @@ test.beforeEach(async ({ baseURL }) => {
   test.skip(!mock?.ok, 'Start the mock hub: MOCK=1 npx vite (see the header of this file).')
 })
 
-test('1. the Hub’s sign-in page offers one command to set up this computer', async ({ page, baseURL }) => {
+test('1. the token door shows the read-only token form and no computer set-up', async ({ page, baseURL }) => {
   // Without a web sign-in: with one, the page opens the Hub instead (step 7).
   await fetch(`${baseURL}/__mock/signout`)
   await page.goto('/#home')
-  const setup = page.getByRole('region', { name: 'Set up this computer' })
-  await expect(setup).toBeVisible()
-  await expect(setup.locator('code')).toHaveText(`npx agentscm --hub-url '${baseURL}'`)
-  await expect(setup.getByRole('button', { name: /copy/i })).toBeVisible()
-})
-
-test('1b. no set-up card at all where there is no command to show', async ({ page, baseURL }) => {
-  // localhost isn't a Hub address the CLI accepts (only https or 127.0.0.1/[::1]), so no command renders; neither may its card.
-  await fetch(`${baseURL}/__mock/signout`)
-  await page.goto(`${baseURL!.replace('127.0.0.1', 'localhost')}/#home`)
-  await expect(page.getByRole('button', { name: /Open status/ })).toBeVisible()
+  // The mock hub lists no sign-in providers: say so, show the read-only token form, and offer no workspace sign-in.
+  await expect(page.getByText(/has no GitHub or GitLab sign-in, so it opens with a read-only token/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /Open repository/ })).toBeVisible()
+  await expect(page.getByText('Sign in to workspace')).toHaveCount(0)
+  // Computer set-up cannot work without a sign-in provider, so the door does not offer it.
+  await expect(page.getByRole('button', { name: /Setting up your own computer/ })).toHaveCount(0)
   await expect(page.getByRole('region', { name: 'Set up this computer' })).toHaveCount(0)
-  await expect(page.getByRole('heading', { name: 'Set up this computer' })).toHaveCount(0)
+  await expect(page.locator('.install')).toHaveCount(0)
 })
 
 test('2. the browser lands on “This computer is signed in”, with no token and nothing stored', async ({ page, baseURL }) => {
@@ -61,7 +56,7 @@ test('4. account menu → Your computers → Revoke', async ({ page }) => {
   await expect(main.getByText('maria-desktop')).toBeVisible()
   const row = main.locator('.computer', { hasText: 'ci-runner-old' })
   await row.getByRole('button', { name: 'Revoke' }).click()
-  await expect(row).toContainText('Its agents stop at once')
+  await expect(row).toContainText('It does not stop them running')
   await row.getByRole('button', { name: 'Revoke ci-runner-old' }).click()
   await expect(main.getByText(/ci-runner-old was revoked/)).toBeVisible()
   await expect(main.locator('.computer', { hasText: 'ci-runner-old' })).toHaveCount(0)
@@ -99,38 +94,59 @@ test('6. a browser without a Hub session signs in through the forge; only admins
 test('7. a web sign-in opens the Hub with no pasted token, switches repositories, and stores no token', async ({ page, baseURL }) => {
   await page.goto('/#home')
   const repoButton = page.locator('.repo-btn')
-  // The first repository the sign-in may open, sorted: acme/billing-docs.
+  // With nothing picked before, the sign-in probes for unfinished work: acme/billing-docs (sorted first) is
+  // empty, so it opens acme/widgets, which has some.
+  await expect(repoButton).toHaveText(/acme\/widgets/)
+  await expect(page.locator('#main')).toContainText(/unfinished tasks?|Nobody is working|no task is claimed/)
+  await expect(page.getByRole('button', { name: /Open repository/ })).toHaveCount(0)
+
+  await repoButton.click()
+  await page.getByRole('menuitem', { name: 'acme/billing-docs' }).click()
   await expect(repoButton).toHaveText(/acme\/billing-docs/)
-  await expect(page.locator('#main')).toContainText(/working on|Nobody is working/)
-  await expect(page.getByRole('button', { name: /Open status/ })).toHaveCount(0)
 
+  // A repository the person's role is too low for: the sign-in's probe walked past it (sorted between
+  // billing-docs and widgets), the Hub refused it, and it never reached the list.
   await repoButton.click()
-  await page.getByRole('menuitem', { name: 'acme/widgets' }).click()
-  await expect(repoButton).toHaveText(/acme\/widgets/)
-
-  // A repository the person's role is too low for: the Hub's sentence, and it leaves the list.
-  await repoButton.click()
-  await page.getByRole('menuitem', { name: 'acme/secret-plans' }).click()
-  await repoButton.click()
-  await expect(page.getByRole('status').filter({ hasText: 'ask a repository owner for Triage or higher' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'acme/widgets' })).toBeVisible()
   await expect(page.getByRole('menuitem', { name: 'acme/secret-plans' })).toHaveCount(0)
-  await expect(repoButton).toHaveText(/acme\/widgets/)
+  await page.keyboard.press('Escape')
+  await expect(repoButton).toHaveText(/acme\/billing-docs/)
 
-  // One mint to open and one per switch that succeeded; nothing written to browser storage but the repository name.
-  expect((await (await fetch(`${baseURL}/v1/hub/__count/read-tokens`)).json()).minted).toBe(2)
+  // Two mints to open: the probe mints billing-docs, finds it empty, is refused secret-plans (no token), then
+  // mints widgets, which has work. Plus one for the switch to billing-docs. Nothing is written to browser storage but the repository name.
+  expect((await (await fetch(`${baseURL}/v1/hub/__count/read-tokens`)).json()).minted).toBe(3)
   const stored = await page.evaluate(() => JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage }))
   expect(stored).not.toContain('webread:')
-  expect(stored).toContain('acme/widgets')
+  expect(stored).toContain('acme/billing-docs')
 
-  // A reload asks once more, and opens the repository picked last.
+  // A reload asks once more, with no probe now that a repository is remembered, and opens the one picked last.
   await page.reload()
-  await expect(repoButton).toHaveText(/acme\/widgets/)
-  expect((await (await fetch(`${baseURL}/v1/hub/__count/read-tokens`)).json()).minted).toBe(3)
+  await expect(repoButton).toHaveText(/acme\/billing-docs/)
+  expect((await (await fetch(`${baseURL}/v1/hub/__count/read-tokens`)).json()).minted).toBe(4)
 
   // Signing out of the browser goes back to the token page.
   await page.getByRole('button', { name: /Account and settings/ }).click()
   await page.getByRole('menuitem', { name: /Sign out of Hub pages/ }).click()
-  await expect(page.getByRole('button', { name: /Open status/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Open repository/ })).toBeVisible()
+})
+
+test('7b. a remembered repository the Hub refuses falls back to the next allowed one and leaves the list', async ({ page, baseURL }) => {
+  await page.addInitScript(() => { window.localStorage.setItem('agentscm.web.repository', 'acme/secret-plans') })
+  await page.goto('/#home')
+  const repoButton = page.locator('.repo-btn')
+  // A remembered repository means no probe: the order is the remembered one first, then the rest as sorted. The Hub
+  // refuses secret-plans (no token), so the first allowed in order, acme/billing-docs, opens even though it is empty.
+  await expect(repoButton).toHaveText(/acme\/billing-docs/)
+  await expect(page.locator('#main')).toContainText('Nobody is working')
+  await repoButton.click()
+  await expect(page.getByRole('menuitem', { name: 'acme/widgets' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'acme/secret-plans' })).toHaveCount(0)
+  // The refusal says why, so a repository that vanished from the list is not a mystery.
+  await expect(page.getByRole('status').filter({ hasText: 'Triage or higher' })).toBeVisible()
+  // One mint: the refused repository mints nothing, and there is no probe to mint more.
+  expect((await (await fetch(`${baseURL}/v1/hub/__count/read-tokens`)).json()).minted).toBe(1)
+  // The fallback replaces the refused name in storage.
+  expect(await page.evaluate(() => window.localStorage.getItem('agentscm.web.repository'))).toBe('acme/billing-docs')
 })
 
 test('8. Promises stays reachable after Hub sign-out, with Workspace access disclosed', async ({ page }) => {
@@ -159,12 +175,12 @@ test('8b. Computers sign-out clears Hub pages with one DELETE while Workspace st
     if (request.method() === 'DELETE' && new URL(request.url()).pathname === '/v1/hub/session') deletes++
   })
   await signOut.click()
-  await expect(page.getByRole('button', { name: /Open status/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Open repository/ })).toBeVisible()
   expect(deletes).toBe(1)
   expect((await page.request.get('/v1/hub/session')).status()).toBe(401)
   expect((await page.request.get('/v1/hub/workspace/session')).status()).toBe(200)
   await page.evaluate(() => { window.location.hash = 'home' })
-  await expect(page.getByRole('button', { name: /Open status/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Open repository/ })).toBeVisible()
   await page.evaluate(() => { window.location.hash = 'promises' })
   await expect(page.getByRole('heading', { name: 'What must remain true?' })).toBeVisible()
   await expect(page.getByText('You are signed in as synthetic-maintainer.')).toBeVisible()
@@ -176,10 +192,10 @@ test('9. Hub repository switch preserves a Workspace Promise draft', async ({ pa
   await expect(draft).toBeVisible()
   await draft.fill('Retain the unfinished owner request.')
   const repo = page.locator('.repo-btn')
-  await expect(repo).toHaveText(/acme\/billing-docs/)
-  await repo.click()
-  await page.getByRole('menuitem', { name: 'acme/widgets' }).click()
   await expect(repo).toHaveText(/acme\/widgets/)
+  await repo.click()
+  await page.getByRole('menuitem', { name: 'acme/billing-docs' }).click()
+  await expect(repo).toHaveText(/acme\/billing-docs/)
   await expect(draft).toHaveValue('Retain the unfinished owner request.')
   await expect(page.getByText('You are signed in as synthetic-maintainer.')).toBeVisible()
   await page.getByRole('button', { name: /Account and settings/ }).click()
@@ -190,19 +206,19 @@ test('9. Hub repository switch preserves a Workspace Promise draft', async ({ pa
 
 test('10. Hub repository switch preserves a Workspace settings draft and refreshes Hub data', async ({ page }) => {
   await page.goto('/#home')
-  await expect(page.locator('#main')).toContainText('Nobody is working')
+  await expect(page.locator('#main')).toContainText('Refactor the billing module')
   await page.evaluate(() => { window.location.hash = 'workspace/settings' })
   const name = page.getByLabel('Workspace name')
   await expect(name).toBeVisible()
   await name.fill('Unfinished workspace name')
   const repo = page.locator('.repo-btn')
   await repo.click()
-  await page.getByRole('menuitem', { name: 'acme/widgets' }).click()
-  await expect(repo).toHaveText(/acme\/widgets/)
+  await page.getByRole('menuitem', { name: 'acme/billing-docs' }).click()
+  await expect(repo).toHaveText(/acme\/billing-docs/)
   await expect(name).toHaveValue('Unfinished workspace name')
   await page.evaluate(() => { window.location.hash = 'home' })
-  await expect(page.locator('#main')).toContainText('Refactor the billing module')
-  await expect(page.locator('#main')).not.toContainText('Nobody is working')
+  await expect(page.locator('#main')).toContainText('Nobody is working')
+  await expect(page.locator('#main')).not.toContainText('Refactor the billing module')
 })
 
 test('11. a Hub token 401 renewal preserves a Workspace Promise draft', async ({ page }) => {
@@ -243,7 +259,7 @@ test('12b. failed Computers sign-out reports the shared Hub warning and permits 
   await expect(page.getByRole('alert').filter({ hasText: 'Hub sign-out failed' })).toBeVisible()
   expect((await page.request.get('/v1/hub/session')).status()).toBe(200)
   await signOut.click()
-  await expect(page.getByRole('button', { name: /Open status/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Open repository/ })).toBeVisible()
   expect((await page.request.get('/v1/hub/session')).status()).toBe(401)
 })
 
@@ -278,7 +294,7 @@ test('12d. Hub pages offer sign-out retry separately from connection retry', asy
   await page.request.get('/__mock/reject-next-read')
   await expect(page.getByRole('button', { name: 'Retry Hub connection' })).toBeVisible()
   await page.getByRole('button', { name: 'Retry Hub sign-out' }).click()
-  await expect(page.getByRole('button', { name: /Open status/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Open repository/ })).toBeVisible()
   expect((await page.request.get('/v1/hub/session')).status()).toBe(401)
 })
 
@@ -289,8 +305,8 @@ test('12e. a live Hub session with no repository keeps sign-out and the token fo
   await page.goto('/#home')
   await expect(page.getByText('No repository available')).toBeVisible()
   await expect(page.getByText(/has no repository to open yet/)).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open status' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open status' })).toBeInViewport()
+  await expect(page.getByRole('button', { name: 'Open repository' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open repository' })).toBeInViewport()
   await page.getByRole('button', { name: 'Sign out of Hub pages' }).click()
   expect((await page.request.get('/v1/hub/session')).status()).toBe(401)
 })
@@ -302,7 +318,7 @@ test('12f. an identified refused Hub session keeps its access explanation and to
   await page.goto('/#home')
   await expect(page.getByText('Hub access refused')).toBeVisible()
   await expect(page.getByText(/ask a repository owner for Triage or higher/).first()).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open status' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open repository' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Sign out of Hub pages' })).toBeVisible()
 })
 

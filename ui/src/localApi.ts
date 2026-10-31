@@ -263,7 +263,7 @@ export const localReachable = (hostname = window.location.hostname) => /^(127\.0
 function adviceFor(status: number, path: string): string {
   if (status === 404) return path.startsWith('/v1/local/workspace/') ? 'Not found. If the timeline never loads, start agentscm serve with --timeline-workspace.' : 'Not found. In the Library, check the change ID and library path, or the run ID.'
   if (status === 400) return 'The local server could not use that value. Check the ID and try again.'
-  if (status === 401) return 'The local server needs its read token. Add it in Settings → This computer.'
+  if (status === 401) return 'The local server needs its read token. Add it in Setup › Preferences › This computer.'
   if (status === 421) return 'The local read API refused this page’s address; open the hub UI on localhost.'
   if (status === 403) return 'The local server refused this page’s address. Start agentscm serve with --browser-origin for it, or open the page through the dev proxy.'
   if (status === 409) return 'The workspace changed while reading. Try again.'

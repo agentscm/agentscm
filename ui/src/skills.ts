@@ -73,7 +73,7 @@ export const isSelfReported = (assurance: string | null) => assurance === 'self_
 export function assuranceView(assurance: string | null): { label: string; tone: Tone; icon: string; tip: string } | null {
   if (assurance === null) return null
   if (assurance === 'self_reported') return { label: 'Self-reported', tone: 'warn', icon: 'person-check', tip: 'An agent recorded this itself. The hub did not check it.' }
-  if (assurance === 'observed') return { label: 'Observed', tone: 'brand', icon: 'eye', tip: 'The hub observed this on the forge.' }
+  if (assurance === 'observed') return { label: 'Observed', tone: 'brand', icon: 'eye', tip: 'The hub observed this on GitHub or GitLab.' }
   if (assurance === 'receipt') return { label: 'Receipt', tone: 'ok', icon: 'patch-check', tip: 'A signed receipt backs this evidence.' }
   return { label: `Unrecognised: ${assurance.slice(0, 40)}`, tone: 'muted', icon: 'question-circle', tip: 'This hub does not know this assurance level.' }
 }
@@ -99,7 +99,7 @@ export function gateSteps(gates: Gate[]): Step[] {
 export const selfReportedCount = (run: Pick<RunView, 'gates'>) => run.gates.filter((g) => g.state === 'done' && isSelfReported(g.assurance)).length
 
 export function adoptionLabel(source: AdoptionSource, defaultBranch: string | null): string {
-  if (source === 'default_branch') return `Adoption: read from ${defaultBranch ?? 'the default branch'} on the forge`
+  if (source === 'default_branch') return `Adoption: read from ${defaultBranch ?? 'the default branch'} on GitHub or GitLab`
   if (source === 'reported_by_checkout') return 'Adoption: reported by checkout'
   return 'Not adopted'
 }
@@ -109,6 +109,13 @@ const PLANNED: Record<string, string> = { forge_status: 'merge check', native: '
 export function enforcement(gates: { enforce: string[] }[]): { enforced: string[]; planned: string[] } {
   const all = new Set(gates.flatMap((g) => g.enforce))
   return { enforced: Object.keys(ENFORCED).filter((k) => all.has(k)).map((k) => ENFORCED[k]!), planned: Object.keys(PLANNED).filter((k) => all.has(k)).map((k) => PLANNED[k]!) }
+}
+/** Steps (gates) across the adopted skills, and how many can stop an agent finishing: only those the opt-in Stop hook covers. */
+export function stepCounts(lib: Library): { steps: number; canStop: number } {
+  const gates = lib.adoption.pins
+    .filter((p) => p.status === 'adopted')
+    .flatMap((p) => lib.catalog.find((c) => c.name === p.name && c.sha256 === p.sha256)?.gates ?? [])
+  return { steps: gates.length, canStop: gates.filter((g) => g.enforce.includes('stop')).length }
 }
 /** The hub numbers its lines; the page numbers them with <ol>. */
 export const stepText = (line: string) => line.replace(/^\d+\.\s+/, '')

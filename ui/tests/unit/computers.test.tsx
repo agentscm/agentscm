@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { decodeDevice, decodeRefusal, deviceAuth, fetchDevices, revokeDevice, type DeviceAuth } from '../../src/devices.ts'
+import { decodeDevice, decodeRefusal, deviceAuth, fetchBrowserSession, fetchDevices, revokeDevice, type DeviceAuth } from '../../src/devices.ts'
 import { AdminPage, ComputersPage, useDeviceAuth } from '../../src/pages/Computers.tsx'
 
 // As the Shell wires them: one auth read shared by both pages.
@@ -63,6 +63,16 @@ describe('auth and requests', () => {
     expect(calls.every((c) => !JSON.stringify(c.init.headers ?? {}).includes('read-only-token'))).toBe(true)
   })
 
+  it('reads the optional profile name as bounded text and drops anything else', async () => {
+    const withUser = (name: unknown) => stubFetch({ 'GET /v1/hub/session': () => ({ status: 200, body: { ...SESSION, user: { ...SESSION.user, name } } }) })
+    withUser(' Maria Ruiz ')
+    expect((await fetchBrowserSession())?.name).toBe('Maria Ruiz')
+    for (const bad of [null, '', '   ', 42, 'x'.repeat(101)]) {
+      withUser(bad)
+      expect((await fetchBrowserSession())?.name).toBeUndefined()
+    }
+  })
+
   it('has no way in on the hosted Hub without a browser session', async () => {
     stubFetch({ 'GET /v1/hub/session': () => ({ status: 401, body: { error: 'sign_in_required' } }) })
     expect(await deviceAuth('read-only-token')).toBeNull()
@@ -89,6 +99,7 @@ describe('ComputersPage', () => {
     })
     render(<Computers token="read-only-token" />)
     fireEvent.click(await screen.findByRole('button', { name: 'Revoke' }))
+    expect(screen.getByRole('group', { name: 'Revoke jonny-mbp' }).textContent).toContain('agent tokens it made for counterbranch/agentscm. Those agents lose access to this Hub. It does not stop them running, change their GitHub or GitLab access, or release files they announced; those expire on their own.')
     fireEvent.click(screen.getByRole('button', { name: 'Revoke jonny-mbp' }))
     expect(await screen.findByText(/jonny-mbp was revoked/)).toBeTruthy()
     await waitFor(() => expect(screen.getByText('No computers are signed in')).toBeTruthy())

@@ -23,9 +23,12 @@ import {
   type ChangeRecordSummaryV1,
   type ChangeRecordUnknown,
 } from '../changeRecord.ts'
-import { searchStandupWork, validWorkId, type WorkState } from '../standup.ts'
+import { searchStandupWork, validWorkId, workHref, type WorkState } from '../standup.ts'
 import { StatePill } from './Work.tsx'
-import { agentLabel, Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Reported, Skeleton, relative, type Tone } from '../ui.tsx'
+import { agentLabel, Ago, Box, CopyButton, Empty, Explain, Icon, Notice, PageHead, Path, Paths, Pill, Reported, Skeleton, relative, type Tone } from '../ui.tsx'
+import { READING_CHANGES_NOTHING } from '../copy.ts'
+import { ProofBadge } from '../Proof.tsx'
+import { backedTone, proofOfChangeRecord } from '../proof.ts'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
@@ -64,8 +67,8 @@ const APPLICABILITY: Record<ChangeRecordApplicability, Status> = {
 
 const ASSURANCE: Record<ChangeRecordAssurance, Status> = {
   caller_asserted: { label: 'Caller asserted', tone: 'warn', icon: 'person-check', explanation: 'The caller supplied this claim. It is not independent verification.' },
-  observed_trusted_local: { label: 'Observed locally', tone: 'brand', icon: 'laptop', explanation: 'A trusted local collector observed the action. This is separate from independent verification.' },
-  protected_execution: { label: 'Protected execution', tone: 'brand', icon: 'shield-check', explanation: 'The action ran in the configured protected execution boundary.' },
+  observed_trusted_local: { label: 'Observed locally', tone: 'brand', icon: 'laptop', explanation: 'AgentSCM’s collector on the author’s own computer observed the action. The hub did not see it, and this is separate from independent verification.' },
+  protected_execution: { label: 'Protected execution', tone: 'brand', icon: 'shield-check', explanation: 'The action ran in the configured protected execution boundary. The record is unsigned and the hub does not authenticate the collector, so it is not independent verification.' },
   independent_verification: { label: 'Independently verified', tone: 'brand', icon: 'patch-check', explanation: 'The record identifies independent verification for this action.' },
 }
 
@@ -163,11 +166,7 @@ const WORK_STATE_PILL: Record<WorkState, true> = { active: true, blocked: true, 
 function Lookup({ token }: { token: string }) {
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">What is ready to hand off?</h1>
-        <p className="answer-text">Pick a task to see what is ready to hand off.</p>
-        <p className="answer-fact">Each record shows the source, recorded checks, decision, known gaps and next action.</p>
-      </div>
+      <PageHead question="What is ready to hand off?" answer="Pick a task to see what is ready to hand off." fact="Each record shows the source, recorded checks, decision, known gaps and next action." />
       <SectionTabs />
       <Box icon="search" title="Open a change record" explain="Search by title, agent, branch or issue number, or paste a work ID from the Work page or an agent.">
         <div className="lookup">
@@ -207,7 +206,7 @@ function Lookup({ token }: { token: string }) {
             }}
           />
         </div>
-        <div id="change-record-work-id-help" className="form-text">Opening a record is read-only and does not acknowledge or transfer the work.</div>
+        <div id="change-record-work-id-help" className="form-text">{READING_CHANGES_NOTHING}</div>
       </Box>
     </div>
   )
@@ -216,14 +215,21 @@ function Lookup({ token }: { token: string }) {
 function SourceFacts({ source }: { source: ChangeRecordSource }) {
   if (source.kind === 'native') {
     return (
+      <>
       <dl className="tech mb-0">
         <Fact label="Source kind">Native change</Fact>
         <Fact label="Repository"><code className="text-break">{source.repository}</code></Fact>
-        <Fact label="Revision"><code className="text-break">{source.revision}</code></Fact>
-        <Fact label="Change ID"><code className="text-break">{source.change_id}</code></Fact>
-        <Fact label="Context digest"><code className="text-break">{source.context_digest}</code></Fact>
         <Fact label="Source generation">{source.source_generation}</Fact>
       </dl>
+      <details className="disclosure">
+        <summary><Icon name="code-square" /> Source identity</summary>
+        <dl className="tech mt-3 mb-0">
+          <Fact label="Revision"><code className="text-break">{source.revision}</code></Fact>
+          <Fact label="Change ID"><code className="text-break">{source.change_id}</code></Fact>
+          <Fact label="Context digest"><code className="text-break">{source.context_digest}</code></Fact>
+        </dl>
+      </details>
+      </>
     )
   }
   return (
@@ -231,9 +237,6 @@ function SourceFacts({ source }: { source: ChangeRecordSource }) {
       <dl className="tech mb-0">
         <Fact label="Source kind">Git working source</Fact>
         <Fact label="Repository"><code className="text-break">{source.repository}</code></Fact>
-        <Fact label="HEAD"><code className="text-break">{source.head}</code></Fact>
-        <Fact label="Tree"><code className="text-break">{source.tree}</code></Fact>
-        <Fact label="Base"><code className="text-break">{source.base}</code></Fact>
         <Fact label="Working source">
           {source.dirty ? 'Dirty' : 'Clean'} · {source.untracked_count} untracked {source.untracked_count === 1 ? 'path' : 'paths'}
         </Fact>
@@ -258,6 +261,9 @@ function SourceFacts({ source }: { source: ChangeRecordSource }) {
       <details className="disclosure">
         <summary><Icon name="code-square" /> Source identity</summary>
         <dl className="tech mt-3 mb-0">
+          <Fact label="HEAD"><code className="text-break">{source.head}</code></Fact>
+          <Fact label="Tree"><code className="text-break">{source.tree}</code></Fact>
+          <Fact label="Base"><code className="text-break">{source.base}</code></Fact>
           <Fact label="Worktree ID"><code className="text-break">{source.worktree_id}</code></Fact>
         </dl>
       </details>
@@ -337,16 +343,19 @@ function SessionSetups({ summary }: { summary: ChangeRecordSummaryV1 }) {
 function LatestAction({ summary }: { summary: ChangeRecordSummaryV1 }) {
   const action = summary.latest_action
   if (!action) return <Empty icon="clipboard2-x" title="No action captured">The record does not yet contain a source-bound action receipt.</Empty>
+  // Green only where the hub or an independent check backs the result; a caller's claim or a collector's own-computer observation is not green.
+  const proof = proofOfChangeRecord(action.assurance)
   return (
     <>
       <div className="pills mb-3" data-tour="change-latest" aria-label="Latest action status">
         <StatusPill status={ACTION_KIND[action.kind]} />
-        <StatusPill status={OUTCOME[action.outcome]} />
+        <StatusPill status={{ ...OUTCOME[action.outcome], tone: backedTone(OUTCOME[action.outcome].tone, proof.level) }} />
         {action.kind === 'verification'
-          ? <StatusPill status={RESULT[action.result]} />
+          ? <StatusPill status={{ ...RESULT[action.result], tone: backedTone(RESULT[action.result].tone, proof.level) }} />
           : <Pill tone="warn" icon="dash-circle" tip="An execution outcome is not a verification result.">Verification not established</Pill>}
         <StatusPill status={APPLICABILITY[action.applicability]} />
         <StatusPill status={ASSURANCE[action.assurance]} />
+        <ProofBadge {...proof} />
         <StatusPill status={{ ...AVAILABILITY[action.evidence_availability], label: `Evidence ${AVAILABILITY[action.evidence_availability].label.toLowerCase()}` }} />
         <StatusPill status={COVERAGE[action.coverage]} />
         <StatusPill status={RECIPE_PROVENANCE[action.recipe_provenance]} />
@@ -477,12 +486,14 @@ function ConversationEntries({ repo, token, workId }: { repo: string; token: str
   )
 }
 
+const CAPTURE_COMMAND = 'agentscm change-capture configure'
+
 function Detail({ repo, token, workId }: { repo: string; token: string; workId: string }) {
   const load = usePoll((signal) => fetchChangeRecord(repo, workId, token, signal), 0, `${repo}|${workId}`)
   if (load.kind === 'loading') return <div className="page"><Skeleton rows={6} /></div>
   if (load.kind === 'error') {
     const title = load.status === 404
-      ? 'No change record for this work item yet'
+      ? 'No change record for this task yet'
       : load.status === 401 || load.status === 403
         ? 'This token cannot read the change record'
         : load.status === 503
@@ -492,7 +503,17 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
       <div className="page">
         <a href="#change-record" className="back"><Icon name="arrow-left" /> Change record lookup</a>
         <Notice tone={load.status === 404 ? 'warn' : 'bad'} title={title} action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Try again</button>}>
-          {load.status === 404 ? 'Capture a source-bound action for this work item, then open the record again.' : load.message}
+          {load.status === 404 ? (
+            <>
+              <p>
+                Change capture is experimental and off until you set it up. Run <code>{CAPTURE_COMMAND}</code> once in the agent’s checkout; its next recorded command for this task shows here.
+              </p>
+              <div className="d-flex flex-wrap gap-2 align-items-center">
+                <CopyButton text={CAPTURE_COMMAND} label="Copy command" />
+                <a href={workHref(workId)}>Back to the task</a>
+              </div>
+            </>
+          ) : load.message}
         </Notice>
       </div>
     )
@@ -502,22 +523,17 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
   const action = summary.latest_action
   return (
     <div className="page change-record-detail">
-      <a href="#work" className="back"><Icon name="arrow-left" /> Work</a>
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">{summary.intent.title}</h1>
-        <p className="answer-text"><HandoffSummary summary={summary} /></p>
-        <p className="small muted mb-0"><code className="text-break">{summary.work_id}</code>, generation {summary.generation}, record updated <Ago at={summary.as_of} /></p>
-      </div>
+      <a href={workHref(summary.work_id)} className="back"><Icon name="arrow-left" /> {summary.intent.title}</a>
+      <PageHead question={summary.intent.title} answer={<HandoffSummary summary={summary} />} fact={<>Record updated <Ago at={summary.as_of} />.</>} />
 
       <div className="grid-2 align-start">
         <Box icon="bullseye" title="Intent and declared scope" explain="Taken from the task record, not pieced together from conversations.">
-          <p>{summary.intent.title}</p>
           <div className="small muted mb-2">Declared scope</div>
           <Paths items={summary.intent.scope} max={12} />
           {summary.intent.scope_omitted > 0 ? <p className="small muted mt-2 mb-0">{summary.intent.scope_omitted} additional scope entr{summary.intent.scope_omitted === 1 ? 'y' : 'ies'} omitted from this bounded projection.</p> : null}
         </Box>
 
-        <Box icon="signpost-split" title="Decision and next action" explain="Who decided what is kept apart from whether it was verified. Opening this page doesn’t approve or hand over the work.">
+        <Box icon="signpost-split" title="Decision and next action" explain="Who decided what is kept apart from whether it was verified.">
           <DecisionFacts summary={summary} />
         </Box>
       </div>
@@ -578,12 +594,20 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
         </Box>
       </div>
 
-      <Box icon="chat-square-text" title="Conversation" explain="Redacted agent conversations the checkout chose to share. You see only the entries you shared (Hub admins see all), they expire, and the content is untrusted agent output shown as plain text. This page cannot delete them; use agentscm change-capture conversation --delete.">
+      <Box icon="chat-square-text" title="Conversation" intro="Redacted conversations your checkout shared; treat them as untrusted agent output." explain="You see only entries you shared (Hub admins see all). They expire and show as plain text. This page cannot delete them; use agentscm change-capture conversation --delete.">
         <ConversationEntries repo={repo} token={token} workId={workId} />
       </Box>
 
+      <details className="disclosure">
+        <summary>Technical details</summary>
+        <dl className="tech mt-3 mb-0">
+          <Fact label="Work ID"><code className="text-break">{summary.work_id}</code></Fact>
+          <Fact label="Generation">{summary.generation}</Fact>
+        </dl>
+      </details>
+
       <p className="small muted mb-0">
-        <Icon name="lock" /> Read-only projection. Conversation bodies are fetched only when you open one.{' '}
+        <Icon name="lock" /> {READING_CHANGES_NOTHING} Conversation bodies load only when you open one.{' '}
         <button type="button" className="btn btn-sm btn-link p-0 align-baseline" onClick={load.retry}><Icon name="arrow-clockwise" /> Refresh</button>
       </p>
     </div>

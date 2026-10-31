@@ -11,7 +11,8 @@ import {
   type CatchupPage,
   type CatchupWorkEvent,
 } from './catchup.ts'
-import { Ago, Icon, Notice, Skeleton, localDate } from './ui.tsx'
+import { READING_CHANGES_NOTHING } from './copy.ts'
+import { Ago, Explain, Icon, Notice, Skeleton, localDate } from './ui.tsx'
 import { useNow } from './useHub.ts'
 
 type LoadState =
@@ -28,6 +29,7 @@ const WORK_LABEL: Record<string, string> = {
   work_joined: 'Agent joined',
   work_takeover: 'Work taken over',
   work_checkpoint: 'Checkpoint reported',
+  work_pr_link: 'Relationship changed',
 }
 
 const COORDINATION_LABEL: Record<string, string> = {
@@ -37,13 +39,14 @@ const COORDINATION_LABEL: Record<string, string> = {
   coordination_withdrawn: 'Coordination withdrawn',
 }
 
-function WorkUpdate({ event }: { event: CatchupWorkEvent }) {
-  const summary = event.item.current?.summary ?? event.item.title
+export function WorkUpdate({ event }: { event: CatchupWorkEvent }) {
+  const relationshipChanged = event.kind === 'work_pr_link'
+  const summary = relationshipChanged ? 'Explicit PR relationship updated; inspect Work for the current link.' : event.item.current?.summary
   return (
-    <li className={event.item.state === 'finished' ? 'tone-ok' : undefined}>
-      <Icon name={event.item.state === 'finished' ? 'check2-circle' : 'chat-square-text'} />
+    <li className={!relationshipChanged && event.item.state === 'finished' ? 'tone-ok' : undefined}>
+      <Icon name={relationshipChanged ? 'git' : event.item.state === 'finished' ? 'check2-circle' : 'chat-square-text'} />
       <div><strong>{WORK_LABEL[event.kind] ?? 'Work updated'}</strong> · <a href={`#work/${encodeURIComponent(event.work_id)}`}>{event.item.title}</a></div>
-      <div className="small muted">{event.item.lead_agent} · {summary} · <Ago at={event.at} /></div>
+      <div className="small muted">{event.item.lead_agent} · {summary ?? <span className="muted">No summary reported</span>} · <Ago at={event.at} /></div>
       <details className="disclosure">
         <summary>Source details</summary>
         <dl className="tech">
@@ -114,7 +117,7 @@ const clock = (at: number) => new Date(at * 1000).toLocaleTimeString([], { hour:
 function records(page: CatchupPage): Rec[] {
   return [
     ...page.merges.map((m) => ({ lane: 'merge' as const, at: m.observed_at, key: `m${m.id}`, bad: false, node: <MergeUpdate key={`m${m.id}`} merge={m} /> })),
-    ...page.work_events.map((e) => ({ lane: 'work' as const, at: e.at, key: `w${e.seq}`, bad: e.item.state === 'blocked', node: <WorkUpdate key={`w${e.seq}`} event={e} /> })),
+    ...page.work_events.map((e) => ({ lane: 'work' as const, at: e.at, key: `w${e.seq}`, bad: e.kind !== 'work_pr_link' && e.item.state === 'blocked', node: <WorkUpdate key={`w${e.seq}`} event={e} /> })),
     ...page.coordination_events.map((e) => ({ lane: 'coord' as const, at: e.at, key: `c${e.seq}`, bad: false, node: <CoordinationUpdate key={`c${e.seq}`} event={e} /> })),
   ].sort((x, y) => y.at - x.at)
 }
@@ -130,7 +133,7 @@ function Lanes({ recs, from, to, lane, onLane }: { recs: Rec[]; from: number; to
           return (
             <li key={l.key} className={`sl sl-${l.key}${lane === l.key ? ' is-on' : lane ? ' is-dim' : ''}`}>
               <button type="button" className="sl-name" disabled={mine.length === 0} aria-pressed={lane === l.key} onClick={() => onLane(lane === l.key ? null : l.key)}>
-                {l.label} <span>{mine.length}</span>
+                {l.label}
               </button>
               <div className="sl-rail" aria-hidden="true">
                 {mine.map((r) => (
@@ -291,7 +294,7 @@ export function CatchupPanel({ token }: { token: string }) {
   const bad = recs.filter((r) => r.bad).length
 
   const action = page.complete ? (
-    <button type="button" className="btn btn-sm btn-outline-secondary since-done" disabled={currentBusy !== null} onClick={() => void acknowledge()}>
+    <button type="button" className="btn btn-sm btn-outline-secondary since-done" title="Acts at once. Moves only your own review position; nothing on GitHub or GitLab changes." disabled={currentBusy !== null} onClick={() => void acknowledge()}>
       <Icon name="check2" /> {currentBusy === 'ack' ? 'Marking…' : hasGap ? 'Mark available records reviewed' : 'Mark reviewed'}
     </button>
   ) : (
@@ -305,7 +308,7 @@ export function CatchupPanel({ token }: { token: string }) {
       <div className="since-head">
         <div className="since-title">
           <h2 id="since-title">Since you last checked</h2>
-          {recs.length > 0 && <span className="since-range">{clock(from)} <Icon name="arrow-right" /> now</span>}
+          <Explain text={`${READING_CHANGES_NOTHING} Only Mark reviewed moves your own review position. Merge entries are observations AgentSCM recorded; they do not claim all forge history.`} />
         </div>
         {action}
       </div>
@@ -368,9 +371,6 @@ export function CatchupPanel({ token }: { token: string }) {
           </dl>
         </details>
       </div>
-      <p className="since-cover">
-        <Icon name="info-circle" /> A fixed, personal delivery: opening, refreshing or paging it does not mark it reviewed. Merge entries are immutable observations recorded by AgentSCM; source status does not claim all forge history.
-      </p>
     </section>
   )
 }

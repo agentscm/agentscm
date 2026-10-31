@@ -119,6 +119,7 @@ function Probe({ enabled = true }: { enabled?: boolean }) {
       )}
       {s.kind === 'none' && <output data-testid="none">{s.empty ? 'empty' : (s.refusal?.message ?? 'signed out')}</output>}
       {s.kind === 'unavailable' && <output data-testid="unavailable">{s.reason}</output>}
+      {s.kind === 'unavailable' && <output data-testid="unavailable-refusal">{s.refusal?.message ?? ''}</output>}
     </div>
   )
 }
@@ -150,6 +151,19 @@ function hub(extra: Record<string, (init: RequestInit) => Reply | Promise<Reply>
 }
 
 describe('useWebRead', () => {
+  // A remembered pick means no work probing on sign-in; these tests are about tokens and sessions, not the choice.
+  beforeEach(() => localStorage.setItem('agentscm.web.repository', 'acme/docs'))
+
+  it('with no remembered pick, probes each allowed repository once and falls back to the first when the overview fails', async () => {
+    localStorage.clear()
+    const calls = hub()
+    render(<Probe />)
+    expect((await screen.findByTestId('repo')).textContent).toBe('acme/docs')
+    // docs and widgets minted and probed (overview answers 404 here), secret refused; no repository is minted twice.
+    expect(minted(calls).map((c) => JSON.parse(c.init.body as string).repository)).toEqual(['acme/docs', 'acme/secret', 'acme/widgets'])
+    expect(calls.filter((c) => c.url.startsWith('/v1/hub/standup/overview'))).toHaveLength(2)
+  })
+
   it('opens the first allowed repository with one mint, and never stores the token', async () => {
     const calls = hub()
     render(<Probe />)
@@ -232,7 +246,17 @@ describe('useWebRead', () => {
     render(<Probe />)
     expect((await screen.findByTestId('repo')).textContent).toBe('acme/zeta')
     expect(screen.getByTestId('repos').textContent).toBe('acme/zeta,acme/alpha')
-    expect(minted(calls)).toHaveLength(1)
+    // First sign-in also reads acme/alpha looking for unfinished work; neither has any, so acme/zeta opens.
+    expect(minted(calls)).toHaveLength(2)
+  })
+
+  it('keeps the Hub\'s own sentence when its access check is unavailable', async () => {
+    hub({
+      'POST /v1/hub/session/read-token': () => ({ status: 503, body: { error: 'permission_unavailable', message: "GitHub didn't answer the Hub's access check; nothing changed, so try again in a minute" } }),
+    })
+    render(<Probe />)
+    expect((await screen.findByTestId('unavailable')).textContent).toBe('connection')
+    expect(screen.getByTestId('unavailable-refusal').textContent).toBe("GitHub didn't answer the Hub's access check; nothing changed, so try again in a minute")
   })
 
   it('distinguishes no web sign-in from an identified session with nothing to open', async () => {
@@ -244,6 +268,21 @@ describe('useWebRead', () => {
     render(<Probe />)
     expect((await screen.findByTestId('unavailable')).textContent).toBe('empty')
     expect(screen.getByText('retry sign out')).toBeTruthy()
+  })
+
+  it('a tab left signed out opens the app when it regains focus after a sign-in elsewhere', async () => {
+    let signedIn = false
+    const calls = hub({ 'GET /v1/hub/session': () => (signedIn ? { status: 200, body: SESSION_BODY } : { status: 401 }) })
+    render(<Probe />)
+    expect((await screen.findByTestId('none')).textContent).toBe('signed out')
+    // Still signed out: focus asks only for the session, and nothing changes.
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    await waitFor(() => expect(calls.filter((c) => c.url === '/v1/hub/session')).toHaveLength(2))
+    expect(screen.getByTestId('none')).toBeTruthy()
+    expect(minted(calls)).toHaveLength(0)
+    signedIn = true
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    expect((await screen.findByTestId('repo')).textContent).toBe('acme/docs')
   })
 
   it('ignores a mint response from before web sign-in was disabled and reopened', async () => {

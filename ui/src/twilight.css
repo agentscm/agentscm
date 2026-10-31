@@ -386,8 +386,9 @@ textarea.form-control {
 @media (prefers-reduced-motion: no-preference) {
   .skeleton { animation: skeleton-wait 1ms 180ms backwards; }
   .skeleton .placeholder { animation: skeleton-sheen 1.6s ease-in-out infinite; background-image: linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--hub-surface) 70%, transparent) 50%, transparent 100%); background-size: 200% 100%; background-repeat: no-repeat; }
-  /* Content mounts settle in once; polling re-renders keep their nodes, so they do not replay this. */
-  .page > *, .box-body > * { animation: settle-in 260ms cubic-bezier(0.25, 1, 0.5, 1) backwards; }
+  /* Content mounts settle in once; polling re-renders keep their nodes, so they do not replay this.
+     The page tabs stay put: they are the click target for the next page, so they must not move under the pointer. */
+  .page > :not(.htabs), .box-body > * { animation: settle-in 260ms cubic-bezier(0.25, 1, 0.5, 1) backwards; }
   .box-body > .skeleton, .page > .skeleton { animation: skeleton-wait 1ms 180ms backwards; }
 }
 @keyframes skeleton-wait { from { opacity: 0; } }
@@ -410,6 +411,40 @@ textarea.form-control {
   color: var(--frame-ink);
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   gap: 14px;
+}
+/* The installed app with the window-controls overlay (html.wco): the top bar is the title bar. */
+html.wco .app-shell {
+  --top-h: max(var(--hub-top-h, 56px), calc(env(titlebar-area-y, 0px) + env(titlebar-area-height, 0px)));
+}
+html.wco .topbar {
+  -webkit-app-region: drag;
+  app-region: drag;
+  /* Clear the traffic lights (macOS, left) or the caption buttons (Windows, right). */
+  padding-left: calc(env(titlebar-area-x, 0px) + 12px);
+  padding-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw) + 12px);
+}
+html.wco .topbar :is(a, button, input, .pop) {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+@media (min-width: 961px) {
+  html.wco .topbar-logo {
+    min-width: max(0px, calc(var(--side-w) - 36px - env(titlebar-area-x, 0px)));
+  }
+}
+/* Pages without the top bar (sign-in) keep a frame-coloured strip to drag the window by. */
+html.wco:not(:has(.topbar)) body {
+  padding-top: env(titlebar-area-height, 0px);
+}
+html.wco:not(:has(.topbar)) body::before {
+  content: '';
+  position: fixed;
+  inset: 0 0 auto;
+  height: env(titlebar-area-height, 0px);
+  z-index: 1040;
+  background: var(--frame);
+  -webkit-app-region: drag;
+  app-region: drag;
 }
 .topbar-div {
   background: rgba(255, 255, 255, 0.12);
@@ -2204,31 +2239,227 @@ textarea.form-control {
   color: var(--frame-dim);
   font-size: 16px;
 }
-.signin-points li {
-  font-weight: 500;
-  color: var(--frame-ink);
-}
-.signin-points i {
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--frame-active-icon);
-}
-.signin-panel .box,
-.signin-panel form.box {
+.signin-card {
   background: var(--hub-surface);
   color: var(--hub-text);
   border-radius: 26px;
 }
-.signin-alt .btn-outline-secondary {
+.signin-agents-title {
+  color: var(--frame-ink);
+}
+.signin-agents-note, .signin-agents-miss, .signin-agents-copy {
+  color: var(--frame-dim);
+}
+.signin-agents-copy .signin-agents-copylink {
+  color: var(--frame-ink);
+}
+.signin-agent {
+  font-size: 13.5px;
+  padding: 7px 14px;
   --bs-btn-color: var(--frame-ink);
+  --bs-btn-bg: transparent;
   --bs-btn-border-color: rgba(255, 255, 255, 0.18);
   --bs-btn-hover-color: #fff;
   --bs-btn-hover-bg: var(--frame-brand);
   --bs-btn-hover-border-color: var(--frame-brand);
+  --bs-btn-active-color: #fff;
+  --bs-btn-active-bg: var(--frame-brand);
+  --bs-btn-active-border-color: var(--frame-brand);
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: var(--frame-ink);
 }
-.signin-alt .btn-outline-secondary:hover {
+.signin-agent:hover {
+  background: var(--frame-brand);
+  border-color: var(--frame-brand);
+  color: #fff;
+}
+.signin-agent:focus-visible {
+  outline: 2px solid var(--frame-active-icon);
+  outline-offset: 2px;
+}
+/* Signed out, frame and sheet: the promise and an example on the frame, the way in on the sheet. */
+.signin-sheeted {
+  display: grid;
+  grid-template-columns: minmax(0, 56fr) minmax(0, 44fr);
+  place-items: stretch;
+  padding: 0;
+}
+.signin-pane-frame {
+  display: grid;
+  align-items: center;
+  padding: 104px clamp(32px, 5vw, 72px) 64px;
+}
+.signin-pane-frame-inner {
+  width: min(100%, 620px);
+}
+.signin-sheeted h1 {
+  font-size: clamp(36px, 4.6vw, 60px);
+  font-weight: 300;
+  letter-spacing: -0.035em;
+  line-height: 1.08;
+  margin: 0 0 16px;
+  color: #fff;
+  text-wrap: balance;
+}
+.signin-sheeted .lead {
+  color: var(--frame-dim);
+  font-size: 16px;
+  max-width: 42ch;
+  margin: 0 0 44px;
+}
+.signin-example-caption {
+  font-size: 12px;
+  color: var(--frame-dim);
+  margin-bottom: 4px;
+}
+.signin-example-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) minmax(150px, 44%);
+  gap: 14px;
+  align-items: center;
+  padding: 14px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+.signin-example-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+}
+.signin-example-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.signin-example-who {
+  font-size: 13px;
+  color: var(--frame-ink);
+}
+.signin-example-what {
+  font-size: 14px;
+  font-weight: 500;
+  color: #fff;
+}
+.signin-example-lane {
+  display: flex;
+  gap: 4px;
+  height: 24px;
+}
+.signin-example-lane > span {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+.signin-example-lane .seg-claimed {
+  flex: 0 0 12%;
+  background: rgba(255, 255, 255, 0.24);
+}
+.signin-example-lane .seg-now {
+  flex: 1 1 0;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
   background: var(--frame-brand);
 }
+.signin-example-lane .seg-now.is-blocked {
+  background: var(--frame-coral);
+  color: var(--frame-on-coral);
+}
+.signin-example-lane .seg-next,
+.signin-example-lane .seg-done {
+  flex: 0 0 18%;
+}
+.signin-pane-sheet {
+  display: grid;
+  place-items: center;
+  padding: 64px clamp(24px, 4vw, 56px);
+  background: var(--hub-canvas);
+  color: var(--hub-text);
+  border-top-left-radius: 26px;
+}
+.signin-sheet-inner {
+  width: min(100%, 440px);
+}
+.signin-sheeted .signin-logo {
+  top: 28px;
+  left: 32px;
+}
+.signin-sheeted .signin-card {
+  background: none;
+  border-radius: 0;
+}
+.signin-sheet-title {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0 0 24px;
+}
+.signin-sheeted .signin-agents {
+  margin-top: 44px;
+}
+@media (max-width: 640px) {
+  .signin-sheeted .signin-logo {
+    top: 20px;
+    left: 20px;
+  }
+  .signin-sheeted .signin-logo img,
+  .signin-sheeted .signin-logo svg {
+    height: 30px;
+  }
+}
+@media (max-width: 960px) {
+  .signin-sheeted {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+  }
+  .signin-pane-frame {
+    padding: 88px 24px 40px;
+  }
+  .signin-example {
+    display: none;
+  }
+  .signin-sheeted .lead {
+    margin-bottom: 0;
+  }
+  .signin-pane-sheet {
+    place-items: start center;
+    padding: 40px 24px 64px;
+  }
+}
+
+
+/* The agent buttons sit on the sheet: outline pills with the sheet's rule colour, brand on hover. */
+.signin-sheeted .signin-agent {
+  padding-inline: 12px;
+  --bs-btn-color: var(--hub-text);
+  --bs-btn-hover-color: #fff;
+  background: transparent;
+  border-color: var(--hub-rule-strong);
+  color: var(--hub-text);
+}
+.signin-sheeted .signin-agent:hover {
+  background: var(--hub-brand);
+  border-color: var(--hub-brand);
+  color: #fff;
+}
+.signin-sheeted .signin-agent:focus-visible {
+  outline: 2px solid var(--hub-brand);
+}
+.signin-sheeted .signin-agents-title {
+  color: var(--hub-text);
+}
+.signin-sheeted .signin-agents-note, .signin-sheeted .signin-agents-miss, .signin-sheeted .signin-agents-copy {
+  color: var(--hub-text-3);
+}
+.signin-sheeted .signin-agents-copy .signin-agents-copylink {
+  color: var(--hub-text);
+}
+
 .signed-out-workspace {
   background: var(--hub-canvas);
   min-height: 100dvh;
@@ -2996,6 +3227,15 @@ a.brief-cite:hover {
   vertical-align: top;
 }
 
+/* 375px phones: tighter topbar gaps so the bar fits without sideways scroll (after the 14px gap above). */
+@media (max-width: 400px) {
+  .topbar {
+    gap: 4px;
+  }
+  .topbar-right {
+    gap: 4px;
+  }
+}
 /* ---------- All repositories: one ruled row per repository, status in words first ---------- */
 .repo-list { list-style: none; margin: 0; padding: 0; }
 .repo-list > li { border-bottom: 1px solid var(--hub-rule); }
@@ -3043,4 +3283,158 @@ html[data-density='condensed'] .repo-row-meta { font-size: 12px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .repo-row, .repo-row-go { transition: none; }
+}
+
+/* ---------- opening a web sign-in: the sign-in layout with a roll call, then the sheet widens into the app ---------- */
+.roll {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.roll li {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 0;
+  border-top: 1px solid var(--hub-rule);
+  font-size: 16px;
+  color: var(--hub-text-3);
+  font-variant-numeric: tabular-nums;
+}
+.roll-mark {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1.5px solid var(--hub-rule-strong);
+  display: grid;
+  place-items: center;
+}
+.roll-mark svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: var(--hub-ok);
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.roll li[data-state='done'] {
+  color: var(--hub-text-2);
+}
+.roll li[data-state='done'] .roll-mark {
+  border-color: transparent;
+  background: var(--hub-ok-soft);
+}
+.roll li[data-state='now'],
+.roll li[data-state='bad'] {
+  color: var(--hub-text);
+}
+.roll li[data-state='now'] .roll-mark,
+.roll li[data-state='bad'] .roll-mark {
+  border: 2px solid var(--hub-brand);
+}
+.roll li[data-state='now'] .roll-mark::after,
+.roll li[data-state='bad'] .roll-mark::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--hub-brand);
+}
+.roll li[data-state='bad'] .roll-mark {
+  border-color: var(--hub-bad);
+}
+.roll li[data-state='bad'] .roll-mark::after {
+  background: var(--hub-bad);
+}
+.roll-trouble {
+  margin-top: 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hub-rule);
+  color: var(--hub-text-2);
+}
+.roll-trouble p {
+  margin: 0 0 12px;
+}
+.roll-trouble strong {
+  color: var(--hub-bad);
+}
+.roll-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+@keyframes roll-pulse {
+  from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--hub-brand) 45%, transparent); }
+  to { box-shadow: 0 0 0 9px transparent; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .roll li[data-state='now'] .roll-mark {
+    animation: roll-pulse 1.8s ease-out infinite;
+  }
+}
+
+/* The morph: sheet and logo carry matching names in both layouts. `html.vt-app` names the app's side, and only
+   for the length of the transition, so one element holds each name at a time and the sheet's fixed children
+   are not trapped by a permanent name. Phones skip the names and crossfade. */
+@media (min-width: 961px) {
+  .signin-opening .signin-pane-sheet {
+    view-transition-name: hub-sheet;
+  }
+  .signin-opening .signin-logo .logo {
+    view-transition-name: hub-logo;
+  }
+  html.vt-leave .signin-pane-sheet {
+    view-transition-name: hub-sheet;
+  }
+  html.vt-app .content {
+    view-transition-name: hub-sheet;
+  }
+  html.vt-app .topbar-logo .logo {
+    view-transition-name: hub-logo;
+  }
+  ::view-transition-group(hub-sheet),
+  ::view-transition-group(hub-logo) {
+    animation-duration: 520ms;
+    animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  ::view-transition-group(hub-sheet) {
+    border-top-left-radius: 26px;
+    overflow: clip;
+  }
+}
+
+/* ---------- install offer: one flat violet line, never coral ---------- */
+.install-offer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 8px 8px 8px 14px;
+  border-radius: 12px;
+  background: var(--hub-brand-soft);
+  color: var(--hub-brand-ink);
+  font-size: 0.875rem;
+}
+.install-text {
+  flex: 1;
+  min-width: 0;
+}
+.install-text .muted {
+  color: inherit;
+  opacity: 0.8;
+}
+.install-x {
+  border: 0;
+  background: none;
+  color: inherit;
+  padding: 4px 8px;
+  border-radius: 8px;
+}
+.install-x:hover,
+.install-x:focus-visible {
+  background: var(--hub-brand-soft);
+  filter: brightness(0.95);
 }

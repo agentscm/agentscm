@@ -36,3 +36,11 @@ export function agentSetupPrompt(rawOrigin: string): string | null {
     ? `Set up AgentSCM on this computer for the Hub at ${origin}. Run: npx agentscm --yes --json --hub-url ${shellQuote(origin)}. If it prints a sign-in link, show it to me and wait while I sign in. It sets up every coding agent it finds, once for all my projects. Tell me which agents it set up and which failed. Then tell me to fully quit and reopen my agents, and, for Codex, to run /hooks once and trust the AgentSCM hooks. Leave trust approvals to me; do not edit trust records, create accounts, expose tokens or deploy a Hub.`
     : null
 }
+
+/** For a Hub with no GitHub or GitLab sign-in: the agent helps its runner turn sign-in on, or helps a viewer ask for a link. */
+export function signInHelpPrompt(rawOrigin: string): string | null {
+  const origin = safeHubOrigin(rawOrigin)
+  return origin
+    ? `The AgentSCM Hub at ${origin} has no GitHub or GitLab sign-in, so its web page only opens with a read-only token. If I run this Hub, help me turn sign-in on: follow "Sign-in configuration" in https://github.com/agentscm/agentscm/blob/main/docs/hub.md and walk me through creating the OAuth app; I will handle the client secret myself. If I don't run it, help me write a short message asking whoever does for a read-only link. Do not edit trust records, expose tokens or deploy a Hub.`
+    : null
+}

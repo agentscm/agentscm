@@ -3,10 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SECTIONS, sectionFromHash } from '../../src/App.tsx'
 import { SkillsPage } from '../../src/pages/Skills.tsx'
 import {
-  addCommand, adoptionLabel, assuranceView, decodeRun, enforcement, gateSteps, isSelfReported, removeCommand, runMatches, runStateLabel, skillsRoute, type Gate, type RunView,
+  addCommand, adoptionLabel, stepCounts, assuranceView, decodeRun, enforcement, gateSteps, isSelfReported, removeCommand, runMatches, runStateLabel, skillsRoute, type Gate, type RunView,
 } from '../../src/skills.ts'
 import { crumbsFor } from '../../src/TopNav.tsx'
-import { stubHub } from '../fixtures/mockFetch.ts'
+import { fromMock, stubHub, type Override } from '../fixtures/mockFetch.ts'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -40,11 +40,13 @@ describe('labels', () => {
     expect(runStateLabel({ state: 'completed', current_gate: null })).toBe('Completed')
   })
   it('states where adoption came from', () => {
-    expect(adoptionLabel('default_branch', 'main')).toBe('Adoption: read from main on the forge')
+    expect(adoptionLabel('default_branch', 'main')).toBe('Adoption: read from main on GitHub or GitLab')
     expect(adoptionLabel('reported_by_checkout', null)).toBe('Adoption: reported by checkout')
     expect(adoptionLabel('none', null)).toBe('Not adopted')
   })
   it('only enforcing values count as enforced', () => {
+    const lib = { catalog: [{ name: 'a', sha256: 'x', gates: [{ id: 'tests', enforce: ['stop'] }, { id: 'ci', enforce: ['forge_status'] }, { id: 'merge', enforce: ['advise'] }] }], adoption: { pins: [{ name: 'a', sha256: 'x', status: 'adopted' }, { name: 'b', sha256: 'y', status: 'unknown_version' }] } }
+    expect(stepCounts(lib as never)).toEqual({ steps: 3, canStop: 1 })
     expect(enforcement([{ enforce: ['stop'] }, { enforce: ['forge_status', 'advise'] }, { enforce: ['signal'] }])).toEqual({ enforced: ['Stop hook'], planned: ['merge check'] })
     expect(enforcement([{ enforce: ['advise'] }, { enforce: ['signal'] }])).toEqual({ enforced: [], planned: [] })
     // native is planned, not enforced, for skill gates.
@@ -89,21 +91,22 @@ describe('Skills page against the mock hub', () => {
     const sent = stubHub()
     at('#skills')
     render(<SkillsPage repo="acme/widgets" token="read" />)
-    expect(await screen.findByText('Adoption: read from main on the forge')).toBeTruthy()
+    expect(await screen.findByText('Adoption: read from main on GitHub or GitLab')).toBeTruthy()
     for (const t of ['When to use', 'Prerequisites', 'Not for']) expect(screen.getAllByText(t).length).toBeGreaterThan(0)
     expect(screen.getAllByText('How it works').length).toBe(2)
     expect(screen.getAllByText('Full procedure').length).toBe(2)
     expect(document.body.textContent).toContain('same agent token and session')
     // Adopted pr-gate uses the pin's walkthrough (merge method squash); numbers come from the track, not the text.
     expect(screen.getAllByText('The author runs the tests on the exact head commit.').length).toBe(1)
-    expect(screen.getAllByText('Blocks finish').length).toBe(3)
+    expect(screen.getAllByText('Blocks the author’s session where the Stop hook is installed').length).toBe(3)
     expect(screen.getAllByRole('heading', { name: 'pr-gate v1' }).length).toBe(1)
     expect(document.body.textContent).not.toContain('name: pr-gate')
     expect(screen.getAllByText(/Needs: the merge \(squash\)/).length).toBe(1)
     expect(screen.queryByText(/^1\. /)).toBeNull()
     expect(screen.getByText(/Planned: merge check/)).toBeTruthy()
-    expect(screen.getByText(/Enforced: Stop hook/)).toBeTruthy()
-    expect(document.body.textContent).not.toMatch(/Enforced:[^.]*forge status/i)
+    expect(screen.getByText('Available: Stop hook (opt-in, fails open)')).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/Enforced/i)
+    expect(document.body.textContent).toMatch(/\d+ of \d+ steps can stop an agent \(opt-in Stop hook\); evidence is reported by the agent/)
     expect(screen.getByText('agentscm skill add post-merge-check')).toBeTruthy()
     expect(screen.getByText('agentscm skill remove pr-gate')).toBeTruthy()
     expect(screen.getByText('Unknown version')).toBeTruthy()
@@ -122,5 +125,24 @@ describe('Skills page against the mock hub', () => {
     const table = await screen.findByRole('table')
     await waitFor(() => expect(within(table).getAllByText('Self-reported').length).toBeGreaterThan(0))
     expect(screen.getByText('Yes')).toBeTruthy()
+  })
+  // The mock hub's overview, with the billing task on run_41's branch.
+  const onBranch: Override = (url, init) =>
+    url.pathname === '/v1/hub/standup/overview'
+      ? fromMock(url, init, (o) => ({ ...o, current: (o['current'] as { title: string }[]).map((t) => (t.title === 'Refactor the billing module' ? { ...t, branch: 'feat/sync-retry-budget' } : t)) }))
+      : undefined
+  it('a run whose branch matches a task names the task and person first, and sums up its proof', async () => {
+    stubHub(onBranch)
+    at('#skills/runs')
+    const { unmount } = render(<SkillsPage repo="acme/widgets" token="read" />)
+    const row = (await screen.findByText('Refactor the billing module · maria’s claude-code')).closest('a')!
+    expect(row.textContent!.indexOf('Refactor the billing module')).toBeLessThan(row.textContent!.indexOf('feat/sync-retry-budget'))
+    unmount()
+    at('#skills/runs/run_41')
+    render(<SkillsPage repo="acme/widgets" token="read" />)
+    await screen.findByRole('table')
+    // run_41 has an observed gate and a self-reported one: the summary is the weaker.
+    expect(screen.getByText(/Proof so far/).textContent).toBe('Proof so far: Agent says')
+    expect((await screen.findByRole('link', { name: 'Refactor the billing module' })).getAttribute('href')).toMatch(/^#work\/wrk_/)
   })
 })

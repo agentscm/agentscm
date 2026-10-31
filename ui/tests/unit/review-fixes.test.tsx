@@ -119,6 +119,7 @@ describe('2. pull request links accept only https', () => {
     const hrefs = [...document.querySelectorAll('.pr-list a')].map((a) => a.getAttribute('href'))
     expect(hrefs).toEqual(['https://github.com/acme/widgets/pull/2'])
     expect(document.querySelector('.pr-list')!.textContent).toContain('#1 PR 1')
+    expect(document.querySelector('.pr-with')!.textContent).toContain('maya’s claude-ivy is editing src/a.rs')
   })
 })
 

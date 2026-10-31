@@ -2,16 +2,20 @@ import 'bootstrap/dist/css/bootstrap.min.css'
 import 'bootstrap-icons/font/bootstrap-icons.min.css'
 import './styles.css'
 import './twilight.css'
+import './plain.css'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { adoptFragmentToken } from './fragmentToken.ts'
 import { adoptFrontDoorLink } from './frontDoor.ts'
 import { loadDensity } from './storage.ts'
+import { listenForLaunches, watchTitleBar } from './install.ts'
 import App from './App.tsx'
 import { ErrorBoundary } from './ErrorBoundary.tsx'
 
-// Before the first render, so the page never paints at the wrong density.
+// Before the first render, so the page never paints at the wrong density or under the window controls.
 document.documentElement.dataset['density'] = loadDensity()
+watchTitleBar()
+listenForLaunches()
 
 // A `#token=` or `#pair=` link opened in an already-loaded tab only changes the hash; reload so it is stripped and checked like a fresh load.
 window.addEventListener('hashchange', () => {

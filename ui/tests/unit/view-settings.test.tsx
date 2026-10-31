@@ -23,6 +23,14 @@ beforeEach(() => vi.clearAllMocks())
 afterEach(() => vi.restoreAllMocks())
 
 describe('inline agent views settings', () => {
+  it('says in plain words when the hub is too old, never the HTTP status', async () => {
+    vi.mocked(api.fetchViewSettings).mockRejectedValue(Object.assign(new Error('HTTP 404'), { status: 404 }))
+    vi.mocked(ws.workspaceRequest).mockResolvedValue(session(false) as never)
+    render(<ViewSettingsBox token="t" />)
+    expect(await screen.findByText('This hub does not offer inline agent views')).toBeTruthy()
+    expect(screen.getByText(/Ask your hub admin to update it/)).toBeTruthy()
+    expect(document.body.textContent).not.toContain('HTTP')
+  })
   it('renders effective values with their source', async () => {
     setup(report({ coordination_inbox: false, work_overview: null }), true)
     expect((await sw('Show views in agent apps')).checked).toBe(true)

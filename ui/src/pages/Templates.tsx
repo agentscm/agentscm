@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Combobox } from '../Combobox.tsx'
 import { fetchHandoff, fetchLocalChanges, fetchLocalRuns, inspectTemplate, localReachable, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
-import { Box, Empty, Explain, Icon, Notice, OnThisComputer, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
+import { Box, Empty, Explain, Icon, Notice, OnThisComputer, PageHead, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import { SkillLibraryPanel, WorkflowLibraryPanel } from '../WorkflowLibraryPanel.tsx'
@@ -26,7 +26,7 @@ const RUN: Record<RunState, { tone: Tone; icon: string; word: string }> = {
   pending: { tone: 'brand', icon: 'hourglass-split', word: 'Waiting to start' },
   running: { tone: 'brand', icon: 'arrow-repeat', word: 'Running' },
   succeeded: { tone: 'ok', icon: 'check-circle', word: 'Passed' },
-  completed_with_omissions: { tone: 'warn', icon: 'exclamation-circle', word: 'Passed, with gaps' },
+  completed_with_omissions: { tone: 'warn', icon: 'exclamation-circle', word: 'Passed, some steps skipped' },
   failed: { tone: 'bad', icon: 'x-octagon', word: 'Failed' },
   blocked: { tone: 'bad', icon: 'slash-circle', word: 'Blocked' },
   cancelled: { tone: 'warn', icon: 'stop-circle', word: 'Cancelled' },
@@ -62,7 +62,7 @@ function Recipe({ value }: { value: TemplateInspect }) {
           )
         })}
       </ol>
-      <p className="small muted mb-0"><Icon name="info-circle" /> Skill: <code>{t.skill.entrypoint}</code>. Looking at a template does not approve, start or run anything.</p>
+      <p className="small muted mb-0"><Icon name="info-circle" /> Skill: <code>{t.skill.entrypoint}</code></p>
     </>
   )
 }
@@ -250,7 +250,7 @@ function InspectorPanel() {
   const preview = [inspect, handoff].find((p) => p.kind === 'ready' && p.value?.source === 'preview')
   return (
     <div className="stack">
-      <p className="small muted mb-0">Inspect a source-bound template or retained run. This view never changes or starts either one.</p>
+      <p className="small muted mb-0">Read from <code>agentscm serve</code> on this computer, not from the hub. Nothing here changes or starts a run.</p>
       {preview && preview.kind === 'ready' && <PreviewBanner reason={preview.value?.reason} />}
       <div className="grid-2 align-start">
         <Box icon="journal-code" title="See a change’s recipe" explain="The template this computer uses, applied to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">
@@ -274,9 +274,8 @@ function InspectorPanel() {
         </Box>
       )}
       {recipe === null && runId === null && (
-        <Empty icon="journal-code" title="Open a change or a run to begin">Paste an ID above. This page reads from this computer only and never starts or approves anything.</Empty>
+        <Empty icon="journal-code" title="Open a change or a run to begin">Paste a change ID and its template file above, or a run ID from your agent.</Empty>
       )}
-      <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not from the hub.</p>
     </div>
   )
 }
@@ -319,11 +318,11 @@ export function TemplatesPage({ repository = null, onDirtyChange }: { repository
   }, [onDirtyChange, workflowDirty])
   return (
     <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Which reusable workflows can agents configure here?</h1>
-        <p className="answer-text">Build a workflow once, freeze it, and reuse that exact version.</p>
-        <p className="answer-fact">Draft the steps, publish an immutable version, simulate what it would do, then attach it to <code>{repository ?? 'a repository'}</code>. Nothing here runs a command.</p>
-      </div>
+      <PageHead
+        question="Which reusable workflows can agents configure here?"
+        answer="Build a workflow once, freeze it, and reuse that exact version."
+        fact={<>Draft, publish a version, simulate it, then attach it to <code>{repository ?? 'a repository'}</code>. Nothing here runs a command.</>}
+      />
       <SectionTabs />
       {!localReachable() ? (
         <OnThisComputer what="The library" />

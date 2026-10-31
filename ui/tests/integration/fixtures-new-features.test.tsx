@@ -7,7 +7,7 @@ import { LandedPage } from '../../src/pages/Landed.tsx'
 import { TemplatesPage } from '../../src/pages/Templates.tsx'
 import { TimelinePage } from '../../src/pages/Timeline.tsx'
 import seeded from '../fixtures/publications.json'
-import { json, type Override } from '../fixtures/mockFetch.ts'
+import { fromMock, json, type Override } from '../fixtures/mockFetch.ts'
 
 const LOAD = { timeout: 5_000 }
 const REPO = 'counterbranch/agentscm'
@@ -19,13 +19,17 @@ const at = (hash: string) =>
     window.dispatchEvent(new HashChangeEvent('hashchange'))
   })
 
+const overviewRoute = (url: URL) => url.pathname === '/v1/hub/standup/overview'
+/** No task index unless a test supplies one: Landed rows then show no task line. */
+const noTasks: Override = (url) => (overviewRoute(url) ? json(404, { error: 'not_found' }) : undefined)
+
 /** Stub fetch with handlers; every request is recorded, and anything unhandled is a test failure. */
 function stub(...handlers: Override[]) {
   const sent: { method: string; url: string }[] = []
   vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) => {
     const url = new URL(input, 'http://127.0.0.1:5184')
     sent.push({ method: (init.method ?? 'GET').toUpperCase(), url: url.pathname + url.search })
-    for (const h of handlers) {
+    for (const h of [...handlers, noTasks]) {
       const r = await h(url, init)
       if (r) return r
     }
@@ -55,15 +59,33 @@ describe('Landed changes', () => {
   it('lists every change, then fills in CI and deploys for merged ones from their own detail, read-only', async () => {
     const sent = stub(listFixture, showFixture)
     render(<LandedPage repo={REPO} token="read-only" />)
-    await screen.findByText(/3 of 7 recent changes landed/, {}, LOAD)
+    await screen.findByText(/3 of 7 recent changes merged/, {}, LOAD)
     expect(screen.getAllByRole('list', { name: 'How far this change got' })).toHaveLength(7)
     expect(screen.getByText('Branch rejected')).toBeTruthy()
     // Once the three merged details load, the failing CI on schema-migration-lock is counted.
-    await screen.findByText(/1 had a failure after landing/, {}, LOAD)
+    await screen.findByText(/1 had a failure after merging/, {}, LOAD)
     expect(screen.getByText('That’s everything.')).toBeTruthy()
     const shows = sent.filter((r) => showRoute(new URL(r.url, 'http://x')))
     expect(shows.map((r) => r.url.split('/').pop()).sort()).toEqual([idOf('handoff-expiry-sweep'), idOf('schema-migration-lock'), idOf('token-ttl-docs')].sort())
     expect(sent.every((r) => r.method === 'GET')).toBe(true)
+  })
+
+  it('leads a row with its title, then the branch, and names the task and person when a task has that branch', async () => {
+    const branch = pubs[0]!.branch
+    const titled: Override = (url) => (listRoute(url) ? json(200, { publications: pubs.map((p, i) => ({ ...listItem(p, i), ...(i === 0 ? { title: 'Retry with jitter' } : {}) })), next_cursor: null, complete: true }) : undefined)
+    // The mock hub's overview, with its first task moved onto this change's branch.
+    const tasks: Override = (url, init) => (overviewRoute(url) ? fromMock(url, { ...init, headers: { Authorization: 'Bearer read-token' } }, (o) => ({ ...o, current: (o['current'] as Record<string, unknown>[]).map((t, i) => (i === 0 ? { ...t, branch } : t)) })) : undefined)
+    stub(titled, tasks, showFixture)
+    render(<LandedPage repo={REPO} token="read-only" />)
+    const row = (await screen.findByText('Retry with jitter', {}, LOAD)).closest('a')!
+    expect(row.querySelector('strong')!.textContent).toBe('Retry with jitter')
+    expect(row.textContent!.indexOf('Retry with jitter')).toBeLessThan(row.textContent!.indexOf(branch))
+    // Untitled rows still lead with the branch.
+    expect(screen.getAllByText(pubs[1]!.branch)[0]!.closest('strong')).toBeTruthy()
+    const task = await screen.findByRole('link', { name: 'Refactor the billing module' }, LOAD)
+    expect(task.getAttribute('href')).toMatch(/^#work\/wrk_/)
+    expect(task.closest('a.landed-row')).toBeNull()
+    expect(task.closest('li')!.textContent).toContain('Task: Refactor the billing module · maria’s claude-code')
   })
 
   it('shows merged rows as Checking… until their detail loads, never as passed', async () => {
@@ -71,11 +93,32 @@ describe('Landed changes', () => {
     const gate = new Promise<void>((r) => (release = r))
     stub(listFixture, (url) => (showRoute(url) ? gate.then(() => showFixture(url, {}) as Response) : undefined))
     render(<LandedPage repo={REPO} token="read-only" />)
-    await screen.findByText(/3 of 7 recent changes landed/, {}, LOAD)
-    expect(screen.getAllByText('Landed, checking…')).toHaveLength(3)
-    expect(screen.queryByText('Landed and passed')).toBeNull()
+    await screen.findByText(/3 of 7 recent changes merged/, {}, LOAD)
+    expect(screen.getAllByText('Merged, checking…')).toHaveLength(3)
+    expect(screen.queryByText('Merged and passed')).toBeNull()
     release()
-    await waitFor(() => expect(screen.queryByText('Landed, checking…')).toBeNull(), LOAD)
+    await waitFor(() => expect(screen.queryByText('Merged, checking…')).toBeNull(), LOAD)
+  })
+
+  it('says test and deploy results are not tracked, with a date range and how to turn it on, only once every merged change is read', async () => {
+    at('#landed')
+    const untracked: Override = (url) => (showRoute(url) ? json(200, { ...pubs.find((p) => url.pathname.endsWith(p.id)), external: null }) : undefined)
+    stub(untracked, listFixture)
+    render(<LandedPage repo={REPO} token="read-only" />)
+    const head = () => document.querySelector('.answer-text')!.textContent ?? ''
+    await waitFor(() => expect(head()).toMatch(/^3 of 7 recent changes merged \(.+\)\. Test and deploy results after merge are not tracked\./), LOAD)
+    expect(document.querySelector('.answer-fact')!.textContent).toMatch(/^Tracking is off\. A hub admin can turn it on for this repository \(GitHub only, experimental\)\./)
+    expect(document.body.textContent).toContain('AGENTSCM_GITHUB_EXTERNAL_RUNS')
+    expect(document.body.textContent).not.toMatch(/\blanded\b/i)
+  })
+
+  it('does not say tracking is off while details are loading or when CI is read', async () => {
+    at('#landed')
+    stub(showFixture, listFixture)
+    render(<LandedPage repo={REPO} token="read-only" />)
+    await screen.findByText(/1 had a failure after merging/, {}, LOAD)
+    expect(document.querySelector('.answer-text')!.textContent).not.toMatch(/not tracked/)
+    expect(document.querySelector('.answer-fact')!.textContent).toMatch(/^Merged on GitHub or GitLab, as of the hub’s last sync/)
   })
 
   it('pages with "Older changes" and only says "That’s everything" when the list is complete', async () => {
@@ -88,7 +131,7 @@ describe('Landed changes', () => {
         : json(200, { publications: pubs.slice(0, 4).map(listItem), next_cursor: pubs[3]!.id, complete: false })
     })
     render(<LandedPage repo={REPO} token="read-only" />)
-    await screen.findByText(/of 4 recent changes landed/, {}, LOAD)
+    await screen.findByText(/of 4 recent changes merged/, {}, LOAD)
     expect(screen.queryByText('That’s everything.')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: /Older changes/ }))
     await screen.findByText('That’s everything.', {}, LOAD)
@@ -100,7 +143,7 @@ describe('Landed changes', () => {
     render(<LandedPage repo={REPO} token="read-only" />)
     expect((await screen.findAllByText(/needs a newer hub/, {}, LOAD)).length).toBeGreaterThan(0)
     at(`#landed/${idOf('handoff-expiry-sweep')}`)
-    await screen.findByText('Landed changes aren’t readable here yet', {}, LOAD)
+    await screen.findByText('Published changes aren’t readable here yet', {}, LOAD)
   })
 
   it('treats a hub without the list route (405) the same way', async () => {
@@ -113,7 +156,7 @@ describe('Landed changes', () => {
     stub(showFixture)
     at(`#landed/${idOf('handoff-expiry-sweep')}`)
     const { unmount } = render(<LandedPage repo={REPO} token="read-only" />)
-    await screen.findByText('CI after landing', {}, LOAD)
+    await screen.findByText('CI after merge', {}, LOAD)
     expect(document.querySelector('.honesty')!.textContent).toMatch(/^Checked/)
     expect(screen.getByText(/not evidence for the landing decision/i)).toBeTruthy()
     unmount()
@@ -139,7 +182,7 @@ describe('Landed changes', () => {
     stub((url) => (showRoute(url) ? json(200, hostile) : undefined))
     at(`#landed/${id}`)
     render(<LandedPage repo={REPO} token="read-only" />)
-    const box = (await screen.findByText('CI after landing', {}, LOAD)).closest('section')!
+    const box = (await screen.findByText('CI after merge', {}, LOAD)).closest('section')!
     expect(within(box).getByText('build')).toBeTruthy()
     expect(within(box).queryAllByRole('link').every((a) => (a as HTMLAnchorElement).href.startsWith('https://'))).toBe(true)
   })
@@ -147,7 +190,7 @@ describe('Landed changes', () => {
   it('opens a change by ID and remembers it', async () => {
     stub(listFixture, showFixture)
     render(<LandedPage repo={REPO} token="read-only" />)
-    await screen.findByText(/recent changes landed/, {}, LOAD)
+    await screen.findByText(/recent changes merged/, {}, LOAD)
     const id = idOf('activity-pagination')
     const picker = screen.getByRole('combobox', { name: 'Find a change' })
     fireEvent.focus(picker)

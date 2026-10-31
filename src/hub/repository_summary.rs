@@ -166,6 +166,7 @@ mod tests {
                     user_id: 1,
                 },
                 login: "example-user".into(),
+                name: None,
                 disabled: false,
             },
             via: via.iter().map(|v| (*v).into()).collect(),

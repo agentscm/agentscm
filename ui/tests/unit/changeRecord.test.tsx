@@ -386,6 +386,9 @@ describe('change record route and page', () => {
     expect(screen.getByText('Stale')).toBeTruthy()
     expect(screen.getByText('Caller asserted')).toBeTruthy()
     expect(screen.getByText('Evidence local')).toBeTruthy()
+    expect(screen.getByText('Agent says')).toBeTruthy()
+    expect(screen.getByRole('link', { name: 'Capture a bounded change-record handoff' }).getAttribute('href')).toBe(`#work/${WORK_ID}`)
+    expect(screen.getByText('Technical details', { selector: 'summary' }).closest('details')?.textContent).toContain(WORK_ID)
     expect(screen.getAllByText('Partial').length).toBeGreaterThan(0)
     expect(screen.getByText('Decision proposed')).toBeTruthy()
     expect(screen.getByText('Agent proposal')).toBeTruthy()
@@ -456,7 +459,9 @@ describe('change record route and page', () => {
     expect(window.location.hash).toBe(changeRecordHref(WORK_ID))
 
     await act(async () => window.dispatchEvent(new HashChangeEvent('hashchange')))
-    await screen.findByText('No change record for this work item yet')
+    await screen.findByText('No change record for this task yet')
+    expect(screen.getAllByText('agentscm change-capture configure').length).toBeGreaterThan(0)
+    expect(screen.getByRole('link', { name: 'Back to the task' }).getAttribute('href')).toBe(`#work/${WORK_ID}`)
   })
 
   it('does not label an authorization denial as an empty record', async () => {

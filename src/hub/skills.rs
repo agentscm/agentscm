@@ -273,7 +273,7 @@ fn run_view(
     )))
 }
 
-fn views(
+pub(super) fn views(
     store: &dyn Store,
     repo: &str,
     branch: Option<&str>,
