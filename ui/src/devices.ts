@@ -24,7 +24,7 @@ export interface Device {
 }
 export interface AdminRepository { fullName: string; provider: string; host: string; devices: number; agentTokens: number }
 export interface SignInRefusal { at: number; count: number; provider: string; login: string; reason: string; via: 'sign_in' | 'device_mint' | 'web_read_token' }
-export interface BrowserSession { login: string; provider: string; admin: boolean; csrf: string }
+export interface BrowserSession { login: string; /** The forge profile name, when the person has one. */ name?: string; provider: string; admin: boolean; csrf: string }
 
 /** How this page may reach the computer routes, or null when it can't. */
 export type DeviceAuth = { kind: 'local'; token: string } | { kind: 'browser'; session: BrowserSession }
@@ -113,7 +113,8 @@ export async function fetchBrowserSession(signal?: AbortSignal): Promise<Browser
   const u = rec(j['user'])
   const login = typeof u['login'] === 'string' && LOGIN.test(u['login']) ? u['login'] : null
   const csrf = typeof j['csrf_token'] === 'string' && /^[A-Za-z0-9_-]{16,200}$/.test(j['csrf_token']) ? j['csrf_token'] : null
-  return login && csrf ? { login, provider: typeof u['provider'] === 'string' && PROVIDER.test(u['provider']) ? u['provider'] : 'github', admin: j['admin'] === true, csrf } : null
+  const name = typeof u['name'] === 'string' && u['name'].trim() && u['name'].length <= 100 ? u['name'].trim() : undefined
+  return login && csrf ? { login, ...(name ? { name } : {}), provider: typeof u['provider'] === 'string' && PROVIDER.test(u['provider']) ? u['provider'] : 'github', admin: j['admin'] === true, csrf } : null
 }
 
 /** How this page reaches the computer routes: the local page's grant, else a browser session. */
@@ -209,7 +210,7 @@ function decodeRepositoryRow(raw: unknown): RepositoryRow | null {
   }
 }
 
-/** Every connected repository this web sign-in can read now, worst first, with counts only. Each is role-checked by the Hub, so this is one forge request per repository. */
+/** Every connected repository this web sign-in can read now, worst first, with counts only. Each is role-checked by the Hub, so this can be one forge request per repository (the Hub reuses an answer for 90 seconds). */
 export async function fetchRepositoryList(session: BrowserSession, signal?: AbortSignal): Promise<RepositoryList> {
   const j = rec(await (await request('/v1/hub/session/repositories', { kind: 'browser', session }, signal)).json())
   return { rows: list(j, 'repositories', decodeRepositoryRow, 200), unchecked: count(j['unchecked']), complete: j['complete'] === true }

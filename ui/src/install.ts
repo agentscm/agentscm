@@ -98,3 +98,52 @@ export function useAppBadge(n: number): void {
   useEffect(() => setBadge(n), [n])
   useEffect(() => () => setBadge(0), [])
 }
+
+type LaunchQueue = { setConsumer: (consume: (params: { targetURL?: string }) => void) => void }
+
+/**
+ * Routes a Hub link opened while the app window is open (`launch_handler: focus-existing`): the
+ * window is focused, not duplicated, and this moves it to the link's page. A bare `/ui/` (the Dock
+ * icon) leaves the window where it was.
+ */
+export function routeLaunch(target: string): void {
+  let url: URL
+  try {
+    url = new URL(target)
+  } catch {
+    return
+  }
+  const here = window.location
+  if (url.origin !== here.origin) return
+  if (url.pathname !== here.pathname || url.search !== here.search) here.assign(url.href)
+  // The hashchange listeners route it, including the reload a `#token=` link needs.
+  else if (url.hash && url.hash !== here.hash) here.hash = url.hash
+}
+
+/** Feature-detected: only an installed Chromium app window has a launch queue. */
+export function listenForLaunches(): void {
+  ;(window as { launchQueue?: LaunchQueue }).launchQueue?.setConsumer((p) => {
+    if (p.targetURL) routeLaunch(p.targetURL)
+  })
+}
+
+type Overlay = EventTarget & { visible: boolean }
+
+/** Marks `<html>` with `wco` while the window-controls overlay is on, so the top bar fills the title bar. */
+export function watchTitleBar(): void {
+  const overlay = (navigator as { windowControlsOverlay?: Overlay }).windowControlsOverlay
+  if (!overlay) return
+  const sync = () => document.documentElement.classList.toggle('wco', overlay.visible)
+  sync()
+  overlay.addEventListener('geometrychange', sync)
+}
+
+/**
+ * The once-only tip for the installed app; null where there is nothing to do. A Chromium app on a
+ * Mac leaves the Dock when closed unless kept; Safari's File › Add to Dock already keeps it.
+ */
+export function dockTip(userAgent: string, maxTouchPoints: number): string | null {
+  if (/Windows NT/.test(userAgent)) return 'Keep AgentSCM on your taskbar: right-click its icon and pin it to the taskbar.'
+  if (/Macintosh/.test(userAgent) && /Chrome\//.test(userAgent) && maxTouchPoints <= 1) return 'Keep AgentSCM in your Dock: right-click its icon › Options › Keep in Dock.'
+  return null
+}

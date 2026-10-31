@@ -91,7 +91,7 @@ use super::store::{
     HubEvent, LIST_LIMIT, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal,
     PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit,
     like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
-    validate_login,
+    validate_display_name, validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
@@ -346,6 +346,7 @@ fn work_who(tx: &Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
                         user_id: row.get(7)?,
                     },
                     login: row.get(8)?,
+                    name: None,
                     disabled: false,
                 },
             })
@@ -3691,6 +3692,7 @@ fn active_token(tx: &Transaction<'_>, token: &str, now: i64) -> Result<Who> {
                         user_id: row.get(5)?,
                     },
                     login: row.get(6)?,
+                    name: None,
                     disabled: false,
                 },
             })
@@ -3892,6 +3894,7 @@ fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Intent, String, Opti
                     user_id: row.get(12)?,
                 },
                 login: row.get(13)?,
+                name: None,
                 disabled: false,
             },
             via: Vec::new(),
@@ -5303,15 +5306,17 @@ impl Store for SqliteStore {
                 id,
                 identity: identity.clone(),
                 login: login.to_owned(),
+                name: None,
                 disabled: false,
             }
         } else {
-            let (id, previous, disabled): (String, String, bool) = tx.query_row(
-                "SELECT id, login, disabled FROM hub_users
-                 WHERE provider = ?1 AND host = ?2 AND forge_user_id = ?3",
-                params![identity.provider, identity.host, identity.user_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+            let (id, previous, name, disabled): (String, String, Option<String>, bool) = tx
+                .query_row(
+                    "SELECT id, login, display_name, disabled FROM hub_users
+                     WHERE provider = ?1 AND host = ?2 AND forge_user_id = ?3",
+                    params![identity.provider, identity.host, identity.user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
             if previous != login {
                 tx.execute(
                     "UPDATE hub_users SET login = ?2 WHERE id = ?1",
@@ -5323,11 +5328,24 @@ impl Store for SqliteStore {
                 id,
                 identity: identity.clone(),
                 login: login.to_owned(),
+                name,
                 disabled,
             }
         };
         tx.commit()?;
         Ok(user)
+    }
+
+    fn set_user_name(&self, user: &str, name: Option<&str>) -> Result<()> {
+        validate_display_name(name)?;
+        let changed = self.conn().execute(
+            "UPDATE hub_users SET display_name = ?2 WHERE id = ?1",
+            params![user, name],
+        )?;
+        if changed == 0 {
+            return Err(HubError::Invalid("unknown user".into()));
+        }
+        Ok(())
     }
 
     fn set_user_disabled(&self, user: &str, disabled: bool) -> Result<()> {
@@ -5403,7 +5421,7 @@ impl Store for SqliteStore {
     fn list_users(&self) -> Result<Vec<User>> {
         let conn = self.conn();
         let mut statement = conn.prepare(
-            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users
+            "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users
              ORDER BY created_at, id LIMIT ?1",
         )?;
         let users = statement
@@ -5416,6 +5434,7 @@ impl Store for SqliteStore {
                         user_id: row.get(3)?,
                     },
                     login: row.get(4)?,
+                    name: row.get(6)?,
                     disabled: row.get(5)?,
                 })
             })?
@@ -5425,12 +5444,12 @@ impl Store for SqliteStore {
 
     fn user_by_id(&self, id: &str) -> Result<Option<User>> {
         Ok(self.conn().query_row(
-            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE id = ?1",
+            "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users WHERE id = ?1",
             [id],
             |row| Ok(User {
                 id: row.get(0)?,
                 identity: ForgeIdentity { provider: row.get(1)?, host: row.get(2)?, user_id: row.get(3)? },
-                login: row.get(4)?, disabled: row.get(5)?,
+                login: row.get(4)?, name: row.get(6)?, disabled: row.get(5)?,
             }),
         ).optional()?)
     }
@@ -5438,9 +5457,9 @@ impl Store for SqliteStore {
     fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>> {
         identity.validate()?;
         Ok(self.conn().query_row(
-            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE provider=?1 AND host=?2 AND forge_user_id=?3",
+            "SELECT id, provider, host, forge_user_id, login, disabled, display_name FROM hub_users WHERE provider=?1 AND host=?2 AND forge_user_id=?3",
             params![identity.provider,identity.host,identity.user_id],
-            |row| Ok(User { id:row.get(0)?, identity:ForgeIdentity {provider:row.get(1)?,host:row.get(2)?,user_id:row.get(3)?}, login:row.get(4)?,disabled:row.get(5)? }),
+            |row| Ok(User { id:row.get(0)?, identity:ForgeIdentity {provider:row.get(1)?,host:row.get(2)?,user_id:row.get(3)?}, login:row.get(4)?,name:row.get(6)?,disabled:row.get(5)? }),
         ).optional()?)
     }
 
@@ -5484,6 +5503,7 @@ impl Store for SqliteStore {
                                 user_id: row.get(7)?,
                             },
                             login: row.get(8)?,
+                            name: None,
                             disabled: false,
                         },
                     })
@@ -5548,6 +5568,7 @@ impl Store for SqliteStore {
                                 user_id: row.get(7)?,
                             },
                             login: row.get(8)?,
+                            name: None,
                             disabled: row.get(9)?,
                         },
                     })
@@ -5593,6 +5614,7 @@ impl Store for SqliteStore {
                             user_id: row.get(8)?,
                         },
                         login: row.get(9)?,
+                        name: None,
                         disabled: row.get(10)?,
                     },
                     repositories: Vec::new(),
@@ -5801,7 +5823,7 @@ impl Store for SqliteStore {
         let conn = self.conn();
         let found = conn
             .query_row(
-                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at
+                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at, u.display_name
                  FROM hub_browser_sessions s JOIN hub_users u ON u.id = s.owner
                  WHERE s.digest = ?1 AND s.expires_at > ?2 AND s.created_at > ?3",
                 params![digest.as_str(), now, now - BROWSER_SESSION_MAX_SECONDS],
@@ -5815,6 +5837,7 @@ impl Store for SqliteStore {
                                 user_id: row.get(3)?,
                             },
                             login: row.get(4)?,
+                            name: row.get(7)?,
                             disabled: row.get(5)?,
                         },
                         row.get::<_, i64>(6)?,
@@ -11221,6 +11244,7 @@ impl Store for SqliteStore {
                     id: request.requester.owner.clone(),
                     identity: who.owner.identity.clone(),
                     login: request.requester.login.clone(),
+                    name: None,
                     disabled: false,
                 },
             };

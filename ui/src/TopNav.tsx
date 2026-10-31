@@ -18,6 +18,7 @@ import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
 import { READING_CHANGES_NOTHING } from './copy.ts'
 import { Explain, Icon, Tip, agentLabel, relative } from './ui.tsx'
 import type { Refusal } from './refusal.ts'
+import type { RepositoryList } from './devices.ts'
 import { TourTrigger, useTour } from './tour/Tour.tsx'
 import { tourFor } from './tour/content.ts'
 
@@ -190,6 +191,8 @@ export interface WebChoice {
   pick: (repo: string) => void
   /** Why the Hub refused the last repository picked, which has left the list. */
   refusal: Refusal | null
+  /** The All repositories list the sign-in already fetched, so that page needn't wait for it again. */
+  list?: { value: RepositoryList; fetchedAt: number } | null
 }
 
 function WebRepoSwitcher({ repo, web, onSignOut }: { repo: string; web: WebChoice; onSignOut: () => void }) {

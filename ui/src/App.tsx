@@ -330,7 +330,7 @@ export default function App() {
     const ready = web.state.kind === 'ready' ? web.state : null
     const hubSessionKnown = web.state.kind === 'ready' || ((web.state.kind === 'checking' || web.state.kind === 'unavailable') && !!web.state.session)
     // Every credential source keeps one independent-page tree; Hub pages still reset with their token.
-    return <Shell key={independent ? 'independent' : 'web'} token={ready?.read.token ?? ''} web={ready ? { repos: ready.repos, pick: web.pick, refusal: ready.refusal } : undefined} hubSignedOut={!ready} hubSignOutError={web.signOutError} hubUnavailable={unavailable} hubChecking={web.state.kind === 'checking'} hubSessionKnown={hubSessionKnown} section={section} workflowDirty={workflowDirty} onWorkflowDirtyChange={setWorkflowDirty} onHubSignedOut={web.confirmSignedOut} onHubSignOutFailed={web.reportSignOutFailure} onHubRetry={web.retry} onHubSignOut={() => void web.signOut()} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={web.renew} onForget={() => void web.signOut()} />
+    return <Shell key={independent ? 'independent' : 'web'} token={ready?.read.token ?? ''} web={ready ? { repos: ready.repos, pick: web.pick, refusal: ready.refusal, list: ready.list } : undefined} hubSignedOut={!ready} hubSignOutError={web.signOutError} hubUnavailable={unavailable} hubChecking={web.state.kind === 'checking'} hubSessionKnown={hubSessionKnown} section={section} workflowDirty={workflowDirty} onWorkflowDirtyChange={setWorkflowDirty} onHubSignedOut={web.confirmSignedOut} onHubSignOutFailed={web.reportSignOutFailure} onHubRetry={web.retry} onHubSignOut={() => void web.signOut()} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={web.renew} onForget={() => void web.signOut()} />
   }
   if (web.state.kind === 'checking' || web.state.kind === 'unavailable') {
     const { state } = web
@@ -339,7 +339,7 @@ export default function App() {
     const warning = web.signOutError ? `${web.signOutError} ${unavailable?.message ?? ''}` : unavailable?.message ?? null
     if (!compact) {
       const trouble = warning === null ? null : { title, message: warning, onRetry: unavailable ? web.retry : undefined, retryLabel: unavailable?.retryLabel, onSignOut: state.session ? () => void web.signOut() : undefined, signOutLabel: warning.startsWith('Hub sign-out') ? 'Retry Hub sign-out' : 'Sign out of Hub pages' }
-      return <Opening login={state.session?.login} repos={state.repos} trouble={trouble} />
+      return <Opening login={state.session?.login} name={state.session?.name} repos={state.repos} trouble={trouble} />
     }
     return <>
       <div className="opening opening-inline" role="status" aria-label={title}>

@@ -27,7 +27,7 @@ use super::super::store::{
 };
 use super::super::work::WorkOverviewQuery;
 use super::super::{HubError, HubState};
-use super::{ApiResult, Human, random_hex, session_digest};
+use super::{ApiResult, Human, Login, random_hex, session_digest};
 use crate::team::auth::generate_secret;
 
 pub(super) fn routes() -> Router<HubState> {
@@ -612,20 +612,33 @@ async fn readable(
     let mut pending = candidates.into_iter();
     let mut checks = tokio::task::JoinSet::new();
     let (mut allowed, mut unchecked) = (Vec::new(), 0);
+    let now = unix_now();
     loop {
         while checks.len() < LIST_CONCURRENCY
             && let Some(repo) = pending.next()
         {
-            let (state, owner) = (state.clone(), owner.clone());
-            checks.spawn(async move {
-                let role = repository_role(&state, &owner, &repo).await;
-                (repo, role)
-            });
+            match cached_role(&state.login, &owner.id, &repo, now) {
+                Some(true) => allowed.push(repo),
+                Some(false) => {}
+                None => {
+                    let (state, owner) = (state.clone(), owner.clone());
+                    checks.spawn(async move {
+                        let role = repository_role(&state, &owner, &repo).await;
+                        (repo, role)
+                    });
+                }
+            }
         }
         match tokio::time::timeout_at(deadline, checks.join_next()).await {
             Ok(None) => break,
-            Ok(Some(Ok((repo, Ok(()))))) => allowed.push(repo),
-            Ok(Some(Ok((_, Err(Denial::Role(_) | Denial::Kind("not_connected")))))) => {}
+            Ok(Some(Ok((repo, Ok(()))))) => {
+                remember_role(&state.login, &owner.id, &repo, true, unix_now());
+                allowed.push(repo);
+            }
+            Ok(Some(Ok((repo, Err(Denial::Role(_)))))) => {
+                remember_role(&state.login, &owner.id, &repo, false, unix_now());
+            }
+            Ok(Some(Ok((_, Err(Denial::Kind("not_connected")))))) => {}
             Ok(Some(_)) => unchecked += 1,
             Err(_) => {
                 unchecked += checks.len() + pending.len();
@@ -635,6 +648,45 @@ async fn readable(
         }
     }
     (allowed, unchecked)
+}
+
+/// How long the All repositories list reuses a person's role answer for one repository, so a
+/// granted or lost access shows there within this long. Mints and read tokens always ask.
+const ROLE_CHECK_TTL_SECONDS: i64 = 90;
+
+/// Starts with the person, so [`forget_role_checks`] finds all of theirs.
+fn role_check_key(person: &str, repo: &ConnectedRepository) -> String {
+    format!("{person}\n{}\n{}", repo.connection, repo.repository_id)
+}
+
+/// Whether `person` could read `repo` when last asked within the TTL, if they were.
+fn cached_role(login: &Login, person: &str, repo: &ConnectedRepository, now: i64) -> Option<bool> {
+    let key = role_check_key(person, repo);
+    login.pending().role_checks.get(&key, now).copied()
+}
+
+/// Keeps a forge answer (readable or not) for the TTL; failures are never kept.
+fn remember_role(
+    login: &Login,
+    person: &str,
+    repo: &ConnectedRepository,
+    readable: bool,
+    now: i64,
+) {
+    let key = role_check_key(person, repo);
+    let expires_at = now + ROLE_CHECK_TTL_SECONDS;
+    login
+        .pending()
+        .role_checks
+        .insert(key, expires_at, readable, now);
+}
+
+/// Forgets every role answer kept for `person`, when they sign out.
+pub(super) fn forget_role_checks(login: &Login, person: &str) {
+    login
+        .pending()
+        .role_checks
+        .remove_prefixed(&format!("{person}\n"));
 }
 
 async fn revoke_token(
@@ -969,5 +1021,45 @@ mod tests {
             assert!(message.contains("; "), "{kind}: {message}");
             assert_eq!(error.code(), kind);
         }
+    }
+
+    fn connected(repository_id: i64) -> ConnectedRepository {
+        ConnectedRepository {
+            id: format!("rep_{}", "0".repeat(32)),
+            connection: "con_test".into(),
+            host: "github.com".into(),
+            repository_id,
+            full_name: format!("acme/r{repository_id}"),
+            node_id: None,
+            installation_id: Some(1),
+            pulls_etag: None,
+        }
+    }
+
+    #[test]
+    fn role_answers_are_kept_per_person_until_the_ttl_or_sign_out() {
+        let login = Login::unconfigured();
+        let (widgets, docs) = (connected(1), connected(2));
+        assert_eq!(cached_role(&login, "usr_a", &widgets, 100), None);
+        remember_role(&login, "usr_a", &widgets, true, 100);
+        remember_role(&login, "usr_a", &docs, false, 100);
+        assert_eq!(cached_role(&login, "usr_a", &widgets, 100), Some(true));
+        assert_eq!(cached_role(&login, "usr_a", &docs, 150), Some(false));
+        // Never another person's, even one whose id starts the same.
+        assert_eq!(cached_role(&login, "usr_b", &widgets, 100), None);
+        assert_eq!(cached_role(&login, "usr_", &widgets, 100), None);
+        assert_eq!(cached_role(&login, "usr_ab", &widgets, 100), None);
+        // Asked again once the TTL is over.
+        let expired = 100 + ROLE_CHECK_TTL_SECONDS;
+        assert_eq!(
+            cached_role(&login, "usr_a", &widgets, expired - 1),
+            Some(true)
+        );
+        assert_eq!(cached_role(&login, "usr_a", &widgets, expired), None);
+        // Signing out forgets only that person's.
+        remember_role(&login, "usr_ab", &widgets, true, 100);
+        forget_role_checks(&login, "usr_a");
+        assert_eq!(cached_role(&login, "usr_a", &docs, 100), None);
+        assert_eq!(cached_role(&login, "usr_ab", &widgets, 100), Some(true));
     }
 }

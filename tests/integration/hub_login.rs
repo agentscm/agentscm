@@ -48,6 +48,8 @@ enum Step {
 struct Fake {
     base: String,
     users: HashMap<i64, String>,
+    /// Profile names; a user without one is served `null`, as GitHub does.
+    names: HashMap<i64, String>,
     /// Who approves at the authorize endpoint.
     current_user: i64,
     deny: bool,
@@ -192,7 +194,8 @@ fn bearer_user(fake: &Fake, headers: &HeaderMap) -> Option<i64> {
 fn user_endpoint(fake: &Shared, headers: &HeaderMap, field: &str) -> Response {
     let fake = fake.lock().unwrap();
     match bearer_user(&fake, headers) {
-        Some(id) => Json(json!({"id": id, field: fake.users[&id]})).into_response(),
+        Some(id) => Json(json!({"id": id, field: fake.users[&id], "name": fake.names.get(&id)}))
+            .into_response(),
         None => (StatusCode::UNAUTHORIZED, Json(json!({"message": "401"}))).into_response(),
     }
 }
@@ -1174,6 +1177,37 @@ async fn client_secret_from_a_crlf_file_or_the_environment_both_sign_in() {
 }
 
 // ---- identity ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn profile_name_is_cleaned_refreshed_and_cleared_at_each_sign_in() {
+    let env = Env::start("").await;
+    let unnamed = env.browser_login("github", 7).await;
+    assert!(unnamed["user"]["name"].is_null());
+    let name = |raw: &str| env.fake.lock().unwrap().names.insert(7, raw.into());
+    name("  Alice\u{7}\u{1b}[31m Liddell  ");
+    let named = env.browser_login("github", 7).await;
+    assert_eq!(named["user"]["name"], "Alice[31m Liddell");
+    let (_, session) = env.get("/v1/hub/session", Some(&secret(&named))).await;
+    assert_eq!(session["user"]["name"], "Alice[31m Liddell");
+    // A changed name replaces the stored one; an oversized one is capped at 100 characters.
+    name(&"é".repeat(150));
+    let long = env.device_login("github", 7).await;
+    assert_eq!(long["user"]["name"], "é".repeat(100));
+    // Whitespace only, then no name at all, clears it.
+    name(" \t ");
+    assert!(env.device_login("github", 7).await["user"]["name"].is_null());
+    name("Alice");
+    env.device_login("github", 7).await;
+    env.fake.lock().unwrap().names.remove(&7);
+    let cleared = env.device_login("github", 7).await;
+    assert!(cleared["user"]["name"].is_null());
+    let stored = env
+        .store
+        .user_by_id(cleared["user"]["id"].as_str().unwrap());
+    assert_eq!(stored.unwrap().unwrap().name, None);
+    // A display name is not audited, so no sign-in adds an event for it.
+    assert!(!env.kinds().iter().any(|kind| kind.contains("name")));
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn renamed_forge_user_keeps_the_hub_id() {

@@ -237,6 +237,41 @@ fn rename_keeps_identity(db: &Db) {
     );
 }
 
+fn display_name_is_stored_and_cleared(db: &Db) {
+    let store = db.open();
+    let alice = store.upsert_user(&identity(7), "alice").unwrap();
+    assert_eq!(alice.name, None);
+    let events = kinds(&*store).len();
+    store
+        .set_user_name(&alice.id, Some("Alice Liddell"))
+        .unwrap();
+    let named = Some("Alice Liddell".to_owned());
+    assert_eq!(store.user_by_id(&alice.id).unwrap().unwrap().name, named);
+    assert_eq!(
+        store.upsert_user(&identity(7), "alice").unwrap().name,
+        named
+    );
+    assert_eq!(store.list_users().unwrap()[0].name, named);
+    let digest = store::browser_session_digest(&format!("{:064}", 1)).unwrap();
+    let now = unix_now();
+    store
+        .insert_browser_session(&alice.id, &digest, now + 60, now)
+        .unwrap();
+    let restored = store.browser_session(&digest, now, now).unwrap().unwrap().0;
+    assert_eq!(restored.name, named);
+    for bad in ["", " padded", "a\nb", &"x".repeat(101)] {
+        assert!(
+            store.set_user_name(&alice.id, Some(bad)).is_err(),
+            "{bad:?}"
+        );
+    }
+    assert!(store.set_user_name("usr_unknown", None).is_err());
+    store.set_user_name(&alice.id, None).unwrap();
+    assert_eq!(store.user_by_id(&alice.id).unwrap().unwrap().name, None);
+    // The name is never an event.
+    assert_eq!(kinds(&*store).len(), events);
+}
+
 fn idempotent_migrations(db: &Db) {
     for _ in 0..3 {
         db.open();
@@ -2670,6 +2705,7 @@ conformance!(
     revocation,
     owner_disable_cascades,
     rename_keeps_identity,
+    display_name_is_stored_and_cleared,
     idempotent_migrations,
     named_migrations_are_a_set,
     concurrent_startup,

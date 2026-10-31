@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use super::forge_http::{Forge, check_base_url};
 use super::http::{ApiError, JsonBody, Reader, bearer, blocking};
 use super::store::{
-    ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, User, mint_bound_agent_token, unix_now,
-    validate_agent_name, validate_login, validate_repository,
+    ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, User, clean_display_name, mint_bound_agent_token,
+    unix_now, validate_agent_name, validate_login, validate_repository,
 };
 use super::{HubError, HubState, Result};
 use crate::team::auth::{generate_secret, token_digest};
@@ -344,6 +344,11 @@ impl<T> Table<T> {
             .map(|(_, value)| value)
     }
 
+    /// Drops every entry whose key starts with `prefix`.
+    pub(super) fn remove_prefixed(&mut self, prefix: &str) {
+        self.0.retain(|key, _| !key.starts_with(prefix));
+    }
+
     pub(super) fn take(&mut self, key: &str, now: i64) -> Option<T> {
         self.0
             .remove(key)
@@ -457,6 +462,9 @@ struct Pending {
     device: Table<DeviceLogin>,
     handoffs: Table<Handoff>,
     sessions: Table<Human>,
+    /// Recent role checks of the All repositories list, keyed by person, connection and
+    /// repository: true when readable. Only forge answers are kept, never a failure.
+    role_checks: Table<bool>,
     /// Providers whose forge app refused device sign-in when last asked.
     no_device: std::collections::BTreeSet<String>,
 }
@@ -684,7 +692,7 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 
 fn user_json(user: &User) -> Value {
     json!({"id": user.id, "provider": user.identity.provider, "host": user.identity.host,
-        "user_id": user.identity.user_id, "login": user.login})
+        "user_id": user.identity.user_id, "login": user.login, "name": user.name})
 }
 
 impl Signed {
@@ -1191,6 +1199,8 @@ async fn sign_in(
         host: provider.host.clone(),
         user_id: id,
     };
+    // The profile name is display only: cleaned here, and never used to decide anything.
+    let name = body["name"].as_str().and_then(clean_display_name);
     let admin = state.login.is_admin(provider.name, id, &login);
     // No user, event or session is stored for anyone refused; administrators see a bounded,
     // deduplicated refusal row.
@@ -1198,6 +1208,7 @@ async fn sign_in(
         id: String::new(),
         identity: identity.clone(),
         login: login.clone(),
+        name: None,
         disabled: false,
     };
     let refuse =
@@ -1227,8 +1238,12 @@ async fn sign_in(
     }
     let store = state.store.clone();
     let user = blocking(state, move || {
-        let user = store.upsert_user(&identity, &login)?;
+        let mut user = store.upsert_user(&identity, &login)?;
         if !user.disabled {
+            if user.name != name {
+                store.set_user_name(&user.id, name.as_deref())?;
+                user.name = name;
+            }
             store.record_sign_in(
                 &user.id,
                 if method == "workspace" {
@@ -1496,6 +1511,7 @@ async fn logout(
     State(state): State<HubState>,
     HumanSession(human): HumanSession,
 ) -> ApiResult<Response> {
+    devices::forget_role_checks(&state.login, &human.user.id);
     let Some(browser) = human.browser else {
         state.login.pending().sessions.0.remove(&human.key);
         return Ok(StatusCode::NO_CONTENT.into_response());
@@ -1750,6 +1766,7 @@ mod tests {
                     user_id: 1,
                 },
                 login: "x".into(),
+                name: None,
                 disabled: false,
             },
             admin: false,

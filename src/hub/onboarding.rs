@@ -660,6 +660,7 @@ mod tests {
                     user_id: 1,
                 },
                 login: "member".into(),
+                name: None,
                 disabled: false,
             },
         }

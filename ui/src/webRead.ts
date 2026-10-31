@@ -5,7 +5,7 @@
 // expires, or after a 401, and never twice at once.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from './api.ts'
-import { fetchBrowserSession, fetchRepositoryList, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type WebReadToken } from './devices.ts'
+import { fetchBrowserSession, fetchRepositoryList, mintWebReadToken, sessionRepositories, signOutBrowser, type BrowserSession, type RepositoryList, type WebReadToken } from './devices.ts'
 import type { Refusal } from './refusal.ts'
 import { fetchOverview } from './standup.ts'
 
@@ -17,8 +17,8 @@ export type WebRead =
   | { kind: 'unavailable'; session: BrowserSession | null; reason: 'connection' | 'empty' | 'refused'; refusal: Refusal | null; /** How far a failed check got: the repositories seen so far. */ repos?: number }
   /** No browser session, or a confirmed sign-out. */
   | { kind: 'none'; refusal: Refusal | null; empty: boolean }
-  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. `readable` counts the repositories the Hub listed as readable now. */
-  | { kind: 'ready'; session: BrowserSession; repos: string[]; readable: number; read: WebReadToken; refusal: Refusal | null; restarts: number }
+  /** `restarts` counts renewals after a 401; each new token restarts Hub polling. `readable` counts the repositories the Hub listed as readable now; `list` is that list, for All repositories to show at once. */
+  | { kind: 'ready'; session: BrowserSession; repos: string[]; readable: number; list: { value: RepositoryList; fetchedAt: number } | null; read: WebReadToken; refusal: Refusal | null; restarts: number }
 
 const PICKED_KEY = 'agentscm.web.repository'
 export const RENEW_BEFORE_SECONDS = 120
@@ -217,6 +217,7 @@ export function useWebRead(enabled: boolean, commit: (apply: () => void) => void
         keepFailuresFor(session)
         if (!allowed(session)) return
         const [known, list] = await Promise.all([sessionRepositories(session, ctl.signal), fetchRepositoryList(session, ctl.signal).catch(() => null)])
+        const listedAt = Date.now()
         if (!allowed(session)) return
         // What the Hub says this sign-in can read now comes first; what it only knew of may still be refused.
         const readable = list?.rows.map((r) => r.repository) ?? []
@@ -236,7 +237,7 @@ export function useWebRead(enabled: boolean, commit: (apply: () => void) => void
           return setState(unavailable)
         }
         remember(read.repository)
-        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), readable: readable.length, read, refusal, restarts: 0 } as const
+        const ready = { kind: 'ready', session, repos: repos.filter((r) => !refused.includes(r)), readable: readable.length, list: list && { value: list, fetchedAt: listedAt }, read, refusal, restarts: 0 } as const
         commitRef.current(() => {
           if (!valid()) return
           current.current = ready
@@ -298,6 +299,32 @@ export function useWebRead(enabled: boolean, commit: (apply: () => void) => void
     const timer = window.setTimeout(() => void ask(), ms)
     return () => window.clearTimeout(timer)
   }, [expiresAt, ask])
+
+  // A tab left signed out notices a sign-in made in another tab when it comes back into view.
+  const signedOut = enabled && state.kind === 'none'
+  useEffect(() => {
+    if (!signedOut) return
+    let ctl: AbortController | null = null
+    const recheck = () => {
+      if (document.hidden || ctl) return
+      const mine = (ctl = new AbortController())
+      fetchBrowserSession(mine.signal)
+        .then((session) => {
+          if (!session || mine.signal.aborted || confirmedGone.current.has(sessionKey(session)) || current.current.kind !== 'none') return
+          // A new session: the ones signed out before can no longer come back under it.
+          confirmedGone.current.clear()
+          setAttempt((n) => n + 1)
+        }, () => {})
+        .finally(() => { if (ctl === mine) ctl = null })
+    }
+    window.addEventListener('focus', recheck)
+    document.addEventListener('visibilitychange', recheck)
+    return () => {
+      ctl?.abort()
+      window.removeEventListener('focus', recheck)
+      document.removeEventListener('visibilitychange', recheck)
+    }
+  }, [signedOut])
 
   const signOut = useCallback(() => {
     const s = current.current
