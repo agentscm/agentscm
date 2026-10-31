@@ -300,14 +300,16 @@ Flags: `--yes`, `--init` (also run `init-repo`; without it quickstart writes not
 ### Status-bar companion and client status
 
 `agentscm tray` opens the optional macOS status-bar app and returns after its background
-process is ready. A primary click on its icon opens the AgentSCM work panel with Now, Agents and
-Start views; right click opens
-the setup and troubleshooting menu. The panel groups locally connected checkouts, recent local
-agent sightings and current Hub Work by repository. A signed-in computer can also list other
-repositories it can read on the same Hub, after a fresh role check for each. The panel orders
-repositories needing attention first and marks partial or unavailable Hub reads. Local agent
-integrations are labelled as configured unless AgentSCM recently observed a hook or MCP call;
-Hub Work state and next actions are reported by agents, not verified execution.
+process is ready. A primary click on its icon opens the AgentSCM work overview; right click opens
+the setup and troubleshooting menu. The default **Work** view groups every listed repository's
+local agent connections and recent sightings with current Hub Work and live agent tasks. A
+signed-in computer can also list other repositories it can read on the same Hub, after a fresh
+role check for each. Repositories needing attention come first, and **Needs you** narrows the
+roster to actionable rows. Opening the panel refreshes stale local and Hub reads while keeping
+the last known view visible. Local agents are labelled as connected unless AgentSCM recently
+observed a hook or MCP call; a local sighting does not reveal the agent's task. Hub Work state
+and next actions are reported by agents, not verified execution. Partial and unavailable Hub
+reads stay labelled.
 
 The panel's quick prompt sends one prompt to installed Claude Code or Codex CLI in an explicitly
 selected, still-current connected checkout. The prompt goes to the

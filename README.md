@@ -73,10 +73,12 @@ npx agentscm open
 The page can switch between repositories connected on this computer, each using its own Hub
 and access. The local source explorer is currently Unix-only. On macOS, the optional
 [menu-bar companion](docs/install.md#where-files-go) also opens this view and shows connections.
-Clicking its icon opens a work panel that groups local agent sightings and Hub Work by repository,
-including accessible Hub repositories without a local checkout when the Hub supports that read.
-It shows Inbox attention, can send a prompt to installed Claude Code or Codex CLI in a selected
-connected checkout, and stays on top when pinned. Right click opens setup and troubleshooting.
+Clicking its icon opens a work overview: every listed repository shows its local agent connections
+and sightings beside current Hub tasks and live agents, including accessible Hub repositories
+without a local checkout when the Hub supports that read. Repositories needing attention come first; **Needs you** filters them,
+and **Start** sends a prompt to installed Claude Code or Codex CLI in a selected connected
+checkout. The panel refreshes stale local and Hub reads when opened and stays on top when pinned.
+Right click opens setup and troubleshooting.
 The installed client keeps its own login and settings; open its native
 session for interactive approvals and full CLI features. On Linux, `agentscm tray` provides a terminal
 companion with saved checkout status and the same prompt route; a Linux status icon and native
