@@ -2434,7 +2434,7 @@ html.wco:not(:has(.topbar)) body::before {
 
 
 /* The agent buttons sit on the sheet: outline pills with the sheet's rule colour, brand on hover. */
-.signin-sheeted .signin-agent {
+:is(.signin-sheeted, .repo-start) .signin-agent {
   padding-inline: 12px;
   --bs-btn-color: var(--hub-text);
   --bs-btn-hover-color: #fff;
@@ -2442,21 +2442,21 @@ html.wco:not(:has(.topbar)) body::before {
   border-color: var(--hub-rule-strong);
   color: var(--hub-text);
 }
-.signin-sheeted .signin-agent:hover {
+:is(.signin-sheeted, .repo-start) .signin-agent:hover {
   background: var(--hub-brand);
   border-color: var(--hub-brand);
   color: #fff;
 }
-.signin-sheeted .signin-agent:focus-visible {
+:is(.signin-sheeted, .repo-start) .signin-agent:focus-visible {
   outline: 2px solid var(--hub-brand);
 }
 .signin-sheeted .signin-agents-title {
   color: var(--hub-text);
 }
-.signin-sheeted .signin-agents-note, .signin-sheeted .signin-agents-miss, .signin-sheeted .signin-agents-copy {
+:is(.signin-sheeted, .repo-start) .signin-agents-note, :is(.signin-sheeted, .repo-start) .signin-agents-miss, :is(.signin-sheeted, .repo-start) .signin-agents-copy {
   color: var(--hub-text-3);
 }
-.signin-sheeted .signin-agents-copy .signin-agents-copylink {
+:is(.signin-sheeted, .repo-start) .signin-agents-copy .signin-agents-copylink {
   color: var(--hub-text);
 }
 
@@ -3271,18 +3271,87 @@ button.repo-row:focus-visible { outline: 2px solid var(--hub-brand); outline-off
 .repo-row[aria-busy='true'] .repo-row-meta { color: var(--hub-brand-ink); }
 .repo-row-go { grid-area: go; color: var(--hub-text-3); transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), color 0.18s; }
 button.repo-row:hover .repo-row-go { color: var(--hub-brand-ink); transform: translateX(2px); }
-/* A quiet repository stays listed, as a shorter row. */
-.repo-list > li.is-quiet .repo-row { padding-block: calc(var(--hub-row-y) * 0.6); }
-.repo-list > li.is-quiet .repo-row-name { font-size: 14.5px; }
 .answer-trouble { color: var(--coral); }
+/* Quiet repositories fold into one line; opened, a compact list of names with a filter. */
+.repo-quiet { border-top: 1px solid var(--hub-rule); }
+.repo-quiet-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  width: 100%;
+  padding: 14px 0;
+  border: 0;
+  background: transparent;
+  color: var(--hub-text);
+  font: inherit;
+  text-align: left;
+}
+.repo-quiet-toggle b { font-weight: 600; }
+.repo-quiet-toggle:focus-visible { outline: 2px solid var(--hub-brand); outline-offset: 3px; border-radius: 6px; }
+.repo-quiet-chev { color: var(--hub-text-3); transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
+.repo-quiet-toggle[aria-expanded='true'] .repo-quiet-chev { transform: rotate(90deg); }
+.repo-quiet-hint { font-size: 13px; color: var(--hub-text-3); }
+.repo-drawer { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
+.repo-drawer.is-open { grid-template-rows: 1fr; }
+.repo-drawer-in { min-height: 0; overflow: hidden; }
+.repo-quiet-filter { max-width: 360px; margin: 2px 0 12px; border-radius: 999px; padding-inline: 14px; }
+.repo-quiet-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 0 18px;
+  margin: 0;
+  padding: 0 0 12px;
+  list-style: none;
+}
+.repo-quiet-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13.5px;
+  text-align: left;
+}
+.repo-quiet-item > .bi, .repo-quiet-item > .pill { flex: none; }
+button.repo-quiet-item:hover { background: var(--hub-sunken); }
+button.repo-quiet-item:focus-visible { outline: 2px solid var(--hub-brand); outline-offset: 1px; }
+.repo-quiet-opening { color: var(--hub-brand-ink); font-size: 12.5px; }
+.repo-quiet-none { grid-column: 1 / -1; padding: 6px 0; font-size: 13.5px; color: var(--hub-text-3); }
+/* No agent anywhere yet: one card to pick a repository and open an agent with its setup request. */
+.repo-start {
+  display: grid;
+  gap: 18px;
+  max-width: 760px;
+  padding: 24px 26px 26px;
+  border-radius: 20px;
+  background: var(--hub-surface);
+  box-shadow: var(--hub-shadow);
+}
+.repo-start-field { max-width: 380px; }
+.repo-start-label { margin: 0 0 6px; font-size: 12.5px; font-weight: 600; color: var(--hub-text-3); }
+.repo-start .signin-agents { margin-top: 0; }
+.repo-start .signin-agents-title { font-size: 12.5px; font-weight: 600; color: var(--hub-text-3); margin-bottom: 8px; }
+.repo-start .signin-agents-title b { color: var(--hub-text); font-weight: 600; }
 html[data-density='condensed'] .repo-row-name { font-size: 14px; }
 html[data-density='condensed'] .repo-row-meta { font-size: 12px; }
 @media (max-width: 640px) {
   .repo-row { grid-template-columns: minmax(0, 1fr) 16px; grid-template-areas: 'name go' 'status go' 'meta go'; }
   .repo-row-status { justify-self: start; }
+  .repo-quiet-hint { flex-basis: 100%; }
+  .repo-quiet-list { grid-template-columns: minmax(0, 1fr); }
+  .repo-quiet-item { min-height: 40px; }
+  .repo-quiet-filter { max-width: none; }
+  .repo-start { padding: 20px 18px; border-radius: 18px; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .repo-row, .repo-row-go { transition: none; }
+  .repo-row, .repo-row-go, .repo-drawer, .repo-quiet-chev { transition: none; }
 }
 
 /* ---------- opening a web sign-in: the sign-in layout with a roll call, then the sheet widens into the app ---------- */
