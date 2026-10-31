@@ -17,12 +17,12 @@ use winit::event_loop::EventLoopProxy;
 
 use super::UserEvent;
 
-const WIDTH: f64 = 700.0;
+const WIDTH: f64 = 740.0;
 const HEIGHT: f64 = 780.0;
 const TAB_WIDTH: f64 = (WIDTH - 60.0) / 3.0;
 const TAB_STEP: f64 = TAB_WIDTH + 8.0;
 const REPOSITORY_LIMIT: usize = 50;
-const HUB_ACTIVITY_LIMIT: usize = 1;
+const HUB_ACTIVITY_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RepositoryRow {
@@ -830,20 +830,14 @@ impl CompanionPanel {
                 .iter()
                 .map(|row| row.local.len())
                 .sum::<usize>();
-            let hub = self
-                .all_rows
-                .iter()
-                .map(|row| row.work.len())
-                .sum::<usize>();
             let repository = if self.all_rows.len() == 1 {
-                "repo"
+                "repository"
             } else {
-                "repos"
+                "repositories"
             };
             format!(
-                "{} {repository} · {} Hub activities · {} of {} local agents seen",
+                "{} {repository} · {} of {} local agents seen",
                 self.all_rows.len(),
-                hub,
                 local,
                 connected
             )
@@ -995,15 +989,17 @@ impl CompanionPanel {
                 if is_quiet_row(row)
                     && !self.expanded.contains(&(row.hub.clone(), row.name.clone()))
                 {
-                    return 90.0;
+                    return 98.0;
                 }
                 if !self.expanded.contains(&(row.hub.clone(), row.name.clone())) {
-                    return if row.local.is_empty() { 92.0 } else { 112.0 }
+                    let extra_work = row.work.len().saturating_sub(1) as f64 * 27.0;
+                    return if row.local.is_empty() { 100.0 } else { 120.0 }
                         + if row.attention_summary.is_empty() {
                             0.0
                         } else {
                             20.0
-                        };
+                        }
+                        + extra_work;
                 }
                 86.0 + if row.local.is_empty() {
                     0.0
@@ -1023,7 +1019,7 @@ impl CompanionPanel {
             .collect();
         let viewport_height = self.work_scroll.frame().size.height;
         let footer_height = if omitted_repositories > 0 { 44.0 } else { 0.0 };
-        let total = (12.0 + heights.iter().sum::<f64>() + 12.0 * rows.len() as f64 + footer_height)
+        let total = (16.0 + heights.iter().sum::<f64>() + 16.0 * rows.len() as f64 + footer_height)
             .max(viewport_height);
         let document =
             NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH - 44.0, total));
@@ -1060,8 +1056,8 @@ impl CompanionPanel {
             let card = surface(mtm, rect(0.0, bottom, WIDTH - 44.0, height), 0xffffff, 16.0);
             document.addSubview(&card);
 
-            let name = label(mtm, &row.name, 16.0, true);
-            name.setFrame(rect(20.0, top - 29.0, 350.0, 25.0));
+            let name = label(mtm, &row.name, 17.0, true);
+            name.setFrame(rect(20.0, top - 30.0, 350.0, 26.0));
             name.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             document.addSubview(&name);
 
@@ -1097,7 +1093,7 @@ impl CompanionPanel {
                 || row.local_agents.clone(),
                 |source| format!("{} · {source}", row.local_agents),
             );
-            let local = label(mtm, &context, 12.0, false);
+            let local = label(mtm, &context, 13.0, false);
             local.setFrame(rect(20.0, top - 51.0, WIDTH - 82.0, 20.0));
             local.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             local.setTextColor(Some(&color(0x6c6b80)));
@@ -1117,13 +1113,13 @@ impl CompanionPanel {
                         row.work_note
                     )
                 };
-                let summary = label(mtm, &summary, 12.0, false);
+                let summary = label(mtm, &summary, 13.0, false);
                 summary.setFrame(rect(20.0, top - 76.0, WIDTH - 82.0, 20.0));
                 summary.setTextColor(Some(&color(0x656177)));
                 summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
                 document.addSubview(&summary);
                 if !row.local.is_empty() {
-                    let more = button(mtm, "Details", rect(375.0, top - 31.0, 90.0, 29.0));
+                    let more = button(mtm, "Details", rect(WIDTH - 325.0, top - 31.0, 90.0, 29.0));
                     more.setTag(index as isize);
                     more.setAccessibilityLabel(Some(&NSString::from_str(&format!(
                         "Show agent details for {}",
@@ -1136,39 +1132,44 @@ impl CompanionPanel {
                     }
                     document.addSubview(&more);
                 }
-                top = bottom - 12.0;
+                top = bottom - 16.0;
                 continue;
             }
 
             let expanded = self.expanded.contains(&(row.hub.clone(), row.name.clone()));
             if !expanded {
-                if let Some(work) = row.work.first() {
-                    let dot = surface(
-                        mtm,
-                        rect(20.0, top - 73.0, 8.0, 8.0),
-                        if work.needs_you { 0xc8432a } else { 0x6d5ce0 },
-                        4.0,
-                    );
-                    document.addSubview(&dot);
-                    let headline = if work.needs_you {
-                        format!("Needs you · {} · {}", work.agent, work.title)
-                    } else {
-                        format!("{} · {}", work.agent, work.title)
-                    };
-                    let title = label(mtm, &headline, 14.0, true);
-                    title.setFrame(rect(36.0, top - 79.0, WIDTH - 100.0, 22.0));
-                    title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                    document.addSubview(&title);
-                } else {
-                    let note = label(mtm, &row.work_note, 12.0, false);
+                let extra_work = row.work.len().saturating_sub(1) as f64 * 27.0;
+                if row.work.is_empty() {
+                    let note = label(mtm, &row.work_note, 13.0, false);
                     note.setFrame(rect(20.0, top - 79.0, WIDTH - 82.0, 20.0));
                     note.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
                     note.setTextColor(Some(&color(0x656177)));
                     document.addSubview(&note);
+                } else {
+                    for (work_index, work) in row.work.iter().enumerate() {
+                        let offset = work_index as f64 * 27.0;
+                        let dot = surface(
+                            mtm,
+                            rect(20.0, top - 73.0 - offset, 8.0, 8.0),
+                            if work.needs_you { 0xc8432a } else { 0x6d5ce0 },
+                            4.0,
+                        );
+                        document.addSubview(&dot);
+                        let headline = if work.needs_you {
+                            format!("Needs you · {} · {}", work.agent, work.title)
+                        } else {
+                            format!("{} · {}", work.agent, work.title)
+                        };
+                        let title = label(mtm, &headline, 15.0, true);
+                        title.setFrame(rect(36.0, top - 79.0 - offset, WIDTH - 100.0, 22.0));
+                        title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                        title.setAccessibilityLabel(Some(&NSString::from_str(&headline)));
+                        document.addSubview(&title);
+                    }
                 }
                 if !row.local.is_empty() {
-                    let summary = label(mtm, &local_glance(&row.local), 12.0, false);
-                    summary.setFrame(rect(20.0, top - 99.0, WIDTH - 82.0, 18.0));
+                    let summary = label(mtm, &local_glance(&row.local), 13.0, false);
+                    summary.setFrame(rect(20.0, top - 99.0 - extra_work, WIDTH - 82.0, 18.0));
                     summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
                     summary.setTextColor(Some(&color(0x48415d)));
                     document.addSubview(&summary);
@@ -1177,12 +1178,12 @@ impl CompanionPanel {
                     let summary = label(
                         mtm,
                         &format!("In Hub · {}", row.attention_summary),
-                        12.0,
+                        13.0,
                         true,
                     );
                     summary.setFrame(rect(
                         20.0,
-                        top - if row.local.is_empty() { 99.0 } else { 119.0 },
+                        top - if row.local.is_empty() { 99.0 } else { 119.0 } - extra_work,
                         WIDTH - 82.0,
                         18.0,
                     ));
@@ -1199,7 +1200,7 @@ impl CompanionPanel {
                 } else {
                     "Details".to_owned()
                 };
-                let more = button(mtm, &title, rect(375.0, top - 31.0, 90.0, 29.0));
+                let more = button(mtm, &title, rect(WIDTH - 325.0, top - 31.0, 90.0, 29.0));
                 more.setTag(index as isize);
                 more.setAccessibilityLabel(Some(&NSString::from_str(&format!(
                     "Show agent and work details for {}",
@@ -1211,7 +1212,7 @@ impl CompanionPanel {
                     more.setAction(Some(sel!(expandRepository:)));
                 }
                 document.addSubview(&more);
-                top = bottom - 12.0;
+                top = bottom - 16.0;
                 continue;
             }
 
@@ -1310,7 +1311,7 @@ impl CompanionPanel {
                 more.setAction(Some(sel!(expandRepository:)));
             }
             document.addSubview(&more);
-            top = bottom - 12.0;
+            top = bottom - 16.0;
         }
         if omitted_repositories > 0 {
             let more = button(
