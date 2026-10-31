@@ -26,8 +26,10 @@ pub mod narrative;
 pub mod onboarding;
 #[cfg(unix)]
 pub mod pipeline_rules;
+pub mod pr_context;
 pub mod promise;
 mod promise_http;
+pub mod provider_context;
 pub mod publish;
 mod repository_summary;
 pub mod session;
@@ -43,6 +45,7 @@ pub mod ui;
 pub mod view_settings;
 pub mod work;
 pub mod work_http;
+pub mod work_links;
 pub mod work_preflight;
 pub mod workspace;
 #[cfg(unix)]
@@ -426,6 +429,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(pr_context::routes())
         .merge(promise_http::routes())
         .merge(skills::routes())
         .merge(work_http::routes())

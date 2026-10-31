@@ -43,6 +43,24 @@ own routes, including the agent MCP endpoint `POST /mcp` and the hook endpoints
 `POST /v1/hub/hook/{agent}`; see the [hub guide](hub.md#routes) and
 [agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints).
 
+## Hub PR context
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/pr-context?number=…&expected_head=…` | Agent or read-only bearer token; retained PR context with explicit coverage, no provider refresh or writes |
+
+`expected_head` is optional. MCP exposes the same service as `agentscm_pr_context`.
+See [PR context](advanced/pr-context.md) for revision identity, bounds and unknowns.
+
+| Work relationship route | Contract |
+| --- | --- |
+| `GET /v1/hub/standup/work/{id}/pr-link` | Repository-scoped reader; optional `expected_updated_seq` and `expected_head` comparisons |
+| `POST /v1/hub/standup/pr-link` | Current Work lead with generation/session/sequence fencing; explicit set or `link:null` removal, idempotent operation ID |
+
+MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the same
+Work store. The relationship records caller-reported identity, not provider approval.
+
+
 ## Hub change-record routes
 
 These routes belong to `agentscm hub serve`, not the unauthenticated local `serve` API above. They

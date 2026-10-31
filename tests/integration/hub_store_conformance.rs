@@ -2684,6 +2684,7 @@ conformance!(
     upgrade_from_hub_settings_migration,
     connections_and_repositories,
     observations,
+    provider_context_events_are_digest_summaries_of_retained_bytes,
     deliveries_outbound_and_notices,
     forge_check_journal,
     merge_group_journal,
@@ -2759,4 +2760,110 @@ fn postgres_reconnects_after_the_backend_is_terminated() {
     let _ = store.set_user_disabled(&alice.id, true);
     store.set_user_disabled(&alice.id, true).unwrap();
     assert_eq!(store.authenticate(&digest, unix_now()).unwrap(), None);
+}
+
+fn provider_context_events_are_digest_summaries_of_retained_bytes(db: &Db) {
+    use sha2::{Digest, Sha256};
+
+    let store = db.open();
+    let connection = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    let repo = store
+        .upsert_repository(
+            &connection.id,
+            "github.com",
+            4242,
+            "acme/widgets",
+            None,
+            None,
+        )
+        .unwrap();
+    let snapshot = json!({"version": 1, "provider": "github", "repository_id": 4242,
+        "number": 17, "head_sha": "a".repeat(40), "base_sha": "b".repeat(40),
+        "permissions": {"availability": "observed"},
+        "reviews": {"availability": "available", "complete": true, "items": [{"provider_id": 1, "body": "private-event-marker".repeat(740)}]},
+        "check_runs": {"availability": "incomplete", "complete": false, "items": [{"name": "test", "state": "in_progress"}]},
+        "commit_statuses": {"availability": "permission_missing", "complete": false, "items": []}});
+    // Deliberate whitespace makes the digest's exact-byte contract observable.
+    let data = format!(" \n{}\n ", snapshot);
+    assert!(data.len() > 14 * 1024);
+    assert!(data.len() <= 16 * 1024);
+    store
+        .observe(&repo.id, "provider_context", "17", &data, 100)
+        .unwrap();
+    let retained = store
+        .observation(&repo.id, "provider_context", "17")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.data, data);
+    let expected_digest = format!("{:x}", Sha256::digest(data.as_bytes()));
+    let canonical_digest = format!("{:x}", Sha256::digest(snapshot.to_string().as_bytes()));
+    assert_ne!(expected_digest, canonical_digest);
+    let event = store
+        .events_after(0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "provider_context_observed")
+        .unwrap();
+    assert!(event.data.len() <= 1024);
+    let summary: Value = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(summary["number"], 17);
+    assert_eq!(summary["repository_id"], 4242);
+    assert_eq!(summary["scope"], "pull_request");
+    assert_eq!(summary["head_sha"], "a".repeat(40));
+    assert_eq!(
+        summary["categories"]["reviews"],
+        json!({"availability": "available", "complete": true})
+    );
+    assert_eq!(
+        summary["categories"]["check_runs"],
+        json!({"availability": "incomplete", "complete": false})
+    );
+    assert_eq!(
+        summary["categories"]["commit_statuses"],
+        json!({"availability": "permission_missing", "complete": false})
+    );
+    assert_eq!(
+        summary["snapshot_digest"],
+        json!({"algorithm": "sha256", "encoding": "hex", "covered_bytes": "observation_data_utf8", "value": expected_digest})
+    );
+    assert!(!event.data.contains("private-event-marker"));
+    assert!(summary.get("reviews").is_none());
+    assert_eq!(
+        store
+            .observe(&repo.id, "provider_context", "17", &data, 200)
+            .unwrap(),
+        Observed::Unchanged
+    );
+    assert_eq!(events_of(&*store, "provider_context_observed").len(), 1);
+    // Production forget passes a tombstone, not the old observation bytes.
+    let tombstone = json!({"number": 17, "availability": "closed_or_gone"}).to_string();
+    assert!(
+        store
+            .forget(
+                &repo.id,
+                "provider_context",
+                "17",
+                300,
+                &tombstone,
+                "provider_context_removed"
+            )
+            .unwrap()
+    );
+    let removed = store
+        .events_after(event.seq, 100)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "provider_context_removed")
+        .unwrap();
+    assert!(removed.data.len() <= 1024);
+    let removed_summary: Value = serde_json::from_str(&removed.data).unwrap();
+    assert_eq!(removed_summary["number"], 17);
+    assert_eq!(removed_summary["repository_id"], 4242);
+    assert_eq!(removed_summary["change"], "removed");
+    assert_eq!(removed_summary.get("snapshot_digest"), Some(&Value::Null));
+    assert_eq!(removed_summary.get("head_sha"), Some(&Value::Null));
+    assert_eq!(removed_summary["categories"], json!({}));
+    assert!(!removed.data.contains("private-event-marker"));
 }

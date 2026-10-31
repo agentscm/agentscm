@@ -159,6 +159,14 @@ pub struct PullHead {
 
 pub type Gh<T> = std::result::Result<T, GhError>;
 
+fn context_sha(sha: &str) -> Gh<()> {
+    if sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(GhError::Failed("invalid context commit".into()))
+    }
+}
+
 pub struct Reply {
     pub status: u16,
     pub body: Value,
@@ -650,6 +658,105 @@ impl Api {
             return Ok(None);
         }
         reply.ok("app").map(Some)
+    }
+
+    /// The first review page and, when GitHub supplies a numeric last-page hint, that
+    /// last page. GitHub reviews are chronological; projection chooses the newest
+    /// observed rows. Intermediate or unknown pages stay explicitly unread.
+    pub async fn context_reviews(&self, token: &str, repository: &str, number: i64) -> Gh<Paged> {
+        if number <= 0 {
+            return Err(GhError::Failed("invalid pull number".into()));
+        }
+        let suffix = format!("pulls/{number}/reviews");
+        let (mut first, last) = self
+            .context_page_number(token, repository, &suffix, None, 1)
+            .await?;
+        if first.unread > 0
+            && let Some(last) = last.filter(|page| *page > 1)
+        {
+            // Never follow the Link URL: only its parsed numeric page is used with our
+            // configured API base and validated repository/PR path.
+            let (end, _) = self
+                .context_page_number(token, repository, &suffix, None, last)
+                .await?;
+            first.pages += end.pages;
+            first.unread = last.saturating_sub(2).max(end.unread);
+            first.items.extend(end.items);
+        }
+        Ok(first)
+    }
+
+    /// Check runs for the explicitly requested commit, without logs or annotations.
+    pub async fn context_checks(&self, token: &str, repository: &str, sha: &str) -> Gh<Paged> {
+        context_sha(sha)?;
+        self.context_page(
+            token,
+            repository,
+            &format!("commits/{sha}/check-runs?filter=latest"),
+            Some("check_runs"),
+        )
+        .await
+    }
+
+    /// Commit-status observations for the explicitly requested commit, newest first.
+    pub async fn context_statuses(&self, token: &str, repository: &str, sha: &str) -> Gh<Paged> {
+        context_sha(sha)?;
+        self.context_page(token, repository, &format!("commits/{sha}/statuses"), None)
+            .await
+    }
+
+    async fn context_page(
+        &self,
+        token: &str,
+        repository: &str,
+        suffix: &str,
+        key: Option<&str>,
+    ) -> Gh<Paged> {
+        self.context_page_number(token, repository, suffix, key, 1)
+            .await
+            .map(|(page, _)| page)
+    }
+
+    async fn context_page_number(
+        &self,
+        token: &str,
+        repository: &str,
+        suffix: &str,
+        key: Option<&str>,
+        page: u32,
+    ) -> Gh<(Paged, Option<u32>)> {
+        validate_repository(repository)?;
+        if repository.split('/').count() != 2 || page == 0 {
+            return Err(GhError::Failed("invalid repository or page".into()));
+        }
+        let sep = if suffix.contains('?') { '&' } else { '?' };
+        let url = format!(
+            "{}/repos/{repository}/{suffix}{sep}per_page=16&page={page}",
+            self.base
+        );
+        let reply = self
+            .send(token, Method::GET, &url, None, None, false)
+            .await?;
+        let (next, last) = (reply.next, reply.last_page);
+        // Preserve authorization refusal separately from an ordinary failed optional
+        // read; the collector must clear old evidence after a known refusal.
+        if reply.status == 403 {
+            return Err(GhError::Auth("403 from repos".into()));
+        }
+        let body = reply.ok("repos")?;
+        let items = key.map_or(&body, |key| &body[key]);
+        let items = items
+            .as_array()
+            .ok_or_else(|| GhError::Failed("unreadable context reply".into()))?;
+        Ok((
+            Paged {
+                items: items.iter().take(16).cloned().collect(),
+                etag: None,
+                pages: 1,
+                unread: u32::from(next || last.is_some_and(|last| last > page) || items.len() > 16),
+            },
+            last,
+        ))
     }
 
     /// The current merge queue branches of `base` as (branch name, commit), at most one page of

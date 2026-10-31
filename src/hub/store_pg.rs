@@ -106,6 +106,9 @@ use super::work::{
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
     work_payload_row_bytes,
 };
+use super::work_links::{
+    self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
+};
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::{HubError, Result};
 
@@ -1772,6 +1775,11 @@ fn work_payload_bytes(
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                     AND w.repository_id IS NOT DISTINCT FROM $4
                  UNION ALL
+                 SELECT octet_length(l.snapshot)::bigint + 256 FROM hub_work_pr_links l
+                  JOIN hub_work_items w ON w.id = l.work
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
                  SELECT octet_length(o.request)::bigint + 256 FROM hub_work_checkpoint_ops o
                   JOIN hub_work_items w ON w.id = o.work
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
@@ -1793,7 +1801,7 @@ fn work_payload_bytes(
                    FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                     AND w.repository_id IS NOT DISTINCT FROM $4
-                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
                  UNION ALL
                  SELECT octet_length(r.proposed_scope)::bigint
                         + octet_length(r.proposed_title)::bigint + 256
@@ -6422,7 +6430,7 @@ impl Store for PgStore {
             )?;
             append(
                 &mut tx,
-                &Event::observation(observed_kind, &repository, data)?,
+                &Event::observation(observed_kind, &repository, key, data)?,
             )?;
             tx.commit()?;
             Ok(Observed::Changed { previous })
@@ -6465,10 +6473,22 @@ impl Store for PgStore {
             )?;
             // An already-forgotten row only moves its read time forward.
             if !gone {
-                append(&mut tx, &Event::observation(gone_kind, &repository, data)?)?;
+                append(
+                    &mut tx,
+                    &Event::observation(gone_kind, &repository, key, data)?,
+                )?;
             }
             tx.commit()?;
             Ok(!gone)
+        })
+    }
+
+    fn observation(&self, repo: &str, kind: &str, key: &str) -> Result<Option<Observation>> {
+        observation_kinds(kind)?;
+        self.run(true, |client| {
+            Ok(client.query_opt(
+                "SELECT kind,key,data,observed_at FROM hub_observations WHERE repository=$1 AND kind=$2 AND key=$3 AND NOT deleted",
+                &[&repo,&kind,&key])?.map(|row| Observation {kind:row.get(0),key:row.get(1),data:row.get(2),observed_at:row.get(3)}))
         })
     }
 
@@ -7912,6 +7932,166 @@ impl Store for PgStore {
             let item = scoped_work(&mut tx, &who, id, now, false)?;
             tx.commit()?;
             Ok(item)
+        })
+    }
+
+    fn work_pr_link_get(
+        &self,
+        token: &str,
+        id: &str,
+        query: &WorkPrLinkQuery,
+        now: i64,
+    ) -> Result<Option<WorkPrLinkView>> {
+        query.validate()?;
+        super::work::validate_id("work", id, "wrk")?;
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+            let who = work_who(&mut tx, token, now)?;
+            let repository_id = work_links::trusted_repository_id(&who)?;
+            let Some(item) = scoped_work(&mut tx, &who, id, now, false)? else {
+                return Ok(None);
+            };
+            let snapshot: Option<String> = tx
+                .query_opt(
+                    "SELECT snapshot FROM hub_work_pr_links WHERE work=$1",
+                    &[&id],
+                )?
+                .map(|row| row.get(0));
+            let link = snapshot
+                .as_deref()
+                .map(json_value::<WorkPrLink>)
+                .transpose()?;
+            let view = work_links::view(&item, repository_id, link, query);
+            tx.commit()?;
+            Ok(Some(view))
+        })
+    }
+
+    fn work_pr_link_set(
+        &self,
+        token: &str,
+        update: &WorkPrLinkUpdate,
+        now: i64,
+    ) -> Result<WorkPrLinkResult> {
+        update.validate()?;
+        let request = json_string(&json!({"operation": "work_pr_link", "update": update}))?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let mut item = scoped_work(&mut tx, &who, &update.work_id, now, true)?
+                .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+            let old_link: Option<String> = tx
+                .query_opt(
+                    "SELECT snapshot FROM hub_work_pr_links WHERE work=$1",
+                    &[&item.id],
+                )?
+                .map(|row| row.get(0));
+            if let Some(row) = tx.query_opt(
+                "SELECT o.request,v.snapshot,o.event_seq FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work=o.work AND v.event_seq=o.event_seq
+                 WHERE o.work=$1 AND o.operation_id=$2",
+                &[&item.id, &update.operation_id],
+            )? {
+                let previous: String = row.get(0);
+                let committed_snapshot: String = row.get(1);
+                let event_seq: i64 = row.get(2);
+                if previous != request {
+                    return Err(HubError::Invalid(
+                        "operation_id was already used for another request".into(),
+                    ));
+                }
+                // An exact retry belongs to the committing lead, even after a takeover.
+                let committed: WorkItem = json_value(&committed_snapshot)?;
+                let repository_id = update.authorize(&who, &committed)?;
+                let link = old_link
+                    .as_deref()
+                    .map(json_value::<WorkPrLink>)
+                    .transpose()?;
+                let view =
+                    work_links::view(&item, repository_id, link, &WorkPrLinkQuery::default());
+                tx.commit()?;
+                return Ok(WorkPrLinkResult {
+                    view,
+                    receipt: CheckpointReceipt {
+                        work_id: item.id,
+                        operation_id: update.operation_id.clone(),
+                        generation: committed.generation,
+                        event_seq,
+                        replayed: true,
+                    },
+                });
+            }
+            let repository_id = update.authorize(&who, &item)?;
+            if item.updated_seq != update.expected_updated_seq {
+                return Err(HubError::Invalid(
+                    "PR link receipt expired or Work changed".into(),
+                ));
+            }
+            let previous_link = old_link
+                .as_deref()
+                .map(json_value::<WorkPrLink>)
+                .transpose()?;
+            if previous_link.as_ref().map(|link| &link.target) == update.link.as_ref() {
+                return Err(HubError::Invalid("PR relationship is unchanged".into()));
+            }
+            let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
+            item.updated_at = now;
+            let event = work_links::mutation_event(&item, &who, update, now)?;
+            let seq = append(&mut tx, &event)?;
+            item.updated_seq = seq;
+            let snapshot = save_work_version(&mut tx, &item, seq)?;
+            let link = work_links::asserted_link(&who, update, seq, now);
+            let new_link = link.as_ref().map(json_string).transpose()?;
+            if let Some(snapshot) = &new_link {
+                tx.execute(
+                    "INSERT INTO hub_work_pr_links (work,snapshot) VALUES ($1,$2)
+                            ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",
+                    &[&item.id, snapshot],
+                )?;
+            } else {
+                tx.execute("DELETE FROM hub_work_pr_links WHERE work=$1", &[&item.id])?;
+            }
+            tx.execute(
+                "INSERT INTO hub_work_checkpoint_ops (work,operation_id,request,event_seq)
+                        VALUES ($1,$2,$3,$4)",
+                &[&item.id, &update.operation_id, &request, &seq],
+            )?;
+            let old_bytes = old_link
+                .as_ref()
+                .map(|s| work_payload_row_bytes(s.len()))
+                .transpose()?
+                .unwrap_or(0);
+            let new_bytes = new_link
+                .as_ref()
+                .map(|s| work_payload_row_bytes(s.len()))
+                .transpose()?
+                .unwrap_or(0);
+            let delta = work_transition_payload_bytes(&snapshot, &event)?
+                .checked_sub(previous_item_bytes)
+                .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
+                .and_then(|v| v.checked_add(new_bytes))
+                .and_then(|v| v.checked_sub(old_bytes))
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            adjust_work_payload_capacity(&mut tx, &who, delta, now)?;
+            let view = work_links::view(&item, repository_id, link, &WorkPrLinkQuery::default());
+            tx.commit()?;
+            Ok(WorkPrLinkResult {
+                view,
+                receipt: CheckpointReceipt {
+                    work_id: item.id,
+                    operation_id: update.operation_id.clone(),
+                    generation: update.generation,
+                    event_seq: seq,
+                    replayed: false,
+                },
+            })
         })
     }
 
@@ -9560,7 +9740,7 @@ impl Store for PgStore {
                          JOIN hub_work_items w ON w.id = e.subject
                          WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                            AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
                            AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                            AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                         &[
@@ -9577,7 +9757,7 @@ impl Store for PgStore {
                      WHERE w.id = e.subject
                        AND w.provider = $1 AND w.host = $2 AND w.repository = $3
                        AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                     &[
