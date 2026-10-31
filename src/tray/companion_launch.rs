@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use agentscm::{Error, Result};
 
-const MAX_PROMPT_BYTES: usize = 16 * 1024;
+pub(super) const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

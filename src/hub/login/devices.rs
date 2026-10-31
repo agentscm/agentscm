@@ -587,6 +587,17 @@ async fn repositories_for_owner(
         };
         let mut rows = Vec::with_capacity(readable.len());
         for repo in readable {
+            // `readable` was role checked above. The device catalog exposes only a count;
+            // request bodies and participants stay behind the repository's own read token.
+            let inbox_requests = if include_work {
+                store.repository_open_coordination_count(
+                    &owner,
+                    &repo.full_name,
+                    repo.repository_id,
+                )?
+            } else {
+                0
+            };
             let overview = store.repository_work_overview(
                 &owner,
                 &repo.full_name,
@@ -638,6 +649,7 @@ async fn repositories_for_owner(
                             "state": item.state,
                             "claim_status": item.claim_status,
                             "next_action": item.next_action,
+                            "scope_unknown": item.scope.is_empty(),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -686,6 +698,7 @@ async fn repositories_for_owner(
                 owner.identity.provider.clone(),
                 &facts,
             );
+            let attention_categories = json!(summary.attention_categories);
             let revision = if include_work && summary.needs_you > 0 {
                 revision_key
                     .as_deref()
@@ -693,23 +706,44 @@ async fn repositories_for_owner(
             } else {
                 None
             };
-            rows.push((summary, work, live, work_complete, live_complete, revision));
+            rows.push((
+                summary,
+                work,
+                live,
+                work_complete,
+                live_complete,
+                revision,
+                attention_categories,
+                inbox_requests,
+            ));
         }
         Ok(rows)
     })
     .await?;
-    // What needs a person first, then stuck work, then the newest activity.
-    rows.sort_by(|(a, _, _, _, _, _), (b, _, _, _, _, _)| {
-        (b.needs_you > 0)
-            .cmp(&(a.needs_you > 0))
-            .then((b.unfinished.stuck > 0).cmp(&(a.unfinished.stuck > 0)))
-            .then(b.last_activity_at.cmp(&a.last_activity_at))
-            .then(a.repository.cmp(&b.repository))
-    });
+    // What needs a person first, then agent Inbox requests and stuck work.
+    rows.sort_by(
+        |(a, _, _, _, _, _, _, a_inbox), (b, _, _, _, _, _, _, b_inbox)| {
+            (b.needs_you > 0)
+                .cmp(&(a.needs_you > 0))
+                .then((b_inbox > &0).cmp(&(a_inbox > &0)))
+                .then((b.unfinished.stuck > 0).cmp(&(a.unfinished.stuck > 0)))
+                .then(b.last_activity_at.cmp(&a.last_activity_at))
+                .then(a.repository.cmp(&b.repository))
+        },
+    );
     let rows = rows
         .into_iter()
         .map(
-            |(summary, work, live, work_complete, live_complete, revision)| {
+            |(
+                summary,
+                work,
+                live,
+                work_complete,
+                live_complete,
+                revision,
+                attention_categories,
+                inbox_requests,
+            )| {
                 let mut value =
                     serde_json::to_value(summary).expect("repository summary serializes");
                 if include_work {
@@ -718,6 +752,8 @@ async fn repositories_for_owner(
                     value["live"] = json!(live);
                     value["live_complete"] = json!(live_complete);
                     value["attention_revision"] = json!(revision);
+                    value["attention_categories"] = attention_categories;
+                    value["inbox_requests"] = json!(inbox_requests);
                 }
                 value
             },

@@ -37,6 +37,15 @@ pub struct RepositorySummary {
     /// Only used to form the computer catalog's change marker; never serialized.
     #[serde(skip)]
     pub(crate) contested_markers: Vec<String>,
+    #[serde(skip)]
+    pub(crate) attention_categories: AttentionCategories,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct AttentionCategories {
+    pub work: usize,
+    pub overlaps: usize,
+    pub contested_files: usize,
 }
 
 /// What the Hub read for one repository.
@@ -79,6 +88,11 @@ pub(super) fn summarize(
             && facts.overview.overlaps_complete
             && facts.live_complete,
         contested_markers,
+        attention_categories: AttentionCategories {
+            work: decisions,
+            overlaps: facts.overview.overlaps.len(),
+            contested_files: contested_count,
+        },
     }
 }
 
