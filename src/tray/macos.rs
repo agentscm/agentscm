@@ -2453,7 +2453,7 @@ fn companion_attention(
             .take(2)
             .map(|(repository, count)| {
                 format!(
-                    "{repository} ({count} Hub decision{})",
+                    "{repository} ({count} Hub alert{})",
                     if *count == 1 { "" } else { "s" }
                 )
             })
@@ -4351,7 +4351,7 @@ mod tests {
         let text =
             companion_attention(&MenuExtras::default(), &[signal], &catalog, &snapshot).unwrap();
         assert!(text.contains("2 Work / Inbox signals"));
-        assert!(text.contains("example/project (1 Hub decision)"));
+        assert!(text.contains("example/project (1 Hub alert)"));
     }
 
     #[test]
