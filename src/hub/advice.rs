@@ -227,11 +227,20 @@ pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
 
 /// A handoff line: the holder's request, or the answer to the requester's.
 fn handoff_line(note: &HandoffNote) -> String {
-    let who = format!(
-        "{}'s agent {}",
-        ascii_name(&note.login),
-        ascii_name(&note.agent)
-    );
+    // A person acting from the Hub's web pages is named as the person, not passed off as the agent.
+    let who = if note.hub {
+        format!(
+            "{} (from the Hub's web page, for their agent {})",
+            ascii_name(&note.login),
+            ascii_name(&note.agent)
+        )
+    } else {
+        format!(
+            "{}'s agent {}",
+            ascii_name(&note.login),
+            ascii_name(&note.agent)
+        )
+    };
     let path = sanitize(&note.path, PATH_CHARS);
     match note.kind {
         "request" => {
@@ -822,7 +831,18 @@ mod tests {
             note: text.map(str::to_owned),
             reason: None,
             session: "sess-1".into(),
+            hub: false,
         }
+    }
+
+    #[test]
+    fn a_person_acting_from_the_hub_is_named_as_the_person() {
+        let mut from_hub = note("grant", None);
+        from_hub.hub = true;
+        assert_eq!(
+            handoff_line(&from_hub),
+            "amy (from the Hub's web page, for their agent codex) handed src/a.rs to this session; repeating the edit applies it."
+        );
     }
 
     #[test]

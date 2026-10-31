@@ -79,16 +79,15 @@ test('a work item opens its authenticated change-record projection', async ({ pa
   await expect(main(page)).toContainText('No action captured')
 })
 
-test('a directed request expands to show targets, receipts and paths', async ({ page }) => {
+test('the Inbox lists conversations and shows the selected one beside them', async ({ page }) => {
   await signIn(page, '#work/coordination')
   await expect(page).toHaveURL(/#work\/coordination$/)
   await expect(rail(page).getByRole('link', { name: /^Inbox/ })).toHaveAttribute('aria-current', 'page')
-  const request = main(page).locator('details.request').first()
-  await expect(request).toBeVisible()
-  await request.locator('summary').click()
-  await expect(request).toHaveAttribute('open', '')
-  await expect(request).toContainText('Target lead')
-  await expect(request).toContainText(/Awaiting receipt|Received/)
+  const wrap = main(page).locator('.in-wrap')
+  await expect(wrap).toBeVisible()
+  await expect(wrap.getByRole('navigation', { name: 'Conversations' })).toBeVisible()
+  // With a conversation selected its timeline shows; with none, the idle scene does.
+  await expect(wrap.locator('.in-pane').locator('.in-tl, .in-idle').first()).toBeVisible()
 })
 
 test('rail collapse persists across reload, with tooltips naming each icon', async ({ page }) => {

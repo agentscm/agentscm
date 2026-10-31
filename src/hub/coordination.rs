@@ -85,6 +85,11 @@ pub struct CoordinationResponse {
     pub target_generation: i64,
     pub kind: CoordinationResponseKind,
     pub note: Option<String>,
+    /// `hub` when the person who owns the responding agent answered for it from the Hub's web
+    /// pages; absent when the agent answered itself. `responder` is still the agent, so a reader
+    /// that ignores this field sees the same shape as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub created_at: i64,
     pub seq: i64,
 }
@@ -189,6 +194,10 @@ pub struct CoordinationReply {
     pub expected_updated_seq: i64,
     pub kind: CoordinationResponseKind,
     pub note: Option<String>,
+    /// Set only by the Hub's browser-session route, never read from a request body: the person
+    /// who owns the lead agent answered for it. Recorded as `via: "hub"` on the response.
+    #[serde(skip)]
+    pub via_hub: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -331,4 +340,12 @@ pub(super) fn parse_response_kind(value: &str) -> Result<CoordinationResponseKin
 
 pub(super) fn invalid(message: &str) -> HubError {
     HubError::Invalid(message.to_owned())
+}
+
+/// The event data of a response, marked `via: "hub"` when a person answered for the agent.
+pub(super) fn with_hub_via(mut data: serde_json::Value, hub: bool) -> serde_json::Value {
+    if hub {
+        data["via"] = serde_json::json!("hub");
+    }
+    data
 }

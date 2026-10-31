@@ -47,7 +47,7 @@ use super::coordination::{
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name,
+    status_name, with_hub_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -57,8 +57,9 @@ use super::external_runs::{
     EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
 };
 use super::handoff::{
-    Answered, Asked, HandoffNote, MAX_OPEN, PER_TOUCH, Request, Verdict, answer_kind, clean_note,
-    cutoff, file_key, grant_call, judge, remaining, still_holds,
+    Answered, Asked, HandoffNote, HandoffParty, HandoffView, MAX_OPEN, PER_TOUCH, Request, Verdict,
+    Via, answer_kind, clean_note, cutoff, file_key, grant_call, judge, remaining, still_holds,
+    view_state,
 };
 use super::insights::{
     CostGroup, HistoryPoint, InsightCursor, InsightInput, InsightPage, InsightQuery, MAX_HISTORY,
@@ -2333,7 +2334,7 @@ fn coordination_request_at(
         .collect::<Vec<_>>();
     let response_rows = tx.query(
         "SELECT id, operation_id, target_work, token, agent, session, owner, login,
-                target_generation, kind, note, created_at, event_seq
+                target_generation, kind, note, created_at, event_seq, via
          FROM hub_coordination_responses WHERE request = $1 AND event_seq <= $2
          ORDER BY CASE WHEN EXISTS (
              SELECT 1 FROM hub_coordination_targets t JOIN hub_work_items w ON w.id=t.work
@@ -2370,6 +2371,7 @@ fn coordination_request_at(
             target_generation: row.get(8),
             kind: parse_response_kind(&kind)?,
             note: row.get(10),
+            via: row.get(13),
             created_at: row.get(11),
             seq: row.get(12),
         });
@@ -4359,7 +4361,7 @@ fn ask_in(
     row: &Row,
     key: &str,
     note: Option<&str>,
-    auto: bool,
+    (auto, via): (bool, Via),
     now: i64,
 ) -> Result<Asked> {
     let token = who.token.as_str();
@@ -4428,8 +4430,8 @@ fn ask_in(
     tx.execute(
         "INSERT INTO hub_handoffs (id, repository, path, requester_token,
              requester_session, holder_token, holder_session, holder_intent, note,
-             state, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10)",
+             state, created_at, asked_via_hub)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11)",
         &[
             &id,
             &who.repository,
@@ -4441,9 +4443,10 @@ fn ask_in(
             &holder.id,
             &note,
             &now,
+            &via.hub(),
         ],
     )?;
-    let event = Event::handoff_request(token, &id, name, key, note, &holder, auto)?;
+    let event = Event::handoff_request(token, &id, name, key, note, &holder, (auto, via))?;
     append(tx, &event)?;
     Ok(Asked::Requested { holder })
 }
@@ -4466,7 +4469,16 @@ fn auto_ask(
             let row = session_row(tx, &who.token, name)?
                 .ok_or_else(|| HubError::Invalid("unknown session".into()))?;
             let note = clean_note(row.task.as_deref());
-            let asked = ask_in(tx, who, name, &row, key, note.as_deref(), true, now)?;
+            let asked = ask_in(
+                tx,
+                who,
+                name,
+                &row,
+                key,
+                note.as_deref(),
+                (true, Via::Agent),
+                now,
+            )?;
             tx.batch_execute("RELEASE auto_ask")?;
             Ok(asked)
         };
@@ -4490,7 +4502,7 @@ fn handoffs_in(
     now: i64,
 ) -> Result<Vec<HandoffNote>> {
     let requests = tx.query(
-        "SELECT h.id, h.path, h.note, t.name, u.login
+        "SELECT h.id, h.path, h.note, t.name, u.login, h.asked_via_hub
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.requester_token
          JOIN hub_users u ON u.id = t.owner
          WHERE h.holder_token = $1 AND h.holder_session = $2 AND h.state = 'pending'
@@ -4499,7 +4511,7 @@ fn handoffs_in(
         &[&token, &session, &cutoff(now), &PER_TOUCH],
     )?;
     let answers = tx.query(
-        "SELECT h.id, h.state, h.path, t.name, u.login, h.reply
+        "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
          JOIN hub_users u ON u.id = t.owner
          WHERE h.requester_token = $1 AND h.requester_session = $2
@@ -4516,7 +4528,7 @@ fn handoffs_in(
     };
     told(tx, "holder_told", &requests)?;
     told(tx, "requester_told", &answers)?;
-    let note = |kind, path, note, reason, agent, login| HandoffNote {
+    let note = |kind, path, note, reason, agent, login, hub| HandoffNote {
         kind,
         path,
         note,
@@ -4524,6 +4536,7 @@ fn handoffs_in(
         agent,
         login,
         session: session.to_owned(),
+        hub,
     };
     Ok(requests
         .iter()
@@ -4535,11 +4548,20 @@ fn handoffs_in(
                 None,
                 row.get(3),
                 row.get(4),
+                row.get(5),
             )
         })
         .chain(answers.iter().map(|row| {
             let kind = answer_kind(row.get(1));
-            note(kind, row.get(2), None, row.get(5), row.get(3), row.get(4))
+            note(
+                kind,
+                row.get(2),
+                None,
+                row.get(5),
+                row.get(3),
+                row.get(4),
+                row.get(6),
+            )
         }))
         .collect())
 }
@@ -5817,12 +5839,13 @@ impl Store for PgStore {
         })
     }
 
-    fn ask_handoff(
+    fn ask_handoff_via(
         &self,
         token: &str,
         session: Option<&str>,
         path: &str,
         note: Option<&str>,
+        via: Via,
         now: i64,
     ) -> Result<Asked> {
         let key = file_key(path)?;
@@ -5845,7 +5868,7 @@ impl Store for PgStore {
                 &row,
                 &key,
                 note.as_deref(),
-                false,
+                (false, via),
                 now,
             )?;
             tx.commit()?;
@@ -5853,13 +5876,13 @@ impl Store for PgStore {
         })
     }
 
-    fn answer_handoff(
+    fn answer_handoff_via(
         &self,
         token: &str,
         session: Option<&str>,
         path: &str,
-        accept: bool,
-        reason: Option<&str>,
+        (accept, reason): (bool, Option<&str>),
+        via: Via,
         now: i64,
     ) -> Result<Answered> {
         let key = file_key(path)?;
@@ -5996,12 +6019,14 @@ impl Store for PgStore {
                 touch_in(&mut tx, &requester_who, &check(&call)?, now)?;
             }
             tx.execute(
-                "UPDATE hub_handoffs SET state = $2, decided_at = $3, reply = $4 WHERE id = $1",
+                "UPDATE hub_handoffs SET state = $2, decided_at = $3, reply = $4,
+                     answered_via_hub = $5 WHERE id = $1",
                 &[
                     &request.id,
                     &if accept { "granted" } else { "declined" },
                     &now,
                     &reason,
+                    &via.hub(),
                 ],
             )?;
             let kind = if accept {
@@ -6016,6 +6041,7 @@ impl Store for PgStore {
                 &key,
                 &request,
                 reason.as_deref(),
+                via,
             )?;
             append(&mut tx, &event)?;
             tx.commit()?;
@@ -6024,6 +6050,64 @@ impl Store for PgStore {
             } else {
                 Answered::Declined { requester }
             })
+        })
+    }
+
+    fn handoffs_of_owner(
+        &self,
+        owner: &str,
+        repository: &str,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<HandoffView>> {
+        self.run(true, |client| {
+            let rows = client.query(
+                "SELECT h.id, h.path, h.state, h.note, h.reply, h.created_at, h.decided_at,
+                        h.holder_told, h.requester_told, h.asked_via_hub, h.answered_via_hub,
+                        h.requester_token, h.requester_session, rt.name, rt.owner, ru.login,
+                        h.holder_token, h.holder_session, ht.name, ht.owner, hu.login
+                 FROM hub_handoffs h
+                 JOIN hub_agent_tokens rt ON rt.id = h.requester_token
+                 JOIN hub_users ru ON ru.id = rt.owner
+                 JOIN hub_agent_tokens ht ON ht.id = h.holder_token
+                 JOIN hub_users hu ON hu.id = ht.owner
+                 WHERE h.repository = $1 AND (rt.owner = $2 OR ht.owner = $2)
+                 ORDER BY h.created_at DESC, h.id LIMIT $3",
+                &[&repository, &owner, &(limit as i64)],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|row| {
+                    let (state, created_at): (String, i64) = (row.get(2), row.get(5));
+                    HandoffView {
+                        id: row.get(0),
+                        path: row.get(1),
+                        state: view_state(&state, created_at, now),
+                        note: row.get(3),
+                        reply: row.get(4),
+                        created_at,
+                        decided_at: row.get(6),
+                        holder_told: row.get(7),
+                        requester_told: row.get(8),
+                        asked_via_hub: row.get(9),
+                        answered_via_hub: row.get(10),
+                        requester: HandoffParty {
+                            token: row.get(11),
+                            session: row.get(12),
+                            agent: row.get(13),
+                            owner: row.get(14),
+                            login: row.get(15),
+                        },
+                        holder: HandoffParty {
+                            token: row.get(16),
+                            session: row.get(17),
+                            agent: row.get(18),
+                            owner: row.get(19),
+                            login: row.get(20),
+                        },
+                    }
+                })
+                .collect())
         })
     }
 
@@ -10395,16 +10479,19 @@ impl Store for PgStore {
                 "coordination_responded",
                 &request.id,
                 now,
-                json!({"response_id": response_id, "target_work_id": target.work_id,
-                    "kind": response_kind_name(reply.kind), "token": who.token,
-                    "session": reply.session, "generation": target.generation}),
+                with_hub_via(
+                    json!({"response_id": response_id, "target_work_id": target.work_id,
+                        "kind": response_kind_name(reply.kind), "token": who.token,
+                        "session": reply.session, "generation": target.generation}),
+                    reply.via_hub,
+                ),
             )?;
             let seq = append(&mut tx, &event)?;
             tx.execute(
                 "INSERT INTO hub_coordination_responses
                  (id,request,operation_id,target_work,token,agent,session,owner,login,
-                  target_generation,kind,note,created_at,event_seq)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                  target_generation,kind,note,created_at,event_seq,via)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
                 &[
                     &response_id,
                     &request.id,
@@ -10420,6 +10507,7 @@ impl Store for PgStore {
                     &reply.note,
                     &now,
                     &seq,
+                    &reply.via_hub.then_some("hub"),
                 ],
             )?;
             tx.execute(

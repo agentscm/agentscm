@@ -216,6 +216,45 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `forbidden`, and a computer credential 401. Each call stores a new token, so a page keeps its
   token in memory and asks again only near `expires_at`. Signing out does not end a token
   already handed out; it lasts until it expires.
+- <a id="people-answering-for-their-own-agent"></a>**People answering for their own agent** (experimental). The Inbox page offers four routes
+  that need the web sign-in's cookie, and the CSRF token for a change; a `hub login` session or a
+  computer credential is refused (403 `forbidden`, 401) and a cookie alone answers 403 `csrf`.
+  Each names the person's own agent by its token id (`token`). The Hub requires that token to be
+  an active, writable agent token owned by the signed-in person; anything else (another person's
+  token, a read-only one, an expired, revoked or unknown id) is the same 403 `not_your_agent`.
+  The store then applies the rules an agent's own call meets (the token must lead the target Work
+  and its named session, hold the file, and so on), so a person never gains an agent's powers
+  beyond what that agent could do itself.
+  - `POST /v1/hub/session/coordination/reply` (`token`, `request_id`, `operation_id`,
+    `target_work_id`, `session`, `expected_updated_seq`, `kind`, optional `note`) is
+    `POST /v1/hub/standup/coordination/reply` for the agent that leads the target Work. Same
+    kinds (`propose_split`, `join`, `handover`, `decline`), 500-byte note, `operation_id`
+    replay and `expected_updated_seq` check. Reply: the updated request.
+  - `POST /v1/hub/session/handoff/answer` (`token`, optional `session`, `path`, `accept`,
+    optional `reason`) answers the oldest open file handoff request addressed to that agent's
+    session, as `agentscm_handoff` does. Reply: `{"outcome": "granted" | "declined" |
+    "no_open_request" | "not_held", "requester": {"agent", "login"}}`.
+  - `POST /v1/hub/session/handoff/ask` (`token`, optional `session`, `path`, optional `note`)
+    asks the session holding the exact file to hand it over to that agent's session, as
+    `agentscm_ask` does (200-character filtered note, three open requests per session).
+    Reply: `{"outcome": "requested" | "already_asked" | "not_held" | "yours" | "too_many",
+    "holder": {"agent", "login"}}`.
+  - `GET /v1/hub/session/handoffs?repository=owner/name` lists the person's 50 newest file
+    handoffs in that repository where one of their agents is the requester or the holder. Each
+    row has `id`, `path`, `state` (`pending`, `granted`, `declined`, or `lapsed` for a pending
+    request past the 30-minute hold cap), `note`, `reply`, `created_at`, `decided_at`,
+    `holder_told`, `requester_told`, `asked_via_hub`, `answered_via_hub` and the two sides
+    (`agent`, `login`, `mine`); `token` and `session` appear only on the person's own side.
+  There is no withdrawal: the store has no way to retract a reply or a file request, so the page
+  offers none. The coordination request's own requester can still withdraw it, as an agent.
+  These routes use the store permits of the agent routes (503 `busy` when saturated) and no extra
+  limit. The record says a person answered: a coordination response carries `"via": "hub"` beside
+  the agent that leads the Work (`responder` is still that agent, whose `login` is its owner, the
+  person); the `coordination_responded`, `handoff_request`, `handoff_grant` and `handoff_decline`
+  events carry `"via": "hub"`; and the agent that is told reads "amy (from the Hub's web page, for
+  their agent codex)" instead of "amy's agent codex". Migration 21 adds `via` to coordination
+  responses and `asked_via_hub` / `answered_via_hub` to handoffs; rows and events from an agent's
+  own call keep their old shape.
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
   on the person's forge host that they can read now, for the web pages' All repositories list.
   Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,
@@ -845,7 +884,8 @@ live agents and the last activity, worst first; a row opens that repository's Da
 [the design](design/all-repositories.md). Its rail has six items, each
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
-overlaps and directed requests), History (Finished, Changes, Change records, and Files from this
+overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
+person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)), History (Finished, Changes, Change records, and Files from this
 computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
 Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
 [local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in

@@ -14,3 +14,16 @@ export const BrandIcon = ({ name }: { name: keyof typeof PATHS }) => (
     <path d={PATHS[name]} clipRule="evenodd" />
   </svg>
 )
+
+export type BrandName = keyof typeof PATHS
+const BRAND_OF: Record<string, BrandName> = { claude: 'claudecode', 'claude-code': 'claudecode', codex: 'codex', cursor: 'cursor', copilot: 'copilot', gemini: 'gemini', grok: 'grok' }
+const NAME_OF: Record<string, string> = { claudecode: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini', grok: 'Grok' }
+
+/** The brand an agent name stands for ("claude-code", "codex"), or null for a name the Hub made up. */
+export const brandOf = (agent: string): BrandName | null => BRAND_OF[agent.toLowerCase()] ?? null
+
+/** How people say a known agent ("Claude Code"); null for one that is not. */
+export const brandName = (agent: string): string | null => {
+  const b = brandOf(agent)
+  return b ? NAME_OF[b]! : null
+}

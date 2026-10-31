@@ -17,7 +17,7 @@
 import type { Contested, PrOverlap } from './derive.ts'
 import type { CoordinationAgent, CoordinationRequest, WorkItem, WorkOverlapPair } from './standup.ts'
 import { agentLabel } from './ui.tsx'
-import { currentAck, currentResponse, RESPONSE_LABEL, stage } from './pages/Inbox.tsx'
+import { currentAck, currentResponse, RESPONSE_LABEL, stage } from './requests.ts'
 import { lead } from './pages/workParts.tsx'
 
 export interface Person {
