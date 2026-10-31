@@ -22,12 +22,13 @@ const HEIGHT: f64 = 780.0;
 const TAB_WIDTH: f64 = (WIDTH - 60.0) / 3.0;
 const TAB_STEP: f64 = TAB_WIDTH + 8.0;
 const REPOSITORY_LIMIT: usize = 50;
-const HUB_ACTIVITY_LIMIT: usize = 5;
+const HUB_ACTIVITY_LIMIT: usize = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RepositoryRow {
     pub name: String,
     pub hub: Option<String>,
+    pub last_activity_at: Option<i64>,
     pub local_agents: String,
     pub hub_state: String,
     pub attention: usize,
@@ -292,15 +293,22 @@ impl Target {
 pub(super) struct CompanionPanel {
     panel: Retained<NSPanel>,
     panel_scroll: Retained<NSScrollView>,
+    content: Retained<NSView>,
+    header_group: Retained<NSView>,
     target: Retained<Target>,
     status: Retained<NSTextField>,
     list_title: Retained<NSTextField>,
     attention_title: Retained<NSTextField>,
     attention: Retained<NSTextField>,
     work_scroll: Retained<NSScrollView>,
+    activity_icon: Option<Retained<NSImageView>>,
     now_group: Retained<NSView>,
     list_group: Retained<NSView>,
     prompt_group: Retained<NSView>,
+    composer_card: Retained<NSBox>,
+    composer_title: Retained<NSTextField>,
+    composer_icon: Option<Retained<NSImageView>>,
+    composer_hint: Retained<NSTextField>,
     now_actions: [Retained<NSButton>; 2],
     action_backgrounds: [Retained<NSBox>; 2],
     footer_card: Retained<NSBox>,
@@ -312,6 +320,7 @@ pub(super) struct CompanionPanel {
     tab_backgrounds: [Retained<NSBox>; 3],
     tab_marker: Retained<NSBox>,
     tab: usize,
+    compact_screen: bool,
     preserve_long_draft: bool,
     all_rows: Vec<RepositoryRow>,
     rendered_rows: Vec<RepositoryRow>,
@@ -320,9 +329,14 @@ pub(super) struct CompanionPanel {
     visible_limit: usize,
     prompt: Retained<NSTextField>,
     checkout_label: Retained<NSTextField>,
+    checkout_next: Retained<NSButton>,
     agent_label: Retained<NSTextField>,
+    agent_next: Retained<NSButton>,
     option_label: Retained<NSTextField>,
+    option_next: Retained<NSButton>,
+    submit: Retained<NSButton>,
     pin: PinControl,
+    pin_label: Retained<NSTextField>,
     pinned: bool,
 }
 
@@ -354,7 +368,10 @@ impl CompanionPanel {
         panel.setBackgroundColor(Some(&color(0xfafafc)));
 
         let content = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, HEIGHT));
-        let now_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 520.0, WIDTH, 92.0));
+        let header_group =
+            NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 676.0, WIDTH, 104.0));
+        header_group.setBoundsOrigin(NSPoint::new(0.0, 676.0));
+        let now_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 540.0, WIDTH, 72.0));
         let list_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, HEIGHT));
         let prompt_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, HEIGHT));
         let header = surface(mtm, rect(14.0, 676.0, WIDTH - 28.0, 90.0), 0x17142e, 20.0);
@@ -420,15 +437,15 @@ impl CompanionPanel {
         let tab_marker = surface(mtm, rect(22.0, 626.0, TAB_WIDTH, 3.0), 0x6d5ce0, 1.5);
 
         let activity_title = label(mtm, "Agents across your work", 18.0, true);
-        activity_title.setFrame(rect(66.0, 488.0, 400.0, 28.0));
-        let activity_icon = symbol(mtm, "square.stack.3d.up", rect(36.0, 491.0, 20.0, 20.0));
+        activity_title.setFrame(rect(66.0, 506.0, 400.0, 28.0));
+        let activity_icon = symbol(mtm, "square.stack.3d.up", rect(36.0, 509.0, 20.0, 20.0));
         let status = label(mtm, "Checking connected work…", 12.0, false);
-        status.setFrame(rect(36.0, 464.0, WIDTH - 72.0, 18.0));
+        status.setFrame(rect(36.0, 482.0, WIDTH - 72.0, 18.0));
         status.setTextColor(Some(&color(0x656177)));
         status.setAccessibilityLabel(Some(&NSString::from_str("Local agent status")));
         let work_scroll = NSScrollView::initWithFrame(
             NSScrollView::alloc(mtm),
-            rect(14.0, 167.0, WIDTH - 28.0, 289.0),
+            rect(14.0, 124.0, WIDTH - 28.0, 352.0),
         );
         work_scroll.setHasVerticalScroller(true);
         work_scroll.setDrawsBackground(false);
@@ -436,22 +453,22 @@ impl CompanionPanel {
             "Connected repositories and agent work",
         )));
 
-        let attention_card = surface(mtm, rect(14.0, 0.0, WIDTH - 28.0, 92.0), 0xf1eefd, 16.0);
+        let attention_card = surface(mtm, rect(14.0, 0.0, WIDTH - 28.0, 72.0), 0xf1eefd, 16.0);
         let attention_title = label(mtm, "Attention", 16.0, true);
-        attention_title.setFrame(rect(66.0, 61.0, 270.0, 25.0));
-        let attention_icon = symbol(mtm, "bell.badge", rect(36.0, 64.0, 20.0, 20.0));
+        attention_title.setFrame(rect(66.0, 42.0, 270.0, 25.0));
+        let attention_icon = symbol(mtm, "bell.badge", rect(36.0, 45.0, 20.0, 20.0));
         let attention = label(mtm, "Checking attention…", 13.0, false);
-        attention.setFrame(rect(36.0, 8.0, WIDTH - 72.0, 48.0));
+        attention.setFrame(rect(36.0, 7.0, WIDTH - 72.0, 32.0));
         attention.setPreferredMaxLayoutWidth(WIDTH - 68.0);
-        attention.setMaximumNumberOfLines(0);
+        attention.setMaximumNumberOfLines(2);
         attention.setUsesSingleLineMode(false);
-        attention.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+        attention.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         attention.setTextColor(Some(&color(0x48415d)));
         attention.setAccessibilityLabel(Some(&NSString::from_str("Attention status")));
         let open_hub = button(
             mtm,
             "Review in Hub  ↗",
-            rect(WIDTH - 162.0, 61.0, 126.0, 29.0),
+            rect(WIDTH - 162.0, 40.0, 126.0, 29.0),
         );
         open_hub.setAccessibilityLabel(Some(&NSString::from_str(
             "Open the first listed repository in Hub for Inbox and Dashboard",
@@ -486,7 +503,7 @@ impl CompanionPanel {
             cell.setUsesSingleLineMode(false);
         }
         let quick_prompt = NSTextField::textFieldWithString(&NSString::new(), mtm);
-        quick_prompt.setFrame(rect(34.0, 37.0, WIDTH - 228.0, 43.0));
+        quick_prompt.setFrame(rect(34.0, 22.0, WIDTH - 228.0, 43.0));
         quick_prompt.setFont(Some(&NSFont::systemFontOfSize(15.0)));
         quick_prompt
             .setPlaceholderString(Some(&NSString::from_str("Ask your agent to do something…")));
@@ -526,7 +543,7 @@ impl CompanionPanel {
             12.0,
             false,
         );
-        footer_hint.setFrame(rect(34.0, 88.0, WIDTH - 68.0, 18.0));
+        footer_hint.setFrame(rect(34.0, 70.0, WIDTH - 68.0, 18.0));
         footer_hint.setTextColor(Some(&color(0x656177)));
 
         let target = Target::new(
@@ -589,7 +606,7 @@ impl CompanionPanel {
         let start_cta = button(
             mtm,
             "Agent options  →",
-            rect(WIDTH - 169.0, 113.0, 130.0, 27.0),
+            rect(WIDTH - 169.0, 86.0, 130.0, 27.0),
         );
         start_cta.setTag(2);
         start_cta.setBordered(false);
@@ -610,17 +627,17 @@ impl CompanionPanel {
             all_cta.setTarget(Some(&target));
             all_cta.setAction(Some(sel!(selectTab:)));
         }
-        let footer_card = surface(mtm, rect(14.0, 13.0, WIDTH - 28.0, 140.0), 0xf1eefd, 16.0);
+        let footer_card = surface(mtm, rect(14.0, 9.0, WIDTH - 28.0, 108.0), 0xf1eefd, 16.0);
         let action_backgrounds = [
             surface(mtm, rect(34.0, 24.0, 170.0, 44.0), 0xffffff, 11.0),
-            surface(mtm, rect(WIDTH - 169.0, 113.0, 130.0, 27.0), 0xd9d0fa, 9.0),
+            surface(mtm, rect(WIDTH - 169.0, 86.0, 130.0, 27.0), 0xd9d0fa, 9.0),
         ];
         let footer_title = label(mtm, "Quick prompt", 17.0, true);
-        footer_title.setFrame(rect(34.0, 112.0, 280.0, 26.0));
+        footer_title.setFrame(rect(34.0, 89.0, 280.0, 26.0));
         let quick_submit = button(
             mtm,
             "Start agent  ↗",
-            rect(WIDTH - 184.0, 37.0, 150.0, 43.0),
+            rect(WIDTH - 184.0, 22.0, 150.0, 43.0),
         );
         quick_submit.setBezelStyle(NSBezelStyle::Push);
         quick_submit.setBezelColor(Some(&color(0xc6bbff)));
@@ -636,8 +653,8 @@ impl CompanionPanel {
         list_group.addSubview(&status);
         list_group.addSubview(&work_scroll);
         prompt_group.addSubview(&composer_card);
-        if let Some(icon) = composer_icon {
-            prompt_group.addSubview(&icon);
+        if let Some(icon) = &composer_icon {
+            prompt_group.addSubview(icon);
         }
         prompt_group.addSubview(&composer_title);
         prompt_group.addSubview(&composer_hint);
@@ -664,17 +681,18 @@ impl CompanionPanel {
         // bounded to its card so it cannot intercept list or footer clicks.
         content.addSubview(&all_cta);
         content.addSubview(&start_cta);
-        content.addSubview(&header);
-        content.addSubview(&logo);
-        content.addSubview(&brand);
-        content.addSubview(&tagline);
-        content.addSubview(&header_rule);
-        content.addSubview(&header_note);
+        header_group.addSubview(&header);
+        header_group.addSubview(&logo);
+        header_group.addSubview(&brand);
+        header_group.addSubview(&tagline);
+        header_group.addSubview(&header_rule);
+        header_group.addSubview(&header_note);
         match &pin {
-            PinControl::Switch(control) => content.addSubview(control),
-            PinControl::Button(control) => content.addSubview(control),
+            PinControl::Switch(control) => header_group.addSubview(control),
+            PinControl::Button(control) => header_group.addSubview(control),
         }
-        content.addSubview(&pin_label);
+        header_group.addSubview(&pin_label);
+        content.addSubview(&header_group);
         for background in &tab_backgrounds {
             content.addSubview(background);
         }
@@ -700,15 +718,22 @@ impl CompanionPanel {
         Some(Self {
             panel,
             panel_scroll,
+            content,
+            header_group,
             target,
             status,
             list_title: activity_title,
             attention_title,
             attention,
             work_scroll,
+            activity_icon,
             now_group,
             list_group,
             prompt_group,
+            composer_card,
+            composer_title,
+            composer_icon,
+            composer_hint,
             now_actions: [all_cta, start_cta],
             action_backgrounds,
             footer_card,
@@ -720,6 +745,7 @@ impl CompanionPanel {
             tab_backgrounds,
             tab_marker,
             tab: 0,
+            compact_screen: false,
             preserve_long_draft: false,
             all_rows: Vec::new(),
             rendered_rows: Vec::new(),
@@ -728,9 +754,14 @@ impl CompanionPanel {
             visible_limit: REPOSITORY_LIMIT,
             prompt,
             checkout_label,
+            checkout_next,
             agent_label,
+            agent_next,
             option_label,
+            option_next,
+            submit,
             pin,
+            pin_label,
             pinned: false,
         })
     }
@@ -804,16 +835,16 @@ impl CompanionPanel {
                 .map(|row| row.work.len())
                 .sum::<usize>();
             let repository = if self.all_rows.len() == 1 {
-                "repository"
+                "repo"
             } else {
-                "repositories"
+                "repos"
             };
             format!(
-                "{} {repository} · {} local agents ({} seen) · {} Hub tasks or sessions",
+                "{} {repository} · {} Hub activities · {} of {} local agents seen",
                 self.all_rows.len(),
-                connected,
+                hub,
                 local,
-                hub
+                connected
             )
         };
         self.status.setStringValue(&NSString::from_str(&summary));
@@ -829,6 +860,10 @@ impl CompanionPanel {
 
     pub(super) fn set_rows(&mut self, rows: &[RepositoryRow]) {
         if self.all_rows != rows {
+            self.expanded.retain(|key| {
+                rows.iter()
+                    .any(|row| (row.hub.clone(), row.name.clone()) == *key)
+            });
             self.all_rows = rows.to_vec();
             self.update_summary("Checking connected work…");
             self.render_rows();
@@ -843,6 +878,9 @@ impl CompanionPanel {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
         }
+        // Force a rebuild even when the visible row data is unchanged, while retaining
+        // the old document's scroll position for this in-place disclosure.
+        self.rendered_omitted = usize::MAX;
         self.render_rows();
     }
 
@@ -868,13 +906,15 @@ impl CompanionPanel {
             self.preserve_long_draft = preserve;
         }
         self.tab = index;
+        self.position_pin();
         self.now_group.setHidden(index == 2);
         self.now_actions[0].setHidden(true);
-        self.now_actions[1].setHidden(index == 2);
+        self.now_actions[1].setHidden(index == 2 || self.compact_screen);
         self.action_backgrounds[0].setHidden(true);
-        self.action_backgrounds[1].setHidden(index == 2);
+        self.action_backgrounds[1].setHidden(index == 2 || self.compact_screen);
         self.footer_card.setHidden(index == 2);
-        self.footer_title.setHidden(index == 2);
+        self.footer_title
+            .setHidden(index == 2 || self.compact_screen);
         self.footer_hint.setHidden(index == 2);
         self.quick_prompt.setHidden(index == 2);
         self.quick_submit.setHidden(index == 2);
@@ -904,8 +944,12 @@ impl CompanionPanel {
                 if tab_index == index { ", selected" } else { "" }
             ))));
         }
-        self.tab_marker
-            .setFrame(rect(22.0 + index as f64 * TAB_STEP, 626.0, TAB_WIDTH, 3.0));
+        self.tab_marker.setFrame(rect(
+            22.0 + index as f64 * TAB_STEP,
+            if self.compact_screen { 729.0 } else { 626.0 },
+            TAB_WIDTH,
+            3.0,
+        ));
         self.scroll_outer_to_tab();
         self.rendered_rows.clear();
         self.rendered_omitted = usize::MAX;
@@ -947,34 +991,26 @@ impl CompanionPanel {
         let heights: Vec<f64> = rows
             .iter()
             .map(|row| {
-                if is_quiet_row(row) {
-                    return 126.0;
+                if is_quiet_row(row)
+                    && !self.expanded.contains(&(row.hub.clone(), row.name.clone()))
+                {
+                    return 90.0;
+                }
+                if !self.expanded.contains(&(row.hub.clone(), row.name.clone())) {
+                    return if row.local.is_empty() { 92.0 } else { 112.0 };
                 }
                 86.0 + if row.local.is_empty() {
                     0.0
-                } else if row
-                    .local
-                    .iter()
-                    .all(|agent| !agent.observed && !agent.needs_you)
-                {
-                    30.0
                 } else {
                     23.0 + 42.0 * row.local.len() as f64
                 } + if row.work.is_empty() {
                     63.0
                 } else {
                     23.0 + 52.0 * row.work.len() as f64
-                } + if row.overflow > 0
-                    || (row.work.len() > HUB_ACTIVITY_LIMIT
-                        && self.expanded.contains(&(row.hub.clone(), row.name.clone())))
-                {
-                    30.0
-                } else {
-                    0.0
-                }
+                } + 30.0
             })
             .collect();
-        let viewport_height = 289.0;
+        let viewport_height = self.work_scroll.frame().size.height;
         let footer_height = if omitted_repositories > 0 { 44.0 } else { 0.0 };
         let total = (12.0 + heights.iter().sum::<f64>() + 12.0 * rows.len() as f64 + footer_height)
             .max(viewport_height);
@@ -1014,12 +1050,12 @@ impl CompanionPanel {
             document.addSubview(&card);
 
             let name = label(mtm, &row.name, 16.0, true);
-            name.setFrame(rect(20.0, top - 34.0, 350.0, 25.0));
+            name.setFrame(rect(20.0, top - 29.0, 350.0, 25.0));
             name.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             document.addSubview(&name);
 
             let hub = label(mtm, &row.hub_state, 11.0, false);
-            hub.setFrame(rect(WIDTH - 230.0, top - 30.0, 105.0, 18.0));
+            hub.setFrame(rect(WIDTH - 230.0, top - 26.0, 105.0, 18.0));
             hub.setTextColor(Some(&color(if row.attention > 0 {
                 0xc8432a
             } else {
@@ -1027,7 +1063,7 @@ impl CompanionPanel {
             })));
             document.addSubview(&hub);
             if row.hub.is_some() {
-                let open = button(mtm, "Open ↗", rect(WIDTH - 118.0, top - 36.0, 65.0, 29.0));
+                let open = button(mtm, "Open ↗", rect(WIDTH - 118.0, top - 31.0, 65.0, 29.0));
                 open.setAccessibilityLabel(Some(&NSString::from_str(&format!(
                     "Open {} in Hub",
                     row.name
@@ -1051,40 +1087,105 @@ impl CompanionPanel {
                 |source| format!("{} · {source}", row.local_agents),
             );
             let local = label(mtm, &context, 12.0, false);
-            local.setFrame(rect(20.0, top - 61.0, WIDTH - 82.0, 20.0));
+            local.setFrame(rect(20.0, top - 51.0, WIDTH - 82.0, 20.0));
             local.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             local.setTextColor(Some(&color(0x6c6b80)));
             document.addSubview(&local);
 
-            if is_quiet_row(row) {
-                let agents = if row.local.is_empty() {
-                    "No local agents".to_owned()
+            if is_quiet_row(row) && !self.expanded.contains(&(row.hub.clone(), row.name.clone())) {
+                let summary = if row.local.is_empty() {
+                    row.work_note.clone()
                 } else {
                     format!(
-                        "{} · no recent activity observed",
+                        "{} available here · {}",
                         row.local
                             .iter()
                             .map(|agent| agent.agent.as_str())
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join(", "),
+                        row.work_note
                     )
                 };
-                let agent_line = label(mtm, &agents, 12.0, true);
-                agent_line.setFrame(rect(20.0, top - 84.0, WIDTH - 82.0, 20.0));
-                agent_line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                document.addSubview(&agent_line);
-                let hub_line = label(mtm, &row.work_note, 11.0, false);
-                hub_line.setFrame(rect(20.0, top - 106.0, WIDTH - 82.0, 18.0));
-                hub_line.setTextColor(Some(&color(0x656177)));
-                hub_line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                document.addSubview(&hub_line);
+                let summary = label(mtm, &summary, 12.0, false);
+                summary.setFrame(rect(20.0, top - 76.0, WIDTH - 82.0, 20.0));
+                summary.setTextColor(Some(&color(0x656177)));
+                summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                document.addSubview(&summary);
+                if !row.local.is_empty() {
+                    let more = button(mtm, "Details", rect(375.0, top - 31.0, 90.0, 29.0));
+                    more.setTag(index as isize);
+                    more.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                        "Show agent details for {}",
+                        row.name
+                    ))));
+                    // SAFETY: the retained target implements this selector for row buttons.
+                    unsafe {
+                        more.setTarget(Some(&self.target));
+                        more.setAction(Some(sel!(expandRepository:)));
+                    }
+                    document.addSubview(&more);
+                }
+                top = bottom - 12.0;
+                continue;
+            }
+
+            let expanded = self.expanded.contains(&(row.hub.clone(), row.name.clone()));
+            if !expanded {
+                if let Some(work) = row.work.first() {
+                    let dot = surface(
+                        mtm,
+                        rect(20.0, top - 73.0, 8.0, 8.0),
+                        if work.needs_you { 0xc8432a } else { 0x6d5ce0 },
+                        4.0,
+                    );
+                    document.addSubview(&dot);
+                    let headline = if work.needs_you {
+                        format!("Needs you · {} · {}", work.agent, work.title)
+                    } else {
+                        format!("{} · {}", work.agent, work.title)
+                    };
+                    let title = label(mtm, &headline, 14.0, true);
+                    title.setFrame(rect(36.0, top - 79.0, WIDTH - 100.0, 22.0));
+                    title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                    document.addSubview(&title);
+                } else {
+                    let note = label(mtm, &row.work_note, 12.0, false);
+                    note.setFrame(rect(20.0, top - 79.0, WIDTH - 82.0, 20.0));
+                    note.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                    note.setTextColor(Some(&color(0x656177)));
+                    document.addSubview(&note);
+                }
+                if !row.local.is_empty() {
+                    let summary = label(mtm, &local_glance(&row.local), 12.0, false);
+                    summary.setFrame(rect(20.0, top - 99.0, WIDTH - 82.0, 18.0));
+                    summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                    summary.setTextColor(Some(&color(0x48415d)));
+                    document.addSubview(&summary);
+                }
+                let title = if row.overflow > 0 {
+                    format!("Details (+{})", row.overflow)
+                } else {
+                    "Details".to_owned()
+                };
+                let more = button(mtm, &title, rect(375.0, top - 31.0, 90.0, 29.0));
+                more.setTag(index as isize);
+                more.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                    "Show agent and work details for {}",
+                    row.name
+                ))));
+                // SAFETY: the retained target implements this selector for row buttons.
+                unsafe {
+                    more.setTarget(Some(&self.target));
+                    more.setAction(Some(sel!(expandRepository:)));
+                }
+                document.addSubview(&more);
                 top = bottom - 12.0;
                 continue;
             }
 
             let mut cursor = top - 86.0;
-            let section = label(mtm, "WORK IN HUB", 10.0, true);
-            section.setFrame(rect(20.0, cursor - 3.0, 160.0, 16.0));
+            let section = label(mtm, "WHAT THEY'RE DOING IN HUB", 11.0, true);
+            section.setFrame(rect(20.0, cursor - 3.0, 300.0, 16.0));
             section.setTextColor(Some(&color(0x656177)));
             document.addSubview(&section);
             cursor -= 23.0;
@@ -1111,7 +1212,7 @@ impl CompanionPanel {
                     let detail = label(
                         mtm,
                         &format!("{} · {}", work.agent, work.detail),
-                        11.0,
+                        12.0,
                         false,
                     );
                     detail.setFrame(rect(36.0, y - 19.0, WIDTH - 100.0, 18.0));
@@ -1122,75 +1223,44 @@ impl CompanionPanel {
                 }
             }
             if !row.local.is_empty() {
-                if row
-                    .local
-                    .iter()
-                    .all(|agent| !agent.observed && !agent.needs_you)
-                {
-                    let names = row
-                        .local
-                        .iter()
-                        .map(|agent| agent.agent.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let summary = label(
+                let section = label(mtm, "AGENTS ON THIS MAC", 11.0, true);
+                section.setFrame(rect(20.0, cursor - 3.0, 160.0, 16.0));
+                section.setTextColor(Some(&color(0x656177)));
+                document.addSubview(&section);
+                cursor -= 23.0;
+                for agent in &row.local {
+                    let dot = surface(
                         mtm,
-                        &format!("On this Mac · {names} · no recent activity"),
-                        12.0,
-                        false,
+                        rect(20.0, cursor - 10.0, 8.0, 8.0),
+                        if agent.needs_you {
+                            0xc8432a
+                        } else if agent.observed {
+                            0x127a52
+                        } else {
+                            0xb9b5c5
+                        },
+                        4.0,
                     );
-                    summary.setFrame(rect(20.0, cursor - 21.0, WIDTH - 82.0, 20.0));
-                    summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                    summary.setTextColor(Some(&color(0x656177)));
-                    document.addSubview(&summary);
-                } else {
-                    let section = label(mtm, "ON THIS MAC", 10.0, true);
-                    section.setFrame(rect(20.0, cursor - 3.0, 160.0, 16.0));
-                    section.setTextColor(Some(&color(0x656177)));
-                    document.addSubview(&section);
-                    cursor -= 23.0;
-                    for agent in &row.local {
-                        let dot = surface(
-                            mtm,
-                            rect(20.0, cursor - 10.0, 8.0, 8.0),
-                            if agent.needs_you {
-                                0xc8432a
-                            } else if agent.observed {
-                                0x127a52
-                            } else {
-                                0xb9b5c5
-                            },
-                            4.0,
-                        );
-                        document.addSubview(&dot);
-                        let title = label(mtm, &agent.agent, 13.0, true);
-                        title.setFrame(rect(36.0, cursor - 13.0, WIDTH - 100.0, 20.0));
-                        document.addSubview(&title);
-                        let detail = label(mtm, &agent.detail, 11.0, false);
-                        detail.setFrame(rect(36.0, cursor - 30.0, WIDTH - 100.0, 18.0));
-                        detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                        detail.setTextColor(Some(&color(0x656177)));
-                        document.addSubview(&detail);
-                        cursor -= 42.0;
-                    }
+                    document.addSubview(&dot);
+                    let title = label(mtm, &agent.agent, 14.0, true);
+                    title.setFrame(rect(36.0, cursor - 13.0, WIDTH - 100.0, 20.0));
+                    document.addSubview(&title);
+                    let detail = label(mtm, &agent.detail, 12.0, false);
+                    detail.setFrame(rect(36.0, cursor - 30.0, WIDTH - 100.0, 18.0));
+                    detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                    detail.setTextColor(Some(&color(0x656177)));
+                    document.addSubview(&detail);
+                    cursor -= 42.0;
                 }
             }
-            let expanded = self.expanded.contains(&(row.hub.clone(), row.name.clone()));
-            if row.overflow > 0 || (expanded && row.work.len() > HUB_ACTIVITY_LIMIT) {
-                let title = if expanded {
-                    "Show fewer activities".to_owned()
-                } else {
-                    format!("Show {} more Hub activities", row.overflow)
-                };
-                let more = button(mtm, &title, rect(31.0, bottom + 8.0, 230.0, 26.0));
-                more.setTag(index as isize);
-                // SAFETY: the retained target implements this selector for row buttons.
-                unsafe {
-                    more.setTarget(Some(&self.target));
-                    more.setAction(Some(sel!(expandRepository:)));
-                }
-                document.addSubview(&more);
+            let more = button(mtm, "Show less", rect(31.0, bottom + 8.0, 230.0, 26.0));
+            more.setTag(index as isize);
+            // SAFETY: the retained target implements this selector for row buttons.
+            unsafe {
+                more.setTarget(Some(&self.target));
+                more.setAction(Some(sel!(expandRepository:)));
             }
+            document.addSubview(&more);
             top = bottom - 12.0;
         }
         if omitted_repositories > 0 {
@@ -1230,18 +1300,20 @@ impl CompanionPanel {
     /// Suppress a passive notice only while the aggregate card is fully on screen.
     pub(super) fn is_attention_visible(&self) -> bool {
         let visible = self.panel_scroll.contentView().bounds();
+        let attention_bottom = if self.compact_screen { 651.0 } else { 540.0 };
+        let attention_top = attention_bottom + 72.0;
         self.tab != 2
             && self.panel.isVisible()
             && self.panel.isKeyWindow()
-            && visible.origin.y <= 520.0
-            && visible.origin.y + visible.size.height >= 612.0
+            && visible.origin.y <= attention_bottom
+            && visible.origin.y + visible.size.height >= attention_top
     }
 
     pub(super) fn is_pinned(&self) -> bool {
         self.pinned
     }
 
-    fn fit_to_screen(&self) {
+    fn fit_to_screen(&mut self) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -1253,10 +1325,169 @@ impl CompanionPanel {
         self.panel.setContentSize(NSSize::new(WIDTH, height));
         self.panel_scroll.setFrame(rect(0.0, 0.0, WIDTH, height));
         self.panel_scroll.setHasVerticalScroller(height < HEIGHT);
+        self.layout_for_height(height);
         self.scroll_outer_to_tab();
         if resized && self.panel.isVisible() {
             self.panel.center();
         }
+    }
+
+    fn layout_for_height(&mut self, height: f64) {
+        let compact = height < 650.0;
+        let bottom = HEIGHT - height;
+        if compact != self.compact_screen {
+            let parent = if compact {
+                &self.content
+            } else {
+                &self.header_group
+            };
+            match &self.pin {
+                PinControl::Switch(control) => {
+                    control.removeFromSuperview();
+                    parent.addSubview(control);
+                }
+                PinControl::Button(control) => {
+                    control.removeFromSuperview();
+                    parent.addSubview(control);
+                }
+            }
+            self.pin_label.removeFromSuperview();
+            parent.addSubview(&self.pin_label);
+        }
+        self.compact_screen = compact;
+        self.header_group.setHidden(compact);
+        self.position_pin();
+        let tabs_y = if compact { 734.0 } else { 631.0 };
+        for (index, background) in self.tab_backgrounds.iter().enumerate() {
+            background.setFrame(rect(
+                22.0 + index as f64 * TAB_STEP,
+                tabs_y,
+                TAB_WIDTH,
+                34.0,
+            ));
+            self.tab_buttons[index].setFrame(rect(
+                22.0 + index as f64 * TAB_STEP,
+                tabs_y,
+                TAB_WIDTH,
+                34.0,
+            ));
+        }
+        self.tab_marker.setFrame(rect(
+            22.0 + self.tab as f64 * TAB_STEP,
+            tabs_y - 5.0,
+            TAB_WIDTH,
+            3.0,
+        ));
+        if compact {
+            self.now_group.setFrame(rect(0.0, 651.0, WIDTH, 72.0));
+            self.list_title.setFrame(rect(66.0, 529.0, 400.0, 28.0));
+            if let Some(icon) = &self.activity_icon {
+                icon.setFrame(rect(36.0, 532.0, 20.0, 20.0));
+            }
+            self.status.setFrame(rect(36.0, 507.0, WIDTH - 72.0, 18.0));
+            self.work_scroll
+                .setFrame(rect(14.0, bottom, WIDTH - 28.0, 500.0 - bottom));
+            self.footer_card
+                .setFrame(rect(14.0, 566.0, WIDTH - 28.0, 75.0));
+            self.footer_hint
+                .setFrame(rect(34.0, 620.0, WIDTH - 68.0, 18.0));
+            self.quick_prompt
+                .setFrame(rect(34.0, 572.0, WIDTH - 228.0, 43.0));
+            self.quick_submit
+                .setFrame(rect(WIDTH - 184.0, 572.0, 150.0, 43.0));
+            self.composer_card
+                .setFrame(rect(14.0, bottom + 12.0, WIDTH - 28.0, 711.0 - bottom));
+            self.composer_title.setFrame(rect(66.0, 682.0, 370.0, 32.0));
+            if let Some(icon) = &self.composer_icon {
+                icon.setFrame(rect(36.0, 688.0, 20.0, 20.0));
+            }
+            self.composer_hint.setFrame(rect(36.0, 660.0, 470.0, 20.0));
+            self.prompt
+                .setFrame(rect(36.0, bottom + 190.0, WIDTH - 72.0, 460.0 - bottom));
+            self.checkout_label
+                .setFrame(rect(36.0, bottom + 150.0, 410.0, 22.0));
+            self.checkout_next
+                .setFrame(rect(WIDTH - 116.0, bottom + 148.0, 82.0, 27.0));
+            self.agent_label
+                .setFrame(rect(36.0, bottom + 112.0, 410.0, 22.0));
+            self.agent_next
+                .setFrame(rect(WIDTH - 116.0, bottom + 110.0, 82.0, 27.0));
+            self.option_label
+                .setFrame(rect(36.0, bottom + 74.0, 410.0, 22.0));
+            self.option_next
+                .setFrame(rect(WIDTH - 116.0, bottom + 72.0, 82.0, 27.0));
+            self.submit
+                .setFrame(rect(WIDTH - 190.0, bottom + 20.0, 156.0, 40.0));
+        } else {
+            self.now_group.setFrame(rect(0.0, 540.0, WIDTH, 72.0));
+            self.list_title.setFrame(rect(66.0, 506.0, 400.0, 28.0));
+            if let Some(icon) = &self.activity_icon {
+                icon.setFrame(rect(36.0, 509.0, 20.0, 20.0));
+            }
+            self.status.setFrame(rect(36.0, 482.0, WIDTH - 72.0, 18.0));
+            self.work_scroll
+                .setFrame(rect(14.0, bottom + 124.0, WIDTH - 28.0, 352.0 - bottom));
+            self.footer_card
+                .setFrame(rect(14.0, bottom + 9.0, WIDTH - 28.0, 108.0));
+            self.footer_title
+                .setFrame(rect(34.0, bottom + 89.0, 280.0, 26.0));
+            self.footer_hint
+                .setFrame(rect(34.0, bottom + 70.0, WIDTH - 68.0, 18.0));
+            self.quick_prompt
+                .setFrame(rect(34.0, bottom + 22.0, WIDTH - 228.0, 43.0));
+            self.quick_submit
+                .setFrame(rect(WIDTH - 184.0, bottom + 22.0, 150.0, 43.0));
+            self.now_actions[1].setFrame(rect(WIDTH - 169.0, bottom + 86.0, 130.0, 27.0));
+            self.action_backgrounds[1].setFrame(rect(WIDTH - 169.0, bottom + 86.0, 130.0, 27.0));
+            let lift = (bottom - 80.0).max(0.0);
+            self.composer_card
+                .setFrame(rect(14.0, 85.0 + lift, WIDTH - 28.0, 535.0 - lift));
+            self.composer_title.setFrame(rect(66.0, 572.0, 370.0, 32.0));
+            if let Some(icon) = &self.composer_icon {
+                icon.setFrame(rect(36.0, 578.0, 20.0, 20.0));
+            }
+            self.composer_hint.setFrame(rect(36.0, 545.0, 470.0, 20.0));
+            self.prompt
+                .setFrame(rect(36.0, 285.0 + lift, WIDTH - 72.0, 245.0 - lift));
+            self.checkout_label
+                .setFrame(rect(36.0, 238.0 + lift, 410.0, 22.0));
+            self.checkout_next
+                .setFrame(rect(WIDTH - 116.0, 236.0 + lift, 82.0, 27.0));
+            self.agent_label
+                .setFrame(rect(36.0, 195.0 + lift, 410.0, 22.0));
+            self.agent_next
+                .setFrame(rect(WIDTH - 116.0, 193.0 + lift, 82.0, 27.0));
+            self.option_label
+                .setFrame(rect(36.0, 152.0 + lift, 410.0, 22.0));
+            self.option_next
+                .setFrame(rect(WIDTH - 116.0, 150.0 + lift, 82.0, 27.0));
+            self.submit
+                .setFrame(rect(WIDTH - 190.0, 100.0 + lift, 156.0, 40.0));
+        }
+        self.footer_title.setHidden(compact || self.tab == 2);
+        self.now_actions[1].setHidden(compact || self.tab == 2);
+        self.action_backgrounds[1].setHidden(compact || self.tab == 2);
+        self.rendered_rows.clear();
+    }
+
+    fn position_pin(&self) {
+        let (pin_y, label_y) = match (self.compact_screen, self.tab) {
+            (true, 2) => (687.0, 691.0),
+            (true, _) => (532.0, 536.0),
+            (false, _) => (720.0, 725.0),
+        };
+        match &self.pin {
+            PinControl::Switch(control) => control.setFrame(rect(WIDTH - 85.0, pin_y, 42.0, 22.0)),
+            PinControl::Button(control) => control.setFrame(rect(WIDTH - 85.0, pin_y, 42.0, 22.0)),
+        }
+        self.pin_label
+            .setFrame(rect(WIDTH - 115.0, label_y, 30.0, 14.0));
+        self.pin_label
+            .setTextColor(Some(&color(if self.compact_screen {
+                0x656177
+            } else {
+                0xc2bce1
+            })));
     }
 
     fn scroll_outer_to_tab(&self) {
@@ -1378,6 +1609,23 @@ fn is_quiet_row(row: &RepositoryRow) -> bool {
             .local
             .iter()
             .all(|agent| !agent.observed && !agent.needs_you)
+}
+
+fn local_glance(agents: &[LocalAgentRow]) -> String {
+    let names = agents
+        .iter()
+        .map(|agent| {
+            if agent.needs_you {
+                format!("{} needs a look", agent.agent)
+            } else if agent.observed {
+                format!("{} seen here", agent.agent)
+            } else {
+                format!("{} available", agent.agent)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("This Mac · {names}")
 }
 
 fn selected_rows(
@@ -1537,6 +1785,7 @@ mod tests {
         RepositoryRow {
             name: name.into(),
             hub: Some("https://hub.example".into()),
+            last_activity_at: None,
             local_agents: "Connected checkout on this Mac".into(),
             hub_state: "Hub current".into(),
             attention: 0,
@@ -1602,5 +1851,27 @@ mod tests {
         assert_eq!(omitted, 0);
         assert_eq!(rows[0].work.len(), HUB_ACTIVITY_LIMIT + 1);
         assert_eq!(rows[0].overflow, 0);
+    }
+
+    #[test]
+    fn compact_local_summary_names_agents_and_evidence() {
+        let agents = vec![
+            LocalAgentRow {
+                agent: "Codex".into(),
+                detail: "Task not reported locally".into(),
+                observed: true,
+                needs_you: false,
+            },
+            LocalAgentRow {
+                agent: "Claude Code".into(),
+                detail: "Reconnect this checkout".into(),
+                observed: false,
+                needs_you: true,
+            },
+        ];
+        assert_eq!(
+            local_glance(&agents),
+            "This Mac · Codex seen here · Claude Code needs a look"
+        );
     }
 }

@@ -2573,7 +2573,7 @@ fn local_agent_rows(
                     ("Connection changed · reconnect this checkout", true)
                 }
                 _ if observed => ("Seen on this Mac · task not reported locally", false),
-                _ => ("Connected on this Mac · no recent activity observed", false),
+                _ => ("Available on this Mac · no recent activity observed", false),
             };
             companion_panel::LocalAgentRow {
                 agent,
@@ -2604,12 +2604,15 @@ fn companion_rows(
                 .map(|binding| activity.snapshot(binding, now))
                 .unwrap_or_default();
             let mut local = local_agent_rows(&connection.agents, &observed);
-            let local_agents = "Connected checkout on this Mac".to_owned();
             let signal = signals.iter().find(|signal| signal.root == connection.root);
             let catalog_row = catalog
                 .repositories
                 .iter()
                 .find(|row| row.hub == connection.hub && row.repository == connection.repository);
+            let local_agents = catalog_row.map_or_else(
+                || "Checkout on this Mac".to_owned(),
+                |row| format!("{} · checkout on this Mac", hub_agent_context(row)),
+            );
             let hub_state = match (signal.filter(|signal| signal.available), catalog_row) {
                 (Some(signal), _) if signal.complete => "Hub current",
                 (Some(_), _) => "Hub partial",
@@ -2619,16 +2622,13 @@ fn companion_rows(
                 (None, None) => "Checking Hub",
             }
             .to_owned();
-            let work_note = match hub_state.as_str() {
-                "Hub current" if catalog_row.is_some_and(|row| row.agents > 0) => {
-                    format!(
-                        "Connected agents: {} · no current task reported",
-                        catalog_row.map_or(0, |row| row.agents)
-                    )
+            let work_note = match (hub_state.as_str(), catalog_row) {
+                ("Hub current", Some(row)) if row.agents > 0 => {
+                    format!("{} · no current task reported", hub_agent_count_label(row))
                 }
-                "Hub current" => "No current Hub work reported".into(),
-                "Hub partial" => "No work in this partial Hub snapshot".into(),
-                "Hub unavailable" => "Hub work unavailable; open Hub to check".into(),
+                ("Hub current", _) => "No current Hub work reported".into(),
+                ("Hub partial", _) => "No work in this partial Hub snapshot".into(),
+                ("Hub unavailable", _) => "Hub work unavailable; open Hub to check".into(),
                 _ => "Checking Hub work…".into(),
             };
             let work_source = signal
@@ -2653,12 +2653,14 @@ fn companion_rows(
             if let Some(catalog_row) = catalog_row {
                 append_live_work(&mut work, &catalog_row.live);
             }
+            work.sort_by_key(|item| !item.needs_you);
             if let Some(run) = run.filter(|run| run.root == connection.root) {
                 merge_local_run(&mut local, run.agent.label(), run.state);
             }
             companion_panel::RepositoryRow {
                 name: connection.repository.clone(),
                 hub: Some(connection.hub.clone()),
+                last_activity_at: catalog_row.and_then(|row| row.last_activity_at),
                 local_agents,
                 hub_state,
                 attention: catalog_row.map_or(0, |row| row.attention).max(
@@ -2679,6 +2681,7 @@ fn companion_rows(
             .map(|row| companion_panel::RepositoryRow {
                 name: row.repo,
                 hub: None,
+                last_activity_at: None,
                 local_agents: "Observed on this Mac · not connected to Hub".into(),
                 hub_state: "Local only".into(),
                 attention: 0,
@@ -2709,7 +2712,8 @@ fn companion_rows(
             .map(|row| companion_panel::RepositoryRow {
                 name: row.repository.clone(),
                 hub: Some(row.hub.clone()),
-                local_agents: "Hub repository · no checkout on this Mac".into(),
+                last_activity_at: row.last_activity_at,
+                local_agents: format!("{} · no checkout on this Mac", hub_agent_context(row)),
                 hub_state: if row.complete {
                     "Hub current"
                 } else {
@@ -2718,10 +2722,7 @@ fn companion_rows(
                 .into(),
                 attention: row.attention,
                 work_note: if row.complete && row.agents > 0 {
-                    format!(
-                        "Connected agents: {} · no current task reported",
-                        row.agents
-                    )
+                    format!("{} · no current task reported", hub_agent_count_label(row))
                 } else if row.complete {
                     "No current Hub work reported".into()
                 } else {
@@ -2742,6 +2743,7 @@ fn companion_rows(
                         })
                         .collect::<Vec<_>>();
                     append_live_work(&mut work, &row.live);
+                    work.sort_by_key(|item| !item.needs_you);
                     work
                 },
                 overflow: 0,
@@ -2764,7 +2766,7 @@ fn companion_rows(
                     .any(|work| work.needs_you)
                     .cmp(&left.work.iter().any(|work| work.needs_you)),
             )
-            .then(right.work.len().cmp(&left.work.len()))
+            .then((!right.work.is_empty()).cmp(&(!left.work.is_empty())))
             .then(
                 right
                     .local
@@ -2773,6 +2775,8 @@ fn companion_rows(
                     .count()
                     .cmp(&left.local.iter().filter(|agent| agent.observed).count()),
             )
+            .then(right.last_activity_at.cmp(&left.last_activity_at))
+            .then(right.work.len().cmp(&left.work.len()))
             .then(left.name.cmp(&right.name))
     });
     rows
@@ -2784,6 +2788,33 @@ fn companion_live_row(item: &companion_hub::LiveAgent) -> companion_panel::WorkR
         title: item.task.clone(),
         detail: format!("Active in Hub · seen through {}", item.source),
         needs_you: false,
+    }
+}
+
+fn hub_agent_count_label(row: &companion_hub::CatalogRepository) -> String {
+    let noun = if row.agents == 1 { "record" } else { "records" };
+    if row.complete {
+        format!("{} live Hub agent {noun}", row.agents)
+    } else {
+        format!("{} live Hub agent {noun} shown (partial)", row.agents)
+    }
+}
+
+fn hub_agent_context(row: &companion_hub::CatalogRepository) -> String {
+    let names = row
+        .live
+        .iter()
+        .map(|item| item.agent.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if names.is_empty() {
+        hub_agent_count_label(row)
+    } else if row.complete {
+        format!("Hub: {}", names.into_iter().collect::<Vec<_>>().join(", "))
+    } else {
+        format!(
+            "Hub (partial): {}",
+            names.into_iter().collect::<Vec<_>>().join(", ")
+        )
     }
 }
 
@@ -3977,6 +4008,7 @@ mod tests {
                 companion_hub::CatalogRepository {
                     hub: "https://hub.example".into(),
                     repository: "example/project".into(),
+                    last_activity_at: Some(200),
                     agents: 1,
                     attention: 0,
                     attention_revision: String::new(),
@@ -3992,6 +4024,7 @@ mod tests {
                 companion_hub::CatalogRepository {
                     hub: "https://hub.example".into(),
                     repository: "example/remote".into(),
+                    last_activity_at: Some(100),
                     agents: 1,
                     attention: 2,
                     attention_revision: "revision".into(),
@@ -4022,7 +4055,10 @@ mod tests {
         assert_eq!(rows[0].work[0].title, "Prepare release");
         assert_eq!(rows[1].name, "example/project");
         assert_eq!(rows[1].work[0].title, "Inspect changes");
-        assert_eq!(rows[1].local_agents, "Connected checkout on this Mac");
+        assert_eq!(
+            rows[1].local_agents,
+            "Hub: Claude Code · checkout on this Mac"
+        );
         assert_eq!(rows[1].local.len(), 2);
         assert!(rows[1].local.iter().all(|agent| !agent.observed));
         assert!(rows[0].local.is_empty());
@@ -4035,6 +4071,49 @@ mod tests {
             companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot)
                 .unwrap()
                 .contains("Prepare release · Next: Ask for review")
+        );
+    }
+
+    #[test]
+    fn panel_orders_equally_active_hub_repositories_by_latest_activity() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![],
+        };
+        let row = |name: &str, last_activity_at| companion_hub::CatalogRepository {
+            hub: "https://hub.example".into(),
+            repository: name.into(),
+            last_activity_at,
+            agents: 1,
+            attention: 0,
+            attention_revision: String::new(),
+            attention_complete: true,
+            complete: true,
+            work: vec![],
+            live: vec![companion_hub::LiveAgent {
+                agent: "Codex".into(),
+                task: "Inspect source".into(),
+                source: "session".into(),
+            }],
+        };
+        let catalog = companion_hub::Catalog {
+            repositories: vec![
+                row("example/older", Some(100)),
+                row("example/newer", Some(200)),
+            ],
+            ..Default::default()
+        };
+        let rows = companion_rows(
+            &snapshot,
+            &crate::client_activity::ActivityStore::default(),
+            &[],
+            &catalog,
+            None,
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["example/newer", "example/older"]
         );
     }
 
@@ -4052,6 +4131,7 @@ mod tests {
             repositories: vec![companion_hub::CatalogRepository {
                 hub: "https://hub.example".into(),
                 repository: "example/project".into(),
+                last_activity_at: None,
                 agents: 0,
                 attention: 0,
                 attention_revision: String::new(),
@@ -4131,6 +4211,7 @@ mod tests {
             repositories: vec![companion_hub::CatalogRepository {
                 hub: "https://hub.example".into(),
                 repository: "example/project".into(),
+                last_activity_at: None,
                 agents: 0,
                 attention: 1,
                 attention_revision: String::new(),

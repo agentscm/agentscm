@@ -87,6 +87,7 @@ pub(super) struct Catalog {
 pub(super) struct CatalogRepository {
     pub hub: String,
     pub repository: String,
+    pub last_activity_at: Option<i64>,
     pub agents: usize,
     pub attention: usize,
     pub attention_revision: String,
@@ -282,6 +283,7 @@ async fn read_catalog(
                     .filter(|character| !character.is_control())
                     .take(255)
                     .collect(),
+                last_activity_at: row["last_activity_at"].as_i64(),
                 agents: row["agents"].as_u64().unwrap_or(0).min(500) as usize,
                 attention: row["needs_you"].as_u64().unwrap_or(0).min(500) as usize,
                 attention_revision: bounded_text(&row["attention_revision"], 64, ""),
