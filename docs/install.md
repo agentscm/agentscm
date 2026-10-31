@@ -195,6 +195,7 @@ delete the folder when no AgentSCM command is running.
 
 The optional macOS tray is part of this same binary; no separate app install is needed. Run
 `npx agentscm tray` to open it, or add `--tray` to quickstart to open it after successful setup.
+Click its menu-bar icon to see the work panel; right click for setup and troubleshooting actions.
 Quickstart no longer prompts to enable the tray or Start at Login. Without `--tray`, it prints
 the command for opening the menu-bar app. Opening the tray does not change Start at Login;
 you can enable or disable that option in the tray menu. When quickstart connects agents on macOS it also writes a small

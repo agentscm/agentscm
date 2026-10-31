@@ -6102,6 +6102,28 @@ impl Store for SqliteStore {
         finish(rows)
     }
 
+    fn live_intents_scoped(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<Intent>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "{INTENT_SELECT} WHERE {TOKEN_SCOPE} AND i.released_at IS NULL AND i.expires_at > ?5
+             ORDER BY i.id LIMIT ?6"
+        ))?;
+        let rows = statement
+            .query_map(
+                params![
+                    who.repository,
+                    who.repository_id,
+                    who.owner.identity.host,
+                    who.owner.identity.provider,
+                    now,
+                    limit as i64
+                ],
+                intent_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        finish(rows)
+    }
+
     fn notices_after(&self, token: &str, after: i64, limit: usize) -> Result<Vec<HubEvent>> {
         let conn = self.conn();
         let mut statement = conn.prepare(
@@ -6322,6 +6344,20 @@ impl Store for SqliteStore {
             params![key, value, unix_now(), actor],
         )?;
         Ok(())
+    }
+
+    fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (key) DO NOTHING",
+            params![key, value, unix_now(), actor],
+        )?;
+        Ok(conn.query_row(
+            "SELECT value FROM hub_settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )?)
     }
 
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()> {

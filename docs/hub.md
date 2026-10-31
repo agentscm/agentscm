@@ -231,6 +231,15 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
   200 connected repositories. A `hub login` session gets 403 `forbidden`. Each call makes one forge
   request per repository, so the page asks every two minutes.
+- `GET /v1/hub/device/repositories` (computer credential only) makes the same allow-list and
+  current forge-role checks for the macOS work panel. It returns the same bounded repository
+  summaries plus each repository's current Work title, lead agent, reported state, claim status
+  and next action, plus bounded live session or intent agent/task labels. Unreadable repositories
+  are omitted; failed access checks are counted in `unchecked` without naming the repository.
+  At most 20 Work rows and 40 live rows are returned per repository; `work_complete` or
+  `live_complete` is false when that list was cut short. `attention_revision` is an opaque marker
+  for changes to actionable items and is null without attention. This route does not return
+  conversation bodies, source paths or agent tokens.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 

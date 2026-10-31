@@ -19,6 +19,7 @@ use crate::hub_read_token::{
 use super::hub_open::OpenRequest;
 
 const POLL_SECONDS: u64 = 60;
+const CATALOG_POLL_SECONDS: u64 = 120;
 const TOKEN_NAME: &str = "agentscm-tray-attention";
 
 pub(super) struct Worker {
@@ -47,6 +48,45 @@ pub(super) struct Signal {
     pub available: bool,
     pub complete: bool,
     pub count: usize,
+    pub work: Vec<Work>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Work {
+    pub agent: String,
+    pub title: String,
+    pub state: String,
+    pub next_action: String,
+    pub claim_status: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Catalog {
+    pub repositories: Vec<CatalogRepository>,
+    pub unavailable_hubs: usize,
+    pub incomplete_hubs: usize,
+    /// Keep previous notification baselines while these Hubs could not be checked completely.
+    pub unverified_hubs: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CatalogRepository {
+    pub hub: String,
+    pub repository: String,
+    pub agents: usize,
+    pub attention: usize,
+    pub attention_revision: String,
+    pub attention_complete: bool,
+    pub complete: bool,
+    pub work: Vec<Work>,
+    pub live: Vec<LiveAgent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LiveAgent {
+    pub agent: String,
+    pub task: String,
+    pub source: String,
 }
 
 struct CachedToken {
@@ -71,6 +111,7 @@ pub(super) fn spawn(proxy: winit::event_loop::EventLoopProxy<super::UserEvent>) 
             return;
         };
         let mut cache = HashMap::<PathBuf, CachedToken>::new();
+        let mut last_catalog_read: Option<std::time::Instant> = None;
         let Ok(client) = agentscm::hub::forge_http::client() else {
             return;
         };
@@ -84,6 +125,17 @@ pub(super) fn spawn(proxy: winit::event_loop::EventLoopProxy<super::UserEvent>) 
                 .is_err()
             {
                 break;
+            }
+            if last_catalog_read.is_none_or(|at| at.elapsed().as_secs() >= CATALOG_POLL_SECONDS) {
+                let catalog = runtime.block_on(read_catalog(&client, &worker_stopping));
+                last_catalog_read = Some(std::time::Instant::now());
+                if worker_stopping.load(std::sync::atomic::Ordering::Acquire)
+                    || proxy
+                        .send_event(super::UserEvent::CompanionHubCatalog(catalog))
+                        .is_err()
+                {
+                    break;
+                }
             }
             if stopped
                 .recv_timeout(Duration::from_secs(POLL_SECONDS))
@@ -113,6 +165,102 @@ pub(super) fn spawn(proxy: winit::event_loop::EventLoopProxy<super::UserEvent>) 
         stopping,
         thread: Some(thread),
     }
+}
+
+async fn read_catalog(
+    client: &reqwest::Client,
+    stopping: &std::sync::atomic::AtomicBool,
+) -> Catalog {
+    let mut catalog = Catalog::default();
+    for summary in crate::hub_cli::sign_in_summaries() {
+        if stopping.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let Ok((hub, crate::hub_cli::HubAuth::Device(secret))) = load_exact_session(&summary.hub)
+        else {
+            catalog.unavailable_hubs += 1;
+            catalog.unverified_hubs.push(summary.hub);
+            continue;
+        };
+        let url = format!("{hub}/v1/hub/device/repositories");
+        let Ok((200, reply)) =
+            crate::hub_cli::call(client, Method::GET, &url, Some(&secret), None).await
+        else {
+            catalog.unavailable_hubs += 1;
+            catalog.unverified_hubs.push(hub);
+            continue;
+        };
+        let Some(repositories) = reply["repositories"].as_array() else {
+            catalog.unavailable_hubs += 1;
+            catalog.unverified_hubs.push(hub);
+            continue;
+        };
+        let mut incomplete =
+            reply["complete"] != true || reply["unchecked"].as_u64().unwrap_or(1) > 0;
+        for row in repositories.iter().take(200) {
+            let Some(repository) = row["repository"].as_str() else {
+                continue;
+            };
+            let work = row["work"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(100)
+                        .map(|item| Work {
+                            agent: bounded_text(&item["agent"], 64, "Unknown agent"),
+                            title: bounded_text(&item["title"], 160, "Untitled work"),
+                            state: bounded_text(&item["state"], 32, "unknown"),
+                            next_action: bounded_text(
+                                &item["next_action"],
+                                160,
+                                "No next action reported",
+                            ),
+                            claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let live = row["live"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(40)
+                        .map(|item| LiveAgent {
+                            agent: bounded_text(&item["agent"], 64, "Unknown agent"),
+                            task: bounded_text(&item["task"], 160, "Task not reported"),
+                            source: bounded_text(&item["source"], 16, "Hub"),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let complete = row["complete"] == true
+                && row["work_complete"] == true
+                && row["live_complete"] == true;
+            incomplete |= !complete;
+            catalog.repositories.push(CatalogRepository {
+                hub: hub.clone(),
+                repository: repository
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .take(255)
+                    .collect(),
+                agents: row["agents"].as_u64().unwrap_or(0).min(500) as usize,
+                attention: row["needs_you"].as_u64().unwrap_or(0).min(500) as usize,
+                attention_revision: bounded_text(&row["attention_revision"], 64, ""),
+                attention_complete: row["complete"] == true,
+                complete,
+                work,
+                live,
+            });
+        }
+        if incomplete {
+            catalog.incomplete_hubs += 1;
+            catalog.unverified_hubs.push(hub);
+        }
+    }
+    catalog
 }
 
 async fn read(
@@ -168,6 +316,7 @@ async fn read_one(
         available: false,
         complete: false,
         count: 0,
+        work: Vec::new(),
     };
     if OpenRequest::from_status(connection).is_err() {
         if let Some(saved) = cache.remove(&connection.root) {
@@ -347,12 +496,14 @@ fn summarize(
             available: false,
             complete: false,
             count: 0,
+            work: Vec::new(),
         };
     };
     let mut blocked = 0;
     let mut quiet = 0;
     let mut handovers = 0;
     let mut keys = Vec::new();
+    let mut work = Vec::new();
     for item in current {
         let id = item["id"].as_str().unwrap_or("");
         match item["state"].as_str() {
@@ -370,6 +521,13 @@ fn summarize(
             }
             _ => {}
         }
+        work.push(Work {
+            agent: bounded_text(&item["lead_agent"], 64, "Unknown agent"),
+            title: bounded_text(&item["title"], 160, "Untitled work"),
+            state: bounded_text(&item["state"], 32, "unknown"),
+            next_action: bounded_text(&item["next_action"], 160, "No next action reported"),
+            claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
+        });
     }
     let open_requests: Vec<_> = requests
         .iter()
@@ -423,7 +581,21 @@ fn summarize(
         available: true,
         complete,
         count,
+        work,
     }
+}
+
+fn bounded_text(value: &Value, max_chars: usize, fallback: &str) -> String {
+    value
+        .as_str()
+        .map(|text| {
+            text.chars()
+                .filter(|character| !character.is_control())
+                .take(max_chars)
+                .collect::<String>()
+        })
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 #[cfg(test)]

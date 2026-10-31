@@ -6,11 +6,12 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use agentscm::backend::LocalBackend;
+use agentscm::hub::intent::NewIntent;
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::promise::{
     PromiseCreateV1, PromiseForgeAdmissionV1, PromiseRepositoryAdmissionV1, admissions_digest,
 };
-use agentscm::hub::store::{self, Store, mint_bound_agent_token, unix_now};
+use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
 use agentscm::hub::sync::{self, Sync, SyncConfig};
 use agentscm::hub::workspace::{Identity, Workspace, WorkspaceConfig, WorkspaceForgeRepositoryV1};
 use agentscm::hub::{HubState, router};
@@ -2021,6 +2022,49 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         .await;
     assert_eq!(status, 200, "{announced}");
 
+    // Same-named repositories on another host or provider must not disclose intent text.
+    for (provider, host, marker) in [
+        ("github", "other-forge.example", "b"),
+        ("gitlab", env.base.trim_start_matches("http://"), "c"),
+    ] {
+        let foreign = env
+            .store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: provider.into(),
+                    host: host.into(),
+                    user_id: ALICE,
+                },
+                "foreign-alice",
+            )
+            .unwrap();
+        let (foreign_id, _, _) = mint_bound_agent_token(
+            &*env.store,
+            &foreign.id,
+            "foreign-agent",
+            REPO,
+            REPO_ID,
+            600,
+            false,
+        )
+        .unwrap();
+        env.store
+            .announce_intent(
+                &foreign_id,
+                &NewIntent {
+                    id: format!("int_{}", marker.repeat(32)),
+                    task: format!("private {provider} task"),
+                    branch: None,
+                    base: None,
+                    machine: None,
+                    paths: vec![format!("{marker}.rs")],
+                    ttl_seconds: 600,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+
     let (status, body) = list().await;
     assert_eq!(status, 200, "{body}");
     let names: Vec<_> = body["repositories"]
@@ -2063,6 +2107,86 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         ]
     );
 
+    let (status, started) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/standup/start",
+            minted["token"].as_str(),
+            Some(json!({
+                "work_id":null,"source":null,"request_key":"tray-work-view",
+                "title":"Review checkout state","session":"tray-test-session","role":"lead",
+                "scope":["src/lib.rs"],"branch":null,"worktree":null,
+                "next_action":"Check the diff","depends_on":[],"related_work":[],
+                "takeover_generation":null
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{started}");
+    let (status, device_list) = env
+        .call(
+            &env.hub,
+            Method::GET,
+            "/v1/hub/device/repositories",
+            Some(&device),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{device_list}");
+    let marker_key = env
+        .store
+        .get_setting("device_attention_revision_key_v1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker_key.len(), 64);
+    assert_eq!(
+        env.store
+            .get_or_create_setting("device_attention_revision_key_v1", "alternate", "system")
+            .unwrap(),
+        marker_key
+    );
+    assert!(!device_list.to_string().contains("private github task"));
+    assert!(!device_list.to_string().contains("private gitlab task"));
+    assert_eq!(device_list["repositories"][0]["repository"], REPO);
+    assert_eq!(
+        device_list["repositories"][0]["work"][0]["title"],
+        "Review checkout state"
+    );
+    assert_eq!(
+        device_list["repositories"][0]["work"][0]["next_action"],
+        "Check the diff"
+    );
+    assert_eq!(device_list["repositories"][0]["work_complete"], true);
+    assert_eq!(device_list["repositories"][0]["live_complete"], true);
+    assert_eq!(
+        device_list["repositories"][0]["attention_revision"],
+        Value::Null
+    );
+    assert!(
+        device_list["repositories"][0]["live"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["task"] == "t")
+    );
+    assert!(
+        device_list["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["repository"] != "acme/secret")
+    );
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::GET,
+            "/v1/hub/device/repositories",
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401);
+
     // Only the web sign-in asks.
     let (status, refused) = env
         .call(&env.hub, Method::GET, path, Some(&session), None)
@@ -2085,6 +2209,27 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     let (_, body) = list().await;
     assert_eq!(body["repositories"][0]["repository"], "acme/docs");
     assert_eq!(body["repositories"].as_array().unwrap().len(), 1);
+    let (status, device_after_role_loss) = env
+        .call(
+            &env.hub,
+            Method::GET,
+            "/v1/hub/device/repositories",
+            Some(&device),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{device_after_role_loss}");
+    assert_eq!(
+        device_after_role_loss["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        device_after_role_loss["repositories"][0]["repository"],
+        "acme/docs"
+    );
     let refusals = env.store.refusals(unix_now()).unwrap();
     assert!(!refusals.iter().any(|r| r.via == "session_repositories"));
 }
