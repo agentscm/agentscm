@@ -60,6 +60,8 @@ pub(super) struct Signal {
     pub available: bool,
     pub complete: bool,
     pub count: usize,
+    /// Human-facing Work decisions; Inbox requests remain in `count` only.
+    pub needs_you: usize,
     pub work: Vec<Work>,
 }
 
@@ -350,6 +352,7 @@ async fn read_one(
         available: false,
         complete: false,
         count: 0,
+        needs_you: 0,
         work: Vec::new(),
     };
     if OpenRequest::from_status(connection).is_err() {
@@ -530,6 +533,7 @@ fn summarize(
             available: false,
             complete: false,
             count: 0,
+            needs_you: 0,
             work: Vec::new(),
         };
     };
@@ -579,6 +583,7 @@ fn summarize(
     }
     keys.sort();
     let count = blocked + quiet + handovers + open_requests.len() + overlaps.len();
+    let needs_you = blocked + quiet + handovers + overlaps.len();
     let complete = overview["current_complete"] == true
         && overview["overlaps_complete"] == true
         && coordination["complete"] == true;
@@ -615,6 +620,7 @@ fn summarize(
         available: true,
         complete,
         count,
+        needs_you,
         work,
     }
 }
@@ -659,12 +665,32 @@ mod tests {
             &coordination,
         );
         assert_eq!(result.count, 5);
+        assert_eq!(result.needs_you, 4);
         assert!(result.text.contains("1 blocked"));
         assert!(result.text.contains("1 quiet"));
         assert!(result.text.contains("1 handover"));
         assert!(result.text.contains("1 overlap"));
         assert!(result.text.contains("1 Inbox request"));
         assert_eq!(result.keys.len(), 5);
+    }
+
+    #[test]
+    fn agent_inbox_request_is_not_a_human_decision() {
+        let overview = json!({
+            "current": [], "overlaps": [],
+            "current_complete": true, "overlaps_complete": true
+        });
+        let coordination = json!({"requests": [
+            {"id":"crq_open","status":"pending"}
+        ], "complete": true});
+        let result = summarize(
+            std::path::Path::new("/demo"),
+            "example/repo",
+            &overview,
+            &coordination,
+        );
+        assert_eq!(result.count, 1);
+        assert_eq!(result.needs_you, 0);
     }
 
     #[test]

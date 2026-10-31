@@ -17,8 +17,10 @@ use winit::event_loop::EventLoopProxy;
 
 use super::UserEvent;
 
-const WIDTH: f64 = 620.0;
+const WIDTH: f64 = 700.0;
 const HEIGHT: f64 = 780.0;
+const TAB_WIDTH: f64 = (WIDTH - 60.0) / 3.0;
+const TAB_STEP: f64 = TAB_WIDTH + 8.0;
 const REPOSITORY_LIMIT: usize = 50;
 const HUB_ACTIVITY_LIMIT: usize = 5;
 
@@ -55,9 +57,11 @@ pub(super) struct WorkRow {
 struct TargetIvars {
     proxy: EventLoopProxy<UserEvent>,
     prompt: Retained<NSTextField>,
+    quick_prompt: Retained<NSTextField>,
     checkout_label: Retained<NSTextField>,
     agent_label: Retained<NSTextField>,
     option_label: Retained<NSTextField>,
+    quick_selection: Retained<NSTextField>,
     checkouts: RefCell<Vec<String>>,
     agents: RefCell<Vec<String>>,
     options: RefCell<Vec<String>>,
@@ -78,6 +82,16 @@ objc2::define_class!(
     unsafe impl NSObjectProtocol for Target {}
 
     impl Target {
+        #[unsafe(method(submitQuickPrompt:))]
+        fn submit_quick_prompt(&self, _sender: &NSButton) {
+            self.send_quick_prompt();
+        }
+
+        #[unsafe(method(submitQuickPromptField:))]
+        fn submit_quick_prompt_field(&self, _sender: &NSTextField) {
+            self.send_quick_prompt();
+        }
+
         #[unsafe(method(submitPrompt:))]
         fn submit_prompt(&self, _sender: &NSButton) {
             let ivars = self.ivars();
@@ -104,6 +118,7 @@ objc2::define_class!(
             ivars.checkout_index.set(index);
             ivars.checkout_label
                 .setStringValue(&NSString::from_str(&format!("Checkout: {}", options[index])));
+            self.update_quick_selection();
             let _ = ivars.proxy.send_event(UserEvent::CompanionSelection(index));
         }
 
@@ -127,6 +142,7 @@ objc2::define_class!(
                 "What should {} do?",
                 options[index]
             ))));
+            self.update_quick_selection();
         }
 
         #[unsafe(method(nextOption:))]
@@ -145,6 +161,7 @@ objc2::define_class!(
             ivars.option_index.set(index);
             ivars.option_label
                 .setStringValue(&NSString::from_str(&format!("Mode: {}", options[index])));
+            self.update_quick_selection();
         }
 
         #[unsafe(method(pinChanged:))]
@@ -228,6 +245,42 @@ objc2::define_class!(
 );
 
 impl Target {
+    fn send_quick_prompt(&self) {
+        let ivars = self.ivars();
+        let prompt = ivars.quick_prompt.stringValue().to_string();
+        if prompt.trim().is_empty() {
+            return;
+        }
+        let _ = ivars.proxy.send_event(UserEvent::CompanionSubmit {
+            prompt,
+            checkout_index: ivars.checkout_index.get(),
+            agent_index: ivars.agent_index.get(),
+            option_index: ivars.option_index.get(),
+        });
+    }
+
+    fn update_quick_selection(&self) {
+        let ivars = self.ivars();
+        let checkouts = ivars.checkouts.borrow();
+        let agents = ivars.agents.borrow();
+        let options = ivars.options.borrow();
+        let selection = match (
+            agents.get(ivars.agent_index.get()),
+            checkouts.get(ivars.checkout_index.get()),
+        ) {
+            (Some(agent), Some(checkout)) => format!(
+                "{agent} · {checkout} · {}",
+                options
+                    .get(ivars.option_index.get())
+                    .map_or("default", String::as_str)
+            ),
+            _ => "Connect a checkout to start a coding agent".to_owned(),
+        };
+        ivars
+            .quick_selection
+            .setStringValue(&NSString::from_str(&selection));
+    }
+
     fn new(mtm: MainThreadMarker, ivars: TargetIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
         // SAFETY: NSObject's initializer has this signature and Target has no extra init work.
@@ -253,10 +306,13 @@ pub(super) struct CompanionPanel {
     footer_card: Retained<NSBox>,
     footer_title: Retained<NSTextField>,
     footer_hint: Retained<NSTextField>,
+    quick_prompt: Retained<NSTextField>,
+    quick_submit: Retained<NSButton>,
     tab_buttons: [Retained<NSButton>; 3],
     tab_backgrounds: [Retained<NSBox>; 3],
     tab_marker: Retained<NSBox>,
     tab: usize,
+    preserve_long_draft: bool,
     all_rows: Vec<RepositoryRow>,
     rendered_rows: Vec<RepositoryRow>,
     rendered_omitted: usize,
@@ -298,7 +354,7 @@ impl CompanionPanel {
         panel.setBackgroundColor(Some(&color(0xfafafc)));
 
         let content = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, HEIGHT));
-        let now_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 530.0, WIDTH, 82.0));
+        let now_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 520.0, WIDTH, 92.0));
         let list_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, HEIGHT));
         let prompt_group = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, HEIGHT));
         let header = surface(mtm, rect(14.0, 676.0, WIDTH - 28.0, 90.0), 0x17142e, 20.0);
@@ -320,18 +376,18 @@ impl CompanionPanel {
         let pin = if objc2::runtime::AnyClass::get(c"NSSwitch").is_some() {
             let control = NSSwitch::initWithFrame(
                 NSSwitch::alloc(mtm),
-                rect(WIDTH - 85.0, 685.0, 42.0, 22.0),
+                rect(WIDTH - 85.0, 720.0, 42.0, 22.0),
             );
             control.setAccessibilityLabel(Some(&NSString::from_str("Keep panel on top")));
             PinControl::Switch(control)
         } else {
-            let control = button(mtm, "", rect(WIDTH - 85.0, 685.0, 42.0, 22.0));
+            let control = button(mtm, "", rect(WIDTH - 85.0, 720.0, 42.0, 22.0));
             control.setButtonType(NSButtonType::Switch);
             control.setAccessibilityLabel(Some(&NSString::from_str("Keep panel on top")));
             PinControl::Button(control)
         };
         let pin_label = label(mtm, "PIN", 10.0, true);
-        pin_label.setFrame(rect(WIDTH - 115.0, 689.0, 30.0, 14.0));
+        pin_label.setFrame(rect(WIDTH - 115.0, 725.0, 30.0, 14.0));
         pin_label.setTextColor(Some(&color(0xc2bce1)));
 
         let header_rule = surface(mtm, rect(34.0, 695.0, WIDTH - 68.0, 1.0), 0x3c3658, 0.0);
@@ -348,20 +404,20 @@ impl CompanionPanel {
         let tab_backgrounds = [0, 1, 2].map(|index| {
             surface(
                 mtm,
-                rect(22.0 + index as f64 * 194.0, 631.0, 186.0, 34.0),
+                rect(22.0 + index as f64 * TAB_STEP, 631.0, TAB_WIDTH, 34.0),
                 if index == 0 { 0xe6e0fa } else { 0xf1eefd },
                 9.0,
             )
         });
         for (index, control) in tab_buttons.iter().enumerate() {
-            control.setFrame(rect(22.0 + index as f64 * 194.0, 631.0, 186.0, 34.0));
+            control.setFrame(rect(22.0 + index as f64 * TAB_STEP, 631.0, TAB_WIDTH, 34.0));
             control.setTag(index as isize);
             control.setAccessibilityLabel(Some(&NSString::from_str(&format!(
                 "{} view",
                 ["Work", "Needs you", "Start"][index]
             ))));
         }
-        let tab_marker = surface(mtm, rect(22.0, 626.0, 186.0, 3.0), 0x6d5ce0, 1.5);
+        let tab_marker = surface(mtm, rect(22.0, 626.0, TAB_WIDTH, 3.0), 0x6d5ce0, 1.5);
 
         let activity_title = label(mtm, "Agents across your work", 18.0, true);
         activity_title.setFrame(rect(66.0, 488.0, 400.0, 28.0));
@@ -372,7 +428,7 @@ impl CompanionPanel {
         status.setAccessibilityLabel(Some(&NSString::from_str("Local agent status")));
         let work_scroll = NSScrollView::initWithFrame(
             NSScrollView::alloc(mtm),
-            rect(14.0, 84.0, WIDTH - 28.0, 372.0),
+            rect(14.0, 167.0, WIDTH - 28.0, 289.0),
         );
         work_scroll.setHasVerticalScroller(true);
         work_scroll.setDrawsBackground(false);
@@ -380,12 +436,12 @@ impl CompanionPanel {
             "Connected repositories and agent work",
         )));
 
-        let attention_card = surface(mtm, rect(14.0, 0.0, WIDTH - 28.0, 82.0), 0xf1eefd, 16.0);
+        let attention_card = surface(mtm, rect(14.0, 0.0, WIDTH - 28.0, 92.0), 0xf1eefd, 16.0);
         let attention_title = label(mtm, "Attention", 16.0, true);
-        attention_title.setFrame(rect(66.0, 51.0, 270.0, 25.0));
-        let attention_icon = symbol(mtm, "bell.badge", rect(36.0, 54.0, 20.0, 20.0));
+        attention_title.setFrame(rect(66.0, 61.0, 270.0, 25.0));
+        let attention_icon = symbol(mtm, "bell.badge", rect(36.0, 64.0, 20.0, 20.0));
         let attention = label(mtm, "Checking attention…", 13.0, false);
-        attention.setFrame(rect(36.0, 10.0, WIDTH - 72.0, 38.0));
+        attention.setFrame(rect(36.0, 8.0, WIDTH - 72.0, 48.0));
         attention.setPreferredMaxLayoutWidth(WIDTH - 68.0);
         attention.setMaximumNumberOfLines(0);
         attention.setUsesSingleLineMode(false);
@@ -395,7 +451,7 @@ impl CompanionPanel {
         let open_hub = button(
             mtm,
             "Review in Hub  ↗",
-            rect(WIDTH - 162.0, 51.0, 126.0, 29.0),
+            rect(WIDTH - 162.0, 61.0, 126.0, 29.0),
         );
         open_hub.setAccessibilityLabel(Some(&NSString::from_str(
             "Open the first listed repository in Hub for Inbox and Dashboard",
@@ -429,6 +485,17 @@ impl CompanionPanel {
             cell.setWraps(true);
             cell.setUsesSingleLineMode(false);
         }
+        let quick_prompt = NSTextField::textFieldWithString(&NSString::new(), mtm);
+        quick_prompt.setFrame(rect(34.0, 37.0, WIDTH - 228.0, 43.0));
+        quick_prompt.setFont(Some(&NSFont::systemFontOfSize(15.0)));
+        quick_prompt
+            .setPlaceholderString(Some(&NSString::from_str("Ask your agent to do something…")));
+        quick_prompt.setAccessibilityLabel(Some(&NSString::from_str(
+            "Quick prompt for the selected coding agent",
+        )));
+        if let Some(cell) = quick_prompt.cell() {
+            cell.setSendsActionOnEndEditing(false);
+        }
 
         let checkout_label = label(mtm, "Checkout: choose…", 13.0, true);
         checkout_label.setFrame(rect(36.0, 238.0, 410.0, 22.0));
@@ -453,14 +520,25 @@ impl CompanionPanel {
         submit.setBezelStyle(NSBezelStyle::Push);
         submit.setBezelColor(Some(&color(0xc6bbff)));
 
+        let footer_hint = label(
+            mtm,
+            "Connect a checkout to start a coding agent",
+            12.0,
+            false,
+        );
+        footer_hint.setFrame(rect(34.0, 88.0, WIDTH - 68.0, 18.0));
+        footer_hint.setTextColor(Some(&color(0x656177)));
+
         let target = Target::new(
             mtm,
             TargetIvars {
                 proxy,
                 prompt: prompt.clone(),
+                quick_prompt: quick_prompt.clone(),
                 checkout_label: checkout_label.clone(),
                 agent_label: agent_label.clone(),
                 option_label: option_label.clone(),
+                quick_selection: footer_hint.clone(),
                 checkouts: RefCell::new(Vec::new()),
                 agents: RefCell::new(Vec::new()),
                 options: RefCell::new(Vec::new()),
@@ -473,6 +551,8 @@ impl CompanionPanel {
         );
         // SAFETY: the retained target implements the selectors with matching sender types.
         unsafe {
+            quick_prompt.setTarget(Some(&target));
+            quick_prompt.setAction(Some(sel!(submitQuickPromptField:)));
             for control in &tab_buttons {
                 control.setTarget(Some(&target));
                 control.setAction(Some(sel!(selectTab:)));
@@ -508,8 +588,8 @@ impl CompanionPanel {
         now_group.addSubview(&open_hub);
         let start_cta = button(
             mtm,
-            "Start a coding agent  ↗",
-            rect(WIDTH - 250.0, 24.0, 216.0, 44.0),
+            "Agent options  →",
+            rect(WIDTH - 169.0, 113.0, 130.0, 27.0),
         );
         start_cta.setTag(2);
         start_cta.setBordered(false);
@@ -530,21 +610,25 @@ impl CompanionPanel {
             all_cta.setTarget(Some(&target));
             all_cta.setAction(Some(sel!(selectTab:)));
         }
-        let footer_card = surface(mtm, rect(14.0, 13.0, WIDTH - 28.0, 65.0), 0xf1eefd, 16.0);
+        let footer_card = surface(mtm, rect(14.0, 13.0, WIDTH - 28.0, 140.0), 0xf1eefd, 16.0);
         let action_backgrounds = [
             surface(mtm, rect(34.0, 24.0, 170.0, 44.0), 0xffffff, 11.0),
-            surface(mtm, rect(WIDTH - 250.0, 24.0, 216.0, 44.0), 0xd9d0fa, 11.0),
+            surface(mtm, rect(WIDTH - 169.0, 113.0, 130.0, 27.0), 0xd9d0fa, 9.0),
         ];
-        let footer_title = label(mtm, "Start something new", 14.0, true);
-        footer_title.setFrame(rect(34.0, 49.0, 280.0, 21.0));
-        let footer_hint = label(
+        let footer_title = label(mtm, "Quick prompt", 17.0, true);
+        footer_title.setFrame(rect(34.0, 112.0, 280.0, 26.0));
+        let quick_submit = button(
             mtm,
-            "Send a prompt through your installed agent",
-            11.0,
-            false,
+            "Start agent  ↗",
+            rect(WIDTH - 184.0, 37.0, 150.0, 43.0),
         );
-        footer_hint.setFrame(rect(34.0, 30.0, 320.0, 18.0));
-        footer_hint.setTextColor(Some(&color(0x656177)));
+        quick_submit.setBezelStyle(NSBezelStyle::Push);
+        quick_submit.setBezelColor(Some(&color(0xc6bbff)));
+        // SAFETY: Target implements the retained control's action selector.
+        unsafe {
+            quick_submit.setTarget(Some(&target));
+            quick_submit.setAction(Some(sel!(submitQuickPrompt:)));
+        }
         if let Some(icon) = &activity_icon {
             list_group.addSubview(icon);
         }
@@ -574,6 +658,8 @@ impl CompanionPanel {
         }
         content.addSubview(&footer_title);
         content.addSubview(&footer_hint);
+        content.addSubview(&quick_prompt);
+        content.addSubview(&quick_submit);
         // The two full-size view groups sit behind the controls. The attention group is
         // bounded to its card so it cannot intercept list or footer clicks.
         content.addSubview(&all_cta);
@@ -628,10 +714,13 @@ impl CompanionPanel {
             footer_card,
             footer_title,
             footer_hint,
+            quick_prompt,
+            quick_submit,
             tab_buttons,
             tab_backgrounds,
             tab_marker,
             tab: 0,
+            preserve_long_draft: false,
             all_rows: Vec::new(),
             rendered_rows: Vec::new(),
             rendered_omitted: 0,
@@ -701,6 +790,12 @@ impl CompanionPanel {
             let local = self
                 .all_rows
                 .iter()
+                .flat_map(|row| row.local.iter())
+                .filter(|agent| agent.observed)
+                .count();
+            let connected = self
+                .all_rows
+                .iter()
                 .map(|row| row.local.len())
                 .sum::<usize>();
             let hub = self
@@ -708,9 +803,15 @@ impl CompanionPanel {
                 .iter()
                 .map(|row| row.work.len())
                 .sum::<usize>();
+            let repository = if self.all_rows.len() == 1 {
+                "repository"
+            } else {
+                "repositories"
+            };
             format!(
-                "Repositories {} · Local agents {} · Hub activities {}",
+                "{} {repository} · {} local agents ({} seen) · {} Hub tasks or sessions",
                 self.all_rows.len(),
+                connected,
                 local,
                 hub
             )
@@ -754,15 +855,29 @@ impl CompanionPanel {
         if index > 2 {
             return;
         }
+        if (self.tab == 2) != (index == 2) {
+            let (quick, full, preserve) = prompt_drafts_on_tab_change(
+                &self.quick_prompt.stringValue().to_string(),
+                &self.prompt.stringValue().to_string(),
+                index == 2,
+                self.preserve_long_draft,
+            );
+            self.quick_prompt
+                .setStringValue(&NSString::from_str(&quick));
+            self.prompt.setStringValue(&NSString::from_str(&full));
+            self.preserve_long_draft = preserve;
+        }
         self.tab = index;
         self.now_group.setHidden(index == 2);
-        self.now_actions[0].setHidden(index != 1);
+        self.now_actions[0].setHidden(true);
         self.now_actions[1].setHidden(index == 2);
-        self.action_backgrounds[0].setHidden(index != 1);
+        self.action_backgrounds[0].setHidden(true);
         self.action_backgrounds[1].setHidden(index == 2);
         self.footer_card.setHidden(index == 2);
-        self.footer_title.setHidden(index != 0);
-        self.footer_hint.setHidden(index != 0);
+        self.footer_title.setHidden(index == 2);
+        self.footer_hint.setHidden(index == 2);
+        self.quick_prompt.setHidden(index == 2);
+        self.quick_submit.setHidden(index == 2);
         self.list_group.setHidden(index == 2);
         self.prompt_group.setHidden(index != 2);
         if index == 1 {
@@ -790,7 +905,7 @@ impl CompanionPanel {
             ))));
         }
         self.tab_marker
-            .setFrame(rect(22.0 + index as f64 * 194.0, 626.0, 186.0, 3.0));
+            .setFrame(rect(22.0 + index as f64 * TAB_STEP, 626.0, TAB_WIDTH, 3.0));
         self.scroll_outer_to_tab();
         self.rendered_rows.clear();
         self.rendered_omitted = usize::MAX;
@@ -837,6 +952,12 @@ impl CompanionPanel {
                 }
                 86.0 + if row.local.is_empty() {
                     0.0
+                } else if row
+                    .local
+                    .iter()
+                    .all(|agent| !agent.observed && !agent.needs_you)
+                {
+                    30.0
                 } else {
                     23.0 + 42.0 * row.local.len() as f64
                 } + if row.work.is_empty() {
@@ -853,7 +974,7 @@ impl CompanionPanel {
                 }
             })
             .collect();
-        let viewport_height = 372.0;
+        let viewport_height = 289.0;
         let footer_height = if omitted_repositories > 0 { 44.0 } else { 0.0 };
         let total = (12.0 + heights.iter().sum::<f64>() + 12.0 * rows.len() as f64 + footer_height)
             .max(viewport_height);
@@ -920,7 +1041,16 @@ impl CompanionPanel {
                 document.addSubview(&open);
             }
 
-            let local = label(mtm, &row.local_agents, 12.0, false);
+            let source = row.hub.as_ref().and_then(|hub| {
+                reqwest::Url::parse(hub)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+            });
+            let context = source.map_or_else(
+                || row.local_agents.clone(),
+                |source| format!("{} · {source}", row.local_agents),
+            );
+            let local = label(mtm, &context, 12.0, false);
             local.setFrame(rect(20.0, top - 61.0, WIDTH - 82.0, 20.0));
             local.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             local.setTextColor(Some(&color(0x6c6b80)));
@@ -953,38 +1083,7 @@ impl CompanionPanel {
             }
 
             let mut cursor = top - 86.0;
-            if !row.local.is_empty() {
-                let section = label(mtm, "ON THIS MAC", 10.0, true);
-                section.setFrame(rect(20.0, cursor - 3.0, 160.0, 16.0));
-                section.setTextColor(Some(&color(0x656177)));
-                document.addSubview(&section);
-                cursor -= 23.0;
-                for agent in &row.local {
-                    let dot = surface(
-                        mtm,
-                        rect(20.0, cursor - 10.0, 8.0, 8.0),
-                        if agent.needs_you {
-                            0xc8432a
-                        } else if agent.observed {
-                            0x127a52
-                        } else {
-                            0xb9b5c5
-                        },
-                        4.0,
-                    );
-                    document.addSubview(&dot);
-                    let title = label(mtm, &agent.agent, 13.0, true);
-                    title.setFrame(rect(36.0, cursor - 13.0, WIDTH - 100.0, 20.0));
-                    document.addSubview(&title);
-                    let detail = label(mtm, &agent.detail, 11.0, false);
-                    detail.setFrame(rect(36.0, cursor - 30.0, WIDTH - 100.0, 18.0));
-                    detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                    detail.setTextColor(Some(&color(0x656177)));
-                    document.addSubview(&detail);
-                    cursor -= 42.0;
-                }
-            }
-            let section = label(mtm, "IN HUB", 10.0, true);
+            let section = label(mtm, "WORK IN HUB", 10.0, true);
             section.setFrame(rect(20.0, cursor - 3.0, 160.0, 16.0));
             section.setTextColor(Some(&color(0x656177)));
             document.addSubview(&section);
@@ -994,6 +1093,7 @@ impl CompanionPanel {
                 no_work.setFrame(rect(20.0, cursor - 21.0, WIDTH - 82.0, 20.0));
                 no_work.setTextColor(Some(&color(0x6c6b80)));
                 document.addSubview(&no_work);
+                cursor -= 40.0;
             } else {
                 for work in &row.work {
                     let y = cursor - 15.0;
@@ -1004,16 +1104,75 @@ impl CompanionPanel {
                         4.0,
                     );
                     document.addSubview(&dot);
-                    let title = label(mtm, &format!("{} · {}", work.agent, work.title), 13.0, true);
+                    let title = label(mtm, &work.title, 15.0, true);
                     title.setFrame(rect(36.0, y, WIDTH - 100.0, 22.0));
                     title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
                     document.addSubview(&title);
-                    let detail = label(mtm, &work.detail, 11.0, false);
+                    let detail = label(
+                        mtm,
+                        &format!("{} · {}", work.agent, work.detail),
+                        11.0,
+                        false,
+                    );
                     detail.setFrame(rect(36.0, y - 19.0, WIDTH - 100.0, 18.0));
                     detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
                     detail.setTextColor(Some(&color(0x656177)));
                     document.addSubview(&detail);
                     cursor -= 52.0;
+                }
+            }
+            if !row.local.is_empty() {
+                if row
+                    .local
+                    .iter()
+                    .all(|agent| !agent.observed && !agent.needs_you)
+                {
+                    let names = row
+                        .local
+                        .iter()
+                        .map(|agent| agent.agent.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let summary = label(
+                        mtm,
+                        &format!("On this Mac · {names} · no recent activity"),
+                        12.0,
+                        false,
+                    );
+                    summary.setFrame(rect(20.0, cursor - 21.0, WIDTH - 82.0, 20.0));
+                    summary.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                    summary.setTextColor(Some(&color(0x656177)));
+                    document.addSubview(&summary);
+                } else {
+                    let section = label(mtm, "ON THIS MAC", 10.0, true);
+                    section.setFrame(rect(20.0, cursor - 3.0, 160.0, 16.0));
+                    section.setTextColor(Some(&color(0x656177)));
+                    document.addSubview(&section);
+                    cursor -= 23.0;
+                    for agent in &row.local {
+                        let dot = surface(
+                            mtm,
+                            rect(20.0, cursor - 10.0, 8.0, 8.0),
+                            if agent.needs_you {
+                                0xc8432a
+                            } else if agent.observed {
+                                0x127a52
+                            } else {
+                                0xb9b5c5
+                            },
+                            4.0,
+                        );
+                        document.addSubview(&dot);
+                        let title = label(mtm, &agent.agent, 13.0, true);
+                        title.setFrame(rect(36.0, cursor - 13.0, WIDTH - 100.0, 20.0));
+                        document.addSubview(&title);
+                        let detail = label(mtm, &agent.detail, 11.0, false);
+                        detail.setFrame(rect(36.0, cursor - 30.0, WIDTH - 100.0, 18.0));
+                        detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                        detail.setTextColor(Some(&color(0x656177)));
+                        document.addSubview(&detail);
+                        cursor -= 42.0;
+                    }
                 }
             }
             let expanded = self.expanded.contains(&(row.hub.clone(), row.name.clone()));
@@ -1074,7 +1233,7 @@ impl CompanionPanel {
         self.tab != 2
             && self.panel.isVisible()
             && self.panel.isKeyWindow()
-            && visible.origin.y <= 530.0
+            && visible.origin.y <= 520.0
             && visible.origin.y + visible.size.height >= 612.0
     }
 
@@ -1172,12 +1331,42 @@ impl CompanionPanel {
             self.option_label
                 .setStringValue(&NSString::from_str(&format!("Mode: {option}")));
         }
+        self.target.update_quick_selection();
         self.set_status(status, attention);
     }
 }
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
+fn prompt_drafts_on_tab_change(
+    quick: &str,
+    full: &str,
+    to_start: bool,
+    preserve_long_draft: bool,
+) -> (String, String, bool) {
+    if to_start {
+        if preserve_long_draft {
+            (quick.into(), full.into(), true)
+        } else {
+            (quick.into(), quick.into(), false)
+        }
+    } else if full.contains('\n') || full.contains('\r') {
+        (
+            if preserve_long_draft {
+                quick.into()
+            } else {
+                String::new()
+            },
+            full.into(),
+            true,
+        )
+    } else if preserve_long_draft && !quick.is_empty() {
+        (quick.into(), full.into(), !full.trim().is_empty())
+    } else {
+        (full.into(), full.into(), false)
+    }
 }
 
 /// The work view keeps the whole bounded roster; the attention view only narrows it.
@@ -1307,6 +1496,42 @@ impl CompanionPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_tabs_keep_long_drafts_and_propagate_single_line_deletion() {
+        let (_, full, preserve) = prompt_drafts_on_tab_change("old task", "", true, false);
+        assert_eq!(full, "old task");
+        let (quick, full, preserve) = prompt_drafts_on_tab_change("old task", "", false, preserve);
+        assert!(quick.is_empty());
+        assert!(full.is_empty());
+        assert!(!preserve);
+
+        let (quick, full, preserve) =
+            prompt_drafts_on_tab_change("old task", "first\nsecond", false, false);
+        assert!(quick.is_empty());
+        assert!(preserve);
+        let (quick, full, preserve) =
+            prompt_drafts_on_tab_change("new task", &full, true, preserve);
+        assert_eq!(full, "first\nsecond");
+        let (quick, full, preserve) = prompt_drafts_on_tab_change(&quick, &full, false, preserve);
+        assert_eq!(quick, "new task");
+        assert_eq!(full, "first\nsecond");
+        assert!(preserve);
+
+        let (quick, _, preserve) = prompt_drafts_on_tab_change(&quick, &full, true, preserve);
+        let (quick, full, preserve) =
+            prompt_drafts_on_tab_change(&quick, "edited single line", false, preserve);
+        assert_eq!(quick, "new task");
+        assert_eq!(full, "edited single line");
+        assert!(preserve);
+
+        let (quick, full, preserve) = prompt_drafts_on_tab_change(&quick, "", false, preserve);
+        assert_eq!(quick, "new task");
+        assert!(full.is_empty());
+        assert!(!preserve);
+        let (_, full, _) = prompt_drafts_on_tab_change(&quick, &full, true, preserve);
+        assert_eq!(full, "new task");
+    }
 
     fn repository(name: &str) -> RepositoryRow {
         RepositoryRow {

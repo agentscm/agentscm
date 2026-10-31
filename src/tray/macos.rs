@@ -2342,9 +2342,42 @@ fn companion_attention(
 ) -> Option<String> {
     let mut alerts: Vec<_> = hub_signals
         .iter()
-        .filter(|signal| signal.available && signal.count > 0)
+        .filter(|signal| {
+            signal.available
+                && signal.count > 0
+                && snapshot
+                    .connections
+                    .iter()
+                    .any(|connection| connection.root == signal.root)
+        })
         .collect();
     alerts.sort_by_key(|signal| std::cmp::Reverse(signal.count));
+    let mut by_repository = std::collections::HashMap::<(String, String), (usize, usize)>::new();
+    for connection in &snapshot.connections {
+        if let Some(signal) = hub_signals
+            .iter()
+            .find(|signal| signal.available && signal.root == connection.root)
+        {
+            let entry = by_repository
+                .entry((connection.hub.clone(), connection.repository.clone()))
+                .or_default();
+            entry.0 = entry.0.max(signal.count.saturating_sub(signal.needs_you));
+            entry.1 = entry.1.max(signal.needs_you);
+        }
+    }
+    let mut catalog_extra = Vec::new();
+    for row in &catalog.repositories {
+        let key = (row.hub.clone(), row.repository.clone());
+        let entry = by_repository.entry(key).or_default();
+        if row.attention > entry.1
+            && snapshot.connections.iter().any(|connection| {
+                connection.hub == row.hub && connection.repository == row.repository
+            })
+        {
+            catalog_extra.push((row.repository.as_str(), row.attention - entry.1));
+        }
+        entry.1 = entry.1.max(row.attention);
+    }
     let remote = catalog
         .repositories
         .iter()
@@ -2354,24 +2387,109 @@ fn companion_attention(
             })
         })
         .collect::<Vec<_>>();
-    let total: usize = alerts.iter().map(|signal| signal.count).sum::<usize>()
-        + remote.iter().map(|row| row.attention).sum::<usize>();
+    let total: usize = by_repository
+        .values()
+        .map(|(inbox, human)| inbox + human)
+        .sum();
+    let human: usize = by_repository.values().map(|(_, human)| human).sum();
     let local = extras.attention.len();
+    let coverage_incomplete = catalog.unavailable_hubs > 0
+        || catalog.incomplete_hubs > 0
+        || hub_signals.len() < snapshot.connections.len()
+        || hub_signals
+            .iter()
+            .any(|signal| !signal.available || !signal.complete);
     if total + local > 0 {
+        if human == 0 && local == 0 {
+            let mut text = format!(
+                "{total} agent-to-agent Inbox request{} · follow in Hub",
+                if total == 1 { "" } else { "s" },
+            );
+            if coverage_incomplete {
+                text.push_str(" · some Hub data unavailable");
+            }
+            return Some(text);
+        }
+        let next_work = alerts
+            .iter()
+            .find_map(|signal| {
+                signal
+                    .work
+                    .iter()
+                    .find(|item| {
+                        item.state == "blocked"
+                            || item.state == "handover"
+                            || item.claim_status != "active"
+                    })
+                    .map(|item| (signal.repository.as_str(), item))
+            })
+            .or_else(|| {
+                catalog.repositories.iter().find_map(|row| {
+                    row.work
+                        .iter()
+                        .find(|item| {
+                            item.state == "blocked"
+                                || item.state == "handover"
+                                || item.claim_status != "active"
+                        })
+                        .map(|item| (row.repository.as_str(), item))
+                })
+            });
         let leading = alerts
             .iter()
             .take(2)
-            .map(|signal| format!("{} ({})", signal.repository, signal.count))
+            .map(|signal| signal.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let remote_leading = remote
+            .iter()
+            .filter(|row| row.attention > 0)
+            .take(2)
+            .map(|row| format!("{} ({})", row.repository, row.attention))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let catalog_leading = catalog_extra
+            .iter()
+            .take(2)
+            .map(|(repository, count)| {
+                format!(
+                    "{repository} ({count} Hub decision{})",
+                    if *count == 1 { "" } else { "s" }
+                )
+            })
             .collect::<Vec<_>>()
             .join(" · ");
         let mut text = format!("{} Work / Inbox signals", total);
+        if let Some((repository, item)) = next_work {
+            if item.next_action == "No next action reported" {
+                text.push_str(&format!(" · {repository}: {} · Open in Hub", item.title));
+            } else {
+                text.push_str(&format!(
+                    " · {repository}: {} · Next: {}",
+                    item.title, item.next_action
+                ));
+            }
+            if local > 0 {
+                text.push_str(&format!(" · {local} local setup alerts"));
+            }
+            if coverage_incomplete {
+                text.push_str(" · some Hub data unavailable");
+            }
+            return Some(text);
+        }
         if local > 0 {
             text.push_str(&format!(" · {local} local setup alerts"));
         }
         if !leading.is_empty() {
             text.push_str(&format!(" · {leading}"));
         }
-        if catalog.unavailable_hubs > 0 || catalog.incomplete_hubs > 0 {
+        if !remote_leading.is_empty() {
+            text.push_str(&format!(" · {remote_leading}"));
+        }
+        if !catalog_leading.is_empty() {
+            text.push_str(&format!(" · {catalog_leading}"));
+        }
+        if coverage_incomplete {
             text.push_str(" · some Hub data unavailable");
         }
         return Some(text);
@@ -2533,27 +2651,20 @@ fn companion_rows(
                 })
                 .unwrap_or_default();
             if let Some(catalog_row) = catalog_row {
-                work.extend(catalog_row.live.iter().map(companion_live_row));
+                append_live_work(&mut work, &catalog_row.live);
             }
             if let Some(run) = run.filter(|run| run.root == connection.root) {
-                local.insert(
-                    0,
-                    companion_panel::LocalAgentRow {
-                        agent: run.agent.label().into(),
-                        detail: format!("Quick prompt · {}", run.state),
-                        observed: true,
-                        needs_you: run.state == "launch or status failed",
-                    },
-                );
+                merge_local_run(&mut local, run.agent.label(), run.state);
             }
             companion_panel::RepositoryRow {
                 name: connection.repository.clone(),
                 hub: Some(connection.hub.clone()),
                 local_agents,
                 hub_state,
-                attention: signal.filter(|signal| signal.available).map_or_else(
-                    || catalog_row.map_or(0, |row| row.attention),
-                    |signal| signal.count,
+                attention: catalog_row.map_or(0, |row| row.attention).max(
+                    signal
+                        .filter(|signal| signal.available)
+                        .map_or(0, |signal| signal.needs_you),
                 ),
                 work_note,
                 local,
@@ -2617,19 +2728,22 @@ fn companion_rows(
                     "No work in this partial Hub snapshot".into()
                 },
                 local: Vec::new(),
-                work: row
-                    .work
-                    .iter()
-                    .map(|item| companion_panel::WorkRow {
-                        agent: item.agent.clone(),
-                        title: item.title.clone(),
-                        detail: companion_work_detail(item),
-                        needs_you: item.state == "blocked"
-                            || item.state == "handover"
-                            || item.claim_status != "active",
-                    })
-                    .chain(row.live.iter().map(companion_live_row))
-                    .collect(),
+                work: {
+                    let mut work = row
+                        .work
+                        .iter()
+                        .map(|item| companion_panel::WorkRow {
+                            agent: item.agent.clone(),
+                            title: item.title.clone(),
+                            detail: companion_work_detail(item),
+                            needs_you: item.state == "blocked"
+                                || item.state == "handover"
+                                || item.claim_status != "active",
+                        })
+                        .collect::<Vec<_>>();
+                    append_live_work(&mut work, &row.live);
+                    work
+                },
                 overflow: 0,
             }),
     );
@@ -2670,6 +2784,40 @@ fn companion_live_row(item: &companion_hub::LiveAgent) -> companion_panel::WorkR
         title: item.task.clone(),
         detail: format!("Active in Hub · seen through {}", item.source),
         needs_you: false,
+    }
+}
+
+fn merge_local_run(local: &mut Vec<companion_panel::LocalAgentRow>, agent: &str, state: &str) {
+    let row = companion_panel::LocalAgentRow {
+        agent: agent.into(),
+        detail: format!("Quick prompt · {state}"),
+        observed: true,
+        needs_you: state == "launch or status failed",
+    };
+    if let Some(existing) = local
+        .iter_mut()
+        .find(|existing| existing.agent.eq_ignore_ascii_case(&row.agent))
+    {
+        existing.detail = if existing.needs_you {
+            format!("{} · {}", existing.detail, row.detail)
+        } else {
+            row.detail
+        };
+        existing.observed = true;
+        existing.needs_you |= row.needs_you;
+    } else {
+        local.insert(0, row);
+    }
+}
+
+fn append_live_work(work: &mut Vec<companion_panel::WorkRow>, live: &[companion_hub::LiveAgent]) {
+    for item in live {
+        if !work.iter().any(|reported| {
+            reported.agent.eq_ignore_ascii_case(&item.agent)
+                && reported.title.eq_ignore_ascii_case(&item.task)
+        }) {
+            work.push(companion_live_row(item));
+        }
     }
 }
 
@@ -3665,6 +3813,7 @@ mod tests {
             available: true,
             complete,
             count: keys.len(),
+            needs_you: 0,
             work: Vec::new(),
         }
     }
@@ -3882,6 +4031,157 @@ mod tests {
                 .unwrap()
                 .contains("2 Work / Inbox signals")
         );
+        assert!(
+            companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot)
+                .unwrap()
+                .contains("Prepare release · Next: Ask for review")
+        );
+    }
+
+    #[test]
+    fn panel_keeps_checkout_attention_when_catalog_lags() {
+        let connection = share_connection("/synthetic/project", None);
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![connection],
+        };
+        let mut signal = signal("/synthetic/project", &["overlap:a:b"], true);
+        signal.needs_you = 1;
+        let catalog = companion_hub::Catalog {
+            repositories: vec![companion_hub::CatalogRepository {
+                hub: "https://hub.example".into(),
+                repository: "example/project".into(),
+                agents: 0,
+                attention: 0,
+                attention_revision: String::new(),
+                attention_complete: false,
+                complete: false,
+                work: vec![],
+                live: vec![],
+            }],
+            ..Default::default()
+        };
+        let rows = companion_rows(
+            &snapshot,
+            &crate::client_activity::ActivityStore::default(),
+            &[signal],
+            &catalog,
+            None,
+        );
+        assert_eq!(rows[0].attention, 1);
+    }
+
+    #[test]
+    fn panel_does_not_repeat_the_same_hub_task_as_a_live_session() {
+        let mut work = vec![companion_panel::WorkRow {
+            agent: "Codex".into(),
+            title: "Prepare release".into(),
+            detail: "Working".into(),
+            needs_you: false,
+        }];
+        append_live_work(
+            &mut work,
+            &[
+                companion_hub::LiveAgent {
+                    agent: "codex".into(),
+                    task: "prepare release".into(),
+                    source: "session".into(),
+                },
+                companion_hub::LiveAgent {
+                    agent: "Claude Code".into(),
+                    task: "Review patch".into(),
+                    source: "intent".into(),
+                },
+            ],
+        );
+        assert_eq!(work.len(), 2);
+        assert_eq!(work[1].title, "Review patch");
+    }
+
+    #[test]
+    fn agent_inbox_only_attention_is_labeled_as_agent_handled() {
+        let signal = signal("/synthetic/project", &["request:open"], true);
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![share_connection("/synthetic/project", None)],
+        };
+        assert_eq!(
+            companion_attention(
+                &MenuExtras::default(),
+                &[signal],
+                &companion_hub::Catalog::default(),
+                &snapshot,
+            )
+            .as_deref(),
+            Some("1 agent-to-agent Inbox request · follow in Hub")
+        );
+    }
+
+    #[test]
+    fn connected_catalog_decision_is_in_attention_with_agent_inbox() {
+        let signal = signal("/synthetic/project", &["request:open"], true);
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![share_connection("/synthetic/project", None)],
+        };
+        let catalog = companion_hub::Catalog {
+            repositories: vec![companion_hub::CatalogRepository {
+                hub: "https://hub.example".into(),
+                repository: "example/project".into(),
+                agents: 0,
+                attention: 1,
+                attention_revision: String::new(),
+                attention_complete: true,
+                complete: true,
+                work: vec![],
+                live: vec![],
+            }],
+            ..Default::default()
+        };
+        let text =
+            companion_attention(&MenuExtras::default(), &[signal], &catalog, &snapshot).unwrap();
+        assert!(text.contains("2 Work / Inbox signals"));
+        assert!(text.contains("example/project (1 Hub decision)"));
+    }
+
+    #[test]
+    fn duplicate_checkouts_keep_distinct_inbox_and_human_evidence() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![
+                share_connection("/synthetic/first", None),
+                share_connection("/synthetic/second", None),
+            ],
+        };
+        let mut human = signal("/synthetic/first", &["work:blocked"], true);
+        human.needs_you = 1;
+        let inbox = signal("/synthetic/second", &["request:open"], true);
+        let text = companion_attention(
+            &MenuExtras::default(),
+            &[human, inbox],
+            &companion_hub::Catalog::default(),
+            &snapshot,
+        )
+        .unwrap();
+        assert!(text.contains("2 Work / Inbox signals"));
+    }
+
+    #[test]
+    fn local_run_keeps_an_existing_connection_alert() {
+        let mut local = vec![companion_panel::LocalAgentRow {
+            agent: "Codex".into(),
+            detail: "Sign-in rejected · reconnect this checkout".into(),
+            observed: true,
+            needs_you: true,
+        }];
+        merge_local_run(&mut local, "Codex", "client process running");
+        assert_eq!(local.len(), 1);
+        assert!(local[0].needs_you);
+        assert!(local[0].detail.starts_with("Sign-in rejected"));
     }
 
     #[test]
