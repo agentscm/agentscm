@@ -558,15 +558,23 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           res.statusCode = 204
           return res.end()
         }
-        if (url.pathname === '/session') return scenario === 'empty' || !browserSignedIn ? send(401, { error: 'sign_in_required' }) : send(200, { user: { id: 'usr_maria', login: 'maria', provider: 'github', host: 'github.com', user_id: 1001 }, admin: true, csrf_token: 'synthetic-csrf-no-authority', expires_at: ago(-86400 / 3) })
+        if (url.pathname === '/session') return scenario === 'empty' || !browserSignedIn ? send(401, { error: 'sign_in_required' }) : send(200, { user: { id: 'usr_maria', login: 'maria', provider: 'github', host: 'github.com', user_id: 1001, joined_at: /(?:^|;\s*)mock_new=1/.test(req.headers.cookie ?? '') ? ago(3600) : ago(40 * 86400) }, admin: true, csrf_token: 'synthetic-csrf-no-authority', expires_at: ago(-86400 / 3) })
         if (url.pathname === '/session/repositories') {
           if (scenario === 'empty' || !browserSignedIn) return send(401, { error: 'sign_in_required' })
           const row = (repository: string, needs_you: number, total: number, moving: number, stuck: number, agents: number, idle: number | null, complete = true) => ({ repository, repository_id: repository.length, provider: 'github', unfinished: { total, moving, stuck }, needs_you, agents, last_activity_at: idle === null ? null : ago(idle), complete })
           // One row in the full scenario keeps the landing on #home that the e2e specs expect; demo shows several,
           // including the repository whose read token the mock refuses.
-          const rows = scenario === 'demo'
-            ? [row(REPO, 2, 5, 3, 2, 4, 120), row(REFUSED_REPO, 1, 2, 1, 1, 2, 3600), row('acme/billing-docs', 0, 3, 1, 2, 1, 7200, false), row('acme/infra', 0, 2, 2, 0, 3, 600), row('acme/design-system', 0, 0, 0, 0, 0, 86400 * 9), row('acme/handbook', 0, 0, 0, 0, 0, null)]
-            : [row(REPO, 0, 1, 1, 0, 1, 300)]
+          // A `mock_repos` cookie (or MOCK_REPOS) picks a set for screenshots: quiet (agents busy, nothing needs you),
+          // attention (the demo set) or new (no agent anywhere yet). Without one, the scenario decides.
+          const pick = /(?:^|;\s*)mock_repos=(\w+)/.exec(req.headers.cookie ?? '')?.[1] ?? process.env['MOCK_REPOS']
+          const attention = [row(REPO, 2, 5, 3, 2, 4, 120), row(REFUSED_REPO, 1, 2, 1, 1, 2, 3600), row('acme/billing-docs', 0, 3, 1, 2, 1, 7200, false), row('acme/infra', 0, 2, 2, 0, 3, 600), row('acme/design-system', 0, 0, 0, 0, 0, 86400 * 9), row('acme/handbook', 0, 0, 0, 0, 0, null)]
+          const rows = pick === 'quiet'
+            ? [row(REPO, 0, 3, 3, 0, 2, 90), row('acme/infra', 0, 1, 1, 0, 1, 1800), row('acme/web', 0, 0, 0, 0, 1, 5400), row('acme/design-system', 0, 0, 0, 0, 0, 86400 * 9), row('acme/handbook', 0, 0, 0, 0, 0, null)]
+            : pick === 'new'
+              ? [row(REPO, 0, 0, 0, 0, 0, null), row('acme/infra', 0, 0, 0, 0, 0, 86400 * 30), row('acme/handbook', 0, 0, 0, 0, 0, null)]
+              : pick === 'attention' || scenario === 'demo'
+                ? attention
+                : [row(REPO, 0, 1, 1, 0, 1, 300)]
           return send(200, { repositories: rows, unchecked: scenario === 'demo' ? 1 : 0, complete: true, checked_at: ago(0) })
         }
         if (url.pathname === '/devices') return send(200, { devices: scenario === 'empty' ? [] : devices().filter((d) => d.owner.login === maria.login).map((d) => ({ ...d, owner: undefined })) })
@@ -620,6 +628,21 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         const empty = scenario === 'empty'
         const billingDocs = token.startsWith('webread:acme:billing-docs:')
         if (url.pathname === '/standup/overview') return send(200, empty || billingDocs ? { ...overview(), current: [], recent: [], overlaps: [] } : overview())
+        // The agent briefing for the human subscriber: written by a synthetic agent over the overview's work, or pending when there is none.
+        if (url.pathname === '/standup/narrative') {
+          const written = !(empty || billingDocs)
+          const ref = (id: string, label: string) => ({ id, label, work_id: `wrk_${id.repeat(32)}`, commit: null, pull_number: null })
+          return send(200, {
+            id: 'brief_synthetic_1', digest: 'd'.repeat(64), status: written ? 'ready' : 'pending', generated_at: written ? ago(900) : null, generated_by: written ? 'claude-code' : null,
+            window: { event_from: 27, event_through: 40, merge_from: 0, merge_through: 2, subscriber: 'human', complete: true },
+            sources: written ? [ref('a', 'Refactor the billing module'), ref('f', 'Round invoice totals per currency')] : [], warnings: [],
+            output: written ? {
+              headline: 'Invoice rounding shipped; the billing refactor is the main work still moving.', headline_references: ['a', 'f'],
+              facts: [{ text: 'Round invoice totals per currency was reported finished.', references: ['f'] }, { text: 'The billing refactor extracted the tax module and reports tests green.', references: ['a'] }],
+              implications: [{ text: 'Check the billing scope before editing src/billing.rs, since two tasks declare it.', references: ['a'] }],
+            } : null,
+          })
+        }
         // A fixed personal delivery over the overview's work, two coordination events and two merges. Ack empties it once.
         if (url.pathname === '/standup/briefing') {
           const ov = overview()

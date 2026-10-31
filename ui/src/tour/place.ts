@@ -14,10 +14,14 @@ export interface Placement {
   style: { top?: number; left?: number; right?: number; bottom?: number; width?: number; maxHeight?: string; inset?: number; margin?: string; height?: string }
 }
 
-export const CARD_W = 400
-export const HERO_W = 480
-// Spacious density: 100px wider (tour.css sizes the type and padding to match).
-const WIDE = 100
+// Beside a target the card is 560px (840 spacious); centred it has room to spread: 640 (920), and the welcome hero 680 (960).
+// Past WIDE_FROM px tour.css lays the copy out in two columns, so lines stay short however wide the card is.
+export const CARD_W = 560
+export const CENTER_W = 640
+export const HERO_W = 680
+export const WIDE_FROM = 760
+// Spacious density: 280px wider (tour.css sizes the type and padding to match).
+const WIDE = 280
 const GAP = 12
 const EDGE = 16
 const COMPACT_H = 300
@@ -30,7 +34,7 @@ export function placeCard(rect: Rect | null, card: { fullH: number; h: number; h
   const extra = spacious ? WIDE : 0
   const narrow = vp.w <= 640
   if (!rect) {
-    const w = Math.min((card.hero ? HERO_W : CARD_W) + extra, vp.w - 32)
+    const w = Math.min((card.hero ? HERO_W : CENTER_W) + extra, vp.w - 32)
     return { compact: vp.h < card.fullH + 32, sheet: false, style: { inset: 0, margin: 'auto', height: 'fit-content', width: w } }
   }
   if (narrow) {

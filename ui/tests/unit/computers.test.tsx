@@ -73,6 +73,16 @@ describe('auth and requests', () => {
     }
   })
 
+  it('reads the optional account age as unix seconds and drops anything else', async () => {
+    const withUser = (joined_at: unknown) => stubFetch({ 'GET /v1/hub/session': () => ({ status: 200, body: { ...SESSION, user: { ...SESSION.user, joined_at } } }) })
+    withUser(1_900_000_000)
+    expect((await fetchBrowserSession())?.joinedAt).toBe(1_900_000_000)
+    for (const bad of [null, '1900000000', 0, -5, Number.NaN, {}]) {
+      withUser(bad)
+      expect((await fetchBrowserSession())?.joinedAt).toBeUndefined() // an older Hub, or nonsense: no pulse
+    }
+  })
+
   it('has no way in on the hosted Hub without a browser session', async () => {
     stubFetch({ 'GET /v1/hub/session': () => ({ status: 401, body: { error: 'sign_in_required' } }) })
     expect(await deviceAuth('read-only-token')).toBeNull()

@@ -30,10 +30,14 @@ export function clientSetupCommand(rawOrigin: string, agent: ClientAgent): strin
   return origin ? `npx agentscm client setup --agent ${shellQuote(agent)} --hub ${shellQuote(origin)}` : null
 }
 
-export function agentSetupPrompt(rawOrigin: string): string | null {
+const REPO = /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/
+
+/** With `repo`, the agent starts in that repository's checkout. Kept short: the prompt rides in a launch link. */
+export function agentSetupPrompt(rawOrigin: string, repo?: string | null): string | null {
   const origin = safeHubOrigin(rawOrigin)
+  const where = repo && REPO.test(repo) ? ` Work in my checkout of ${repo}, cloning it if needed.` : ''
   return origin
-    ? `Set up AgentSCM on this computer for the Hub at ${origin}. Run: npx agentscm --yes --json --hub-url ${shellQuote(origin)}. If it prints a sign-in link, show it to me and wait while I sign in. It sets up every coding agent it finds, once for all my projects. Tell me which agents it set up and which failed. Then tell me to fully quit and reopen my agents, and, for Codex, to run /hooks once and trust the AgentSCM hooks. Leave trust approvals to me; do not edit trust records, create accounts, expose tokens or deploy a Hub.`
+    ? `Set up AgentSCM on this computer for the Hub at ${origin}.${where} Run: npx agentscm --yes --json --hub-url ${shellQuote(origin)}. If it prints a sign-in link, show it to me and wait while I sign in. It sets up every coding agent it finds, once for all my projects. Tell me which agents it set up and which failed. Then tell me to fully quit and reopen my agents, and, for Codex, to run /hooks once and trust the AgentSCM hooks. Leave trust approvals to me; do not edit trust records, create accounts, expose tokens or deploy a Hub.`
     : null
 }
 
