@@ -68,32 +68,42 @@
 .tour-band { display: grid; place-items: center; height: 84px; flex: none; background: var(--hub-brand-soft); color: var(--hub-text-2); border-bottom: 1px solid var(--hub-rule); }
 .tour-band.is-hero { height: 140px; }
 .tour-art { height: 100%; max-width: 100%; padding: 6px 0; }
-.tour-art .ln { fill: none; stroke: var(--hub-text-2); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
-.tour-art .ln.soft { stroke: var(--hub-text-3); stroke-opacity: 0.7; }
-.tour-art .ln.brand { stroke: var(--hub-brand); }
-.tour-art .ln.bad { stroke: var(--hub-bad); }
-.tour-art .ln.ok { stroke: var(--hub-ok); }
+.tour-art .ln { fill: none; stroke: var(--c); stroke-width: var(--sw, 1.5); stroke-linecap: round; stroke-linejoin: round; }
+.tour-art .ln.ink { --c: var(--hub-text-2); }
+.tour-art .ln.soft { --c: var(--hub-text-3); stroke-opacity: 0.7; }
+.tour-art .ln.brand { --c: var(--hub-brand); }
+.tour-art .ln.bad { --c: var(--hub-bad); }
+.tour-art .ln.ok { --c: var(--hub-ok); }
 .tour-art .ln.dot { fill: var(--hub-surface); }
 .tour-art .ln.dot.brand { fill: var(--hub-brand); }
 .tour-art .ln.dot.ok { fill: var(--hub-ok); }
 .tour-art .ln.dot.bad { fill: var(--hub-bad); }
+/* A few shapes carry a soft tint of their own colour, so a drawing has weight as well as line. */
+.tour-art .ln.fill { fill: color-mix(in srgb, var(--c) 24%, transparent); }
+.tour-art .breathe { fill: var(--hub-brand); fill-opacity: 0.1; transform-box: fill-box; transform-origin: center; }
+.tour-art .rest .ln.ink { stroke-opacity: 0.6; }
+.tour-art .rest .ln.brand { stroke-opacity: 0.75; }
+.tour-art .rider { fill: var(--hub-brand); stroke: var(--hub-surface); stroke-width: 1.2; }
 .tour-hero .agent rect { fill: var(--hub-surface); stroke: var(--hub-brand); stroke-width: 1.5; }
 .tour-hero .agent path { fill: none; stroke: var(--hub-text-2); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .tour-hero .hub circle { fill: var(--hub-brand); }
 .tour-hero .hub path { fill: none; stroke: var(--hub-surface); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .tour-hero .halo { fill: var(--hub-brand); fill-opacity: 0.16; }
+.tour-hero .ring { fill: none; stroke: var(--hub-text-3); stroke-opacity: 0.35; stroke-width: 1; }
 .tour-hero .agent, .tour-hero .hub, .tour-hero .halo { transform-box: fill-box; transform-origin: center; }
 
 @media (prefers-reduced-motion: no-preference) {
-  .tour-art .ln:not(.dot) { stroke-dasharray: 1; animation: tour-draw 600ms var(--tour-ease) backwards; animation-delay: calc(var(--i, 0) * 70ms); }
-  .tour-art .ln.dot { animation: tour-pop 320ms var(--tour-ease) backwards; animation-delay: calc(var(--i, 0) * 70ms + 200ms); transform-box: fill-box; transform-origin: center; }
+  .tour-art .ln:not(.dot) { stroke-dasharray: 1; animation: tour-draw 600ms var(--tour-ease) backwards; animation-delay: calc((var(--b, 0) + var(--i, 0)) * 70ms); }
+  .tour-art .ln.dot { animation: tour-pop 320ms var(--tour-ease) backwards; animation-delay: calc((var(--b, 0) + var(--i, 0)) * 70ms + 200ms); transform-box: fill-box; transform-origin: center; }
+  /* The one loop in a drawing: its halo breathes, slowly. (A dot riding a path is SMIL in art.tsx.) */
+  .tour-art .breathe { animation: tour-breathe 4.4s ease-in-out 1.2s infinite; }
   .tour-hero .ln { animation-duration: 640ms; animation-delay: calc(var(--i, 0) * 140ms + 180ms); }
-  .tour-hero:not(.is-still) .agent { animation: tour-pop 300ms var(--tour-ease) backwards; animation-delay: calc(var(--i, 0) * 140ms); }
-  .tour-hero:not(.is-still) .hub { animation: tour-pop 360ms var(--tour-ease) backwards 800ms; }
-  .tour-hero:not(.is-still) .halo { animation: tour-halo 500ms var(--tour-ease) backwards 900ms; }
-  .tour-hero.is-still .ln, .tour-hero.is-still .ln.dot { animation: none; stroke-dasharray: none; }
+  .tour-hero .agent { animation: tour-pop 300ms var(--tour-ease) backwards; animation-delay: calc(var(--i, 0) * 140ms); }
+  .tour-hero .hub { animation: tour-pop 360ms var(--tour-ease) backwards 800ms; }
+  .tour-hero .halo { animation: tour-halo 500ms var(--tour-ease) backwards 900ms; }
   .tour-live-dot::after { animation: tour-ripple 900ms var(--tour-ease) 1 backwards 250ms; }
 }
+@keyframes tour-breathe { 0%, 100% { transform: scale(0.82); opacity: 0.6; } 50% { transform: scale(1.12); opacity: 1; } }
 @keyframes tour-draw { from { stroke-dashoffset: 1; opacity: 0; } 12% { opacity: 1; } to { stroke-dashoffset: 0; opacity: 1; } }
 @keyframes tour-pop { from { opacity: 0; transform: scale(0.6); } }
 @keyframes tour-halo { from { opacity: 0; transform: scale(0.55); } }
@@ -118,12 +128,12 @@
 
 .tour-swap { display: flex; flex-direction: column; gap: var(--tour-gap, 12px); }
 .tour-title { margin: 0; font-size: 1.125rem; font-weight: 700; line-height: 1.25; letter-spacing: -0.01em; text-wrap: balance; }
-.tour-what { margin: 0; font-size: 0.906rem; line-height: var(--tour-lh, 1.5); color: var(--hub-text); }
+.tour-what { margin: 0; max-width: 68ch; font-size: 0.906rem; line-height: var(--tour-lh, 1.5); color: var(--hub-text); }
 .tour-body { display: grid; gap: var(--tour-rows, 10px); margin: 0; }
 .tour-row { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 10px; }
 .tour-glyph { width: 16px; height: 16px; margin-top: 2px; fill: none; stroke: var(--hub-brand); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .tour-row dt { font-size: 0.78rem; font-weight: 600; color: var(--hub-text-3); }
-.tour-row dd { margin: 1px 0 0; font-size: 0.844rem; line-height: var(--tour-lh, 1.45); color: var(--hub-text-2); }
+.tour-row dd { margin: 1px 0 0; max-width: 68ch; font-size: 0.844rem; line-height: var(--tour-lh, 1.45); color: var(--hub-text-2); }
 .tour-more { display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; min-height: 32px; padding: 2px 8px 2px 0; border: 0; background: transparent; color: var(--hub-brand-ink); font-size: 0.82rem; font-weight: 600; }
 .tour-more::after { content: ''; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform 160ms var(--tour-ease); }
 .tour-more[aria-expanded='true']::after { transform: translateY(1px) rotate(-135deg); }
@@ -216,7 +226,11 @@
   --hub-text-3: var(--frame-dim);
   --hub-brand: var(--frame-active-icon);
   --hub-surface: var(--frame);
-  background: radial-gradient(120% 140% at 50% 0%, color-mix(in srgb, var(--frame-brand) 34%, var(--frame)) 0%, var(--frame) 70%);
+  --hub-ok: var(--hub-ok-fill);
+  --hub-bad: var(--frame-coral);
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--frame-ink) 12%, transparent) 1px, transparent 0) 0 0 / 20px 20px,
+    radial-gradient(120% 140% at 50% 0%, color-mix(in srgb, var(--frame-brand) 34%, var(--frame)) 0%, var(--frame) 70%);
   border-bottom: 0;
   color: var(--frame-ink);
 }
@@ -230,3 +244,24 @@
 .tour-foot { border-top: 0; padding-top: 6px; }
 .tour-buttons .btn { border-radius: 999px; }
 .tour-keys kbd { border-radius: 6px; background: var(--hub-sunken); color: var(--hub-text-2); box-shadow: none; }
+
+/* ---------- Wide cards (760px and up): the copy goes into two columns, so lines stay short however wide the card is ---------- */
+.tour-layer .tour-card.is-wide .tour-band { height: 148px; }
+.tour-layer .tour-card.is-wide .tour-band.is-hero { height: 200px; }
+.tour-layer .tour-card.is-wide .tour-cols { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); column-gap: 40px; align-items: start; }
+.tour-layer .tour-card.is-wide .tour-cols > .tour-what { grid-column: 1; grid-row: 1; }
+.tour-layer .tour-card.is-wide .tour-cols > .tour-body { grid-column: 2; grid-row: 1; }
+
+/* ---------- First sign-in: the ? button invites a first look. A soft violet ring that breathes a dozen times, then rests as a still ring. ---------- */
+.topbar .tour-trigger.is-pulsing {
+  background: color-mix(in srgb, var(--frame-brand) 30%, transparent);
+  color: var(--frame-ink);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--frame-active-icon) 50%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .topbar .tour-trigger.is-pulsing { animation: tour-invite 3.8s ease-in-out 1.5s 12; }
+}
+@keyframes tour-invite {
+  0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--frame-active-icon) 24%, transparent), 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--frame-active-icon) 62%, transparent), 0 0 14px 4px color-mix(in srgb, var(--frame-brand) 55%, transparent); }
+}

@@ -631,7 +631,7 @@ function RailTip({ on, text, children }: { on: boolean; text: string; children: 
   return on ? <Tip text={text} placement="right" className="rail-tip">{children}</Tip> : <>{children}</>
 }
 
-function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer, onClose }: { nav: NavDef[]; sections: SectionDef[]; section: Section; badges: Badges; collapsed: boolean; onCollapse: () => void; drawer: boolean; onClose: () => void }) {
+function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer, onClose, allRepos = false }: { /** The web sign-in can read more than one repository, so All repositories leads the rail. */ allRepos?: boolean; nav: NavDef[]; sections: SectionDef[]; section: Section; badges: Badges; collapsed: boolean; onCollapse: () => void; drawer: boolean; onClose: () => void }) {
   const hash = useHash()
   // A task's own page is reached from the dashboard's track, so the dashboard stays lit.
   const here = section === 'repositories' ? null : section === 'work' && workIdFromHash(hash) ? 'home' : sections.find((s) => s.key === section)?.nav
@@ -641,6 +641,17 @@ function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer
       <aside data-tour="nav" className={`side${collapsed ? ' is-compact' : ''}${drawer ? ' is-open' : ''}`} aria-label="Hub sections">
         <nav className="side-nav">
           <div className="side-group">
+            {allRepos && (
+              <RailTip on={collapsed && !drawer} text="All repositories: Which of my repositories need me?">
+                <a href="#repositories" data-tour="nav-repositories" className={`side-link${section === 'repositories' ? ' active' : ''}`} aria-current={section === 'repositories' ? 'page' : undefined} aria-label={collapsed && !drawer ? 'All repositories' : undefined} onClick={onClose}>
+                  <span className="side-icon"><Icon name="collection" /></span>
+                  <span className="side-text">
+                    <span className="side-label">All repositories</span>
+                    <span className="side-q">Which of my repositories need me?</span>
+                  </span>
+                </a>
+              </RailTip>
+            )}
             {nav.map((n) => {
               const b = badges[n.key]
               const active = here === n.key
@@ -911,7 +922,7 @@ export function AppChrome({ logo, token, repo, web, hubSignedOut = false, nav, s
             <AccountMenu data={data} onForget={onForget} web={!!web} />
           </div>}
         </header>
-        <div hidden={hubSignedOut}><SideNav nav={nav} sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} /></div>
+        <div hidden={hubSignedOut}><SideNav allRepos={!!web && web.repos.length > 1} nav={nav} sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} /></div>
         <div className="content">
           <Breadcrumbs section={current} overview={overview} />
           <main className="main" id="main" tabIndex={-1} data-tour="main" data-section={current.key}>

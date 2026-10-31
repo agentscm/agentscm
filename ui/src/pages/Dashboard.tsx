@@ -499,6 +499,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
           {needs.length === 0 && start}
           <Coach id="needs" side="above">These wait on a person. Open a row for the reason and who decides; its button opens or copies the prompt for the agent.</Coach>
           <NeedsYou needs={all} ov={ov} d={d} me={handoff.me} handoff={handoff} />
+          <NarrativePanel token={token} compact />
           {needs.length > 0 && start}
           <Coach id="track" side="above">Every unfinished task, left to right: claimed, now, next, finished. Open a task for its full story.</Coach>
           <Track ov={ov} />

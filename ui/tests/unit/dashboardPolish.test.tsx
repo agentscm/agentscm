@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Derived } from '../../src/derive.ts'
 import { DashboardPage } from '../../src/pages/Dashboard.tsx'
 import type { WorkItem, WorkOverview } from '../../src/standup.ts'
@@ -25,6 +25,13 @@ const page = (ov: WorkOverview) => (
     <DashboardPage section="home" question="q" token="t" repo="acme/widgets" data={data} d={d} overview={ready(ov)} />
   </TourProvider>
 )
+// The Dashboard asks for the agent briefing; unless a test says otherwise this Hub has none (404).
+let narrative: unknown = null
+beforeEach(() => {
+  narrative = null
+  vi.stubGlobal('fetch', async (url: string) => new Response(narrative === null ? '{}' : JSON.stringify(narrative), { status: url.startsWith('/v1/hub/standup/narrative') && narrative !== null ? 200 : 404 }))
+})
+afterEach(() => vi.unstubAllGlobals())
 afterEach(() => localStorage.setItem(TOUR, '{"welcomeSeen":true,"welcomeOff":true,"autoplay":[],"sectionsSeen":[]}'))
 const before = (a: Element, b: Element) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
 
@@ -112,7 +119,8 @@ describe('a Needs you row', () => {
 })
 
 describe('coach marks', () => {
-  const fresh = () => localStorage.removeItem(TOUR)
+  // The introduction is off by default; these are the viewers who switched it on in Settings.
+  const fresh = () => localStorage.setItem(TOUR, '{"welcomeSeen":false,"welcomeOff":false,"autoplay":[],"sectionsSeen":[],"helpSeen":false}')
   const marks = () => [...document.querySelectorAll<HTMLElement>('[data-coach]')]
   const stored = () => JSON.parse(localStorage.getItem(TOUR) ?? 'null')
 
@@ -152,5 +160,89 @@ describe('coach marks', () => {
   it('never show for a viewer who already finished or switched off the old welcome tour', () => {
     render(page(overview([blocked()])))
     expect(marks()).toHaveLength(0)
+  })
+
+  it('stay away by default, for a first-time viewer with nothing saved', () => {
+    localStorage.removeItem(TOUR)
+    render(page(overview([blocked()])))
+    expect(marks()).toHaveLength(0)
+  })
+})
+
+describe('the Agent briefing on the first tab', () => {
+  const wid = `wrk_${'a'.repeat(32)}`
+  const view = (over: Record<string, unknown> = {}) => ({
+    id: 'b1', digest: 'b'.repeat(64), status: 'ready', generated_at: now - 600, generated_by: 'claude-code',
+    window: { event_from: 1, event_through: 2, merge_from: 0, merge_through: 0, subscriber: 'human', complete: true },
+    sources: [{ id: 's1', label: 'Round invoice totals', work_id: wid, commit: null, pull_number: null }], warnings: [],
+    output: { headline: 'Invoice rounding shipped.', headline_references: ['s1'], facts: [{ text: 'It was reported finished.', references: ['s1'] }], implications: [{ text: 'Check the scope before editing.', references: ['s1'] }] }, ...over,
+  })
+
+  it('follows the Needs you list: headline, facts and implications in view, sources folded away, a way to the full Catch up', async () => {
+    narrative = view()
+    render(page(overview([blocked()])))
+    const brief = await waitFor(() => {
+      const b = document.getElementById('agent-briefing')
+      if (!b?.querySelector('.brief-headline')?.textContent?.includes('Invoice rounding shipped.')) throw new Error('not yet')
+      return b
+    })
+    expect(brief.classList.contains('brief-compact')).toBe(true)
+    expect(before(document.getElementById('box-needs')!, brief)).toBe(true)
+    expect(before(brief, document.getElementById('box-track')!)).toBe(true)
+    expect(brief.textContent).toMatch(/Written by claude-code/)
+    expect(within(brief).getByRole('heading', { name: 'Reported facts' })).toBeTruthy()
+    expect(within(brief).getByText('It was reported finished.')).toBeTruthy()
+    expect(within(brief).getByRole('heading', { name: 'What this may mean for your work' })).toBeTruthy()
+    expect(within(brief).getByText('Check the scope before editing.')).toBeTruthy()
+    // No task box on the Dashboard; that stays on Catch up.
+    expect(within(brief).queryByRole('button', { name: 'Brief this task' })).toBeNull()
+    expect(within(brief).getByRole('link', { name: /Read in full on Catch up/ }).getAttribute('href')).toBe('#activity')
+    const sources = brief.querySelector('details')!
+    expect(sources.open).toBe(false)
+    expect(sources.querySelector('summary')!.textContent).toBe('Sources and warnings')
+    expect(sources.querySelector('.brief-sources')!.textContent).toContain('Round invoice totals')
+    // A numbered citation opens the fold so its source can be seen.
+    Element.prototype.scrollIntoView = vi.fn()
+    fireEvent.click(within(brief).getAllByRole('link', { name: 'Source 1: Round invoice totals' })[0]!)
+    expect(sources.open).toBe(true)
+  })
+
+  it('flags an incomplete window or warnings on the fold without opening it', async () => {
+    narrative = view({ warnings: ['One source was skipped'], window: { event_from: 1, event_through: 2, merge_from: 0, merge_through: 0, subscriber: 'human', complete: false } })
+    render(page(overview([item('a', 'dev')])))
+    const fold = await waitFor(() => {
+      const f = document.querySelector<HTMLDetailsElement>('#agent-briefing details')
+      if (!f) throw new Error('not yet')
+      return f
+    })
+    expect(fold.open).toBe(false)
+    expect(fold.querySelector('summary')!.textContent).toBe('Sources and warnings · needs a look')
+    expect(fold.textContent).toContain('One source was skipped')
+    expect(fold.textContent).toContain('The source window is incomplete')
+  })
+
+  it('is one quiet line while no briefing is ready', async () => {
+    narrative = view({ status: 'pending', generated_at: null, generated_by: null, sources: [], output: null })
+    render(page(overview([item('a', 'dev')])))
+    await screen.findByText('Waiting for a connected agent to generate this briefing.')
+    const line = document.getElementById('agent-briefing')!
+    expect(line.classList.contains('brief-line')).toBe(true)
+    expect(line.querySelector('.brief-cols, details, input')).toBeNull()
+    expect(before(document.getElementById('box-needs')!, line)).toBe(true)
+  })
+
+  it('is one quiet line on a Hub that does not write briefings', async () => {
+    render(page(overview([item('a', 'dev')])))
+    await screen.findByText('This Hub doesn’t write agent briefings yet.')
+    expect(document.getElementById('agent-briefing')!.classList.contains('brief-line')).toBe(true)
+  })
+
+  it('keeps the full briefing, with its task box, on the Catch up tab', async () => {
+    narrative = view()
+    render(<DashboardPage section="activity" question="q" token="t" repo="acme/widgets" data={data} d={d} overview={ready(overview([]))} />)
+    await screen.findByText('Invoice rounding shipped.')
+    const brief = document.getElementById('agent-briefing')!
+    expect(brief.classList.contains('brief-compact')).toBe(false)
+    expect(within(brief).getByRole('button', { name: 'Brief this task' })).toBeTruthy()
   })
 })

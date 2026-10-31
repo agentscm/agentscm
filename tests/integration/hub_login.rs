@@ -1189,6 +1189,7 @@ async fn profile_name_is_cleaned_refreshed_and_cleared_at_each_sign_in() {
     assert_eq!(named["user"]["name"], "Alice[31m Liddell");
     let (_, session) = env.get("/v1/hub/session", Some(&secret(&named))).await;
     assert_eq!(session["user"]["name"], "Alice[31m Liddell");
+    assert!(session["user"]["joined_at"].is_i64(), "{session}");
     // A changed name replaces the stored one; an oversized one is capped at 100 characters.
     name(&"é".repeat(150));
     let long = env.device_login("github", 7).await;

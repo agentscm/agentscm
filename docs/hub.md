@@ -351,7 +351,9 @@ status shown; clients show `message` as is.
   `provider`, `host`, `user_id`, `login` and `name`: the forge profile name, or `null` when the
   profile has none. Each sign-in trims it, drops control characters, keeps at most 100
   characters and replaces the stored copy (named migration `user_display_name`); it is for
-  display only and never decides access. `GET /v1/hub/users` returns it too.
+  display only and never decides access. `GET /v1/hub/users` returns it too. `GET
+  /v1/hub/session` alone adds `joined_at` to `user`: when the person first signed in to this
+  Hub, in unix seconds.
   `POST /v1/hub/tokens` (`name`, `repository`, `ttl_seconds`; 201 with the
   token secret, shown only here; 403 `forbidden` if the forge says no; 401 if
   the session's forge token no longer works), `GET /v1/hub/tokens`,

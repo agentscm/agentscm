@@ -219,6 +219,8 @@ pub trait Store: Send + Sync {
     fn list_users(&self) -> Result<Vec<User>>;
     /// Exact identity lookup; authorization must not depend on a bounded user list.
     fn user_by_id(&self, id: &str) -> Result<Option<User>>;
+    /// When the person first signed in to this Hub (unix seconds); None for an unknown id.
+    fn user_created_at(&self, id: &str) -> Result<Option<i64>>;
     /// Exact numeric forge identity lookup, including disabled users.
     fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>>;
     /// `method` is `browser` or `device`. Unknown user is `Invalid`.
