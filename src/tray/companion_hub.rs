@@ -74,6 +74,7 @@ pub(super) struct Work {
     pub state: String,
     pub next_action: String,
     pub claim_status: String,
+    pub scope_unknown: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -257,6 +258,7 @@ async fn read_catalog(
                                 "No next action reported",
                             ),
                             claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
+                            scope_unknown: item["scope_unknown"] == true,
                         })
                         .collect()
                 })
@@ -575,6 +577,7 @@ fn summarize(
             state: bounded_text(&item["state"], 32, "unknown"),
             next_action: bounded_text(&item["next_action"], 160, "No next action reported"),
             claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
+            scope_unknown: item["scope"].as_array().is_some_and(Vec::is_empty),
         });
     }
     let open_requests: Vec<_> = requests
@@ -690,8 +693,8 @@ mod tests {
     fn hub_signals_match_work_and_inbox_categories() {
         let overview = json!({
             "current": [
-                {"id":"wrk_blocked","state":"blocked","claim_status":"active","updated_at":4},
-                {"id":"wrk_quiet","state":"active","claim_status":"stale","updated_at":5},
+                {"id":"wrk_blocked","state":"blocked","claim_status":"active","updated_at":4,"scope":[]},
+                {"id":"wrk_quiet","state":"active","claim_status":"stale","updated_at":5,"scope":["src/lib.rs"]},
                 {"id":"wrk_handover","state":"handover","claim_status":"active","updated_at":6}
             ],
             "overlaps": [{"left":{"id":"wrk_a"},"right":{"id":"wrk_b"}}],
@@ -709,6 +712,14 @@ mod tests {
         );
         assert_eq!(result.count, 5);
         assert_eq!(result.needs_you, 4);
+        assert_eq!(
+            result
+                .work
+                .iter()
+                .map(|item| item.scope_unknown)
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
         assert!(result.text.contains("1 blocked"));
         assert!(result.text.contains("1 quiet"));
         assert!(result.text.contains("1 handover"));

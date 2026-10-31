@@ -638,6 +638,7 @@ async fn repositories_for_owner(
                             "state": item.state,
                             "claim_status": item.claim_status,
                             "next_action": item.next_action,
+                            "scope_unknown": item.scope.is_empty(),
                         })
                     })
                     .collect::<Vec<_>>()

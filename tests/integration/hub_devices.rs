@@ -2167,6 +2167,10 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         device_list["repositories"][0]["work"][0]["next_action"],
         "Check the diff"
     );
+    assert_eq!(
+        device_list["repositories"][0]["work"][0]["scope_unknown"],
+        false
+    );
     assert_eq!(device_list["repositories"][0]["work_complete"], true);
     assert_eq!(device_list["repositories"][0]["live_complete"], true);
     assert_eq!(

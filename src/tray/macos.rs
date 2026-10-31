@@ -2941,7 +2941,11 @@ fn companion_work_detail(item: &companion_hub::Work) -> String {
         (_, "stale") => "Agent may need attention",
         _ => "Check in Hub",
     };
-    format!("{status} · Next: {}", item.next_action)
+    if item.scope_unknown {
+        format!("{status} · Files not stated · Next: {}", item.next_action)
+    } else {
+        format!("{status} · Next: {}", item.next_action)
+    }
 }
 
 fn build_menu(
@@ -4104,6 +4108,7 @@ mod tests {
                         state: "blocked".into(),
                         next_action: "Ask for review".into(),
                         claim_status: "active".into(),
+                        scope_unknown: true,
                     }],
                     live: vec![],
                 },
@@ -4121,6 +4126,7 @@ mod tests {
         assert_eq!(rows[0].name, "example/remote");
         assert!(rows[0].work[0].needs_you);
         assert_eq!(rows[0].work[0].title, "Prepare release");
+        assert!(rows[0].work[0].detail.contains("Files not stated"));
         assert_eq!(rows[1].name, "example/project");
         assert_eq!(rows[1].work[0].title, "Inspect changes");
         assert_eq!(
