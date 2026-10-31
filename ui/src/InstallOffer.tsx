@@ -10,7 +10,7 @@ import { Icon } from './ui.tsx'
  */
 export function InstallOffer() {
   const tour = useTour()
-  // The welcome tour plays first; this waits until it is done.
+  // The Dashboard's first-visit tips come first; this waits until they are dismissed or skipped.
   const touring = !!tour && tour.remember && !tour.prefs.welcomeSeen && !tour.prefs.welcomeOff
   if (touring) return null
   return isStandalone() ? <DockTip /> : <Offer />

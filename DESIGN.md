@@ -429,7 +429,13 @@ A 7px dot with a 3px soft halo in its tone, then a 12.5px 500 word in text-2. A 
 - **Breadcrumbs:** only deep pages (a run, a step, a saved moment) carry a quiet pill trail above the page.
 
 ### Needs you
-A box listing only decisions for a person: a blocker, a task whose agent went quiet, a handover, two agents holding one file, two tasks planning the same files, or a pull request touching held files. Each row is a 30px circle icon drawn as a 1.5px ring in its tone (Brand Ink, warn or coral), a 15px 600 title, a text-2 body and a 13px text-3 line saying what to do next. Rows are separated by hairlines. When empty it says "Nothing needs you" beside a green check. Its explanation states that reading the page answers none of them.
+A box listing only decisions for a person: a blocker, a task whose agent went quiet, a handover, two agents holding one file, two tasks planning the same files, or a pull request touching held files. It comes before "Start a task" whenever it is not empty. Each row is one line: a 30px circle icon drawn as a 1.5px ring in its tone (Brand Ink, warn or coral), a 15px 600 title, one 13px text-3 line under it (the task and when, or where to look), a single primary action as an outline pill ("Open in <the viewer's agent>" when a launch link exists, otherwise "Copy prompt for <agent>"), a "⋯" menu for the other prompts, and a chevron. The chevron, or a click on the row's own text, opens the row in place with a height animation: the reason, "Decision for …", the line saying what to do next, the box for the person's own words and Hide, in one sunken well; the chevron button carries `aria-expanded`. Rows are separated by hairlines, and the box's head counts them (coral when the box is bad). When empty it says "All clear" beside a green check. Its explanation states that reading the page answers none of them.
+
+### Start a task
+One quiet pill-shaped line ("Start a task · Describe it, then hand it to your agent") that opens in place into a card: the pill's corners ease to the card's 20px as it grows. It sits after Needs you when something needs a person, and leads the page otherwise.
+
+### Coach marks
+A new viewer's first Dashboard visit carries up to three short pointers in the page, not over it: one under the headline, one above Needs you, one above the track. Each is a brand-soft note with a small tail toward what it points at, and a "Got it" pill; the first one still on the page also carries "Skip tips". A dismissed pointer folds away and the page glides up. Dismissals and "Skip tips" are saved in this browser with the welcome tour's own flags (finishing or switching off the welcome tour also removes them), nothing blocks the page, and the walkthrough stays one click away from the question-mark button.
 
 ### The track and its lane bar
 Every unfinished task as one row: a task column (180–260px; 160–230px in Condensed) with the title link, its status dot and word, its branch in mono, and a check-in line, then the lane bar, then the agent's own last words in one ellipsised line with their time.
@@ -479,7 +485,7 @@ A computer is a ruled row: laptop icon in text-3, the name in 600 with a brand "
 
 ### Motion
 - **The baton ride:** when a task's state, claim or holder changes between refreshes, its Now segment sweeps in from the left (a clip-path reveal, 0.7s, `cubic-bezier(.16, 1, .3, 1)`) and the holder's avatar slides in from 38px to the left over 0.9s, sharpening from blurred and faint. This is the world's one authored moment.
-- **Feedback only:** a box rings once (1.4s) when an answer link jumps to it, the signed-in mark lets one green ring out (1.1s) when the landing page opens, the area drawer settles in over 0.4s, and tile tint and rings ease over 0.3–0.5s.
+- **Feedback only:** a box rings once (1.4s) when an answer link jumps to it, the signed-in mark lets one green ring out (1.1s) when the landing page opens, the area drawer settles in over 0.4s, a Needs you row, the Start a task line and a coach mark grow and fold in height over 0.3–0.4s, and tile tint and rings ease over 0.3–0.5s.
 - With `prefers-reduced-motion: reduce`, the ride, the ring and the drawer animation stop, smooth scrolling becomes instant, and tile, lane, tab, button and rail transitions are removed.
 
 ## Do's and Don'ts

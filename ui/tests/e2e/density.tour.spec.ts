@@ -76,10 +76,12 @@ for (const density of ['spacious', 'condensed'] as const) {
     })
 
     test('the welcome tour stays on screen and reachable', async ({ page }) => {
-      // The welcome tour only starts for a viewer who has not seen it.
-      await page.addInitScript(() => localStorage.removeItem('agentscm.tour.v1'))
+      // The welcome tour is replayed from ⌘K; it no longer opens by itself.
       await signIn(page)
       await expect(page.locator('html')).toHaveAttribute('data-density', density)
+      await page.keyboard.press('ControlOrMeta+k')
+      await page.getByRole('dialog', { name: 'Search the hub' }).locator('input').fill('replay the welcome')
+      await page.keyboard.press('Enter')
       await expect(dialog(page)).toBeVisible()
       await walk(page)
     })

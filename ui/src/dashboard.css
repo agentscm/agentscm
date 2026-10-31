@@ -1,0 +1,410 @@
+/* The Dashboard's progressive disclosures and first-visit pointers. Loaded after twilight.css and plain.css; only --hub-* tokens.
+   Motion here is feedback: heights and tails ease in once, and `prefers-reduced-motion` removes every bit of it. */
+
+/* ---------- reveal: a body that grows and shrinks in height ---------- */
+.reveal {
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.4s var(--ease);
+}
+.reveal[data-open='true'] {
+  grid-template-rows: 1fr;
+}
+/* The padding and matching negative margin leave room for focus rings that the clip would otherwise cut. */
+.reveal-in {
+  min-height: 0;
+  margin: -4px;
+  padding: 4px;
+  overflow: hidden;
+  visibility: hidden;
+  transition: visibility 0s linear 0.4s;
+}
+.reveal[data-open='true'] > .reveal-in {
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+/* ---------- needs you: one line per decision ---------- */
+.attn-item.need {
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0 14px;
+  padding: 14px 0;
+}
+.attn-item.need:first-child {
+  padding-top: 4px;
+}
+.need .reveal {
+  grid-column: 2 / -1;
+}
+.need-main {
+  min-width: 0;
+  cursor: pointer;
+}
+.need-main:hover .attn-title {
+  color: var(--hub-brand-ink);
+}
+.need-gist {
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--hub-text-3);
+}
+.need-acts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.need-primary {
+  white-space: nowrap;
+}
+.need-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--hub-text-3);
+  transition: background-color 0.2s, color 0.2s;
+}
+.need-btn:hover,
+.need-btn[aria-expanded='true'] {
+  background: var(--hub-sunken);
+  color: var(--hub-brand-ink);
+}
+.need-btn:focus-visible {
+  outline: 2px solid var(--hub-brand);
+  outline-offset: 2px;
+}
+.need-chev .bi {
+  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.need.is-open .need-chev .bi {
+  transform: rotate(180deg);
+}
+.need-menu {
+  right: 0;
+  width: max-content;
+  max-width: min(340px, 80vw);
+  z-index: 20;
+}
+.need-menu .pop-item {
+  align-items: center;
+  white-space: nowrap;
+}
+.need-menu .pop-item:disabled {
+  opacity: 0.55;
+}
+/* The reason, who decides and the words box sit in one sunken well, under the row's own text. */
+.need-more {
+  display: grid;
+  gap: 8px;
+  max-width: 76ch;
+  margin-top: 10px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: var(--hub-sunken);
+}
+.need-more > p {
+  margin: 0;
+  color: var(--hub-text-2);
+}
+.need-more .next-step {
+  margin: 0;
+}
+.need-more .attn-status {
+  display: flex;
+}
+.need-more .attn-status .hide-btn {
+  margin-left: -9px;
+}
+.attn-item.need.is-hidden :is(.need-main, .need-more) {
+  opacity: 0.55;
+}
+@media (max-width: 640px) {
+  .attn-item.need {
+    grid-template-columns: 30px minmax(0, 1fr);
+  }
+  .need-acts {
+    grid-column: 2;
+    margin-top: 10px;
+    gap: 6px;
+  }
+  .need-primary {
+    flex: 1 1 auto;
+    min-height: 44px;
+    white-space: normal;
+    line-height: 1.25;
+  }
+  .need-btn {
+    width: 44px;
+    height: 44px;
+  }
+  .need-menu {
+    right: 0;
+  }
+  .need-gist {
+    white-space: normal;
+  }
+}
+
+/* ---------- start a task: a single line that opens in place ---------- */
+.start-line {
+  border-radius: 999px;
+  background: var(--hub-surface);
+  box-shadow: var(--card);
+  transition: border-radius 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.start-line.is-open {
+  border-radius: var(--r);
+}
+.start-line-h {
+  margin: 0;
+  font: inherit;
+}
+.start-line-toggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 52px;
+  padding: 0 20px;
+  border: 0;
+  border-radius: inherit;
+  background: none;
+  color: var(--hub-text);
+  font: inherit;
+  text-align: left;
+}
+.start-line-toggle > .bi:first-child {
+  flex: none;
+  font-size: 18px;
+  color: var(--hub-brand);
+}
+.start-line-title {
+  flex: none;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.start-line-hint {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13.5px;
+  color: var(--hub-text-3);
+}
+.start-line-chev {
+  flex: none;
+  color: var(--hub-text-3);
+  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.start-line.is-open .start-line-chev {
+  transform: rotate(180deg);
+}
+.start-line-toggle:hover .start-line-title {
+  color: var(--hub-brand-ink);
+}
+.start-line-toggle:focus-visible {
+  outline: 2px solid var(--hub-brand);
+  outline-offset: 3px;
+}
+.start-line-body {
+  display: grid;
+  gap: 12px;
+  padding: 2px 22px 22px 50px;
+}
+.start-line-body p {
+  margin: 0;
+}
+:root[data-density='condensed'] .start-line-toggle {
+  min-height: 40px;
+}
+@media (max-width: 760px) {
+  .start-line-hint {
+    display: none;
+  }
+  .start-line-toggle {
+    min-height: 48px;
+  }
+  .start-line-body {
+    padding: 2px 18px 18px;
+  }
+}
+
+/* ---------- coach marks: pointers in the page, never over it ---------- */
+.coach {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+/* Pulled toward the thing they point at, past the page's section gap, then the gap returns when they go. */
+.coach.is-below {
+  margin-top: calc(var(--hub-gap) * -1 - 4px);
+}
+.coach.is-above {
+  margin-bottom: calc(var(--hub-gap) * -1 + 2px);
+}
+.coach-clip {
+  min-height: 0;
+  overflow: hidden;
+  padding: 8px 2px;
+}
+.coach-card {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  max-width: 660px;
+  padding: 10px 12px 10px 18px;
+  border-radius: 16px;
+  /* Opaque, so the tail (a rotated square that overlaps the card) does not double the tint in dark mode. */
+  background: linear-gradient(var(--hub-brand-soft), var(--hub-brand-soft)) var(--hub-canvas);
+  color: var(--hub-text);
+}
+.coach-card::before {
+  content: '';
+  position: absolute;
+  left: 30px;
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: inherit;
+  transform: rotate(45deg);
+}
+.coach.is-below .coach-card::before {
+  top: -5px;
+}
+.coach.is-above .coach-card::before {
+  bottom: -5px;
+}
+.coach-text {
+  flex: 1 1 280px;
+  min-width: 0;
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.45;
+}
+.coach-acts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+.coach-btn {
+  min-height: 32px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--hub-surface);
+  color: var(--hub-brand-ink);
+  font-size: 13px;
+  font-weight: 600;
+  transition: background-color 0.2s, color 0.2s;
+}
+.coach-btn:hover {
+  background: var(--hub-brand);
+  color: var(--hub-on-brand);
+}
+.coach-btn.is-quiet {
+  background: transparent;
+  font-weight: 500;
+}
+.coach-btn.is-quiet:hover {
+  background: var(--hub-surface);
+  color: var(--hub-brand-ink);
+}
+.coach-btn:focus-visible {
+  outline: 2px solid var(--hub-brand);
+  outline-offset: 2px;
+}
+@media (max-width: 640px) {
+  .coach-btn {
+    min-height: 44px;
+  }
+  .coach-acts {
+    margin-left: 0;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .page > .coach {
+    animation: coach-in 0.55s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+    transition: grid-template-rows 0.32s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s;
+  }
+  .page > .coach[data-coach='needs'] {
+    animation-delay: 0.1s;
+  }
+  .page > .coach[data-coach='track'] {
+    animation-delay: 0.2s;
+  }
+  .page > .coach.is-leaving {
+    grid-template-rows: 0fr;
+    opacity: 0;
+    animation: none;
+  }
+  .coach-card::before {
+    animation: coach-tail 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.35s backwards;
+  }
+}
+@keyframes coach-in {
+  from { grid-template-rows: 0fr; opacity: 0; }
+  to { grid-template-rows: 1fr; opacity: 1; }
+}
+@keyframes coach-tail {
+  from { transform: translateY(6px) rotate(45deg) scale(0.4); opacity: 0; }
+}
+
+/* ---------- the track: a little more room ---------- */
+@media (min-width: 761px) {
+  .rl-row,
+  .rl-head {
+    grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);
+  }
+}
+.rl {
+  --lb-h: 40px;
+}
+:root[data-density='condensed'] .rl {
+  --lb-h: 28px;
+}
+.rl .lb-hit {
+  font-size: 13px;
+}
+.rl-said {
+  font-size: 13px;
+}
+.lane-on {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  color: var(--hub-text-3);
+}
+.lane-on .lane-branch {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal,
+  .reveal-in,
+  .start-line,
+  .start-line-chev,
+  .need-chev .bi,
+  .need-btn,
+  .coach-btn {
+    transition: none;
+  }
+}
+
+/* A Now segment with no note of its own (the agent's words sit under the bar) has nothing to separate from. */
+.lb-seg.is-here .lb-label:last-child::after {
+  content: none;
+}
