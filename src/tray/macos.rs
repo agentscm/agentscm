@@ -366,9 +366,12 @@ struct TrayApp {
 struct LocalRun {
     root: std::path::PathBuf,
     repository: String,
+    connection_identity: String,
     agent: companion_launch::Agent,
+    task: Option<String>,
     started: std::time::Instant,
     state: &'static str,
+    failed: bool,
     pid: Option<u32>,
     finished_after: Option<Duration>,
     session: Option<String>,
@@ -401,7 +404,12 @@ fn clear_refresh_notice(notice: &mut Option<Notice>) {
 }
 
 impl TrayApp {
+    fn prune_local_run(&mut self) {
+        prune_finished_local_run(&mut self.local_run, std::time::Instant::now());
+    }
+
     fn show_companion(&mut self) {
+        self.prune_local_run();
         if agentscm::hub::store::unix_now().saturating_sub(self.snapshot.snapshot_at) >= 20
             && !self.refreshing.swap(true, Ordering::AcqRel)
         {
@@ -468,6 +476,7 @@ impl TrayApp {
     }
 
     fn replace_menu(&mut self, notice: Option<&str>) {
+        self.prune_local_run();
         update_refresh_notice(&mut self.notice, notice);
         if self.companion.is_visible() {
             let roots: Vec<_> = self
@@ -824,9 +833,12 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                         self.local_run = Some(LocalRun {
                             root: root.clone(),
                             repository: connection.repository.clone(),
+                            connection_identity: connection_identity(connection),
                             agent: *agent,
+                            task: Some(local_task_label(&prompt)),
                             started: std::time::Instant::now(),
                             state: "launch requested",
+                            failed: false,
                             pid: None,
                             finished_after: None,
                             session: None,
@@ -873,6 +885,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                                 "client exited with an error"
                             };
                             run.finished_after = Some(run.started.elapsed());
+                            run.failed = !success;
                             run.session = session;
                             let handoff = run.session.as_ref().map_or_else(
                                 || "Open this checkout in the native client to inspect its recent session.".to_owned(),
@@ -908,6 +921,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                             self.quit_run_confirmed = false;
                             run.state = "launch or status failed";
                             run.finished_after = Some(run.started.elapsed());
+                            run.failed = true;
                             self.notice = Some(Notice::Action(message));
                             if self.quit_after_run {
                                 event_loop.exit();
@@ -2443,7 +2457,7 @@ fn companion_status(
         snapshot.connections.len(),
         observed
     );
-    if let Some(run) = run {
+    if let Some(run) = run.filter(|run| local_run_visible(run, snapshot, now)) {
         summary.push_str(&format!(
             " · {} on {}: {}",
             run.agent.label(),
@@ -2452,6 +2466,42 @@ fn companion_status(
         ));
     }
     summary
+}
+
+fn local_run_recent(run: &LocalRun, now: std::time::Instant) -> bool {
+    run.finished_after.is_none_or(|finished_after| {
+        run.started
+            .checked_add(finished_after)
+            .is_some_and(|finished_at| {
+                now.saturating_duration_since(finished_at) <= crate::client_activity::STALE_AFTER
+            })
+    })
+}
+
+fn local_run_task(run: &LocalRun, now: std::time::Instant) -> Option<&str> {
+    run.task.as_deref().filter(|_| local_run_recent(run, now))
+}
+
+fn prune_finished_local_run(run: &mut Option<LocalRun>, now: std::time::Instant) {
+    if let Some(value) = run.as_mut()
+        && value.finished_after.is_some()
+        && !local_run_recent(value, now)
+    {
+        if value.failed {
+            value.task = None;
+        } else {
+            *run = None;
+        }
+    }
+}
+
+fn local_run_visible(run: &LocalRun, snapshot: &Snapshot, now: std::time::Instant) -> bool {
+    let current_binding = snapshot.connections.iter().any(|connection| {
+        connection.root == run.root
+            && connection.repository == run.repository
+            && connection_identity(connection) == run.connection_identity
+    });
+    current_binding && (run.failed || local_run_recent(run, now))
 }
 
 fn local_agent_rows(
@@ -2498,6 +2548,9 @@ fn local_agent_rows(
             companion_panel::LocalAgentRow {
                 agent,
                 detail: detail.into(),
+                task: None,
+                alert: None,
+                task_needs_you: false,
                 observed,
                 needs_you,
             }
@@ -2598,11 +2651,20 @@ fn companion_rows(
             }
             work.sort_by_key(|item| !item.needs_you);
             if let Some(run) = run.filter(|run| {
-                checkouts
-                    .iter()
-                    .any(|connection| run.root == connection.root)
+                local_run_visible(run, snapshot, now)
+                    && run.repository == repository
+                    && checkouts
+                        .iter()
+                        .any(|connection| run.root == connection.root)
             }) {
-                merge_local_run(&mut local, run.agent.label(), run.state);
+                merge_local_run(
+                    &mut local,
+                    run.agent.label(),
+                    run.state,
+                    local_run_task(run, now),
+                    run.finished_after.is_some(),
+                    run.failed,
+                );
             }
             companion_panel::RepositoryRow {
                 name: repository,
@@ -2641,6 +2703,9 @@ fn companion_rows(
                     .map(|agent| companion_panel::LocalAgentRow {
                         agent: agent_label(agent).into(),
                         detail: "Seen on this Mac · checkout not connected to Hub".into(),
+                        task: None,
+                        alert: None,
+                        task_needs_you: false,
                         observed: true,
                         needs_you: false,
                     })
@@ -2845,24 +2910,83 @@ fn hub_agent_context(row: &companion_hub::CatalogRepository) -> String {
     }
 }
 
-fn merge_local_run(local: &mut Vec<companion_panel::LocalAgentRow>, agent: &str, state: &str) {
+fn local_task_label(prompt: &str) -> String {
+    if prompt.len() > companion_launch::MAX_PROMPT_BYTES {
+        return "Prompt exceeds quick-launch limit".into();
+    }
+    let normalized = prompt
+        .lines()
+        .find_map(|line| {
+            let clean = line
+                .chars()
+                .map(|character| {
+                    if character.is_control()
+                        || matches!(
+                            character,
+                            '\u{061C}'
+                                | '\u{200B}'..='\u{200F}'
+                                | '\u{2028}'..='\u{2029}'
+                                | '\u{202A}'..='\u{202E}'
+                                | '\u{2060}'..='\u{206F}'
+                                | '\u{FEFF}'
+                        )
+                    {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
+            let title = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!title.is_empty()).then_some(title)
+        })
+        .unwrap_or_else(|| "Task started from quick prompt".into());
+    let mut chars = normalized.chars();
+    let title: String = chars.by_ref().take(100).collect();
+    if chars.next().is_some() {
+        format!("{title}…")
+    } else {
+        title
+    }
+}
+
+fn merge_local_run(
+    local: &mut Vec<companion_panel::LocalAgentRow>,
+    agent: &str,
+    state: &str,
+    task: Option<&str>,
+    finished: bool,
+    failed: bool,
+) {
+    let phase = if failed && task.is_none() {
+        "Quick prompt failed"
+    } else if finished {
+        "Recent quick prompt"
+    } else {
+        "Quick prompt"
+    };
+    let task_needs_you = failed;
     let row = companion_panel::LocalAgentRow {
         agent: agent.into(),
-        detail: format!("Quick prompt · {state}"),
+        detail: format!("{phase} · {state}"),
+        task: task.map(str::to_owned),
+        alert: None,
+        task_needs_you,
         observed: true,
-        needs_you: state == "launch or status failed",
+        needs_you: task_needs_you,
     };
     if let Some(existing) = local
         .iter_mut()
         .find(|existing| existing.agent.eq_ignore_ascii_case(&row.agent))
     {
-        existing.detail = if existing.needs_you {
-            format!("{} · {}", existing.detail, row.detail)
-        } else {
-            row.detail
-        };
+        if existing.needs_you {
+            existing.alert = Some(existing.detail.clone());
+        }
+        existing.detail = row.detail;
         existing.observed = true;
         existing.needs_you |= row.needs_you;
+        existing.task = row.task;
+        existing.task_needs_you = row.task_needs_you;
     } else {
         local.insert(0, row);
     }
@@ -4469,13 +4593,157 @@ mod tests {
         let mut local = vec![companion_panel::LocalAgentRow {
             agent: "Codex".into(),
             detail: "Sign-in rejected · reconnect this checkout".into(),
+            task: None,
+            alert: None,
+            task_needs_you: false,
             observed: true,
             needs_you: true,
         }];
-        merge_local_run(&mut local, "Codex", "client process running");
+        merge_local_run(
+            &mut local,
+            "Codex",
+            "client process running",
+            Some("Review the patch"),
+            false,
+            false,
+        );
         assert_eq!(local.len(), 1);
         assert!(local[0].needs_you);
-        assert!(local[0].detail.starts_with("Sign-in rejected"));
+        assert_eq!(
+            local[0].alert.as_deref(),
+            Some("Sign-in rejected · reconnect this checkout")
+        );
+        assert!(!local[0].task_needs_you);
+        assert!(local[0].detail.starts_with("Quick prompt"));
+        assert_eq!(local[0].task.as_deref(), Some("Review the patch"));
+    }
+
+    #[test]
+    fn quick_prompt_task_label_is_bounded_to_its_first_nonempty_line() {
+        assert_eq!(
+            local_task_label("\n  Review   the patch  \nIgnore this later line"),
+            "Review the patch"
+        );
+        assert_eq!(local_task_label("\0\nFix\0 this"), "Fix this");
+        assert_eq!(local_task_label("Fix\u{202E} this"), "Fix this");
+        assert_eq!(local_task_label("Fix\u{061C} this"), "Fix this");
+        assert_eq!(
+            local_task_label(&"x".repeat(companion_launch::MAX_PROMPT_BYTES + 1)),
+            "Prompt exceeds quick-launch limit"
+        );
+        assert_eq!(
+            local_task_label(&"x".repeat(105)),
+            format!("{}…", "x".repeat(100))
+        );
+        let mut rows = Vec::new();
+        merge_local_run(
+            &mut rows,
+            "Codex CLI",
+            "client exited; task outcome unverified",
+            Some("Review the patch"),
+            true,
+            false,
+        );
+        assert!(rows[0].detail.starts_with("Recent quick prompt"));
+        merge_local_run(
+            &mut rows,
+            "Codex CLI",
+            "client exited with an error",
+            Some("Review the patch"),
+            true,
+            true,
+        );
+        assert!(rows[0].task_needs_you);
+        assert!(rows[0].needs_you);
+    }
+
+    #[test]
+    fn local_task_label_expires_and_stays_with_its_original_connection() {
+        let connection = share_connection("/synthetic/prompt", None);
+        let now = std::time::Instant::now();
+        let mut run = LocalRun {
+            root: connection.root.clone(),
+            repository: connection.repository.clone(),
+            connection_identity: connection_identity(&connection),
+            agent: companion_launch::Agent::Codex,
+            task: Some("Review the patch".into()),
+            started: now,
+            state: "client exited; task outcome unverified",
+            failed: false,
+            pid: None,
+            finished_after: Some(Duration::from_secs(60)),
+            session: None,
+        };
+        let mut snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![connection],
+        };
+        assert!(local_run_visible(
+            &run,
+            &snapshot,
+            now + Duration::from_secs(120)
+        ));
+        assert!(!local_run_visible(
+            &run,
+            &snapshot,
+            now + Duration::from_secs(60 * 20)
+        ));
+        run.failed = true;
+        assert!(local_run_visible(
+            &run,
+            &snapshot,
+            now + Duration::from_secs(60 * 20)
+        ));
+        assert_eq!(
+            local_run_task(&run, now + Duration::from_secs(60 * 20)),
+            None
+        );
+        run.task = None;
+        let mut local = Vec::new();
+        merge_local_run(&mut local, "Codex CLI", run.state, None, true, run.failed);
+        assert!(local[0].needs_you);
+        assert!(local[0].task.is_none());
+        assert!(local[0].detail.starts_with("Quick prompt failed"));
+        run.finished_after = None;
+        snapshot.connections[0].binding.generation = Some("new generation".into());
+        assert!(!local_run_visible(&run, &snapshot, now));
+        snapshot.connections[0].binding.generation = Some("generation".into());
+        snapshot.connections[0].repository = "example/other".into();
+        assert!(!local_run_visible(&run, &snapshot, now));
+    }
+
+    #[test]
+    fn expired_success_clears_but_failed_attention_keeps_no_prompt_excerpt() {
+        let now = std::time::Instant::now();
+        let make = |failed| LocalRun {
+            root: "/synthetic/prompt".into(),
+            repository: "example/project".into(),
+            connection_identity: "binding".into(),
+            agent: companion_launch::Agent::Codex,
+            task: Some("Review the patch".into()),
+            started: now,
+            state: if failed {
+                "client exited with an error"
+            } else {
+                "client exited; task outcome unverified"
+            },
+            failed,
+            pid: None,
+            finished_after: Some(Duration::from_secs(60)),
+            session: None,
+        };
+        let later = now + Duration::from_secs(60 * 20);
+        let mut success = Some(make(false));
+        prune_finished_local_run(&mut success, later);
+        assert!(success.is_none());
+        let mut failure = Some(make(true));
+        prune_finished_local_run(&mut failure, later);
+        assert!(
+            failure
+                .as_ref()
+                .is_some_and(|run| run.failed && run.task.is_none())
+        );
     }
 
     #[test]

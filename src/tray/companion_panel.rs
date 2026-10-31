@@ -43,6 +43,11 @@ pub(super) struct RepositoryRow {
 pub(super) struct LocalAgentRow {
     pub agent: String,
     pub detail: String,
+    /// Short, in-memory label for a quick prompt started in this panel.
+    pub task: Option<String>,
+    /// A separate connection alert when the quick prompt has its own state.
+    pub alert: Option<String>,
+    pub task_needs_you: bool,
     pub observed: bool,
     pub needs_you: bool,
 }
@@ -1031,7 +1036,7 @@ impl CompanionPanel {
                 86.0 + if row.local.is_empty() {
                     0.0
                 } else {
-                    23.0 + 42.0 * row.local.len() as f64
+                    23.0 + row.local.iter().map(expanded_local_height).sum::<f64>()
                 } + if row.work.is_empty() {
                     63.0
                 } else {
@@ -1244,13 +1249,52 @@ impl CompanionPanel {
                         );
                         document.addSubview(&dot);
                         let context = format!("{} · {}", agent.agent, agent.detail);
-                        let line = label(mtm, &context, 13.0, agent.needs_you);
-                        line.setFrame(rect(36.0, cursor - 21.0, WIDTH - 100.0, 20.0));
-                        line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                        line.setTextColor(Some(&color(0x48415d)));
-                        line.setAccessibilityLabel(Some(&NSString::from_str(&context)));
-                        document.addSubview(&line);
-                        cursor -= 28.0;
+                        if let Some(task) = &agent.task {
+                            let title = label(mtm, task, 15.0, true);
+                            title.setFrame(rect(36.0, cursor - 22.0, WIDTH - 100.0, 22.0));
+                            title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                            title.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                                "{} · local quick prompt · {}",
+                                agent.agent, task
+                            ))));
+                            document.addSubview(&title);
+                            let detail = label(mtm, &context, 12.0, false);
+                            detail.setFrame(rect(36.0, cursor - 40.0, WIDTH - 100.0, 18.0));
+                            detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                            detail.setTextColor(Some(&color(if agent.task_needs_you {
+                                0xa23c2e
+                            } else {
+                                0x656177
+                            })));
+                            document.addSubview(&detail);
+                            if let Some(alert) = &agent.alert {
+                                let warning = label(mtm, alert, 12.0, true);
+                                warning.setFrame(rect(36.0, cursor - 58.0, WIDTH - 100.0, 18.0));
+                                warning.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                                warning.setTextColor(Some(&color(0xa23c2e)));
+                                document.addSubview(&warning);
+                            }
+                            cursor -= collapsed_local_height(agent);
+                        } else {
+                            let line = label(mtm, &context, 13.0, agent.needs_you);
+                            line.setFrame(rect(36.0, cursor - 21.0, WIDTH - 100.0, 20.0));
+                            line.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                            line.setTextColor(Some(&color(if agent.needs_you {
+                                0xa23c2e
+                            } else {
+                                0x48415d
+                            })));
+                            line.setAccessibilityLabel(Some(&NSString::from_str(&context)));
+                            document.addSubview(&line);
+                            if let Some(alert) = &agent.alert {
+                                let warning = label(mtm, alert, 12.0, true);
+                                warning.setFrame(rect(36.0, cursor - 39.0, WIDTH - 100.0, 18.0));
+                                warning.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                                warning.setTextColor(Some(&color(0xa23c2e)));
+                                document.addSubview(&warning);
+                            }
+                            cursor -= collapsed_local_height(agent);
+                        }
                     }
                 }
                 let title = if row.overflow > 0 {
@@ -1353,12 +1397,49 @@ impl CompanionPanel {
                     let title = label(mtm, &agent.agent, 14.0, true);
                     title.setFrame(rect(36.0, cursor - 13.0, WIDTH - 100.0, 20.0));
                     document.addSubview(&title);
-                    let detail = label(mtm, &agent.detail, 12.0, false);
-                    detail.setFrame(rect(36.0, cursor - 30.0, WIDTH - 100.0, 18.0));
-                    detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                    detail.setTextColor(Some(&color(0x656177)));
-                    document.addSubview(&detail);
-                    cursor -= 42.0;
+                    if let Some(task) = &agent.task {
+                        let task_label = label(mtm, task, 13.0, true);
+                        task_label.setFrame(rect(36.0, cursor - 32.0, WIDTH - 100.0, 20.0));
+                        task_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                        task_label.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                            "Local quick prompt: {task}"
+                        ))));
+                        document.addSubview(&task_label);
+                        let detail = label(mtm, &agent.detail, 12.0, false);
+                        detail.setFrame(rect(36.0, cursor - 50.0, WIDTH - 100.0, 18.0));
+                        detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                        detail.setTextColor(Some(&color(if agent.task_needs_you {
+                            0xa23c2e
+                        } else {
+                            0x656177
+                        })));
+                        document.addSubview(&detail);
+                        if let Some(alert) = &agent.alert {
+                            let warning = label(mtm, alert, 12.0, true);
+                            warning.setFrame(rect(36.0, cursor - 68.0, WIDTH - 100.0, 18.0));
+                            warning.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                            warning.setTextColor(Some(&color(0xa23c2e)));
+                            document.addSubview(&warning);
+                        }
+                    } else {
+                        let detail = label(mtm, &agent.detail, 12.0, false);
+                        detail.setFrame(rect(36.0, cursor - 30.0, WIDTH - 100.0, 18.0));
+                        detail.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                        detail.setTextColor(Some(&color(if agent.needs_you {
+                            0xa23c2e
+                        } else {
+                            0x656177
+                        })));
+                        document.addSubview(&detail);
+                        if let Some(alert) = &agent.alert {
+                            let warning = label(mtm, alert, 12.0, true);
+                            warning.setFrame(rect(36.0, cursor - 48.0, WIDTH - 100.0, 18.0));
+                            warning.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                            warning.setTextColor(Some(&color(0xa23c2e)));
+                            document.addSubview(&warning);
+                        }
+                    }
+                    cursor -= expanded_local_height(agent);
                 }
             }
             let more = button(mtm, "Show less", rect(31.0, bottom + 8.0, 230.0, 26.0));
@@ -1734,9 +1815,25 @@ fn collapsed_row_height(row: &RepositoryRow) -> f64 {
         + if row.local.is_empty() {
             0.0
         } else {
-            22.0 + 28.0 * row.local.len() as f64
+            22.0 + row.local.iter().map(collapsed_local_height).sum::<f64>()
         }
         + 14.0
+}
+
+fn collapsed_local_height(agent: &LocalAgentRow) -> f64 {
+    if agent.task.is_some() {
+        46.0 + if agent.alert.is_some() { 18.0 } else { 0.0 }
+    } else {
+        28.0 + if agent.alert.is_some() { 18.0 } else { 0.0 }
+    }
+}
+
+fn expanded_local_height(agent: &LocalAgentRow) -> f64 {
+    if agent.task.is_some() {
+        62.0 + if agent.alert.is_some() { 18.0 } else { 0.0 }
+    } else {
+        42.0 + if agent.alert.is_some() { 18.0 } else { 0.0 }
+    }
 }
 
 fn first_attention_link(rows: &[RepositoryRow]) -> Option<(String, String)> {
@@ -1944,6 +2041,9 @@ mod tests {
             local: vec![LocalAgentRow {
                 agent: "Claude Code".into(),
                 detail: "Connected on this Mac · no recent activity observed".into(),
+                task: None,
+                alert: None,
+                task_needs_you: false,
                 observed: false,
                 needs_you: false,
             }],
@@ -1994,6 +2094,9 @@ mod tests {
         row.local.push(LocalAgentRow {
             agent: "Codex".into(),
             detail: "Seen on this Mac · task not reported locally".into(),
+            task: None,
+            alert: None,
+            task_needs_you: false,
             observed: true,
             needs_you: false,
         });
@@ -2020,6 +2123,18 @@ mod tests {
         let (attention, _) = selected_rows(&rows, 1, REPOSITORY_LIMIT, &HashSet::new());
         assert_eq!(attention[0].work.len(), 1);
         assert_eq!(attention[0].work[0].title, "Needs review");
+    }
+
+    #[test]
+    fn local_quick_prompt_gets_room_for_a_task_title() {
+        let mut row = repository("example/project");
+        let base = collapsed_row_height(&row);
+        row.local[0].task = Some("Review the patch".into());
+        assert_eq!(collapsed_row_height(&row), base + 18.0);
+        assert_eq!(expanded_local_height(&row.local[0]), 62.0);
+        row.local[0].alert = Some("Reconnect this checkout".into());
+        assert_eq!(collapsed_row_height(&row), base + 36.0);
+        assert_eq!(expanded_local_height(&row.local[0]), 80.0);
     }
 
     #[test]
@@ -2067,12 +2182,18 @@ mod tests {
             LocalAgentRow {
                 agent: "Codex".into(),
                 detail: "Task not reported locally".into(),
+                task: None,
+                alert: None,
+                task_needs_you: false,
                 observed: true,
                 needs_you: false,
             },
             LocalAgentRow {
                 agent: "Claude Code".into(),
                 detail: "Reconnect this checkout".into(),
+                task: None,
+                alert: None,
+                task_needs_you: false,
                 observed: false,
                 needs_you: true,
             },
