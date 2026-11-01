@@ -1460,7 +1460,6 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   border-top: 1px solid var(--hub-rule);
 }
 
-.finished-grid,
 .grid-2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1619,7 +1618,15 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 .change-mark.is-work_takeover { background: var(--hub-warn-soft); color: var(--hub-warn); }
 .change-mark.is-work_checkpoint { background: var(--hub-ok-soft); color: var(--hub-ok); }
 .change-main { min-width: 0; }
-.change-main > a { font-weight: 600; overflow-wrap: anywhere; }
+.change-main > a,
+.history-page .rp-done li > a { font-weight: 600; color: var(--hub-text); text-decoration: none; overflow-wrap: anywhere; }
+.change-main > a:hover, .change-main > a:focus-visible,
+.history-page .rp-done li > a:hover, .history-page .rp-done li > a:focus-visible { color: var(--hub-brand-ink); text-decoration: underline; }
+/* History borrows All repositories' finished rows, so it carries the same spacing scale (as the Inbox does). */
+.history-page { --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; }
+.history-page .rp-done li > a { min-width: 0; font-size: 14.5px; }
+.history-page .rp-done-who { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.history-page .lane-title { font-size: var(--t-group); font-weight: 650; letter-spacing: -0.01em; }
 .change-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 4px; font-size: 0.82rem; color: var(--hub-text-2); }
 .change-who { display: inline-flex; align-items: center; gap: 6px; }
 .change-quote { margin: 6px 0 0; font-size: 0.86rem; color: var(--hub-text-2); overflow-wrap: anywhere; }
@@ -2161,8 +2168,7 @@ a.run-row:hover {
   .request-chevron { grid-area: chev; align-self: start; }
 }
 @container main (max-width: 720px) {
-  .grid-2,
-  .finished-grid {
+  .grid-2 {
     grid-template-columns: minmax(0, 1fr);
   }
   .overlap,
