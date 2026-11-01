@@ -174,7 +174,7 @@ function Lookup({ token }: { token: string }) {
             id="change-record-work-id"
             data-tour="change-record-picker"
             label="Find a work item"
-            placeholder="Search by title, agent or branch, or paste a wrk_ ID"
+            placeholder="Search by title, agent or branch"
             describedBy="change-record-work-id-help"
             parseId={(t) => (validWorkId(t) ? t : null)}
             onSelect={(id) => { window.location.hash = changeRecordHref(id).slice(1) }}
@@ -206,7 +206,7 @@ function Lookup({ token }: { token: string }) {
             }}
           />
         </div>
-        <div id="change-record-work-id-help" className="form-text">{READING_CHANGES_NOTHING}</div>
+        <div id="change-record-work-id-help" className="form-text">Or paste a work ID an agent gave you.</div>
       </Box>
     </div>
   )

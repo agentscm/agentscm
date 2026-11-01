@@ -3114,6 +3114,17 @@ a.brief-cite:hover {
   padding: 0 12px;
   font-size: 12.5px;
 }
+/* The Library's three views stay one pill track on a phone instead of wrapping inside it. */
+@media (max-width: 640px) {
+  nav.lens {
+    flex-wrap: nowrap;
+    max-width: 100%;
+  }
+  nav.lens .lens-seg {
+    padding: 0 11px;
+    white-space: nowrap;
+  }
+}
 
 .flow {
   list-style: none;
@@ -3205,9 +3216,23 @@ a.brief-cite:hover {
 
 /* The library's own rows, steps and results take the sheet's language. */
 .wl-toolbar h2 {
-  font-size: 18px;
-  font-weight: 500;
+  font-size: var(--t-card);
+  font-weight: 600;
   letter-spacing: -0.015em;
+}
+/* Headings inside the Promises, Checks and Access forms and records: a group over a run of fields, a sub-head inside a card. */
+.group-head {
+  margin: 0 0 8px;
+  font-size: var(--t-group);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--hub-text);
+}
+.sub-head {
+  margin: 0 0 6px;
+  font-size: var(--t-sub);
+  font-weight: 650;
+  color: var(--hub-text-2);
 }
 .wl-open {
   border-radius: 14px;

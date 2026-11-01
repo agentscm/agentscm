@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import type { Health } from '../types.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import { Box, Explain, Icon, Notice, PageHead, Skeleton } from '../ui.tsx'
@@ -12,6 +13,20 @@ const COUNTERS = [
   ['rate_limited', 'speedometer', 'Rate-limited refusals', 'Edits that passed with only a note, because a session had already been refused 3 times in 10 minutes.'],
 ] as const
 
+const plural = (n: number, one: string) => `${n.toLocaleString()} ${n === 1 ? one : `${one}s`}`
+
+/** The answer: is the Hub OK, and if not quite, what deserves a look. Refusals and warnings are the hook working, so they never count. */
+export function healthAnswer(health: Health | null): ReactNode {
+  if (!health) return 'Checking…'
+  if (health.status !== 'ok') return 'The Hub is not answering, so edits go ahead unchecked.'
+  const c = health.coordination
+  const notes: ReactNode[] = []
+  if (c && c.fail_open > 0) notes.push(<><b>{plural(c.fail_open, 'edit')}</b> went ahead because it could not decide</>)
+  if (c && c.hook_p95_ms >= BUDGET_MS * 0.85) notes.push(<>its hook is slow, <b>{Math.round(c.hook_p95_ms)} ms</b> at p95</>)
+  if (!notes.length) return 'The Hub is healthy. Nothing needs a look.'
+  return <>The Hub is answering, but {notes[0]}{notes[1] ? <> and {notes[1]}</> : null}.</>
+}
+
 export function HealthPage({ health }: { health: Health | null }) {
   const ok = health?.status === 'ok'
   const c = health?.coordination
@@ -21,14 +36,14 @@ export function HealthPage({ health }: { health: Health | null }) {
     <div className="page">
       <PageHead
         question="Is the hub OK?"
-        answer={!health ? 'Checking…' : ok ? <>The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'The hub reports it is unavailable. This page keeps trying.'}
-        fact={health && ok ? `${health.demo ? 'Demo hub. ' : ''}Checked every 15 seconds.` : undefined}
+        answer={healthAnswer(health)}
+        fact={health ? `${health.demo ? 'Demo hub. ' : ''}${ok && health.storage ? `Storing data in ${STORAGE[health.storage] ?? health.storage}. ` : ''}Checked every 15 seconds.` : undefined}
       />
       <SectionTabs />
       {!health ? (
         <Skeleton rows={4} />
       ) : !ok ? (
-        <Notice tone="bad" icon="heartbreak" title="Hub unavailable">The database did not answer the last health check. Edits go ahead unchecked until it recovers.</Notice>
+        <Notice tone="bad" icon="heartbreak" title="Hub unavailable">The database did not answer the last health check. This page checks again every 15 seconds.</Notice>
       ) : (
         <div className="stack">
           {!c && <Notice tone="muted" icon="info-circle" title="No coordination counters reported yet">They appear once agents start editing through the hook.</Notice>}

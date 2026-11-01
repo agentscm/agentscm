@@ -164,7 +164,7 @@
   border-bottom: 1px solid var(--hub-rule);
 }
 .explorer-inspector-head > div { min-width: 0; }
-.explorer-inspector-head h2 { margin: 1px 0; font-size: 1.05rem; font-weight: 650; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.explorer-inspector-head h2 { margin: 1px 0; font-size: var(--t-card); font-weight: 600; letter-spacing: -0.015em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .explorer-inspector > .tabbar { padding-inline: 16px; flex: none; }
 .explorer-tab-panel { min-height: 0; overflow: auto; flex: 1; padding: 16px; }
 .explorer-tab-panel > .notice + .notice { margin-top: 10px; }
@@ -248,7 +248,7 @@
   top: 0;
   z-index: 2;
 }
-.explorer-conversation h2 { margin: 0; font-size: 1rem; font-weight: 650; }
+.explorer-conversation h2 { margin: 0; font-size: var(--t-card); font-weight: 600; letter-spacing: -0.015em; }
 .explorer-conversation header p { margin: 4px 0 0; font-size: 0.8rem; color: var(--hub-text-3); }
 .explorer-conversation > .notice,
 .explorer-conversation > .placeholder-glow,
@@ -325,8 +325,8 @@
 
 .walkthrough { min-width: 0; }
 .walkthrough h2, .walkthrough h3, .walkthrough h4 { overflow-wrap: anywhere; }
-.walkthrough h3 { font-size: 1.05rem; margin-top: 1.6rem; }
-.walkthrough h4 { font-size: .95rem; }
+.walkthrough h3 { font-size: var(--t-group); font-weight: 650; letter-spacing: -0.01em; margin-top: 1.6rem; }
+.walkthrough h4 { font-size: var(--t-sub); font-weight: 650; color: var(--hub-text-2); }
 .walkthrough-case { margin-top: 1.5rem; }
 .walkthrough-prose { white-space: pre-wrap; overflow-wrap: anywhere; }
 .walkthrough-identities { display: grid; gap: .5rem; margin: 1rem 0; }
