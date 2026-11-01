@@ -42,6 +42,7 @@ mod store_pg;
 mod store_sqlite;
 pub mod sync;
 pub mod ui;
+pub mod value_metrics;
 pub mod view_settings;
 pub mod work;
 pub mod work_http;

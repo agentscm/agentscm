@@ -13,7 +13,7 @@ const OVERVIEW = (current: WorkItem[]) => ({ current, recent: [], overlaps: [], 
 function stubList(body: unknown) {
   const calls: string[] = []
   vi.stubGlobal('fetch', async (url: string) => {
-    calls.push(url)
+    if (url === '/v1/hub/session/repositories') calls.push(url)
     return new Response(JSON.stringify(body), { status: url === '/v1/hub/session/repositories' ? 200 : 404, headers: { 'content-type': 'application/json' } })
   })
   return calls

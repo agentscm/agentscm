@@ -559,6 +559,9 @@ async fn protocol_basics() {
             "agentscm_shared_conversation",
             "agentscm_work_insight",
             "agentscm_work_insights",
+            "agentscm_value_metrics",
+            "agentscm_contribution_receipt",
+            "agentscm_receipt_settings",
             "agentscm_work_search",
             "agentscm_publications_list",
             "agentscm_workflow_runs_list",
@@ -1689,7 +1692,8 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
             (
                 "agentscm_coordination_inbox",
                 "ui://agentscm/coordination-inbox"
-            )
+            ),
+            ("agentscm_value_metrics", "ui://agentscm/value-metrics")
         ]
     );
 
@@ -1707,6 +1711,7 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
         uris,
         [
             "ui://agentscm/work-overview",
+            "ui://agentscm/value-metrics",
             "ui://agentscm/coordination-inbox"
         ]
     );
@@ -1810,7 +1815,16 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
         .rpc(&secret, &rpc_body("resources/list", json!({})))
         .await
         .json();
-    assert_eq!(list["result"]["resources"].as_array().unwrap().len(), 1);
+    let remaining_uris: Vec<_> = list["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|resource| resource["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        remaining_uris,
+        ["ui://agentscm/work-overview", "ui://agentscm/value-metrics"]
+    );
     let off = hub
         .tool_result(&secret, "agentscm_view_settings", json!({"enabled": false}))
         .await;
@@ -1889,7 +1903,7 @@ async fn view_settings_are_per_user_over_a_hub_default() {
     assert_eq!(on["structuredContent"]["effective"]["enabled"], true);
     assert_eq!(on["structuredContent"]["hub_default"]["enabled"], false);
     assert_eq!(on["structuredContent"]["override"]["enabled"], true);
-    assert_eq!(resources(&hub, &a).await, 2);
+    assert_eq!(resources(&hub, &a).await, 3);
     assert_eq!(resources(&hub, &b).await, 0);
 
     // Partial updates merge; a user's off beats a default that is on.
@@ -1903,7 +1917,7 @@ async fn view_settings_are_per_user_over_a_hub_default() {
         .await;
     assert_eq!(merged["structuredContent"]["override"]["enabled"], true);
     assert_eq!(resources(&hub, &a).await, 1);
-    assert_eq!(resources(&hub, &b).await, 2);
+    assert_eq!(resources(&hub, &b).await, 3);
     let tools = hub.rpc(&b, &rpc_body("tools/list", json!({}))).await.json();
     assert!(
         tools["result"]["tools"]
@@ -1918,7 +1932,7 @@ async fn view_settings_are_per_user_over_a_hub_default() {
         .tool_result(&a, "agentscm_view_settings", json!({"reset": true}))
         .await;
     assert_eq!(reset["structuredContent"]["override"], Value::Null);
-    assert_eq!(resources(&hub, &a).await, 2);
+    assert_eq!(resources(&hub, &a).await, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2244,7 +2258,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (36, 39, 44));
+    assert_eq!((before.len(), listed.len(), all.len()), (39, 42, 47));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
@@ -2262,6 +2276,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         include_str!("../../src/hub/narrative.rs"),
         include_str!("../../src/hub/mcp_views/work-overview.html"),
         include_str!("../../src/hub/mcp_views/coordination-inbox.html"),
+        include_str!("../../src/hub/mcp_views/value-metrics.html"),
         &instructions,
     ];
     let mut checked = 0;
@@ -2375,4 +2390,261 @@ async fn explicit_work_pr_links_share_http_mcp_scope_and_read_only_fences() {
         .await
         .json();
     assert_eq!(foreign["result"]["isError"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_metrics_and_receipts_are_scoped_and_automatic_delivery_is_idempotent() {
+    use agentscm::hub::value_metrics::ValueMetricsQuery;
+    let hub = Hub::start().await;
+    let (token_id, key) = hub.secret_with_id(101, "builder");
+    let initial = hub.tool_result(&key,"agentscm_start",json!({"task":"implement parser","session":"receipt-session","branch":"feat/parser","paths":["src/parser.rs"]})).await;
+    let item = &initial["structuredContent"]["work"]["item"];
+    let work_id = item["id"].as_str().unwrap();
+    let query = json!({"work_id":work_id,"until":unix_now()});
+    let metrics = hub
+        .tool_result(&key, "agentscm_value_metrics", query.clone())
+        .await;
+    assert_eq!(metrics["isError"], false, "{metrics}");
+    let own_http = hub.send(reqwest::Method::GET,&format!("/v1/hub/standup/value-metrics?repository=acme%2Fwidgets&work_id={work_id}&until={}",query["until"].as_i64().unwrap()),Some(&key),"").await;
+    assert_eq!(own_http.status, 200, "{}", own_http.text);
+    assert_eq!(
+        own_http.json()["assessment_id"],
+        metrics["structuredContent"]["assessment_id"]
+    );
+    assert_eq!(
+        own_http.json()["resources"],
+        metrics["structuredContent"]["resources"]
+    );
+    let foreign_http = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/standup/value-metrics?repository=other%2Fhidden",
+            Some(&key),
+            "",
+        )
+        .await;
+    assert_eq!(foreign_http.status, 400, "{}", foreign_http.text);
+    for undisclosed in [
+        "other/hidden",
+        REPO,
+        work_id,
+        "assessment_id",
+        "evidence",
+        "resources",
+    ] {
+        assert!(
+            !foreign_http.text.contains(undisclosed),
+            "foreign repository rejection exposed projection data: {}",
+            foreign_http.text
+        );
+    }
+    let expected = hub
+        .store
+        .value_metrics(
+            &token_id,
+            &serde_json::from_value::<ValueMetricsQuery>(query).unwrap(),
+            unix_now(),
+        )
+        .unwrap();
+    assert_eq!(
+        metrics["structuredContent"]["assessment_id"],
+        expected.assessment_id
+    );
+    assert_eq!(
+        metrics["structuredContent"]["scope"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (foreign, error) = hub
+        .tool(
+            &key,
+            "/mcp?repo=other/hidden",
+            "agentscm_value_metrics",
+            json!({}),
+        )
+        .await;
+    assert!(error && foreign.contains("another repository"));
+    // The typed MCP query must not allow an aggregate repository escape.
+    let foreign = hub
+        .tool_result(
+            &key,
+            "agentscm_value_metrics",
+            json!({"repository":"other/hidden"}),
+        )
+        .await;
+    assert_eq!(foreign["isError"], true);
+    let settings = hub
+        .tool_result(
+            &key,
+            "agentscm_receipt_settings",
+            json!({"session":"receipt-session"}),
+        )
+        .await;
+    assert_eq!(settings["structuredContent"]["mode"], "requested_only");
+    let automatic = hub
+        .tool_result(
+            &key,
+            "agentscm_receipt_settings",
+            json!({"session":"receipt-session","mode":"automatic"}),
+        )
+        .await;
+    assert_eq!(automatic["structuredContent"]["mode"], "automatic");
+    let progress=hub.tool_result(&key,"agentscm_work_checkpoint",json!({"work_id":work_id,"operation_id":"select-parser-source","generation":item["generation"],"expected_updated_seq":item["updated_seq"],"session":"receipt-session","kind":"progress","summary":"parser source selected","source_refs":[{"kind":"commit","oid":"a".repeat(40),"path":null}]})).await;
+    assert_eq!(progress["isError"], false);
+    let before_finish = hub
+        .tool_result(
+            &key,
+            "agentscm_contribution_receipt",
+            json!({"work_id":work_id,"session":"receipt-session"}),
+        )
+        .await;
+    let assessment = before_finish["structuredContent"]["version"]
+        .as_str()
+        .unwrap();
+    // Simulate the retained delivery identity from a preceding pre-merge tool response.
+    // Finishing the same source changes no metric counts, but is a distinct substantive phase.
+    hub.store
+        .receipt_work_remember(&token_id, "receipt-session", work_id, unix_now())
+        .unwrap();
+    assert!(
+        hub.store
+            .receipt_announce(
+                &token_id,
+                "receipt-session",
+                work_id,
+                item["generation"].as_i64().unwrap(),
+                &format!("pre_merge:{assessment}"),
+                unix_now()
+            )
+            .unwrap()
+    );
+    let checkpoint = json!({"work_id":work_id,"operation_id":"finish-parser","generation":item["generation"],"expected_updated_seq":progress["structuredContent"]["item"]["updated_seq"],"session":"receipt-session","kind":"finish","summary":"parser implementation recorded","source_refs":[{"kind":"commit","oid":"a".repeat(40),"path":null}]});
+    let finish = hub
+        .tool_result(&key, "agentscm_work_checkpoint", checkpoint.clone())
+        .await;
+    assert_eq!(finish["isError"], false, "{finish}");
+    let receipt = &finish["structuredContent"]["contribution_receipt"];
+    assert_eq!(receipt["phase"], "completion", "{finish}");
+    assert_eq!(
+        receipt["version"], assessment,
+        "completion has a new delivery phase with unchanged metric evidence"
+    );
+    assert!(
+        receipt["text"]
+            .as_str()
+            .unwrap()
+            .contains("merge not observed")
+    );
+    assert!(receipt["text"].as_str().unwrap().len() < 2048);
+    assert!(receipt.to_string().len() < 8192);
+    let repeat = hub
+        .tool_result(&key, "agentscm_work_checkpoint", checkpoint)
+        .await;
+    assert!(
+        repeat["structuredContent"]
+            .get("contribution_receipt")
+            .is_none(),
+        "{repeat}"
+    );
+    let explicit = hub
+        .tool_result(
+            &key,
+            "agentscm_contribution_receipt",
+            json!({"work_id":work_id,"session":"receipt-session"}),
+        )
+        .await;
+    assert_eq!(
+        explicit["structuredContent"]["receipt_id"],
+        receipt["receipt_id"]
+    );
+    // A later provider observation updates a finished Work through catch-up, using the same
+    // receipt identity and its declared source association; no provider call runs here.
+    use agentscm::hub::catchup::{CatchupMergeSource, CatchupRepositoryScope, NewCatchupMerge};
+    hub.store
+        .record_catchup_merge(
+            &CatchupRepositoryScope {
+                provider: "github".into(),
+                host: "github.com".into(),
+                repository: REPO.into(),
+                repository_id: None,
+            },
+            &NewCatchupMerge {
+                source: CatchupMergeSource::ForgePull,
+                source_id: "501".into(),
+                occurred_at: None,
+                title: Some("Parser update".into()),
+                branch: "feat/parser".into(),
+                base: "main".into(),
+                head_commit: "a".repeat(40),
+                merge_commit: "b".repeat(40),
+                pull_number: 501,
+                paths: vec!["src/parser.rs".into()],
+                paths_complete: true,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let merged = hub
+        .tool_result(
+            &key,
+            "agentscm_work_catchup",
+            json!({"subscriber":"agent:receipt-session"}),
+        )
+        .await;
+    assert_eq!(merged["isError"], false, "{merged}");
+    let update = &merged["structuredContent"]["contribution_receipt"];
+    assert_eq!(update["receipt_id"], receipt["receipt_id"], "{merged}");
+    assert_eq!(update["phase"], "provider_observed_merge");
+    assert_ne!(update["version"], receipt["version"]);
+    assert!(
+        update["text"]
+            .as_str()
+            .unwrap()
+            .contains("Work association declared")
+    );
+    let merged_again = hub
+        .tool_result(
+            &key,
+            "agentscm_work_catchup",
+            json!({"subscriber":"agent:receipt-session"}),
+        )
+        .await;
+    assert!(
+        merged_again["structuredContent"]
+            .get("contribution_receipt")
+            .is_none(),
+        "{merged_again}"
+    );
+    let other_session = hub
+        .tool_result(
+            &key,
+            "agentscm_receipt_settings",
+            json!({"session":"other-session"}),
+        )
+        .await;
+    assert_eq!(other_session["structuredContent"]["mode"], "requested_only");
+    hub.tool_result(
+        &key,
+        "agentscm_receipt_settings",
+        json!({"session":"receipt-session","mode":"disabled"}),
+    )
+    .await;
+    let disabled = hub
+        .tool_result(
+            &key,
+            "agentscm_contribution_receipt",
+            json!({"work_id":work_id,"session":"receipt-session"}),
+        )
+        .await;
+    assert_eq!(disabled["isError"], true);
+    let invalid_session = hub
+        .tool_result(
+            &key,
+            "agentscm_receipt_settings",
+            json!({"session":"s".repeat(256),"mode":"automatic"}),
+        )
+        .await;
+    assert_eq!(invalid_session["isError"], true);
 }

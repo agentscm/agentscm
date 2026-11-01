@@ -84,8 +84,8 @@ each:
 - Repositories the Hub could not check (forge unavailable, rate limited, connection credential
   failing) are not listed by name. The page shows "N repositories could not be checked" with a
   retry, so a forge outage does not look like lost access and does not reveal names.
-- The page is read-only. It does not show task titles, paths or people; those stay on each
-  repository's Dashboard, behind that repository's own token.
+- Repository rows show counts rather than task titles, paths or people. The separately
+  authorized contribution projection described below can expose bounded evidence details.
 
 Pull-request overlaps (`pr` in `needsYou`) come from the repository's forge state on the
 Dashboard. They are left out of the row count in the first version, and the row says "needs you"
@@ -264,3 +264,39 @@ separate role system.
 1. Whether the empty-repository case for a single readable repository should also show the page,
    so the person sees it is empty rather than broken.
 2. Whether pull-request overlaps belong in the first version's *Needs you* count.
+
+## Recorded contributions
+
+The experimental All repositories page also reads `GET /v1/hub/session/value-metrics`.
+This is a separate server projection scoped to the browser session's currently readable
+repositories. It does not mint a token for each repository or download repository histories.
+The section is self-contained below the repository attention list.
+
+The section is headed “What AgentSCM recorded”. Four cards show issue episodes, follow-ups,
+team context and recorded resources, with numbers above their labels. A segmented period
+control offers 7, 30 or 90 days; repository scope narrows the server request. A visible amber
+coverage strip records population limits and omissions, with detailed gaps available by
+disclosure. Evidence is a separate disclosure below the cards. Refresh and a visible-tab two-minute poll request new projections.
+
+The browser displays the shared `agentscm.observed.v1` projection. It does not calculate
+aggregate counts, monetary savings, defect prevention or productivity scores. Unknown values
+remain unknown. Token integers stay decimal strings to preserve large values; amounts are shown
+in currency micros with their accounting basis, provider, model and category, without combining
+currencies or bases. Missing cost and unallocated overhead remain explicit.
+
+Evidence is paged with the returned cursor and a fixed window. Each disclosure identifies its
+recorded state, observation time, repository, Work, source, recipe/run and policy where known.
+Opening its repository uses the existing token-minting path and can still be refused. Reading a
+contribution does not acknowledge context, accept evidence or change workflow state.
+
+The section labels partial and unknown coverage, missing populations and omitted records. Zero
+observations do not establish zero problems; observed-Work coverage does not establish token-volume
+coverage. A failed or refused refresh removes the previous projection. Changing session, period
+or readable scope immediately hides data from the previous request and ignores late responses.
+An unavailable projection is a visible unknown state with a retry action, independent of the
+repository list.
+
+UI regression coverage exercises unknown values, exact large token integers, mixed currencies
+and accounting bases, bounded reads, period/scope requests, evidence paging, access refusal and
+late responses. These checks do not by themselves qualify live forge capture or provider merge
+verification; local end-to-end qualification is reported separately.

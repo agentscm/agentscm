@@ -10,6 +10,7 @@ import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
 import { SectionTabs, type WebChoice } from '../TopNav.tsx'
 import { Ago, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
+import { ValueMetricsSection } from '../ValueMetrics.tsx'
 import type { Load } from './Computers.tsx'
 import { workTabHref } from './Work.tsx'
 
@@ -127,6 +128,7 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
                 </>
               )}
               {quiet.length > 0 && <QuietDrawer rows={quiet} hint={newHere ? 'No agents or unfinished work yet' : 'Nothing in progress'} {...rowProps} />}
+              <ValueMetricsSection session={session} repositories={v.rows} onOpen={web ? open : undefined} />
               {!v.complete && <p className="muted small">Only the first 200 connected repositories are checked.</p>}
               {current && overview && v.rows.length > 0 && !newHere && <Done repo={current} overview={overview} token={token} />}
             </div>
