@@ -295,6 +295,7 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
         expected_updated_seq: acknowledged.updated_seq,
         kind: CoordinationResponseKind::Join,
         note: Some("Join the incumbent work as a helper".into()),
+        via_hub: false,
     };
     let responded = store
         .coordination_reply(&incumbent, &reply, now + 6)
@@ -605,6 +606,7 @@ fn response_projection_does_not_change_status(db: &Db) {
                 expected_updated_seq: request.updated_seq,
                 kind: CoordinationResponseKind::Decline,
                 note: None,
+                via_hub: false,
             },
             now + 3,
         )
@@ -621,6 +623,7 @@ fn response_projection_does_not_change_status(db: &Db) {
                     expected_updated_seq: current.updated_seq,
                     kind: CoordinationResponseKind::ProposeSplit,
                     note: None,
+                    via_hub: false,
                 },
                 now + 4 + index,
             )
@@ -1303,6 +1306,85 @@ fn default_work_session_is_durably_aliased_to_the_first_hook(db: &Db) {
     ));
 }
 
+/// A person's answer through the Hub keeps the responding agent as the responder and says
+/// `hub` beside it; the requester's inbox sees it, and an agent's own answer carries no mark.
+fn a_person_reply_through_the_hub_is_marked_and_delivered(db: &Db) {
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let requester = token(&*store, 2, "requester");
+    let now = unix_now();
+    store
+        .work_start(&incumbent, &start("incumbent", "incumbent-session"), now)
+        .unwrap();
+    let request = store
+        .work_start(
+            &requester,
+            &start("requester", "requester-session"),
+            now + 1,
+        )
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let target = request.targets[0].work_id.clone();
+    let reply = |operation: &str, seq: i64, via_hub: bool| CoordinationReply {
+        request_id: request.id.clone(),
+        operation_id: operation.into(),
+        target_work_id: target.clone(),
+        session: "incumbent-session".into(),
+        expected_updated_seq: seq,
+        kind: CoordinationResponseKind::ProposeSplit,
+        note: Some("I take tax, you take rounding".into()),
+        via_hub,
+    };
+    let by_person = reply("person", request.updated_seq, true);
+    let first = store
+        .coordination_reply(&incumbent, &by_person, now + 2)
+        .unwrap();
+    let response = &first.responses[0];
+    assert_eq!(response.via.as_deref(), Some("hub"));
+    // The responder is still the agent that leads the Work; its owner is the person.
+    assert_eq!(response.responder.token, incumbent);
+    assert_eq!(response.responder.login, "user1");
+    // A retry of the same operation replays instead of answering twice.
+    let again = store
+        .coordination_reply(&incumbent, &by_person, now + 3)
+        .unwrap();
+    assert_eq!(again.responses.len(), 1);
+    assert_eq!(again.updated_seq, first.updated_seq);
+
+    // The requester's session finds it in its inbox at its next touch, with the mark.
+    let inbox = store
+        .coordination_inbox(
+            &requester,
+            &CoordinationInboxQuery {
+                session: Some("requester-session".into()),
+                ..CoordinationInboxQuery::default()
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(inbox.requests[0].responses[0].via.as_deref(), Some("hub"));
+    let data: Vec<String> = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "coordination_responded")
+        .map(|event| event.data)
+        .collect();
+    assert_eq!(data.len(), 1);
+    assert!(data[0].contains("\"via\":\"hub\""), "{data:?}");
+
+    // The agent answering for itself (a different target generation is not needed): no mark.
+    let own = reply("agent", first.updated_seq, false);
+    let second = store.coordination_reply(&incumbent, &own, now + 5).unwrap();
+    assert!(
+        second
+            .responses
+            .iter()
+            .any(|response| response.via.is_none() && response.id != first.responses[0].id)
+    );
+}
+
 macro_rules! parity_case {
     ($name:ident, $case:ident) => {
         mod $name {
@@ -1321,6 +1403,10 @@ macro_rules! parity_case {
     };
 }
 
+parity_case!(
+    person_reply_through_the_hub,
+    a_person_reply_through_the_hub_is_marked_and_delivered
+);
 parity_case!(
     queued_expansion,
     queued_expansion_requires_the_proposed_scope
@@ -1393,6 +1479,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
             target_generation: 1,
             kind: CoordinationResponseKind::ProposeSplit,
             note: Some("n".repeat(500)),
+            via: None,
             created_at: index,
             seq: index,
         })

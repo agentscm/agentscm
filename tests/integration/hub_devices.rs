@@ -1756,6 +1756,343 @@ async fn with_cookie(
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// A signed-in web page: the cookie, its CSRF token and the person's user id.
+struct Page {
+    cookie: String,
+    csrf: String,
+    id: String,
+}
+
+async fn page(env: &Env, user: i64) -> Page {
+    let cookie = web_sign_in(env, user).await;
+    let (_, me) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    Page {
+        csrf: me["csrf_token"].as_str().unwrap().to_owned(),
+        id: me["user"]["id"].as_str().unwrap().to_owned(),
+        cookie,
+    }
+}
+
+/// A POST from a web page; `csrf` is withheld to play another site's form.
+async fn page_post(env: &Env, page: &Page, csrf: bool, path: &str, body: Value) -> (u16, Value) {
+    let mut request = browser()
+        .post(format!("{}{path}", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", page.cookie),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_string());
+    if csrf {
+        request = request.header("x-csrf-token", &page.csrf);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+fn agent_for(env: &Env, owner: &str, name: &str, read_only: bool) -> (String, String) {
+    let (id, secret, _) =
+        mint_bound_agent_token(&*env.store, owner, name, REPO, REPO_ID, 3600, read_only).unwrap();
+    (id, secret.expose().to_owned())
+}
+
+fn hook_call(session: &str, paths: &[&str]) -> agentscm::hub::session::SessionCall {
+    agentscm::hub::session::SessionCall {
+        session: Some(session.to_owned()),
+        via: "hook:claude".into(),
+        task: None,
+        paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+        deny: true,
+        report: true,
+    }
+}
+
+fn work(key: &str, session: &str) -> agentscm::hub::work::WorkStart {
+    agentscm::hub::work::WorkStart {
+        work_id: None,
+        source: None,
+        request_key: Some(key.into()),
+        title: key.into(),
+        session: session.into(),
+        role: agentscm::hub::work::WorkRole::Lead,
+        scope: vec!["src/billing.rs".into()],
+        branch: None,
+        worktree: None,
+        next_action: Some("continue".into()),
+        depends_on: Vec::new(),
+        related_work: Vec::new(),
+        takeover_generation: None,
+        preflight: None,
+    }
+}
+
+const REPLY: &str = "/v1/hub/session/coordination/reply";
+const ANSWER: &str = "/v1/hub/session/handoff/answer";
+const ASK: &str = "/v1/hub/session/handoff/ask";
+
+#[tokio::test]
+async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (lead, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let (lead_read_only, _) = agent_for(&env, &alice.id, "viewer", true);
+    let (asker, asker_secret) = agent_for(&env, &bob.id, "codex", false);
+    let now = unix_now();
+    env.store
+        .work_start(&lead, &work("billing", "alice-session"), now)
+        .unwrap();
+    let request = env
+        .store
+        .work_start(&asker, &work("rounding", "bob-session"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let body = |token: &str, operation: &str| {
+        json!({"token": token, "request_id": request.id, "operation_id": operation,
+            "target_work_id": request.targets[0].work_id, "session": "alice-session",
+            "expected_updated_seq": request.updated_seq, "kind": "propose_split",
+            "note": "I take tax, you take rounding"})
+    };
+
+    // Signed out, a cookie without its CSRF token, and a computer's bearer session are refused.
+    let (status, _) = env
+        .call(&env.hub, Method::POST, REPLY, None, Some(body(&lead, "a")))
+        .await;
+    assert_eq!(status, 401);
+    let (status, refused) = page_post(&env, &alice, false, REPLY, body(&lead, "a")).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (session, _, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, refused) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            REPLY,
+            Some(&session),
+            Some(body(&lead, "a")),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("forbidden"))
+    );
+
+    // Nobody answers for an agent that is not theirs: not another person's, not a read-only
+    // token of their own, not one that does not exist. All look alike.
+    for (who, token) in [
+        (&bob, lead.as_str()),
+        (&alice, asker.as_str()),
+        (&alice, lead_read_only.as_str()),
+        (&alice, "tok_00000000000000000000000000000000"),
+    ] {
+        let (status, refused) = page_post(&env, who, true, REPLY, body(token, "b")).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (403, Some("not_your_agent")),
+            "{token}"
+        );
+    }
+    // The store's own rule still holds for the right owner: only the Work's lead session.
+    let mut wrong = body(&lead, "c");
+    wrong["session"] = json!("someone-elses-session");
+    let (status, _) = page_post(&env, &alice, true, REPLY, wrong).await;
+    assert_eq!(status, 403);
+
+    // Bad kinds, unknown fields (no one sets the mark themselves) and long notes are refused.
+    let mut bad_kind = body(&lead, "d");
+    bad_kind["kind"] = json!("merge_it");
+    assert_eq!(page_post(&env, &alice, true, REPLY, bad_kind).await.0, 400);
+    let mut marked = body(&lead, "d");
+    marked["via_hub"] = json!(false);
+    assert_eq!(page_post(&env, &alice, true, REPLY, marked).await.0, 400);
+    let mut long = body(&lead, "d");
+    long["note"] = json!("x".repeat(501));
+    assert_eq!(page_post(&env, &alice, true, REPLY, long).await.0, 400);
+    let mut stale = body(&lead, "e");
+    stale["expected_updated_seq"] = json!(request.updated_seq + 99);
+    let (status, refused) = page_post(&env, &alice, true, REPLY, stale).await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused["message"].as_str().unwrap().contains("changed"),
+        "{refused}"
+    );
+
+    // The owner answers; the record says a person did, beside the agent that leads the Work.
+    let (status, answered) = page_post(&env, &alice, true, REPLY, body(&lead, "f")).await;
+    assert_eq!(status, 200, "{answered}");
+    let response = &answered["responses"][0];
+    assert_eq!(response["via"], "hub");
+    assert_eq!(response["kind"], "propose_split");
+    assert_eq!(response["responder"]["login"], "alice");
+    assert_eq!(response["responder"]["agent"], "claude-code");
+    assert_eq!(response["responder"]["token"], json!(lead));
+    // A retry replays the same answer instead of adding a second.
+    let (status, replay) = page_post(&env, &alice, true, REPLY, body(&lead, "f")).await;
+    assert_eq!(
+        (status, replay["responses"].as_array().unwrap().len()),
+        (200, 1)
+    );
+
+    // The asking agent reads it in its inbox at its next touch, marked as a person's answer.
+    let (status, inbox) = env
+        .get("/v1/hub/standup/inbox?session=bob-session", &asker_secret)
+        .await;
+    assert_eq!(status, 200, "{inbox}");
+    assert_eq!(inbox["requests"][0]["responses"][0]["via"], "hub");
+    assert_eq!(
+        inbox["requests"][0]["responses"][0]["note"],
+        "I take tax, you take rounding"
+    );
+    let events = env.store.events_after(0, 1000).unwrap();
+    let responded: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "coordination_responded")
+        .collect();
+    assert_eq!(responded.len(), 1);
+    assert!(responded[0].data.contains("\"via\":\"hub\""));
+}
+
+#[tokio::test]
+async fn a_web_session_asks_and_answers_file_handoffs_only_for_its_own_agents() {
+    let env = Env::start("github").await;
+    let (alice, bob, admin) = (
+        page(&env, ALICE).await,
+        page(&env, BOB).await,
+        page(&env, ADMIN).await,
+    );
+    let (holder, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let (wanter, _) = agent_for(&env, &bob.id, "codex", false);
+    let file = "src/billing.rs";
+    let now = unix_now();
+    env.store
+        .touch_session(&holder, &hook_call("ha", &[file]), now)
+        .unwrap();
+    env.store
+        .touch_session(&wanter, &hook_call("hb", &[]), now + 1)
+        .unwrap();
+    let ask = |token: &str| json!({"token": token, "session": "hb", "path": file, "note": "rounding fix"});
+
+    // Bob may not ask through Alice's page, without the page's CSRF token, or signed out.
+    let (status, _) = page_post(&env, &bob, false, ASK, ask(&wanter)).await;
+    assert_eq!(status, 403);
+    let (status, refused) = page_post(&env, &alice, true, ASK, ask(&wanter)).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    let (status, _) = env
+        .call(&env.hub, Method::POST, ASK, None, Some(ask(&wanter)))
+        .await;
+    assert_eq!(status, 401);
+    let mut glob = ask(&wanter);
+    glob["path"] = json!("src/**");
+    assert_eq!(page_post(&env, &bob, true, ASK, glob).await.0, 400);
+    // A long note is cut like an agent's, not refused.
+    let mut long = ask(&wanter);
+    long["note"] = json!("word ".repeat(100));
+    let (status, asked) = page_post(&env, &bob, true, ASK, long).await;
+    assert_eq!(
+        (status, asked["outcome"].as_str()),
+        (200, Some("requested")),
+        "{asked}"
+    );
+    assert_eq!(asked["holder"]["login"], "alice");
+    let (_, again) = page_post(&env, &bob, true, ASK, ask(&wanter)).await;
+    assert_eq!(again["outcome"], "already_asked");
+
+    // Each person reads their own side of it, with the other agent's token and session withheld.
+    let list = |page: &Page| {
+        let (hub, cookie) = (env.hub.clone(), page.cookie.clone());
+        async move {
+            with_cookie(
+                &hub,
+                Method::GET,
+                &format!("/v1/hub/session/handoffs?repository={REPO}"),
+                &cookie,
+                None,
+            )
+            .await
+        }
+    };
+    let (status, mine) = list(&alice).await;
+    assert_eq!(status, 200, "{mine}");
+    let row = &mine["handoffs"][0];
+    assert_eq!(
+        (row["state"].as_str(), row["asked_via_hub"].as_bool()),
+        (Some("pending"), Some(true))
+    );
+    assert_eq!(row["holder"]["token"], json!(holder));
+    assert_eq!(row["holder"]["session"], "ha");
+    assert!(row["requester"].get("token").is_none() && row["requester"]["mine"] == false);
+    let (_, theirs) = list(&bob).await;
+    assert_eq!(theirs["handoffs"][0]["requester"]["token"], json!(wanter));
+    assert!(theirs["handoffs"][0]["holder"].get("token").is_none());
+    assert!(
+        list(&admin).await.1["handoffs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let path = "/v1/hub/session/handoffs?repository=acme/widgets";
+    assert_eq!(
+        with_cookie(&env.hub, Method::GET, path, "nope", None)
+            .await
+            .0,
+        401
+    );
+
+    // The holder's agent hears it at its next touch, from a person at the Hub.
+    let told = env
+        .store
+        .touch_session(&holder, &hook_call("ha", &[]), now + 5)
+        .unwrap();
+    assert_eq!(told.handoffs.len(), 1);
+    assert!(told.handoffs[0].hub);
+
+    // Bob cannot answer for Alice's agent; she can, once.
+    let answer = |token: &str, accept: bool| json!({"token": token, "session": "ha", "path": file, "accept": accept});
+    let (status, refused) = page_post(&env, &bob, true, ANSWER, answer(&holder, true)).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    assert_eq!(
+        page_post(&env, &alice, false, ANSWER, answer(&holder, true))
+            .await
+            .0,
+        403
+    );
+    let (status, done) = page_post(&env, &alice, true, ANSWER, answer(&holder, true)).await;
+    assert_eq!(
+        (status, done["outcome"].as_str()),
+        (200, Some("granted")),
+        "{done}"
+    );
+    assert_eq!(done["requester"]["login"], "bob");
+    let (_, twice) = page_post(&env, &alice, true, ANSWER, answer(&holder, true)).await;
+    assert_eq!(twice["outcome"], "no_open_request");
+
+    // The wanting agent hears the grant, and the record says a person gave it.
+    let heard = env
+        .store
+        .touch_session(&wanter, &hook_call("hb", &[file]), now + 9)
+        .unwrap();
+    assert_eq!(heard.handoffs.len(), 1);
+    assert!(heard.handoffs[0].hub && heard.handoffs[0].kind == "grant");
+    let grants: Vec<_> = env
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "handoff_grant")
+        .collect();
+    assert!(grants[0].data.contains("\"via\":\"hub\""));
+    let (_, after) = list(&alice).await;
+    assert_eq!(after["handoffs"][0]["state"], "granted");
+    assert_eq!(after["handoffs"][0]["answered_via_hub"], true);
+}
+
 #[tokio::test]
 async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() {
     let env = Env::start("github").await;

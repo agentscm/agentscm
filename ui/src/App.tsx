@@ -237,7 +237,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
           </Notice>
         )}
         {(section === 'home' || section === 'now' || section === 'activity' || section === 'team') && <DashboardPage section={section} question={SECTIONS.find((s) => s.key === section)!.question} token={token} repo={repo} data={data} d={d} overview={overview} />}
-        {section === 'inbox' && <InboxPage token={token} overview={overview} handoff={handoff} />}
+        {section === 'inbox' && <InboxPage token={token} overview={overview} handoff={handoff} session={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session : null} live={d ? { agents: d.agents, contested: d.contested } : null} />}
         {section === 'work' && <WorkPage token={token} overview={overview} handoff={handoff} />}
         {section === 'promises' && <PromisesPage />}
         {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}

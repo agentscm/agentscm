@@ -26,7 +26,7 @@ use super::coordination::{
 };
 use super::device::{Device, DevicePrincipal, Refusal, RepositoryUsage};
 use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
-use super::handoff::{Answered, Asked};
+use super::handoff::{Answered, Asked, HandoffView, Via};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
 use super::promise::{
@@ -317,6 +317,19 @@ pub trait Store: Send + Sync {
         path: &str,
         note: Option<&str>,
         now: i64,
+    ) -> Result<Asked> {
+        self.ask_handoff_via(token, session, path, note, Via::Agent, now)
+    }
+    /// [`Store::ask_handoff`] with the record saying who asked: `Via::Hub` is the token owner
+    /// acting for the agent on the Hub's web pages. The caller has checked that they own `token`.
+    fn ask_handoff_via(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        path: &str,
+        note: Option<&str>,
+        via: Via,
+        now: i64,
     ) -> Result<Asked>;
     /// The holder's answer to the oldest open request for `path` addressed to the token (to its
     /// session `session`, if given). Accepting moves the file to the requester's session; a
@@ -329,7 +342,28 @@ pub trait Store: Send + Sync {
         accept: bool,
         reason: Option<&str>,
         now: i64,
+    ) -> Result<Answered> {
+        self.answer_handoff_via(token, session, path, (accept, reason), Via::Agent, now)
+    }
+    /// [`Store::answer_handoff`] with the record saying who answered, as for `ask_handoff_via`.
+    fn answer_handoff_via(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        path: &str,
+        answer: (bool, Option<&str>),
+        via: Via,
+        now: i64,
     ) -> Result<Answered>;
+    /// The newest handoffs in `repository` (most recent first, at most `limit`) in which a
+    /// token owned by `owner` is the requester or the holder, in any state.
+    fn handoffs_of_owner(
+        &self,
+        owner: &str,
+        repository: &str,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<HandoffView>>;
     /// Live intents in `repository`, ordered by id, at most `limit`.
     fn live_intents(&self, repository: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// Live intents in the principal's repository and forge scope, ordered by id.

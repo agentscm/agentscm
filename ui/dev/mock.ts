@@ -66,6 +66,51 @@ let readTokensMinted = 0
 let rejectNextWebRead = false
 let rejectNextHubSignOut = false
 let rejectNextAgentRead = false
+// Inbox fixtures: directed requests and file handoffs, and what a signed-in person's answers change.
+// Memory only; /__mock/reset restores them. maria is the signed-in person.
+interface MockAgent { token: string; agent: string; session: string; owner: string; login: string }
+interface MockResponse { id: string; operation_id: unknown; target_work_id: string; responder: MockAgent; target_generation: number; kind: unknown; note: unknown; via: string | null; created_at: number; seq: number }
+interface MockRequest { id: string; status: string; updated_at: number; updated_seq: number; targets: { work_id: string; generation: number; lead: MockAgent }[]; responses: MockResponse[] }
+interface MockSide { agent: string; login: string; mine: boolean; token?: string; session?: string }
+interface MockHandoff { id: string; path: string; state: string; requester: MockSide; holder: MockSide; [field: string]: unknown }
+const wk = (c: string) => `wrk_${c.repeat(32)}`
+const crq = (n: number) => `crq_${n.toString(16).padStart(32, '0')}`
+const who = (login: string, token: string, agent: string) => ({ token, agent, session: `${agent}-session`, owner: `github:github.com:${login}`, login })
+const MARIA_CC = who('maria', 'tok_claude-code', 'claude-code')
+const MARIA_CODEX = who('maria', 'tok_codex', 'codex')
+const DEV_CODEX = who('dev', 'tok_codex', 'codex')
+const DEV_CURSOR = who('dev', 'tok_cursor', 'cursor')
+const SAM_COPILOT = who('sam', 'tok_copilot', 'copilot')
+function freshInbox() {
+  const req = (n: number, requester: ReturnType<typeof who>, title: string, scope: string[], target: { work: string; lead: ReturnType<typeof who>; mine: string }, secs: number, over: Record<string, unknown> = {}) => ({
+    id: crq(n), requester, proposal: { work_id: null, source: null, request_key: `req_${n.toString(16).padStart(32, '0')}`, title, scope },
+    targets: [{ work_id: target.work, lead: target.lead, generation: 1, reasons: [{ your_path: target.mine, their_path: scope[0] ?? target.mine }], reasons_complete: true }],
+    status: 'pending', acknowledgements: [], acknowledgements_complete: true, responses: [], responses_complete: true,
+    created_at: ago(secs), updated_at: ago(secs), created_seq: n * 10, updated_seq: n * 10, ...over,
+  })
+  const ack = (work: string | null, agent: ReturnType<typeof who>, through: number, secs: number, seq: number) => ({ target_work_id: work, agent, generation: 1, through_seq: through, acknowledged_at: ago(secs), seq })
+  return {
+    seq: 100,
+    requests: [
+      // Addressed to maria's Claude Code, received, not answered: a conversation that needs her.
+      req(1, SAM_COPILOT, 'Round invoice totals per currency', ['src/billing.rs', 'src/invoice/totals.rs'], { work: wk('a'), lead: MARIA_CC, mine: 'src/billing.rs' }, 600, { acknowledgements: [ack(wk('a'), MARIA_CC, 10, 420, 12)], updated_at: ago(420), updated_seq: 12 }),
+      // Sent by maria's Claude Code to dev's Codex, received, no reply yet.
+      req(2, MARIA_CC, 'Move tax out of invoice totals', ['src/billing.rs', 'src/tax.rs'], { work: wk('b'), lead: DEV_CODEX, mine: 'src/billing.rs' }, 1500, { acknowledgements: [ack(wk('b'), DEV_CODEX, 20, 1200, 22)], updated_at: ago(1200), updated_seq: 22 }),
+      // Answered and closed some time ago.
+      req(3, DEV_CURSOR, 'Settings page layout', ['docs/webhooks.md'], { work: wk('c'), lead: MARIA_CODEX, mine: 'docs/webhooks.md' }, 7200, {
+        status: 'resolved', updated_at: ago(5400), updated_seq: 34,
+        acknowledgements: [ack(wk('c'), MARIA_CODEX, 30, 7000, 32)],
+        responses: [{ id: `crs_${'3'.repeat(32)}`, operation_id: 'mock-op-3', target_work_id: wk('c'), responder: MARIA_CODEX, target_generation: 1, kind: 'handover', note: 'Take the docs file; I am blocked on the policy anyway.', via: null, created_at: ago(6000), seq: 33 }],
+      }),
+    ] as unknown as MockRequest[],
+    handoffs: [
+      { id: 'hof_mock_1', path: 'src/webhooks/retry.rs', state: 'pending', note: 'I need the retry policy for the webhook docs. Can you hand it over once your tests pass?', reply: null, created_at: ago(420), decided_at: null, holder_told: true, requester_told: false, asked_via_hub: false, answered_via_hub: false, requester: { agent: 'codex', login: 'dev', mine: false }, holder: { agent: 'claude-code', login: 'maria', mine: true, token: MARIA_CC.token, session: 'ses-claude-1' } },
+      { id: 'hof_mock_2', path: 'src/ledger.rs', state: 'pending', note: null, reply: null, created_at: ago(240), decided_at: null, holder_told: false, requester_told: false, asked_via_hub: false, answered_via_hub: false, requester: { agent: 'claude-code', login: 'maria', mine: true, token: MARIA_CC.token, session: 'ses-claude-1' }, holder: { agent: 'copilot', login: 'sam', mine: false } },
+      { id: 'hof_mock_3', path: 'src/tax.rs', state: 'granted', note: 'Rounding fix needs a one-line change here', reply: null, created_at: ago(3300), decided_at: ago(3000), holder_told: true, requester_told: true, asked_via_hub: false, answered_via_hub: false, requester: { agent: 'codex', login: 'dev', mine: false }, holder: { agent: 'claude-code', login: 'maria', mine: true, token: MARIA_CC.token, session: 'ses-claude-1' } },
+    ] as MockHandoff[],
+  }
+}
+let inbox = freshInbox()
 // A repository the signed-in person can list but whose role is too low: the mint refuses it.
 const REFUSED_REPO = 'acme/secret-plans'
 const webToken = (repo: string, serial: number) => `webread:${repo.replace('/', ':')}:${serial}`
@@ -493,6 +538,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         }
         if (req.url?.startsWith('/reset')) {
           revokedDevices.clear()
+          inbox = freshInbox()
           browserSignedIn = true
           readTokensMinted = 0
           rejectNextWebRead = false
@@ -616,6 +662,43 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           { at: ago(900), count: 3, provider: 'github', login: 'brandonfla', forge_user_id: 3001, reason: 'insufficient_role', via: 'device_mint' },
           { at: ago(86400 * 2), count: 1, provider: 'github', login: 'drive-by', forge_user_id: 3002, reason: 'not_allowed', via: 'sign_in' },
         ] })
+        // A signed-in person answering for their own agent (the Inbox). Cookie sign-in; CSRF for a change.
+        if (url.pathname.startsWith('/session/') && /^\/session\/(handoffs|coordination\/reply|handoff\/(answer|ask))$/.test(url.pathname)) {
+          if (!browserSignedIn || scenario === 'empty') return send(401, { error: 'sign_in_required' })
+          if (req.method === 'POST' && req.headers['x-csrf-token'] !== 'synthetic-csrf-no-authority') return send(403, { error: 'csrf', message: 'This change did not come from the Hub’s own page; reload the page and try again' })
+          if (url.pathname === '/session/handoffs') return send(200, { handoffs: url.searchParams.get('repository') === REPO ? inbox.handoffs : [] })
+          let raw = ''
+          for await (const chunk of req) raw += chunk
+          const body = JSON.parse(raw || '{}') as Record<string, unknown>
+          const mine = body['token'] === MARIA_CC.token || body['token'] === MARIA_CODEX.token
+          if (!mine) return send(403, { error: 'not_your_agent', message: 'That agent is not yours, or it is no longer connected' })
+          if (url.pathname === '/session/coordination/reply') {
+            const r = inbox.requests.find((x) => x.id === body['request_id'])
+            const t = r?.targets.find((x) => x.work_id === body['target_work_id'] && x.lead.token === body['token'])
+            if (!r || !t) return send(403, { error: 'not_your_agent', message: 'That agent is not yours, or it is no longer connected' })
+            if (String(body['note'] ?? '').includes('!fail')) return send(400, { error: 'invalid_request', message: 'coordination request changed; current updated_seq is 99' })
+            if (r.updated_seq !== body['expected_updated_seq']) return send(400, { error: 'invalid_request', message: `coordination request changed; current updated_seq is ${r.updated_seq}` })
+            if (!r.responses.some((x) => x.operation_id === body['operation_id'])) {
+              inbox.seq += 1
+              r.responses.push({ id: `crs_${inbox.seq.toString(16).padStart(32, '0')}`, operation_id: body['operation_id'], target_work_id: t.work_id, responder: t.lead, target_generation: t.generation, kind: body['kind'], note: body['note'] ?? null, via: 'hub', created_at: ago(0), seq: inbox.seq })
+              r.status = 'responded'
+              r.updated_at = ago(0)
+              r.updated_seq = inbox.seq
+            }
+            return send(200, r)
+          }
+          if (url.pathname === '/session/handoff/answer') {
+            const h = inbox.handoffs.find((x) => x.state === 'pending' && x.holder.mine && x.holder.token === body['token'] && x.path === body['path'])
+            if (!h) return send(200, { outcome: 'no_open_request', requester: null })
+            Object.assign(h, { state: body['accept'] ? 'granted' : 'declined', decided_at: ago(0), reply: body['accept'] ? null : (body['reason'] ?? null), answered_via_hub: true })
+            return send(200, { outcome: h.state, requester: { agent: h.requester.agent, login: h.requester.login } })
+          }
+          // /session/handoff/ask: only a file some other agent holds can be asked for.
+          if (body['path'] !== 'src/billing.rs') return send(200, { outcome: 'not_held', holder: null })
+          if (inbox.handoffs.some((x) => x.state === 'pending' && x.requester.mine && x.path === body['path'])) return send(200, { outcome: 'already_asked', holder: { agent: 'codex', login: 'dev' } })
+          inbox.handoffs.unshift({ id: `hof_mock_${inbox.handoffs.length + 1}`, path: String(body['path']), state: 'pending', note: body['note'] ?? null, reply: null, created_at: ago(0), decided_at: null, holder_told: false, requester_told: false, asked_via_hub: true, answered_via_hub: false, requester: { agent: 'claude-code', login: 'maria', mine: true, token: MARIA_CC.token, session: 'ses-claude-1' }, holder: { agent: 'codex', login: 'dev', mine: false } })
+          return send(200, { outcome: 'requested', holder: { agent: 'codex', login: 'dev' } })
+        }
         const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
         if (!token || token === 'expired') return send(401, { error: 'unauthorized' })
         if (!token.startsWith('webread:') && rejectNextAgentRead && (url.pathname === '/whoami' || /^\/repos\/[^/]+\/(work|activity)$/.test(url.pathname))) {
@@ -658,7 +741,10 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           const events = items.map((item, i) => ({ seq: 10 + i, at: item.updated_at, kind: i % 3 === 0 ? 'work_started' : 'work_checkpoint', work_id: item.id, item }))
           return send(200, { delivery: null, from: 0, through: 40, after: 0, work_after: null, next_after: 40, next_work_after: null, next_work_done: true, items, events, retention_gap: false, complete: true })
         }
-        if (url.pathname === '/standup/coordination') return send(200, { from: 0, through: 40, next_after: 0, requests: [], complete: true, retention_gap: false })
+        if (url.pathname === '/standup/coordination') {
+          const rows = empty || billingDocs ? [] : inbox.requests.filter((r) => url.searchParams.get('active_only') !== 'true' || (r.status !== 'resolved' && r.status !== 'withdrawn')).sort((a, b) => a.updated_seq - b.updated_seq)
+          return send(200, { from: 0, through: inbox.seq, next_after: rows.at(-1)?.updated_seq ?? 0, requests: rows, complete: true, retention_gap: false })
+        }
         if (url.pathname.startsWith('/standup/work/') && url.pathname.endsWith('/pr-link')) {
           const id = decodeURIComponent(url.pathname.slice('/standup/work/'.length, -'/pr-link'.length))
           const item = overview().current.find((w) => w.id === id)

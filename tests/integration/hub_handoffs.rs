@@ -5,7 +5,7 @@ use crate::hub_pg;
 use std::sync::{Arc, Barrier};
 
 use agentscm::hub::HubError;
-use agentscm::hub::handoff::{Answered, Asked};
+use agentscm::hub::handoff::{Answered, Asked, HandoffView, Via};
 use agentscm::hub::intent::Intent;
 use agentscm::hub::session::{HOLD_CAP_SECONDS, SessionCall, Touched};
 use agentscm::hub::store::{
@@ -806,6 +806,115 @@ fn a_refused_call_asks_for_three_files_at_most(db: &Db) {
     assert_eq!(touch(&*store, &alice, "ha", &[], T0 + 2).handoffs.len(), 3);
 }
 
+/// The id of user `n`, who owns agent `n`.
+fn owner_of(store: &dyn Store, n: i64) -> String {
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: n,
+    };
+    store
+        .upsert_user(&identity, &format!("user{n}"))
+        .unwrap()
+        .id
+}
+
+fn mine(views: &[HandoffView]) -> (&'static str, bool, bool) {
+    (
+        views[0].state,
+        views[0].asked_via_hub,
+        views[0].answered_via_hub,
+    )
+}
+
+fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    touch(&*store, &alice, "ha", &[A, "src/b.rs"], T0);
+    touch_silent(&*store, &bob, "hb", T0 + 1);
+
+    // Bob asks from the Hub's page for his agent: the request says so, and is not auto.
+    let asked = store
+        .ask_handoff_via(&bob.token, Some("hb"), A, Some("need it"), Via::Hub, T0 + 2)
+        .unwrap();
+    assert!(matches!(asked, Asked::Requested { .. }), "{asked:?}");
+    let requests = events(&*store, "handoff_request");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].1["via"], "hub");
+    assert_eq!(requests[0].1["auto"], false);
+
+    // Alice's agent is told at its next touch, and the line names a person, not the agent.
+    let told = touch(&*store, &alice, "ha", &[], T0 + 3);
+    assert_eq!(told.handoffs.len(), 1);
+    assert!(told.handoffs[0].hub && told.handoffs[0].kind == "request");
+
+    // Each person reads their own side, with a third person seeing nothing.
+    let (alice_owner, bob_owner) = (owner_of(&*store, 1), owner_of(&*store, 2));
+    let bobs = store
+        .handoffs_of_owner(&bob_owner, REPO, T0 + 4, 10)
+        .unwrap();
+    assert_eq!(bobs.len(), 1);
+    assert_eq!(mine(&bobs), ("pending", true, false));
+    assert_eq!(
+        (
+            bobs[0].requester.owner.as_str(),
+            bobs[0].holder.owner.as_str()
+        ),
+        (bob_owner.as_str(), alice_owner.as_str())
+    );
+    assert!(bobs[0].holder_told);
+    let carol = owner_of(&*store, 3);
+    assert!(
+        store
+            .handoffs_of_owner(&carol, REPO, T0 + 4, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .handoffs_of_owner(&bob_owner, "acme/other", T0 + 4, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Alice answers from the Hub's page for her agent: recorded, and Bob's agent is told.
+    let granted = store
+        .answer_handoff_via(&alice.token, Some("ha"), A, (true, None), Via::Hub, T0 + 5)
+        .unwrap();
+    assert!(matches!(granted, Answered::Granted { .. }), "{granted:?}");
+    assert_eq!(events(&*store, "handoff_grant")[0].1["via"], "hub");
+    let heard = touch(&*store, &bob, "hb", &[A], T0 + 6);
+    assert_eq!(heard.handoffs.len(), 1);
+    assert!(heard.handoffs[0].hub && heard.handoffs[0].kind == "grant");
+    let alices = store
+        .handoffs_of_owner(&alice_owner, REPO, T0 + 7, 10)
+        .unwrap();
+    assert_eq!(mine(&alices), ("granted", true, true));
+    assert!(alices[0].requester_told);
+
+    // A pending request past the hold cap reads as lapsed.
+    let again = store
+        .ask_handoff_via(&bob.token, Some("hb"), "src/b.rs", None, Via::Hub, T0 + 9)
+        .unwrap();
+    assert!(matches!(again, Asked::Requested { .. }), "{again:?}");
+    let late = store
+        .handoffs_of_owner(&bob_owner, REPO, T0 + 9 + HOLD_CAP_SECONDS + 1, 10)
+        .unwrap();
+    assert_eq!(late[0].state, "lapsed");
+
+    // An agent's own call leaves the plain record.
+    touch(&*store, &alice, "ha", &["src/d.rs"], T0 + 10);
+    let own = store
+        .ask_handoff(&bob.token, Some("hb"), "src/d.rs", None, T0 + 11)
+        .unwrap();
+    assert!(matches!(own, Asked::Requested { .. }), "{own:?}");
+    let all = events(&*store, "handoff_request");
+    assert_eq!(all.len(), 3);
+    assert!(all[..2].iter().all(|e| e.1["via"] == "hub"));
+    assert!(all[2].1.get("via").is_none());
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -820,6 +929,7 @@ macro_rules! conformance {
 }
 
 conformance!(
+    a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told,
     a_grant_moves_the_file_and_is_told_once,
     a_decline_is_told_once_and_the_retry_passes,
     a_decline_reason_is_filtered_and_told_once,
