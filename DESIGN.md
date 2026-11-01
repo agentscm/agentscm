@@ -73,9 +73,9 @@ typography:
     letterSpacing: "-0.02em"
   title:
     fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
-    fontSize: "16px"
+    fontSize: "18px"
     fontWeight: 600
-    letterSpacing: "-0.01em"
+    letterSpacing: "-0.015em"
   tab:
     fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
     fontSize: "15px"
@@ -347,7 +347,9 @@ All three are self-hosted from the `@fontsource-variable/onest`, `@fontsource/un
 ### Hierarchy
 - **Answer** (300 in light mode, 400 in dark; clamp(26px, 2.8vw, 34px); 1.25; −0.025em; at most 28ch): the sentence that leads each page. Bold counts step up to 500 in light and 600 in dark. Links in it are weight 500 with a 1.5px underline offset 6px. Condensed sets it at 21px, 1.3, up to 60ch. A record's own page shows its title at the same size in place of the hidden question.
 - **Headline** (300 light / 400 dark, 22px, 1.4; 17px on phones, 15.5px in Condensed): the summary sentence of the "Since you last checked" card.
-- **Title** (600, 16px, −0.01em; 14px in Condensed): box titles, the Since card title and the area-drawer heading.
+- **Title** (600, 18px, −0.015em; 15.5px in Condensed; `--t-card`): box titles, the Since card title and card heads on All repositories.
+- **Group** (650, 15px, −0.01em, text colour; 14px in Condensed; `--t-group`): a heading over a run of rows inside a list, such as Stuck or Moving on All repositories, or Waiting on others in the Inbox list. It has more space above it than below. Where the rows carry no hairlines of their own, a rule-strong hairline runs from the heading to the edge.
+- **Sub** (650, 13.5px, text-2; 12.5px in Condensed; `--t-sub`): a column heading inside a card (the briefing's Reported facts, the area drawer's columns) and the Inbox's "Answer as …" line. It sits a step above the 12.5–13px text-3 metadata, so a heading never wears the metadata's grey.
 - **Tab** (600, 15px; 14px in Condensed and on phones): Dashboard tab labels. Need-you row titles use 600 at 15px too.
 - **Body** (400, 14.5px; 13.5px in Condensed): all running text, task titles and tile names.
 - **Label** (500, 12.5px): status words, lane-bar segment text (600 labels), tab status lines, column headings (600, text-3, sentence case) and meta lines.
@@ -429,7 +431,7 @@ A 7px dot with a 3px soft halo in its tone, then a 12.5px 500 word in text-2. A 
 - **Breadcrumbs:** only deep pages (a run, a step, a saved moment) carry a quiet pill trail above the page.
 
 ### Needs you
-A box listing only decisions for a person: a blocker, a task whose agent went quiet, a handover, two agents holding one file, two tasks planning the same files, or a pull request touching held files. It comes before "Start a task" whenever it is not empty. Each row is one line: a 30px circle icon drawn as a 1.5px ring in its tone (Brand Ink, warn or coral), a 15px 600 title, one 13px text-3 line under it (the task and when, or where to look), a single primary action as an outline pill ("Open in <the viewer's agent>" when a launch link exists, otherwise "Copy prompt for <agent>"), a "⋯" menu for the other prompts, and a chevron. The chevron, or a click on the row's own text, opens the row in place with a height animation: the reason, "Decision for …", the line saying what to do next, the box for the person's own words and Hide, in one sunken well; the chevron button carries `aria-expanded`. Rows are separated by hairlines, and the box's head counts them (coral when the box is bad). When empty it says "All clear" beside a green check. Its explanation states that reading the page answers none of them.
+A box listing only decisions for a person: a blocker, a task whose agent went quiet, a handover, two agents holding one file, two tasks planning the same files, or a pull request touching held files. It comes before "Start a task" whenever it is not empty. Each row is one line: a 30px circle icon drawn as a 1.5px ring in its tone (Brand Ink, warn or coral), a 15px 600 title, one 13px text-3 line under it (the task and when, or where to look), a single primary action as an outline pill ("Open in <the viewer's agent>" when a launch link exists, otherwise "Copy prompt for <agent>"), a "⋯" menu for the other prompts, and a chevron. The chevron, or a click on the row's own text, opens the row in place with a height animation: the reason, "Decision for …", the line saying what to do next, the box for the person's own words and Hide, in one sunken well; the chevron button carries `aria-expanded`. Overlaps are settled in the Inbox, so they share one row instead of one each: "N overlaps to talk through" with the first path under it and an "Open the Inbox" pill, at the place the first overlap would sit. Rows are separated by hairlines, and the box's head counts every need, each overlap included (coral when the box is bad). When empty it says "All clear" beside a green check. Its explanation states that reading the page answers none of them.
 
 ### Start a task
 One quiet pill-shaped line ("Start a task · Describe it, then hand it to your agent") that opens in place into a card: the pill's corners ease to the card's 20px as it grows. It sits after Needs you when something needs a person, and leads the page otherwise.

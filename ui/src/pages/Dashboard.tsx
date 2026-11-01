@@ -97,7 +97,7 @@ const person = (p: { owner: string; name: string }) => ({ login: p.owner, agent:
 function MoreActions({ items, describedBy }: { items: ReturnType<typeof useStepActions>['more']; describedBy: string }) {
   const [open, setOpen] = useState(false)
   const ref = useDismiss(open, () => setOpen(false))
-  if (items.length === 0) return null
+  if (items.length === 0) return <ActSlot />
   return (
     <div className="pop need-pop" ref={ref}>
       <button type="button" className="need-btn" aria-haspopup="menu" aria-expanded={open} aria-label="More actions" aria-describedby={describedBy} onClick={() => setOpen((o) => !o)}>
@@ -113,6 +113,9 @@ function MoreActions({ items, describedBy }: { items: ReturnType<typeof useStepA
     </div>
   )
 }
+
+/** An empty menu or chevron slot, so every row's primary pill ends at the same place. */
+const ActSlot = () => <span className="need-btn need-slot" aria-hidden="true" />
 
 /** Clicks on the row's own text open it; clicks on a link, button or input inside it do what they say. */
 const plainClick = (e: MouseEvent) => !(e.target as HTMLElement).closest('a, button, input, label, .gloss, time')
@@ -259,6 +262,39 @@ function SortingRow({ n, d }: { n: Need; d: Derived }) {
   )
 }
 
+/**
+ * Overlaps are settled in the Inbox, so Needs you shows them as one line that leads there instead of repeating each.
+ * Overlaps hidden in this browser (before they were folded) fold into their own dimmed row, shown only with the hidden ones.
+ */
+function TalkRow({ overlaps, hidden }: { overlaps: Need[]; hidden: boolean }) {
+  const n = overlaps.length
+  const first = overlaps.find((o) => o.path)?.path
+  return (
+    <li className={`attn-item need tone-warn${hidden ? ' is-hidden' : ''}`}>
+      <span className="attn-icon" aria-hidden="true">
+        <Icon name="sign-intersection-y" />
+      </span>
+      <div className="need-main">
+        <div className="attn-title">
+          <a className="work-link" href="#inbox">{n === 1 ? '1 overlap' : `${n} overlaps`} to talk through</a>
+        </div>
+        <div className="need-gist">
+          {n === 1 ? 'Two tasks plan' : 'Tasks plan'} to touch the <Gloss term="overlap">same files</Gloss>
+          {first && <>, starting with <Path>{first}</Path></>}
+        </div>
+      </div>
+      <div className="need-acts">
+        {hidden && <HideButton k={overlaps.map(needHideKey)} hidden what={n === 1 ? 'this overlap' : 'these overlaps'} />}
+        <a className="btn btn-sm btn-outline-secondary need-primary" href="#inbox">
+          Open the Inbox
+        </a>
+        <ActSlot />
+        <ActSlot />
+      </div>
+    </li>
+  )
+}
+
 const MAX_NEEDS = 6
 
 /** `needs` includes the ones hidden in this browser; they stay out of the list until asked for. */
@@ -267,6 +303,10 @@ function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkO
   const sorting = all.filter((n) => n.who === 'agents')
   const { rows: needs, count: hidden, show, setShow, isHidden } = useHideable(you, needHideKey)
   const [expanded, setExpanded] = useState(false)
+  const overlaps = needs.filter((n) => n.kind === 'overlap' && !isHidden(n))
+  const hiddenOverlaps = needs.filter((n) => n.kind === 'overlap' && isHidden(n))
+  // One row per need, except the overlaps, which share one row at the place the first would sit (hidden ones, a second).
+  const rows = needs.filter((n) => n.kind !== 'overlap' || n === overlaps[0] || n === hiddenOverlaps[0])
   return (
     <Box
       id="box-needs"
@@ -288,11 +328,13 @@ function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkO
       ) : (
         <>
           <ul className="attn">
-            {(expanded ? needs : needs.slice(0, MAX_NEEDS)).map((n) => (
-              <NeedRow key={n.key} n={n} ov={ov} d={d} me={me} handoff={handoff} hidden={isHidden(n)} />
-            ))}
+            {(expanded ? rows : rows.slice(0, MAX_NEEDS)).map((n) =>
+              n.kind === 'overlap' ? (
+                isHidden(n) ? <TalkRow key="overlaps-hidden" overlaps={hiddenOverlaps} hidden /> : <TalkRow key="overlaps" overlaps={overlaps} hidden={false} />
+              ) : <NeedRow key={n.key} n={n} ov={ov} d={d} me={me} handoff={handoff} hidden={isHidden(n)} />,
+            )}
           </ul>
-          {needs.length > MAX_NEEDS && !expanded && (
+          {rows.length > MAX_NEEDS && !expanded && (
             <button type="button" className="show-hidden" onClick={() => setExpanded(true)}>
               <Icon name="chevron-down" /> Show all {needs.length}
             </button>

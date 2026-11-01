@@ -148,6 +148,10 @@
   --r-tile: 16px;
   --r-nav: 12px;
   --hub-gap: 32px;
+  /* heading roles under the answer, each a clear step above the 14.5px body and the 13px grey metadata */
+  --t-card: 18px;
+  --t-group: 15px;
+  --t-sub: 13.5px;
   --hub-top-h: 62px;
   --sheet-top: 44px;
   --sheet-side: clamp(20px, 4vw, 60px);
@@ -835,12 +839,14 @@ html.wco:not(:has(.topbar)) body::before {
   display: none;
 }
 .box-title {
-  font-size: 16px;
+  font-size: var(--t-card);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
 }
-:root[data-density='condensed'] .box-title {
-  font-size: 14px;
+:root[data-density='condensed'] {
+  --t-card: 15.5px;
+  --t-group: 14px;
+  --t-sub: 12.5px;
 }
 .box-count {
   font-weight: 500;
@@ -1771,9 +1777,9 @@ html.wco:not(:has(.topbar)) body::before {
   gap: 28px;
 }
 .area-cols h4 {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--hub-text-3);
+  font-size: var(--t-sub);
+  font-weight: 650;
+  color: var(--hub-text-2);
   margin: 0 0 10px;
 }
 .ad-list {
@@ -1950,9 +1956,9 @@ html.wco:not(:has(.topbar)) body::before {
   gap: 4px 12px;
 }
 .since-title h2 {
-  font-size: 16px;
+  font-size: var(--t-card);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
   margin: 0;
 }
 .since-range {
@@ -2951,10 +2957,10 @@ html.wco:not(:has(.topbar)) body::before {
   gap: 8px 32px;
 }
 .brief-cols h3 {
-  margin: 0 0 6px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--hub-text-3);
+  margin: 0 0 8px;
+  font-size: var(--t-sub);
+  font-weight: 650;
+  color: var(--hub-text-2);
 }
 .brief-list {
   list-style: none;
@@ -3320,7 +3326,7 @@ button.rp-link:focus-visible { outline: 2px solid var(--hub-brand); outline-offs
 /* groups and rows share one grid: icon, name and status line, agents, last activity, chevron */
 .rp-group { min-width: 0; }
 .rp-ghead { display: flex; align-items: center; gap: var(--s3); margin: 0 0 var(--s2); padding: 0 var(--s2); }
-.rp-ghead h2 { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--hub-text-2); }
+.rp-ghead h2 { margin: 0; font-size: var(--t-group); font-weight: 650; letter-spacing: -0.01em; color: var(--hub-text); }
 .rp-n { display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px; background: var(--hub-sunken); color: var(--hub-text-3); font-size: 12px; font-weight: 600; }
 .rp-rows { list-style: none; margin: 0; padding: 0; }
 .rp-rows > li:last-child { border-bottom: 1px solid var(--hub-rule); }
@@ -3413,7 +3419,7 @@ button.repo-quiet-item:focus-visible { outline: 2px solid var(--hub-brand); outl
 .rp-rail { display: grid; gap: var(--s4); min-width: 0; }
 .rp-card { padding: var(--s5); border-radius: 20px; background: var(--hub-surface); box-shadow: var(--card); min-width: 0; }
 .rp-chead { display: flex; align-items: center; gap: var(--s3); margin: 0 0 var(--s4); }
-.rp-chead h2 { flex: 1; min-width: 0; margin: 0; font-size: 14.5px; font-weight: 600; overflow-wrap: anywhere; }
+.rp-chead h2 { flex: 1; min-width: 0; margin: 0; font-size: var(--t-card); font-weight: 600; letter-spacing: -0.015em; overflow-wrap: anywhere; }
 .rp-live { position: relative; width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--hub-ok-fill); }
 .rp-empty { margin: 0; font-size: 13.5px; color: var(--hub-text-3); }
 .rp-people { list-style: none; margin: 0; padding: 0; }
@@ -3628,7 +3634,9 @@ button.repo-quiet-item:focus-visible { outline: 2px solid var(--hub-brand); outl
 .in-main { container: inbox / inline-size; min-width: 0; }
 .in-wrap { display: grid; grid-template-columns: 300px minmax(0, 1fr); background: var(--hub-surface); border-radius: 22px; box-shadow: var(--card); overflow: hidden; min-height: 560px; }
 .in-list { min-width: 0; padding: var(--s3) 10px; border-right: 1px solid var(--hub-rule); background: var(--hub-canvas); }
-.in-gh { margin: 14px 12px 6px; font-size: 12.5px; font-weight: 500; color: var(--hub-text-3); }
+/* a group heading carries a hairline to the edge so each group reads as its own block */
+.in-gh { display: flex; align-items: center; gap: 10px; margin: 26px 12px 8px; font-size: var(--t-group); font-weight: 650; letter-spacing: -0.01em; color: var(--hub-text); }
+.in-gh::after { content: ''; flex: 1; height: 1px; background: var(--hub-rule-strong); }
 .in-group:first-child .in-gh { margin-top: var(--s1); }
 .in-list button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 10px; width: 100%; padding: var(--s3); border: 0; border-radius: 12px; background: none; text-align: left; font: inherit; color: var(--hub-text-2); cursor: pointer; }
 .in-list button:hover { background: color-mix(in srgb, var(--hub-brand) 7%, transparent); }
@@ -3680,7 +3688,7 @@ button.repo-quiet-item:focus-visible { outline: 2px solid var(--hub-brand); outl
 .in-row.is-pending .in-dot { box-shadow: 0 0 0 1.5px var(--hub-brand); }
 .in-row.is-pending .in-dot::after { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--hub-brand); }
 .in-reply { display: grid; gap: 10px; padding: var(--s4) 28px 20px; border-top: 1px solid var(--hub-rule); background: var(--hub-canvas); }
-.in-lbl { display: flex; align-items: center; gap: var(--s2); font-size: 12.5px; color: var(--hub-text-3); }
+.in-lbl { display: flex; align-items: center; gap: var(--s2); font-size: var(--t-sub); font-weight: 650; color: var(--hub-text-2); }
 .in-lbl .bi { color: var(--hub-brand); }
 .in-choice { display: inline-flex; flex-wrap: wrap; gap: 2px; width: max-content; max-width: 100%; padding: 3px; border-radius: 12px; background: var(--hub-sunken); }
 .in-choice button { height: 32px; padding: 0 14px; border: 0; border-radius: 9px; background: transparent; font: inherit; font-size: 13.5px; font-weight: 500; color: var(--hub-text-2); cursor: pointer; }
