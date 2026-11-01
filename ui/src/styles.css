@@ -1460,7 +1460,6 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   border-top: 1px solid var(--hub-rule);
 }
 
-.finished-grid,
 .grid-2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1619,7 +1618,15 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 .change-mark.is-work_takeover { background: var(--hub-warn-soft); color: var(--hub-warn); }
 .change-mark.is-work_checkpoint { background: var(--hub-ok-soft); color: var(--hub-ok); }
 .change-main { min-width: 0; }
-.change-main > a { font-weight: 600; overflow-wrap: anywhere; }
+.change-main > a,
+.rp-done li > a { font-weight: 600; color: var(--hub-text); text-decoration: none; overflow-wrap: anywhere; }
+.change-main > a:hover, .change-main > a:focus-visible,
+.rp-done li > a:hover, .rp-done li > a:focus-visible { color: var(--hub-brand-ink); text-decoration: underline; }
+/* History borrows All repositories' finished rows, so it carries the same spacing scale (as the Inbox does). Both lists' titles are ink, like .work-title. */
+.history-page { --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; }
+.rp-done li > a { min-width: 0; font-size: 14.5px; }
+.history-page .rp-done-who { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.history-page .lane-title { font-size: var(--t-group); font-weight: 650; letter-spacing: -0.01em; }
 .change-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 4px; font-size: 0.82rem; color: var(--hub-text-2); }
 .change-who { display: inline-flex; align-items: center; gap: 6px; }
 .change-quote { margin: 6px 0 0; font-size: 0.86rem; color: var(--hub-text-2); overflow-wrap: anywhere; }
@@ -1939,6 +1946,36 @@ a.run-row:hover {
   display: flex;
   flex-direction: column;
 }
+/* One agent: face, "maria’s Codex" over its two checks, one state pill. */
+.setup-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.setup-main {
+  display: grid;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.setup-name {
+  font-size: 15px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.setup-checks {
+  font-size: 13px;
+  color: var(--hub-text-3);
+}
+.setup-head .pill {
+  flex: none;
+}
+.setup-next {
+  margin: 8px 0 0 40px;
+  font-size: 13.5px;
+  color: var(--hub-text-2);
+  max-width: 70ch;
+}
 .steps {
   list-style: none;
   padding: 0;
@@ -1973,9 +2010,6 @@ a.run-row:hover {
   align-items: center;
   flex-wrap: wrap;
   margin-bottom: 12px;
-}
-.connect .disclosure {
-  margin-bottom: 10px;
 }
 .prompt-preview {
   font-size: 0.8rem;
@@ -2161,8 +2195,7 @@ a.run-row:hover {
   .request-chevron { grid-area: chev; align-self: start; }
 }
 @container main (max-width: 720px) {
-  .grid-2,
-  .finished-grid {
+  .grid-2 {
     grid-template-columns: minmax(0, 1fr);
   }
   .overlap,
@@ -2487,15 +2520,16 @@ a.run-row:hover {
 /* Feature walkthrough: see tour/tour.css */
 .crumb-tools { display: inline-flex; align-items: center; gap: 12px; }
 /* Skills: library, runs and one run */
-.skill-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 28px; }
+.skill-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 28px; }
 .skill-item + .skill-item { border-top: 1px solid var(--hub-rule); padding-top: 28px; }
 .skill-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
-.skill-head strong { font-size: 1.05rem; }
+.skill-head strong { font-size: var(--t-group); font-weight: 650; letter-spacing: -0.01em; }
+.skill-runs { margin-left: auto; font-size: 13px; color: var(--hub-text-3); }
 .skill-summary { margin: 0 0 14px; font-size: 0.95rem; line-height: 1.55; color: var(--hub-text); max-width: 68ch; }
-.skill-sub { margin: 0 0 10px; font-size: 0.82rem; font-weight: 650; color: var(--hub-text-2); }
+.skill-sub { margin: 0 0 10px; font-size: var(--t-sub); font-weight: 650; color: var(--hub-text-2); }
 .skill-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0 0 18px; font-size: 0.86rem; border-radius: 12px; overflow: hidden; background: var(--hub-rule); border: 1px solid var(--hub-rule); }
 .skill-facts > div { padding: 10px 14px 12px; background: var(--hub-sunken); }
-.skill-facts dt { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; font-size: 0.75rem; font-weight: 650; color: var(--hub-text-3); }
+.skill-facts dt { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; font-size: var(--t-sub); font-weight: 650; color: var(--hub-text-2); }
 .skill-facts dd { margin: 0; line-height: 1.45; color: var(--hub-text-2); }
 .skill-facts ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 3px; }
 .skill-facts li::first-letter { text-transform: uppercase; }
@@ -2511,23 +2545,34 @@ a.run-row:hover {
 .gate-step.is-block::before { background: var(--hub-brand); border-color: var(--hub-brand); color: var(--hub-on-brand); }
 .gate-step.is-record::before { border-style: dashed; }
 .gate-step-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-height: 26px; }
-.gate-step-head strong { font-size: 0.94rem; }
+.gate-step-head strong { font-size: 14.5px; font-weight: 600; }
+:root[data-density='condensed'] .gate-step-head strong { font-size: 13.5px; }
 .gate-who { display: inline-flex; align-items: center; gap: 5px; font-size: 0.8rem; color: var(--hub-text-3); }
-/* The enforcement label is a sentence: let it wrap, or its nowrap width widens the whole page past a phone and the fixed tour card with it. */
-.gate-step-head .pill { margin-left: auto; white-space: normal; }
+/* The enforcement pill sits inline after who does the step, so every step's pill lands in the same reading position. */
+.gate-step-head .pill { white-space: normal; }
 .gate-plain { margin: 2px 0 0; font-size: 0.88rem; line-height: 1.5; color: var(--hub-text); overflow-wrap: anywhere; }
 .gate-note { display: flex; gap: 6px; align-items: baseline; margin: 12px 0 0; font-size: 0.8rem; color: var(--hub-text-3); }
 .gate-needs { margin: 2px 0 0; font-size: 0.8rem; line-height: 1.45; color: var(--hub-text-3); overflow-wrap: anywhere; }
 
-/* Full procedure: the workflow file, set as a readable document rather than a code dump. */
-.skill-proc { margin-top: 14px; border: 1px solid var(--hub-rule); border-radius: 12px; background: var(--hub-surface); }
-.skill-proc > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; cursor: pointer; font-size: 0.86rem; font-weight: 600; list-style: none; }
+/* Disclosures (Full procedure, How it works, Settings, a run's stale evidence and details): a chevron row that opens in place.
+   .disc-row is the same row for section-level disclosures on other pages (DESIGN.md, the Disclosure Row Rule). */
+.skill-proc, .skill-details, .disc-row { margin-top: 14px; border: 1px solid var(--hub-rule); border-radius: 12px; background: var(--hub-surface); }
+.skill-details + .skill-details, .disc-row + .disc-row { margin-top: 8px; }
+.skill-details .skill-proc { background: var(--hub-sunken); }
+.skill-details > :not(summary), .disc-row > :not(summary) { margin: 14px; }
+.skill-details[open] > summary, .disc-row[open] > summary { border-bottom: 1px solid var(--hub-rule); }
+.skill-details > summary::-webkit-details-marker, .disc-row > summary::-webkit-details-marker { display: none; }
+.skill-details > summary::after, .disc-row > summary::after { content: ''; margin-left: auto; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); transition: transform 160ms ease; color: var(--hub-text-3); }
+.skill-details[open] > summary::after, .disc-row[open] > summary::after { transform: rotate(-135deg); }
+.skill-proc > summary, .skill-details > summary, .disc-row > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; cursor: pointer; font-size: 0.86rem; font-weight: 600; list-style: none; }
 .skill-proc > summary::-webkit-details-marker { display: none; }
 .skill-proc > summary::after { content: ''; margin-left: auto; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); transition: transform 160ms ease; color: var(--hub-text-3); }
 .skill-proc[open] > summary::after { transform: rotate(-135deg); }
 .skill-proc[open] > summary { border-bottom: 1px solid var(--hub-rule); }
 .skill-proc .md { padding: 16px 20px 18px; max-height: 60vh; overflow-y: auto; }
 .skill-act { margin-top: 14px; }
+/* A command stays whole: scroll it sideways rather than break "post-merge-check" mid-word on a phone. */
+.skill-act .cmd code { white-space: pre; overflow-x: auto; overflow-wrap: normal; }
 
 .md { font-size: 0.9rem; line-height: 1.6; color: var(--hub-text); max-width: 72ch; overflow-wrap: anywhere; }
 .md > :first-child { margin-top: 0; }
@@ -2551,21 +2596,19 @@ a.run-row:hover {
 .skill-state { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 .skill-cells { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
 .skill-cells > div { background: var(--hub-surface); border: 1px solid var(--hub-rule); border-radius: 12px; padding: 12px 14px; }
-.skill-cells h2 { font-size: 0.75rem; font-weight: 650; letter-spacing: 0.03em; color: var(--hub-text-3); margin: 0 0 4px; }
+.skill-cells h2 { font-size: var(--t-sub); font-weight: 650; color: var(--hub-text-2); margin: 0 0 4px; }
 .skill-gates { width: 100%; border-collapse: collapse; }
 .skill-gates th, .skill-gates td { text-align: left; vertical-align: top; padding: 10px 8px; border-top: 1px solid var(--hub-rule); }
 .skill-gates thead th { border-top: 0; font-size: 0.75rem; color: var(--hub-text-3); }
 .skill-evidence { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; overflow-wrap: anywhere; }
-.skill-details { margin: 12px 0; }
-.skill-details summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; }
 .skill-tech { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; overflow-wrap: anywhere; }
 .skill-tech dd { margin: 0; }
 @container main (max-width: 860px) {
   .skill-facts, .skill-cells { grid-template-columns: minmax(0, 1fr); }
 }
 @container main (max-width: 520px) {
-  .gate-step-head .pill { margin-left: 0; }
   .skill-proc .md { padding: 12px 14px; }
+  .skill-runs { margin-left: 0; flex-basis: 100%; }
 }
 @container main (max-width: 640px) {
   .skill-gates thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }

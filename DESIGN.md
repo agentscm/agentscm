@@ -73,9 +73,9 @@ typography:
     letterSpacing: "-0.02em"
   title:
     fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
-    fontSize: "16px"
+    fontSize: "18px"
     fontWeight: 600
-    letterSpacing: "-0.01em"
+    letterSpacing: "-0.015em"
   tab:
     fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
     fontSize: "15px"
@@ -347,7 +347,9 @@ All three are self-hosted from the `@fontsource-variable/onest`, `@fontsource/un
 ### Hierarchy
 - **Answer** (300 in light mode, 400 in dark; clamp(26px, 2.8vw, 34px); 1.25; −0.025em; at most 28ch): the sentence that leads each page. Bold counts step up to 500 in light and 600 in dark. Links in it are weight 500 with a 1.5px underline offset 6px. Condensed sets it at 21px, 1.3, up to 60ch. A record's own page shows its title at the same size in place of the hidden question.
 - **Headline** (300 light / 400 dark, 22px, 1.4; 17px on phones, 15.5px in Condensed): the summary sentence of the "Since you last checked" card.
-- **Title** (600, 16px, −0.01em; 14px in Condensed): box titles, the Since card title and the area-drawer heading.
+- **Title** (600, 18px, −0.015em; 15.5px in Condensed; `--t-card`): box titles, the Since card title and card heads on All repositories.
+- **Group** (650, 15px, −0.01em, text colour; 14px in Condensed; `--t-group`): a heading over a run of rows inside a list, such as Stuck or Moving on All repositories, or Waiting on others in the Inbox list. It has more space above it than below. Where the rows carry no hairlines of their own, a rule-strong hairline runs from the heading to the edge.
+- **Sub** (650, 13.5px, text-2; 12.5px in Condensed; `--t-sub`): a column heading inside a card (the briefing's Reported facts, the area drawer's columns) and the Inbox's "Answer as …" line. It sits a step above the 12.5–13px text-3 metadata, so a heading never wears the metadata's grey.
 - **Tab** (600, 15px; 14px in Condensed and on phones): Dashboard tab labels. Need-you row titles use 600 at 15px too.
 - **Body** (400, 14.5px; 13.5px in Condensed): all running text, task titles and tile names.
 - **Label** (500, 12.5px): status words, lane-bar segment text (600 labels), tab status lines, column headings (600, text-3, sentence case) and meta lines.
@@ -359,6 +361,8 @@ All three are self-hosted from the `@fontsource-variable/onest`, `@fontsource/un
 **The Plain Voice Rule.** Every word on screen is Onest. Unbounded appears only as a dark-mode tally numeral and JetBrains Mono only as a path, branch or identifier.
 
 **The Answer Has No Eyebrow Rule.** Nothing visible sits above the answer sentence. The question lives under the active rail item and in a visually hidden h1.
+
+**The Whole Name Rule.** An identifier or name in an answer sentence (a skill such as `pr-gate`, a run's skill and version) never wraps inside itself; it moves to the next line whole. Reading-only reassurance ("Reading changes nothing. Changes you make here are labelled.") is said once, in the rail footer, not again in a page's fact line.
 
 **The Sentence Case Rule.** Headings, tab labels and column heads are sentence case. No tracked uppercase labels.
 
@@ -404,14 +408,23 @@ A sentence, not a header. There is no rule under it and nothing visible above it
 - **Head:** transparent, with no divider, no icon and no tinted band. The title is 16px 600; the count sits plain on the right in 13px 500 text-3, or coral 700 when the box's tone is bad; the explanation spans the full width beneath.
 - **Internal Padding:** head 22px 26px 6px and body 14px 26px 26px; Condensed 12px 16px 2px and 8px 16px 14px; mobile 18px 18px 4px and 10px 18px 20px.
 
+### Skills library
+The answer names the adopted skills and their open runs ("Agents here are asked to follow 1 skill, pr-gate. 2 runs are open; 1 is waiting at a stop gate."), with the open-runs count linking to the runs; the fact line carries the caveat (how many steps the opt-in Stop hook can stop, and that agents report their own evidence) and the adoption source. A pinned skill that is not in force comes first as a plain warn notice, never boxed. An adopted skill shows its head (name at Group size, the run counts and View runs on the right), summary, applicability, steps and command. An available skill shows only its head, summary and adopt command; How it works and Settings wait behind disclosures. Attribute pills are short words with the detail in their tip, all in the outlined tag (the Pill Family Rule): "Built in", "Can stop the agent (opt-in)", "Merge check: planned", and on a step "Can stop the agent", "Warns only" or "Recorded only", inline after who does the step; the step marker, not the pill, shows which steps can stop the agent. Skill names in the answer never wrap at their hyphen. Commands never break mid-word; they scroll sideways.
+
+**The Disclosure Row Rule.** A section-level disclosure (Skills' Full procedure, How it works and Settings; Setup's Preview the instructions, Use the command line instead and Good to know; an Inbox thread's Copy a prompt instead) is a 44px row in a 12px hairline frame with its icon and label on the left and a chevron on the right that turns when open; its contents sit inside that frame, so nothing below it reads as its contents. Outside Skills it is `.disc-row`. A toggle that only reveals more rows of the list it closes (Dashboard's "Agents are sorting it out · 4", the Inbox's quiet agents, Catch up's technical details) stays a plain text summary with its count, because its contents are more of the same list, not a separate section.
+
 ### Intent review
 On the local Work detail, keep the human request, amendments and agent focus distinct. Show candidate identity and source coverage beside criterion findings; make supported, mismatch and unknown states explicit, with evidence origin and assurance visible. Label findings stale when their intent or candidate binding differs. Keep execution status separate from semantic outcome, retain attempt history, and make incomplete coverage visible. A human disposition records a view; it never grants admission.
 
 ### Section tabs
-The Dashboard (and any rail item with more than one page) shows its pages as equal columns over a 1px rule-strong baseline. Each tab is a label over its live status: "1 needs you" with a coral dot, "No crossings" with no dot, "Last event 4 min ago" with a violet dot, "2 of 3 awake" with a green dot. The open tab is text colour with a 2px brand underline; hover shows a rule-strong underline. Tabs are links (`#home`, `#now`, `#activity`, `#team`) with `aria-current="page"`.
+The Dashboard (and any rail item with more than one page) shows its pages as equal columns over a 1px rule-strong baseline. Each tab is a label over its live status: "1 needs you" with a coral dot, "No crossings" with no dot, "Last event 4 min ago" with a violet dot, "2 of 3 awake" with a green dot. The open tab is text colour with a 2px brand underline; hover shows a rule-strong underline. Tabs are links (`#home`, `#now`, `#activity`, `#team`) with `aria-current="page"`. Every tab in a strip carries a status line, worded from data the page already has (Setup › Computers reads "Signed in here" or "Needs a web sign-in"; Admin "You are an admin"). On a phone a strip wider than the screen scrolls sideways and fades over 44px at each edge that has more tabs, so a cut-off tab reads as "more this way".
 
 ### Status dot and muted tag
 A 7px dot with a 3px soft halo in its tone, then a 12.5px 500 word in text-2. A bad dot is coral. Muted metadata (a client, a draft) is instead a 6px-cornered outlined tag with no dot.
+
+**The Pill Family Rule.** The dot pill is for state that can change while you watch: a run waiting at a gate, an agent Ready or Blocked, a request's stage, how strong a piece of evidence is. The outlined tag is for a fixed attribute of the thing: what a step does when evidence is missing, that a skill is built in, that a pull request is a draft, a client. Values of the same kind always take the same family, so a row never shows a dot pill and an outlined tag for two answers to one question. Pick the family by what the value is, never to make one value louder.
+
+**The One Name Rule.** Someone's agent is always "<login>'s <Product name>": "maria's Claude Code", "dev's Cursor". `who(login, agent)` in `ui/src/nextStep.ts` writes it, mapping both the work-record ids (`claude-code`) and the client ids (`claude`) to the product name and falling back to the Hub's own name for an agent it does not know; `agentName(agent)` gives the product name alone where no login is known (a skill's evidence, the agent picker). Never print a raw agent id beside a login, and never "<login> with <agent>".
 
 ### Buttons, fields and choices
 - **Shape:** full pill, 14px side padding (12px for small, at 13px).
@@ -429,7 +442,7 @@ A 7px dot with a 3px soft halo in its tone, then a 12.5px 500 word in text-2. A 
 - **Breadcrumbs:** only deep pages (a run, a step, a saved moment) carry a quiet pill trail above the page.
 
 ### Needs you
-A box listing only decisions for a person: a blocker, a task whose agent went quiet, a handover, two agents holding one file, two tasks planning the same files, or a pull request touching held files. It comes before "Start a task" whenever it is not empty. Each row is one line: a 30px circle icon drawn as a 1.5px ring in its tone (Brand Ink, warn or coral), a 15px 600 title, one 13px text-3 line under it (the task and when, or where to look), a single primary action as an outline pill ("Open in <the viewer's agent>" when a launch link exists, otherwise "Copy prompt for <agent>"), a "⋯" menu for the other prompts, and a chevron. The chevron, or a click on the row's own text, opens the row in place with a height animation: the reason, "Decision for …", the line saying what to do next, the box for the person's own words and Hide, in one sunken well; the chevron button carries `aria-expanded`. Rows are separated by hairlines, and the box's head counts them (coral when the box is bad). When empty it says "All clear" beside a green check. Its explanation states that reading the page answers none of them.
+A box listing only decisions for a person: a blocker, a task whose agent went quiet, a handover, two agents holding one file, two tasks planning the same files, or a pull request touching held files. It comes before "Start a task" whenever it is not empty. Each row is one line: a 30px circle icon drawn as a 1.5px ring in its tone (Brand Ink, warn or coral), a 15px 600 title, one 13px text-3 line under it (the task and when, or where to look), a single primary action as an outline pill ("Open in <the viewer's agent>" when a launch link exists, otherwise "Copy prompt for <agent>"), a "⋯" menu for the other prompts, and a chevron. The chevron, or a click on the row's own text, opens the row in place with a height animation: the reason, "Decision for …", the line saying what to do next, the box for the person's own words and Hide, in one sunken well; the chevron button carries `aria-expanded`. Overlaps are settled in the Inbox, so they share one row instead of one each: "N overlaps to talk through" with the first path under it and an "Open the Inbox" pill, at the place the first overlap would sit. Rows are separated by hairlines, and the box's head counts every need, each overlap included (coral when the box is bad). When empty it says "All clear" beside a green check. Its explanation states that reading the page answers none of them.
 
 ### Start a task
 One quiet pill-shaped line ("Start a task · Describe it, then hand it to your agent") that opens in place into a card: the pill's corners ease to the card's 20px as it grows. It sits after Needs you when something needs a person, and leads the page otherwise.
@@ -477,8 +490,15 @@ When the Hub says no, the page shows the Hub's own sentence as the notice title,
 ### Set up this computer
 One lead sentence in text-2 (60ch), the command in a sunken command row (terminal icon, 12.5px mono, Copy at the end), then one 12.5px text-3 line saying what it will do. It sits on the signed-out page in its own white box above the token form, and under the empty states of Setup › Agents and Team. The command is written in one place in the code.
 
+### Agent status rows (Setup › Agents)
+The answer counts what is already loaded: "1 of 2 agents is ready; maria's Codex needs its AgentSCM hooks approved." Only an empty list gets an instruction. Each row is the agent's face, the agent named the way the Dashboard names someone's agent ("maria's Codex", 15px 600) over one 13px text-3 line of its checks ("MCP ✓ · Edit hook not yet"), and a single state pill on the right. A row that is not Ready adds one 13.5px text-2 line, aligned under the name, saying what to do next: the Hub's own instruction, with no label in front of it that repeats it. What Ready means and how long proof lasts is said once, in the box's explanation, never repeated on the page.
+
 ### Signed in (the browser's landing page)
 The one browser moment of setup, told on the frame rather than the sheet: a 600px column, the logo, a 56px green mark with a dark check, "This computer is signed in." in 30–44px 300 white, then "<computer> is signed in to <host> as <login> on GitHub. You won't need to do this again." in 17px Frame Dim with Frame Ink bolds. Three hairline-ruled next steps follow (terminal, menu bar, revoke), then a pill **Open the Hub** in Frame Brand and "You can close this tab." A refused sign-in swaps the mark for coral with a cross and shows the refusal notice on a white 20px sheet. The page shows nothing written into its link except the login, provider and computer name.
+
+### History (Finished and Changes)
+**Finished** lists each task an agent reported finished as one row in the same card list as All repositories' "Done lately": the task title in ink 600 (Brand Ink and underlined on hover or focus) with its time on the right, then "<login>'s <agent>" and a muted "Agent says" pill, then the agent's latest report in text-2 when there is one. Rows run newest first. Every row on History is self-reported, so "Agent says" wears the muted tone here; other pages keep it amber, where it sits beside stronger proof.
+**Changes** answers with the count and recency of the page ("6 changes on this page, the latest 1 min. ago"). Its rows are sorted newest first by time on the client, because the Hub pages forward by sequence; Next goes forward in time. Row titles are ink, never brand links, and the agent reads as "<login>'s <agent>". The Recent changes / Work on this page switch is the lens segmented control. Empty states say what the agent does to make something appear, never an MCP tool name.
 
 ### Computers and Admin lists
 A computer is a ruled row: laptop icon in text-3, the name in 600 with a brand "This computer" pill or a muted "Revoked" pill, the owner's login (Admin only), then a 13px text-3 line ("Signed in 12 days ago · last used 5 min. ago · 2 repositories") and up to four repository chips in mono on sunken 6px corners. **Revoke** is a small outline-danger pill on the right; it turns into an inline confirm ("Its agents stop at once and their tokens are revoked." with a filled danger "Revoke <name>" and Cancel), never a modal. The computer the page runs on is never offered for revoke. Revoked rows are hidden behind "Show N revoked computers". Signed out in this browser, the box holds one line and a primary **Sign in with GitHub** (or GitLab) pill instead of a list; signed in, its head carries a small outline **Sign out of this browser**, which leaves every computer signed in. The Admin tab appears only for a browser signed in as a Hub admin; anyone who opens it anyway is told why, and the tabs stay. Admin adds **Turned away** (login · forge · how, the reason sentence in text-2 at 68ch, an amber "3×" pill for repeats, the time) and **Connected repositories** (a plain table with right-aligned tabular counts).
@@ -496,6 +516,7 @@ A computer is a ruled row: laptop icon in text-3, the name in 600 with a brand "
 - **Do** draw unfinished work as the four-part lane bar, Claimed · Now · Next · Finished, with the wide Now segment naming the state in words and showing the holder's face.
 - **Do** show a quiet or unknown claim as amber and "still assigned", never as free work.
 - **Do** show status as a 7px dot with a soft halo plus a word.
+- **Do** set a row's title link in ink (Brand Ink and underlined on hover or focus), on every list: All repositories' Done lately, History, the track. Brand-coloured text is for the answer's own links and the current selection.
 - **Do** make every control a full pill and every container a soft 20px card (14px in Condensed).
 - **Do** switch density by changing measurements only, keyed on `html[data-density='condensed']`.
 - **Do** self-host fonts from the @fontsource packages and inline them, so they load under `font-src 'self' data:`.

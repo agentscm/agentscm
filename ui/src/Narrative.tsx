@@ -2,6 +2,7 @@ import { ApiError } from './api.ts'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { fetchNarrative, validateNarrativeTask, type NarrativeSource, type NarrativeStatement, type NarrativeView } from './narrative.ts'
 import { Ago, Icon, Notice, Skeleton } from './ui.tsx'
+import { agentName } from './nextStep.ts'
 
 type LoadState =
   | { kind: 'loading'; token: string; task: string | undefined }
@@ -164,7 +165,7 @@ function NarrativeCompact({ view }: { view: NarrativeView }) {
         <div className="brief-by">
           <i aria-hidden="true" />
           <h2 id="agent-briefing-title">Agent briefing</h2>
-          <span>Written by {view.generated_by ?? 'a connected agent'} · {view.generated_at === null ? 'time not reported' : <Ago at={view.generated_at} />}</span>
+          <span>Written by {view.generated_by ? agentName(view.generated_by) : 'a connected agent'} · {view.generated_at === null ? 'time not reported' : <Ago at={view.generated_at} />}</span>
         </div>
         <a className="brief-more" href="#activity">Read in full on Catch up <Icon name="chevron-right" /></a>
       </header>
@@ -208,7 +209,7 @@ function NarrativeReady({ view, controls }: { view: NarrativeView; controls: Tas
   const sources = new Map(view.sources.map((source) => [source.id, source]))
   const numbers = citationNumbers(view)
   const cited = [...numbers].map(([id, n]) => ({ n, source: sources.get(id) })).filter((x): x is { n: number; source: NarrativeSource } => !!x.source)
-  const by = <>Written by {view.generated_by ?? 'a connected agent'} · {view.generated_at === null ? 'time not reported' : <Ago at={view.generated_at} />}</>
+  const by = <>Written by {view.generated_by ? agentName(view.generated_by) : 'a connected agent'} · {view.generated_at === null ? 'time not reported' : <Ago at={view.generated_at} />}</>
   return (
     <NarrativeBox controls={controls} state={view.window.complete && view.warnings.length === 0 ? 'ready' : 'bad'} by={by}>
       <WindowNotices view={view} />

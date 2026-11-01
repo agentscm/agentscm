@@ -10,14 +10,15 @@
 //   REPLY_CHOICES                                         the coordination reply kinds, in words, with what each does
 //   agentName(agent), named(login, agent, me)             "Claude Code", "dev’s Codex" / "Your Codex"
 //   askOption(thread, ctx)                                the person's own agent that could ask the holder of a file to hand it over, or null
-import { brandName } from './agentIcons.tsx'
 import type { MyHandoff } from './inboxApi.ts'
 import type { Contested, LiveAgent } from './derive.ts'
 import { lead } from './pages/workParts.tsx'
 import { currentAck, currentResponse, pending, RESPONSE_LABEL, stage } from './requests.ts'
 import type { CoordinationRequest, CoordinationResponseKind, CoordinationTarget, WorkItem, WorkOverlapPair, WorkOverview } from './standup.ts'
-import { agentLabel } from './ui.tsx'
+import { agentName } from './nextStep.ts'
 import { hideKey } from './dismiss.tsx'
+
+export { agentName }
 
 export type Group = 'needs' | 'waiting' | 'others' | 'earlier'
 export const GROUPS: Group[] = ['needs', 'waiting', 'others', 'earlier']
@@ -89,8 +90,6 @@ export const REPLY_CHOICES: { kind: CoordinationResponseKind; label: string; hin
 
 const DID: Record<CoordinationResponseKind, string> = { propose_split: 'proposed a scope split', join: 'offered to join', handover: 'offered a handover', decline: 'declined' }
 
-/** "Claude Code" for a known agent, else the Hub's name for it. */
-export const agentName = (agent: string): string => brandName(agent) ?? agentLabel(agent)
 
 /** "Your Codex" for the person's own agent, "dev’s Codex" for anyone else's. */
 export const named = (login: string, agent: string, me: string | null): string => (me !== null && login === me ? `Your ${agentName(agent)}` : `${login}’s ${agentName(agent)}`)

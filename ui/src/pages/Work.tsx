@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
 import {
   fetchBriefing,
@@ -7,13 +7,14 @@ import {
   workMatchesSearch,
   type BriefingQuery,
   type StandupBriefing,
+  type BriefingEvent,
   type WorkItem,
-  type WorkOutcome,
   type WorkOverview,
   type WorkState,
 } from '../standup.ts'
-import { agentLabel, Ago, Avatar, Empty, Explain, Icon, Notice, PageHead, Skeleton, Tip, localDate } from '../ui.tsx'
-import { FINISHED_MEANS_AGENT_SAID, READING_CHANGES_NOTHING, SEARCH_THIS_PAGE_ONLY } from '../copy.ts'
+import { Ago, Avatar, Empty, Explain, Icon, Notice, PageHead, Skeleton, Tip, localDate } from '../ui.tsx'
+import { FINISHED_MEANS_AGENT_SAID, SEARCH_THIS_PAGE_ONLY } from '../copy.ts'
+import { agentName, who } from '../nextStep.ts'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { hashPath, Pager } from '../Pager.tsx'
 import { WorkDetail } from './WorkDetail.tsx'
@@ -39,7 +40,7 @@ function Action({ item }: { item: WorkItem }) {
   return <div className="muted small">No next action reported</div>
 }
 
-function WorkCard({ item, outcomeAt }: { item: WorkItem; outcomeAt?: number }) {
+function WorkCard({ item }: { item: WorkItem }) {
   const l = lead(item)
   const helpers = item.participants.filter((p) => p.role !== 'lead')
   return (
@@ -50,24 +51,24 @@ function WorkCard({ item, outcomeAt }: { item: WorkItem; outcomeAt?: number }) {
       <div className="work-owner">
         <Avatar name={l.agent} size={28} />
         <span>
-          {l.login}’s <strong title={l.agent}>{agentLabel(l.agent)}</strong>
+          {l.login}’s <strong title={l.agent}>{agentName(l.agent)}</strong>
         </span>
       </div>
       <div className="pills">
         {/* A finished card says so once: the proof badge carries the caveat, the foot carries the time. */}
-        {item.state === 'finished' ? <ProofBadge level="reported" /> : <StatePill state={item.state} />}
+        {item.state === 'finished' ? <ProofBadge level="reported" tone="muted" /> : <StatePill state={item.state} />}
         {/* In progress, a live claim is the normal case; elsewhere "Assigned" says the lead still holds it. */}
         {(item.state !== 'active' || item.claim_status !== 'active') && <ClaimPill item={item} />}
       </div>
       <Action item={item} />
       {helpers.length > 0 && (
         <div className="small muted">
-          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${agentLabel(p.agent)} (${p.role})`).join(', ')}
+          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${who(p.login, p.agent)} (${p.role})`).join(', ')}
           {helpers.length > 2 && <> · <WorkLink id={item.id}>+{helpers.length - 2} more</WorkLink></>}
         </div>
       )}
       <div className="work-foot small muted">
-        <Icon name={outcomeAt === undefined ? 'clock' : 'flag'} /> {outcomeAt === undefined ? 'Checked in' : 'Finished'} <Ago at={outcomeAt ?? item.last_checkin_at} />
+        <Icon name="clock" /> Checked in <Ago at={item.last_checkin_at} />
         <span className="ms-auto">
           {item.source.kind !== 'native' && <Source item={item} />}
         </span>
@@ -114,27 +115,55 @@ function Board({ items, showFinished = false }: { items: WorkItem[]; showFinishe
 
 function Finished({ overview, search }: { overview: WorkOverview; search: string }) {
   const all = overview.recent.filter((o) => o.kind === 'completion')
-  const visible = all.filter((o: WorkOutcome) => workMatchesSearch(o.item, search))
+  const visible = all.filter((o) => workMatchesSearch(o.item, search)).sort((a, b) => b.at - a.at || b.seq - a.seq)
   return (
     <div className="stack">
       {!overview.recent_complete && <Notice title="This window is incomplete">{overview.history_retention_gap ? 'Some outcomes in this window were compacted from retained history.' : 'The overview limit was reached; more completions exist.'}</Notice>}
       {visible.length === 0 ? (
-        <Empty icon="flag" title={all.length ? 'No completion matches your search' : 'Nothing reported finished in this window'}>
-          {!all.length && 'When an agent is done it records a finished checkpoint (agentscm_work_checkpoint) and it shows here.'}
+        <Empty icon="flag" title={all.length ? 'No finished task matches your search' : 'Nothing reported finished in this window'}>
+          {!all.length && 'When an agent reports a task finished, it shows here.'}
         </Empty>
       ) : (
-        <div className="finished-grid">
+        // The same row as All repositories' "Done lately": title and time, who, then the agent's last report.
+        <>
           <h2 className="visually-hidden">Reported finished</h2>
-          {visible.map((o) => (
-            <WorkCard key={o.seq} item={o.item} outcomeAt={o.at} />
-          ))}
-        </div>
+          <ul className="rp-done" aria-label="Reported finished">
+            {visible.map((o) => {
+              const l = lead(o.item)
+              return (
+                <li key={o.seq}>
+                  <WorkLink id={o.item.id}>{o.item.title}</WorkLink>
+                  <span className="rp-done-at"><Ago at={o.at} /></span>
+                  <span className="rp-done-who">{who(l.login, l.agent)} · <ProofBadge level="reported" tone="muted" /></span>
+                  {o.item.current && <span className="rp-done-say">{o.item.current.summary}</span>}
+                </li>
+              )
+            })}
+          </ul>
+        </>
       )}
     </div>
   )
 }
 
 /* ---------- Change history ---------- */
+
+/** One page of changes, newest first. The Hub pages forward by sequence, oldest first, and a sequence is not a time. */
+export const newestFirst = (events: readonly BriefingEvent[]): BriefingEvent[] => [...events].sort((a, b) => b.at - a.at || b.seq - a.seq)
+
+function changesAnswer(events: readonly BriefingEvent[]) {
+  if (events.length === 0) return 'No changes on this page.'
+  return <><b>{plural(events.length, 'change')}</b> on this page, the latest <Ago at={Math.max(...events.map((e) => e.at))} />.</>
+}
+
+function HistoryHead({ answer }: { answer: ReactNode }) {
+  return (
+    <>
+      <PageHead question="What changed in Work, and when?" answer={answer} fact="Starts, joins, takeovers and checkpoints, newest first. Next goes forward in time." />
+      <SectionTabs />
+    </>
+  )
+}
 
 function History({ token }: { token: string }) {
   const [queries, setQueries] = useState<BriefingQuery[]>([{ limit: 10 }])
@@ -144,26 +173,31 @@ function History({ token }: { token: string }) {
   const [filter, setFilter] = useState<'all' | WorkState>('all')
   const query = queries[page]!
   const load = usePoll((signal) => fetchBriefing(token, signal, query), 0, JSON.stringify(query))
-  if (load.kind === 'loading') return <Skeleton rows={6} />
+  if (load.kind === 'loading') return <><HistoryHead answer="Checking what changed…" /><Skeleton rows={6} /></>
   if (load.kind === 'error')
     return (
-      <Notice tone="bad" title="Could not load the change history" action={<button className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>}>
-        {load.message}
-      </Notice>
+      <>
+        <HistoryHead answer="The change history could not be loaded." />
+        <Notice tone="bad" title="Could not load the change history" action={<button className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>}>
+          {load.message}
+        </Notice>
+      </>
     )
   const b: StandupBriefing = load.value
   const items = b.items.filter((i) => workMatchesSearch(i, search))
-  const events = b.events.filter((e) => (filter === 'all' || e.item.state === filter) && workMatchesSearch(e.item, search))
+  const events = newestFirst(b.events).filter((e) => (filter === 'all' || e.item.state === filter) && workMatchesSearch(e.item, search))
   const canNext = hasMoreBriefing(b, view)
   return (
+    <>
+    <HistoryHead answer={changesAnswer(b.events)} />
     <div className="stack">
       {b.retention_gap && <Notice title="Some history is no longer retained">The current work snapshot is complete, but this change history has a gap.</Notice>}
       <div className="toolbar">
-        <div className="btn-group" role="group" aria-label="History view">
-          <button type="button" className={`btn btn-sm ${view === 'changes' ? 'btn-secondary' : 'btn-outline-secondary'}`} onClick={() => setView('changes')} aria-pressed={view === 'changes'}>
+        <div className="lens" role="tablist" aria-label="History view">
+          <button type="button" role="tab" aria-selected={view === 'changes'} className={`lens-seg${view === 'changes' ? ' on' : ''}`} onClick={() => setView('changes')}>
             <Icon name="list-ul" /> Recent changes
           </button>
-          <button type="button" className={`btn btn-sm ${view === 'current' ? 'btn-secondary' : 'btn-outline-secondary'}`} onClick={() => setView('current')} aria-pressed={view === 'current'}>
+          <button type="button" role="tab" aria-selected={view === 'current'} className={`lens-seg${view === 'current' ? ' on' : ''}`} onClick={() => setView('current')}>
             <Icon name="kanban" /> Work on this page
           </button>
         </div>
@@ -184,7 +218,7 @@ function History({ token }: { token: string }) {
         <Board items={items} showFinished={b.items.some((i) => i.state === 'finished')} />
       ) : events.length === 0 ? (
         <Empty icon="list" title="No changes on this page">
-          {!search.trim() && filter === 'all' && 'Changes appear when an agent starts or joins work (agentscm_start).'}
+          {!search.trim() && filter === 'all' && 'Changes appear here when an agent starts, joins or checks in on a task.'}
         </Empty>
       ) : (
         <ol className="change-feed box">
@@ -197,7 +231,7 @@ function History({ token }: { token: string }) {
                   <WorkLink id={e.work_id}>{e.item.title}</WorkLink>
                   <div className="change-meta">
                     <span>{EVENT_LABEL[e.kind] ?? e.kind}</span>
-                    <span className="change-who"><Avatar name={l.agent} size={18} /> <span title={l.agent}>{agentLabel(l.agent)}</span> <span className="muted">{l.login}</span></span>
+                    <span className="change-who"><Avatar name={l.agent} size={18} /> <span title={l.agent}>{who(l.login, l.agent)}</span></span>
                     <StatePill state={e.item.state} />
                   </div>
                   {e.item.current && e.kind === 'work_checkpoint' && <p className="change-quote">“{e.item.current.summary}”</p>}
@@ -220,6 +254,7 @@ function History({ token }: { token: string }) {
         }}
       />
     </div>
+    </>
   )
 }
 
@@ -253,10 +288,8 @@ export function WorkPage({ token, overview, handoff }: { token: string; overview
   const finished = ov?.recent.filter((o) => o.kind === 'completion').length ?? 0
   const history = tab === 'history'
   return (
-    <div className="page">
-      {history ? (
-        <PageHead question="What changed in Work, and when?" answer="Every change to Work, newest first." fact={<>Starts, joins, takeovers and checkpoints. {READING_CHANGES_NOTHING}</>} />
-      ) : (
+    <div className="page history-page">
+      {!history && (
         <PageHead
           question="What did agents report finished?"
           answer={
@@ -275,7 +308,7 @@ export function WorkPage({ token, overview, handoff }: { token: string; overview
           fact={FINISHED_MEANS_AGENT_SAID}
         />
       )}
-      <SectionTabs />
+      {!history && <SectionTabs />}
       {!history && overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
           {overview.message}

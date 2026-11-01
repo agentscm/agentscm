@@ -33,5 +33,3 @@ export function setupState(row: SetupStatus, now: number, available: boolean): '
   if (row.blocker !== null) return 'Blocked'
   return row.mcp_verified && row.native_verified ? 'Ready' : 'Unverified'
 }
-
-export const blockerLabel = (blocker: string | null): string => ({ login: 'Sign in to your agent', trust: 'Review native approvals', quota: 'Usage limit', unsupported: 'Account access unsupported', unknown: 'Inspect agent status' }[blocker ?? ''] ?? 'Verification needed')

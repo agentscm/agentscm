@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, installCommand, safeHubOrigin, type ClientAgent } from '../connectAgent.ts'
 import { onFrontDoor } from '../frontDoor.ts'
+import { agentName } from '../nextStep.ts'
 import { CopyButton, Icon, Notice } from '../ui.tsx'
 
 /** The set-up command for the Hub serving this page, or null: on the local page the origin is this computer, and an unsupported origin gets none. */
@@ -23,11 +24,9 @@ export function InstallCommand({ lead = 'Run this in a checkout of a repository 
   )
 }
 
-const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini' }
-
 const STEPS = [
   { icon: 'clipboard-check', title: 'Paste into your agent', body: 'Open any coding agent and paste the instructions.' },
-  { icon: 'person-check', title: 'Sign in with your forge', body: 'Complete the GitHub or GitLab browser sign-in when asked.' },
+  { icon: 'person-check', title: 'Sign in with your forge', body: 'Complete the GitHub or GitLab browser sign-in when asked. Use an account that can read a repository on this Hub.' },
   { icon: 'shield-check', title: 'Approve AgentSCM access', body: 'Approve the AgentSCM hooks and MCP server inside your agent yourself.' },
   { icon: 'patch-check', title: 'Verify a real edit', body: 'Your agent checks MCP and its edit hook in the same session. Blockers come with the next step.' },
 ]
@@ -53,7 +52,6 @@ export function ConnectAgent() {
   }
   return (
     <div className="connect">
-      <p className="muted small">Your GitHub or GitLab account needs access to a repository this hub is connected to; otherwise the hub refuses with “not connected”.</p>
       <ol className="steps" data-tour="setup-steps">
         {STEPS.map((s, i) => (
           <li key={s.title}>
@@ -75,41 +73,43 @@ export function ConnectAgent() {
         </div>
         <CopyButton text={prompt} label="Copy setup instructions" className="btn btn-primary" />
       </div>
-      <details className="disclosure">
+      <details className="disc-row">
         <summary>
           <Icon name="eye" /> Preview the instructions
         </summary>
         <p className="prompt-preview">{prompt}</p>
-        <p className="muted small mb-0">Your agent has no terminal to answer in, so it passes <code>--yes</code> and takes the recommended answers: every coding agent it finds, set up once for all your projects. It runs the latest published AgentSCM through <code>npx</code>. You approve sign-in and trust yourself. To run it yourself, use <code>{installCommand(window.location.origin)}</code> in a terminal; add <code>--dry-run</code> to preview and <code>npx agentscm uninstall</code> to undo.</p>
+        <p className="muted small">Your agent has no terminal to answer in, so it passes <code>--yes</code> and takes the recommended answers: every coding agent it finds, set up once for all your projects. It runs the latest published AgentSCM through <code>npx</code>. You approve sign-in and trust yourself. To run it yourself, use <code>{installCommand(window.location.origin)}</code> in a terminal; add <code>--dry-run</code> to preview and <code>npx agentscm uninstall</code> to undo.</p>
       </details>
-      <details className="disclosure">
+      <details className="disc-row">
         <summary>
           <Icon name="terminal" /> Use the command line instead
         </summary>
-        <label className="form-label small mt-2" htmlFor="agent-pick">
-          Your coding agent
-        </label>
-        <select id="agent-pick" className="form-select" value={agent} onChange={(e) => setAgent(e.target.value as ClientAgent | '')}>
-          <option value="">Choose an agent…</option>
-          {CLIENT_AGENTS.map((a) => (
-            <option key={a} value={a}>
-              {AGENT_NAMES[a]}
-            </option>
-          ))}
-        </select>
-        {command && (
-          <div className="command">
-            <code>{command}</code>
-            <CopyButton text={command} />
-          </div>
-        )}
-        {command && <p className="muted small mt-2 mb-0">Then run <code>npx agentscm client check</code> in the checkout (Hub binding only). Verify hooks and MCP from your agent.</p>}
+        <div>
+          <label className="form-label small" htmlFor="agent-pick">
+            Your coding agent
+          </label>
+          <select id="agent-pick" className="form-select" value={agent} onChange={(e) => setAgent(e.target.value as ClientAgent | '')}>
+            <option value="">Choose an agent…</option>
+            {CLIENT_AGENTS.map((a) => (
+              <option key={a} value={a}>
+                {agentName(a)}
+              </option>
+            ))}
+          </select>
+          {command && (
+            <div className="command">
+              <code>{command}</code>
+              <CopyButton text={command} />
+            </div>
+          )}
+          {command && <p className="muted small mt-2 mb-0">Then run <code>npx agentscm client check</code> in the checkout (Hub binding only). Verify hooks and MCP from your agent.</p>}
+        </div>
       </details>
-      <details className="disclosure">
+      <details className="disc-row">
         <summary>
           <Icon name="info-circle" /> Good to know
         </summary>
-        <p className="muted small mt-2 mb-0">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification. <code>agentscm quickstart</code> sets up agents through the same <code>client setup</code>, so either way the agent reports here. Undo one checkout with <code>agentscm client remove</code>. <code>agentscm init-repo</code> only commits shared instructions; each developer still runs this setup.</p>
+        <p className="muted small">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification. <code>agentscm quickstart</code> sets up agents through the same <code>client setup</code>, so either way the agent reports here. Undo one checkout with <code>agentscm client remove</code>. <code>agentscm init-repo</code> only commits shared instructions; each developer still runs this setup.</p>
       </details>
     </div>
   )
