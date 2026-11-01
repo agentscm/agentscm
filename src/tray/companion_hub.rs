@@ -60,6 +60,10 @@ pub(super) struct Signal {
     pub available: bool,
     pub complete: bool,
     pub count: usize,
+    /// Human-facing Work decisions; Inbox requests remain in `count` only.
+    pub needs_you: usize,
+    pub decisions: usize,
+    pub overlaps: usize,
     pub work: Vec<Work>,
 }
 
@@ -70,6 +74,7 @@ pub(super) struct Work {
     pub state: String,
     pub next_action: String,
     pub claim_status: String,
+    pub scope_unknown: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -85,8 +90,11 @@ pub(super) struct Catalog {
 pub(super) struct CatalogRepository {
     pub hub: String,
     pub repository: String,
+    pub last_activity_at: Option<i64>,
     pub agents: usize,
     pub attention: usize,
+    pub inbox_requests: usize,
+    pub attention_summary: String,
     pub attention_revision: String,
     pub attention_complete: bool,
     pub complete: bool,
@@ -251,6 +259,7 @@ async fn read_catalog(
                                 "No next action reported",
                             ),
                             claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
+                            scope_unknown: item["scope_unknown"] == true,
                         })
                         .collect()
                 })
@@ -269,9 +278,7 @@ async fn read_catalog(
                         .collect()
                 })
                 .unwrap_or_default();
-            let complete = row["complete"] == true
-                && row["work_complete"] == true
-                && row["live_complete"] == true;
+            let (complete, attention_complete) = catalog_coverage(row);
             incomplete |= !complete;
             catalog.repositories.push(CatalogRepository {
                 hub: hub.clone(),
@@ -280,10 +287,13 @@ async fn read_catalog(
                     .filter(|character| !character.is_control())
                     .take(255)
                     .collect(),
+                last_activity_at: row["last_activity_at"].as_i64(),
                 agents: row["agents"].as_u64().unwrap_or(0).min(500) as usize,
                 attention: row["needs_you"].as_u64().unwrap_or(0).min(500) as usize,
+                inbox_requests: row["inbox_requests"].as_u64().unwrap_or(0).min(500) as usize,
+                attention_summary: attention_summary(&row["attention_categories"]),
                 attention_revision: bounded_text(&row["attention_revision"], 64, ""),
-                attention_complete: row["complete"] == true,
+                attention_complete,
                 complete,
                 work,
                 live,
@@ -350,6 +360,9 @@ async fn read_one(
         available: false,
         complete: false,
         count: 0,
+        needs_you: 0,
+        decisions: 0,
+        overlaps: 0,
         work: Vec::new(),
     };
     if OpenRequest::from_status(connection).is_err() {
@@ -530,6 +543,9 @@ fn summarize(
             available: false,
             complete: false,
             count: 0,
+            needs_you: 0,
+            decisions: 0,
+            overlaps: 0,
             work: Vec::new(),
         };
     };
@@ -561,6 +577,7 @@ fn summarize(
             state: bounded_text(&item["state"], 32, "unknown"),
             next_action: bounded_text(&item["next_action"], 160, "No next action reported"),
             claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
+            scope_unknown: item["scope"].as_array().is_some_and(Vec::is_empty),
         });
     }
     let open_requests: Vec<_> = requests
@@ -579,6 +596,7 @@ fn summarize(
     }
     keys.sort();
     let count = blocked + quiet + handovers + open_requests.len() + overlaps.len();
+    let needs_you = blocked + quiet + handovers + overlaps.len();
     let complete = overview["current_complete"] == true
         && overview["overlaps_complete"] == true
         && coordination["complete"] == true;
@@ -615,6 +633,9 @@ fn summarize(
         available: true,
         complete,
         count,
+        needs_you,
+        decisions: blocked + quiet + handovers,
+        overlaps: overlaps.len(),
         work,
     }
 }
@@ -632,17 +653,72 @@ fn bounded_text(value: &Value, max_chars: usize, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+fn catalog_coverage(row: &Value) -> (bool, bool) {
+    // Older Hubs lack the Inbox count. Do not present that gap as a
+    // verified zero or mark the repository current.
+    let attention_complete = row["complete"] == true && row["inbox_requests"].is_u64();
+    (
+        attention_complete && row["work_complete"] == true && row["live_complete"] == true,
+        attention_complete,
+    )
+}
+
+fn attention_summary(value: &Value) -> String {
+    let mut parts = Vec::new();
+    for (key, noun) in [
+        ("work", "work decision"),
+        ("overlaps", "task overlap"),
+        ("contested_files", "contested file"),
+    ] {
+        let count = value[key].as_u64().unwrap_or(0).min(500);
+        if count > 0 {
+            parts.push(format!(
+                "{count} {noun}{}",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
+    fn old_hub_catalog_without_inbox_count_is_partial() {
+        let legacy = json!({"complete": true, "work_complete": true, "live_complete": true});
+        assert_eq!(catalog_coverage(&legacy), (false, false));
+        for value in [Value::Null, json!("0"), json!(-1)] {
+            let mut malformed = legacy.clone();
+            malformed["inbox_requests"] = value;
+            assert_eq!(catalog_coverage(&malformed), (false, false));
+        }
+        let current = json!({"complete": true, "work_complete": true, "live_complete": true,
+            "inbox_requests": 0});
+        assert_eq!(catalog_coverage(&current), (true, true));
+    }
+
+    #[test]
+    fn attention_categories_have_bounded_plain_language() {
+        assert_eq!(
+            attention_summary(&json!({"work": 1, "overlaps": 2, "contested_files": 1})),
+            "1 work decision · 2 task overlaps · 1 contested file"
+        );
+        assert_eq!(attention_summary(&Value::Null), "");
+        assert_eq!(
+            attention_summary(&json!({"overlaps": 9999})),
+            "500 task overlaps"
+        );
+    }
+
+    #[test]
     fn hub_signals_match_work_and_inbox_categories() {
         let overview = json!({
             "current": [
-                {"id":"wrk_blocked","state":"blocked","claim_status":"active","updated_at":4},
-                {"id":"wrk_quiet","state":"active","claim_status":"stale","updated_at":5},
+                {"id":"wrk_blocked","state":"blocked","claim_status":"active","updated_at":4,"scope":[]},
+                {"id":"wrk_quiet","state":"active","claim_status":"stale","updated_at":5,"scope":["src/lib.rs"]},
                 {"id":"wrk_handover","state":"handover","claim_status":"active","updated_at":6}
             ],
             "overlaps": [{"left":{"id":"wrk_a"},"right":{"id":"wrk_b"}}],
@@ -659,12 +735,40 @@ mod tests {
             &coordination,
         );
         assert_eq!(result.count, 5);
+        assert_eq!(result.needs_you, 4);
+        assert_eq!(
+            result
+                .work
+                .iter()
+                .map(|item| item.scope_unknown)
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
         assert!(result.text.contains("1 blocked"));
         assert!(result.text.contains("1 quiet"));
         assert!(result.text.contains("1 handover"));
         assert!(result.text.contains("1 overlap"));
         assert!(result.text.contains("1 Inbox request"));
         assert_eq!(result.keys.len(), 5);
+    }
+
+    #[test]
+    fn agent_inbox_request_is_not_a_human_decision() {
+        let overview = json!({
+            "current": [], "overlaps": [],
+            "current_complete": true, "overlaps_complete": true
+        });
+        let coordination = json!({"requests": [
+            {"id":"crq_open","status":"pending"}
+        ], "complete": true});
+        let result = summarize(
+            std::path::Path::new("/demo"),
+            "example/repo",
+            &overview,
+            &coordination,
+        );
+        assert_eq!(result.count, 1);
+        assert_eq!(result.needs_you, 0);
     }
 
     #[test]

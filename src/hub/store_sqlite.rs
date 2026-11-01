@@ -11111,6 +11111,27 @@ impl Store for SqliteStore {
         self.overview_for(&reader, query, now)
     }
 
+    fn repository_open_coordination_count(
+        &self,
+        owner: &User,
+        repository: &str,
+        repository_id: i64,
+    ) -> Result<usize> {
+        let count: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM hub_coordination_requests
+             WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_id IS ?4
+               AND status IN ('pending','responded')",
+            params![
+                &owner.identity.provider,
+                &owner.identity.host,
+                repository,
+                repository_id
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
     fn work_scope_check(
         &self,
         token: &str,
