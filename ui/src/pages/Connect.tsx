@@ -23,11 +23,11 @@ export function InstallCommand({ lead = 'Run this in a checkout of a repository 
   )
 }
 
-const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini' }
+export const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini' }
 
 const STEPS = [
   { icon: 'clipboard-check', title: 'Paste into your agent', body: 'Open any coding agent and paste the instructions.' },
-  { icon: 'person-check', title: 'Sign in with your forge', body: 'Complete the GitHub or GitLab browser sign-in when asked.' },
+  { icon: 'person-check', title: 'Sign in with your forge', body: 'Complete the GitHub or GitLab browser sign-in when asked. Use an account that can read a repository on this Hub.' },
   { icon: 'shield-check', title: 'Approve AgentSCM access', body: 'Approve the AgentSCM hooks and MCP server inside your agent yourself.' },
   { icon: 'patch-check', title: 'Verify a real edit', body: 'Your agent checks MCP and its edit hook in the same session. Blockers come with the next step.' },
 ]
@@ -53,7 +53,6 @@ export function ConnectAgent() {
   }
   return (
     <div className="connect">
-      <p className="muted small">Your GitHub or GitLab account needs access to a repository this hub is connected to; otherwise the hub refuses with “not connected”.</p>
       <ol className="steps" data-tour="setup-steps">
         {STEPS.map((s, i) => (
           <li key={s.title}>

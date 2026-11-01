@@ -117,6 +117,12 @@ export function stepCounts(lib: Library): { steps: number; canStop: number } {
     .flatMap((p) => lib.catalog.find((c) => c.name === p.name && c.sha256 === p.sha256)?.gates ?? [])
   return { steps: gates.length, canStop: gates.filter((g) => g.enforce.includes('stop')).length }
 }
+/** The adopted skills by name, and their open runs and runs at a stop gate, from the counts the hub already sends. */
+export function adoptedSummary(lib: Library): { names: string[]; open: number; atStop: number } {
+  const names = [...new Set(lib.adoption.pins.filter((p) => p.status === 'adopted').map((p) => p.name))]
+  const sum = (k: 'open' | 'at_stop_gate') => names.reduce((t, n) => t + (lib.counts[n]?.[k] ?? 0), 0)
+  return { names, open: sum('open'), atStop: sum('at_stop_gate') }
+}
 /** The hub numbers its lines; the page numbers them with <ol>. */
 export const stepText = (line: string) => line.replace(/^\d+\.\s+/, '')
 
