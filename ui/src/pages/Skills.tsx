@@ -3,7 +3,7 @@ import { SectionTabs } from '../TopNav.tsx'
 import { Track } from './Landed.tsx'
 import { lead, WorkLink } from './workParts.tsx'
 import { Gloss } from '../Gloss.tsx'
-import { who } from '../nextStep.ts'
+import { agentName, who } from '../nextStep.ts'
 import { SEARCH_THIS_PAGE_ONLY } from '../copy.ts'
 import { ProofBadge } from '../Proof.tsx'
 import { runProof } from '../proof.ts'
@@ -57,8 +57,9 @@ function Applicability({ c }: { c: CatalogEntry }) {
   )
 }
 
+// How a step is enforced is a fixed attribute of the step, so every level is the outlined tag (DESIGN.md, the Pill Family Rule).
 const ENFORCE_VIEW: Record<StepEnforce, { label: string; tone: Tone; icon: string }> = {
-  block: { label: 'Can stop the agent', tone: 'brand', icon: 'sign-stop' },
+  block: { label: 'Can stop the agent', tone: 'muted', icon: 'sign-stop' },
   warn: { label: 'Warns only', tone: 'muted', icon: 'bell' },
   record: { label: 'Recorded only', tone: 'muted', icon: 'journal-text' },
 }
@@ -131,7 +132,7 @@ function SkillHead({ c, children }: { c: CatalogEntry; children?: ReactNode }) {
   return (
     <div className="skill-head" data-tour="skills-head">
       <strong>{c.name}</strong> <span className="muted">v{c.workflow_version}</span>
-      {c.first_party && <Pill tone="brand" icon="patch-check">Built in</Pill>}
+      {c.first_party && <Pill tone="muted" icon="patch-check">Built in</Pill>}
       {enforced.length > 0 && <Pill tone="muted" icon="shield" tip="Some steps can hold the author’s session until they have evidence, through the opt-in Stop hook. It is installed per checkout with the agentscm skill stop command, and the hub does not know which checkouts have it. It fails open: the agent may finish when the hub is unreachable or the checkout is detached.">Can stop the agent (opt-in)</Pill>}
       {planned.map((p) => <Pill key={p} tone="muted" icon="hourglass-split" tip="Not built yet. Nothing checks this step on the hub’s behalf today.">{p[0]!.toUpperCase() + p.slice(1)}: planned</Pill>)}
       {children}
@@ -181,7 +182,8 @@ function LibraryAnswer({ lib }: { lib: Library }) {
   const n = names.length
   if (n === 0) return <>This repository has adopted no skills yet.</>
   // Name the skills while the list stays short enough to read in one breath.
-  const named = n <= 3 ? `, ${new Intl.ListFormat('en', { type: 'conjunction' }).format(names)}` : ''
+  // Each name stays whole in the headline: "pr-gate" never wraps at its hyphen.
+  const named = n <= 3 ? <>, {new Intl.ListFormat('en', { type: 'conjunction' }).formatToParts(names).map((p, i) => (p.type === 'element' ? <span key={i} className="text-nowrap">{p.value}</span> : p.value))}</> : null
   return (
     <>
       Agents here are asked to follow <b>{n} <Gloss term="skills">{n === 1 ? 'skill' : 'skills'}</Gloss></b>{named}.{' '}
@@ -340,7 +342,7 @@ function EvidenceItem({ e }: { e: Evidence }) {
   return (
     <li>
       {e.summary} {a && e.assurance === 'self_reported' && <Pill tone={a.tone} icon={a.icon}>{a.label}</Pill>}
-      <span className="small muted d-block">{e.kind} on <code>{shortSha(e.head_sha)}</code>{e.agent ? ` · ${e.agent}` : ''}{e.session ? ` · session ${e.session.slice(0, 8)}` : ''} · <Ago at={e.recorded_at} />{/^https?:\/\//.test(e.url ?? '') && <> · <a href={e.url!} target="_blank" rel="noreferrer noopener">link</a></>}</span>
+      <span className="small muted d-block">{e.kind} on <code>{shortSha(e.head_sha)}</code>{e.agent ? ` · ${agentName(e.agent)}` : ''}{e.session ? ` · session ${e.session.slice(0, 8)}` : ''} · <Ago at={e.recorded_at} />{/^https?:\/\//.test(e.url ?? '') && <> · <a href={e.url!} target="_blank" rel="noreferrer noopener">link</a></>}</span>
     </li>
   )
 }
@@ -366,7 +368,7 @@ function Run({ run, task }: { run: RunView; task: WorkItem | undefined }) {
       <PageHead
         className="detail-head"
         question={task ? task.title : `${pr}${run.branch}`}
-        answer={<><Pill tone={runStateTone(run)}>{runStateLabel(run)}</Pill> {run.skill.name} v{run.skill.workflow_version}</>}
+        answer={<><Pill tone={runStateTone(run)}>{runStateLabel(run)}</Pill> <span className="text-nowrap">{run.skill.name} v{run.skill.workflow_version}</span></>}
         fact={<>{task && l && <><WorkLink id={task.id}>Open the task</WorkLink> by {who(l.login, l.agent)}. </>}<span>Proof so far: <ProofBadge level={runProof(run.gates)} /></span></>}
       />
       <div className="skill-cells">

@@ -12,9 +12,9 @@ import {
   type WorkOverview,
   type WorkState,
 } from '../standup.ts'
-import { agentLabel, Ago, Avatar, Empty, Explain, Icon, Notice, PageHead, Skeleton, Tip, localDate } from '../ui.tsx'
+import { Ago, Avatar, Empty, Explain, Icon, Notice, PageHead, Skeleton, Tip, localDate } from '../ui.tsx'
 import { FINISHED_MEANS_AGENT_SAID, SEARCH_THIS_PAGE_ONLY } from '../copy.ts'
-import { who } from '../nextStep.ts'
+import { agentName, who } from '../nextStep.ts'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { hashPath, Pager } from '../Pager.tsx'
 import { WorkDetail } from './WorkDetail.tsx'
@@ -51,7 +51,7 @@ function WorkCard({ item }: { item: WorkItem }) {
       <div className="work-owner">
         <Avatar name={l.agent} size={28} />
         <span>
-          {l.login}’s <strong title={l.agent}>{agentLabel(l.agent)}</strong>
+          {l.login}’s <strong title={l.agent}>{agentName(l.agent)}</strong>
         </span>
       </div>
       <div className="pills">
@@ -63,7 +63,7 @@ function WorkCard({ item }: { item: WorkItem }) {
       <Action item={item} />
       {helpers.length > 0 && (
         <div className="small muted">
-          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${agentLabel(p.agent)} (${p.role})`).join(', ')}
+          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${who(p.login, p.agent)} (${p.role})`).join(', ')}
           {helpers.length > 2 && <> · <WorkLink id={item.id}>+{helpers.length - 2} more</WorkLink></>}
         </div>
       )}

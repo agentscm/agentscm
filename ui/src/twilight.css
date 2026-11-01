@@ -1084,6 +1084,10 @@ html.wco:not(:has(.topbar)) body::before {
   .htabs::-webkit-scrollbar {
     display: none;
   }
+  /* A strip wider than the phone fades at the edge that has more tabs, so a cut-off tab reads as "scroll for more". */
+  .htabs[data-more='end'] { mask-image: linear-gradient(to right, #000 calc(100% - 44px), transparent); }
+  .htabs[data-more='start'] { mask-image: linear-gradient(to left, #000 calc(100% - 44px), transparent); }
+  .htabs[data-more='both'] { mask-image: linear-gradient(to right, transparent, #000 44px, #000 calc(100% - 44px), transparent); }
   .htab b {
     font-size: 14px;
   }
@@ -3707,8 +3711,7 @@ button.repo-quiet-item:focus-visible { outline: 2px solid var(--hub-brand); outl
 .in-done { display: flex; align-items: center; gap: var(--s2); margin: 0; font-size: 13.5px; color: var(--hub-ok); }
 .in-foot { margin: 0; font-size: 12.5px; color: var(--hub-text-3); }
 .in-prompt { padding: var(--s3) 28px; border-top: 1px solid var(--hub-rule); font-size: 13px; color: var(--hub-text-3); }
-.in-prompt summary { cursor: pointer; width: max-content; color: var(--hub-brand-ink); text-decoration: underline; text-underline-offset: 3px; }
-.in-prompt[open] summary { margin-bottom: var(--s3); }
+.in-prompt .disc-row { margin-top: 0; }
 .in-quiet { margin-top: var(--s5); }
 /* The idle scene: two cursors politely passing a file. Decoration only; the sentence beside it says the same in words. */
 .in-idle { display: grid; flex: 1; align-content: center; justify-items: center; gap: var(--s3); min-height: 440px; padding: 40px var(--s5); text-align: center; }

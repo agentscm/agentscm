@@ -1614,12 +1614,12 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 .change-mark.is-work_checkpoint { background: var(--hub-ok-soft); color: var(--hub-ok); }
 .change-main { min-width: 0; }
 .change-main > a,
-.history-page .rp-done li > a { font-weight: 600; color: var(--hub-text); text-decoration: none; overflow-wrap: anywhere; }
+.rp-done li > a { font-weight: 600; color: var(--hub-text); text-decoration: none; overflow-wrap: anywhere; }
 .change-main > a:hover, .change-main > a:focus-visible,
-.history-page .rp-done li > a:hover, .history-page .rp-done li > a:focus-visible { color: var(--hub-brand-ink); text-decoration: underline; }
-/* History borrows All repositories' finished rows, so it carries the same spacing scale (as the Inbox does). */
+.rp-done li > a:hover, .rp-done li > a:focus-visible { color: var(--hub-brand-ink); text-decoration: underline; }
+/* History borrows All repositories' finished rows, so it carries the same spacing scale (as the Inbox does). Both lists' titles are ink, like .work-title. */
 .history-page { --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; }
-.history-page .rp-done li > a { min-width: 0; font-size: 14.5px; }
+.rp-done li > a { min-width: 0; font-size: 14.5px; }
 .history-page .rp-done-who { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
 .history-page .lane-title { font-size: var(--t-group); font-weight: 650; letter-spacing: -0.01em; }
 .change-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 4px; font-size: 0.82rem; color: var(--hub-text-2); }
@@ -2005,9 +2005,6 @@ a.run-row:hover {
   align-items: center;
   flex-wrap: wrap;
   margin-bottom: 12px;
-}
-.connect .disclosure {
-  margin-bottom: 10px;
 }
 .prompt-preview {
   font-size: 0.8rem;
@@ -2552,16 +2549,17 @@ a.run-row:hover {
 .gate-note { display: flex; gap: 6px; align-items: baseline; margin: 12px 0 0; font-size: 0.8rem; color: var(--hub-text-3); }
 .gate-needs { margin: 2px 0 0; font-size: 0.8rem; line-height: 1.45; color: var(--hub-text-3); overflow-wrap: anywhere; }
 
-/* Disclosures (Full procedure, How it works, Settings, a run's stale evidence and details): a chevron row that opens in place. */
-.skill-proc, .skill-details { margin-top: 14px; border: 1px solid var(--hub-rule); border-radius: 12px; background: var(--hub-surface); }
-.skill-details + .skill-details { margin-top: 8px; }
+/* Disclosures (Full procedure, How it works, Settings, a run's stale evidence and details): a chevron row that opens in place.
+   .disc-row is the same row for section-level disclosures on other pages (DESIGN.md, the Disclosure Row Rule). */
+.skill-proc, .skill-details, .disc-row { margin-top: 14px; border: 1px solid var(--hub-rule); border-radius: 12px; background: var(--hub-surface); }
+.skill-details + .skill-details, .disc-row + .disc-row { margin-top: 8px; }
 .skill-details .skill-proc { background: var(--hub-sunken); }
-.skill-details > :not(summary) { margin: 14px; }
-.skill-details[open] > summary { border-bottom: 1px solid var(--hub-rule); }
-.skill-details > summary::-webkit-details-marker { display: none; }
-.skill-details > summary::after { content: ''; margin-left: auto; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); transition: transform 160ms ease; color: var(--hub-text-3); }
-.skill-details[open] > summary::after { transform: rotate(-135deg); }
-.skill-proc > summary, .skill-details > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; cursor: pointer; font-size: 0.86rem; font-weight: 600; list-style: none; }
+.skill-details > :not(summary), .disc-row > :not(summary) { margin: 14px; }
+.skill-details[open] > summary, .disc-row[open] > summary { border-bottom: 1px solid var(--hub-rule); }
+.skill-details > summary::-webkit-details-marker, .disc-row > summary::-webkit-details-marker { display: none; }
+.skill-details > summary::after, .disc-row > summary::after { content: ''; margin-left: auto; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); transition: transform 160ms ease; color: var(--hub-text-3); }
+.skill-details[open] > summary::after, .disc-row[open] > summary::after { transform: rotate(-135deg); }
+.skill-proc > summary, .skill-details > summary, .disc-row > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; cursor: pointer; font-size: 0.86rem; font-weight: 600; list-style: none; }
 .skill-proc > summary::-webkit-details-marker { display: none; }
 .skill-proc > summary::after { content: ''; margin-left: auto; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); transition: transform 160ms ease; color: var(--hub-text-3); }
 .skill-proc[open] > summary::after { transform: rotate(-135deg); }

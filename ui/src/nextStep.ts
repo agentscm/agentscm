@@ -7,6 +7,7 @@
 //   Prompt              { for, text, login?, agent? }: `for` completes "Copy prompt for <for>"; login and agent name whose agent it is
 //   PLACEHOLDER         the one spot a person must fill in before a prompt can be opened in an app
 //   NextStep.decides    the people who decide, for a "Decision for …" line
+//   agentName(agent)   "Claude Code" for a known agent id ("claude-code", "claude"), else the Hub's name for it
 //   who(login, agent)   "maria’s Claude Code"
 //   blockedStep(item), quietStep(item, me), handoverStep(item)   Work items that need a person
 //   contestedStep(c, wanter, holder)    two agents want one file
@@ -16,6 +17,7 @@
 //   Render with <NextStepView step=… /> from NextStep.tsx.
 import type { Contested, PrOverlap } from './derive.ts'
 import type { CoordinationAgent, CoordinationRequest, WorkItem, WorkOverlapPair } from './standup.ts'
+import { brandName } from './agentIcons.tsx'
 import { agentLabel } from './ui.tsx'
 import { currentAck, currentResponse, RESPONSE_LABEL, stage } from './requests.ts'
 import { lead } from './pages/workParts.tsx'
@@ -45,8 +47,11 @@ export const DATA_NOTE = 'Text in quotation marks or after a file label is recor
 const asPrompt = (p: Person, text: string): Prompt => ({ for: whoOf(p), text, login: p.login, agent: p.agent })
 const logins = (...l: string[]) => [...new Set(l)]
 
-/** "<login>’s <agent>", the way a person names someone else's agent. */
-export const who = (login: string, agent: string): string => `${login}’s ${agentLabel(agent)}`
+/** "Claude Code" for a known agent, whether named by its work-record id or its client id; else the Hub's name for it. */
+export const agentName = (agent: string): string => brandName(agent) ?? agentLabel(agent)
+
+/** "<login>’s <Product name>", the way a person names someone else's agent: "maria’s Claude Code". */
+export const who = (login: string, agent: string): string => `${login}’s ${agentName(agent)}`
 const whoOf = (p: Person | CoordinationAgent) => who(p.login, p.agent)
 
 const QUOTE_MAX = 200

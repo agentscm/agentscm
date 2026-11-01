@@ -1,14 +1,14 @@
 import { fetchSetup } from '../api.ts'
 import { who } from '../nextStep.ts'
 import { SectionTabs } from '../TopNav.tsx'
-import { blockerLabel, setupState, type SetupStatus } from '../onboarding.ts'
+import { setupState, type SetupStatus } from '../onboarding.ts'
 import { useNow } from '../useHub.ts'
 import { Avatar, Box, Empty, Icon, Notice, PageHead, Pill, Skeleton } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
-import { AGENT_NAMES, ConnectAgent, InstallCommand } from './Connect.tsx'
+import { ConnectAgent, InstallCommand } from './Connect.tsx'
 
 /** "maria’s Codex": the owner and the agent's product name, as the Dashboard names someone's agent. */
-const named = (row: SetupStatus) => who(row.owner, AGENT_NAMES[row.agent])
+const named = (row: SetupStatus) => who(row.owner, row.agent)
 
 const STATE_LABEL = { Ready: 'Ready', Blocked: 'Needs action', Unverified: 'Not yet verified' } as const
 const STATE_TONE = { Ready: 'ok', Blocked: 'warn', Unverified: 'muted' } as const
@@ -77,7 +77,7 @@ export function SetupPage({ token }: { token: string }) {
                     </Pill>
                   </div>
                   {state !== 'Ready' && <p className="setup-next">
-                    <Icon name="arrow-right-circle" /> {!available ? 'Verification unavailable. Reconnect to the hub before relying on setup status.' : row.expires_at <= now / 1000 ? 'Evidence expired. Ask your agent to verify MCP and a native edit again.' : row.blocker ? `${blockerLabel(row.blocker)}. ${row.next_action}` : state === 'Unverified' ? `Ask your agent to: ${row.next_action}` : row.next_action}
+                    <Icon name="arrow-right-circle" /> {!available ? 'Verification unavailable. Reconnect to the hub before relying on setup status.' : row.expires_at <= now / 1000 ? 'Evidence expired. Ask your agent to verify MCP and a native edit again.' : state === 'Unverified' ? `Ask your agent to: ${row.next_action}` : row.next_action}
                   </p>}
                 </li>
               )

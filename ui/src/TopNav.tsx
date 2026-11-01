@@ -107,12 +107,30 @@ export function SectionTabs({ label }: { label?: string }) {
     const b = on.getBoundingClientRect()
     s.scrollLeft += b.left - a.left - (a.width - b.width) / 2
   }, [chrome?.section, hash])
+  // Which edges have tabs scrolled out of view, so the strip can fade there instead of cutting a tab off with no hint.
+  const [more, setMore] = useState('')
+  useEffect(() => {
+    const s = strip.current
+    if (!s) return
+    const measure = () => {
+      const start = s.scrollLeft > 1
+      const end = s.scrollLeft + s.clientWidth < s.scrollWidth - 1
+      setMore(start && end ? 'both' : start ? 'start' : end ? 'end' : '')
+    }
+    measure()
+    s.addEventListener('scroll', measure, { passive: true })
+    window.addEventListener('resize', measure)
+    return () => {
+      s.removeEventListener('scroll', measure)
+      window.removeEventListener('resize', measure)
+    }
+  }, [chrome?.section, chrome?.hubSignedOut])
   if (!chrome || chrome.hubSignedOut) return null
   const tabs = tabsFor(chrome.sections, chrome.section, hash)
   if (tabs.length === 0) return null
   const nav = chrome.sections.find((s) => s.key === chrome.section)?.nav
   return (
-    <nav ref={strip} className="htabs" data-tour="tabs" aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
+    <nav ref={strip} className="htabs" data-tour="tabs" data-more={more || undefined} aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
       {tabs.map((t) => {
         const st = chrome.statuses[t.key]
         return (
