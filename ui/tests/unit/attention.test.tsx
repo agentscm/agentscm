@@ -56,6 +56,20 @@ describe('Needs you', () => {
     expect(needsBox().getByText('Agents are sorting it out · 1')).toBeTruthy()
     expect(needsBox().getByText(/kept/).textContent).toMatch(/^maria’s .+ kept src\/ledger\.rs: “Mid-refactor”\.$/)
   })
+
+  it('folds overlaps into one row that leads to the Inbox, still counting each', () => {
+    const a = item('a', 'maria', { claim_status: 'active' })
+    const b = item('b', 'dev', { claim_status: 'active' })
+    const c = item('c', 'sam', { claim_status: 'active' })
+    const pair = (l: WorkItem, r: WorkItem, path: string) => ({ left: l, right: r, reasons: [{ left_path: path, right_path: path }], reasons_complete: true })
+    const ov = { ...overview([a, b, c]), overlaps: [pair(a, b, 'src/billing.rs'), pair(a, c, 'src/tax.rs')] } as unknown as WorkOverview
+    render(page(ov))
+    const box = needsBox()
+    expect(box.getAllByRole('listitem')).toHaveLength(1)
+    expect(box.getByRole('link', { name: '2 overlaps to talk through' }).getAttribute('href')).toBe('#inbox')
+    expect(box.getByRole('link', { name: 'Open the Inbox' }).getAttribute('href')).toBe('#inbox')
+    expect(box.getByText('2')).toBeTruthy()
+  })
 })
 
 describe('Headline', () => {

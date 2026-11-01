@@ -5,7 +5,7 @@ import type { Derived, LiveAgent } from '../derive.ts'
 import { HideButton, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
 import { Gloss } from '../Gloss.tsx'
 import { needHideKey, needsYou, needUpdatedAt, type Need } from '../needs.ts'
-import { blockedStep, contestedStep, handoverStep, overlapSteps, prStep, quietStep, who, type NextStep } from '../nextStep.ts'
+import { blockedStep, contestedStep, handoverStep, prStep, quietStep, who, type NextStep } from '../nextStep.ts'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
 import { handoffOf, type Handoff } from '../launchLink.ts'
 import { StartTask } from '../StartTask.tsx'
@@ -121,7 +121,7 @@ const plainClick = (e: MouseEvent) => !(e.target as HTMLElement).closest('a, but
  * One decision for a person, as one line: who and what, one primary action, a small menu for the rest. Opening it
  * (the chevron, or the row's text) shows the reason, who decides and the box for the person's own words.
  */
-function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
+function NeedRow({ n, d, me, handoff, hidden }: { n: Need; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
   const now = useNow() / 1000
   const [open, setOpen] = useState(false)
   const id = useId()
@@ -167,13 +167,6 @@ function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview;
     const holder = holders.find((h) => !asker || h.owner !== asker.owner || h.name !== asker.name) ?? c?.handoff?.to
     if (c && asker && holder) step = contestedStep(c, person(asker), person(holder))
     gist = <a href="#box-contested">see the contested file</a>
-  } else if (n.kind === 'overlap') {
-    const o = ov.overlaps.find((x) => `overlap:${x.left.id}:${x.right.id}` === n.key)
-    icon = 'sign-intersection-y'
-    title = <><Gloss term="overlap">Two tasks plan to touch</Gloss> <Path>{n.path ?? 'the same files'}</Path></>
-    body = o ? <><a className="work-link" href={workHref(o.left.id)}>{o.left.title}</a> and <a className="work-link" href={workHref(o.right.id)}>{o.right.title}</a> declared overlapping scope.</> : null
-    gist = <a href="#inbox">open the Inbox</a>
-    if (o) step = overlapSteps(o)
   } else if (n.kind === 'pr') {
     const p = d.prOverlaps.find((x) => `pr:${x.pr.number}` === n.key)
     icon = 'git'
@@ -253,14 +246,44 @@ function SortingRow({ n, d }: { n: Need; d: Derived }) {
   )
 }
 
+/** Overlaps are settled in the Inbox, so Needs you shows them as one line that leads there instead of repeating each. */
+function TalkRow({ overlaps }: { overlaps: Need[] }) {
+  const n = overlaps.length
+  const first = overlaps.find((o) => o.path)?.path
+  return (
+    <li className="attn-item need tone-warn">
+      <span className="attn-icon" aria-hidden="true">
+        <Icon name="sign-intersection-y" />
+      </span>
+      <div className="need-main">
+        <div className="attn-title">
+          <a className="work-link" href="#inbox">{n === 1 ? '1 overlap' : `${n} overlaps`} to talk through</a>
+        </div>
+        <div className="need-gist">
+          {n === 1 ? 'Two tasks plan' : 'Tasks plan'} to touch the <Gloss term="overlap">same files</Gloss>
+          {first && <>, starting with <Path>{first}</Path></>}
+        </div>
+      </div>
+      <div className="need-acts">
+        <a className="btn btn-sm btn-outline-secondary need-primary" href="#inbox">
+          Open the Inbox
+        </a>
+      </div>
+    </li>
+  )
+}
+
 const MAX_NEEDS = 6
 
 /** `needs` includes the ones hidden in this browser; they stay out of the list until asked for. */
-function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff }) {
+function NeedsYou({ needs: all, d, me, handoff }: { needs: Need[]; d: Derived; me: string | null; handoff: Handoff }) {
   const you = all.filter((n) => n.who === 'you')
   const sorting = all.filter((n) => n.who === 'agents')
   const { rows: needs, count: hidden, show, setShow, isHidden } = useHideable(you, needHideKey)
   const [expanded, setExpanded] = useState(false)
+  const overlaps = needs.filter((n) => n.kind === 'overlap')
+  // One row per need, except the overlaps, which share one row at the place the first would sit.
+  const rows = needs.filter((n) => n.kind !== 'overlap' || n === overlaps[0])
   return (
     <Box
       id="box-needs"
@@ -282,13 +305,13 @@ function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkO
       ) : (
         <>
           <ul className="attn">
-            {(expanded ? needs : needs.slice(0, MAX_NEEDS)).map((n) => (
-              <NeedRow key={n.key} n={n} ov={ov} d={d} me={me} handoff={handoff} hidden={isHidden(n)} />
-            ))}
+            {(expanded ? rows : rows.slice(0, MAX_NEEDS)).map((n) =>
+              n.kind === 'overlap' ? <TalkRow key="overlaps" overlaps={overlaps} /> : <NeedRow key={n.key} n={n} d={d} me={me} handoff={handoff} hidden={isHidden(n)} />,
+            )}
           </ul>
-          {needs.length > MAX_NEEDS && !expanded && (
+          {rows.length > MAX_NEEDS && !expanded && (
             <button type="button" className="show-hidden" onClick={() => setExpanded(true)}>
-              <Icon name="chevron-down" /> Show all {needs.length}
+              <Icon name="chevron-down" /> Show all {rows.length}
             </button>
           )}
         </>
@@ -498,7 +521,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
           {/* What waits on a person comes first; starting a task is one quiet line until asked for. With nothing waiting, it leads. */}
           {needs.length === 0 && start}
           <Coach id="needs" side="above">These wait on a person. Open a row for the reason and who decides; its button opens or copies the prompt for the agent.</Coach>
-          <NeedsYou needs={all} ov={ov} d={d} me={handoff.me} handoff={handoff} />
+          <NeedsYou needs={all} d={d} me={handoff.me} handoff={handoff} />
           <NarrativePanel token={token} compact />
           {needs.length > 0 && start}
           <Coach id="track" side="above">Every unfinished task, left to right: claimed, now, next, finished. Open a task for its full story.</Coach>
