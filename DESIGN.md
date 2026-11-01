@@ -479,6 +479,9 @@ When the Hub says no, the page shows the Hub's own sentence as the notice title,
 ### Set up this computer
 One lead sentence in text-2 (60ch), the command in a sunken command row (terminal icon, 12.5px mono, Copy at the end), then one 12.5px text-3 line saying what it will do. It sits on the signed-out page in its own white box above the token form, and under the empty states of Setup › Agents and Team. The command is written in one place in the code.
 
+### Agent status rows (Setup › Agents)
+The answer counts what is already loaded: "1 of 2 agents is ready; maria's Codex needs its AgentSCM hooks approved." Only an empty list gets an instruction. Each row is the agent's face, the agent named the way the Dashboard names someone's agent ("maria's Codex", 15px 600) over one 13px text-3 line of its checks ("MCP ✓ · Edit hook not yet"), and a single state pill on the right. A row that is not Ready adds one 13.5px text-2 line, aligned under the name, saying what to do next. What Ready means and how long proof lasts is said once, in the box's explanation, never repeated on the page.
+
 ### Signed in (the browser's landing page)
 The one browser moment of setup, told on the frame rather than the sheet: a 600px column, the logo, a 56px green mark with a dark check, "This computer is signed in." in 30–44px 300 white, then "<computer> is signed in to <host> as <login> on GitHub. You won't need to do this again." in 17px Frame Dim with Frame Ink bolds. Three hairline-ruled next steps follow (terminal, menu bar, revoke), then a pill **Open the Hub** in Frame Brand and "You can close this tab." A refused sign-in swaps the mark for coral with a cross and shows the refusal notice on a white 20px sheet. The page shows nothing written into its link except the login, provider and computer name.
 
