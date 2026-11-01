@@ -1,7 +1,7 @@
 // G · Work over live data: every unfinished change by lifecycle step, and one change with its status, the six
 // lifecycle steps and how each is known, the evidence behind them, and the Hub's full record one click away.
 import { useState } from 'react'
-import { Ago, Avatar, Box, Icon, PageHead, Pill, Reveal } from '../ui.tsx'
+import { Ago, Avatar, Box, Icon, Notice, PageHead, Pill, Reveal, Skeleton } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { fetchStandupWork, fetchCoordination, type WorkItem } from '../standup.ts'
 import { fetchChangeRecord } from '../changeRecord.ts'
@@ -11,7 +11,8 @@ import { lifecycle } from '../lifecycle.ts'
 import { fetchRuns } from '../skills.ts'
 import { PROOF } from '../proof.ts'
 import { lead } from '../pages/workParts.tsx'
-import { blockedStep, handoverStep, quietStep } from '../nextStep.ts'
+import { blockedStep, handoverStep, quietStep, who } from '../nextStep.ts'
+import { scrollToAnchor } from '../LifecycleStrip.tsx'
 import { StepAction, useStepActions } from '../NextStep.tsx'
 import { StartTask } from '../StartTask.tsx'
 import { WorkDetail } from '../pages/WorkDetail.tsx'
@@ -37,11 +38,12 @@ export function LiveChanges({ live }: { live: LiveProps }) {
   return (
     <>
       <PageHead question="Where is each change?" answer={ov ? <>{all.length} unfinished {all.length === 1 ? 'change' : 'changes'}.<br /><span className="g-quiet">{waiting} {waiting === 1 ? 'waits' : 'wait'} on people; the rest {all.length - waiting === 1 ? 'is' : 'are'} moving.</span></> : <>Reading the Hub…</>} />
+      {ov && !ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
       <div className="g-filters" role="group" aria-label="Show">
         {FILTERS.map((x) => <button key={x.id} type="button" aria-pressed={f === x.id} className={f === x.id ? 'on' : ''} onClick={() => setF(x.id)}>{x.label}<span>{all.filter(x.test).length}</span></button>)}
       </div>
       <Box icon="diagram-3" title="By lifecycle step" count={all.filter(filter.test).length}>
-        {ov ? <LiveTrack items={all.filter(filter.test)} ov={ov} live={live} runs={runs} /> : <div className="g-skeleton-rows" aria-hidden="true"><span /><span /><span /></div>}
+        {ov ? <LiveTrack items={all.filter(filter.test)} ov={ov} live={live} runs={runs} /> : <Skeleton rows={3} />}
       </Box>
       <div className="g-two">
         <Box icon="flag" title="Recently reported finished" count={finished.length} explain="Reported finished by the agent. That does not confirm review, verification or merge.">
@@ -62,8 +64,8 @@ function input<T, V>(p: Poll<T>, pick: (v: T) => V): V | null | 'failed' {
 
 export function LiveChange({ id, live }: { id: string; live: LiveProps }) {
   const item = usePoll((s) => fetchStandupWork(id, live.token, s), 15_000, `g-work:${id}`)
-  if (item.kind === 'loading') return <><a href="#changes" className="px-link g-back"><Icon name="arrow-left" /> All changes</a><div className="g-skeleton-rows" aria-hidden="true"><span /><span /><span /></div></>
-  if (item.kind === 'error') return <><a href="#changes" className="px-link g-back"><Icon name="arrow-left" /> All changes</a><div className="notice tone-bad" role="alert"><Icon name="exclamation-triangle" className="notice-icon" /><div className="notice-body"><strong>Could not load this change</strong><div>{item.message}</div></div><button type="button" className="btn btn-sm btn-outline-secondary" onClick={item.retry}>Retry</button></div></>
+  if (item.kind === 'loading') return <><a href="#changes" className="px-link g-back"><Icon name="arrow-left" /> All changes</a><Skeleton rows={3} /></>
+  if (item.kind === 'error') return <><a href="#changes" className="px-link g-back"><Icon name="arrow-left" /> All changes</a><Notice tone="bad" title="Could not load this change" action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={item.retry}>Retry</button>}>{item.message}</Notice></>
   return <Change item={item.value} live={live} />
 }
 
@@ -103,7 +105,7 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
       <header className="g-work-hero" style={{ viewTransitionName: `g-w-${item.id}` }}>
         <div>
           <h1 className="g-work-title">{item.title}</h1>
-          <p className="g-work-context"><Avatar name={`${l.login}-${l.agent}`} size={22} /> {l.login}’s {l.agent}{branch ? <> · <code>{branch}</code></> : null}{prNumber !== null ? <> · {prUrl ? <a href={prUrl} target="_blank" rel="noreferrer noopener">PR #{prNumber}</a> : `PR #${prNumber}`}</> : null} · checked in <Ago at={item.last_checkin_at} /></p>
+          <p className="g-work-context"><Avatar name={`${l.login}-${l.agent}`} size={22} /> {who(l.login, l.agent)}{branch ? <> · <code>{branch}</code></> : null}{prNumber !== null ? <> · {prUrl ? <a href={prUrl} target="_blank" rel="noreferrer noopener">PR #{prNumber}</a> : `PR #${prNumber}`}</> : null} · checked in <Ago at={item.last_checkin_at} /></p>
         </div>
       </header>
 
@@ -125,7 +127,7 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
                   <li key={s.key} className={i < at ? 'past' : i === at ? 'now' : ''}>
                     <span className={`g-ring small tone-${s.tone}`}><Icon name={s.icon} /></span>
                     <span className="g-life-main"><b>{s.label}</b><span className={`tone-${s.tone}-text`}>{s.word}</span>{s.detail && <small>{s.detail}</small>}</span>
-                    <span className="g-life-proof">{p && <Pill tone={p.tone} icon={p.icon} tip={s.proofTip ?? p.tip}>{p.label}</Pill>}{s.href && <a href={s.href} className="px-link" target={s.href.startsWith('http') ? '_blank' : undefined} rel="noreferrer noopener">Evidence</a>}</span>
+                    <span className="g-life-proof">{p && <Pill tone={p.tone} icon={p.icon} tip={s.proofTip ?? p.tip}>{p.label}</Pill>}{s.href && <a href={s.href} className="px-link" target={s.href.startsWith('http') ? '_blank' : undefined} rel="noreferrer noopener" onClick={(e) => scrollToAnchor(e, s.href!)}>Evidence</a>}</span>
                   </li>
                 )
               })}
@@ -141,11 +143,11 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
               {item.participants.map((p) => <li key={`${p.login}${p.agent}${p.session}`}><Avatar name={`${p.login}-${p.agent}`} size={30} /><span className="g-person"><b>{p.login}</b><span className="small muted">{p.agent} · {p.role}</span></span></li>)}
             </ul>
           </Box>
-          <Box icon="clock-history" title="Latest reports">
+          <Box id="agent-reports" icon="clock-history" title="Latest reports">
             <ol className="g-timeline">
               {item.blocker && <li className="fresh"><span className="g-tl-dot tone-bad" aria-hidden="true" /><span className="g-tl-text">Blocked: {item.blocker.summary}</span><span className="g-tl-at"><Ago at={item.blocker.at} /></span></li>}
               {item.current && <li><span className="g-tl-dot" aria-hidden="true" /><span className="g-tl-text">{item.current.summary}</span><span className="g-tl-at">{item.current.kind} · <Ago at={item.current.at} /></span></li>}
-              <li><span className="g-tl-dot tone-ok" aria-hidden="true" /><span className="g-tl-text">Claimed by {l.login}’s {l.agent}</span><span className="g-tl-at"><Ago at={item.created_at} /></span></li>
+              <li><span className="g-tl-dot tone-ok" aria-hidden="true" /><span className="g-tl-text">Claimed by {who(l.login, l.agent)}</span><span className="g-tl-at"><Ago at={item.created_at} /></span></li>
             </ol>
           </Box>
           {acts.more.length > 0 && <Box icon="terminal" title="Other ways to act"><div className="g-acts">{acts.more.map((a) => <StepAction key={a.key} a={a} className="btn btn-sm btn-outline-secondary" />)}</div></Box>}

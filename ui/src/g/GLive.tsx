@@ -115,7 +115,7 @@ export function GLive({ live, section, page, showAdmin, hubSignedOut, onClassic,
           <Icon name="search" /><span className="search-text">Search pages, changes and paths…</span><kbd>⌘ K</kbd>
         </button>}
         <div className="topbar-right">
-          <a href="#health" className={`health-chip${data.failing || data.health?.status === 'unavailable' ? ' is-bad' : ''}`}><span className="live-dot" aria-hidden="true" /><span className="health-text">{data.failing ? 'Reconnecting' : data.health ? (data.health.status === 'ok' ? 'Hub live' : 'Degraded') : '…'}</span></a>
+          <a href="#health" className={`health-chip${data.failing || (data.health && data.health.status !== 'ok') ? ' is-bad' : ''}`}><span className="live-dot" aria-hidden="true" /><span className="health-text">{data.failing ? 'Reconnecting' : data.health ? (data.health.status === 'ok' ? 'Hub live' : 'Degraded') : '…'}</span></a>
           <a href="#inbox" className="top-icon bell" aria-label={`Inbox, ${overlaps} overlap${overlaps === 1 ? '' : 's'}`}><Icon name="bell" />{overlaps > 0 && <span className="bell-count tone-warn" aria-hidden="true">{overlaps}</span>}</a>
           <button type="button" className="g-classic" onClick={onClassic} title="Switch back to the classic Hub layout"><Icon name="layout-sidebar" /> <span>Classic layout</span></button>
         </div>
@@ -143,7 +143,7 @@ export function GLive({ live, section, page, showAdmin, hubSignedOut, onClassic,
           {cur === null && <div className="g-classic-page">{page(section)}</div>}
         </main>
       </div>
-      {palette && <LivePalette live={live} onClose={() => setPalette(false)} />}
+      {palette && <LivePalette live={live} admin={!!showAdmin} onClose={() => setPalette(false)} />}
     </div>
   )
 }
@@ -168,14 +168,14 @@ function RailGroup({ n, section, g }: { n: Group; section: Section; g: GPage | n
 }
 
 /** ⌘K: every page and every unfinished change, as one keyboard-driven list. */
-function LivePalette({ live, onClose }: { live: LiveProps; onClose: () => void }) {
+function LivePalette({ live, admin, onClose }: { live: LiveProps; admin: boolean; onClose: () => void }) {
   const [q, setQ] = useState('')
   const [at, setAt] = useState(0)
   const input = useRef<HTMLInputElement>(null)
   useEffect(() => input.current?.focus(), [])
   const ov = live.overview.kind === 'ready' ? live.overview.value : null
   const items = [
-    ...[['Now', '#home', 'sun'], ['Changes', '#changes', 'kanban'], ['Process', '#process', 'diagram-3'], ['Code map', '#code', 'grid-1x2'], ['Inbox', '#inbox', 'inbox'], ['Catch up', '#activity', 'clock-history'], ['Team', '#team', 'people'], ['Finished and history', '#work/finished', 'flag'], ['Change records', '#change-record', 'clipboard2-check'], ['Landed', '#landed', 'rocket-takeoff'], ['Skills', '#skills', 'journal-check'], ['Runs', '#workflows', 'play-circle'], ['Library', '#templates', 'journal-code'], ['Held files', '#now', 'lock'], ['Files', '#explorer', 'folder2-open'], ['Timeline', '#timeline', 'camera'], ['Promises', '#promises', 'journal-check'], ['Setup: agents', '#setup', 'robot'], ['Computers', '#computers', 'laptop'], ['Access', '#workspace', 'people'], ['Hub health', '#health', 'heart-pulse'], ['Preferences', '#settings', 'sliders'], ['Contributions', '#contributions', 'stars'], ['Feature map', '#features', 'compass'], ['All repositories', '#repositories', 'collection']].map(([label, href, icon]) => ({ label: label!, href: href!, icon: icon!, sub: 'Page', paths: '' })),
+    ...[['Now', '#home', 'sun'], ['Changes', '#changes', 'kanban'], ['Process', '#process', 'diagram-3'], ['Code map', '#code', 'grid-1x2'], ['Inbox', '#inbox', 'inbox'], ['Catch up', '#activity', 'clock-history'], ['Team', '#team', 'people'], ['Finished and history', '#work/finished', 'flag'], ['Change records', '#change-record', 'clipboard2-check'], ['Landed', '#landed', 'rocket-takeoff'], ['Skills', '#skills', 'journal-check'], ['Runs', '#workflows', 'play-circle'], ['Library', '#templates', 'journal-code'], ['Held files', '#now', 'lock'], ['Files', '#explorer', 'folder2-open'], ['Timeline', '#timeline', 'camera'], ['Promises', '#promises', 'journal-check'], ['Setup: agents', '#setup', 'robot'], ['Computers', '#computers', 'laptop'], ['Access', '#workspace', 'people'], ['Hub health', '#health', 'heart-pulse'], ...(admin ? [['Admin', '#admin', 'shield-lock']] : []), ['Preferences', '#settings', 'sliders'], ['Contributions', '#contributions', 'stars'], ['Feature map', '#features', 'compass'], ['All repositories', '#repositories', 'collection']].map(([label, href, icon]) => ({ label: label!, href: href!, icon: icon!, sub: 'Page', paths: '' })),
     ...(ov?.current ?? []).map((w) => ({ label: w.title, href: `#work/${w.id}`, icon: 'record-circle', sub: `${w.owner_login} · ${w.state}`, paths: w.scope.join(' ') })),
   ]
   const hits = items.filter((i) => `${i.label} ${i.sub} ${i.paths}`.toLowerCase().includes(q.toLowerCase())).slice(0, 10)

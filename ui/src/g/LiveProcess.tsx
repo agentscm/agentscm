@@ -1,7 +1,7 @@
 // G · Workflows over live data: the adopted skill's gates as a graph on the frame's violet, what each gate asks in
 // plain words, which gates can stop an agent, and the runs moving through them right now.
 import { useState, type CSSProperties } from 'react'
-import { Ago, Icon, PageHead, Pill } from '../ui.tsx'
+import { Ago, Icon, Notice, PageHead, Pill } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { fetchLibrary, runStateLabel, runStateTone, type CatalogEntry } from '../skills.ts'
 import type { LiveProps } from './GLive.tsx'
@@ -26,7 +26,7 @@ export function LiveProcess({ live }: { live: LiveProps }) {
   return (
     <>
       <PageHead question="What process applies here?" answer={<>Your process, made repeatable.<br /><span className="g-quiet">Keep the tools you already use.</span></>} fact={v ? `Adoption is read from ${v.adoption.source === 'default_branch' ? `the default branch${v.adoption.default_branch ? ` (${v.adoption.default_branch})` : ''}` : v.adoption.source === 'reported_by_checkout' ? 'what a checkout reported' : 'nowhere yet'}. Agents read it at session start; the Hub runs nothing.` : undefined} />
-      {lib.kind === 'error' && <div className="notice tone-bad" role="alert"><Icon name="exclamation-triangle" className="notice-icon" /><div className="notice-body"><strong>Could not load skills</strong><div>{lib.message}</div></div><button type="button" className="btn btn-sm btn-outline-secondary" onClick={lib.retry}>Retry</button></div>}
+      {lib.kind === 'error' && <Notice tone="bad" title="Could not load skills" action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={lib.retry}>Retry</button>}>{lib.message}</Notice>}
       <div className="g-flows">
         <aside className="g-flowlist" aria-label="Skills">
           <span className="g-k">Adopted here</span>
@@ -38,7 +38,7 @@ export function LiveProcess({ live }: { live: LiveProps }) {
           ))}
           {v && adopted.length === 0 && <p className="small muted">Nothing adopted yet.</p>}
           {available.length > 0 && <span className="g-k mt-3">Available</span>}
-          {available.map((a) => <a key={a.name} href="#skills" className="g-flowitem"><span><b>{a.name}</b><small>{a.summary}</small></span><span className="g-state-chip">Not adopted</span></a>)}
+          {available.map((a) => <a key={a.name} href="#skills" className="g-flowitem g-flowitem-avail"><span><b>{a.name}</b><small>{a.summary}</small></span><span className="g-state-chip">Not adopted</span></a>)}
           <a href="#templates" className="g-flowitem add"><Icon name="journal-code" /> Workflow library</a>
           <a href="#workflows" className="g-flowitem add"><Icon name="play-circle" /> Recorded runs</a>
         </aside>

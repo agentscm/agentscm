@@ -1,10 +1,11 @@
 // G · Now over live data: what needs you (the dashboard's own needs and next steps), every unfinished change as a
 // lane, who is working, the process that applies, connections and recent outcomes.
 import { useState, type CSSProperties, type ReactNode } from 'react'
-import { Ago, Avatar, Box, Icon, PageHead, Reveal } from '../ui.tsx'
+import { Ago, Avatar, Box, Empty, Icon, Notice, PageHead, Reveal, Skeleton } from '../ui.tsx'
 import { useNow } from '../useHub.ts'
 import { needView } from '../pages/Dashboard.tsx'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
+import { who } from '../nextStep.ts'
 import { lead } from '../pages/workParts.tsx'
 import { usePoll } from '../usePoll.ts'
 import { fetchLibrary, fetchRuns, type RunView } from '../skills.ts'
@@ -55,12 +56,13 @@ export function LiveNow({ live }: { live: LiveProps }) {
           </a>
         </span>}
       />
-      {overview.kind === 'error' && <div className="notice tone-bad" role="alert"><Icon name="exclamation-triangle" className="notice-icon" /><div className="notice-body"><strong>Could not load the work overview</strong><div>{overview.message}</div></div><button type="button" className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button></div>}
+      {overview.kind === 'error' && <Notice tone="bad" title="Could not load the work overview" action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>{overview.message}</Notice>}
+      {ov && !ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
       <div className="g-now">
         <section className="g-needs" aria-label="Needs you">
           {ov && d && needs.map((need, i) => <LiveNeedCard key={need.key} n={need} i={i} ov={ov} d={d} live={live} />)}
           {ov && d && needs.length === 0 && <article className="g-need is-done"><span className="g-ring tone-ok"><Icon name="check2" /></span><div className="g-need-body"><span className="g-need-title small">Nothing is waiting on you</span><span className="g-need-outcome">Blocked work, contested files, overlaps and handovers show up here first.</span></div></article>}
-          {loading && <div className="g-need g-skeleton" aria-hidden="true"><span /><span /><span /></div>}
+          {loading && <Skeleton rows={3} />}
         </section>
         <aside className="g-col g-side" aria-label="Around you">
           <Together d={d} items={current} />
@@ -68,7 +70,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
         </aside>
       </div>
       <Box icon="diagram-3" title="Every unfinished change" count={current.length} explain="Each lane shows the furthest step the Hub can see: an open pull request for the branch, a skill gate run on it, or an overlap with another task. Reaching a step is not proof it passed; open a change for its evidence.">
-        {ov ? <LiveTrack items={current} ov={ov} live={live} runs={runs} /> : <div className="g-skeleton-rows" aria-hidden="true"><span /><span /><span /></div>}
+        {ov ? <LiveTrack items={current} ov={ov} live={live} runs={runs} /> : <Skeleton rows={3} />}
       </Box>
       <div className="g-now-foot">
         <Connections live={live} />
@@ -112,7 +114,7 @@ export function LiveTrack({ items, ov, live, runs }: { items: WorkItem[]; ov: Wo
   const [sel, setSel] = useState<number | null>(null)
   const placed = items.map((w) => ({ w, at: stepOf(w, pulls, runs, ov), tone: toneOf(w) }))
   const rows = placed.filter((x) => sel === null || x.at === sel)
-  if (items.length === 0) return <p className="g-empty"><Icon name="inbox" /> No unfinished change. A lane appears when an agent claims work with <code>agentscm_start</code>.</p>
+  if (items.length === 0) return <Empty icon="inbox" title="No unfinished change">A lane appears when an agent claims work with <code>agentscm_start</code>.</Empty>
   return (
     <div className="px-track g-track">
       <div className="px-track-row head">
@@ -138,7 +140,7 @@ export function LiveTrack({ items, ov, live, runs }: { items: WorkItem[]; ov: Wo
             <span className="px-track-task">
               <span className="px-track-title">{w.title}</span>
               <span className="px-status"><span className={`px-dot tone-${dotTone(tone)}`} aria-hidden="true" />{stateText(w)}</span>
-              <span className="px-track-meta">{l.login}’s {l.agent}{pr ? ` · PR #${pr.number}` : w.branch ? ` · ${w.branch}` : ''} · <Ago at={w.updated_at} /></span>
+              <span className="px-track-meta">{who(l.login, l.agent)}{pr ? ` · PR #${pr.number}` : w.branch ? ` · ${w.branch}` : ''} · <Ago at={w.updated_at} /></span>
             </span>
             <LiveLane key={`${w.id}-${at}-${tone}`} at={at} tone={tone} holder={`${l.login}-${l.agent}`} label={`${w.title}: ${STEPS[at]?.label}, ${stateText(w)}`} />
           </a>
@@ -169,7 +171,7 @@ export function LiveLane({ at, tone, holder, label, note }: { at: number; tone: 
 
 function Together({ d, items }: { d: Derived | null; items: WorkItem[] }) {
   const nowS = useNow() / 1000
-  if (!d) return <Box icon="people" title="Working together"><div className="g-skeleton-rows" aria-hidden="true"><span /><span /></div></Box>
+  if (!d) return <Box icon="people" title="Working together"><Skeleton rows={2} /></Box>
   return (
     <Box icon="people" title="Working together" count={d.groups.length} explain="People first; their agents alongside. Awake means the agent reported activity in the last five minutes.">
       {d.groups.length === 0 && <p className="small muted mb-0">No agent is connected right now. <a href="#setup">Connect one</a>.</p>}

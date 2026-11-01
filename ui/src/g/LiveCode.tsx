@@ -1,7 +1,8 @@
 // G · Repository over live data: one tile per top-level folder someone holds or plans to touch (the Hub's own
 // `areas`), coloured by what needs attention there, with an inspector for who is in it and what they plan.
 import { useState, type CSSProperties } from 'react'
-import { Avatar, Box, Icon, PageHead, Pill, Path } from '../ui.tsx'
+import { Avatar, Box, Empty, Icon, PageHead, Pill, Path } from '../ui.tsx'
+import { who } from '../nextStep.ts'
 import { areas } from '../needs.ts'
 import type { LiveProps } from './GLive.tsx'
 
@@ -16,7 +17,7 @@ export function LiveCode({ live }: { live: LiveProps }) {
       <PageHead question="What do we know about this code?" answer={<>The code, with its context.<br /><span className="g-quiet">{list.length ? `${list.length} ${list.length === 1 ? 'area has' : 'areas have'} agents in or planning to be.` : 'Nobody is in the code right now.'}</span></>} fact="From live file holds and the scope each unfinished change declared. Areas nobody holds or plans to touch are not shown; that does not mean unused." />
       <div className="g-repo">
         <div className="g-map-wrap">
-          {list.length === 0 && <p className="g-empty"><Icon name="grid-1x2" /> No agent holds or plans files right now. Tiles appear as agents announce edits or declare scope.</p>}
+          {list.length === 0 && <Empty icon="grid-1x2" title="No agent holds or plans files right now">Tiles appear as agents announce edits or declare scope.</Empty>}
           <div className="g-areas">
             {list.map((x, i) => {
               const people = x.holders.length + x.planned.length
@@ -39,7 +40,7 @@ export function LiveCode({ live }: { live: LiveProps }) {
             <h2>{a.name || 'Repository root'}</h2>
             <span className="g-k">Editing now</span>
             {a.holders.length === 0 && <p className="small muted">Nobody holds a file here.</p>}
-            <ul className="g-links">{a.holders.map((h) => <li key={h.id}><Avatar name={`${h.owner}-${h.name}`} size={20} /><span><b>{h.owner}’s {h.name}</b><small>{h.files.slice(0, 3).join(', ')}{h.files.length > 3 ? ` +${h.files.length - 3}` : ''}</small></span></li>)}</ul>
+            <ul className="g-links">{a.holders.map((h) => <li key={h.id}><Avatar name={`${h.owner}-${h.name}`} size={20} /><span><b>{who(h.owner, h.name)}</b><small>{h.files.slice(0, 3).join(', ')}{h.files.length > 3 ? ` +${h.files.length - 3}` : ''}</small></span></li>)}</ul>
             <span className="g-k">Planned by unfinished changes</span>
             {a.planned.length === 0 && <p className="small muted">No change declared scope here.</p>}
             <ul className="g-links">{a.planned.map((p) => <li key={p.item.id}><Icon name="record-circle" /><span><a href={`#work/${p.item.id}`} className="px-link-quiet"><b>{p.item.title}</b></a><small>{p.paths.slice(0, 2).join(', ')}</small></span></li>)}</ul>

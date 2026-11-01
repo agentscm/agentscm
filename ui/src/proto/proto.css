@@ -1,11 +1,11 @@
 /* Lifecycle prototypes. Built only from the Twilight tokens (--frame, --hub-*), so both themes work unchanged. */
 
 .px-root { min-height: 100vh; padding-bottom: 96px; }
-.px-root .tone-ok-text { color: var(--hub-ok); }
-.px-root .tone-warn-text { color: var(--hub-warn); }
-.px-root .tone-bad-text { color: var(--hub-bad); }
-.px-root .tone-brand-text { color: var(--hub-brand-ink); }
-.px-root .tone-muted-text { color: var(--hub-text-3); }
+:is(.px-root, .gl-shell) .tone-ok-text { color: var(--hub-ok); }
+:is(.px-root, .gl-shell) .tone-warn-text { color: var(--hub-warn); }
+:is(.px-root, .gl-shell) .tone-bad-text { color: var(--hub-bad); }
+:is(.px-root, .gl-shell) .tone-brand-text { color: var(--hub-brand-ink); }
+:is(.px-root, .gl-shell) .tone-muted-text { color: var(--hub-text-3); }
 .px-norail { --side-w: 0px; }
 .px-norail .content { border-top-left-radius: 26px; }
 .px-topbar .px-repo { color: var(--frame-ink); display: inline-flex; gap: 6px; align-items: center; font-size: 14px; opacity: 0.9; }
