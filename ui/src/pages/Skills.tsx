@@ -10,7 +10,7 @@ import { runProof } from '../proof.ts'
 import type { WorkItem } from '../standup.ts'
 import { useTaskIndex } from '../taskIndex.ts'
 import {
-  GATE_STATE_VIEW, addCommand, adoptionLabel, assuranceView, enforcement, fetchLibrary, fetchRun, fetchRuns, gateLabel, gateSteps, lastEvidence, paramText, parseStep, removeCommand,
+  GATE_STATE_VIEW, addCommand, adoptedSummary, adoptionLabel, assuranceView, enforcement, fetchLibrary, fetchRun, fetchRuns, gateLabel, gateSteps, lastEvidence, paramText, parseStep, removeCommand,
   runMatches, runStateLabel, stepText, runStateTone, selfReportedCount, shortSha, skillRunHref, stepCounts, skillRunsHref, skillsHref, skillsRoute, type CatalogEntry, type Evidence, type Library, type Pin, type RunView, type StepEnforce,
 } from '../skills.ts'
 import { Markdown } from '../Markdown.tsx'
@@ -58,7 +58,7 @@ function Applicability({ c }: { c: CatalogEntry }) {
 }
 
 const ENFORCE_VIEW: Record<StepEnforce, { label: string; tone: Tone; icon: string }> = {
-  block: { label: 'Blocks the author’s session where the Stop hook is installed', tone: 'brand', icon: 'sign-stop' },
+  block: { label: 'Can stop the agent', tone: 'brand', icon: 'sign-stop' },
   warn: { label: 'Warns only', tone: 'muted', icon: 'bell' },
   record: { label: 'Recorded only', tone: 'muted', icon: 'journal-text' },
 }
@@ -84,12 +84,12 @@ function Step({ line }: { line: string }) {
   )
 }
 
-function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
+function HowItWorks({ c, pin, heading = true }: { c: CatalogEntry; pin: Pin | null; heading?: boolean }) {
   const lines = pin && pin.walkthrough.length ? pin.walkthrough : c.walkthrough
   if (lines.length === 0) return null
   return (
     <div className="skill-walkthrough" data-tour="skills-how">
-      <h3 className="skill-sub">How it works</h3>
+      {heading && <h3 className="skill-sub">How it works</h3>}
       <ol className="gate-track">{lines.map((l, i) => <Step key={i} line={l} />)}</ol>
       {lines.every((l) => parseStep(l)?.needs.endsWith(LOWEST_BAR)) && <p className="gate-note"><Icon name="person-check" /> Every step accepts evidence the agent reports itself. The hub records it; it does not check it.</p>}
       {c.procedure && (
@@ -102,19 +102,26 @@ function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
   )
 }
 
-function SkillItem({ c, pin, children }: { c: CatalogEntry; pin: Pin | null; children: ReactNode }) {
+// An adopted skill shows everything; an available one stays at its head, summary and command until opened.
+function SkillItem({ c, pin, runs, command }: { c: CatalogEntry; pin: Pin | null; runs?: ReactNode; command: ReactNode }) {
+  const how = <><Applicability c={c} /><HowItWorks c={c} pin={pin} heading={pin !== null} /></>
   return (
     <li className="skill-item" data-tour="skills-item">
-      <SkillHead c={c} />
+      <SkillHead c={c}>{runs}</SkillHead>
       <p className="skill-summary">{c.summary}</p>
-      <Applicability c={c} />
-      <HowItWorks c={c} pin={pin} />
+      {pin && how}
+      <div className="skill-act">{command}</div>
+      {!pin && (
+        <details className="skill-details">
+          <summary><Icon name="signpost-split" /> How it works</summary>
+          {how}
+        </details>
+      )}
       <details className="skill-details">
-        <summary>Settings and version digest</summary>
+        <summary><Icon name="sliders" /> Settings and version digest</summary>
         <p className="small mb-1">Digest <code>sha256:{shortSha(c.sha256)}</code></p>
         <Params c={c} pin={pin} />
       </details>
-      <div className="skill-act">{children}</div>
     </li>
   )
 }
@@ -125,8 +132,8 @@ function SkillHead({ c, children }: { c: CatalogEntry; children?: ReactNode }) {
     <div className="skill-head" data-tour="skills-head">
       <strong>{c.name}</strong> <span className="muted">v{c.workflow_version}</span>
       {c.first_party && <Pill tone="brand" icon="patch-check">Built in</Pill>}
-      {enforced.length > 0 && <Pill tone="muted" icon="shield" tip="Installed per checkout with the agentscm skill stop command. The hub does not know which checkouts have it, and it lets the agent finish when the hub is unreachable or the checkout is detached.">Available: {enforced.join(', ')} (opt-in, fails open)</Pill>}
-      {planned.length > 0 && <Pill tone="muted" icon="hourglass-split">Planned: {planned.join(', ')}</Pill>}
+      {enforced.length > 0 && <Pill tone="muted" icon="shield" tip="Some steps can hold the author’s session until they have evidence, through the opt-in Stop hook. It is installed per checkout with the agentscm skill stop command, and the hub does not know which checkouts have it. It fails open: the agent may finish when the hub is unreachable or the checkout is detached.">Can stop the agent (opt-in)</Pill>}
+      {planned.map((p) => <Pill key={p} tone="muted" icon="hourglass-split" tip="Not built yet. Nothing checks this step on the hub’s behalf today.">{p[0]!.toUpperCase() + p.slice(1)}: planned</Pill>)}
       {children}
     </div>
   )
@@ -158,12 +165,38 @@ function LibraryView({ repo, token }: { repo: string; token: string }) {
     <div className="page">
       <PageHead
         question="Which workflows are agents in this repository expected to follow?"
-        answer={poll.kind === 'ready' ? (() => { const n = poll.value.adoption.pins.filter((p) => p.status === 'adopted').length; const { steps, canStop } = stepCounts(poll.value); return n === 0 ? 'This repository has adopted no skills yet.' : <>Agents here are expected to follow <b>{n} <Gloss term="skills">{n === 1 ? 'skill' : 'skills'}</Gloss></b>. {canStop} of {steps} steps can stop an agent (opt-in Stop hook); evidence is reported by the agent.</> })() : 'Checking which skills this repository has adopted…'}
-        fact={<>{poll.kind === 'ready' && <><span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span>. </>}<a href="#templates?view=skills">Create or import reusable skills</a></>}
+        answer={poll.kind === 'ready' ? <LibraryAnswer lib={poll.value} /> : 'Checking which skills this repository has adopted…'}
+        fact={<>{poll.kind === 'ready' && <LibraryFact lib={poll.value} />}<a href="#templates?view=skills">Create or import reusable skills</a></>}
       />
       <SectionTabs />
       <Loaded poll={poll} what="skills">{(lib) => <Library lib={lib} />}</Loaded>
     </div>
+  )
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
+
+function LibraryAnswer({ lib }: { lib: Library }) {
+  const { names, open, atStop } = adoptedSummary(lib)
+  const n = names.length
+  if (n === 0) return <>This repository has adopted no skills yet.</>
+  // Name the skills while the list stays short enough to read in one breath.
+  const named = n <= 3 ? `, ${new Intl.ListFormat('en', { type: 'conjunction' }).format(names)}` : ''
+  return (
+    <>
+      Agents here are asked to follow <b>{n} <Gloss term="skills">{n === 1 ? 'skill' : 'skills'}</Gloss></b>{named}.{' '}
+      {open === 0 ? 'No runs are open.' : <><a href={skillRunsHref}><b>{plural(open, 'run is', 'runs are')} open</b></a>{atStop > 0 ? `; ${plural(atStop, 'is', 'are')} waiting at a stop gate.` : '.'}</>}
+    </>
+  )
+}
+
+function LibraryFact({ lib }: { lib: Library }) {
+  const { steps, canStop } = stepCounts(lib)
+  return (
+    <>
+      {steps > 0 && <>{canStop} of {steps} steps can stop an agent, where the opt-in Stop hook is installed; agents report their own evidence. </>}
+      <span>{adoptionLabel(lib.adoption.source, lib.adoption.default_branch)}</span>.{' '}
+    </>
   )
 }
 
@@ -175,7 +208,16 @@ function Library({ lib }: { lib: Library }) {
   const attention = lib.adoption.pins.filter((p) => p.status !== 'adopted')
   return (
     <>
-      <Box tour="skills-adopted" icon="check2-circle" title="Adopted" intro="Adoption takes effect once agentscm-skills.lock.json is committed." explain="Skills pinned in this repository’s lock file. Agents are expected to follow them.">
+      {attention.length > 0 && (
+        <div className="d-grid gap-2">
+          {attention.map((p) => (
+            <Notice key={`${p.name}:${p.sha256}`} title={`${p.name} is pinned but not in force`} icon="exclamation-triangle">
+              <Pill tone="warn">{pinProblem(p).label}</Pill> {pinProblem(p).text(p, lib.catalog.find((c) => c.name === p.name) ?? null)}
+            </Notice>
+          ))}
+        </div>
+      )}
+      <Box tour="skills-adopted" icon="check2-circle" title="Adopted" explain="Skills pinned in this repository’s lock file. Agents are expected to follow them. Adopting or removing one takes effect once agentscm-skills.lock.json is committed.">
         {adopted.length === 0 ? (
           <Empty icon="journal-check" title={lib.adoption.source === 'none' ? 'Not adopted' : 'Nothing adopted'}>No skill is pinned yet. Copy an adopt command under Available, run it in the repository, then commit the lock file.</Empty>
         ) : (
@@ -183,11 +225,13 @@ function Library({ lib }: { lib: Library }) {
             {adopted.map(({ p, c }) => {
               const n = lib.counts[c.name] ?? { open: 0, at_stop_gate: 0, completed: 0 }
               return (
-                <SkillItem key={c.name} c={c} pin={p}>
-                  <p className="small mb-2">{n.open} open, {n.at_stop_gate} at a stop gate, {n.completed} completed <a className="ms-2" href={skillRunsHref}>View runs</a></p>
-                  <p className="small muted mb-1">To remove it, run this in the repository, then commit the lock file:</p>
-                  <Cmd command={removeCommand(c.name)} label={`Remove ${c.name}`} />
-                </SkillItem>
+                <SkillItem
+                  key={c.name}
+                  c={c}
+                  pin={p}
+                  runs={<span className="skill-runs">{n.open} open, {n.at_stop_gate} at a stop gate, {n.completed} completed · <a href={skillRunsHref}>View runs</a></span>}
+                  command={<><p className="small muted mb-1">To remove it, run this in the repository, then commit the lock file:</p><Cmd command={removeCommand(c.name)} label={`Remove ${c.name}`} /></>}
+                />
               )
             })}
           </ul>
@@ -199,25 +243,16 @@ function Library({ lib }: { lib: Library }) {
         ) : (
           <ul className="skill-list">
             {available.map((c) => (
-              <SkillItem key={c.name} c={c} pin={null}>
-                <p className="small muted mb-1">To adopt it, run this in the repository, then commit <code>agentscm-skills.lock.json</code>:</p>
-                <Cmd command={addCommand(c.name)} label={`Adopt ${c.name}`} />
-              </SkillItem>
+              <SkillItem
+                key={c.name}
+                c={c}
+                pin={null}
+                command={<><p className="small muted mb-1">To adopt it, run this in the repository, then commit <code>agentscm-skills.lock.json</code>:</p><Cmd command={addCommand(c.name)} label={`Adopt ${c.name}`} /></>}
+              />
             ))}
           </ul>
         )}
       </Box>
-      {attention.length > 0 && (
-        <Box icon="exclamation-triangle" title="Needs attention" count={attention.length} tone="warn">
-          <div className="d-grid gap-2">
-            {attention.map((p) => (
-              <Notice key={`${p.name}:${p.sha256}`} title={`${p.name} is pinned but not in force`} icon="exclamation-triangle">
-                <Pill tone="warn">{pinProblem(p).label}</Pill> {pinProblem(p).text(p, lib.catalog.find((c) => c.name === p.name) ?? null)}
-              </Notice>
-            ))}
-          </div>
-        </Box>
-      )}
     </>
   )
 }

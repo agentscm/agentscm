@@ -460,14 +460,14 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('skills-head'),
         title: 'What can stop an agent, and what is planned',
-        what: 'Each skill says which steps can stop an agent and which are only planned. “Available: Stop hook (opt-in, fails open)” means an opt-in Stop hook (a check that can stop an agent finishing) can keep the author’s session from finishing at tests, review and fix, where it is installed. “Planned: merge check” is not built yet.',
+        what: 'Each skill says which steps can stop an agent and which are only planned. “Can stop the agent (opt-in)” means an opt-in Stop hook (a check that can stop an agent finishing) can keep the author’s session from finishing at tests, review and fix, where it is installed. “Merge check: planned” is not built yet.',
         why: 'So you know which steps the hub checks at all, and which rely only on the agent following along.',
         how: 'Treat the hook as a reminder, not a lock. It is off unless installed, lets the agent finish when the hub cannot be reached or the checkout is detached, and accepts evidence the agents report themselves.',
         tip: (c) => {
           const t = c.text('[data-tour="skills-head"]')
           return t ? `The first skill on screen reads: ${t}.` : null
         },
-        empty: 'Each skill shows its version and its Available and Planned labels here.',
+        empty: 'Each skill shows its version, whether it can stop the agent and what is planned here.',
       },
       {
         target: T('skills-how'),
