@@ -322,3 +322,25 @@
 }
 
 .explorer-conversations-intro { max-width: 70ch; color: var(--hub-text-2); margin: 0 0 12px; }
+
+.walkthrough { min-width: 0; }
+.walkthrough h2, .walkthrough h3, .walkthrough h4 { overflow-wrap: anywhere; }
+.walkthrough h3 { font-size: 1.05rem; margin-top: 1.6rem; }
+.walkthrough h4 { font-size: .95rem; }
+.walkthrough-case { margin-top: 1.5rem; }
+.walkthrough-prose { white-space: pre-wrap; overflow-wrap: anywhere; }
+.walkthrough-identities { display: grid; gap: .5rem; margin: 1rem 0; }
+.walkthrough-identities dd, .walkthrough-case dd { overflow-wrap: anywhere; margin: 0; }
+.walkthrough-steps { padding-left: 1.5rem; }
+.walkthrough-steps > li { padding: .75rem 0 1rem .25rem; border-bottom: 1px solid var(--bs-border-color); }
+.walkthrough-anchors { display: flex; flex-wrap: wrap; gap: .5rem; }
+.walkthrough-anchors button { min-height: 44px; overflow-wrap: anywhere; text-align: left; }
+.walkthrough-source { margin: 1rem 0; }
+.walkthrough-graph { list-style: none; padding: 0; }
+.walkthrough-graph li { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; margin: .75rem 0; }
+.walkthrough-graph li > span:not(.walkthrough-edge) { padding: .6rem .8rem; border: 1px solid var(--bs-border-color); border-radius: .4rem; overflow-wrap: anywhere; }
+.walkthrough-edge { font-size: .85rem; overflow-wrap: anywhere; }
+.walkthrough-command { white-space: pre-wrap; text-align: left; overflow-wrap: anywhere; }
+.walkthrough-case details { padding: .6rem 0; }
+.walkthrough-case details dl { margin: .75rem 0; }
+@media (max-width: 600px) { .walkthrough-graph li { flex-direction: column; align-items: stretch; } }

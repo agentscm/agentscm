@@ -1,3 +1,4 @@
+import { walkthroughFixtureResponse } from './walkthrough.ts'
 import { CONTEXT_PULLS, contextFixture, expandedContextFixture } from './prContext.ts'
 // Dev-only: answers status and workspace GET endpoints from synthetic fixtures.
 // Workspace fixtures are visibly labelled; mutations return 501 and never execute.
@@ -454,7 +455,7 @@ const CONTEXT_RUNS = CONTEXT_PULLS.map((p) => {
 })
 const LOCK_PIN = (over: Record<string, unknown> = {}) => ({ name: 'pr-gate', workflow_version: 1, path: null, sha256: SHA_PR_GATE, status: 'adopted', params: { merge_method: 'squash' }, walkthrough: walk(' (squash)'), source: { kind: 'first_party' }, ...over })
 
-export type Scenario = 'full' | 'empty' | 'down' | 'demo' | 'context'
+export type Scenario = 'full' | 'empty' | 'down' | 'demo' | 'context' | 'walkthrough'
 
 export function mockHub(scenario: Scenario = 'full'): Plugin {
   let down = scenario === 'down'
@@ -466,6 +467,13 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
       return html.replace('<body>', '<body><div role="status" style="padding:10px 20px;background:#fff0c2;color:#342900;font:14px sans-serif">Synthetic local preview · Not live-qualified. No live GitHub reads or permission changes. #42: context + overlap; #43: context head differs from the PR list; #44: context request denied (simulated 403); #45: reported blocker.</div>')
     },
     configureServer(server) {
+      if (scenario === 'walkthrough') server.middlewares.use('/v1/local/explorer', (req, res) => {
+        if (req.method !== 'GET') { res.statusCode = 405; res.end(); return }
+        const value = walkthroughFixtureResponse(new URL(req.url ?? '/', 'http://localhost'))
+        res.setHeader('Content-Type', 'application/json')
+        res.statusCode = value === undefined ? 404 : 200
+        res.end(JSON.stringify(value ?? { error: 'fixture_not_available' }))
+      })
       server.middlewares.use('/__mock', (req, res) => {
         if (req.url?.startsWith('/reject-next-agent-read')) {
           rejectNextAgentRead = true
