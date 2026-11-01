@@ -1934,6 +1934,36 @@ a.run-row:hover {
   display: flex;
   flex-direction: column;
 }
+/* One agent: face, "maria’s Codex" over its two checks, one state pill. */
+.setup-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.setup-main {
+  display: grid;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.setup-name {
+  font-size: 15px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.setup-checks {
+  font-size: 13px;
+  color: var(--hub-text-3);
+}
+.setup-head .pill {
+  flex: none;
+}
+.setup-next {
+  margin: 8px 0 0 40px;
+  font-size: 13.5px;
+  color: var(--hub-text-2);
+  max-width: 70ch;
+}
 .steps {
   list-style: none;
   padding: 0;
