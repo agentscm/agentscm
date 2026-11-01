@@ -3,15 +3,15 @@
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import { Ago, Avatar, Box, Empty, Icon, Notice, PageHead, Reveal, Skeleton } from '../ui.tsx'
 import { useNow } from '../useHub.ts'
-import { needView } from '../pages/Dashboard.tsx'
+import { AWAKE_SECONDS, needView } from '../pages/Dashboard.tsx'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
 import { who } from '../nextStep.ts'
-import { lead } from '../pages/workParts.tsx'
+import { lead, plural } from '../pages/workParts.tsx'
 import { usePoll } from '../usePoll.ts'
 import { fetchLibrary, fetchRuns, type RunView } from '../skills.ts'
 import { fetchSetup } from '../api.ts'
 import { setupState } from '../onboarding.ts'
-import type { WorkItem, WorkOverview } from '../standup.ts'
+import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
 import type { Need } from '../needs.ts'
 import type { Derived } from '../derive.ts'
 import type { LiveProps } from './GLive.tsx'
@@ -48,11 +48,11 @@ export function LiveNow({ live }: { live: LiveProps }) {
             ? <><Tick k={n}>{word(n)}</Tick> {n === 1 ? 'thing needs' : 'things need'} you.<br /><span className="g-quiet">The rest has a next step.</span></>
             : <>Nothing needs you.<br /><span className="g-quiet"><Tick k={moving}>{word(moving)}</Tick> {moving === 1 ? 'change is' : 'changes are'} moving on {moving === 1 ? 'its' : 'their'} own.</span></>}
         fact={loading ? <span className="g-fact">{repo}</span> : <span className="g-fact">
-          <span>{repo} · {current.length} unfinished · {people} {people === 1 ? 'person' : 'people'} with {agents} live {agents === 1 ? 'agent' : 'agents'}</span>
+          <span>{repo} · {current.length} unfinished · {plural(people, 'person', 'people')} with {plural(agents, 'live agent')}</span>
           <a href="#contributions" className="g-strip" aria-label="What the Hub has recorded">
-            <span><Icon name="sign-intersection-y" /> {ov?.overlaps.length ?? 0} {ov?.overlaps.length === 1 ? 'overlap' : 'overlaps'} open</span>
-            <span><Icon name="exclamation-diamond" /> {d?.contested.length ?? 0} contested {d?.contested.length === 1 ? 'file' : 'files'}</span>
-            {data.health?.coordination && <span><Icon name="shield-check" /> {data.health.coordination.denied} {data.health.coordination.denied === 1 ? 'edit' : 'edits'} refused once</span>}
+            <span><Icon name="sign-intersection-y" /> {plural(ov?.overlaps.length ?? 0, 'overlap')} open</span>
+            <span><Icon name="exclamation-diamond" /> {plural(d?.contested.length ?? 0, 'contested file')}</span>
+            {data.health?.coordination && <span><Icon name="shield-check" /> {plural(data.health.coordination.denied, 'edit')} refused once</span>}
           </a>
         </span>}
       />
@@ -136,13 +136,13 @@ export function LiveTrack({ items, ov, live, runs }: { items: WorkItem[]; ov: Wo
         const pr = prFor(w, pulls)
         const l = lead(w)
         return (
-          <a key={w.id} href={`#work/${w.id}`} className="px-track-row g-row" style={{ viewTransitionName: `g-w-${w.id}`, '--i': i } as CSSProperties}>
+          <a key={w.id} href={workHref(w.id)} className="px-track-row g-row" style={{ viewTransitionName: `g-w-${w.id}`, '--i': i } as CSSProperties}>
             <span className="px-track-task">
               <span className="px-track-title">{w.title}</span>
               <span className="px-status"><span className={`px-dot tone-${dotTone(tone)}`} aria-hidden="true" />{stateText(w)}</span>
               <span className="px-track-meta">{who(l.login, l.agent)}{pr ? ` · PR #${pr.number}` : w.branch ? ` · ${w.branch}` : ''} · <Ago at={w.updated_at} /></span>
             </span>
-            <LiveLane key={`${w.id}-${at}-${tone}`} at={at} tone={tone} holder={`${l.login}-${l.agent}`} label={`${w.title}: ${STEPS[at]?.label}, ${stateText(w)}`} />
+            <LiveLane key={`${w.id}-${at}-${tone}`} at={at} tone={tone} holder={l.agent} label={`${w.title}: ${STEPS[at]?.label}, ${stateText(w)}`} />
           </a>
         )
       })}
@@ -177,7 +177,7 @@ function Together({ d, items }: { d: Derived | null; items: WorkItem[] }) {
       {d.groups.length === 0 && <p className="small muted mb-0">No agent is connected right now. <a href="#setup">Connect one</a>.</p>}
       <ul className="g-people">
         {d.groups.map((g) => {
-          const awake = g.agents.filter((a) => nowS - a.lastActive < 300).length
+          const awake = g.agents.filter((a) => nowS - a.lastActive < AWAKE_SECONDS).length
           const blocked = items.some((i) => i.owner_login === g.owner && i.state === 'blocked')
           const tone = blocked ? 'bad' : awake ? 'ok' : 'warn'
           return (
@@ -185,7 +185,7 @@ function Together({ d, items }: { d: Derived | null; items: WorkItem[] }) {
               <Avatar name={g.owner} size={36} />
               <span className="g-person">
                 <span className="g-person-top"><b>{g.owner}</b><span className="px-status"><span className={`px-dot tone-${tone}`} aria-hidden="true" />{blocked ? 'Has a blocked task' : awake ? `${awake} awake` : 'Quiet'}</span></span>
-                <span className="g-agents">{g.agents.map((a) => <span key={a.id} className="g-agent"><Avatar name={`${g.owner}-${a.name}`} size={18} />{a.name}{a.holdings.length ? ` · ${a.holdings.length} file${a.holdings.length === 1 ? '' : 's'}` : ''}</span>)}</span>
+                <span className="g-agents">{g.agents.map((a) => <span key={a.id} className="g-agent"><Avatar name={a.name} size={18} />{a.name}{a.holdings.length ? ` · ${plural(a.holdings.length, 'file')}` : ''}</span>)}</span>
               </span>
             </li>
           )
@@ -205,7 +205,7 @@ function ProcessCard({ live, runs }: { live: LiveProps; runs: RunView[] }) {
       <span className="g-process-head"><Icon name="diagram-3" /> {lib.kind === 'loading' ? 'Your process' : lib.kind === 'error' ? 'Could not read skills' : pins.length ? 'Your process is attached' : 'No process adopted yet'}</span>
       <b>{entry ? `${entry.name} · v${entry.workflow_version}` : lib.kind === 'loading' ? 'Reading skills…' : lib.kind === 'error' ? 'Open Workflows to retry' : 'Pick a skill or workflow'}</b>
       {entry && <span className="g-process-dots" aria-hidden="true">{entry.gates.slice(0, 6).map((g) => <span key={g.id} title={g.id}><Icon name={g.enforce.includes('stop') ? 'shield-check' : 'circle'} /></span>)}</span>}
-      <span className="small">{entry ? `${entry.gates.length} steps · ${open} open run${open === 1 ? '' : 's'}` : lib.kind === 'loading' ? '' : 'Agents follow whatever the repository adopts; nothing runs until you choose.'}</span>
+      <span className="small">{entry ? `${entry.gates.length} steps · ${plural(open, 'open run')}` : lib.kind === 'loading' ? '' : 'Agents follow whatever the repository adopts; nothing runs until you choose.'}</span>
     </a>
   )
 }
@@ -236,7 +236,7 @@ function Recent({ ov }: { ov: WorkOverview | null }) {
     <section className="g-contrib" aria-label="Recently reported">
       <div className="g-contrib-head"><Icon name="stars" /> Recently reported</div>
       {items.length === 0 && <p className="small mb-0">No completions or decisions reported in this window yet.</p>}
-      <ul>{items.map((o) => <li key={o.seq}><Icon name={o.kind === 'completion' ? 'flag' : 'signpost-split'} /><span><a href={`#work/${o.item.id}`} className="px-link-quiet">{o.item.title}</a> <span className="small muted">· {o.kind === 'completion' ? 'reported finished' : 'decision'} <Ago at={o.at} /></span></span></li>)}</ul>
+      <ul>{items.map((o) => <li key={o.seq}><Icon name={o.kind === 'completion' ? 'flag' : 'signpost-split'} /><span><a href={workHref(o.item.id)} className="px-link-quiet">{o.item.title}</a> <span className="small muted">· {o.kind === 'completion' ? 'reported finished' : 'decision'} <Ago at={o.at} /></span></span></li>)}</ul>
       <a href="#contributions" className="px-link">What the Hub has recorded <Icon name="arrow-right" /></a>
     </section>
   )

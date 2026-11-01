@@ -48,6 +48,10 @@
 .g-flowitem-avail { flex-direction: column; align-items: flex-start; gap: 6px; }
 .g-flowitem-avail small { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
+/* process: the repository list's white pill (rp-open), as a link on the violet canvas */
+.g-canvas .rp-open { display: inline-flex; align-items: center; text-decoration: none; }
+.g-canvas .rp-open:hover { color: var(--frame); }
+
 /* process: empty state on the violet canvas */
 .g-canvas-empty { justify-items: center; text-align: center; padding: 36px 28px; gap: 12px; }
 .g-canvas-empty h2 { font-size: 20px; font-weight: 300; margin: 0; }
