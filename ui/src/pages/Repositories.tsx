@@ -40,7 +40,16 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
   const session = auth.kind === 'ready' && auth.value?.kind === 'browser' ? auth.value.session : null
   // The list the web sign-in just fetched shows at once; the poll takes over once it is EVERY_MS old.
   const seed = session && web?.list ? { key: session.login, ...web.list } : null
-  const list = usePoll((signal) => (session ? fetchRepositoryList(session, signal) : Promise.reject(new Error('Sign in on the web to list repositories'))), EVERY_MS, session?.login ?? '', 0, seed)
+  // The overview behind Working now polls every few seconds; when its working set changes, refresh the slow list at
+  // once so the headline never contradicts that card for up to EVERY_MS.
+  const liveSet = `${current}:${workingNow(overview).map((i) => i.id).sort().join(',')}`
+  const [seen, setSeen] = useState(liveSet)
+  const [bump, setBump] = useState(0)
+  if (seen !== liveSet) {
+    setSeen(liveSet)
+    setBump(bump + 1)
+  }
+  const list = usePoll((signal) => (session ? fetchRepositoryList(session, signal) : Promise.reject(new Error('Sign in on the web to list repositories'))), EVERY_MS, session?.login ?? '', bump, seed)
   const [opening, setOpening] = useState<string | null>(null)
   const refused = opening && web && !web.repos.includes(opening) ? web.refusal : null
   useEffect(() => {

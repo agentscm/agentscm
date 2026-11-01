@@ -7,7 +7,7 @@ import { Tip } from './ui.tsx'
 import './plain.css'
 
 /** An in-page anchor (`#agent-reports`) scrolls to its element instead of changing the hash route. */
-function scrollToAnchor(e: MouseEvent<HTMLAnchorElement>, href: string) {
+export function scrollToAnchor(e: MouseEvent<HTMLAnchorElement>, href: string) {
   const el = href.startsWith('#') ? document.getElementById(href.slice(1)) : null
   if (!el) return
   e.preventDefault()

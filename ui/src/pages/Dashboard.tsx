@@ -121,10 +121,8 @@ const plainClick = (e: MouseEvent) => !(e.target as HTMLElement).closest('a, but
  * One decision for a person, as one line: who and what, one primary action, a small menu for the rest. Opening it
  * (the chevron, or the row's text) shows the reason, who decides and the box for the person's own words.
  */
-function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
-  const now = useNow() / 1000
-  const [open, setOpen] = useState(false)
-  const id = useId()
+/** What a need says, shared by the classic Needs you list and the G layout: icon, title, one-line gist, reason and next step. */
+export function needView(n: Need, ov: WorkOverview, d: Derived, me: string | null): { icon: string; title: ReactNode; gist: ReactNode; body: ReactNode; step: NextStep | null } {
   const i = n.item
   let icon = 'exclamation-circle'
   let title: ReactNode = null
@@ -182,6 +180,14 @@ function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview;
     if (p) step = prStep(p)
     gist = <a href="#box-prs">see the pull request</a>
   }
+  return { icon, title, gist, body, step }
+}
+
+function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
+  const now = useNow() / 1000
+  const [open, setOpen] = useState(false)
+  const id = useId()
+  const { icon, title, gist, body, step } = needView(n, ov, d, me)
   const acts = useStepActions(step, { viewer: handoff.me, repo: handoff.repo, originUrl: handoff.originUrl })
   const canHide = !hidden && isStale(needUpdatedAt(n), now)
   return (
