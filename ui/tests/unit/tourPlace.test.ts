@@ -6,8 +6,15 @@ const desk = { w: 1280, h: 800 }
 
 describe('placeCard', () => {
   it('centres a card with no target, wider for the welcome hero', () => {
-    expect(placeCard(null, card, desk).style.width).toBe(400)
-    expect(placeCard(null, { ...card, hero: true }, desk).style.width).toBe(480)
+    expect(placeCard(null, card, desk).style.width).toBe(640)
+    expect(placeCard(null, { ...card, hero: true }, desk).style.width).toBe(680)
+  })
+  it('spreads to 920px (960 for the hero) in Spacious density, 840 beside a target, and never past the viewport', () => {
+    expect(placeCard(null, card, desk, true).style.width).toBe(920)
+    expect(placeCard(null, { ...card, hero: true }, desk, true).style.width).toBe(960)
+    expect(placeCard({ top: 100, left: 300, width: 200, height: 40 }, card, desk, true).style.width).toBe(840)
+    expect(placeCard(null, { ...card, hero: true }, { w: 700, h: 800 }, true).style.width).toBe(668)
+    expect(placeCard({ top: 100, left: 10, width: 200, height: 40 }, card, { w: 700, h: 800 }, true).style.width).toBe(668)
   })
   it('puts the full card below a small target', () => {
     const p = placeCard({ top: 100, left: 300, width: 200, height: 40 }, card, desk)

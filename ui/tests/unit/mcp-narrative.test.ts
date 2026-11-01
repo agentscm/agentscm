@@ -3,9 +3,9 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 const html = readFileSync(resolve(process.cwd(), '../src/hub/mcp_views/work-overview.html'), 'utf8')
-const script = new DOMParser().parseFromString(html, 'text/html').querySelector('script')!.textContent!.replace('findBuild();\nstart();', '')
+const script = new DOMParser().parseFromString(html, 'text/html').querySelector('script')!.textContent!.replace(/\nstart\(\);\s*$/, '')
 function setup() {
-  document.body.innerHTML = '<div id="app"></div><div id="find"></div>'
+  document.body.innerHTML = '<div id="app"></div>'
   const load = new Function('window', 'document', `${script};return {NARRATIVE,narrativeValue,renderNarrative};`) as (window: Window, document: Document) => {
     NARRATIVE: { value: unknown; error: boolean }
     narrativeValue: (value: unknown) => unknown
@@ -33,7 +33,8 @@ describe('MCP agent narrative', () => {
     expect(root.textContent).toContain('bounded portion')
     expect(root.textContent).toContain('PR #17')
     expect(root.textContent).toContain('not independent verification or edit authority')
-    expect(root.querySelectorAll('details.source')).toHaveLength(3)
+    expect(root.querySelectorAll('.src')).toHaveLength(3)
+    expect(root.querySelectorAll('details')).toHaveLength(1)
     expect(root.querySelector('img')).toBeNull()
     expect(root.querySelector('button')).toBeNull()
   })

@@ -50,11 +50,11 @@ function packagesManifest(): Plugin {
 }
 
 const MOCK = process.env['MOCK']
-const mock = MOCK === 'context' || MOCK === '1' || MOCK === 'empty' || MOCK === 'down' || MOCK === 'demo'
+const mock = MOCK === 'walkthrough' || MOCK === 'context' || MOCK === '1' || MOCK === 'empty' || MOCK === 'down' || MOCK === 'demo'
 
 export default defineConfig({
   base: './',
-  plugins: [packagesManifest(), ...(mock ? [mockHub(MOCK === 'context' || MOCK === 'empty' || MOCK === 'down' || MOCK === 'demo' ? MOCK : 'full')] : [])],
+  plugins: [packagesManifest(), ...(mock ? [mockHub(MOCK === 'walkthrough' || MOCK === 'context' || MOCK === 'empty' || MOCK === 'down' || MOCK === 'demo' ? MOCK : 'full')] : [])],
   // One React instance for the app and its tests.
   resolve: { dedupe: ['react', 'react-dom'] },
   server: {

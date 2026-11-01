@@ -121,10 +121,8 @@ const plainClick = (e: MouseEvent) => !(e.target as HTMLElement).closest('a, but
  * One decision for a person, as one line: who and what, one primary action, a small menu for the rest. Opening it
  * (the chevron, or the row's text) shows the reason, who decides and the box for the person's own words.
  */
-function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
-  const now = useNow() / 1000
-  const [open, setOpen] = useState(false)
-  const id = useId()
+/** What a need says, shared by the classic Needs you list and the G layout: icon, title, one-line gist, reason and next step. */
+export function needView(n: Need, ov: WorkOverview, d: Derived, me: string | null): { icon: string; title: ReactNode; gist: ReactNode; body: ReactNode; step: NextStep | null } {
   const i = n.item
   let icon = 'exclamation-circle'
   let title: ReactNode = null
@@ -182,6 +180,14 @@ function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview;
     if (p) step = prStep(p)
     gist = <a href="#box-prs">see the pull request</a>
   }
+  return { icon, title, gist, body, step }
+}
+
+function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
+  const now = useNow() / 1000
+  const [open, setOpen] = useState(false)
+  const id = useId()
+  const { icon, title, gist, body, step } = needView(n, ov, d, me)
   const acts = useStepActions(step, { viewer: handoff.me, repo: handoff.repo, originUrl: handoff.originUrl })
   const canHide = !hidden && isStale(needUpdatedAt(n), now)
   return (
@@ -475,7 +481,8 @@ export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, even
   }
 }
 
-export function DashboardPage({ section, question, token, repo, data, d, overview }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
+/** `answer` replaces the shared headline: the G layout gives each tab its own sentence. */
+export function DashboardPage({ section, question, token, repo, data, d, overview, answer }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview>; answer?: ReactNode }) {
   const ov = overview.kind === 'ready' ? overview.value : null
   const hidden = useHidden()
   const all = needsYou(ov, d)
@@ -484,7 +491,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
   const start = <StartTask token={token} me={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />
   return (
     <div className="page">
-      <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />
+      {answer ? <PageHead question={question} answer={answer} live /> : <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />}
       {section === 'home' && ov && d && <Coach id="answer" side="below">This sentence is the page in brief: how many tasks are unfinished, how many are moving or stuck, and how many need you.</Coach>}
       <SectionTabs label="Dashboard views" />
       {overview.kind === 'error' && (
@@ -499,6 +506,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
           {needs.length === 0 && start}
           <Coach id="needs" side="above">These wait on a person. Open a row for the reason and who decides; its button opens or copies the prompt for the agent.</Coach>
           <NeedsYou needs={all} ov={ov} d={d} me={handoff.me} handoff={handoff} />
+          <NarrativePanel token={token} compact />
           {needs.length > 0 && start}
           <Coach id="track" side="above">Every unfinished task, left to right: claimed, now, next, finished. Open a task for its full story.</Coach>
           <Track ov={ov} />

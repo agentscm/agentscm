@@ -1,5 +1,5 @@
 import { ApiError } from './api.ts'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { fetchNarrative, validateNarrativeTask, type NarrativeSource, type NarrativeStatement, type NarrativeView } from './narrative.ts'
 import { Ago, Icon, Notice, Skeleton } from './ui.tsx'
 
@@ -32,13 +32,14 @@ function SourceLabel({ source }: { source: NarrativeSource }) {
 }
 
 /** Footnote markers after a statement; each names its source for pointers and screen readers. */
-function Cites({ refs, numbers, sources }: { refs: string[]; numbers: Map<string, number>; sources: Map<string, NarrativeSource> }) {
+function Cites({ refs, numbers, sources, reveal }: { refs: string[]; numbers: Map<string, number>; sources: Map<string, NarrativeSource>; reveal?: () => void }) {
   if (refs.length === 0) return null
   return (
     <span className="brief-cites">
       {refs.map((r) => (
         <a key={r} href={`#brief-src-${numbers.get(r)}`} className="brief-cite" title={sources.get(r)?.label} aria-label={`Source ${numbers.get(r)}: ${sources.get(r)?.label ?? 'unknown'}`} onClick={(e) => {
           e.preventDefault()
+          reveal?.()
           document.getElementById(`brief-src-${numbers.get(r)}`)?.scrollIntoView({ block: 'nearest' })
         }}>
           {numbers.get(r)}
@@ -48,14 +49,14 @@ function Cites({ refs, numbers, sources }: { refs: string[]; numbers: Map<string
   )
 }
 
-function Statements({ items, numbers, sources }: { items: NarrativeStatement[]; numbers: Map<string, number>; sources: Map<string, NarrativeSource> }) {
+function Statements({ items, numbers, sources, reveal }: { items: NarrativeStatement[]; numbers: Map<string, number>; sources: Map<string, NarrativeSource>; reveal?: () => void }) {
   if (items.length === 0) return <p className="muted small mb-0">No cited statements were generated from this bounded source window.</p>
   return (
     <ul className="brief-list">
       {items.map((item, index) => (
         <li key={`${index}:${item.text}`}>
           {item.text}
-          <Cites refs={item.references} numbers={numbers} sources={sources} />
+          <Cites refs={item.references} numbers={numbers} sources={sources} reveal={reveal} />
         </li>
       ))}
     </ul>
@@ -136,6 +137,73 @@ function NarrativeBox({ state, by, controls, children }: { state: 'ready' | 'wai
   )
 }
 
+/** One quiet line for the Dashboard when there is no briefing to read: the same words as the full panel, no box. */
+function BriefLine({ state, children }: { state: 'waiting' | 'writing' | 'bad'; children: ReactNode }) {
+  return (
+    <section id="agent-briefing" className={`brief brief-compact brief-line is-${state}`} aria-labelledby="agent-briefing-title">
+      <div className="brief-by">
+        <i aria-hidden="true" />
+        <h2 id="agent-briefing-title">Agent briefing</h2>
+      </div>
+      <div className="brief-line-text text-break">{children}</div>
+    </section>
+  )
+}
+
+/** The briefing on the Dashboard: headline, facts and what they may mean at a glance; sources and warnings fold away. */
+function NarrativeCompact({ view }: { view: NarrativeView }) {
+  const foot = useRef<HTMLDetailsElement>(null)
+  const reveal = () => { if (foot.current) foot.current.open = true }
+  const sources = new Map(view.sources.map((source) => [source.id, source]))
+  const numbers = citationNumbers(view)
+  const cited = [...numbers].map(([id, n]) => ({ n, source: sources.get(id) })).filter((x): x is { n: number; source: NarrativeSource } => !!x.source)
+  const flagged = !view.window.complete || view.warnings.length > 0
+  return (
+    <section id="agent-briefing" className={`brief brief-compact is-${flagged ? 'bad' : 'ready'}`} aria-labelledby="agent-briefing-title">
+      <header className="brief-head">
+        <div className="brief-by">
+          <i aria-hidden="true" />
+          <h2 id="agent-briefing-title">Agent briefing</h2>
+          <span>Written by {view.generated_by ?? 'a connected agent'} · {view.generated_at === null ? 'time not reported' : <Ago at={view.generated_at} />}</span>
+        </div>
+        <a className="brief-more" href="#activity">Read in full on Catch up <Icon name="chevron-right" /></a>
+      </header>
+      <div className="text-break brief-body">
+        <p className="brief-headline">
+          {view.output!.headline}
+          <Cites refs={view.output!.headline_references} numbers={numbers} sources={sources} reveal={reveal} />
+        </p>
+        <div className="brief-cols">
+          <section>
+            <h3>Reported facts</h3>
+            <Statements items={view.output!.facts} numbers={numbers} sources={sources} reveal={reveal} />
+          </section>
+          <section>
+            <h3>What this may mean for your work</h3>
+            <Statements items={view.output!.implications} numbers={numbers} sources={sources} reveal={reveal} />
+          </section>
+        </div>
+      </div>
+      <details className="disclosure" ref={foot}>
+        <summary>Sources and warnings{flagged && ' · needs a look'}</summary>
+        <WindowNotices view={view} />
+        {cited.length > 0 && (
+          <ol className="brief-sources" aria-label="Sources">
+            {cited.map(({ n, source }) => (
+              <li key={n} id={`brief-src-${n}`}>
+                <span className="brief-cite" aria-hidden="true">{n}</span> <SourceLabel source={source} />
+              </li>
+            ))}
+          </ol>
+        )}
+        <p className="brief-caveat">
+          <Icon name="info-circle" /> Written by an agent from reported records. It does not approve work or show that conflicts are clear.
+        </p>
+      </details>
+    </section>
+  )
+}
+
 function NarrativeReady({ view, controls }: { view: NarrativeView; controls: TaskControls }) {
   const sources = new Map(view.sources.map((source) => [source.id, source]))
   const numbers = citationNumbers(view)
@@ -185,7 +253,8 @@ function NarrativeReady({ view, controls }: { view: NarrativeView; controls: Tas
   )
 }
 
-export function NarrativePanel({ token }: { token: string }) {
+/** `compact` is the Dashboard's calm form: no task box, one line when nothing is ready, and the full briefing is one link away. */
+export function NarrativePanel({ token, compact = false }: { token: string; compact?: boolean }) {
   const [draftTask, setDraftTask] = useState('')
   const [task, setTask] = useState<string | undefined>()
   const [taskError, setTaskError] = useState<string | null>(null)
@@ -272,6 +341,22 @@ export function NarrativePanel({ token }: { token: string }) {
     clear: () => { setDraftTask(''); setTaskError(null); setTask(undefined) },
   }
   const current: LoadState = state.token === token && state.task === task ? state : { kind: 'loading', token, task }
+  if (compact) {
+    if (current.kind === 'loading') return <BriefLine state="waiting"><Skeleton rows={1} /></BriefLine>
+    if (current.kind === 'absent') return <BriefLine state="waiting">This Hub doesn’t write agent briefings yet.</BriefLine>
+    if (current.kind === 'error') {
+      return (
+        <BriefLine state="bad">
+          Agent briefing unavailable. This is not an empty result or an all-clear.{' '}
+          <button type="button" className="btn btn-sm btn-link" onClick={() => { setState({ kind: 'loading', token, task }); setRetry((value) => value + 1) }}>Retry briefing</button>
+        </BriefLine>
+      )
+    }
+    if (current.view.status === 'pending') return <BriefLine state="waiting">Waiting for a connected agent to generate this briefing.</BriefLine>
+    if (current.view.status === 'generating') return <BriefLine state="writing">An eligible connected agent is generating this briefing.</BriefLine>
+    if (current.view.status === 'failed') return <BriefLine state="bad">Agent briefing generation failed. This is not an empty result or an all-clear.</BriefLine>
+    return <NarrativeCompact view={current.view} />
+  }
   if (current.kind === 'loading') {
     return <NarrativeBox controls={controls} state="waiting"><Skeleton rows={2} /></NarrativeBox>
   }

@@ -195,6 +195,8 @@ export interface CoordinationResponse {
   target_generation: number
   kind: CoordinationResponseKind
   note: string | null
+  /** `hub` when the person who owns the responding agent answered for it on the Hub's web pages; `responder` is still the agent. */
+  via: 'hub' | null
   created_at: number
   seq: number
 }
@@ -587,6 +589,11 @@ function forgeWorkRef(value: unknown, field: string): ForgeWorkRef {
   }
 }
 
+/** One request as the Hub sends it, for the page that sends an answer and gets the updated request back. */
+export function decodeCoordinationRequest(value: unknown): CoordinationRequest {
+  return coordinationRequest(value)
+}
+
 function coordinationRequest(value: unknown): CoordinationRequest {
   const item = record(value, 'coordination.request')
   const id = boundedText(item['id'], 'coordination.request.id', 36)
@@ -646,6 +653,7 @@ function coordinationRequest(value: unknown): CoordinationRequest {
       target_generation: safeInteger(response['target_generation'], 'coordination.request.response.target_generation'),
       kind: enumValue(response['kind'], COORDINATION_RESPONSE_KINDS, 'coordination.request.response.kind'),
       note: nullableText(response['note'], 'coordination.request.response.note'),
+      via: response['via'] === 'hub' ? ('hub' as const) : null,
       created_at: timestamp(response['created_at'], 'coordination.request.response.created_at'),
       seq: safeInteger(response['seq'], 'coordination.request.response.seq'),
     }

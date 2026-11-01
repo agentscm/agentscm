@@ -1,413 +1,478 @@
-// Inbox: declared-scope overlaps and directed requests between agents (`#inbox`).
+// Inbox: the conversations agents have to have (`#inbox`), as threads with a timeline.
+//
+// Left, the conversations grouped by who has to move: Needs you, Waiting on others, Between others, Earlier. Right, the
+// selected one: the sentence, the two sides, a timeline of everything the Hub recorded (plans, asks, receipts, replies,
+// AgentSCM's notices, and a person's own answer), and, where the person's own agent was asked, a reply bar. A person who is
+// signed in on the web answers for their OWN agent there; the Hub records that a person did, never that the agent did. With
+// nothing to settle the pane shows a small idle scene. Nothing here merges or approves work.
 //
 // API for other packages:
-//   InboxPage({ token, overview, handoff })   the Inbox page; `handoff` (handoffOf(whoami)) turns on "Open in" for the viewer's own agents
-//   Coordination({ token, overview, search })   requests, overlaps, other signals and decisions
-//   stage(r)       a request's stage: label, tone and icon
-//   pending(r)     true while a request is neither resolved nor withdrawn
-//   currentAck(r, t), currentResponse(r, t)   a target's current receipt and reply
-//   RESPONSE_LABEL a reply kind in words ("Proposed a scope split")
-import { useState } from 'react'
-import {
-  fetchCoordination,
-  workMatchesSearch,
-  type CoordinationQuery,
-  type CoordinationRequest,
-  type CoordinationResponseKind,
-  type CoordinationTarget,
-  type WorkItem,
-  type WorkOverlapPair,
-  type WorkOverview,
-} from '../standup.ts'
-import { agentLabel, Ago, Avatar, Box, Empty, Icon, Notice, PageHead, Paths, Pill, Skeleton, Tip, localDate, type Tone } from '../ui.tsx'
+//   InboxPage({ token, overview, handoff, session, live })   the Inbox page; `handoff` (handoffOf(whoami)) names the viewer and
+//                    turns on "Open in" for their agents; `session` (the web sign-in) turns on answering; `live` (agents and
+//                    contested files) turns on "Ask … to hand it over"
+//   stage(r), pending(r), currentAck(r, t), currentResponse(r, t), RESPONSE_LABEL   a request's state (see requests.ts)
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { AgentMark } from '../AgentMark.tsx'
+import { type BrowserSession } from '../devices.ts'
+import type { Contested, LiveAgent } from '../derive.ts'
+import { HideButton, hideKey, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
+import { answerHandoff, askHandoff, fetchMyHandoffs, operationId, OUTCOME_SENTENCE, replyToRequest, sendError, type MyHandoff } from '../inboxApi.ts'
+import { IdleScene } from '../InboxIdle.tsx'
+import { agentName, askOption, buildThreads, GROUP_TITLE, GROUPS, named, REPLY_CHOICES, type Group, type Row, type Say, type SideView, type Thread } from '../inboxThreads.ts'
 import { OVERLAP_IS_SIGNAL, READING_CHANGES_NOTHING } from '../copy.ts'
+import type { Handoff } from '../launchLink.ts'
+import { NextStepView } from '../NextStep.tsx'
+import { clean, DATA_NOTE, overlapSteps, requestStep, type NextStep } from '../nextStep.ts'
+import { pending, currentAck, currentResponse, RESPONSE_LABEL, stage } from '../requests.ts'
+import { fetchCoordination, type CoordinationRequest, type CoordinationResponseKind, type WorkItem, type WorkOverview } from '../standup.ts'
+import { agentLabel, Ago, Icon, Notice, PageHead, Pill, relative, Skeleton } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { useNow } from '../useHub.ts'
-import { HideButton, hideKey, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
-import { Pager } from '../Pager.tsx'
-import { ClaimPill, lead, PathPair, plural, Search, WorkLink } from './workParts.tsx'
-// nextStep.ts imports this module's helpers: use these only inside render functions (module cycle).
-import { overlapSteps, requestStep, who } from '../nextStep.ts'
-import { NextStepView } from '../NextStep.tsx'
-import type { Handoff } from '../launchLink.ts'
+import { lead, plural, Search, WorkLink, ClaimPill } from './workParts.tsx'
 import { Gloss } from '../Gloss.tsx'
 
-/** A reply kind in words. */
-export const RESPONSE_LABEL: Record<CoordinationResponseKind, string> = { propose_split: 'Proposed a scope split', join: 'Offered to join', handover: 'Offered a handover', decline: 'Declined' }
+export { currentAck, currentResponse, pending, RESPONSE_LABEL, stage }
 
-/* ---------- Needs coordination ---------- */
+const signalHideKey = (i: WorkItem) => hideKey(`signal:${i.id}`, Math.max(i.updated_at, i.last_checkin_at))
 
-/** The target's receipt for this request at its current generation, newest first. */
-export function currentAck(r: CoordinationRequest, t: CoordinationTarget) {
-  return r.acknowledgements.filter((a) => a.target_work_id === t.work_id && a.generation === t.generation && a.through_seq >= r.created_seq).sort((x, y) => y.seq - x.seq)[0]
-}
-/** The target's reply at its current generation, newest first. */
-export function currentResponse(r: CoordinationRequest, t: CoordinationTarget) {
-  return r.responses.filter((x) => x.target_work_id === t.work_id && x.target_generation === t.generation).sort((x, y) => y.seq - x.seq)[0]
-}
-/** Where a request is: resolved, withdrawn, replied, awaiting replies or receipt, or history incomplete. */
-export function stage(r: CoordinationRequest): { label: string; tone: Tone; icon: string } {
-  if (r.status === 'resolved') return { label: 'Resolved', tone: 'ok', icon: 'check2-all' }
-  if (r.status === 'withdrawn') return { label: 'Withdrawn', tone: 'muted', icon: 'x-circle' }
-  if (r.status === 'responded') return { label: 'Replied', tone: 'brand', icon: 'reply' }
-  if (!r.acknowledgements_complete || !r.responses_complete) return { label: 'Pending · history incomplete', tone: 'warn', icon: 'question-circle' }
-  if (r.targets.every((t) => currentAck(r, t) || currentResponse(r, t))) return { label: 'Awaiting replies', tone: 'warn', icon: 'hourglass-split' }
-  return { label: 'Awaiting receipt', tone: 'warn', icon: 'envelope' }
-}
-function requestMatches(r: CoordinationRequest, q: string) {
-  const n = q.trim().toLocaleLowerCase()
-  if (!n) return true
-  return [r.id, r.requester.agent, r.requester.login, r.proposal.title, r.proposal.request_key, ...r.proposal.scope, ...r.targets.flatMap((t) => [t.work_id, t.lead.agent, t.lead.login, ...t.reasons.flatMap((x) => [x.your_path, x.their_path])]), ...r.responses.flatMap((x) => [x.responder.agent, x.responder.login, RESPONSE_LABEL[x.kind], x.note])].some((v) => v?.toLocaleLowerCase().includes(n))
+/** The last good value of a poll, so a refresh after a send replaces the page's data without a skeleton in between. */
+function useLast<T>(poll: Poll<T>): T | null {
+  const [last, setLast] = useState<T | null>(null)
+  if (poll.kind === 'ready' && poll.value !== last) setLast(poll.value)
+  return poll.kind === 'ready' ? poll.value : last
 }
 
+const nowSeconds = () => Math.floor(Date.now() / 1000)
 
-// Browser-only hide keys for the Inbox's lingering rows (see dismiss.tsx).
-const requestHideKey = (r: CoordinationRequest) => hideKey(`request:${r.id}`, r.updated_at)
-const signalUpdatedAt = (i: WorkItem) => Math.max(i.updated_at, i.last_checkin_at)
-const signalHideKey = (i: WorkItem) => hideKey(`signal:${i.id}`, signalUpdatedAt(i))
+/* ---------- the pieces of a thread ---------- */
 
-function Request({ r, handoff }: { r: CoordinationRequest; handoff?: Handoff }) {
-  const st = stage(r)
-  const step = requestStep(r)
-  const first = r.targets[0]?.reasons[0]
-  return (
-    <details className="request">
-      <summary>
-        <Pill tone={st.tone} icon={st.icon}>
-          {st.label}
-        </Pill>
-        <span className="request-main">
-          <strong>{r.proposal.title}</strong>
-          <span className="muted small">
-            <Icon name="person" /> {who(r.requester.login, r.requester.agent)} <Icon name="arrow-right" /> {r.targets.map((t) => who(t.lead.login, t.lead.agent)).join(', ')}
-          </span>
-        </span>
-        {first && (
-          <span className="request-reason small">
-            <PathPair a={first.your_path} b={first.their_path} />
-          </span>
-        )}
-        <span className="muted small request-time">
-          <Ago at={r.updated_at} />
-        </span>
-        <Icon name="chevron-down" className="request-chevron" />
-      </summary>
-      <div className="request-body">
-        <div className="request-proposal">
-          <div className="small muted">
-            Requested by {agentLabel(r.requester.agent)} · {r.requester.login} · <code>{r.id}</code>
-          </div>
-          <div>
-            <span className="label">Proposed scope</span> {r.proposal.scope.length ? <Paths items={r.proposal.scope} max={12} /> : <em className="muted">Scope not declared</em>}
-          </div>
-          {r.proposal.work_id && (
-            <div>
-              <WorkLink id={r.proposal.work_id}>Open the requesting work</WorkLink>
-            </div>
-          )}
-        </div>
-        {step && <NextStepView step={step} viewer={handoff?.me} repo={handoff?.repo} originUrl={handoff?.originUrl} />}
-        {(!r.acknowledgements_complete || !r.responses_complete) && (
-          <Notice title="Some receipt or reply history is omitted">The request status above is authoritative; the history shown below is incomplete.</Notice>
-        )}
-        <div className="targets">
-          {r.targets.map((t) => {
-            const ack = currentAck(r, t)
-            const resp = currentResponse(r, t)
-            const received = ack?.acknowledged_at ?? resp?.created_at
-            return (
-              <section key={t.work_id} className="target target-plain">
-                <div className="target-head">
-                  <Avatar name={t.lead.agent} size={28} />
-                  <span>
-                    <span className="label">Target lead</span>
-                    <strong title={t.lead.agent}>{who(t.lead.login, t.lead.agent)}</strong>
-                  </span>
-                  <WorkLink id={t.work_id}>Open work</WorkLink>
-                </div>
-                <div className="pills">
-                  <Pill tone={received !== undefined ? 'ok' : 'warn'} icon={received !== undefined ? 'envelope-open' : 'envelope'} tip="Receipt means the target agent’s session has seen this request. Viewing this page never counts as receipt.">
-                    {received !== undefined ? `Received ${localDate(received)}` : r.acknowledgements_complete ? 'Awaiting receipt' : 'Receipt history incomplete'}
-                  </Pill>
-                  <Pill tone={resp ? 'brand' : 'warn'} icon={resp ? 'reply' : 'hourglass'}>
-                    {resp ? RESPONSE_LABEL[resp.kind] : r.responses_complete ? 'Awaiting reply' : 'Reply history incomplete'}
-                  </Pill>
-                </div>
-                <ul className="reasons">
-                  {t.reasons.map((x, i) => (
-                    <li key={i}>
-                      <PathPair a={x.your_path} b={x.their_path} joiner={<span className="muted small">overlaps</span>} />
-                    </li>
-                  ))}
-                </ul>
-                {!t.reasons_complete && <p className="small warn-text"><Icon name="three-dots" /> More overlapping paths were omitted; check the full declared scopes.</p>}
-                {resp && (
-                  <blockquote className="response">
-                    <strong>
-                      {who(resp.responder.login, resp.responder.agent)}
-                    </strong>
-                    <p>{resp.note ?? 'No note provided.'}</p>
-                    <Ago at={resp.created_at} />
-                  </blockquote>
-                )}
-              </section>
-            )
-          })}
-        </div>
-      </div>
-    </details>
-  )
-}
-
-function RequestList({ requests, search, complete, handoff }: { requests: CoordinationRequest[]; search: string; complete: boolean; handoff?: Handoff }) {
-  const now = useNow() / 1000
-  const { rows, count, show, setShow, isHidden } = useHideable(requests, requestHideKey)
+function Sentence({ say }: { say: Say }) {
   return (
     <>
-      {rows.length === 0 ? (
-        <Empty icon="chat-left" title={search ? 'No request matches your search' : count > 0 ? 'Every request here is hidden' : complete ? 'No directed requests' : 'No request on this page'}>
-          {!search && count === 0 && (complete ? 'Agents send one when they need a file another agent holds; they use agentscm_ask.' : 'More requests remain in this fixed snapshot.')}
-        </Empty>
-      ) : (
-        <div className="request-list">
-          {rows.map((r) => (
-            <div key={r.id} className={`hideable${isHidden(r) ? ' is-hidden' : ''}`}>
-              <Request r={r} handoff={handoff} />
-              {(isHidden(r) || isStale(r.updated_at, now)) && <HideButton k={requestHideKey(r)} hidden={isHidden(r)} what={`the request “${r.proposal.title}”`} />}
-            </div>
-          ))}
-        </div>
-      )}
-      <ShowHidden count={count} show={show} onShow={setShow} />
+      {say.map((part, i) => (typeof part === 'string' ? part : <code key={i}>{part.code}</code>))}
     </>
   )
 }
 
-function RequestQueue({ token, search, handoff }: { token: string; search: string; handoff?: Handoff }) {
-  const [queries, setQueries] = useState<CoordinationQuery[]>([{ limit: 10, activeOnly: true }])
-  const [page, setPage] = useState(0)
-  const [nonce, setNonce] = useState(0)
-  const query = queries[page]!
-  const fresh = page === 0 && query.through === undefined
-  const key = `${JSON.stringify(query)}|${nonce}`
-  const load = usePoll((signal) => fetchCoordination(token, signal, query), fresh ? 15_000 : 0, key)
-  const restart = (activeOnly: boolean) => {
-    setQueries([{ limit: 10, activeOnly }])
-    setPage(0)
-    setNonce((n) => n + 1)
-  }
+function Side({ side, children }: { side: SideView; children?: ReactNode }) {
   return (
-    <Box
-      id="box-requests"
-      icon="chat-left-dots"
-      title="Directed requests"
-      explain="Agents ask each other to split, join or hand over. They answer themselves; each item says what to tell them if it stalls."
-      actions={
-        <>
-          <div className="form-check form-switch mb-0">
-            <input id="show-closed" className="form-check-input" type="checkbox" role="switch" checked={!query.activeOnly} onChange={(e) => restart(!e.target.checked)} />
-            <label className="form-check-label small" htmlFor="show-closed">
-              Include resolved & withdrawn
-            </label>
-          </div>
-          <Tip text="Return to a fresh first page">
-            <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => restart(query.activeOnly ?? true)} aria-label="Refresh requests">
-              <Icon name="arrow-clockwise" />
-            </button>
-          </Tip>
-        </>
-      }
-    >
-      {load.kind === 'loading' && <Skeleton rows={3} />}
-      {load.kind === 'error' && (
-        <Notice tone="bad" title="Could not load directed requests" action={<button className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>}>
-          {load.message}
-        </Notice>
-      )}
-      {load.kind === 'ready' && (
-        <>
-          {load.value.requests.length > 0 && (
-            <p className="small muted mb-2">
-              {fresh ? 'Refreshes every 15 seconds.' : `Fixed snapshot through event ${load.value.through}.`}
-            </p>
-          )}
-          {load.refreshError && <Notice title="Could not refresh requests">{load.refreshError}</Notice>}
-          {load.value.retention_gap && <Notice title="Some request history is no longer retained" />}
-          <RequestList requests={load.value.requests.filter((r) => requestMatches(r, search))} search={search} complete={load.value.complete} handoff={handoff} />
-          <Pager
-            newerLabel="Previous"
-            olderLabel="Next"
-            status={`Page ${page + 1}`}
-            onNewer={page > 0 ? () => setPage((p) => p - 1) : undefined}
-            onOlder={load.value.complete ? undefined : () => {
-              const b = load.value
-              const next: CoordinationQuery = { after: b.next_after, through: b.through, limit: query.limit, activeOnly: query.activeOnly }
-              setQueries((all) => (fresh ? [{ through: b.through, limit: query.limit, activeOnly: query.activeOnly }, next] : [...all.slice(0, page + 1), next]))
-              setPage((p) => p + 1)
-            }}
-          />
-        </>
-      )}
-    </Box>
-  )
-}
-
-function OverlapRow({ o, handoff }: { o: WorkOverlapPair; handoff?: Handoff }) {
-  const side = (item: WorkItem) => {
-    const l = lead(item)
-    return (
-      <div className="overlap-side">
-        <div>
-          <Avatar name={l.agent} size={24} /> <strong title={l.agent}>{who(l.login, l.agent)}</strong>
-        </div>
-        <WorkLink id={item.id}>{item.title}</WorkLink>
-        <div className="small">
-          <span className="label">
-            <Gloss term="declaredScope">Plans to change:</Gloss>
-          </span>{' '}
-          <Paths items={item.scope} max={4} />
-        </div>
-      </div>
-    )
-  }
-  return (
-    <li className="overlap">
-      <div className="overlap-why">
-        {o.reasons.map((x, i) => (
-          <div key={i}>
-            <PathPair a={x.left_path} b={x.right_path} />
-          </div>
-        ))}
-        {!o.reasons_complete && <div className="small warn-text">More path pairs omitted — compare full scopes.</div>}
-      </div>
-      <div className="overlap-sides">
-        {side(o.left)}
-        <Icon name="arrow-left-right" className="overlap-arrow" />
-        {side(o.right)}
-      </div>
-      <NextStepView step={overlapSteps(o)} tour="inbox-talk" viewer={handoff?.me} repo={handoff?.repo} originUrl={handoff?.originUrl} />
-    </li>
-  )
-}
-
-export function Coordination({ token, overview, search, requestsFirst = true, handoff }: { token: string; overview: WorkOverview; search: string; handoff?: Handoff; /** Directed requests above overlaps; false when none is open. */ requestsFirst?: boolean }) {
-  const overlaps = overview.overlaps.filter((o) => workMatchesSearch(o.left, search) || workMatchesSearch(o.right, search) || o.reasons.some((r) => `${r.left_path} ${r.right_path}`.toLowerCase().includes(search.trim().toLowerCase())))
-  const signals = useHideable(overview.current.filter((i) => workMatchesSearch(i, search) && (i.claim_status !== 'active' || i.scope.length === 0)), signalHideKey)
-  const attention = signals.rows
-  const now = useNow() / 1000
-  const decisions = overview.recent.filter((o) => o.kind === 'decision' && workMatchesSearch(o.item, search))
-  const signalCount = attention.length - (signals.show ? signals.count : 0)
-  const requests = <RequestQueue key="requests" token={token} search={search} handoff={handoff} />
-  const overlapBox = (
-    <Box
-      key="overlaps"
-      id="box-overlaps"
-      icon="sign-intersection-y"
-      tone={overlaps.length ? 'bad' : 'ok'}
-      title="Two tasks plan the same files"
-      explain={`The hub compares the files each task said it would touch. ${OVERLAP_IS_SIGNAL} No request is sent.`}
-    >
-      {!overview.overlaps_complete && <Notice title="Overlap list is incomplete">The current-work limit was reached, so more overlaps may exist. An empty list is not an all-clear.</Notice>}
-      {overlaps.length === 0 ? (
-        <Empty icon="check2-circle" title={overview.overlaps_complete ? 'No declared scopes overlap' : 'No overlaps in this partial snapshot'}>{overview.overlaps_complete && !search.trim() && 'Overlaps appear when two tasks declare the same files; agents declare them with agentscm_start.'}</Empty>
-      ) : (
-        <ul className="overlap-list">
-          {overlaps.map((o) => (
-            <OverlapRow key={`${o.left.id}-${o.right.id}`} o={o} handoff={handoff} />
-          ))}
-        </ul>
-      )}
-    </Box>
-  )
-  return (
-    <div className="stack">
-      {/* Keyed so reordering never remounts the request poll. */}
-      {requestsFirst ? [requests, overlapBox] : [overlapBox, requests]}
-      <div className="grid-2">
-        <details className="disclosure">
-          <summary>Quiet agents and tasks with no stated files · {signalCount}</summary>
-          <p className="small muted mt-2">Overlap checks can’t see these. You can hide an item once it’s a day old.</p>
-            {attention.length === 0 ? (
-              <Empty icon="check2" title="Nothing else needs attention" />
-            ) : (
-              <ul className="plain-list">
-                {attention.map((i) => (
-                  <li key={i.id} className={signals.isHidden(i) ? 'is-hidden' : undefined}>
-                    <WorkLink id={i.id}>{i.title}</WorkLink>
-                    <span className="muted small"> · {agentLabel(lead(i).agent)}</span>
-                    <div className="pills">
-                      {i.claim_status !== 'active' && <ClaimPill item={i} />}
-                      {i.scope.length === 0 && <Pill tone="muted" icon="question-circle">Scope unknown</Pill>}
-                      {(signals.isHidden(i) || isStale(signalUpdatedAt(i), now)) && <HideButton k={signalHideKey(i)} hidden={signals.isHidden(i)} what={`“${i.title}”`} />}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <ShowHidden count={signals.count} show={signals.show} onShow={signals.setShow} />
-        </details>
-        <details className="disclosure">
-          <summary>Recent decisions · {decisions.length}</summary>
-          <p className="small muted mt-2">Decisions agents reported in the same window, for example agreeing a scope split.</p>
-            {decisions.length === 0 ? (
-              <Empty icon="signpost" title="No reported decisions in this window" />
-            ) : (
-              <ul className="plain-list">
-                {decisions.map((o) => (
-                  <li key={o.seq}>
-                    <WorkLink id={o.item.id}>{o.item.title}</WorkLink>
-                    <div className="small">{o.item.current?.summary ?? 'No decision summary retained'}</div>
-                    <span className="small muted">
-                      <Ago at={o.at} />
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-        </details>
-      </div>
+    <div className="in-side">
+      <span className="in-who">
+        <AgentMark agent={side.agent} />
+        {side.me ? 'You' : side.login} · {agentName(side.agent)}
+      </span>
+      <span className={`in-task${side.task ? '' : ' is-none'}`}>{side.task ?? 'Task not shown'}</span>
+      <span className="in-files">{side.files.length ? side.files.slice(0, 4).join(', ') + (side.files.length > 4 ? ` +${side.files.length - 4} more` : '') : 'No files declared'}</span>
+      {children}
     </div>
   )
 }
 
-/** True while a request is neither resolved nor withdrawn. */
-export const pending = (r: CoordinationRequest) => r.status !== 'resolved' && r.status !== 'withdrawn'
+function TimelineRow({ row }: { row: Row }) {
+  return (
+    <li className={`in-row is-${row.kind}${row.tone ? ` is-${row.tone}` : ''}`}>
+      <span className="in-dot" aria-hidden="true">
+        {row.kind === 'agent' ? <AgentMark agent={row.agent ?? ''} /> : row.kind === 'notice' ? <Icon name={row.tone === 'ok' ? 'check2' : 'sign-intersection-y'} /> : row.kind === 'receipt' ? <Icon name="check2" /> : row.kind === 'omitted' ? <Icon name="three-dots" /> : null}
+      </span>
+      <span className="in-rwho">
+        {row.who} <span>{row.did}</span>
+      </span>
+      <span className="in-rtime">{row.at ? <Ago at={row.at} /> : null}</span>
+      {row.text && <span className={`in-what${row.quote ? ' is-quote' : ''}`}>{row.text}</span>}
+    </li>
+  )
+}
+
+/** What a person already sent from this page that the Hub's list may not show yet. */
+export interface Local {
+  /** `sending` while the Hub has it; `sent` once it answered; `error` if it refused. */
+  status: 'sending' | 'sent' | 'error'
+  message?: string
+  /** A sentence that stays beside the timeline once sent. */
+  done?: string
+  rows?: Row[]
+}
+
+/** A prompt to paste, for a handoff request, in the same words as the other next steps. */
+function handoffStep(t: Thread): NextStep | null {
+  const h = t.handoff
+  if (!h || h.state !== 'pending') return null
+  const path = clean(h.path)
+  return h.holder.mine
+    ? { human: `Tell your ${agentName(h.holder.agent)} what to do with ${path}`, decides: [h.holder.login], prompts: [{ for: `your ${agentName(h.holder.agent)}`, login: h.holder.login, agent: h.holder.agent, text: `Another agent asked you to hand over the file ${path}. Call agentscm_handoff with that path and accept true to hand it over, or accept false with a one-line reason to keep it. ${DATA_NOTE}` }] }
+    : { human: `Waiting for ${named(h.holder.login, h.holder.agent, h.requester.login)} to answer`, prompts: [{ for: `your ${agentName(h.requester.agent)}`, login: h.requester.login, agent: h.requester.agent, text: `You asked ${h.holder.login}’s agent for the file ${path}. Repeat the edit to see whether it was handed over, or work on something else first. ${DATA_NOTE}` }] }
+}
+
+function stepFor(t: Thread): NextStep | null {
+  if (t.request) return requestStep(t.request)
+  if (t.overlap) return overlapSteps(t.overlap)
+  return handoffStep(t)
+}
+
+/* ---------- answering ---------- */
+
+interface Draft {
+  choice: string | null
+  note: string
+}
+
+function ReplyBar({ thread, draft, local, onDraft, onSend, canSend }: { thread: Thread; draft: Draft; local: Local | undefined; onDraft: (d: Draft) => void; onSend: () => void; canSend: boolean }) {
+  const plan = thread.reply!
+  const mineAgent = thread.mine.agent
+  const them = thread.theirs ? thread.theirs.login : 'the other'
+  const choices = plan.kind === 'coordination' ? REPLY_CHOICES.map((c) => ({ id: c.kind as string, label: c.label })) : [{ id: 'hand', label: 'Hand it over' }, { id: 'keep', label: 'Keep it' }]
+  const choice = draft.choice ?? choices[0]!.id
+  const sending = local?.status === 'sending'
+  if (!canSend)
+    return (
+      <div className="in-reply">
+        <p className="in-foot">
+          <Icon name="person-lock" /> Sign in on the web to answer for your {agentName(mineAgent)} from here. Until then, copy a prompt and paste it into the agent.
+        </p>
+      </div>
+    )
+  return (
+    <form
+      className="in-reply"
+      onSubmit={(e) => {
+        e.preventDefault()
+        if (!sending) onSend()
+      }}
+    >
+      <span className="in-lbl">
+        <Icon name="send" /> Answer as your {agentName(mineAgent)}
+      </span>
+      <div className="in-choice" role="group" aria-label="Your answer">
+        {choices.map((c) => (
+          <button key={c.id} type="button" aria-pressed={c.id === choice} onClick={() => onDraft({ ...draft, choice: c.id })}>
+            {c.label}
+          </button>
+        ))}
+      </div>
+      <div className="in-send">
+        <input aria-label="Note" value={draft.note} maxLength={plan.kind === 'coordination' ? 500 : 200} onChange={(e) => onDraft({ ...draft, note: e.target.value })} placeholder={`Add a note for ${them}’s agent (optional)`} />
+        <button type="submit" className="in-go" disabled={sending}>
+          <Icon name="send" /> {sending ? 'Sending…' : 'Send'}
+        </button>
+      </div>
+      {local?.status === 'error' && (
+        <p className="in-err" role="alert">
+          <Icon name="exclamation-triangle" /> {local.message}
+        </p>
+      )}
+      <p className="in-foot">
+        It reaches {them}’s agent at its next edit. Nothing here merges or approves work.
+      </p>
+    </form>
+  )
+}
+
+/* ---------- the pane ---------- */
+
+function Pane({ thread, local, draft, canSend, handoff, ask, onDraft, onSend, onAsk, hide }: { thread: Thread; local: Local | undefined; draft: Draft; canSend: boolean; handoff?: Handoff; ask: ReturnType<typeof askOption>; onDraft: (d: Draft) => void; onSend: () => void; onAsk: () => void; hide: ReactNode }) {
+  const step = stepFor(thread)
+  const st = thread.request ? stage(thread.request) : null
+  // What was just sent joins the timeline at once; what happens next stays last.
+  const everything = [...thread.rows, ...(local?.rows ?? [])]
+  const rows = [...everything.filter((r) => r.kind !== 'pending'), ...everything.filter((r) => r.kind === 'pending')]
+  return (
+    <div className="in-panebody" aria-label={thread.title}>
+      <div className="in-phead">
+        <p className="in-kind">
+          <span className={`rp-chip is-sm${thread.tone ? ` is-${thread.tone}` : ''}`}>
+            <Icon name={thread.icon} />
+          </span>
+          {thread.label}
+          {st && (
+            <Pill tone={st.tone} icon={st.icon}>
+              {st.label}
+            </Pill>
+          )}
+          {hide}
+        </p>
+        <h2 className="in-say">
+          <Sentence say={thread.say} />
+        </h2>
+        <div className="in-sides">
+          <Side side={thread.mine} />
+          {thread.theirs && (
+            <Side side={thread.theirs}>
+              {ask && thread.theirs && !local?.rows?.length && (
+                <button type="button" className="in-lnk" onClick={onAsk} disabled={local?.status === 'sending'}>
+                  Ask {named(ask.holder.login, ask.holder.agent, null)} to hand it over
+                </button>
+              )}
+            </Side>
+          )}
+        </div>
+      </div>
+      {thread.notes.map((n) => (
+        <Notice key={n} title={n} />
+      ))}
+      <ol className="in-tl" aria-label="What has happened">
+        {rows.map((r) => (
+          <TimelineRow key={r.key} row={r} />
+        ))}
+      </ol>
+      {thread.reply ? (
+        <ReplyBar thread={thread} draft={draft} local={local} canSend={canSend} onDraft={onDraft} onSend={onSend} />
+      ) : (
+        local?.done && (
+          <div className="in-reply">
+            <p className="in-done" role="status">
+              <Icon name="send" /> {local.done}
+            </p>
+          </div>
+        )
+      )}
+      {local?.status === 'error' && !thread.reply && (
+        <p className="in-err in-padded" role="alert">
+          <Icon name="exclamation-triangle" /> {local.message}
+        </p>
+      )}
+      {step && (
+        <details className="in-prompt" data-tour="inbox-talk">
+          <summary>Copy a prompt instead</summary>
+          <NextStepView step={step} viewer={handoff?.me} repo={handoff?.repo} originUrl={handoff?.originUrl} />
+        </details>
+      )}
+    </div>
+  )
+}
+
+/* ---------- the list ---------- */
+
+function ListItem({ thread, selected, onPick, nowMs }: { thread: Thread; selected: boolean; onPick: () => void; nowMs: number }) {
+  const sides = [thread.mine.agent, thread.theirs?.agent ?? null]
+  return (
+    <button type="button" className={thread.group === 'needs' ? 'is-u' : undefined} aria-current={selected} onClick={onPick}>
+      <span className="in-t">{thread.title}</span>
+      <span className="in-when">{relative(thread.at, nowMs)}</span>
+      <span className="in-s">
+        {sides.map((a, i) => (a ? <AgentMark key={i} agent={a} /> : null))}
+        <span>{thread.status}</span>
+      </span>
+    </button>
+  )
+}
+
+function matches(t: Thread, q: string): boolean {
+  const n = q.trim().toLocaleLowerCase()
+  if (!n) return true
+  const sides = [t.mine, t.theirs].flatMap((s) => (s ? [s.login, s.agent, s.task ?? '', ...s.files] : []))
+  const r = t.request
+  const more = r ? [r.id, r.proposal.request_key ?? '', ...r.proposal.scope, ...r.responses.flatMap((x) => [x.note ?? '', RESPONSE_LABEL[x.kind]])] : []
+  return [t.title, t.label, ...t.files, ...sides, ...more].some((v) => v.toLocaleLowerCase().includes(n))
+}
+
+/* ---------- the page ---------- */
+
+export interface LiveContext {
+  agents: LiveAgent[]
+  contested: Contested[]
+}
 
 /** Inbox: every declared-scope overlap and directed request, the conversations agents have to have. */
-export function InboxPage({ token, overview, handoff }: { token: string; overview: Poll<WorkOverview>; handoff?: Handoff }) {
+export function InboxPage({ token, overview, handoff, session = null, live = null }: { token: string; overview: Poll<WorkOverview>; handoff?: Handoff; session?: BrowserSession | null; live?: LiveContext | null }) {
+  const me = handoff?.me ?? null
+  const repo = handoff?.repo ?? null
   const [search, setSearch] = useState('')
-  const ov = overview.kind === 'ready' ? overview.value : null
-  const requests = usePoll((signal) => fetchCoordination(token, signal, { limit: 10, activeOnly: true }), 15_000, `inbox|${token}`)
+  const [picked, setPicked] = useState<string | null>(null)
+  const [nonce, setNonce] = useState(0)
+  const [drafts, setDrafts] = useState<Record<string, Draft>>({})
+  const [locals, setLocals] = useState<Record<string, Local>>({})
+  const [overrides, setOverrides] = useState<Record<string, CoordinationRequest>>({})
+  const [handoffOverrides, setHandoffOverrides] = useState<Record<string, MyHandoff>>({})
+  const ops = useRef<Record<string, string>>({})
+  const nowMs = useNow()
+  const now = nowMs / 1000
   const hidden = useHidden()
-  const open = requests.kind === 'ready' ? requests.value.requests.filter((r) => pending(r) && !hidden.has(requestHideKey(r))) : []
+  const [showHidden, setShowHidden] = useState(false)
+  const [closed, setClosed] = useState(false)
+
+  const ov = useLast(overview)
+  const signals = useHideable((ov?.current ?? []).filter((i) => i.claim_status !== 'active' || i.scope.length === 0), signalHideKey)
+  const requestsPoll = usePoll((signal) => fetchCoordination(token, signal, { limit: 100, activeOnly: !closed }), 15_000, `inbox|${token}|${closed}|${nonce}`)
+  const handoffsPoll = usePoll((signal) => (session && repo ? fetchMyHandoffs(session, repo, signal) : Promise.resolve([] as MyHandoff[])), 15_000, `inbox-handoffs|${token}|${session?.login ?? ''}|${repo ?? ''}|${nonce}`)
+  const requestsNow = useLast(requestsPoll)
+  const handoffsNow = useLast(handoffsPoll)
+
+  const requests = useMemo(() => (requestsNow?.requests ?? []).map((r) => (overrides[r.id] && overrides[r.id]!.updated_seq > r.updated_seq ? overrides[r.id]! : r)), [requestsNow, overrides])
+  const handoffs = useMemo(() => (handoffsNow ?? []).map((h) => (h.state === 'pending' && handoffOverrides[h.id] ? handoffOverrides[h.id]! : h)), [handoffsNow, handoffOverrides])
+  const all = useMemo(() => buildThreads({ me, overview: ov, requests, handoffs }), [me, ov, requests, handoffs])
+  const searched = all.filter((t) => matches(t, search))
+  const hiddenCount = searched.filter((t) => hidden.has(t.hideKey)).length
+  const threads = showHidden ? searched : searched.filter((t) => !hidden.has(t.hideKey))
+  const active = threads.filter((t) => t.group !== 'earlier')
+  const selected = threads.find((t) => t.id === picked) ?? active[0] ?? null
+  const needs = all.filter((t) => t.group === 'needs' && !hidden.has(t.hideKey)).length
+  const waiting = all.filter((t) => t.group === 'waiting' && !hidden.has(t.hideKey)).length
+
+  // A reload after a send, so the Hub's own record replaces what was shown at once.
+  useEffect(() => {
+    if (Object.keys(locals).length === 0) return
+    const t = window.setTimeout(() => setNonce((n) => n + 1), 1500)
+    return () => window.clearTimeout(t)
+  }, [locals])
+
+  // On a phone the conversation sits under the list: bring it into view.
+  const pane = useRef<HTMLElement>(null)
+  const pick = (id: string) => {
+    setPicked(id)
+    const el = pane.current
+    if (el && typeof el.scrollIntoView === 'function' && window.matchMedia?.('(max-width: 760px)').matches) el.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+  }
+  const setLocal = (id: string, local: Local) => setLocals((l) => ({ ...l, [id]: local }))
+  const canSend = !!session
+  const draftOf = (t: Thread): Draft => drafts[t.id] ?? { choice: null, note: '' }
+
+  const send = async (t: Thread) => {
+    if (!session || !t.reply) return
+    // Stay on this conversation even when the answer moves it to another group.
+    setPicked(t.id)
+    const draft = draftOf(t)
+    const plan = t.reply
+    const note = draft.note.trim()
+    setLocal(t.id, { status: 'sending' })
+    try {
+      if (plan.kind === 'coordination') {
+        const kind = (draft.choice ?? REPLY_CHOICES[0]!.kind) as CoordinationResponseKind
+        // Sending the same answer again after a failure reuses the key, so the Hub replays it instead of answering twice.
+        const key = `${t.id}|${kind}|${note}`
+        const op = (ops.current[key] ??= operationId())
+        const updated = await replyToRequest(session, { token: plan.target.lead.token, request_id: plan.request.id, operation_id: op, target_work_id: plan.target.work_id, session: plan.target.lead.session, expected_updated_seq: plan.request.updated_seq, kind, ...(note ? { note } : {}) })
+        setOverrides((o) => ({ ...o, [updated.id]: updated }))
+        const label = REPLY_CHOICES.find((c) => c.kind === kind)!.label
+        setLocal(t.id, { status: 'sent', done: `Sent as your ${agentName(plan.target.lead.agent)}: ${label}. ${t.theirs?.login ?? 'The other'}’s agent sees it at its next edit.` })
+      } else {
+        const accept = (draft.choice ?? 'hand') === 'hand'
+        const h = plan.handoff
+        const outcome = await answerHandoff(session, { token: h.holder.token!, ...(h.holder.session ? { session: h.holder.session } : {}), path: h.path, accept, ...(note && !accept ? { reason: note } : {}) })
+        const done = outcome === 'granted' || outcome === 'declined'
+        if (done) setHandoffOverrides((o) => ({ ...o, [h.id]: { ...h, state: outcome, decidedAt: nowSeconds(), reply: note && !accept ? note : null, answeredViaHub: true, answeredViaSlack: false, requesterTold: false } }))
+        setLocal(t.id, { status: done ? 'sent' : 'error', ...(done ? { done: `Sent as your ${agentName(h.holder.agent)}: ${accept ? 'handed it over' : 'kept it'}. ${h.requester.login}’s agent sees it at its next edit.` } : { message: OUTCOME_SENTENCE[outcome] }) })
+      }
+    } catch (e) {
+      setLocal(t.id, { status: 'error', message: sendError(e) })
+    }
+  }
+
+  const ask = async (t: Thread, option: NonNullable<ReturnType<typeof askOption>>) => {
+    if (!session) return
+    setPicked(t.id)
+    setLocal(t.id, { status: 'sending' })
+    try {
+      const outcome = await askHandoff(session, { token: option.token, path: option.path })
+      const ok = outcome === 'requested' || outcome === 'already_asked'
+      const who = named(option.holder.login, option.holder.agent, null)
+      const rows: Row[] = ok
+        ? [
+            { key: 'sent-ask', kind: 'agent', tone: 'me', agent: option.mine.agent, who: `You, as your ${agentName(option.mine.agent)}`, did: `asked ${who} to hand it over · from the Hub`, at: nowSeconds(), text: option.path, quote: false },
+            { key: 'sent-wait', kind: 'pending', tone: '', agent: option.holder.agent, who, did: 'sees it at its next edit', at: null, text: null, quote: false },
+          ]
+        : []
+      setLocal(t.id, { status: ok ? 'sent' : 'error', ...(ok ? { rows, done: outcome === 'requested' ? 'Asked. Their agent sees it at its next edit.' : OUTCOME_SENTENCE[outcome] } : { message: OUTCOME_SENTENCE[outcome] }) })
+    } catch (e) {
+      setLocal(t.id, { status: 'error', message: sendError(e) })
+    }
+  }
+
+  const ovReady = ov !== null
+  const partial = ovReady && !ov.overlaps_complete
+  const headline = !ovReady ? (overview.kind === 'error' ? 'The overlap count could not be loaded.' : 'Checking which tasks overlap…') : needs > 0 ? <><b>{plural(needs, 'conversation')}</b> {needs === 1 ? 'needs' : 'need'} you.</> : partial ? 'No overlap in this partial snapshot. An empty list is not an all-clear.' : waiting > 0 ? <>Nothing needs you. <b>{plural(waiting, 'conversation')}</b> {waiting === 1 ? 'is' : 'are'} waiting on others.</> : 'No two tasks plan to touch the same files, and no request is waiting.'
+
   return (
-    <div className="page">
-      <PageHead
-        question="Which overlaps need a conversation?"
-        answer={
-          ov ? (
-            ov.overlaps.length === 0 && open.length === 0 ? (
-              ov.overlaps_complete ? 'No two tasks plan to touch the same files, and no request is waiting.' : 'No overlap in this partial snapshot. An empty list is not an all-clear.'
-            ) : (
-              <>
-                {ov.overlaps.length > 0 && <><b>{plural(ov.overlaps.length, 'overlap')}</b> {ov.overlaps.length === 1 ? 'needs' : 'need'} a conversation. </>}
-                {open.length > 0 && <><b>{plural(open.length, 'request')}</b> {open.length === 1 ? 'is' : 'are'} waiting on another lead.</>}
-              </>
-            )
-          ) : overview.kind === 'error' ? 'The overlap count could not be loaded.' : 'Checking which tasks overlap…'
-        }
-        fact={<>{READING_CHANGES_NOTHING} Agents answer <Gloss term="directedRequest">requests</Gloss> themselves.</>}
-      />
+    <div className="page in-page">
+      <PageHead question="Which overlaps need a conversation?" answer={headline} live fact={<>Answers reach the agents’ running sessions at their next edit. Nothing here merges or approves work. {READING_CHANGES_NOTHING} {OVERLAP_IS_SIGNAL} Agents answer <Gloss term="directedRequest">requests</Gloss> themselves too.</>} />
       {overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
           {overview.message}
         </Notice>
       )}
       {!ov && overview.kind === 'loading' && <Skeleton rows={6} />}
+      {requestsPoll.kind === 'error' && !requestsNow && (
+        <Notice tone="bad" title="Could not load directed requests" action={<button className="btn btn-sm btn-outline-secondary" onClick={requestsPoll.retry}>Retry</button>}>
+          {requestsPoll.message}
+        </Notice>
+      )}
+      {requestsPoll.kind === 'ready' && requestsPoll.refreshError && <Notice title="Could not refresh requests">{requestsPoll.refreshError}</Notice>}
+      {handoffsPoll.kind === 'error' && session && <Notice title="Could not load file handoffs">{handoffsPoll.message}</Notice>}
+      {requestsNow?.retention_gap && <Notice title="Some request history is no longer retained" />}
+      {requestsNow && !requestsNow.complete && <Notice title="Only the newest requests are shown">More requests remain in the Hub’s history than this page loads at once.</Notice>}
+      {partial && <Notice title="Overlap list is incomplete">The current-work limit was reached, so more overlaps may exist. An empty list is not an all-clear.</Notice>}
       {ov && (
         <>
           <Search value={search} onChange={setSearch} placeholder="Search agents, tasks, or paths" />
-          <Coordination token={token} overview={ov} search={search} requestsFirst={open.length > 0} handoff={handoff} />
+          <div className="in-main">
+          <div className="in-wrap" id="box-requests">
+            <nav className="in-list" id="box-overlaps" aria-label="Conversations">
+              {GROUPS.map((g: Group) => {
+                const rows = threads.filter((t) => t.group === g)
+                if (rows.length === 0) return null
+                return (
+                  <div key={g} className="in-group">
+                    <h2 className="in-gh">{GROUP_TITLE[g]}</h2>
+                    {rows.map((t) => (
+                      <ListItem key={t.id} thread={t} selected={selected?.id === t.id} onPick={() => pick(t.id)} nowMs={nowMs} />
+                    ))}
+                  </div>
+                )
+              })}
+              {threads.length === 0 && <p className="in-none">Nothing recorded yet. Agents ask each other with <code>agentscm_ask</code> and declare files with <code>agentscm_start</code>.</p>}
+              <ShowHidden count={hiddenCount} show={showHidden} onShow={setShowHidden} />
+              <div className="form-check form-switch in-closed">
+                <input id="show-closed" className="form-check-input" type="checkbox" role="switch" checked={closed} onChange={(e) => setClosed(e.target.checked)} />
+                <label className="form-check-label small" htmlFor="show-closed">
+                  Include resolved & withdrawn requests
+                </label>
+              </div>
+            </nav>
+            <section className="in-pane" aria-label="Selected conversation" ref={pane}>
+              {selected ? (
+                <Pane
+                  key={selected.id}
+                  thread={selected}
+                  local={locals[selected.id]}
+                  draft={draftOf(selected)}
+                  canSend={canSend}
+                  handoff={handoff}
+                  ask={canSend && live ? askOption(selected, { me, agents: live.agents, contested: live.contested, handoffs }) : null}
+                  onDraft={(d) => setDrafts((all) => ({ ...all, [selected.id]: d }))}
+                  onSend={() => void send(selected)}
+                  onAsk={() => {
+                    const option = live ? askOption(selected, { me, agents: live.agents, contested: live.contested, handoffs }) : null
+                    if (option) void ask(selected, option)
+                  }}
+                  hide={(hidden.has(selected.hideKey) || isStale(selected.updatedAt, now)) && <HideButton k={selected.hideKey} hidden={hidden.has(selected.hideKey)} what={`“${selected.title}”`} />}
+                />
+              ) : (
+                <IdleScene partial={partial} />
+              )}
+            </section>
+          </div>
+          </div>
+          <details className="disclosure in-quiet">
+            <summary>Quiet agents and tasks with no stated files · {signals.rows.length - (signals.show ? signals.count : 0)}</summary>
+            <p className="small muted mt-2">Overlap checks can’t see these. You can hide an item once it’s a day old.</p>
+            {signals.rows.length === 0 ? (
+              <p className="small muted">Nothing else needs attention.</p>
+            ) : (
+              <ul className="plain-list">
+                {signals.rows.map((i) => (
+                  <li key={i.id} className={signals.isHidden(i) ? 'is-hidden' : undefined}>
+                    <WorkLink id={i.id}>{i.title}</WorkLink>
+                    <span className="muted small"> · {agentLabel(lead(i).agent)}</span>
+                    <div className="pills">
+                      {i.claim_status !== 'active' && <ClaimPill item={i} />}
+                      {i.scope.length === 0 && <Pill tone="muted" icon="question-circle">Scope unknown</Pill>}
+                      {(signals.isHidden(i) || isStale(Math.max(i.updated_at, i.last_checkin_at), now)) && <HideButton k={signalHideKey(i)} hidden={signals.isHidden(i)} what={`“${i.title}”`} />}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <ShowHidden count={signals.count} show={signals.show} onShow={signals.setShow} />
+          </details>
         </>
       )}
     </div>

@@ -21,6 +21,16 @@ Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no
 - `hook` reads an agent's hook JSON on standard input and prints that agent's reply; it always exits 0, even on usage errors, and prints a valid "no information" reply when the hub cannot be consulted. `init-repo` prints plain text, shows a diff and asks before writing; without a terminal it needs `--yes`. See [supported agents](../agents.md).
 - `quickstart` and `uninstall` are guided and print plain text. Without a terminal they need `--yes`; otherwise they refuse and list their flags. `uninstall` exits nonzero when it could not undo something, and keeps its record of it.
 
+### `walkthrough` (experimental, Unix)
+
+`agentscm walkthrough map --root PATH --repository NAMESPACE --base FULL_COMMIT --head FULL_COMMIT
+[--current-head FULL_COMMIT]` emits a deterministic bounded Git source map without opening a
+walkthrough store, reading capture evidence or calling a model. It targets 4 KiB with an 8 KiB hard
+ceiling including the newline, preserves exact source identities, reports source applicability and
+separate discovery/display omissions, and defers evidence verification. Source remains available
+through ordinary read/search/diff tools beyond this packet. See [change walkthroughs](../change-walkthrough.md)
+for preview ranges, limits and the separate authored `create`, `list`, `show`, `context` and `source` commands.
+
 ### `promise` (experimental)
 
 `agentscm promise list [--limit N] [--after ID]`, `show ID`, and

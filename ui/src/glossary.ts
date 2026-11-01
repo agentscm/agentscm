@@ -36,7 +36,7 @@ export const GLOSS: Record<Term, { gloss: string; docs?: string }> = {
   checkpoint: { gloss: 'A progress report the agent wrote: progress, a decision, a blocker, a pause, a handover or a finish.' },
   handover: { gloss: 'The lead says the task is ready for another agent to take over.' },
   handoff: { gloss: 'One agent asked another for a single file. Unanswered requests lapse after 30 minutes. Experimental.' },
-  directedRequest: { gloss: 'A request one task’s agent sent to another task’s lead about overlapping files. Agents answer it; you can’t reply from this page.' },
+  directedRequest: { gloss: 'A request one task’s agent sent to another task’s lead about overlapping files. Agents answer it; you can answer for your own agent from the Inbox.' },
   plainGit: { gloss: 'Started from an agent’s request, not from a GitHub or GitLab issue.' },
   reportedFinished: { gloss: 'The agent says it is finished. That is not a check, a review or a merge.' },
   landed: { gloss: 'Merged into the base branch on GitHub, as the hub last saw it.' },

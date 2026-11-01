@@ -1,6 +1,8 @@
-import { act, fireEvent, render, renderHook, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { InstallOffer } from '../../src/InstallOffer.tsx'
+import { TourProvider } from '../../src/tour/Tour.tsx'
+import type { HubData } from '../../src/useHub.ts'
 import { dockTip, installHint, installKind, listenForLaunches, routeLaunch, setBadge, useAppBadge, useInstall, watchTitleBar, type InstallEnv } from '../../src/install.ts'
 
 const SAFARI_MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15'
@@ -102,6 +104,22 @@ describe('InstallOffer', () => {
     setNavigator({ userAgent: SAFARI_IOS })
     render(<InstallOffer />)
     expect(screen.getByText('Tap Share, then Add to Home Screen.')).toBeTruthy()
+  })
+
+  it('waits for the Dashboard’s tips only while some are on the page, never for tips that are not showing', () => {
+    const data: HubData = { whoami: null, work: null, activity: null, health: null, fresh: new Set(), lastOk: null, failing: false }
+    const inTour = (tipsHere: boolean) => <TourProvider section="home" data={data} d={null} overview={null}><InstallOffer tipsHere={tipsHere} /></TourProvider>
+    const tour = (on: boolean) => localStorage.setItem('agentscm.tour.v1', JSON.stringify({ welcomeSeen: !on, welcomeOff: !on, autoplay: [], sectionsSeen: [], helpSeen: false }))
+    tour(true)
+    const waiting = render(inTour(true))
+    expect(screen.queryByText(/in your Dock/)).toBeNull() // the tips come first
+    waiting.unmount()
+    render(inTour(false)) // another page: no tips here, so no waiting
+    expect(screen.getByText(/in your Dock/)).toBeTruthy()
+    cleanup()
+    tour(false)
+    render(inTour(true)) // the default: the introduction is off
+    expect(screen.getByText(/in your Dock/)).toBeTruthy()
   })
 
   it('stays gone once dismissed, across a new mount', () => {

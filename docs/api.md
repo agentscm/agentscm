@@ -43,6 +43,20 @@ own routes, including the agent MCP endpoint `POST /mcp` and the hook endpoints
 `POST /v1/hub/hook/{agent}`; see the [hub guide](hub.md#routes) and
 [agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints).
 
+## Hub: people answering for their own agent
+
+Browser-session routes for the Hub's Inbox page; the web sign-in cookie, and for a change its
+`x-csrf-token`. Each names one of the signed-in person's own writable agent tokens; another
+person's, a read-only or an unknown token is 403 `not_your_agent`. See the
+[Hub guide](hub.md) for the bodies and replies.
+
+| Route | Effect |
+|---|---|
+| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"` |
+| `POST /v1/hub/session/handoff/answer` | Hand over or keep a file asked of the person's agent |
+| `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
+| `GET /v1/hub/session/handoffs?repository=…` | The person's 50 newest file handoffs there, either side |
+
 ## Hub PR context
 
 | Route | Token and effect |

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agentscm::repo_explorer::walkthrough::Store as WalkthroughStore;
 use agentscm::repo_explorer::{Explorer, evidence::EvidenceExplorer, git::GitExplorer};
 use agentscm::{Error, Result};
 use axum::Router;
@@ -65,6 +66,10 @@ pub(super) fn routes() -> Router<AppState> {
 #[derive(Clone, Copy)]
 enum Operation {
     Summary,
+    Walkthroughs,
+    Walkthrough,
+    WalkthroughSource,
+    WalkthroughContext,
     Tree,
     File,
     History,
@@ -79,6 +84,10 @@ impl Operation {
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "summary" => Self::Summary,
+            "walkthroughs" => Self::Walkthroughs,
+            "walkthrough" => Self::Walkthrough,
+            "walkthrough-source" => Self::WalkthroughSource,
+            "walkthrough-context" => Self::WalkthroughContext,
             "tree" => Self::Tree,
             "file" => Self::File,
             "history" => Self::History,
@@ -94,6 +103,9 @@ impl Operation {
     fn fields(self) -> &'static [&'static str] {
         match self {
             Self::Summary => &["ref"],
+            Self::Walkthroughs => &["limit"],
+            Self::Walkthrough | Self::WalkthroughContext => &["id", "current_head"],
+            Self::WalkthroughSource => &["id", "anchor"],
             Self::Tree => &["commit", "path", "after", "limit"],
             Self::File => &["commit", "path"],
             Self::History => &["commit", "path", "cursor", "limit"],
@@ -232,6 +244,30 @@ fn project(
 ) -> Result<Value> {
     let optional = |name| fields.get(name).map(String::as_str);
     let value = match operation {
+        Operation::Walkthroughs => {
+            serde_json::to_value(WalkthroughStore::for_checkout(&explorer.git)?.list(limit)?)?
+        }
+        Operation::Walkthrough => {
+            serde_json::to_value(WalkthroughStore::for_checkout(&explorer.git)?.show(
+                &explorer.git,
+                required(fields, "id")?,
+                optional("current_head"),
+                explorer.evidence.as_ref(),
+            )?)?
+        }
+        Operation::WalkthroughSource => {
+            serde_json::to_value(WalkthroughStore::for_checkout(&explorer.git)?.source(
+                &explorer.git,
+                required(fields, "id")?,
+                required(fields, "anchor")?,
+            )?)?
+        }
+        Operation::WalkthroughContext => WalkthroughStore::for_checkout(&explorer.git)?.context(
+            &explorer.git,
+            required(fields, "id")?,
+            optional("current_head"),
+            explorer.evidence.as_ref(),
+        )?,
         Operation::Summary => serde_json::to_value(explorer.git.summary(optional("ref"))?)?,
         Operation::Tree => serde_json::to_value(explorer.git.tree(
             required(fields, "commit")?,

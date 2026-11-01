@@ -661,6 +661,17 @@ impl FromRequestParts<HubState> for HumanSession {
 }
 
 impl HumanSession {
+    /// The person behind a web-page sign-in: the cookie, and for a change the CSRF token. A
+    /// computer's or a script's bearer session is refused, so an agent or an installed tool
+    /// cannot act through routes that are only for the Hub's own pages.
+    pub(super) fn web_user(&self) -> std::result::Result<&User, ApiError> {
+        if self.0.browser.is_some() {
+            Ok(&self.0.user)
+        } else {
+            Err(forbidden().with_message("Only the Hub's web pages do this"))
+        }
+    }
+
     pub(super) fn admin(&self) -> std::result::Result<&Human, ApiError> {
         if self.0.admin {
             Ok(&self.0)
@@ -1498,13 +1509,19 @@ async fn providers(State(state): State<HubState>) -> Json<Value> {
     Json(json!({"providers": state.login.enabled(), "browser_only": browser_only}))
 }
 
-async fn session(HumanSession(human): HumanSession) -> Json<Value> {
-    let mut reply = json!({"user": user_json(&human.user), "admin": human.admin,
-        "expires_at": human.expires_at});
+async fn session(
+    State(state): State<HubState>,
+    HumanSession(human): HumanSession,
+) -> ApiResult<Json<Value>> {
+    let (store, id) = (state.store.clone(), human.user.id.clone());
+    let joined_at = blocking(&state, move || store.user_created_at(&id)).await?;
+    let mut user = user_json(&human.user);
+    user["joined_at"] = json!(joined_at);
+    let mut reply = json!({"user": user, "admin": human.admin, "expires_at": human.expires_at});
     if let Some(browser) = &human.browser {
         reply["csrf_token"] = json!(browser.csrf);
     }
-    Json(reply)
+    Ok(Json(reply))
 }
 
 async fn logout(

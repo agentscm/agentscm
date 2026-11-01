@@ -1,0 +1,80 @@
+/* G layout over live data: rail sub-items, the classic-layout switch, embedded classic pages, and the few live-only
+   pieces (lifecycle list, code-map tiles, skeletons). Twilight tokens only; motion rules come from g.css. */
+
+.gl-shell .g-railgroup + .g-railgroup { margin-top: 2px; }
+.g-subs { list-style: none; margin: 2px 0 8px 22px; padding: 0 0 0 14px; border-left: 1px solid rgba(255, 255, 255, 0.1); display: grid; gap: 1px; }
+.g-subs a { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 10px; color: var(--frame-dim); font-size: 13px; text-decoration: none; transition: background-color 0.15s, color 0.15s; }
+.g-subs a .bi { font-size: 13px; }
+.g-subs a:hover { background: rgba(255, 255, 255, 0.05); color: #fff; }
+.g-subs a.on { color: #fff; font-weight: 600; background: rgba(255, 255, 255, 0.08); }
+.g-subs a.on .bi { color: var(--frame-active-icon); }
+.gl-shell .side.is-compact .g-subs { display: none; }
+.g-classic { border: 1px solid rgba(255, 255, 255, 0.16); background: none; color: var(--frame-ink); border-radius: 999px; padding: 6px 12px; font-size: 13px; display: inline-flex; align-items: center; gap: 6px; transition: background-color 0.15s; }
+.g-classic:hover { background: rgba(255, 255, 255, 0.08); }
+.g-repo-link { text-decoration: none; padding: 6px 10px; border-radius: 999px; }
+.g-repo-link:hover { background: rgba(255, 255, 255, 0.06); color: var(--frame-ink); }
+@media (max-width: 760px) { .g-classic span { display: none; } }
+
+/* classic pages render unchanged inside this frame */
+.g-classic-page { display: contents; }
+
+.g-two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--hub-gap, 32px); align-items: start; }
+@media (max-width: 1100px) { .g-two { grid-template-columns: minmax(0, 1fr); } }
+
+/* the lifecycle and how each step is known */
+.g-life { list-style: none; margin: 0; padding: 0; display: grid; }
+.g-life li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 11px 6px; border-top: 1px solid var(--hub-rule); }
+.g-life li:first-child { border-top: 0; }
+.g-life li.now { background: var(--hub-brand-soft); border-radius: 12px; border-top-color: transparent; }
+.g-life li.now + li { border-top-color: transparent; }
+.g-life-main { display: grid; gap: 1px; min-width: 0; }
+.g-life-main b { font-size: 14.5px; }
+.g-life-main > span { font-size: 13.5px; font-weight: 500; }
+.g-life-main small { font-size: 12.5px; color: var(--hub-text-2); }
+.g-life-proof { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 640px) { .g-life li { grid-template-columns: auto minmax(0, 1fr); } .g-life-proof { grid-column: 2; justify-content: flex-start; } }
+
+/* the full record, one click away */
+.g-full { display: grid; gap: 12px; }
+.g-full-toggle { justify-self: start; display: inline-flex; gap: 8px; align-items: center; border: 1px solid var(--hub-rule-strong); background: var(--hub-surface); color: var(--hub-text); border-radius: 999px; padding: 9px 16px; font-size: 14px; font-weight: 500; min-height: 44px; transition: border-color 0.15s; }
+.g-full-toggle:hover { border-color: var(--hub-brand); }
+
+/* code map: the Hub's own map tiles in an auto-fill grid */
+.g-areas { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); grid-auto-rows: 132px; gap: 12px; }
+.g-area .tile-foot { display: flex; justify-content: space-between; align-items: center; gap: 6px; font-size: 12.5px; color: var(--hub-text-2); }
+.gl-shell .g-map-wrap { background-image: none; }
+
+/* process: an available skill reads name, then summary, then its state */
+.g-flowitem-avail { flex-direction: column; align-items: flex-start; gap: 6px; }
+.g-flowitem-avail small { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* process: the repository list's white pill (rp-open), as a link on the violet canvas */
+.g-canvas .rp-open { display: inline-flex; align-items: center; text-decoration: none; }
+.g-canvas .rp-open:hover { color: var(--frame); }
+
+/* process: empty state on the violet canvas */
+.g-canvas-empty { justify-items: center; text-align: center; padding: 36px 28px; gap: 12px; }
+.g-canvas-empty h2 { font-size: 20px; font-weight: 300; margin: 0; }
+.g-canvas-empty p { color: var(--frame-dim); max-width: 56ch; margin: 0; }
+.g-canvas-empty .g-ring { color: var(--frame-active-icon); }
+.g-runs { display: grid; gap: 6px; }
+/* contributions: one surface split by hairlines, not six separate cards */
+.g-counts-wide { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 1px; background: var(--hub-rule); border-radius: var(--r); overflow: hidden; box-shadow: var(--card); }
+.g-counts-wide .g-count { border-radius: 0; box-shadow: none; padding: 22px 24px; }
+
+/* step headers drop their icons before their words; below 700px the words go and the icons stay (g.css) */
+@container (min-width: 701px) and (max-width: 1100px) { .g-track .px-stagecell .bi { display: none; } }
+
+/* phones: the repository name truncates and the layout switch lives in the drawer, so the top bar never overflows */
+.g-repo-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.g-repo-link { min-width: 0; }
+.g-classic-rail { display: none; border: 0; background: none; width: 100%; text-align: left; }
+@media (max-width: 640px) {
+  .gl-shell .topbar .g-classic { display: none; }
+  .gl-shell .g-classic-rail { display: flex; }
+  .g-repo-link .bi:first-child { display: none; }
+  .g-repo-link { padding: 6px 4px; flex: 0 1 auto; }
+}
+
+/* long notes keep a readable measure on wide screens */
+.g-measure { max-width: 72ch; }

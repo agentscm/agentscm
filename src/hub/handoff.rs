@@ -14,6 +14,45 @@ pub(super) const MAX_OPEN: usize = 3;
 /// Handoff lines one touch delivers per side; the rest wait for the next touch.
 pub(super) const PER_TOUCH: i64 = 8;
 
+/// Who made a request or gave an answer: the agent itself, or the person who owns it, acting for
+/// it on the Hub's web pages or from a Slack button. The record says which, so an answer is never
+/// passed off as the agent's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    Agent,
+    Hub,
+    /// Only answers: Slack files no requests.
+    Slack,
+}
+
+impl Via {
+    pub(super) fn hub(self) -> bool {
+        self == Self::Hub
+    }
+
+    pub(super) fn slack(self) -> bool {
+        self == Self::Slack
+    }
+
+    /// From the two stored flags.
+    pub(super) fn stored(hub: bool, slack: bool) -> Self {
+        match (hub, slack) {
+            (_, true) => Self::Slack,
+            (true, false) => Self::Hub,
+            (false, false) => Self::Agent,
+        }
+    }
+
+    /// What an event's `via` says, absent for the agent itself.
+    fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Agent => None,
+            Self::Hub => Some("hub"),
+            Self::Slack => Some("slack"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Asked {
     Requested {
@@ -56,6 +95,51 @@ pub struct HandoffNote {
     pub reason: Option<String>,
     /// The touched session's name.
     pub session: String,
+    /// Whether the other side's person asked or answered from the Hub's web pages or Slack, not
+    /// their agent.
+    pub via: Via,
+}
+
+/// One handoff as its owner sees it on the Hub's web pages: either side may be their agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffView {
+    pub id: String,
+    pub path: String,
+    /// `pending`, `granted`, `declined` or `lapsed` (a pending request past the hold cap).
+    pub state: &'static str,
+    pub note: Option<String>,
+    /// The holder's decline reason.
+    pub reply: Option<String>,
+    pub created_at: i64,
+    pub decided_at: Option<i64>,
+    /// The holder's session has been told of the request / the requester of the answer.
+    pub holder_told: bool,
+    pub requester_told: bool,
+    pub asked_via_hub: bool,
+    pub answered_via_hub: bool,
+    pub answered_via_slack: bool,
+    pub requester: HandoffParty,
+    pub holder: HandoffParty,
+}
+
+/// An agent session on one side of a handoff, with its owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffParty {
+    pub token: String,
+    pub session: String,
+    pub agent: String,
+    pub owner: String,
+    pub login: String,
+}
+
+/// A stored request's state, with a pending one past the hold cap shown as lapsed.
+pub(super) fn view_state(state: &str, created_at: i64, now: i64) -> &'static str {
+    match state {
+        "granted" => "granted",
+        "declined" => "declined",
+        "pending" if created_at > cutoff(now) => "pending",
+        _ => "lapsed",
+    }
 }
 
 /// An open request as the answering backend reads it.
@@ -177,10 +261,13 @@ impl Event {
         path: &str,
         note: Option<&str>,
         holder: &Intent,
-        auto: bool,
+        (auto, via): (bool, Via),
     ) -> Result<Self> {
-        let data = json!({"request": request, "paths": [path], "note": note, "session": session,
+        let mut data = json!({"request": request, "paths": [path], "note": note, "session": session,
             "auto": auto, "to": {"agent": holder.agent, "login": holder.owner.login}});
+        if let Some(via) = via.tag() {
+            data["via"] = json!(via);
+        }
         Self::new("handoff_request", token, data)
     }
 
@@ -192,10 +279,14 @@ impl Event {
         path: &str,
         request: &Request,
         reason: Option<&str>,
+        via: Via,
     ) -> Result<Self> {
-        let data = json!({"request": request.id, "paths": [path], "session": session,
+        let mut data = json!({"request": request.id, "paths": [path], "session": session,
             "from": {"agent": request.agent, "login": request.login, "token": request.requester_token},
             "reason": reason});
+        if let Some(via) = via.tag() {
+            data["via"] = json!(via);
+        }
         Self::new(kind, holder, data)
     }
 }

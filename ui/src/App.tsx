@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { ComputerNotices, LocalComputerProvider } from './ComputerBar.tsx'
 import { derive } from './derive.ts'
 import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
@@ -7,6 +7,7 @@ import { fragmentLinkRefused, LINK_REFUSED } from './fragmentToken.ts'
 import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, signInAfterRefusal, type Density, type ThemePref } from './storage.ts'
 import { useHub } from './useHub.ts'
 import { useHidden } from './dismiss.tsx'
+import { needHideKey } from './needs.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
@@ -39,6 +40,10 @@ import { TourProvider } from './tour/Tour.tsx'
 import { InstallOffer } from './InstallOffer.tsx'
 import { useAppBadge } from './install.ts'
 import { hashPath } from './Pager.tsx'
+import { GLive } from './g/GLive.tsx'
+import { gAnswer } from './g/answers.tsx'
+import { useLayout } from './g/layout.ts'
+import { needsYou } from './needs.ts'
 
 const darkQuery = '(prefers-color-scheme: dark)'
 const subscribeDark = (cb: () => void) => {
@@ -191,14 +196,78 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     settings: { text: 'This browser', tone: 'muted' },
   }
 
+  const [layout, setLayout] = useLayout()
+  const hidden = useHidden()
   const [rail, setRail] = useState(loadRail)
   const changeRail = useCallback((v: boolean) => {
     setRail(v)
     saveRail(v)
   }, [])
 
+  /** Every page's element with its live props; the classic chrome and the G layout (`#g`) render the same pages. */
+  const page = (s: Section): ReactNode => {
+    switch (s) {
+      case 'home':
+      case 'now':
+      case 'activity':
+      case 'team':
+        return <DashboardPage section={s} question={SECTIONS.find((x) => x.key === s)!.question} token={token} repo={repo} data={data} d={d} overview={overview} answer={layout === 'g' ? gAnswer(s, d, data.activity?.events ?? null, data.lastOk) : undefined} />
+      case 'inbox':
+        return <InboxPage token={token} overview={overview} handoff={handoff} session={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session : null} live={d ? { agents: d.agents, contested: d.contested } : null} />
+      case 'work':
+        return <WorkPage token={token} overview={overview} handoff={handoff} />
+      case 'promises':
+        return <PromisesPage />
+      case 'workflows':
+        return <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />
+      case 'change-record':
+        return <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />
+      case 'landed':
+        return <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />
+      case 'skills':
+        return <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />
+      case 'templates':
+        return <TemplatesPage repository={data.whoami?.token.repository ?? null} onDirtyChange={onWorkflowDirtyChange} />
+      case 'timeline':
+        return <TimelinePage />
+      case 'explorer':
+        return <ExplorerPage hubRepository={data.whoami?.token.repository ?? null} />
+      case 'setup':
+        return <SetupPage token={token} />
+      case 'workspace':
+        return <WorkspacePage />
+      case 'repositories':
+        return <RepositoriesPage auth={device.auth} web={web} token={token} current={data.whoami?.token.repository ?? null} overview={overview.kind === 'ready' ? overview.value : null} />
+      case 'health':
+        return <HealthPage health={data.health} />
+      case 'computers':
+        return <ComputersPage auth={device.auth} provider={provider} onSignedOut={(session) => { device.reload(); onHubSignedOut?.(session) }} onSignOutFailed={onHubSignOutFailed} />
+      case 'admin':
+        return <AdminPage auth={device.auth} provider={provider} />
+      case 'settings':
+        return <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} density={density} onDensity={onDensity} railCollapsed={rail} onRail={changeRail} onForget={onForget} />
+    }
+  }
+  if (layout === 'g') {
+    const needs = needsYou(ov, d).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
+    const banner = (hubSignOutError || hubUnavailable || (hubChecking && hubSessionKnown) || data.health?.demo)
+      ? <>
+        {(hubSignOutError || hubUnavailable || (hubChecking && hubSessionKnown)) && <Notice tone={hubSignOutError || hubUnavailable ? 'bad' : 'muted'} title={hubSignOutError ? 'Hub sign-out failed' : hubUnavailable ? hubUnavailable.title : 'Checking Hub connection'}>
+          {hubSignOutError ?? (hubUnavailable ? hubUnavailable.message : 'Checking which Hub session is active.')}
+          {hubUnavailable && onHubRetry && <button type="button" className="btn btn-link" onClick={onHubRetry}>{hubUnavailable.retryLabel}</button>}
+        </Notice>}
+        {data.health?.demo && <Notice tone="brand" icon="play-circle" title="Demo hub">Simulated agents on your repository’s file names; nothing is written to it.</Notice>}
+      </>
+      : null
+    return (
+      <LocalComputerProvider token={isLocalCredential(token) ? token : null}>
+        <ComputerNotices />
+        <GLive live={{ token, repo, data, d, overview, needs, handoff }} section={section} sections={sections} page={page} showAdmin={!!showAdmin} hubSignedOut={hubSignedOut} onClassic={() => setLayout('classic')} banner={banner} />
+      </LocalComputerProvider>
+    )
+  }
   const shell = (
-    <TourProvider key={section === 'promises' || section === 'workspace' || section === 'repositories' ? 'independent' : web ? token : 'hub'} signedIn={!hubSignedOut} section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
+    <TourProvider key={section === 'promises' || section === 'workspace' || section === 'repositories' ? 'independent' : web ? token : 'hub'} signedIn={!hubSignedOut} joinedAt={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session.joinedAt : undefined} section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
       <AppChrome
         // The frame is deep violet in both themes, so the top bar always carries the light-on-dark logo.
         logo={<Logo dark height={26} />}
@@ -229,31 +298,14 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
           {hubSessionKnown && onHubSignOut && <button type="button" className="btn btn-link" onClick={onHubSignOut}>{hubSignOutError ? 'Retry Hub sign-out' : 'Sign out of Hub pages'}</button>}
           {hubUnavailable && onHubRetry && <button type="button" className="btn btn-link" onClick={onHubRetry}>{hubUnavailable.retryLabel}</button>}
         </Notice>}
-        {!hubSignedOut && <InstallOffer />}
+        {!hubSignedOut && <InstallOffer tipsHere={section === 'home'} />}
         <ComputerNotices />
         {data.health?.demo && (
           <Notice tone="brand" icon="play-circle" title="Demo hub">
             Simulated agents on your repository’s file names; nothing is written to it. To set up for real, stop the demo and run <code>agentscm quickstart</code> (or <code>npx agentscm</code>).
           </Notice>
         )}
-        {(section === 'home' || section === 'now' || section === 'activity' || section === 'team') && <DashboardPage section={section} question={SECTIONS.find((s) => s.key === section)!.question} token={token} repo={repo} data={data} d={d} overview={overview} />}
-        {section === 'inbox' && <InboxPage token={token} overview={overview} handoff={handoff} />}
-        {section === 'work' && <WorkPage token={token} overview={overview} handoff={handoff} />}
-        {section === 'promises' && <PromisesPage />}
-        {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
-        {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
-        {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
-        {section === 'skills' && <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />}
-        {section === 'templates' && <TemplatesPage repository={data.whoami?.token.repository ?? null} onDirtyChange={onWorkflowDirtyChange} />}
-        {section === 'timeline' && <TimelinePage />}
-        {section === 'explorer' && <ExplorerPage hubRepository={data.whoami?.token.repository ?? null} />}
-        {section === 'setup' && <SetupPage token={token} />}
-        {section === 'workspace' && <WorkspacePage />}
-        {section === 'repositories' && <RepositoriesPage auth={device.auth} web={web} current={data.whoami?.token.repository ?? null} />}
-        {section === 'health' && <HealthPage health={data.health} />}
-        {section === 'computers' && <ComputersPage auth={device.auth} provider={provider} onSignedOut={(session) => { device.reload(); onHubSignedOut?.(session) }} onSignOutFailed={onHubSignOutFailed} />}
-        {section === 'admin' && <AdminPage auth={device.auth} provider={provider} />}
-        {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} density={density} onDensity={onDensity} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
+        {page(section)}
       </AppChrome>
     </TourProvider>
   )

@@ -205,11 +205,45 @@ separate role system.
   its own two-minute poll. Rows do not stream in as each role check finishes.
 - The local development mock (`ui/dev/mock.ts`) does not serve the route; the page shows its
   error there.
-- The page is one hairline-ruled row per repository, not a table: the name, one status as a dot
-  and words (coral "N need you", else amber "N stuck", else green "Nothing needs you"), then a
-  line of counts and the last activity. A repository with nothing unfinished, no agents and
-  nothing needing you is a shorter row. Lower-bound counts read "at least N". On a phone the
-  status moves under the name.
+- The page is a main column and a 320px right column; under about 1000px the right column moves
+  below, and on a phone it is one column. It adds no Hub route and shows nothing the Hub does not
+  already return: the list above, plus the work overview the shell already polls for the open
+  repository.
+- The headline is a sentence. Repositories that need the person are named in it, in coral, as
+  links that open them ("widgets and secret-plans need you."; four or more become a count). With
+  nothing to decide it reads "Nothing needs you." and names where agents are working, then a
+  line saying the counts are checked against the person's role.
+- When something needs the person, a dark card leads for the repository with the most waiting
+  on them (a tie goes to the most recent activity): its name, "N things are waiting on you.",
+  stuck, moving, agents connected and last activity, and "Open what needs you", which opens that
+  repository through the same read-token path as a row.
+- Active repositories follow as rows on one grid, in groups with an icon tile and a count:
+  "Also needs you" (coral), "Stuck" (amber) and "Moving" (violet). A row is the repository, a
+  status line ("2 waiting on you, 2 stuck, 3 moving"; "at least" when the counts are lower
+  bounds), one cursor per connected agent (four at most), the last activity and a chevron. With
+  nothing to decide, the rest sit in "Moving on their own"; stuck work keeps its own group. On a
+  narrow column the agents and time drop out of the row.
+- The quiet rest fold into one line with a moon tile, "N quiet repositories", that opens to a
+  compact list of names with a filter.
+- "Done in {repository} lately" covers the open repository, from the work overview the page
+  already polls. It names its window ("Reported in the last day, newest first"), lists at most six
+  reported completions and decisions, newest first, each with its title, who and which agent led
+  it, the latest checkpoint summary and the time, and links to the finished-work page. When the
+  overview says its recent list is incomplete or compacted, the section says the list is partial.
+  With nothing reported it says so in one line. When an agent briefing for that repository is
+  ready, its headline leads the section with who wrote it and a link to read it in full on Catch
+  up; otherwise nothing extra shows. The section is left out with no open repository, until the
+  overview has loaded, and until some repository has an agent. Nothing is stored or invented.
+- The right column lists "Working now in" the open repository: each current Work item whose claim
+  is not stale and that is not finished, with its owner, title and a status word (blocked in
+  coral, handover and paused in amber, otherwise the time since its last check-in). With no open
+  repository or nothing live it says nobody is working yet. Below it, the other repositories
+  with an agent connected, and a note that names show only for the open repository. A dark card
+  links to that repository's Catch up page.
+- When no repository has an agent, the page leads with "No agent is working in any of these
+  yet.", then a repository picker and the sign-in page's agent row (`ui/src/AskAgent.tsx`),
+  which opens the person's agent with the setup prompt naming that repository. The rows are one
+  "Not connected yet" group.
 - The Dashboard's tabs and its first-visit tips (coach marks) do not show on this page: both
   describe one repository. The tips wait for the first Dashboard.
 

@@ -10,7 +10,7 @@ describe('MCP work catch-up', () => {
     const script = new DOMParser().parseFromString(html, 'text/html').querySelector('script')?.textContent
     expect(script).toBeTruthy()
     expect(() => new Function(script!)).not.toThrow()
-    document.body.innerHTML = '<div id="app"></div><div id="find"></div>'
+    document.body.innerHTML = '<div id="app"></div>'
     const load = new Function('window', 'document', 'ResizeObserver', `${script}; return {CATCH_CLIENT,CATCH,catchupValue,renderCatchup,appendCatch};`) as (
       win: Window,
       doc: Document,

@@ -1,11 +1,12 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchActivity, fetchHealth, fetchWhoami, fetchWork } from '../../src/api.ts'
 import { SECTIONS } from '../../src/App.tsx'
 import { derive } from '../../src/derive.ts'
 import type { WorkOverview } from '../../src/standup.ts'
 import { SECTION_TOURS, WELCOME, tourFor, type TourContext, type TourDef } from '../../src/tour/content.ts'
-import { COACH_IDS, DEFAULT_PREFS, canRemember, closeSection, closeWelcome, coachLeft, dismissCoach, loadPrefs, savePrefs, setAutoplay, setWelcome, shouldAutoplay, shouldWelcome, skipCoach } from '../../src/tour/state.ts'
+import { COACH_IDS, DEFAULT_PREFS, canRemember, closeSection, closeWelcome, coachLeft, dismissCoach, helpPulse, loadPrefs, savePrefs, seeHelp, setAutoplay, setWelcome, shouldAutoplay, shouldWelcome, skipCoach } from '../../src/tour/state.ts'
+import { TourArt, WelcomeHero } from '../../src/tour/art.tsx'
 import { TourProvider, TourTrigger, useTour } from '../../src/tour/Tour.tsx'
 import type { HubData } from '../../src/useHub.ts'
 import { stubHub } from '../fixtures/mockFetch.ts'
@@ -17,15 +18,19 @@ const memory = (init: Record<string, string> = {}) => {
 }
 const throwing = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('blocked') } }
 
+// The introduction is off until the Settings switch turns it on.
+const ON = setWelcome(DEFAULT_PREFS, true)
+
 describe('coach marks', () => {
-  it('follow the welcome flags: all three for a new viewer, none once the old tour was finished or switched off', () => {
-    expect(coachLeft(DEFAULT_PREFS, true)).toEqual([...COACH_IDS])
-    expect(coachLeft(DEFAULT_PREFS, false)).toEqual([]) // nowhere to remember a dismissal
-    expect(coachLeft(closeWelcome(DEFAULT_PREFS, true), true)).toEqual([])
-    expect(coachLeft({ ...DEFAULT_PREFS, welcomeSeen: true }, true)).toEqual([])
+  it('are off by default; the Settings switch turns all three on, and finishing or skipping turns them off', () => {
+    expect(coachLeft(DEFAULT_PREFS, true)).toEqual([])
+    expect(coachLeft(ON, true)).toEqual([...COACH_IDS])
+    expect(coachLeft(ON, false)).toEqual([]) // nowhere to remember a dismissal
+    expect(coachLeft(closeWelcome(ON, true), true)).toEqual([])
+    expect(coachLeft({ ...ON, welcomeSeen: true }, true)).toEqual([])
   })
   it('are dismissed one at a time, and the last one turns the introduction off', () => {
-    const one = dismissCoach(DEFAULT_PREFS, 'answer')
+    const one = dismissCoach(ON, 'answer')
     expect(coachLeft(one, true)).toEqual(['needs', 'track'])
     expect(shouldWelcome(one, true)).toBe(true)
     expect(dismissCoach(one, 'answer')).toEqual(one) // no duplicates
@@ -34,7 +39,7 @@ describe('coach marks', () => {
     expect(all).toMatchObject({ welcomeSeen: true, welcomeOff: true })
   })
   it('Skip tips is the old “Don’t show again”, and the Settings switch brings every mark back', () => {
-    const skipped = skipCoach(dismissCoach(DEFAULT_PREFS, 'needs'))
+    const skipped = skipCoach(dismissCoach(ON, 'needs'))
     expect(skipped).toMatchObject({ welcomeSeen: true, welcomeOff: true })
     expect(coachLeft(skipped, true)).toEqual([])
     expect(coachLeft(setWelcome(skipped, true), true)).toEqual([...COACH_IDS])
@@ -42,7 +47,38 @@ describe('coach marks', () => {
   })
 })
 
+describe('the help button’s first-sign-in pulse', () => {
+  const now = 1_900_000_000
+  const DAY = 86_400
+  it('pulses for an account under a day old that has not used the button', () => {
+    expect(helpPulse(DEFAULT_PREFS, now - 60, now, true)).toBe(true)
+    expect(helpPulse(DEFAULT_PREFS, now - DAY + 1, now, true)).toBe(true)
+    expect(helpPulse(DEFAULT_PREFS, now - DAY, now, true)).toBe(false)
+    expect(helpPulse(DEFAULT_PREFS, now - 3 * DAY, now, true)).toBe(false) // someone who switches browsers or Hubs later
+  })
+  it('never pulses without an account age, once answered, or where nothing can be remembered', () => {
+    expect(helpPulse(DEFAULT_PREFS, undefined, now, true)).toBe(false) // an older Hub
+    expect(helpPulse(DEFAULT_PREFS, null, now, true)).toBe(false)
+    expect(helpPulse(seeHelp(DEFAULT_PREFS), now - 60, now, true)).toBe(false)
+    expect(helpPulse(DEFAULT_PREFS, now - 60, now, false)).toBe(false)
+  })
+  it('tolerates a few minutes of clock skew but not an account from the far future', () => {
+    expect(helpPulse(DEFAULT_PREFS, now + 120, now, true)).toBe(true)
+    expect(helpPulse(DEFAULT_PREFS, now + 3600, now, true)).toBe(false)
+  })
+  it('seeHelp is pure and idempotent', () => {
+    const seen = seeHelp(DEFAULT_PREFS)
+    expect(seen.helpSeen).toBe(true)
+    expect(DEFAULT_PREFS.helpSeen).toBe(false)
+    expect(seeHelp(seen)).toBe(seen)
+  })
+})
+
 describe('tour preferences', () => {
+  it('reads a record saved before the introduction became opt-in as off, and a saved opt-in as on', () => {
+    expect(shouldWelcome(loadPrefs(memory({ [KEY]: JSON.stringify({ welcomeSeen: false, welcomeOff: false, autoplay: [], sectionsSeen: [] }) })), true)).toBe(false)
+    expect(shouldWelcome(loadPrefs(memory({ [KEY]: JSON.stringify(ON) })), true)).toBe(true)
+  })
   it('loads the default for missing, empty, garbage or wrongly typed data', () => {
     expect(loadPrefs(null)).toEqual(DEFAULT_PREFS)
     expect(loadPrefs(memory())).toEqual(DEFAULT_PREFS)
@@ -58,7 +94,7 @@ describe('tour preferences', () => {
   })
   it('round-trips through save and load, and reports a failed write', () => {
     const s = memory()
-    const p = { welcomeSeen: true, welcomeOff: false, autoplay: ['now'], sectionsSeen: ['work'] }
+    const p = { welcomeSeen: false, welcomeOff: false, autoplay: ['now'], sectionsSeen: ['work'], helpSeen: true }
     expect(savePrefs(p, s)).toBe(true)
     expect(loadPrefs(s)).toEqual(p)
     expect(savePrefs(p, null)).toBe(false)
@@ -74,22 +110,23 @@ describe('tour preferences', () => {
     expect(canRemember({ getItem: () => null, setItem: () => {} })).toBe(false)
   })
   it('shouldWelcome and shouldAutoplay need storage that remembers', () => {
-    expect(shouldWelcome(DEFAULT_PREFS, true)).toBe(true)
-    expect(shouldWelcome(DEFAULT_PREFS, false)).toBe(false)
-    expect(shouldWelcome({ ...DEFAULT_PREFS, welcomeSeen: true }, true)).toBe(false)
-    expect(shouldWelcome({ ...DEFAULT_PREFS, welcomeOff: true }, true)).toBe(false)
+    expect(shouldWelcome(DEFAULT_PREFS, true)).toBe(false)
+    expect(shouldWelcome(ON, true)).toBe(true)
+    expect(shouldWelcome(ON, false)).toBe(false)
+    expect(shouldWelcome({ ...ON, welcomeSeen: true }, true)).toBe(false)
+    expect(shouldWelcome({ ...ON, welcomeOff: true }, true)).toBe(false)
     const p = { ...DEFAULT_PREFS, autoplay: ['now'] }
     expect(shouldAutoplay(p, 'now', true)).toBe(true)
     expect(shouldAutoplay(p, 'now', false)).toBe(false)
     expect(shouldAutoplay(p, 'work', true)).toBe(false)
   })
   it('closeWelcome: closing without the box changes nothing; finishing or ticking it turns the tour off', () => {
-    expect(closeWelcome(DEFAULT_PREFS, false)).toEqual(DEFAULT_PREFS)
-    expect(shouldWelcome(closeWelcome(DEFAULT_PREFS, false), true)).toBe(true)
-    expect(closeWelcome(DEFAULT_PREFS, true)).toMatchObject({ welcomeSeen: true, welcomeOff: true })
+    expect(closeWelcome(ON, false)).toEqual(ON)
+    expect(shouldWelcome(closeWelcome(ON, false), true)).toBe(true)
+    expect(closeWelcome(ON, true)).toMatchObject({ welcomeSeen: true, welcomeOff: true })
   })
   it('setWelcome brings the welcome tour back, or turns it off', () => {
-    const done = closeWelcome(DEFAULT_PREFS, true)
+    const done = closeWelcome(ON, true)
     const back = setWelcome(done, true)
     expect(shouldWelcome(back, true)).toBe(true)
     expect(shouldWelcome(setWelcome(back, false), true)).toBe(false)
@@ -193,6 +230,8 @@ const shell = () => (
 /** The welcome tour never opens by itself any more; replay it by hand. */
 const open = () => fireEvent.click(screen.getByRole('button', { name: 'welcome' }))
 const fresh = () => window.localStorage.removeItem(KEY)
+/** A viewer who switched the introduction on in Settings. */
+const introOn = () => window.localStorage.setItem(KEY, JSON.stringify(ON))
 const stored = () => JSON.parse(window.localStorage.getItem(KEY) ?? 'null')
 const dialog = () => screen.queryByRole('dialog')
 
@@ -230,7 +269,7 @@ describe('TourProvider overlay', () => {
     expect(live.textContent).toContain(`Step 1 of ${WELCOME.steps.length}`)
   })
   it('Escape or Skip without the box closes the tour and leaves the coach marks for next time', () => {
-    fresh()
+    introOn()
     const first = render(shell())
     open()
     fireEvent.keyDown(document, { key: 'Escape' })
@@ -283,8 +322,14 @@ describe('TourProvider overlay', () => {
     await new Promise((r) => setTimeout(r, 10))
     expect(document.activeElement?.textContent).toMatch(/Back/)
   })
-  it('“Don’t show again” persists as welcomeOff', () => {
+  it('offers “Don’t show again” on the welcome tour only when the introduction is on, and it persists as welcomeOff', () => {
     fresh()
+    const off = render(shell())
+    open()
+    expect(screen.queryByRole('checkbox', { name: 'Don’t show again' })).toBeNull() // nothing opens by itself, so nothing to switch off
+    fireEvent.keyDown(document, { key: 'Escape' })
+    off.unmount()
+    introOn()
     render(shell())
     open()
     fireEvent.click(screen.getByRole('checkbox', { name: 'Don’t show again' }))
@@ -331,9 +376,82 @@ describe('TourProvider overlay', () => {
     fireEvent.keyDown(document, { key: 'Escape' }) // closing must not throw either
     expect(dialog()).toBeNull()
   })
+  describe('the help button’s pulse', () => {
+    const NOW = 1_900_000_000
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(NOW * 1000)
+    })
+    afterEach(() => vi.useRealTimers())
+    const pulsing = () => document.querySelector('.tour-trigger')!.classList.contains('is-pulsing')
+    const account = (joinedAt: number | null | undefined, section: 'now' | 'repositories' = 'now') => (
+      <TourProvider section={section} joinedAt={joinedAt} data={emptyData} d={null} overview={null}><TourTrigger section={section} /></TourProvider>
+    )
+    it('invites a first look for a new account, on every page, and stops once the button is used', () => {
+      fresh()
+      const first = render(account(NOW - 600))
+      expect(pulsing()).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: 'Tour this page' }))
+      expect(stored().helpSeen).toBe(true)
+      expect(pulsing()).toBe(false)
+      fireEvent.keyDown(document, { key: 'Escape' })
+      first.unmount()
+      render(account(NOW - 600)) // a reload in the same browser
+      expect(pulsing()).toBe(false)
+    })
+    it('is on All repositories too, where the button opens the welcome tour', () => {
+      fresh()
+      render(account(NOW - 600, 'repositories'))
+      expect(screen.getByRole('button', { name: 'Tour the hub' }).classList.contains('is-pulsing')).toBe(true)
+    })
+    it('does not start for an older account, an older Hub, or a tour opened another way', () => {
+      fresh()
+      const a = render(account(NOW - 2 * 86_400))
+      expect(pulsing()).toBe(false)
+      a.unmount()
+      const b = render(account(undefined))
+      expect(pulsing()).toBe(false)
+      b.unmount()
+      const c = render(<TourProvider section="now" joinedAt={NOW - 60} data={emptyData} d={null} overview={null}><Welcome /><TourTrigger section="now" /></TourProvider>)
+      expect(pulsing()).toBe(true)
+      open() // the welcome tour opening answers the invitation too
+      expect(stored().helpSeen).toBe(true)
+      fireEvent.keyDown(document, { key: 'Escape' })
+      expect(pulsing()).toBe(false)
+      c.unmount()
+    })
+  })
   it('renders no trigger for a section without a tour, and nothing outside a provider', () => {
     const missing = SECTIONS.find((s) => !(s.key in SECTION_TOURS))
     const { container } = render(<><TourTrigger section="now" />{missing && <TourTrigger section={missing.key} />}</>)
     expect(container.querySelector('.tour-trigger')).toBeNull() // no provider
+  })
+})
+
+describe('tour illustrations', () => {
+  const markup = (key: string, i: number) => {
+    const { container, unmount } = i === 0 && key === 'welcome' ? render(<WelcomeHero />) : render(<TourArt tourKey={key as never} step={i} />)
+    const svg = container.querySelector('svg')!
+    expect(svg.getAttribute('aria-hidden')).toBe('true')
+    const html = svg.outerHTML
+    unmount()
+    return html
+  }
+  it('gives every step of every tour its own picture, so the band changes on each step', () => {
+    for (const [key, tour] of allTours()) {
+      const seen = tour.steps.map((_, i) => markup(key, i))
+      expect(new Set(seen).size, key).toBe(seen.length)
+    }
+  })
+  it('keeps a still ring and drops the riding dot with reduced motion', () => {
+    const mq = (matches: boolean) => vi.spyOn(window, 'matchMedia').mockImplementation((q) => ({ matches, media: q, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => false }) as MediaQueryList)
+    mq(false)
+    const moving = render(<TourArt tourKey="landed" step={0} />)
+    expect(moving.container.querySelector('.rider animateMotion')).not.toBeNull()
+    moving.unmount()
+    mq(true)
+    const calm = render(<TourArt tourKey="landed" step={0} />)
+    expect(calm.container.querySelector('.rider')).toBeNull()
+    expect(calm.container.querySelector('.breathe')).not.toBeNull()
   })
 })

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
-use super::handoff::{Answered, Asked, HandoffNote};
+use super::handoff::{Answered, Asked, HandoffNote, Via};
 use super::intent::{Intent, Overlap};
 use super::session::Touched;
 use super::work::WorkItem;
@@ -227,11 +227,26 @@ pub fn warn(touched: &Touched, pulls: &[Value], now: i64) -> (String, bool) {
 
 /// A handoff line: the holder's request, or the answer to the requester's.
 fn handoff_line(note: &HandoffNote) -> String {
-    let who = format!(
-        "{}'s agent {}",
-        ascii_name(&note.login),
-        ascii_name(&note.agent)
-    );
+    // A person acting from the Hub's web pages or Slack is named as the person, not passed off as
+    // the agent.
+    let from = match note.via {
+        Via::Agent => None,
+        Via::Hub => Some("the Hub's web page"),
+        Via::Slack => Some("Slack"),
+    };
+    let who = if let Some(from) = from {
+        format!(
+            "{} (from {from}, for their agent {})",
+            ascii_name(&note.login),
+            ascii_name(&note.agent)
+        )
+    } else {
+        format!(
+            "{}'s agent {}",
+            ascii_name(&note.login),
+            ascii_name(&note.agent)
+        )
+    };
     let path = sanitize(&note.path, PATH_CHARS);
     match note.kind {
         "request" => {
@@ -822,7 +837,28 @@ mod tests {
             note: text.map(str::to_owned),
             reason: None,
             session: "sess-1".into(),
+            via: Via::Agent,
         }
+    }
+
+    #[test]
+    fn a_person_acting_from_the_hub_is_named_as_the_person() {
+        let mut from_hub = note("grant", None);
+        from_hub.via = Via::Hub;
+        assert_eq!(
+            handoff_line(&from_hub),
+            "amy (from the Hub's web page, for their agent codex) handed src/a.rs to this session; repeating the edit applies it."
+        );
+    }
+
+    #[test]
+    fn a_person_answering_from_slack_is_named_as_the_person() {
+        let mut from_slack = note("decline", None);
+        from_slack.via = Via::Slack;
+        assert_eq!(
+            handoff_line(&from_slack),
+            "amy (from Slack, for their agent codex) keeps src/a.rs for now. Options, in order: work on something else first, ask the user, or repeat the same edit if the overlap is acceptable."
+        );
     }
 
     #[test]
