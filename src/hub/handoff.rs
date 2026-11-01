@@ -15,17 +15,41 @@ pub(super) const MAX_OPEN: usize = 3;
 pub(super) const PER_TOUCH: i64 = 8;
 
 /// Who made a request or gave an answer: the agent itself, or the person who owns it, acting for
-/// it on the Hub's web pages. The record says which, so an answer is never passed off as the
-/// agent's own.
+/// it on the Hub's web pages or from a Slack button. The record says which, so an answer is never
+/// passed off as the agent's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Via {
     Agent,
     Hub,
+    /// Only answers: Slack files no requests.
+    Slack,
 }
 
 impl Via {
     pub(super) fn hub(self) -> bool {
         self == Self::Hub
+    }
+
+    pub(super) fn slack(self) -> bool {
+        self == Self::Slack
+    }
+
+    /// From the two stored flags.
+    pub(super) fn stored(hub: bool, slack: bool) -> Self {
+        match (hub, slack) {
+            (_, true) => Self::Slack,
+            (true, false) => Self::Hub,
+            (false, false) => Self::Agent,
+        }
+    }
+
+    /// What an event's `via` says, absent for the agent itself.
+    fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Agent => None,
+            Self::Hub => Some("hub"),
+            Self::Slack => Some("slack"),
+        }
     }
 }
 
@@ -71,8 +95,9 @@ pub struct HandoffNote {
     pub reason: Option<String>,
     /// The touched session's name.
     pub session: String,
-    /// The other side's person asked or answered from the Hub's web pages, not their agent.
-    pub hub: bool,
+    /// Whether the other side's person asked or answered from the Hub's web pages or Slack, not
+    /// their agent.
+    pub via: Via,
 }
 
 /// One handoff as its owner sees it on the Hub's web pages: either side may be their agent.
@@ -92,6 +117,7 @@ pub struct HandoffView {
     pub requester_told: bool,
     pub asked_via_hub: bool,
     pub answered_via_hub: bool,
+    pub answered_via_slack: bool,
     pub requester: HandoffParty,
     pub holder: HandoffParty,
 }
@@ -239,8 +265,8 @@ impl Event {
     ) -> Result<Self> {
         let mut data = json!({"request": request, "paths": [path], "note": note, "session": session,
             "auto": auto, "to": {"agent": holder.agent, "login": holder.owner.login}});
-        if via.hub() {
-            data["via"] = json!("hub");
+        if let Some(via) = via.tag() {
+            data["via"] = json!(via);
         }
         Self::new("handoff_request", token, data)
     }
@@ -258,8 +284,8 @@ impl Event {
         let mut data = json!({"request": request.id, "paths": [path], "session": session,
             "from": {"agent": request.agent, "login": request.login, "token": request.requester_token},
             "reason": reason});
-        if via.hub() {
-            data["via"] = json!("hub");
+        if let Some(via) = via.tag() {
+            data["via"] = json!(via);
         }
         Self::new(kind, holder, data)
     }

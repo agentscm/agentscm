@@ -4511,7 +4511,8 @@ fn handoffs_in(
         &[&token, &session, &cutoff(now), &PER_TOUCH],
     )?;
     let answers = tx.query(
-        "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub
+        "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
+                h.answered_via_slack
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
          JOIN hub_users u ON u.id = t.owner
          WHERE h.requester_token = $1 AND h.requester_session = $2
@@ -4528,7 +4529,7 @@ fn handoffs_in(
     };
     told(tx, "holder_told", &requests)?;
     told(tx, "requester_told", &answers)?;
-    let note = |kind, path, note, reason, agent, login, hub| HandoffNote {
+    let note = |kind, path, note, reason, agent, login, via| HandoffNote {
         kind,
         path,
         note,
@@ -4536,7 +4537,7 @@ fn handoffs_in(
         agent,
         login,
         session: session.to_owned(),
-        hub,
+        via,
     };
     Ok(requests
         .iter()
@@ -4548,7 +4549,7 @@ fn handoffs_in(
                 None,
                 row.get(3),
                 row.get(4),
-                row.get(5),
+                Via::stored(row.get(5), false),
             )
         })
         .chain(answers.iter().map(|row| {
@@ -4560,7 +4561,7 @@ fn handoffs_in(
                 row.get(5),
                 row.get(3),
                 row.get(4),
-                row.get(6),
+                Via::stored(row.get(6), row.get(7)),
             )
         }))
         .collect())
@@ -6020,13 +6021,15 @@ impl Store for PgStore {
             }
             tx.execute(
                 "UPDATE hub_handoffs SET state = $2, decided_at = $3, reply = $4,
-                     answered_via_hub = $5 WHERE id = $1",
+                     answered_via_hub = $5,
+                     answered_via_slack = $6 WHERE id = $1",
                 &[
                     &request.id,
                     &if accept { "granted" } else { "declined" },
                     &now,
                     &reason,
                     &via.hub(),
+                    &via.slack(),
                 ],
             )?;
             let kind = if accept {
@@ -6065,7 +6068,8 @@ impl Store for PgStore {
                 "SELECT h.id, h.path, h.state, h.note, h.reply, h.created_at, h.decided_at,
                         h.holder_told, h.requester_told, h.asked_via_hub, h.answered_via_hub,
                         h.requester_token, h.requester_session, rt.name, rt.owner, ru.login,
-                        h.holder_token, h.holder_session, ht.name, ht.owner, hu.login
+                        h.holder_token, h.holder_session, ht.name, ht.owner, hu.login,
+                        h.answered_via_slack
                  FROM hub_handoffs h
                  JOIN hub_agent_tokens rt ON rt.id = h.requester_token
                  JOIN hub_users ru ON ru.id = rt.owner
@@ -6091,6 +6095,7 @@ impl Store for PgStore {
                         requester_told: row.get(8),
                         asked_via_hub: row.get(9),
                         answered_via_hub: row.get(10),
+                        answered_via_slack: row.get(21),
                         requester: HandoffParty {
                             token: row.get(11),
                             session: row.get(12),

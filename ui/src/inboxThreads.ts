@@ -95,7 +95,7 @@ export const agentName = (agent: string): string => brandName(agent) ?? agentLab
 /** "Your Codex" for the person's own agent, "dev’s Codex" for anyone else's. */
 export const named = (login: string, agent: string, me: string | null): string => (me !== null && login === me ? `Your ${agentName(agent)}` : `${login}’s ${agentName(agent)}`)
 
-/** Who an action was done by: the agent, or a person acting for it on the Hub's web pages (never passed off as the agent). */
+/** Who an action was done by: the agent, or a person acting for it on the Hub's web pages or in Slack (never passed off as the agent). */
 const actor = (a: { login: string; agent: string }, viaHub: boolean, me: string | null): string =>
   viaHub ? (me !== null && a.login === me ? `You, as your ${agentName(a.agent)}` : `${a.login}, for their ${agentName(a.agent)}`) : named(a.login, a.agent, me)
 
@@ -277,7 +277,7 @@ function handoffThread(h: MyHandoff, me: string | null, works: Map<string, WorkI
   ]
   if (h.holderTold) rows.push(row({ key: 'told', kind: 'receipt', tone: 'ok', agent: h.holder.agent, who: holder, did: 'received it' }))
   if (h.state === 'granted' || h.state === 'declined') {
-    rows.push(row({ key: 'answered', kind: 'agent', tone: h.holder.mine ? 'me' : '', agent: h.holder.agent, who: actor(h.holder, h.answeredViaHub, me), did: `${h.state === 'granted' ? 'handed it over' : 'kept it for now'}${h.answeredViaHub ? ' · from the Hub' : ''}`, at: h.decidedAt, text: h.reply, quote: !!h.reply }))
+    rows.push(row({ key: 'answered', kind: 'agent', tone: h.holder.mine ? 'me' : '', agent: h.holder.agent, who: actor(h.holder, h.answeredViaHub || h.answeredViaSlack, me), did: `${h.state === 'granted' ? 'handed it over' : 'kept it for now'}${h.answeredViaSlack ? ' · from Slack' : h.answeredViaHub ? ' · from the Hub' : ''}`, at: h.decidedAt, text: h.reply, quote: !!h.reply }))
     if (!h.requesterTold) rows.push(row({ key: 'sees', kind: 'pending', agent: h.requester.agent, who: requester, did: 'sees it at its next edit' }))
   } else if (h.state === 'lapsed') {
     rows.push(notice('lapsed', 'closed the request', h.createdAt + 1800, 'No answer within 30 minutes, so it lapsed.'))
