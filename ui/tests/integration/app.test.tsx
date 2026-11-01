@@ -67,7 +67,7 @@ describe.skipIf(!live)('the Twilight app rendered against the live hub', () => {
   it('Hub health reports SQLite and counters', async () => {
     go('#health')
     render(<App />)
-    await main().findByText(/The hub is answering and storing data in SQLite/, {}, LOAD)
+    await main().findByText(/Storing data in SQLite/, {}, LOAD)
     expect(main().getByText('Refused first edits')).toBeTruthy()
   })
 

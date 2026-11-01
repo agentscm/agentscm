@@ -316,7 +316,7 @@ export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; p
     <div className="page">
       <PageHead
         question="Which repositories are connected, and who was turned away?"
-        answer={v ? <><b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected.</> : 'Connected repositories, refusals and every signed-in computer.'}
+        answer={v ? <><b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected. {v.refusals.length ? <><b>{plural(v.refusals.length, 'refusal')}</b> in the last 30 days.</> : 'Nobody turned away in the last 30 days.'}</> : 'Connected repositories, refusals and every signed-in computer.'}
       />
       <SectionTabs />
       {auth.kind === 'loading' || (browser && data.kind === 'loading') ? (

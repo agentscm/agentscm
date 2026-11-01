@@ -102,7 +102,7 @@ function StepDetail({ step }: { step: SkillWorkflowStep }) {
       {step.detail && <p>{step.detail}</p>}
       {step.action && (
         <div className="mb-3">
-          <h3 className="h6">Productive action</h3>
+          <h3 className="sub-head">Productive action</h3>
           <p className="small">{step.action.outcome === null ? 'Dispatch reserved; no terminal result recorded.' : `Execution: ${step.action.outcome.replaceAll('_', ' ')}.`} {step.action.observed_model ? `Observed model: ${step.action.observed_model}.` : 'No model identity recorded.'}</p>
           <p className="small muted">Output validation is separate from independent verification, approval and publication.</p>
           {step.action.artifact && (
@@ -325,7 +325,7 @@ function List({ token }: { token: string }) {
               </div>
               {runs.length === 0 ? (
                 <Empty icon="inbox" title={load.value.runs.length ? 'No run on this page matches' : 'No retained runs yet'}>
-                  {!load.value.runs.length && 'Runs appear after a skill workflow records its result on the hub. Build one under Reusable workflows to start.'}
+                  {!load.value.runs.length && 'Runs appear when an agent records a check. Build a reusable workflow in Library to start.'}
                 </Empty>
               ) : (
                 <ul className="run-list">
@@ -335,12 +335,12 @@ function List({ token }: { token: string }) {
                       <li key={r.run_id}>
                         <a href={runHref(r.run_id)} className="run-row">
                           <span className={`run-icon tone-${st.tone}`}><Icon name={st.icon} /></span>
-                          <Pill tone={st.tone}>{st.label}</Pill>
                           <span className="run-main">
                             <strong>{r.name}</strong>
                             <span className="small muted" title={`Sequence ${r.sequence}`}><code>{r.run_id}</code> · rev <code>{r.revision.slice(0, 10)}</code></span>
                           </span>
-                          <Icon name="chevron-right" className="muted" />
+                          <Pill tone={st.tone}>{st.label}</Pill>
+                          <Icon name="chevron-right" className="muted ms-auto" />
                         </a>
                       </li>
                     )

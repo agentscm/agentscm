@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
 import { fetchDiff, fetchEntry, fetchTimeline, localReachable, type DiffEntry, type EvidenceState, type TimelineEntry, type Trigger } from '../localApi.ts'
-import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, OnThisComputer, PageHead, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
+import { Ago, Box, CopyButton, Empty, Icon, Notice, OnThisComputer, PageHead, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 
@@ -227,7 +227,7 @@ export function TimelinePage() {
           {route.kind === 'compare' && <Compare key={`${route.left}|${route.right}`} left={route.left} right={route.right} />}
         </>
       )}
-      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not the hub. Saving and forking happen in the CLI or your agent. <Explain text="Shows what was saved since the timeline was turned on. Anything earlier isn’t here." /></p>
+      <p className="small muted"><Icon name="laptop" /> Read from this computer, not the Hub. Saving and forking happen in the CLI or your agent.</p>
     </div>
   )
 }
