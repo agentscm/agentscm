@@ -28,7 +28,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install # reads rust-toolchain.toml
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
       - name: Check release metadata
         run: |
@@ -76,10 +76,10 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install # reads rust-toolchain.toml
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: nextest@0.9.148
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Generate throwaway S3 credentials
         run: |
           access=$(openssl rand -hex 10)
@@ -140,7 +140,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends musl-tools
           # ring and bundled SQLite compile C; cc-rs only guesses musl-gcc for x86_64.
           echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - run: cargo clippy --locked --target "$TARGET" -- -D warnings
