@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use agentscm::backend::LocalBackend;
+use agentscm::hub::handoff::Via;
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::promise::{
@@ -2048,7 +2049,7 @@ async fn a_web_session_asks_and_answers_file_handoffs_only_for_its_own_agents() 
         .touch_session(&holder, &hook_call("ha", &[]), now + 5)
         .unwrap();
     assert_eq!(told.handoffs.len(), 1);
-    assert!(told.handoffs[0].hub);
+    assert_eq!(told.handoffs[0].via, Via::Hub);
 
     // Bob cannot answer for Alice's agent; she can, once.
     let answer = |token: &str, accept: bool| json!({"token": token, "session": "ha", "path": file, "accept": accept});
@@ -2079,7 +2080,7 @@ async fn a_web_session_asks_and_answers_file_handoffs_only_for_its_own_agents() 
         .touch_session(&wanter, &hook_call("hb", &[file]), now + 9)
         .unwrap();
     assert_eq!(heard.handoffs.len(), 1);
-    assert!(heard.handoffs[0].hub && heard.handoffs[0].kind == "grant");
+    assert!(heard.handoffs[0].via == Via::Hub && heard.handoffs[0].kind == "grant");
     let grants: Vec<_> = env
         .store
         .events_after(0, 1000)

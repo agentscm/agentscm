@@ -125,19 +125,22 @@ function Finished({ overview, search }: { overview: WorkOverview; search: string
         </Empty>
       ) : (
         // The same row as All repositories' "Done lately": title and time, who, then the agent's last report.
-        <ul className="rp-done" aria-label="Reported finished">
-          {visible.map((o) => {
-            const l = lead(o.item)
-            return (
-              <li key={o.seq}>
-                <WorkLink id={o.item.id}>{o.item.title}</WorkLink>
-                <span className="rp-done-at"><Ago at={o.at} /></span>
-                <span className="rp-done-who">{who(l.login, l.agent)} · <ProofBadge level="reported" tone="muted" /></span>
-                {o.item.current && <span className="rp-done-say">{o.item.current.summary}</span>}
-              </li>
-            )
-          })}
-        </ul>
+        <>
+          <h2 className="visually-hidden">Reported finished</h2>
+          <ul className="rp-done" aria-label="Reported finished">
+            {visible.map((o) => {
+              const l = lead(o.item)
+              return (
+                <li key={o.seq}>
+                  <WorkLink id={o.item.id}>{o.item.title}</WorkLink>
+                  <span className="rp-done-at"><Ago at={o.at} /></span>
+                  <span className="rp-done-who">{who(l.login, l.agent)} · <ProofBadge level="reported" tone="muted" /></span>
+                  {o.item.current && <span className="rp-done-say">{o.item.current.summary}</span>}
+                </li>
+              )
+            })}
+          </ul>
+        </>
       )}
     </div>
   )

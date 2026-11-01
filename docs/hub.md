@@ -243,17 +243,18 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     handoffs in that repository where one of their agents is the requester or the holder. Each
     row has `id`, `path`, `state` (`pending`, `granted`, `declined`, or `lapsed` for a pending
     request past the 30-minute hold cap), `note`, `reply`, `created_at`, `decided_at`,
-    `holder_told`, `requester_told`, `asked_via_hub`, `answered_via_hub` and the two sides
+    `holder_told`, `requester_told`, `asked_via_hub`, `answered_via_hub`, `answered_via_slack` and the two sides
     (`agent`, `login`, `mine`); `token` and `session` appear only on the person's own side.
   There is no withdrawal: the store has no way to retract a reply or a file request, so the page
   offers none. The coordination request's own requester can still withdraw it, as an agent.
   These routes use the store permits of the agent routes (503 `busy` when saturated) and no extra
-  limit. The record says a person answered: a coordination response carries `"via": "hub"` beside
+  limit. The record says a person answered (a holder who presses a Slack button is `"via": "slack"` on the `handoff_grant` or `handoff_decline` event, `answered_via_slack` on the handoff, and "from Slack" in the line the requesting agent reads): a coordination response carries `"via": "hub"` beside
   the agent that leads the Work (`responder` is still that agent, whose `login` is its owner, the
   person); the `coordination_responded`, `handoff_request`, `handoff_grant` and `handoff_decline`
   events carry `"via": "hub"`; and the agent that is told reads "amy (from the Hub's web page, for
   their agent codex)" instead of "amy's agent codex". Migration 21 adds `via` to coordination
-  responses and `asked_via_hub` / `answered_via_hub` to handoffs; rows and events from an agent's
+  responses and `asked_via_hub` / `answered_via_hub` to handoffs, and the named migration
+  `handoff_answered_via_slack` adds `answered_via_slack`; rows and events from an agent's
   own call keep their old shape.
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
   on the person's forge host that they can read now, for the web pages' All repositories list.

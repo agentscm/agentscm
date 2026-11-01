@@ -72,9 +72,10 @@ export function useHideable<T>(rows: T[], keyOf: (row: T) => string) {
   return { rows: show ? rows : rows.filter((r) => !hidden.has(keyOf(r))), count, show: show && count > 0, setShow, isHidden: (r: T) => hidden.has(keyOf(r)) }
 }
 
-export function HideButton({ k, hidden, what }: { k: string; hidden: boolean; what: string }) {
+/** `k` may list several keys when one row stands for several items, such as the folded overlaps. */
+export function HideButton({ k, hidden, what }: { k: string | string[]; hidden: boolean; what: string }) {
   return (
-    <button type="button" className="hide-btn" onClick={() => setHidden(k, !hidden)} aria-label={hidden ? `Show ${what} again` : `Hide ${what} in this browser`} title={hidden ? undefined : 'Hidden in this browser only. It comes back if it changes.'}>
+    <button type="button" className="hide-btn" onClick={() => [k].flat().forEach((x) => setHidden(x, !hidden))} aria-label={hidden ? `Show ${what} again` : `Hide ${what} in this browser`} title={hidden ? undefined : 'Hidden in this browser only. It comes back if it changes.'}>
       <Icon name={hidden ? 'eye' : 'eye-slash'} /> {hidden ? 'Unhide' : 'Hide'}
     </button>
   )

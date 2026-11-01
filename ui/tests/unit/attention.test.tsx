@@ -18,6 +18,7 @@ const item = (id: string, login: string, over: Partial<WorkItem> = {}): WorkItem
 const overview = (current: WorkItem[]) => ({ current, recent: [], overlaps: [], current_complete: true, recent_complete: true, overlaps_complete: true }) as unknown as WorkOverview
 const d = { agents: [], groups: [], filesHeld: 0, contested: [], prOverlaps: [], otherOpenPrs: 0, intentById: new Map() } as unknown as Derived
 const data = { whoami: { owner: { login: 'maria', provider: 'github', host: 'github.com' }, token: { repository: 'acme/widgets' } }, failing: false, activity: null, fresh: new Set() } as unknown as HubData
+const pair = (l: WorkItem, r: WorkItem, path: string) => ({ left: l, right: r, reasons: [{ left_path: path, right_path: path }], reasons_complete: true })
 const ready = (ov: WorkOverview): Poll<WorkOverview> => ({ kind: 'ready', value: ov }) as Poll<WorkOverview>
 
 afterEach(() => localStorage.removeItem('agentscm.hidden.v1'))
@@ -61,7 +62,6 @@ describe('Needs you', () => {
     const a = item('a', 'maria', { claim_status: 'active' })
     const b = item('b', 'dev', { claim_status: 'active' })
     const c = item('c', 'sam', { claim_status: 'active' })
-    const pair = (l: WorkItem, r: WorkItem, path: string) => ({ left: l, right: r, reasons: [{ left_path: path, right_path: path }], reasons_complete: true })
     const ov = { ...overview([a, b, c]), overlaps: [pair(a, b, 'src/billing.rs'), pair(a, c, 'src/tax.rs')] } as unknown as WorkOverview
     render(page(ov))
     const box = needsBox()
@@ -69,6 +69,44 @@ describe('Needs you', () => {
     expect(box.getByRole('link', { name: '2 overlaps to talk through' }).getAttribute('href')).toBe('#inbox')
     expect(box.getByRole('link', { name: 'Open the Inbox' }).getAttribute('href')).toBe('#inbox')
     expect(box.getByText('2')).toBeTruthy()
+  })
+
+  it('names a single overlap in the singular', () => {
+    const [a, b] = [item('a', 'maria', { claim_status: 'active' }), item('b', 'dev', { claim_status: 'active' })]
+    render(page({ ...overview([a, b]), overlaps: [pair(a, b, 'src/billing.rs')] } as unknown as WorkOverview))
+    expect(needsBox().getByRole('link', { name: '1 overlap to talk through' })).toBeTruthy()
+    expect(needsBox().getByText(/^Two tasks plan/)).toBeTruthy()
+  })
+
+  it('leaves hidden overlaps out of the folded row and the count, and brings them back dimmed with Unhide', () => {
+    const [a, b, c] = [item('a', 'maria', { claim_status: 'active' }), item('b', 'dev', { claim_status: 'active' }), item('c', 'sam', { claim_status: 'active' })]
+    const ov = { ...overview([a, b, c]), overlaps: [pair(a, b, 'src/billing.rs'), pair(a, c, 'src/tax.rs')] } as unknown as WorkOverview
+    const overlaps = needsYou(ov, d)
+    localStorage.setItem('agentscm.hidden.v1', JSON.stringify([needHideKey(overlaps[0]!)]))
+    const { unmount } = render(page(ov))
+    expect(needsBox().getByRole('link', { name: '1 overlap to talk through' })).toBeTruthy()
+    expect(needsBox().getByText('1')).toBeTruthy()
+    fireEvent.click(needsBox().getByRole('button', { name: 'Show 1 hidden' }))
+    const rows = needsBox().getAllByRole('listitem')
+    expect(rows).toHaveLength(2)
+    expect(rows.filter((r) => r.classList.contains('is-hidden'))).toHaveLength(1)
+    expect(needsBox().getByText('2')).toBeTruthy()
+    fireEvent.click(needsBox().getByRole('button', { name: 'Show this overlap again' }))
+    expect(needsBox().getByRole('link', { name: '2 overlaps to talk through' })).toBeTruthy()
+    unmount()
+    localStorage.setItem('agentscm.hidden.v1', JSON.stringify(overlaps.map(needHideKey)))
+    render(page(ov))
+    expect(needsBox().queryByRole('listitem')).toBeNull()
+    expect(needsBox().getByText('All clear')).toBeTruthy()
+  })
+
+  it('offers to show all of the needs the box counts, overlaps included', () => {
+    const quiet = '012345'.split('').map((id) => item(id, 'dev'))
+    const [a, b, c] = [item('a', 'maria', { claim_status: 'active' }), item('b', 'dev', { claim_status: 'active' }), item('c', 'sam', { claim_status: 'active' })]
+    render(page({ ...overview([...quiet, a, b, c]), overlaps: [pair(a, b, 'src/billing.rs'), pair(a, c, 'src/tax.rs')] } as unknown as WorkOverview))
+    expect(needsBox().getByText('8')).toBeTruthy()
+    fireEvent.click(needsBox().getByRole('button', { name: 'Show all 8' }))
+    expect(needsBox().getAllByRole('listitem')).toHaveLength(7)
   })
 })
 
