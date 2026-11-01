@@ -1,8 +1,10 @@
 // The G layout over live Hub data. Its rail groups every Hub page under Now · Work · Workflows · Repository and the
 // utilities; G-only pages (Now, Changes, a change, Process, Code map, Contributions, Feature map) render here, and
 // every other route renders the Hub's own page, unchanged, inside this frame.
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Icon } from '../ui.tsx'
+import { CommandPalette, type Hit, type SectionDef } from '../TopNav.tsx'
+import { plural } from '../pages/workParts.tsx'
 import logoDark from '../logo-dark.png'
 import type { Derived } from '../derive.ts'
 import type { HubData } from '../useHub.ts'
@@ -31,10 +33,10 @@ export interface LiveProps {
   handoff: Handoff
 }
 
-interface Item { label: string; href: string; icon: string; on: (s: Section, g: GPage | null) => boolean; q?: string; badge?: number; badgeTone?: 'warn' | 'bad'; dot?: boolean }
+interface Item { label: string; href: string; icon: string; on: (s: Section, g: GPage | null) => boolean; q?: string; /** What ⌘K shows beside a page that has no group to name. */ hint?: string; badge?: number; badgeTone?: 'warn' | 'bad'; dot?: boolean }
 interface Group extends Item { subs: Item[] }
 
-export function GLive({ live, section, page, showAdmin, hubSignedOut, onClassic, banner }: { live: LiveProps; section: Section; page: (s: Section) => ReactNode; showAdmin: boolean; hubSignedOut: boolean; onClassic: () => void; banner?: ReactNode }) {
+export function GLive({ live, section, sections, page, showAdmin, hubSignedOut, onClassic, banner }: { live: LiveProps; section: Section; sections: SectionDef[]; page: (s: Section) => ReactNode; showAdmin: boolean; hubSignedOut: boolean; onClassic: () => void; banner?: ReactNode }) {
   const hash = useHash()
   const g = hubSignedOut ? null : gRoute(hash)
   const cur = g?.page ?? null
@@ -98,11 +100,11 @@ export function GLive({ live, section, page, showAdmin, hubSignedOut, onClassic,
     { label: 'Preferences', href: '#settings', icon: 'sliders', on: s('settings') },
   ]
   const utils: Group[] = [
-    { label: 'Inbox', href: '#inbox', icon: 'inbox', badge: overlaps, badgeTone: 'warn', on: s('inbox'), subs: [] },
+    { label: 'Inbox', href: '#inbox', icon: 'inbox', hint: 'Overlaps that need a conversation', badge: overlaps, badgeTone: 'warn', on: s('inbox'), subs: [] },
     { label: 'Setup', href: '#setup', icon: 'plug', dot: data.failing || data.health?.status === 'unavailable', on: s('setup', 'computers', 'workspace', 'health', 'admin', 'settings'), subs: setupSubs },
-    { label: 'Contributions', href: '#contributions', icon: 'stars', on: gp('contributions'), subs: [] },
-    { label: 'Feature map', href: '#features', icon: 'compass', on: gp('features'), subs: [] },
-    { label: 'All repositories', href: '#repositories', icon: 'collection', on: s('repositories'), subs: [] },
+    { label: 'Contributions', href: '#contributions', icon: 'stars', hint: 'What the Hub has recorded', on: gp('contributions'), subs: [] },
+    { label: 'Feature map', href: '#features', icon: 'compass', hint: 'What is built and what is only proposed', on: gp('features'), subs: [] },
+    { label: 'All repositories', href: '#repositories', icon: 'collection', hint: 'Every repository you can read', on: s('repositories'), subs: [] },
   ]
 
   return (
@@ -116,7 +118,7 @@ export function GLive({ live, section, page, showAdmin, hubSignedOut, onClassic,
         </button>}
         <div className="topbar-right">
           <a href="#health" className={`health-chip${data.failing || (data.health && data.health.status !== 'ok') ? ' is-bad' : ''}`}><span className="live-dot" aria-hidden="true" /><span className="health-text">{data.failing ? 'Reconnecting' : data.health ? (data.health.status === 'ok' ? 'Hub live' : 'Degraded') : '…'}</span></a>
-          <a href="#inbox" className="top-icon bell" aria-label={`Inbox, ${overlaps} overlap${overlaps === 1 ? '' : 's'}`}><Icon name="bell" />{overlaps > 0 && <span className="bell-count tone-warn" aria-hidden="true">{overlaps}</span>}</a>
+          <a href="#inbox" className="top-icon bell" aria-label={`Inbox, ${plural(overlaps, 'overlap')}`}><Icon name="bell" />{overlaps > 0 && <span className="bell-count tone-warn" aria-hidden="true">{overlaps}</span>}</a>
           <button type="button" className="g-classic" onClick={onClassic} title="Switch back to the classic Hub layout"><Icon name="layout-sidebar" /> <span>Classic layout</span></button>
         </div>
       </header>
@@ -143,9 +145,14 @@ export function GLive({ live, section, page, showAdmin, hubSignedOut, onClassic,
           {cur === null && <div className="g-classic-page">{page(section)}</div>}
         </main>
       </div>
-      {palette && <LivePalette live={live} admin={!!showAdmin} onClose={() => setPalette(false)} />}
+      {palette && !hubSignedOut && <CommandPalette onClose={() => setPalette(false)} sections={sections} section={section} d={live.d} overview={ov} pages={pageHits([...groups, ...utils])} />}
     </div>
   )
+}
+
+/** ⌘K searches the rail's own pages and labels: each sub-page, hinted with the group it sits in, and each group that has none. */
+function pageHits(rail: Group[]): Hit[] {
+  return rail.flatMap((n) => (n.subs.length ? n.subs.map((x) => ({ x, hint: n.label })) : [{ x: n, hint: n.hint ?? '' }])).map(({ x, hint }) => ({ group: 'Pages', icon: x.icon, label: x.label, hint, href: x.href }))
 }
 
 function RailGroup({ n, section, g }: { n: Group; section: Section; g: GPage | null }) {
@@ -163,37 +170,6 @@ function RailGroup({ n, section, g }: { n: Group; section: Section; g: GPage | n
         const active = x.on(section, g)
         return <li key={x.href + x.label}><a href={x.href} className={active ? 'on' : ''} aria-current={active ? 'page' : undefined}><Icon name={x.icon} /> {x.label}</a></li>
       })}</ul>}
-    </div>
-  )
-}
-
-/** ⌘K: every page and every unfinished change, as one keyboard-driven list. */
-function LivePalette({ live, admin, onClose }: { live: LiveProps; admin: boolean; onClose: () => void }) {
-  const [q, setQ] = useState('')
-  const [at, setAt] = useState(0)
-  const input = useRef<HTMLInputElement>(null)
-  useEffect(() => input.current?.focus(), [])
-  const ov = live.overview.kind === 'ready' ? live.overview.value : null
-  const items = [
-    ...[['Now', '#home', 'sun'], ['Changes', '#changes', 'kanban'], ['Process', '#process', 'diagram-3'], ['Code map', '#code', 'grid-1x2'], ['Inbox', '#inbox', 'inbox'], ['Catch up', '#activity', 'clock-history'], ['Team', '#team', 'people'], ['Finished and history', '#work/finished', 'flag'], ['Change records', '#change-record', 'clipboard2-check'], ['Landed', '#landed', 'rocket-takeoff'], ['Skills', '#skills', 'journal-check'], ['Runs', '#workflows', 'play-circle'], ['Library', '#templates', 'journal-code'], ['Held files', '#now', 'lock'], ['Files', '#explorer', 'folder2-open'], ['Timeline', '#timeline', 'camera'], ['Promises', '#promises', 'journal-check'], ['Setup: agents', '#setup', 'robot'], ['Computers', '#computers', 'laptop'], ['Access', '#workspace', 'people'], ['Hub health', '#health', 'heart-pulse'], ...(admin ? [['Admin', '#admin', 'shield-lock']] : []), ['Preferences', '#settings', 'sliders'], ['Contributions', '#contributions', 'stars'], ['Feature map', '#features', 'compass'], ['All repositories', '#repositories', 'collection']].map(([label, href, icon]) => ({ label: label!, href: href!, icon: icon!, sub: 'Page', paths: '' })),
-    ...(ov?.current ?? []).map((w) => ({ label: w.title, href: `#work/${w.id}`, icon: 'record-circle', sub: `${w.owner_login} · ${w.state}`, paths: w.scope.join(' ') })),
-  ]
-  const hits = items.filter((i) => `${i.label} ${i.sub} ${i.paths}`.toLowerCase().includes(q.toLowerCase())).slice(0, 10)
-  const go = (href: string) => { onClose(); window.location.hash = href }
-  return (
-    <div className="px-palette-scrim" onClick={onClose}>
-      <div className="px-palette" role="dialog" aria-modal="true" aria-label="Search the Hub" onClick={(e) => e.stopPropagation()}>
-        <input ref={input} className="form-control" role="combobox" aria-expanded="true" aria-controls="g-palette-list" aria-activedescendant={hits[at] ? `g-hit-${at}` : undefined} aria-autocomplete="list" placeholder="Go to a page, or find a change by title or path…" value={q}
-          onChange={(e) => { setQ(e.target.value); setAt(0) }}
-          onKeyDown={(e) => {
-            if (e.key === 'ArrowDown') { e.preventDefault(); setAt((a) => Math.min(hits.length - 1, a + 1)) }
-            if (e.key === 'ArrowUp') { e.preventDefault(); setAt((a) => Math.max(0, a - 1)) }
-            const hit = hits[at]
-            if (e.key === 'Enter' && hit) go(hit.href)
-          }} />
-        <ul id="g-palette-list" role="listbox" aria-label="Pages and changes">{hits.map((h, i) => <li key={h.href + h.label} id={`g-hit-${i}`} role="option" aria-selected={i === at} className={i === at ? 'on' : ''} onClick={() => go(h.href)} onMouseEnter={() => setAt(i)}><Icon name={h.icon} /><span>{h.label}</span><span className="small muted">{h.sub}</span></li>)}</ul>
-        {hits.length === 0 && <p className="small muted p-3 mb-0">Nothing matches “{q}”.</p>}
-      </div>
     </div>
   )
 }

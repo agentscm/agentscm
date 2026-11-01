@@ -481,7 +481,8 @@ export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, even
   }
 }
 
-export function DashboardPage({ section, question, token, repo, data, d, overview }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
+/** `answer` replaces the shared headline: the G layout gives each tab its own sentence. */
+export function DashboardPage({ section, question, token, repo, data, d, overview, answer }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview>; answer?: ReactNode }) {
   const ov = overview.kind === 'ready' ? overview.value : null
   const hidden = useHidden()
   const all = needsYou(ov, d)
@@ -490,7 +491,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
   const start = <StartTask token={token} me={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />
   return (
     <div className="page">
-      <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />
+      {answer ? <PageHead question={question} answer={answer} live /> : <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />}
       {section === 'home' && ov && d && <Coach id="answer" side="below">This sentence is the page in brief: how many tasks are unfinished, how many are moving or stuck, and how many need you.</Coach>}
       <SectionTabs label="Dashboard views" />
       {overview.kind === 'error' && (
