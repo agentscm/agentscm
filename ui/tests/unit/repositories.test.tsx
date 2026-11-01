@@ -82,6 +82,22 @@ describe('All repositories', () => {
     expect(screen.getByRole('button', { name: /1 quiet repository/ })).toBeTruthy()
   })
 
+  it('refreshes the slow list as soon as the open repository’s working set changes, and only then', async () => {
+    stubList({ repositories: [ROW('example-org/api'), ROW('example-org/docs')], unchecked: 0, complete: true })
+    const web = { repos: [], pick: vi.fn(), refusal: null }
+    const { rerender } = render(<RepositoriesPage auth={AUTH} web={web} current="example-org/api" overview={OVERVIEW([])} />)
+    await waitFor(() => expect(document.querySelector('.answer-text')?.textContent).toBe('No agent is working in any of these yet.'))
+    const calls = stubList({ repositories: [ROW('example-org/api', { agents: 1, unfinished: { total: 1, moving: 1, stuck: 0 } }), ROW('example-org/docs')], unchecked: 0, complete: true })
+    rerender(<RepositoriesPage auth={AUTH} web={web} current="example-org/api" overview={OVERVIEW([ITEM('wrk_1')])} />)
+    // The headline agrees with Working now without waiting for the two-minute poll.
+    await waitFor(() => expect(document.querySelector('.answer-text')?.textContent).toBe('Nothing needs you.'))
+    expect(calls).toEqual(['/v1/hub/session/repositories'])
+    // A fresh overview with the same working set (a check-in) costs the Hub nothing.
+    rerender(<RepositoriesPage auth={AUTH} web={web} current="example-org/api" overview={OVERVIEW([ITEM('wrk_1', { last_checkin_at: now() })])} />)
+    await act(async () => {})
+    expect(calls).toEqual(['/v1/hub/session/repositories'])
+  })
+
   it('opens the focus repository from its button through the page’s own open path', async () => {
     stubList({ repositories: [ROW('example-org/api', { needs_you: 1, agents: 1 }), ROW('example-org/docs', { agents: 1 })], unchecked: 0, complete: true })
     const pick = vi.fn()

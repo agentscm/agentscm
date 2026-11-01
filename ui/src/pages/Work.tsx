@@ -124,6 +124,7 @@ function Finished({ overview, search }: { overview: WorkOverview; search: string
         </Empty>
       ) : (
         <div className="finished-grid">
+          <h2 className="visually-hidden">Reported finished</h2>
           {visible.map((o) => (
             <WorkCard key={o.seq} item={o.item} outcomeAt={o.at} />
           ))}
