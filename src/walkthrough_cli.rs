@@ -36,6 +36,18 @@ pub struct Read {
 
 #[derive(Debug, Subcommand)]
 pub enum WalkthroughCommand {
+    /// Emit a bounded deterministic source map without authoring or storage.
+    Map {
+        #[command(flatten)]
+        checkout: Checkout,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        head: String,
+        /// Exact selected source; omission leaves applicability unknown.
+        #[arg(long)]
+        current_head: Option<String>,
+    },
     /// Bind an authored draft (or empty manifest) to exact committed source.
     Create {
         #[command(flatten)]
@@ -77,6 +89,21 @@ pub enum WalkthroughCommand {
 
 pub fn run(command: WalkthroughCommand) -> Result<Value> {
     match command {
+        WalkthroughCommand::Map {
+            checkout,
+            base,
+            head,
+            current_head,
+        } => {
+            let root = std::fs::canonicalize(&checkout.root)?;
+            let git = GitExplorer::open(&root, &checkout.repository)?;
+            agentscm::repo_explorer::walkthrough_map::map(
+                &git,
+                &base,
+                &head,
+                current_head.as_deref(),
+            )
+        }
         WalkthroughCommand::Create {
             checkout,
             base,

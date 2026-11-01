@@ -1195,12 +1195,17 @@ impl GitExplorer {
         }
         let out = self.run_complete(
             &[
+                "-c",
+                "diff.suppressBlankEmpty=false",
                 "diff",
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-renames",
                 "--no-color",
                 "--unified=3",
+                "--output-indicator-new=+",
+                "--output-indicator-old=-",
+                "--output-indicator-context= ",
                 "--end-of-options",
                 left,
                 right,

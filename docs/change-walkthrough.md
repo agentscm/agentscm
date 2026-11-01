@@ -13,6 +13,52 @@ This alpha slice uses authored JSON and observed Git facts. It does not generate
 with a model, infer which prompt caused a hunk, establish semantic correctness or grant approval.
 A source anchor establishes where to inspect a claim; it does not prove the claim.
 
+## Start with a deterministic map
+
+For a compact starting point without authoring or storing a walkthrough:
+
+```sh
+agentscm walkthrough map --root . --repository example/project \
+  --base FULL_BASE_COMMIT --head FULL_HEAD_COMMIT --current-head FULL_CURRENT_COMMIT
+```
+
+This stateless command uses the guarded local Git reader. It opens no walkthrough database or
+capture spool, calls no model and executes no source or checks. Commit IDs must be full lowercase
+identities available locally. `applicability` is `same_source`, `different_source` or `unknown`
+when `--current-head` is omitted. This compares committed source, not working-tree cleanliness.
+Evidence stays `not_loaded` with verification `unassessed`; deferred evidence is not absent or fresh.
+
+The JSON packet targets 4 KiB and never exceeds 8 KiB including its final newline. A path/kind
+index keeps Git enumeration order, without relevance ranking, for up to 256 of at most 1,000
+discovered changes. `discovered_manifest_complete` distinguishes complete enumeration from a
+known lower bound; `unknown_remainder` preserves that uncertainty. `displayed_index_complete`
+separately reports whether the full manifest is displayed. Omission counts cover known changes,
+not an unknown remainder. A different current head adds a bounded head-to-current path index
+with its own coverage and omissions.
+
+Previews reference `change_index` in the path index. At most 16 files have previews, with at most
+four hunks per file and a prefix of at most 12 unified patch records / 640 UTF-8 bytes per hunk.
+`base` and `head` ranges are `[start, count]` for the full observed hunk; prefixed lines retain
+exact source spelling and side. A space advances both sides, `-` advances base, `+` advances head,
+and a no-newline marker advances neither. Counts are validated before any prefix is exposed.
+`omitted_lines` counts omitted unified records, including markers. Coverage's `loaded_patch_*`
+and `omitted_loaded_*` counts describe only loaded patches; uninspected files have no inferred
+hunk or line counts. Empty text wrappers are removed. Binary, oversized, unsupported and
+unavailable patches remain explicit when their preview fits. Rename/copy previews are deferred;
+old/new paths remain in the index for direct source retrieval.
+
+Source previews are trimmed before the main path index. Patch reads stop when less than 512 bytes
+remain below the target; each loaded preview is bounded before considering another file. An
+index-only packet can exceed the 4 KiB target; paths are omitted whole when needed for the hard bound. Source identities remain
+intact. Ordinary file/tree/diff/search operations and raw evidence records remain available beyond
+the map. The map claims no semantic or dependency completeness and does not establish review
+quality or model-cost savings. Optional authored walkthroughs below remain a separate workflow.
+
+Output is deterministic for a fixed checkout's Git version, configuration and attributes. Local
+`.gitattributes` can change preview formatting or availability even when the selected commits are
+unchanged. The byte bound is not an aggregate execution timeout: the command inherits the reader's
+per-call deadlines and supported path limits.
+
 ## Create a case
 
 Choose full immutable base and head commit IDs available in the local checkout. Run from that

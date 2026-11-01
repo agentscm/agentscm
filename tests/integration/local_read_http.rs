@@ -970,3 +970,72 @@ fn walkthrough_cli_and_authenticated_explorer_share_immutable_local_records() {
     assert_eq!(server.get(list).0, 400);
     assert_eq!(before, inventory());
 }
+
+#[test]
+fn walkthrough_map_cli_is_bounded_stateless_and_requires_full_source_identities() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("repo");
+    let head = explorer_checkout(&root);
+    let home = temporary.path().join("home");
+    let data = temporary.path().join("data");
+    let native = temporary.path().join("native");
+    let invoke = |base: &str, current: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command
+            .args(["--no-telemetry", "--data-dir"])
+            .arg(&native)
+            .args(["walkthrough", "map", "--root"])
+            .arg(&root)
+            .args([
+                "--repository",
+                "synthetic/project",
+                "--base",
+                base,
+                "--head",
+                &head,
+            ])
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .env_remove("AGENTSCM_VERIFIED_INSTALL");
+        if let Some(current) = current {
+            command.args(["--current-head", current]);
+        }
+        command.output().unwrap()
+    };
+    for current in [None, Some(head.as_str())] {
+        let output = invoke(&head, current);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() <= 8192);
+        assert_eq!(output.stdout.last(), Some(&b'\n'));
+        let packet: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            packet["applicability"],
+            if current.is_some() {
+                "same_source"
+            } else {
+                "unknown"
+            }
+        );
+        assert_eq!(packet["coverage"]["discovered_manifest_complete"], true);
+        assert_eq!(packet["evidence"]["state"], "not_loaded");
+        assert_eq!(packet["evidence"]["verification"], "unassessed");
+        assert!(!home.exists());
+        assert!(!data.exists());
+        assert!(!native.exists());
+        assert!(!root.join(".agentscm").exists());
+    }
+    let output = invoke("HEAD", None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("full lowercase Git object ID required")
+    );
+    let output = invoke(&head, Some("HEAD"));
+    assert!(!output.status.success());
+    assert!(!home.exists());
+    assert!(!data.exists());
+    assert!(!native.exists());
+}
