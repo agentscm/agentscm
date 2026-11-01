@@ -476,9 +476,10 @@ export interface Hit {
   run?: () => void
 }
 
-export function paletteHits(sections: SectionDef[], d: Derived | null, overview: WorkOverview | null): Hit[] {
-  const hits: Hit[] = sections.map((s) => ({ group: 'Pages', icon: s.icon, label: s.label, hint: s.question, href: `#${s.key}` }))
-  hits.push({ group: 'Pages', icon: 'list-ul', label: 'Changes', hint: 'Every change to Work, page by page', href: workTabHref('history') })
+/** `pages` replaces the classic page list for a layout that names and routes its pages itself (the G layout). */
+export function paletteHits(sections: SectionDef[], d: Derived | null, overview: WorkOverview | null, pages?: Hit[]): Hit[] {
+  const hits: Hit[] = pages ? [...pages] : sections.map((s) => ({ group: 'Pages', icon: s.icon, label: s.label, hint: s.question, href: `#${s.key}` }))
+  if (!pages) hits.push({ group: 'Pages', icon: 'list-ul', label: 'Changes', hint: 'Every change to Work, page by page', href: workTabHref('history') })
   for (const a of d?.agents ?? []) hits.push({ group: 'Agents', icon: 'robot', label: a.name, hint: `${a.owner}${a.task ? ` · ${a.task}` : ''}`, href: '#team' })
   const files = new Set((d?.agents ?? []).flatMap((a) => a.holdings.map((h) => h.spec)))
   for (const f of files) hits.push({ group: 'Held files', icon: 'file-earmark-code', label: f, hint: 'Claimed by a live agent', href: '#now' })
@@ -494,7 +495,7 @@ export function filterHits(all: Hit[], q: string): Hit[] {
   return list.slice(0, 40)
 }
 
-function CommandPalette({ onClose, sections, section, d, overview }: { onClose: () => void; sections: SectionDef[]; section: Section; d: Derived | null; overview: WorkOverview | null }) {
+export function CommandPalette({ onClose, sections, section, d, overview, pages }: { onClose: () => void; sections: SectionDef[]; section: Section; d: Derived | null; overview: WorkOverview | null; pages?: Hit[] }) {
   const tour = useTour()
   const [q, setQ] = useState('')
   const [sel, setSel] = useState(0)
@@ -508,12 +509,12 @@ function CommandPalette({ onClose, sections, section, d, overview }: { onClose: 
   }, [])
 
   const all = useMemo(() => {
-    const hits = paletteHits(sections, d, overview)
+    const hits = paletteHits(sections, d, overview, pages)
     const here = sections.find((s) => s.key === section)
     if (tour && here && tourFor(section)) hits.push({ group: 'Help', icon: 'signpost-split', label: 'Walk me through this page', hint: `A short tour of ${here.label}`, href: '', run: () => tour.start(section) })
     if (tour) hits.push({ group: 'Help', icon: 'compass', label: 'Replay the welcome tour', hint: 'The top bar, the sections and what each one is for', href: '', run: () => tour.start('welcome') })
     return hits
-  }, [sections, section, d, overview, tour])
+  }, [sections, section, d, overview, pages, tour])
   const shown = useMemo(() => filterHits(all, q), [all, q])
   useEffect(() => {
     if (shown.length > 0) document.getElementById(`hit-${sel}`)?.scrollIntoView?.({ block: 'nearest' })

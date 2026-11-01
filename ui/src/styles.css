@@ -111,6 +111,11 @@ body {
   outline-offset: 3px;
   border-radius: 4px;
 }
+/* Bootstrap's .btn:focus-visible drops the outline for a shadow this theme makes transparent; keep the ring visible. */
+.btn:focus-visible {
+  outline: 2px solid var(--hub-brand);
+  outline-offset: 3px;
+}
 a {
   text-underline-offset: 3px;
 }

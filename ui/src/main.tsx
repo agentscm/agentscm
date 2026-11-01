@@ -12,11 +12,13 @@ import { loadDensity } from './storage.ts'
 import { listenForLaunches, watchTitleBar } from './install.ts'
 import App from './App.tsx'
 import { ErrorBoundary } from './ErrorBoundary.tsx'
+import { takeGLink } from './g/layout.ts'
 
 // Before the first render, so the page never paints at the wrong density or under the window controls.
 document.documentElement.dataset['density'] = loadDensity()
 watchTitleBar()
 listenForLaunches()
+takeGLink()
 
 // A `#token=` or `#pair=` link opened in an already-loaded tab only changes the hash; reload so it is stripped and checked like a fresh load.
 window.addEventListener('hashchange', () => {
@@ -24,6 +26,14 @@ window.addEventListener('hashchange', () => {
   if (fragment.has('token') || fragment.has('pair')) window.location.reload()
 })
 
+// Lifecycle prototypes on sample data (#proto/a, /b, /c): no Hub, no token. Crossing in or out reloads into the other app.
+const proto = window.location.hash.startsWith('#proto')
+window.addEventListener('hashchange', () => {
+  if (window.location.hash.startsWith('#proto') !== proto) window.location.reload()
+})
+if (proto) {
+  void import('./proto/shell.tsx').then(({ ProtoApp }) => createRoot(document.getElementById('root')!).render(<StrictMode><ErrorBoundary><ProtoApp /></ErrorBoundary></StrictMode>))
+} else {
 // A slow hub must not hold the first render: give the link check a few seconds, then show the page anyway.
 // If the check then finishes with a stored token, reload so the page picks it up instead of staying on sign-in.
 let slow = false
@@ -39,3 +49,4 @@ void Promise.race([adopting, new Promise((resolve) => setTimeout(() => { slow = 
   )
   if (slow) void adopting.then((saved) => saved && window.location.reload())
 })
+}

@@ -224,7 +224,8 @@ pub fn plain_text(input: &str, max_chars: usize) -> Value {
     json!({
         "type": "plain_text",
         "text": clip_plain_text(input, max_chars),
-        "emoji": true,
+        // Teammate text such as `:rocket:` stays as typed.
+        "emoji": false,
     })
 }
 
