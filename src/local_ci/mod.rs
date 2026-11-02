@@ -1,8 +1,16 @@
 //! Immutable local CI declarations. These contracts do not execute jobs or grant admission.
+mod coverage;
+mod evidence;
 #[cfg(unix)]
 mod git;
 mod json;
 mod resolve;
+
+pub use coverage::{
+    CellObservation, CoverageAssessment, CoverageReport, ObservationOutcome, ServiceObservation,
+    verify_coverage,
+};
+pub use evidence::{LOCAL_CI_CHECK_KIND, LOCAL_CI_REQUIREMENT_ID, PlanArtifact};
 
 #[cfg(unix)]
 pub use git::GitSourceReader;

@@ -707,3 +707,362 @@ fn native_sources_use_the_same_resolver_without_git_adoption() {
     };
     assert!(trusted.resolve(input, &reader).is_ok());
 }
+
+fn coverage(plan: &ImmutablePlan) -> CoverageReport {
+    CoverageReport {
+        version: VERSION,
+        plan_sha256: plan.digest().unwrap(),
+        cells: plan
+            .cells
+            .iter()
+            .filter(|cell| {
+                !plan
+                    .omissions
+                    .iter()
+                    .any(|o| o.job == cell.job && o.cell == cell.id)
+            })
+            .map(|cell| CellObservation {
+                job: cell.job.clone(),
+                cell: cell.id.clone(),
+                outcome: ObservationOutcome::Success,
+                services: cell
+                    .services
+                    .iter()
+                    .map(|s| ServiceObservation {
+                        id: s.id.clone(),
+                        outcome: ObservationOutcome::Success,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn coverage_inventory_and_outcomes_are_independent_of_execution_assurance() {
+    use agentscm::evidence::EvidenceOutcome;
+    let (trusted, reader) = trusted_fixture(requirements());
+    let plan = trusted.resolve(inputs(), &reader).unwrap().plan().clone();
+    let report = coverage(&plan);
+    let assess = |report: &CoverageReport| {
+        verify_coverage(trusted.binding().clone(), inputs(), &reader, &plan, report).unwrap()
+    };
+    let good = assess(&report);
+    assert!(good.inventory_complete);
+    assert_eq!(good.outcome, EvidenceOutcome::Pass);
+    let mut missing = report.clone();
+    missing.cells.pop();
+    let result = assess(&missing);
+    assert!(!result.inventory_complete);
+    assert_eq!(result.outcome, EvidenceOutcome::Incomplete);
+    let mut missing_service = report.clone();
+    missing_service.cells[0].services.clear();
+    assert!(!assess(&missing_service).inventory_complete);
+    let mut extra = report.clone();
+    extra.cells[0].cell = "unexpected".into();
+    assert!(!assess(&extra).inventory_complete);
+    let mut extra_service = report.clone();
+    extra_service.cells[0].services[0].id = "unexpected".into();
+    assert!(!assess(&extra_service).inventory_complete);
+    for state in [
+        ObservationOutcome::Skipped,
+        ObservationOutcome::Cancelled,
+        ObservationOutcome::Unavailable,
+        ObservationOutcome::Incomplete,
+        ObservationOutcome::Unknown,
+    ] {
+        let mut changed = report.clone();
+        changed.cells[0].outcome = state;
+        assert!(assess(&changed).inventory_complete);
+        assert_eq!(assess(&changed).outcome, EvidenceOutcome::Incomplete);
+    }
+    let mut failed = report.clone();
+    failed.cells[0].outcome = ObservationOutcome::Failed;
+    assert!(assess(&failed).inventory_complete);
+    assert_eq!(assess(&failed).outcome, EvidenceOutcome::Fail);
+    for state in [
+        ObservationOutcome::Failed,
+        ObservationOutcome::Skipped,
+        ObservationOutcome::Cancelled,
+        ObservationOutcome::Unavailable,
+        ObservationOutcome::Incomplete,
+        ObservationOutcome::Unknown,
+    ] {
+        let mut changed = report.clone();
+        changed.cells[0].services[0].outcome = state;
+        assert_eq!(assess(&changed).outcome, EvidenceOutcome::Incomplete);
+    }
+}
+
+#[test]
+fn coverage_strict_parsing_canonicalization_and_duplicate_rejection() {
+    let report = coverage(&plan());
+    let bytes = report.canonical_bytes().unwrap();
+    assert_eq!(
+        CoverageReport::from_slice(&bytes)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap(),
+        bytes
+    );
+    let mut reordered = report.clone();
+    reordered.cells.reverse();
+    assert_eq!(report.digest().unwrap(), reordered.digest().unwrap());
+    let mut duplicate = report.clone();
+    duplicate.cells.push(duplicate.cells[0].clone());
+    assert!(duplicate.validate().is_err());
+    let mut duplicate = report.clone();
+    let service = duplicate.cells[0].services[0].clone();
+    duplicate.cells[0].services.push(service);
+    assert!(duplicate.validate().is_err());
+    let text = String::from_utf8(bytes).unwrap();
+    for invalid in [
+        text.replacen("\"version\":1", "\"version\":2", 1),
+        text.replacen("\"version\":1", "\"version\":1,\"extra\":true", 1),
+        text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+        format!("{text} {{}}"),
+        "{".into(),
+    ] {
+        assert!(CoverageReport::from_slice(invalid.as_bytes()).is_err());
+    }
+    assert!(CoverageReport::from_slice(&vec![b' '; MAX_DOCUMENT_BYTES + 1]).is_err());
+    assert_eq!(
+        report.digest().unwrap(),
+        "9a9d1723217cf6fdddde3b9264ca0dd89e5f41bb61b24080eb58a7b978231b92"
+    );
+}
+
+#[test]
+fn verifier_recomputes_current_subject_policy_and_omissions() {
+    let (trusted, reader) = trusted_fixture(requirements());
+    let original = trusted.resolve(inputs(), &reader).unwrap().plan().clone();
+    let report = coverage(&original);
+    let mut mutations = Vec::new();
+    let mut changed = original.clone();
+    changed.policy_epoch += 1;
+    mutations.push(changed);
+    let mut changed = original.clone();
+    changed.requirements_sha256 = "a".repeat(64);
+    mutations.push(changed);
+    let mut changed = original.clone();
+    changed.configuration.sha256 = "b".repeat(64);
+    mutations.push(changed);
+    let mut changed = original.clone();
+    changed.subject = PlanSubject::PrHead {
+        head: source('a'),
+        base: source('f'),
+    };
+    mutations.push(changed);
+    let mut changed = original.clone();
+    changed.subject = PlanSubject::MergeResult {
+        head: source('a'),
+        base: source('c'),
+        result: source('a'),
+    };
+    mutations.push(changed);
+    let mut changed = original.clone();
+    changed.cells.pop();
+    mutations.push(changed);
+    let mut changed = original.clone();
+    changed.omissions.push(PermittedOmission {
+        job: "mobile".into(),
+        cell: "ios".into(),
+        reason: "skip".into(),
+    });
+    mutations.push(changed);
+    for changed in mutations {
+        // Even a self-consistent report for the altered plan cannot set its own expected inputs.
+        let report = coverage(&changed);
+        assert!(
+            verify_coverage(
+                trusted.binding().clone(),
+                inputs(),
+                &reader,
+                &changed,
+                &report
+            )
+            .is_err()
+        );
+    }
+    let mut stale = inputs();
+    stale.event_inputs.insert("event".into(), "push".into());
+    assert!(
+        verify_coverage(
+            trusted.binding().clone(),
+            stale,
+            &reader,
+            &original,
+            &report
+        )
+        .is_err()
+    );
+    let mut wrong_report = report;
+    wrong_report.plan_sha256 = "f".repeat(64);
+    assert!(
+        verify_coverage(
+            trusted.binding().clone(),
+            inputs(),
+            &reader,
+            &original,
+            &wrong_report
+        )
+        .is_err()
+    );
+    let mut req = requirements();
+    let omission = PermittedOmission {
+        job: "mobile".into(),
+        cell: "ios".into(),
+        reason: "reviewed hosted omission".into(),
+    };
+    req.permitted_omissions.push(omission.clone());
+    let (trusted, reader) = trusted_fixture(req);
+    let mut input = inputs();
+    input.omissions.push(omission);
+    let plan = trusted
+        .resolve(input.clone(), &reader)
+        .unwrap()
+        .plan()
+        .clone();
+    let mut report = coverage(&plan);
+    let result = verify_coverage(
+        trusted.binding().clone(),
+        input.clone(),
+        &reader,
+        &plan,
+        &report,
+    )
+    .unwrap();
+    assert_eq!(result.expected_cells, 1);
+    assert_eq!(result.outcome, agentscm::evidence::EvidenceOutcome::Pass);
+    report.cells.push(CellObservation {
+        job: "mobile".into(),
+        cell: "ios".into(),
+        outcome: ObservationOutcome::Success,
+        services: vec![],
+    });
+    assert!(
+        !verify_coverage(trusted.binding().clone(), input, &reader, &plan, &report)
+            .unwrap()
+            .inventory_complete
+    );
+}
+
+#[test]
+fn portable_evidence_mapping_commits_plan_without_promoting_legacy_assurance() {
+    use agentscm::context::ChangeId;
+    use sha2::{Digest, Sha256};
+    let original = plan();
+    let change = ChangeId {
+        repository: "example/project".into(),
+        id: "pr-1".into(),
+    };
+    let subject = original.evidence_subject(change.clone(), 1).unwrap();
+    assert_eq!(subject.context_digest, original.digest().unwrap());
+    assert_eq!(subject.recipe_sha256, original.requirements_sha256);
+    assert_eq!(LOCAL_CI_CHECK_KIND, "command/v1");
+    assert_ne!(
+        LOCAL_CI_REQUIREMENT_ID,
+        agentscm::local_validation::REQUIREMENT_ID
+    );
+    let artifact = original.evidence_artifact().unwrap();
+    assert_eq!(
+        artifact.record.sha256,
+        format!("{:x}", Sha256::digest(&artifact.bytes))
+    );
+    assert_ne!(artifact.record.sha256, original.digest().unwrap());
+    assert_eq!(artifact.bytes, original.canonical_bytes().unwrap());
+    // Existing portable evidence validation accepts this mapping; a fixture basis stays a
+    // fixture and this does not sign, authenticate or promote its execution claims.
+    use agentscm::evidence::{
+        ArtifactAvailability, ArtifactRecord, CoverageClaim, EvidenceOutcome, EvidencePayload,
+        ExecutionBasis, OutputCommitment, RecoveryState, TerminalState,
+    };
+    let record_sha256 = format!("{:x}", Sha256::digest(b"synthetic record"));
+    let empty = format!("{:x}", Sha256::digest(b""));
+    EvidencePayload {
+        version: 1,
+        requirement_id: LOCAL_CI_REQUIREMENT_ID.into(),
+        check_kind: LOCAL_CI_CHECK_KIND.into(),
+        subject: subject.clone(),
+        installed_policy_sha256: original.requirements_sha256.clone(),
+        installed_policy_epoch: original.policy_epoch,
+        issuer_registry_sha256: "a".repeat(64),
+        dependency_snapshot_sha256: None,
+        attempt_id: "fixture-attempt".into(),
+        run_generation: 1,
+        request_sha256: original.digest().unwrap(),
+        limits_sha256: "b".repeat(64),
+        terminal_record_sha256: record_sha256.clone(),
+        issuer_id: "fixture".into(),
+        key_id: "c".repeat(64),
+        issued_at_ms: 1,
+        expires_at_ms: 2,
+        terminal_state: TerminalState::Success,
+        recovery_state: RecoveryState::NotRequired,
+        outcome: EvidenceOutcome::Pass,
+        execution_basis: ExecutionBasis::Fixture,
+        qualification_claim: None,
+        coverage: CoverageClaim {
+            scope: vec!["synthetic-cells".into()],
+            expected_count: 2,
+            observed_count: 2,
+            inventory_complete: true,
+            omissions: vec![],
+        },
+        dependencies: vec![],
+        artifacts: vec![
+            artifact.record,
+            ArtifactRecord {
+                artifact_id: "record".into(),
+                media_type: "application/json".into(),
+                sha256: record_sha256,
+                bytes: 16,
+                claimed_availability: ArtifactAvailability::Full,
+                expires_at_ms: None,
+            },
+        ],
+        output: OutputCommitment {
+            stdout_sha256: empty.clone(),
+            stdout_bytes: 0,
+            stderr_sha256: empty,
+            stderr_bytes: 0,
+            truncated: false,
+        },
+    }
+    .validate()
+    .unwrap();
+    let mut changed = original.clone();
+    changed.subject = PlanSubject::PrHead {
+        head: source('f'),
+        base: source('c'),
+    };
+    assert_ne!(
+        subject.revision,
+        changed
+            .evidence_subject(change.clone(), 1)
+            .unwrap()
+            .revision
+    );
+    let mut merge = original.clone();
+    merge.subject = PlanSubject::MergeResult {
+        head: source('a'),
+        base: source('c'),
+        result: source('a'),
+    };
+    assert_ne!(
+        subject.context_digest,
+        merge
+            .evidence_subject(change.clone(), 1)
+            .unwrap()
+            .context_digest
+    );
+    assert!(original.evidence_subject(change.clone(), 0).is_err());
+    let wrong = ChangeId {
+        repository: "other/project".into(),
+        id: "pr-1".into(),
+    };
+    assert!(original.evidence_subject(wrong, 1).is_err());
+    let mut reordered = original.clone();
+    reordered.cells.reverse();
+    assert_eq!(subject, reordered.evidence_subject(change, 1).unwrap());
+}
