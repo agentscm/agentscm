@@ -46,7 +46,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
           ? <>Reading the Hub…<br /><span className="g-quiet">Decisions appear here first.</span></>
           : n
             ? <><Tick k={n}>{word(n)}</Tick> {n === 1 ? 'thing needs' : 'things need'} you.<br /><span className="g-quiet">The rest has a next step.</span></>
-            : <>Nothing needs you.<br /><span className="g-quiet"><Tick k={moving}>{word(moving)}</Tick> {moving === 1 ? 'change is' : 'changes are'} moving on {moving === 1 ? 'its' : 'their'} own.</span></>}
+            : <>Nothing needs you.<br /><span className="g-quiet">{moving === 0 ? 'No change is moving right now.' : <><Tick k={moving}>{word(moving)}</Tick> {moving === 1 ? 'change is' : 'changes are'} moving on {moving === 1 ? 'its' : 'their'} own.</>}</span></>}
         fact={loading ? <span className="g-fact">{repo}</span> : <span className="g-fact">
           <span>{repo} · {current.length} unfinished · {plural(people, 'person', 'people')} with {plural(agents, 'live agent')}</span>
           <a href="#contributions" className="g-strip" aria-label="What the Hub has recorded">
