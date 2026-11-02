@@ -80,7 +80,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
   )
 }
 
-const KIND_LABEL: Record<Need['kind'], string> = { blocked: 'Blocked', quiet: 'Gone quiet', handover: 'Handover', contested: 'Contested file', overlap: 'Overlap', pr: 'Pull request' }
+const KIND_LABEL: Record<Need['kind'], string> = { blocked: 'Blocked', asked: 'Asked while idle', quiet: 'Gone quiet', handover: 'Handover', contested: 'Contested file', overlap: 'Overlap', pr: 'Pull request' }
 
 function LiveNeedCard({ n, i, ov, d, live }: { n: Need; i: number; ov: WorkOverview; d: Derived; live: LiveProps }) {
   const { icon, title, gist, body, step } = needView(n, ov, d, live.handoff.me)

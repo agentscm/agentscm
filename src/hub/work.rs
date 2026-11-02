@@ -861,6 +861,13 @@ pub(super) fn fit_json_budget<T: Serialize>(items: &mut Vec<T>, budget: usize) -
     Ok(dropped)
 }
 
+impl WorkItem {
+    /// The lead will not answer a request soon: it paused, or its claim is no longer active.
+    pub(super) fn lead_idle(&self) -> bool {
+        self.state == WorkState::Paused || self.claim_status != ClaimStatus::Active
+    }
+}
+
 /// A lead's claim is active while its token is valid and it checked in recently.
 pub(super) fn claim_status(last_checkin_at: i64, lead_valid: bool, now: i64) -> ClaimStatus {
     if now < last_checkin_at {

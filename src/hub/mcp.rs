@@ -37,7 +37,7 @@ use super::store::{Principal, unix_now};
 use super::view_settings::{ViewOverride, ViewSettings};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, ForgeWorkRef, WorkCheckpoint,
-    WorkConflictKind, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
+    WorkConflictKind, WorkItem, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
 };
 use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult, WorkPreflightStatus};
 #[cfg(not(unix))]
@@ -2905,6 +2905,22 @@ fn start_result(
     text.push_str(&catchup_summary(catchup.as_ref()));
     if let Some(request) = &work.coordination_request {
         text.push_str(&format!("\nCoordination request {} is queued for the affected leads. Queued is not received; inspect agentscm_coordination_inbox for receipts and replies.", request.id));
+        // A paused or quiet lead will not answer; the Hub's Needs you asks the person who owns it instead.
+        for target in &request.targets {
+            let idle = work
+                .context
+                .as_ref()
+                .and_then(|context| {
+                    context
+                        .current
+                        .iter()
+                        .find(|item| item.id == target.work_id)
+                })
+                .is_some_and(WorkItem::lead_idle);
+            if idle {
+                text.push_str(&format!("\nThe agent leading {} is not running (paused or no recent check-in), so it cannot answer. Its person, {}, is asked in the AgentSCM Hub's Needs you instead and can answer for it.", target.work_id, target.lead.login));
+            }
+        }
     }
     if work.item.scope.is_empty() {
         text.push_str("\nScope is undeclared and coverage is unknown. Have the lead checkpoint the intended scope before editing.");

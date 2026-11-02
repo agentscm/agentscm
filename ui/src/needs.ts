@@ -2,9 +2,10 @@
 // shared by the dashboard's answer, its tabs and the rail badges so they always count the same things.
 // No DOM, no React.
 import { specKey, type Contested, type Derived } from './derive.ts'
-import type { WorkItem, WorkOverview } from './standup.ts'
+import { currentResponse, pending } from './requests.ts'
+import type { CoordinationRequest, WorkItem, WorkOverview } from './standup.ts'
 
-export type NeedKind = 'blocked' | 'quiet' | 'handover' | 'contested' | 'overlap' | 'pr'
+export type NeedKind = 'blocked' | 'asked' | 'quiet' | 'handover' | 'contested' | 'overlap' | 'pr'
 
 export interface Need {
   key: string
@@ -13,13 +14,15 @@ export interface Need {
   /** The work item it is about, when there is one. */
   item?: WorkItem
   path?: string
+  /** For `asked`: the request waiting on the viewer's agent. */
+  request?: CoordinationRequest
   at: number
   /** `you`: a person can act on it now. `agents`: the agents are still sorting it out, so no count includes it. */
   who: 'you' | 'agents'
 }
 
-const TONE: Record<NeedKind, Need['tone']> = { blocked: 'bad', contested: 'bad', quiet: 'warn', overlap: 'warn', pr: 'warn', handover: 'brand' }
-const ORDER: NeedKind[] = ['blocked', 'contested', 'quiet', 'overlap', 'pr', 'handover']
+const TONE: Record<NeedKind, Need['tone']> = { blocked: 'bad', asked: 'bad', contested: 'bad', quiet: 'warn', overlap: 'warn', pr: 'warn', handover: 'brand' }
+const ORDER: NeedKind[] = ['blocked', 'asked', 'contested', 'quiet', 'overlap', 'pr', 'handover']
 
 /** A handoff still waiting for its answer is the agents' to settle; so is a settled or refused-only file one agent holds. */
 export function contestedParty(c: Contested): Need['who'] {
@@ -27,16 +30,38 @@ export function contestedParty(c: Contested): Need['who'] {
   return c.repeated || (c.holders.length >= 2 && !pending) ? 'you' : 'agents'
 }
 
+/** Open requests from other agents, and the viewer's login, so a request their idle agent cannot answer reaches them. */
+export interface Asked {
+  requests: CoordinationRequest[]
+  me: string | null
+}
+
+/** True when a task's lead will not answer anything soon: it paused, or stopped checking in. */
+const idle = (i: WorkItem) => i.state === 'paused' || i.claim_status !== 'active'
+
 /**
- * Only things a person should decide: a reported blocker, a task whose lead went quiet but still
- * holds it, a task offered for handover, two agents holding one file, two tasks declaring the same
- * scope, and a pull request touching held files. Worst first, then newest. A paused lead and an
- * open agent-to-agent file request are marked `who: 'agents'`: listed, never counted.
+ * Only things a person should decide: a reported blocker, another agent's request to the viewer's
+ * own idle task, a task whose lead went quiet but still holds it, a task offered for handover, two
+ * agents holding one file, two tasks declaring the same scope, and a pull request touching held
+ * files. Worst first, then newest. A paused lead and an open agent-to-agent file request are marked
+ * `who: 'agents'`: listed, never counted, unless another agent is waiting on that paused lead.
  */
-export function needsYou(ov: WorkOverview | null, d: Derived | null): Need[] {
+export function needsYou(ov: WorkOverview | null, d: Derived | null, asked?: Asked): Need[] {
   const out: Need[] = []
+  const works = new Map((ov?.current ?? []).map((i) => [i.id, i]))
+  const waited = new Set<string>()
+  for (const r of asked?.requests ?? []) {
+    if (!pending(r) || asked?.me == null) continue
+    for (const t of r.targets) {
+      const i = works.get(t.work_id)
+      if (t.lead.login !== asked.me || !i || !idle(i) || currentResponse(r, t)) continue
+      waited.add(i.id)
+      out.push({ key: `asked:${r.id}:${t.work_id}`, kind: 'asked', tone: TONE.asked, item: i, path: t.reasons[0]?.your_path, request: r, at: r.created_at, who: 'you' })
+    }
+  }
   for (const i of ov?.current ?? []) {
     if (i.state === 'blocked') out.push({ key: `blocked:${i.id}`, kind: 'blocked', tone: TONE.blocked, item: i, at: i.blocker?.at ?? i.updated_at, who: 'you' })
+    else if (waited.has(i.id)) continue
     else if (i.claim_status !== 'active') out.push({ key: `quiet:${i.id}`, kind: 'quiet', tone: TONE.quiet, item: i, at: i.last_checkin_at, who: i.state === 'paused' ? 'agents' : 'you' })
     else if (i.state === 'handover') out.push({ key: `handover:${i.id}`, kind: 'handover', tone: TONE.handover, item: i, at: i.updated_at, who: 'you' })
   }
