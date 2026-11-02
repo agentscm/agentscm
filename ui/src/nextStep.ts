@@ -93,6 +93,16 @@ export function quietStep(item: WorkItem, me: string | null): NextStep {
   }
 }
 
+/** Another agent's request to the viewer's own idle task: they answer for it in the Inbox, or start the agent to answer itself. */
+export function askedStep(r: CoordinationRequest, item: WorkItem): NextStep {
+  const l = lead(item)
+  return {
+    human: 'Answer for it in the Inbox: split, join, hand it over or decline',
+    decides: logins(l.login),
+    prompts: [asPrompt(l, `Resume AgentSCM work ${item.id} (“${clean(item.title)}”) with agentscm_start using that work ID, then answer request ${r.id} from ${clean(whoOf(r.requester))} with agentscm_coordination_reply: split the scope, join, hand over, or decline with a reason. ${DATA_NOTE}`)],
+  }
+}
+
 /** A task offered for handover: any agent can take it over with the work ID. */
 export function handoverStep(item: WorkItem): NextStep {
   const note = item.next_action ?? item.current?.summary

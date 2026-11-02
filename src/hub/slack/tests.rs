@@ -769,6 +769,54 @@ async fn similar_work_messages_the_starter_and_the_lead() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_to_an_idle_lead_messages_its_person_once() {
+    let f = Fixture::new().await;
+    let start = |title: &str, session: &str, path: &str| -> WorkStart {
+        serde_json::from_value(json!({"title": title, "session": session, "scope": [path],
+            "work_id": null, "source": null, "request_key": null, "branch": null,
+            "worktree": null, "next_action": null, "takeover_generation": null}))
+        .unwrap()
+    };
+    let now = unix_now();
+    let requests = tokio::task::block_in_place(|| {
+        let store = f.store();
+        // Alice's agent stopped checking in an hour ago on one task and is still on the other.
+        let idle = store
+            .work_start_auto(
+                &f.alice,
+                &start("readable catch up", "a1", "ui/catchup.tsx"),
+                now - 3600,
+            )
+            .unwrap();
+        store
+            .work_start_auto(&f.alice, &start("dashboard", "a2", "ui/dashboard.tsx"), now)
+            .unwrap();
+        let live = store
+            .work_start_auto(
+                &f.bob,
+                &start("dashboard too", "b1", "ui/dashboard.tsx"),
+                now,
+            )
+            .unwrap();
+        let asked = store
+            .work_start_auto(&f.bob, &start("catch up too", "b2", "ui/catchup.tsx"), now)
+            .unwrap();
+        assert_eq!(
+            asked.coordination_request.as_ref().unwrap().targets[0].work_id,
+            idle.item.id
+        );
+        [live.coordination_request, asked.coordination_request]
+    });
+    assert!(requests.iter().all(Option::is_some));
+    f.run().await;
+    assert_eq!(f.sent(), vec![(
+        "U1".into(),
+        "Another agent asked for files your agent holds | File: ui/catchup.tsx | Repository: acme/widgets | Their agent: bob’s Codex | Your agent: Claude Code | Your work: readable catch up | Your agent isn’t running, so it can’t answer. Answer for it in the Hub Inbox.".into()
+    )]);
+    assert_eq!(f.link("U1"), "https://hub.example.test/ui/#inbox");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rate_limits_retry_and_a_wrong_bot_or_revoked_binding_sends_nothing() {
     let f = Fixture::new().await;
     f.contest();

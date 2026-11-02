@@ -4,9 +4,10 @@ import { NarrativePanel } from '../Narrative.tsx'
 import type { Derived, LiveAgent } from '../derive.ts'
 import { HideButton, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
 import { Gloss } from '../Gloss.tsx'
-import { needHideKey, needsYou, needUpdatedAt, type Need } from '../needs.ts'
-import { blockedStep, contestedStep, handoverStep, overlapSteps, prStep, quietStep, who, type NextStep } from '../nextStep.ts'
+import { needHideKey, needsYou, needUpdatedAt, type Asked, type Need } from '../needs.ts'
+import { askedStep, blockedStep, contestedStep, handoverStep, overlapSteps, prStep, quietStep, who, type NextStep } from '../nextStep.ts'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
+import { named } from '../inboxThreads.ts'
 import { handoffOf, type Handoff } from '../launchLink.ts'
 import { StartTask } from '../StartTask.tsx'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
@@ -140,6 +141,13 @@ export function needView(n: Need, ov: WorkOverview, d: Derived, me: string | nul
     gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · reported {i.blocker ? <Ago at={i.blocker.at} /> : 'recently'}</>
     body = <>“{i.blocker?.summary ?? 'No blocker summary reported'}”</>
     step = blockedStep(i)
+  } else if (n.kind === 'asked' && i && n.request) {
+    const r = n.request
+    icon = 'envelope-exclamation'
+    title = <>{named(r.requester.login, r.requester.agent, me)} asked for <Path>{n.path ?? 'files'}</Path> you hold, and your agent isn’t running</>
+    gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · asked <Ago at={r.created_at} /> · <a href="#inbox">open the Inbox</a></>
+    body = <>{i.state === 'paused' ? <>Your agent paused this task</> : i.claim_status === 'stale' ? <>Your agent last checked in <Ago at={i.last_checkin_at} /></> : <>Your agent’s last check-in is unknown</>}, so it can’t answer. The other agent waits until someone does.</>
+    step = askedStep(r, i)
   } else if (n.kind === 'quiet' && i) {
     icon = 'hourglass-split'
     title = <>{leadName(i)} has gone quiet</>
@@ -508,8 +516,8 @@ export type DashTab = 'home' | 'now' | 'activity' | 'team'
 /** The live status under each dashboard tab and the rail badge, from the same joins as the page. */
 /** `asOfMs` is when the data was read (the last successful poll); null before the first one. */
 /** `hidden` holds the needs hidden in this browser, which no count includes. */
-export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null, hidden: ReadonlySet<string> = new Set()) {
-  const needs = needsYou(ov, d).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
+export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null, hidden: ReadonlySet<string> = new Set(), asked?: Asked) {
+  const needs = needsYou(ov, d, asked).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   const contested = d?.contested.length ?? 0
   const overlaps = ov?.overlaps.length ?? 0
   const latest = events?.[0]
@@ -524,10 +532,10 @@ export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, even
 }
 
 /** `answer` replaces the shared headline: the G layout gives each tab its own sentence. */
-export function DashboardPage({ section, question, token, repo, data, d, overview, answer }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview>; answer?: ReactNode }) {
+export function DashboardPage({ section, question, token, repo, data, d, overview, asked, answer }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview>; asked?: Asked; answer?: ReactNode }) {
   const ov = overview.kind === 'ready' ? overview.value : null
   const hidden = useHidden()
-  const all = needsYou(ov, d)
+  const all = needsYou(ov, d, asked)
   const needs = all.filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   const handoff = handoffOf(data.whoami)
   const start = <StartTask token={token} me={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />

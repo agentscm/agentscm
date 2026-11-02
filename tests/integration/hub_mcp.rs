@@ -1557,6 +1557,69 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_start_says_when_the_leading_agent_is_not_running() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let carol = hub.secret(3, "carol-agent");
+    let refused = |result: &Value| {
+        assert!(
+            result["structuredContent"]["work"]["coordination_request"].is_object(),
+            "{result}"
+        );
+        result["content"][0]["text"].as_str().unwrap().to_owned()
+    };
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "rework the catch-up page", "session": "alice",
+                "paths": ["ui/src/pages/Catchup.tsx"]}),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let item = &started["structuredContent"]["work"]["item"];
+    let work_id = item["id"].as_str().unwrap().to_owned();
+
+    // The lead just checked in, so it can answer and nothing says otherwise.
+    let overlap = |task: &str, session: &str| json!({"task": task, "session": session, "paths": ["ui/src/pages/Catchup.tsx"]});
+    let running = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            overlap("restyle the digest list", "bob"),
+        )
+        .await;
+    let said = refused(&running);
+    assert!(!said.contains("is not running"), "{said}");
+
+    let paused = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({"work_id": work_id, "operation_id": "pause-1", "session": "alice",
+                "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+                "kind": "pause", "summary": "stopped for the day"}),
+        )
+        .await;
+    assert_eq!(paused["isError"], false, "{paused}");
+
+    let idle = hub
+        .tool_result(
+            &carol,
+            "agentscm_start",
+            overlap("add a digest filter", "carol"),
+        )
+        .await;
+    let said = refused(&idle);
+    assert!(
+        said.contains(&format!("The agent leading {work_id} is not running"))
+            && said.contains("Its person, user1, is asked in the AgentSCM Hub's Needs you"),
+        "{said}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_are_tool_results_with_fixed_text() {
     let hub = Hub::start().await;
     let key = hub.secret(1, "alice");

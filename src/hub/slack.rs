@@ -39,7 +39,12 @@ const BATCH: usize = 200;
 const MAX_ATTEMPTS: i64 = 8;
 const SENDS_PER_PASS: usize = 20;
 /// The Hub events that become direct messages.
-const KINDS: [&str; 3] = ["edit_repeated", "handoff_decline", "task_overlap"];
+const KINDS: [&str; 4] = [
+    "edit_repeated",
+    "handoff_decline",
+    "task_overlap",
+    "coordination_requested",
+];
 const NAME_CHARS: usize = 64;
 const TEXT_CHARS: usize = 120;
 /// List lines a message field shows before `+N more`.
@@ -777,6 +782,7 @@ impl Slack {
             "edit_repeated" => self.repeated(state, people, &event.subject, &data)?,
             "handoff_decline" => self.declined(state, people, &event.subject, &data)?,
             "task_overlap" => self.similar(state, people, &event.subject, &data)?,
+            "coordination_requested" => self.asked(state, people, &data)?,
             _ => Vec::new(),
         };
         Ok(messages
@@ -1161,6 +1167,63 @@ impl Slack {
                         "Check with them whether it is the same work.",
                         None,
                         &self.work_link(&item.id),
+                    ),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `coordination_requested` (subject: the request): the person leading a target work item
+    /// whose agent is paused or no longer checking in, since that agent cannot answer. One
+    /// message per person per request.
+    fn asked(
+        &self,
+        state: &HubState,
+        people: &[Person],
+        data: &Value,
+    ) -> Result<Vec<(String, String, Value)>> {
+        let Some(requester) = data["requester"].as_str() else {
+            return Ok(Vec::new());
+        };
+        let ids = strings(&data["targets"]);
+        let paths = strings(&data["proposal"]["scope"]);
+        let mut out = Vec::new();
+        let mut done = BTreeSet::new();
+        for reader in people {
+            if !done.insert(reader.repository.as_str()) {
+                continue;
+            }
+            let repository = &reader.repository;
+            let now = unix_now();
+            for id in &ids {
+                let Some(item) = state.store.work_get(&reader.token, id, now)? else {
+                    continue;
+                };
+                if !item.lead_idle() {
+                    continue;
+                }
+                let Some(person) = Self::bound(people, repository, &item.lead_token) else {
+                    continue;
+                };
+                let theirs = Self::bound(people, repository, requester)
+                    .map_or_else(|| "another agent".into(), |p| p.label(requester));
+                let fields = [
+                    files(&paths),
+                    ("Repository", sanitize(repository, TEXT_CHARS)),
+                    ("Their agent", theirs),
+                    ("Your agent", agent_name(&item.lead_agent)),
+                    ("Your work", sanitize(&item.title, TEXT_CHARS)),
+                ];
+                out.push((
+                    person.slack_user.clone(),
+                    "lead".into(),
+                    message(
+                        "Another agent asked for files your agent holds",
+                        &fields,
+                        "Your agent isn’t running, so it can’t answer. Answer for it in the Hub Inbox.",
+                        None,
+                        &self.link("inbox"),
                     ),
                 ));
             }
