@@ -467,12 +467,12 @@ fn validate_inventory(
         if !keys.insert(cell.key()) {
             return Err(Error::Invalid("duplicate job/cell identity".into()));
         }
-        if let Some(script) = &cell.command.reviewed_script {
-            if workflow_paths.get(script.as_str()) != Some(&WorkflowFormat::Commands) {
-                return Err(Error::Invalid(
-                    "reviewed script is not a bound command workflow".into(),
-                ));
-            }
+        if let Some(script) = &cell.command.reviewed_script
+            && workflow_paths.get(script.as_str()) != Some(&WorkflowFormat::Commands)
+        {
+            return Err(Error::Invalid(
+                "reviewed script is not a bound command workflow".into(),
+            ));
         }
     }
     let mut omitted = BTreeSet::new();
