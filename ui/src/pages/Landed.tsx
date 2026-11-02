@@ -213,7 +213,7 @@ function Lookup({ repo, token, recent, onOpen }: { repo: string; token: string; 
           id="landed-id"
           data-tour="landed-picker"
           label="Find a change"
-          placeholder="Find a change by branch, title or PR number, or paste a pub_ ID"
+          placeholder="Find a change by branch, title or PR number"
           describedBy="landed-id-help"
           parseId={(t) => (validPublicationId(t) ? t : null)}
           onSelect={(id) => onOpen(id)}
@@ -249,7 +249,7 @@ function Lookup({ repo, token, recent, onOpen }: { repo: string; token: string; 
           }}
         />
       </div>
-      <div id="landed-id-help" className="form-text">Change IDs start with pub_; the publishing agent prints them and the hub posts them on the PR.</div>
+      <div id="landed-id-help" className="form-text">Or paste a change ID; the Hub posts it on the pull request.</div>
       {recent.length > 0 && (
         <div className="recent">
           <span className="small muted">Opened in this browser</span>

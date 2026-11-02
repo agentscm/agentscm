@@ -24,7 +24,6 @@ import {
   type ExplorerSummary,
 } from '../repoExplorer.ts'
 import { Ago, CopyButton, Empty, Explain, Icon, Notice, OnThisComputer, PageHead, Pill, Reported, Skeleton, type Tone } from '../ui.tsx'
-import { READING_CHANGES_NOTHING } from '../copy.ts'
 import { localReachable } from '../localApi.ts'
 import { onFrontDoor } from '../frontDoor.ts'
 import '../explorer.css'
@@ -524,7 +523,7 @@ export function ExplorerPage({ hubRepository }: { hubRepository?: string | null 
   const summary = useResource(reachable ? `summary|${selectedRef}|${refresh}` : null, (signal) => fetchExplorerSummary(selectedRef, signal))
   return (
     <div className="page explorer-page">
-      <PageHead question="What happened around this code?" answer="Files, history and the evidence behind them." fact={<><Icon name="laptop" /> Read from your local checkout. {READING_CHANGES_NOTHING}</>} />
+      <PageHead question="What happened around this code?" answer="Files, history and the evidence behind them." fact={<><Icon name="laptop" /> Read from your local checkout; reading never changes it.</>} />
       <SectionTabs />
       {!reachable && <OnThisComputer what="The file explorer" />}
       {summary.kind === 'loading' && <Skeleton rows={6} />}
