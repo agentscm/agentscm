@@ -82,6 +82,106 @@ fn rev(root: &Path, name: &str) -> String {
 }
 
 #[test]
+fn repository_map_keeps_immutable_history_and_scope_boundaries() {
+    let repository = Repository::new();
+    repository.write(
+        "ui/main.ts",
+        b"import { api } from '../server/api';\nexport const run = () => api();\n",
+    );
+    repository.write("server/api.ts", b"export const api = () => 1;\n");
+    repository.write("src/lib.rs", b"mod service;\n");
+    repository.write("src/service.rs", b"pub fn answer() -> u8 { 1 }\n");
+    symlink("/etc/passwd", repository.root.join("secret.ts")).unwrap();
+    let before = repository.commit_all("before", 1_792_800_000);
+    repository.write("server/api.ts", b"export const api = () => 2;\n");
+    let after = repository.commit_all("body change", 1_792_800_100);
+    repository.write("ui/main.ts", b"uncommitted and not part of map\n");
+    let git = GitExplorer::open(&repository.root, "example/project").unwrap();
+    let map = git.repository_map(&after, Some(&before), None).unwrap();
+    assert_eq!(map.head.commit, after);
+    let base = map.base.unwrap();
+    assert_eq!(base.commit, before);
+    assert_eq!(map.head.relations.len(), 2);
+    assert_eq!(base.relations.len(), map.head.relations.len());
+    let old = base
+        .files
+        .iter()
+        .find(|f| f.path == "server/api.ts")
+        .unwrap();
+    let new = map.head.files.iter().find(|f| f.path == old.path).unwrap();
+    assert_ne!(old.oid, new.oid);
+    assert_eq!(
+        map.head
+            .files
+            .iter()
+            .find(|f| f.path == "secret.ts")
+            .unwrap()
+            .inspection,
+        "unsupported"
+    );
+    let scoped = git.repository_map(&after, None, Some("ui")).unwrap();
+    assert_eq!(scoped.head.files.len(), 1);
+    assert!(scoped.head.relations.is_empty());
+    assert_eq!(scoped.head.unresolved[0].reason, "outside_view");
+    assert!(git.repository_map("HEAD", None, None).is_err());
+    assert!(
+        git.repository_map(&after, None, Some("../outside"))
+            .is_err()
+    );
+}
+
+#[test]
+fn repository_map_reports_each_resource_bound_and_unsupported_content() {
+    let repository = Repository::new();
+    for i in 0..400 {
+        repository.write(
+            &format!("ui/file{i:03}.ts"),
+            b"import 'external-package';\n",
+        );
+    }
+    repository.write("large.ts", &vec![b'x'; 64 * 1024 + 1]);
+    repository.write("binary.ts", b"a\0b");
+    let commit = repository.commit_all("bounded source", 1_792_800_000);
+    let git = GitExplorer::open(&repository.root, "example/project").unwrap();
+    let map = git.repository_map(&commit, None, None).unwrap();
+    assert_eq!(map.head.coverage.discovered_files, 402);
+    assert_eq!(map.head.files.len(), 384);
+    assert_eq!(map.head.coverage.omitted_files, 18);
+    assert_eq!(map.head.coverage.inspected_files, 128);
+    assert!(
+        map.head
+            .files
+            .iter()
+            .any(|f| f.inspection == "not_inspected")
+    );
+    assert_eq!(
+        map.head
+            .files
+            .iter()
+            .find(|f| f.path == "large.ts")
+            .unwrap()
+            .inspection,
+        "too_large"
+    );
+    assert_eq!(
+        map.head
+            .files
+            .iter()
+            .find(|f| f.path == "binary.ts")
+            .unwrap()
+            .inspection,
+        "binary"
+    );
+    assert!(map.head.relations.is_empty());
+    assert!(
+        map.head
+            .unresolved
+            .iter()
+            .all(|u| u.reason == "external_or_alias")
+    );
+}
+
+#[test]
 fn immutable_browse_reports_dirty_state_and_bounded_file_states() {
     let repository = Repository::new();
     repository.write("README.md", b"first\nneedle[fixed]\n");
