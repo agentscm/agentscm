@@ -126,12 +126,26 @@ describe('walkthrough', () => {
     expect(await screen.findByText('execution · outcome succeeded · verification unknown')).toBeTruthy()
     expect(screen.getByText('partial')).toBeTruthy()
     expect(screen.getByText('caller_asserted')).toBeTruthy()
+    expect(screen.getByText(/This action recorded the same clean commit/).textContent).toContain('does not establish a current pass')
+    expect(screen.getByText(/These observations do not compare/).textContent).toContain('today’s configuration')
     expect(screen.queryByText('passed')).toBeNull()
     expect(screen.getByText(/Evidence applicability is assessed against/).textContent).toContain(WALKTHROUGH_HEAD)
     if (currentHead !== WALKTHROUGH_HEAD) {
       expect(screen.getByText('Different selected source')).toBeTruthy()
       expect(screen.getByText(/Evidence applicability is assessed against/).textContent).toContain(`It has not been evaluated against the currently selected commit ${currentHead}`)
     }
+  })
+
+  it('explains a same-commit dirty source mismatch without claiming a different revision', async () => {
+    const source = { kind: 'git', repository: WALKTHROUGH_REPOSITORY, worktree_id: 'checkout-example', head: WALKTHROUGH_HEAD, tree: 'c'.repeat(40), base: 'b'.repeat(40), dirty: true, untracked_count: 0, omissions: [], captured_snapshot: null, snapshot_coverage: 'complete' }
+    const action = { entry: 'action', relation: 'exact_source_binding', path_relation: 'not_requested', work_id: 'work-example', generation: 1, session_id: 'session-example', action_id: 'action-example', operation_id: 'operation-example', action_kind: 'execution', recipe_provenance: 'observed_native_input', recipe_digest: '1'.repeat(64), setup_digest: '2'.repeat(64), started_at: 100, source, applicability: 'different_recorded_source', start_retention: 'pending', result: null }
+    stub(url => url.pathname.endsWith('/walkthrough') ? json({ ...walkthroughFixture(), evidence: { state: 'available', page: { version: 1, repository: WALKTHROUGH_REPOSITORY, commit: WALKTHROUGH_HEAD, path: null, requested_work_id: null, entries: [action], projection_coverage: { retained_envelopes: 1, compacted_event_batches_unattributed: 0, unavailable_bodies: 0, unverified_bodies: 0, capture_gaps: 0, complete: true }, next_cursor: null, complete: true } } }) : undefined)
+    const user = userEvent.setup()
+    render(<Walkthrough repository={WALKTHROUGH_REPOSITORY} currentHead={WALKTHROUGH_HEAD} />)
+    await user.selectOptions(await screen.findByLabelText('Immutable version history'), WALKTHROUGH_ID)
+    expect(await screen.findByText(/The recorded source state does not establish/)).toBeTruthy()
+    expect(screen.queryByText(/recorded a different source revision/)).toBeNull()
+    expect(screen.getByText(/No finish receipt is available/)).toBeTruthy()
   })
 
   it('enforces shared draft/source limits and accepts the full renamed-path manifest bound', () => {
