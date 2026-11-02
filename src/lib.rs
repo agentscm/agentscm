@@ -42,6 +42,7 @@ pub mod http_listener;
 pub mod hub;
 #[doc(hidden)]
 pub mod lease;
+pub mod local_ci;
 pub mod local_recovery;
 pub mod local_validation;
 pub mod merge;

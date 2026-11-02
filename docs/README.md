@@ -42,6 +42,7 @@ observed actions and source; they are not independent verification or human appr
 - [Supported skills](design/supported-skills.md): experimental `pr-gate` v1 and its self-reported evidence.
 - [All repositories](design/all-repositories.md): experimental cross-repository home page for a web sign-in.
 - [Local workflow library](advanced/workflow-library.md): versioned authoring, pinned imports, simulation and explicit export.
+- [Immutable local CI plans](advanced/local-ci-plans.md): experimental command-first requirements, exact source bindings and independent coverage checks; execution adapters remain separate.
 - [Productive actions](advanced/productive-workflow-actions.md) and [pipeline rules](advanced/pipeline-rules.md): bounded artifacts and operator-local post-merge workflows, separate from native admission.
 - [Portable responsibility](advanced/portable-responsibility.md): continue enrolled Work through installed Claude Code and Codex clients on one Unix computer.
 - [Operating policy](advanced/operating-policy.md): draft, inspect, rehearse and explicitly activate rules for managed post-merge work.
