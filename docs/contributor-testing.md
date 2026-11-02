@@ -95,7 +95,50 @@ Report build time separately from each warm execution time, along with test coun
 
 ## Local validation attestations
 
-A maintainer may attach a signed record of a local run of this gate to a pull request; see [local validation](advanced/local-validation.md). It is experimental and does not replace the evidence rules above. For same-repository pull requests it is the expected evidence for the test gate: the hosted test suites, Windows, musl and macOS release-target builds, container, hub end-to-end and live execution jobs run only with the `ci-extended` label or a manual `workflow_dispatch`, while `CI / static` and the security checks stay automatic and `main` still runs everything.
+A maintainer may attach a signed record of a local run to a pull request; see [local validation](advanced/local-validation.md). It is experimental and does not replace the evidence rules above. The signed recipe includes the full Rust gate and the path-selected routine checks below. Routine hosted jobs require `ci-extended` or manual dispatch; an ordinary push to `main` runs platform/runtime checks and publishing, rather than repeating the local gate. See [hosted routing and fallback](advanced/local-validation.md#hosted-ci-and-required-checks).
+
+## Routine local checks
+
+Use the existing `agentscm local-validation` workflow for signed runs; [the maintainer steps](advanced/local-validation.md#maintainer-workflow) explain enrollment, the clean-checkout requirement and posting. It runs the commands in `.github/local-validation/recipe.json` in order and signs failures too. The four Rust commands at the top of this page always run. Additional groups run when their declared paths changed from the merge-base; changing the local-validation configuration or verifier workflow forces every command. Missing tools fail a required command; they are never treated as a successful skip.
+
+Install the pinned Rust toolchain, Git 2.45 or newer, nextest 0.9.148, cargo-deny 0.20.2, zizmor 1.21.0 and ShellCheck 0.11.0. Use Node 24 with npm for the local UI, documentation and installer checks; Node 24.21.0 is the local qualification baseline. Hosted UI/installer fallbacks retain Node 22, and documentation publishing uses its separately pinned Node version. Toolchain probes record versions but do not enforce these installation pins. For example:
+
+```sh
+cargo install cargo-deny --version 0.20.2 --locked
+export AGENTSCM_CI_TOOLS="$(mktemp -d)"
+python3 -m venv "$AGENTSCM_CI_TOOLS"
+"$AGENTSCM_CI_TOOLS/bin/pip" install zizmor==1.21.0
+export PATH="$AGENTSCM_CI_TOOLS/bin:$PATH"
+```
+
+Keep tool environments outside the tracked source or ignored locally; do not commit them. Install ShellCheck 0.11.0 through its official distribution or a package manager that supplies that version. PostgreSQL and S3 services are required for an accepted attestation under this repository's policy. The runner passes an allowlisted environment, so put the installed executables on `PATH` before invoking it. It is trusted-local execution, not a sandbox for unreviewed contributions.
+
+| Group | Local commands and selection |
+| --- | --- |
+| Dependency audit | `cargo deny --all-features --config deny.toml check` for root manifest/lock/config changes; `cargo deny --manifest-path tools/portable-verifier/Cargo.toml --all-features --config deny.toml check` for the portable verifier. A deny configuration or toolchain change selects both. |
+| Workflow security | `zizmor --offline --no-progress .github/workflows` for `.github/**` or zizmor configuration changes. Offline mode omits GitHub API-dependent audits and uploads no SARIF. |
+| Installer | `shellcheck -s sh install.sh` for shell installer changes; `npm --prefix packages/npm test` for installer, package or release-installer changes. |
+| UI | `npm --prefix ui ci --ignore-scripts`, then `npm --prefix ui run lint`, `npm --prefix ui run build` and `npm --prefix ui run notices -- --check` for UI or notice changes. |
+| Documentation | `npm --prefix docs-site ci --ignore-scripts`, then `npm --prefix docs-site audit --audit-level=low`, `npm --prefix docs-site run build` and `npm --prefix docs-site run check` for docs/site changes. |
+| Release metadata | Rustfmt checks `tools/release-files.rs`; rustc builds and runs its tests and `--check` tool under `target/local-validation`. Manifest, lockfile, helper, toolchain and release-workflow changes select this group. Exact argv and ordering are in the recipe. |
+
+The recipe is the authoritative command/selector list, including workflow-path triggers omitted from this table. Individual commands can also be run directly during iteration without a signing key; retain their actual results and omissions. A direct run is not a signed attestation.
+
+Run both dependency audit commands periodically even when no source changes select them: newly published advisories do not change the Git diff. There is no automatic weekly hosted audit. Audit results describe the advisory database at run time, not a continuously monitored guarantee.
+
+### CodeQL repository setting
+
+The local Rust Clippy gate, cargo-deny dependency audit and offline zizmor workflow lint are narrower checks than CodeQL. They do not provide equivalent multi-language or dataflow security analysis. CodeQL default setup is a GitHub repository setting, separate from tracked workflow files. Retiring it requires the maintainer to disable that setting and verify the readback; a merged documentation or workflow change alone does not disable it. With repository administration permission, inspect, disable or restore default setup using GitHub's [code-scanning API](https://docs.github.com/en/rest/code-scanning/code-scanning#update-a-code-scanning-default-setup-configuration):
+
+```sh
+gh api repos/agentscm/agentscm/code-scanning/default-setup
+gh api --method PATCH repos/agentscm/agentscm/code-scanning/default-setup -f state=not-configured
+gh api repos/agentscm/agentscm/code-scanning/default-setup
+# Restore default setup when explicitly desired:
+gh api --method PATCH repos/agentscm/agentscm/code-scanning/default-setup -f state=configured
+```
+
+Readback confirms configuration, not cancellation of already-running scans or measured runtime/cost savings. This change does not qualify private-repository billing or a replacement SAST engine.
 
 ## Resource audit boundaries
 

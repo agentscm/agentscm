@@ -2,22 +2,21 @@ name: Workflow lint
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - ".github/**"
-  push:
-    branches: [main]
-    paths:
-      - ".github/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: zizmor-${{ github.ref }}
+  group: zizmor-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   zizmor:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,3 +26,5 @@ jobs:
       - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
         with:
           advanced-security: false
+          version: 1.21.0
+          online-audits: false
