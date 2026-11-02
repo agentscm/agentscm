@@ -560,7 +560,7 @@ function Composer({ session, repository, review, onStarted }: { session: Workspa
         )}
         {subject && profile && (
           <section className="ws-subject" aria-label="Revision to execute" tabIndex={-1}>
-            <h3 className="h6">Revision to execute</h3>
+            <h3 className="sub-head">Revision to execute</h3>
             <dl className="tech">
               <dt>Change</dt><dd>{subject.change_id}</dd>
               <dt>Revision</dt><dd><code>{subject.revision}</code></dd>
@@ -619,7 +619,7 @@ function NativeAdmission({ session, repositoryId, profile, subject, blocked }: {
   }
   return (
     <section className="ws-admission" aria-label="Native approval and landing">
-      <h3 className="h6">Approve and land this revision <Explain text="Approving and landing are separate. The server checks membership, the exact change and the required workflow results again for each." /></h3>
+      <h3 className="sub-head">Approve and land this revision <Explain text="Approving and landing are separate. The server checks membership, the exact change and the required workflow results again for each." /></h3>
       {error && <Notice tone="bad" title={error} />}
       {pending && <Notice title={`${pending.action === 'approve' ? 'Approval' : 'Landing'} outcome unknown`}>Retry keeps the original subject, generation and request ID. Inspect the native state before making a different change.</Notice>}
       {approval && <Notice tone="ok" icon="patch-check" title="Native approval recorded">Approval <code>{approval.approval_id}</code> is bound to the displayed revision and review context.</Notice>}
@@ -760,7 +760,7 @@ function Members({ session, onChanged }: { session: WorkspaceSession; onChanged:
             void save()
           }}
         >
-          <h3 className="h6">{editing.existing ? 'Edit member' : 'Add forge member'}</h3>
+          <h3 className="sub-head">{editing.existing ? 'Edit member' : 'Add forge member'}</h3>
           <div className="ws-form-grid">
             <div>
               <label className="form-label" htmlFor="ws-m-provider">Forge</label>
