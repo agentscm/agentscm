@@ -367,6 +367,33 @@ export function appendCatchupPage(current: CatchupPage, next: CatchupPage): Catc
   }
 }
 
+/**
+ * Pages through the rest of a fixed delivery without keeping the records, then
+ * acknowledges it once. Each page is checked against the previous one exactly as
+ * appendCatchupPage checks a continuation, and a page that moves neither cursor
+ * is refused rather than repeated.
+ */
+export async function markAllReviewed(token: string, signal: AbortSignal, page: CatchupPage, deliveryClient = page.delivery_client): Promise<CatchupAckResult> {
+  let last = page
+  while (!last.complete) {
+    signal.throwIfAborted()
+    const next = await fetchCatchup(token, signal, {
+      subscriber: last.subscriber,
+      deliveryClient,
+      delivery: last.delivery,
+      eventAfter: last.next_event_after,
+      eventThrough: last.event_through,
+      mergeAfter: last.next_merge_after,
+      mergeThrough: last.merge_through,
+      limit: MAX_PAGE,
+    })
+    appendCatchupPage({ ...last, work_events: [], coordination_events: [], merges: [] }, next)
+    if (next.next_event_after === last.next_event_after && next.next_merge_after === last.next_merge_after) fail('continuation progress')
+    last = next
+  }
+  return acknowledgeCatchup(token, signal, last)
+}
+
 export function catchupPath(query: CatchupQuery = {}): string {
   const params = new URLSearchParams()
   params.set('subscriber', query.subscriber ?? 'human')

@@ -88,6 +88,13 @@ person’s devices. A verified repository ID keeps that history and readership p
 through a repository rename; unbound repositories retain name-based isolation.
 Agent subscribers retain separate token/session positions.
 Opening a page, login, polling, dismissal and startup never mark records reviewed.
+The Hub's Catch up tab also has a confirmed **Mark all reviewed** action while a
+delivery is only partly loaded. It pages through the rest of the fixed delivery
+without showing it, then sends the one usual acknowledgement. It records that the
+person chose to mark the delivery, not that they read it. The review position moves
+only to the delivery's fixed watermark, so records newer than that stay unreviewed.
+Work, claims and the forge do not change. If any page or the acknowledgement fails,
+the panel reloads the delivery and does not assume the position moved.
 The personal position is an authenticated owner’s readership assertion. An owner’s
 bearer credentials, including read-only tokens, can advance it; the protocol does
 not attest human presence, understanding or approval. Agents use their separate
