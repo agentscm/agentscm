@@ -93,6 +93,7 @@ Silicon macOS; Docker is an explicit fallback. Server deployment is
 
 | Need | Available alpha capability | Start here |
 |---|---|---|
+| Continue during a forge disconnection | Private task context, local command receipts, saved PR/MR drafts and explicit read-only GitHub/GitLab revalidation | [Continuity preparation](docs/continuity.md) |
 | Catch up before taking over | Durable work claims, checkpoints, blockers, handovers and bounded agent briefings | [Stand-up and catch-up](docs/standup.md) |
 | Coordinate concurrent edits | Shared file intents, overlap notices and handoff requests across machines; read-only Git branch/worktree collision checks | [Coordination](docs/intents.md) · [Collision checks](docs/collisions.md) |
 | Inspect what an agent changed and checked | Source-bound action records with separate outcome, coverage, freshness and evidence availability | [Change capture](docs/change-capture.md) |

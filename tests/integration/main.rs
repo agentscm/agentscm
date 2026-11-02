@@ -59,6 +59,9 @@ mod collisions_http;
 mod command_checks;
 mod context_contract;
 #[cfg(unix)]
+mod continuity;
+mod continuity_remote;
+#[cfg(unix)]
 mod demo_cli;
 #[cfg(unix)]
 mod distribution;

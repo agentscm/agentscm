@@ -25,6 +25,7 @@ title: "Documentation"
 
 ## Catch up and inspect changes
 
+- [Continuity preparation](continuity.md): retain local task context, run checks and save exact PR/MR drafts through a GitHub or GitLab disconnection.
 - [Stand-up and catch-up](standup.md): durable ownership, checkpoints, blockers and handovers.
 - [Open this computer](connect-this-computer.md): local checkouts, available evidence and shared work in one page.
 - [Repository explorer](repository-explorer.md): committed files, history and diffs without fetching or changing source.

@@ -1766,6 +1766,8 @@ fn git_bytes_with_input_opened(
     command
         .env_clear()
         .env("LC_ALL", "C")
+        // Source observation must not hydrate a partial clone as a side effect.
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .args(args)
