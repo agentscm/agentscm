@@ -52,6 +52,8 @@ mod client_plugin;
 mod client_setup;
 mod client_status;
 #[cfg(unix)]
+mod continuation_cli;
+#[cfg(unix)]
 mod continuity_cli;
 #[cfg(unix)]
 mod continuity_remote;
@@ -85,9 +87,13 @@ mod local_service;
 #[cfg(unix)]
 mod local_validation_cli;
 #[cfg(unix)]
+mod managed_work;
+#[cfg(unix)]
 mod merge_cli;
 #[cfg(unix)]
 mod open_cli;
+#[cfg(unix)]
+mod operating_policy_cli;
 #[cfg(unix)]
 mod pipeline_cli;
 mod promise_cli;
@@ -206,6 +212,20 @@ enum Command {
     Pipeline {
         #[command(subcommand)]
         command: pipeline_cli::PipelineCommand,
+    },
+    /// [experimental] Continue managed work with another installed coding agent.
+    #[command(hide = true)]
+    #[cfg(unix)]
+    Continuation {
+        #[command(subcommand)]
+        command: continuation_cli::ContinuationCommand,
+    },
+    /// [experimental] Draft, rehearse and activate bounded team operating rules.
+    #[command(hide = true)]
+    #[cfg(unix)]
+    OperatingPolicy {
+        #[command(subcommand)]
+        command: operating_policy_cli::OperatingPolicyCommand,
     },
     /// Inspect or change pseudonymous product telemetry.
     Telemetry {
@@ -962,6 +982,14 @@ async fn run(cli: Cli) -> Result<RunExit> {
         #[cfg(unix)]
         Command::Pipeline { command } => {
             print_json(&pipeline_cli::run(&cli.data_dir, command).await?);
+        }
+        #[cfg(unix)]
+        Command::Continuation { command } => {
+            print_json(&continuation_cli::run(&cli.data_dir, command).await?);
+        }
+        #[cfg(unix)]
+        Command::OperatingPolicy { command } => {
+            print_json(&operating_policy_cli::run(&cli.data_dir, command).await?);
         }
         Command::Telemetry { command } => {
             match telemetry_cli::run(command, cli.no_telemetry).await? {

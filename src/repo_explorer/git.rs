@@ -550,6 +550,12 @@ impl GitExplorer {
             || confirm_head_ref != head_ref
             || confirm_worktree != worktree
             || confirm_refs != refs
+            // Equal repeated samples can still observe HEAD=A and its listed ref=B.
+            // Check the fields returned together, while preserving partial ref pages.
+            || refs.iter().any(|reference| {
+                head_ref.as_deref() == Some(reference.name.as_str())
+                    && observed_head.as_deref() != Some(reference.commit.as_str())
+            })
             || confirm_refs_omitted != refs_omitted
             || confirm_shallow != shallow
             || (selected_ref == "HEAD" && confirm_head.as_deref() != Some(confirm_commit.as_str()))

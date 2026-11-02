@@ -59,6 +59,8 @@ mod collisions_http;
 mod command_checks;
 mod context_contract;
 #[cfg(unix)]
+mod continuation;
+#[cfg(unix)]
 mod continuity;
 mod continuity_remote;
 #[cfg(unix)]
@@ -214,6 +216,8 @@ mod local_validation_reconcile;
 mod merge;
 #[cfg(unix)]
 mod merge_cli;
+#[cfg(unix)]
+mod operating_policy;
 #[cfg(unix)]
 mod pipeline_rules;
 #[cfg(unix)]

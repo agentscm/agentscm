@@ -19,6 +19,8 @@ pub mod checks;
 pub mod civil;
 pub mod context;
 #[cfg(unix)]
+pub mod continuation;
+#[cfg(unix)]
 pub mod continuity;
 pub mod error;
 pub mod evidence;
@@ -44,6 +46,8 @@ pub mod local_recovery;
 pub mod local_validation;
 pub mod merge;
 pub mod model;
+#[cfg(unix)]
+pub mod operating_policy;
 pub mod policy;
 #[cfg(unix)]
 pub mod repo_explorer;

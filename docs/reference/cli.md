@@ -529,6 +529,29 @@ call. No native Grok integration or live-client qualification is implied.
 
 Further `skill-workflow` commands support the Stop triggers. `codex-stop` takes the arguments of `check` and `claude-stop` and is a Codex CLI Stop hook with the same pass/block behavior. `remote-codex-stop` takes the arguments of `remote-check` and `remote-stop` for hosted workspaces. `task-stop` and `task-codex-stop CHANGE --endpoint URL --repository OWNER/NAME --profile ID --token-file ABS_PATH --workspace PATH` are read-only Stop hooks for agent-owned tasks: they pass only when the facade `qualification` is current and qualified and the clean workspace base is the qualified revision, and never run, upload, finalize or checkpoint (see [agent workflow tasks](../advanced/agent-workflow-tasks.md#stop-hook-agent-owned-mode)). `install-stop --settings FILE [--apply] [--remove [--workspace PATH]] -- <claude-stop|remote-stop|codex-stop|remote-codex-stop|task-stop|task-codex-stop> ARGS...` previews by default and writes the hook entry into an operator-local Claude Code or Codex hook file only with `--apply`; it replaces only the same workspace's entry, whatever the stop subcommand or change, and `--remove` removes all its entries or only those for `--workspace`. The Stop handlers require `stop_hook_active` and allow at most 8 consecutive automatic continuations per agent, session, workspace and change; a parse error in a Stop subcommand exits 1, a non-blocking error. See the [Stop hook guide](../advanced/claude-code-workflows.md#opt-in-claude-code-stop-hook) and the [hosted variant](../advanced/hosted-laptop-workflows.md#optional-stop-hooks).
 
+## Portable responsibility and operating policy
+
+`continuation` and `operating-policy` are experimental Unix commands for one trusted local
+operator. They use the existing Hub Work API and local workflow infrastructure. Run each
+command with `--help` for its full arguments.
+
+`continuation` enrolls managed Work and previews a bounded disclosure to installed Claude Code
+or Codex. Explicit confirmation launches the selected client; validated results can replace one
+approved source file and retain an artifact. Subsequent runs preserve the Work identity, context
+and useful results. Arbitrary externally running native sessions cannot be taken over. See
+[portable responsibility](../advanced/portable-responsibility.md) for enrollment, confirmation,
+recovery and the managed-effects boundary.
+
+`operating-policy` drafts typed contracts from plain-language rules, retains owner review and
+rehearsal, and explicitly activates a version against an installed pipeline rule. Provider-confirmed
+post-merge events reserve bounded artifact workflows; the operator runs the retained dispatch.
+Pause and revoke prevent subsequent managed effects and preserve history. See
+[operating policy](../advanced/operating-policy.md) for inspection, activation, dispatch and recovery.
+
+`operating-policy recover` accepts paired `--reconcile-operation OPERATION_ID` and `--observed-seq N` for explicit owner reconciliation of a retained ambiguous administrative request. It preserves that request with an unknown outcome; see the [operating-policy recovery guide](../advanced/operating-policy.md#pause-revoke-and-recover).
+
+Neither command grants forge merge permission or controls unrestricted tools in unrelated agents.
+
 ## Agent-owned workflow tasks
 
 `agent-task` is the Unix operator/client route for the same authenticated task facade and existing workflow journal described in [agent-owned workflow tasks](../advanced/agent-workflow-tasks.md). It does not create another scheduler and does not invoke the server executor.
