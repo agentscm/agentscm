@@ -1066,3 +1066,73 @@ fn portable_evidence_mapping_commits_plan_without_promoting_legacy_assurance() {
     reordered.cells.reverse();
     assert_eq!(subject, reordered.evidence_subject(change, 1).unwrap());
 }
+
+#[test]
+fn frozen_adoption_shapes_resolve_and_require_the_complete_inventory() {
+    use agentscm::evidence::EvidenceOutcome;
+    use sha2::{Digest, Sha256};
+
+    let fixtures: [(&[u8], &[u8], &str, usize); 2] = [
+        (
+            include_bytes!("../fixtures/local-ci/spicy-style.json"),
+            b"synthetic reviewed script\n",
+            "1fc385bdf442f869740db038992150f73b8fd68629e07c8f4cab9602c3e98328",
+            1,
+        ),
+        (
+            include_bytes!("../fixtures/local-ci/mobile-style.json"),
+            b"synthetic mobile commands\n",
+            "3d5736489b1bf0a1c7f334727b35057f335af3cc1eb895cacec06dfea9a075ff",
+            2,
+        ),
+    ];
+    for (bytes, workflow, golden, expected_cells) in fixtures {
+        let requirements = Requirements::from_slice(bytes).unwrap();
+        assert_eq!(requirements.digest().unwrap(), golden);
+        assert_eq!(
+            Requirements::from_slice(&requirements.canonical_bytes().unwrap())
+                .unwrap()
+                .digest()
+                .unwrap(),
+            golden
+        );
+        let reader = MemoryReader {
+            files: BTreeMap::from([
+                ("ci/requirements.json".into(), bytes.to_vec()),
+                (requirements.workflows[0].path.clone(), workflow.to_vec()),
+            ]),
+        };
+        let binding = ConfigBinding {
+            source: source('d'),
+            path: "ci/requirements.json".into(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        };
+        let trusted = TrustedRequirements::load(binding.clone(), &reader).unwrap();
+        let mut input = inputs();
+        input.qualified_capabilities = requirements
+            .cells
+            .iter()
+            .flat_map(|cell| cell.required_capabilities.iter().cloned())
+            .collect();
+        let resolved = trusted.resolve(input.clone(), &reader).unwrap();
+        assert_eq!(resolved.plan().cells.len(), expected_cells);
+        assert!(resolved.adapter_input(AdapterKind::Command).is_ok());
+        assert!(resolved.adapter_input(AdapterKind::Actions).is_err());
+        let mut report = coverage(resolved.plan());
+        let complete = verify_coverage(
+            binding.clone(),
+            input.clone(),
+            &reader,
+            resolved.plan(),
+            &report,
+        )
+        .unwrap();
+        assert_eq!(complete.expected_cells, expected_cells);
+        assert!(complete.inventory_complete);
+        assert_eq!(complete.outcome, EvidenceOutcome::Pass);
+        report.cells.pop();
+        let missing = verify_coverage(binding, input, &reader, resolved.plan(), &report).unwrap();
+        assert!(!missing.inventory_complete);
+        assert_eq!(missing.outcome, EvidenceOutcome::Incomplete);
+    }
+}
