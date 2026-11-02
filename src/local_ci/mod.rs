@@ -1,5 +1,14 @@
 //! Immutable local CI declarations. These contracts do not execute jobs or grant admission.
+#[cfg(unix)]
+mod git;
 mod json;
+mod resolve;
+
+#[cfg(unix)]
+pub use git::GitSourceReader;
+pub use resolve::{
+    AdapterInput, AdapterKind, PlanInputs, ResolvedPlan, SourceReader, TrustedRequirements,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 

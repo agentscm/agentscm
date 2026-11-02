@@ -326,3 +326,384 @@ fn rejects_cross_repository_and_mixed_source_subjects() {
     };
     assert!(value.validate().is_err());
 }
+
+struct MemoryReader {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl SourceReader for MemoryReader {
+    fn verify_source(&self, source: &SourceIdentity) -> agentscm::Result<()> {
+        source.validate()
+    }
+
+    fn read_file(&self, _: &SourceIdentity, path: &str, _: usize) -> agentscm::Result<Vec<u8>> {
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| agentscm::Error::Invalid("fixture file missing".into()))
+    }
+}
+
+fn trusted_fixture(mut requirements: Requirements) -> (TrustedRequirements, MemoryReader) {
+    requirements.workflows = vec![
+        WorkflowBinding::from_bytes(
+            "ci/script.sh".into(),
+            WorkflowFormat::Commands,
+            b"synthetic script\n",
+        )
+        .unwrap(),
+    ];
+    let bytes = requirements.canonical_bytes().unwrap();
+    use sha2::{Digest, Sha256};
+    let binding = ConfigBinding {
+        source: source('d'),
+        path: "ci/requirements.json".into(),
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    let reader = MemoryReader {
+        files: BTreeMap::from([
+            ("ci/requirements.json".into(), bytes),
+            ("ci/script.sh".into(), b"synthetic script\n".to_vec()),
+        ]),
+    };
+    (TrustedRequirements::load(binding, &reader).unwrap(), reader)
+}
+
+fn inputs() -> PlanInputs {
+    PlanInputs {
+        subject: plan().subject,
+        event_inputs: plan().event_inputs,
+        omissions: vec![],
+        qualified_capabilities: BTreeMap::from([
+            ("command/v1".into(), ()),
+            ("mobile-simulator/v1".into(), ()),
+        ])
+        .into_keys()
+        .collect(),
+    }
+}
+
+#[test]
+fn resolution_requires_qualified_capabilities_resolved_dependencies_and_exact_omissions() {
+    let (trusted, reader) = trusted_fixture(requirements());
+    let mut input = inputs();
+    input.qualified_capabilities.remove("mobile-simulator/v1");
+    assert!(trusted.resolve(input, &reader).is_err());
+    let mut input = inputs();
+    input.omissions.push(PermittedOmission {
+        job: "mobile".into(),
+        cell: "ios".into(),
+        reason: "untrusted skip".into(),
+    });
+    assert!(trusted.resolve(input, &reader).is_err());
+    for state in [
+        DependencyState::Unknown {},
+        DependencyState::Declared {},
+        DependencyState::Observed {
+            revision: Some("a".repeat(64)),
+            evidence_digest: "b".repeat(64),
+        },
+        DependencyState::Unavailable {
+            reason: "offline".into(),
+        },
+    ] {
+        let mut req = requirements();
+        req.cells[0].dependencies[0].state = state;
+        let (trusted, reader) = trusted_fixture(req);
+        assert!(trusted.resolve(inputs(), &reader).is_err());
+    }
+    let mut req = requirements();
+    let omission = PermittedOmission {
+        job: "mobile".into(),
+        cell: "ios".into(),
+        reason: "explicit hosted coverage".into(),
+    };
+    req.permitted_omissions.push(omission.clone());
+    req.cells[0].dependencies[0].state = DependencyState::Unknown {};
+    let (trusted, reader) = trusted_fixture(req);
+    let mut input = inputs();
+    input.omissions.push(omission);
+    let resolved = trusted.resolve(input, &reader).unwrap();
+    assert_eq!(resolved.plan().cells.len(), 2);
+    assert_eq!(resolved.plan().omissions.len(), 1);
+}
+
+#[test]
+fn trusted_loading_rejects_substitution_and_oversized_reader_bytes() {
+    let (trusted, mut reader) = trusted_fixture(requirements());
+    let mut binding = trusted.binding().clone();
+    binding.sha256 = "a".repeat(64);
+    assert!(TrustedRequirements::load(binding, &reader).is_err());
+    let mut input = inputs();
+    input.subject = PlanSubject::PrHead {
+        head: SourceIdentity::Native {
+            repository: "example/project".into(),
+            revision: "a".repeat(64),
+        },
+        base: SourceIdentity::Native {
+            repository: "example/project".into(),
+            revision: "b".repeat(64),
+        },
+    };
+    assert!(trusted.resolve(input, &reader).is_err());
+    let mut input = inputs();
+    if let PlanSubject::PrHead {
+        head: SourceIdentity::Git { subject },
+        base: SourceIdentity::Git { subject: base },
+    } = &mut input.subject
+    {
+        subject.repository = "other/project".into();
+        base.repository = "other/project".into();
+    }
+    assert!(trusted.resolve(input, &reader).is_err());
+    reader
+        .files
+        .insert("ci/script.sh".into(), vec![b'x'; MAX_WORKFLOW_BYTES + 1]);
+    assert!(trusted.resolve(inputs(), &reader).is_err());
+    reader.files.insert(
+        "ci/requirements.json".into(),
+        vec![b'x'; MAX_DOCUMENT_BYTES + 1],
+    );
+    assert!(TrustedRequirements::load(trusted.binding().clone(), &reader).is_err());
+}
+
+#[test]
+fn adapter_descriptors_preserve_the_entire_resolved_inventory() {
+    let (trusted, mut reader) = trusted_fixture(requirements());
+    let command = trusted.resolve(inputs(), &reader).unwrap();
+    assert!(command.adapter_input(AdapterKind::Command).is_ok());
+    assert!(command.adapter_input(AdapterKind::Actions).is_err());
+    let mut req = trusted.requirements().clone();
+    req.workflows.push(
+        WorkflowBinding::from_bytes(
+            "ci/actions.yml".into(),
+            WorkflowFormat::Actions,
+            b"synthetic Actions input\n",
+        )
+        .unwrap(),
+    );
+    let bytes = req.canonical_bytes().unwrap();
+    use sha2::{Digest, Sha256};
+    let mut binding = trusted.binding().clone();
+    binding.sha256 = format!("{:x}", Sha256::digest(&bytes));
+    reader.files.insert(binding.path.clone(), bytes);
+    reader.files.insert(
+        "ci/actions.yml".into(),
+        b"synthetic Actions input\n".to_vec(),
+    );
+    let trusted = TrustedRequirements::load(binding, &reader).unwrap();
+    let resolved = trusted.resolve(inputs(), &reader).unwrap();
+    let command = resolved.adapter_input(AdapterKind::Command).unwrap();
+    let actions = resolved.adapter_input(AdapterKind::Actions).unwrap();
+    assert_eq!(command.cells(), actions.cells());
+    assert_eq!(command.omissions(), actions.omissions());
+    assert_eq!(
+        command.plan().digest().unwrap(),
+        actions.plan().digest().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_loader_uses_trusted_configuration_and_exact_workflow_bytes() {
+    use std::{fs, path::Path, process::Command};
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+    fn identity(repo: &Path) -> SourceIdentity {
+        SourceIdentity::Git {
+            subject: GitValidationSubject {
+                repository: "example/project".into(),
+                commit: git(repo, &["rev-parse", "HEAD"]),
+                tree: git(repo, &["rev-parse", "HEAD^{tree}"]),
+            },
+        }
+    }
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    git(root, &["init", "--quiet"]);
+    fs::create_dir(root.join("ci")).unwrap();
+    let mut req = requirements();
+    req.workflows = vec![
+        WorkflowBinding::from_bytes(
+            "ci/script.sh".into(),
+            WorkflowFormat::Commands,
+            b"echo synthetic\n",
+        )
+        .unwrap(),
+    ];
+    req.cells[0].command.reviewed_script = Some("ci/script.sh".into());
+    let bytes = req.canonical_bytes().unwrap();
+    fs::write(root.join("ci/requirements.json"), &bytes).unwrap();
+    fs::write(root.join("ci/script.sh"), b"echo synthetic\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "--quiet", "-m", "fixture base"]);
+    let base = identity(root);
+    use sha2::{Digest, Sha256};
+    let binding = ConfigBinding {
+        source: base.clone(),
+        path: "ci/requirements.json".into(),
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    let reader = GitSourceReader::new(root, "example/project".into()).unwrap();
+    let trusted = TrustedRequirements::load(binding.clone(), &reader).unwrap();
+    req.cells.pop();
+    req.cells[0].services.clear();
+    req.policy_epoch += 1;
+    fs::write(
+        root.join("ci/requirements.json"),
+        req.canonical_bytes().unwrap(),
+    )
+    .unwrap();
+    git(root, &["add", "."]);
+    git(
+        root,
+        &["commit", "--quiet", "-m", "candidate weakens config"],
+    );
+    let candidate = identity(root);
+    let mut input = inputs();
+    input.subject = PlanSubject::PrHead {
+        head: candidate.clone(),
+        base: base.clone(),
+    };
+    let resolved = trusted.resolve(input.clone(), &reader).unwrap();
+    assert_eq!(resolved.plan().cells.len(), 2);
+    assert_eq!(resolved.plan().cells[0].services.len(), 1);
+    assert_eq!(resolved.plan().policy_epoch, 3);
+    let mut false_tree = candidate.clone();
+    if let SourceIdentity::Git { subject } = &mut false_tree {
+        subject.tree = "a".repeat(40);
+    }
+    assert!(reader.verify_source(&false_tree).is_err());
+    fs::write(root.join("ci/script.sh"), b"echo candidate changed\n").unwrap();
+    git(root, &["add", "."]);
+    git(
+        root,
+        &["commit", "--quiet", "-m", "candidate changes workflow"],
+    );
+    let changed = identity(root);
+    input.subject = PlanSubject::PrHead {
+        head: changed.clone(),
+        base: base.clone(),
+    };
+    assert!(trusted.resolve(input, &reader).is_err());
+    if let (
+        SourceIdentity::Git { subject: original },
+        SourceIdentity::Git {
+            subject: replacement,
+        },
+    ) = (&candidate, &changed)
+    {
+        git(root, &["replace", &original.commit, &replacement.commit]);
+    }
+    assert!(reader.verify_source(&candidate).is_ok());
+    let mut input = inputs();
+    input.subject = PlanSubject::PrHead {
+        head: candidate,
+        base: base.clone(),
+    };
+    assert!(trusted.resolve(input, &reader).is_ok());
+    // A reviewed new trusted revision can activate changed requirements, but must explicitly
+    // update the workflow digest as well; the candidate cannot do this to its old plan.
+    let fresh = TrustedRequirements::load(binding, &reader).unwrap();
+    assert_eq!(fresh.requirements().policy_epoch, 3);
+    req.workflows[0] = WorkflowBinding::from_bytes(
+        "ci/script.sh".into(),
+        WorkflowFormat::Commands,
+        b"echo candidate changed\n",
+    )
+    .unwrap();
+    let reviewed_bytes = req.canonical_bytes().unwrap();
+    fs::write(root.join("ci/requirements.json"), &reviewed_bytes).unwrap();
+    git(root, &["add", "."]);
+    git(
+        root,
+        &["commit", "--quiet", "-m", "reviewed configuration fixture"],
+    );
+    let reviewed = identity(root);
+    let activated = TrustedRequirements::load(
+        ConfigBinding {
+            source: reviewed.clone(),
+            path: "ci/requirements.json".into(),
+            sha256: format!("{:x}", Sha256::digest(&reviewed_bytes)),
+        },
+        &reader,
+    )
+    .unwrap();
+    let mut input = inputs();
+    input.subject = PlanSubject::PrHead {
+        head: reviewed,
+        base,
+    };
+    let activated_plan = activated.resolve(input, &reader).unwrap();
+    assert_eq!(activated_plan.plan().policy_epoch, 4);
+    assert_eq!(activated_plan.plan().cells.len(), 1);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("script.sh", root.join("ci/link.sh")).unwrap();
+        fs::write(root.join("ci/literal[1].sh"), b"literal bytes").unwrap();
+        fs::write(root.join("ci/large.bin"), vec![b'x'; 4096]).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "--quiet", "-m", "symlink fixture"]);
+        assert!(
+            reader
+                .read_file(&identity(root), "ci/link.sh", 1024)
+                .is_err()
+        );
+        assert_eq!(
+            reader
+                .read_file(&identity(root), "ci/literal[1].sh", 1024)
+                .unwrap(),
+            b"literal bytes"
+        );
+        assert!(
+            reader
+                .read_file(&identity(root), "ci/large.bin", 1024)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn native_sources_use_the_same_resolver_without_git_adoption() {
+    let (git_trusted, reader) = trusted_fixture(requirements());
+    let native = |c: char| SourceIdentity::Native {
+        repository: "example/project".into(),
+        revision: c.to_string().repeat(64),
+    };
+    let mut binding = git_trusted.binding().clone();
+    binding.source = native('c');
+    let trusted = TrustedRequirements::load(binding, &reader).unwrap();
+    let mut input = inputs();
+    input.subject = PlanSubject::PrHead {
+        head: native('a'),
+        base: native('b'),
+    };
+    assert!(trusted.resolve(input, &reader).is_ok());
+}
