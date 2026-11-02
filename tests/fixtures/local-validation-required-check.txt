@@ -1,0 +1,2 @@
+Synthetic fixture for post-merge qualification of the required local attestation check.
+The disposable draft PR is closed after verification and is not merged.
