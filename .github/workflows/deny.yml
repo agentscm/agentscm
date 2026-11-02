@@ -2,6 +2,7 @@ name: Dependency audit
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -9,21 +10,18 @@ on:
       - "tools/portable-verifier/Cargo.toml"
       - "tools/portable-verifier/Cargo.lock"
       - ".github/workflows/deny.yml"
-  push:
-    branches: [main]
-  schedule:
-    - cron: "17 5 * * 1" # weekly: new advisories appear without any change here
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: deny-${{ github.ref }}
+  group: deny-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   cargo-deny:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
