@@ -1,6 +1,6 @@
 # MCP Apps views for the hub: implementation spec (proposal)
 
-Status: implemented in the work-overview and coordination-inbox views with hub-side on/off settings (`agentscm_view_settings`, Settings page in the 1c UI). Not verified against a real host yet. Extends the earlier `mcp-ui-integration.md` note (Direction 1), which is not in this repository. Host support is documented for Claude, VS Code Copilot, Cursor and ChatGPT; Claude Code is unverified (probably no). Re-check before shipping.
+Status: implemented in the work-overview and coordination-inbox views with hub-side on/off settings (`agentscm_view_settings`, Settings page in the 1c UI) and a quiet [auto-refresh](#auto-refresh). Not verified against a real host yet. Extends the earlier `mcp-ui-integration.md` note (Direction 1), which is not in this repository. Host support is documented for Claude, VS Code Copilot, Cursor and ChatGPT; Claude Code is unverified (probably no). Re-check before shipping.
 
 ## Adversarial panel record
 
@@ -13,13 +13,15 @@ A simulated panel (one model playing four roles, not real people) was told to at
 | Product manager | Humans ask "who is doing what" and "are we colliding" far more than they browse history. A live-looking feed is a promise MCP cannot keep (no server push). | Work overview first, inbox second. Briefing and workflow-run are cut. Manual refresh only; label data age. |
 | DevOps | `resources/read` is a new unauthenticated-looking surface, with unbounded size, no caching story and no logs. | Same auth as tools, size cap, content hash, cache headers, request logging, no polling. |
 
+The "manual refresh only" and "no polling" outcomes above were later relaxed for the views' own read-only tool calls. `resources/read` is still never polled. See [Auto-refresh](#auto-refresh).
+
 Unresolved: whether any host feeds app-initiated tool results back into model context (unverified). Test this first.
 
 ## Goals and non-goals
 
 Goals: show a human, inside the chat, (1) what every agent is doing and (2) which directed coordination requests are open, using the hub's existing read-only tools.
 
-Non-goals: writes (ack, reply, resolve, checkpoint), auto-refresh, animation, briefing and workflow-run views, contested-files view, WebMCP, A2UI.
+Non-goals: writes (ack, reply, resolve, checkpoint), pushing into the conversation (`ui/message`, `ui/update-model-context`), animation, briefing and workflow-run views, contested-files view, WebMCP, A2UI.
 
 ## Wire changes (`src/hub/mcp.rs`)
 
@@ -55,9 +57,22 @@ Layout: header (open count, updated time, Refresh); one row per request with a s
 ## Interaction rules
 
 - The only calls a view makes: `tools/call` to its own tool (refresh, paging). Never any ack, reply, resolve, withdraw, checkpoint or start tool.
-- No timers, no polling. Refresh is a button. Show data age.
+- Refresh is a button and also runs on a quiet timer while the view is on screen (see [Auto-refresh](#auto-refresh)). Show data age.
 - If a call fails, keep the last data and label it "Could not refresh. Showing data from HH:MM:SS".
 - Links to the hub UI use `ui/open-link` and need the hub's public URL; omit the link if unconfigured.
+
+## Auto-refresh
+
+A view that is on screen keeps itself current without spending model tokens. It re-calls its own tool through the same `tools/call` path as the Refresh button. It never uses `ui/message` or `ui/update-model-context`, so the view itself adds nothing to the conversation.
+
+- Cadence: 30 s after the last result (a fresh result pushed by the host also restarts the clock). After a failed call the wait doubles (60 s, 120 s, 240 s) up to 5 min, and returns to 30 s after one success.
+- Only while visible: the timer runs when `document.hidden` is false and an `IntersectionObserver` on the view reports it intersecting. Hiding or scrolling away clears the timer. Coming back refreshes at once if the wait has already elapsed, otherwise when it does. Hosts that do not fire `visibilitychange` for offscreen iframes are covered by the observer; a host that does neither keeps polling while the iframe exists.
+- Never stacked: one call per view is in flight at a time. A timer that fires during a call does nothing. A button press during a call is queued, last press wins, and sent when the call returns.
+- Keeps the person's place: open folds (including source details in the catch-up) are remembered by key, the focused control and scroll position are restored after each repaint, and the inbox re-calls the page the person is on (`after`/`through`) rather than the first page. The overview's catch-up delivery is a fixed window and is not re-fetched: pages already loaded by Load more stay, and new records arrive in the next delivery after Mark reviewed. The overview's briefing is read again after each successful refresh, replacing its own earlier 30 s timer.
+- Failure: the last data stays with "Could not refresh. Showing data from HH:MM:SS" and an amber dot. "Updated HH:MM" moves on every success, including when nothing changed.
+- Changes are announced politely: a visually hidden `role="status"` / `aria-live="polite"` region outside the repainted area is updated only when the one-line summary changes (overview: agents working and things that need a person; inbox: open requests per stage). Focus is never moved.
+- Limits: a repaint replaces the page content, so a text selection is lost every 30 s. Each refresh cycle is two read calls on the overview (its tool and the briefing) and one on the inbox, for as long as the view stays on screen. Whether any host feeds app-initiated tool results back into model context is still unverified (see the unresolved question above); if one does, these refreshes would reach it too.
+- Possible follow-up, not built: an opt-in that pushes a short "needs you" message into the conversation, limited to changes that need the person. That spends model tokens on every push, so it should stay off by default.
 
 ## Security
 
@@ -74,7 +89,7 @@ Layout: header (open count, updated time, Refresh); one row per request with a s
 3. A read-only token can `resources/read`; a bad token cannot. A write tool cannot be called from a view.
 4. Rendering fixtures: complete, partial (`current_complete` false), overlap incomplete, retention gap, empty, 100 items, long strings, markup in task titles (must display as text).
 5. Both views pass a dark-mode and 375 px width check and show text labels for every status.
-6. Manual check in Claude Desktop and VS Code Copilot with a real seeded hub; record what each host does with Refresh results.
+6. Manual check in Claude Desktop and VS Code Copilot with a real seeded hub; record what each host does with Refresh results and whether it keeps offscreen iframes running.
 
 ## Order of work
 
