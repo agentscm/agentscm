@@ -365,6 +365,10 @@ pub async fn poll_merges(
         blocked: None,
         coverage: "newest 100 updated proposals; known confirmed events are skipped, unconfirmed candidates are re-read; labels are observation-time",
     };
+    if !journal.has_legacy_rules(&repository.full_name)? {
+        report.coverage = "no legacy-eligible rules; use operating-policy observe for owned rules";
+        return Ok(report);
+    }
     if let Err(error) = verify_repository(api, token, repository).await {
         report.block(error);
         return Ok(report);
@@ -488,9 +492,9 @@ const SCHEMA:&str="CREATE TABLE pipeline_binding(singleton INTEGER PRIMARY KEY C
             CREATE TABLE pipeline_polls(repository TEXT PRIMARY KEY,observed_at INTEGER NOT NULL CHECK(observed_at>=0),unread_pages INTEGER NOT NULL CHECK(unread_pages>=0)) STRICT;
             CREATE TABLE pipeline_dispatches(dispatch_id TEXT PRIMARY KEY,run_id TEXT NOT NULL UNIQUE,semantic_key TEXT NOT NULL UNIQUE REFERENCES pipeline_observations(semantic_key),event_key TEXT NOT NULL REFERENCES pipeline_events(semantic_key),rule_id TEXT NOT NULL REFERENCES pipeline_rules(rule_id),body TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','claimed','complete','blocked')),claim_generation INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation>=0),error TEXT) STRICT;";
 const APPLICATION_ID: i64 = 0x4153_5052;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 pub struct RuleJournal {
-    db: Connection,
+    pub(crate) db: Connection,
     native_repository: String,
     _access: crate::local_recovery::AccessGuard,
 }
@@ -524,7 +528,15 @@ impl RuleJournal {
         if app == 0 && version == 0 && tables == 0 {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(crate::operating_policy::SCHEMA)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+        }
+        if app == APPLICATION_ID && version == 1 {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_recovery(&tx, &native_repository)?;
+            tx.execute_batch(crate::operating_policy::SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -578,6 +590,9 @@ impl RuleJournal {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if crate::operating_policy::owned(&tx, &rule.rule_id)? {
+            return Err(Error::Conflict("policy-owned installation is immutable; revoke it and install/review a separate rule for a different workflow".into()));
+        }
         let old: Option<String> = tx
             .query_row(
                 "SELECT body FROM pipeline_rules WHERE rule_id=?1",
@@ -657,10 +672,13 @@ impl RuleJournal {
         ]
         .join("\0");
         Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pipeline_events WHERE semantic_key=?1)",
+            "SELECT EXISTS(SELECT 1 FROM pipeline_observations o WHERE o.event_key=?1 AND NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=o.rule_id))",
             [key],
             |r| r.get(0),
         )?)
+    }
+    pub fn has_legacy_rules(&self, repository: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM pipeline_rules r WHERE repository=?1 AND NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=r.rule_id))",[repository],|r|r.get(0))?)
     }
     pub fn polls(&self) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.db.prepare(
@@ -686,6 +704,36 @@ impl RuleJournal {
             .ok_or_else(|| Error::NotFound("pipeline rule".into()))
     }
     pub fn accept(&mut self, event: &ConfirmedMerge) -> Result<Vec<PendingDispatch>> {
+        self.accept_with_actor(event, None)
+    }
+    /// The caller authenticates this actor through the checkout's current Hub connection.
+    /// An absent actor cannot admit operating-policy-owned rules.
+    pub fn accept_with_actor(
+        &mut self,
+        event: &ConfirmedMerge,
+        actor: Option<&str>,
+    ) -> Result<Vec<PendingDispatch>> {
+        self.accept_selected(event, actor, None)
+    }
+    pub fn accept_operating_event(
+        &mut self,
+        rule_id: &str,
+        event: &ConfirmedMerge,
+        actor: &str,
+    ) -> Result<Vec<PendingDispatch>> {
+        if !crate::operating_policy::owned(&self.db, rule_id)? {
+            return Err(Error::Invalid(
+                "rule has no reviewed operating contract".into(),
+            ));
+        }
+        self.accept_selected(event, Some(actor), Some(rule_id))
+    }
+    fn accept_selected(
+        &mut self,
+        event: &ConfirmedMerge,
+        actor: Option<&str>,
+        only_rule: Option<&str>,
+    ) -> Result<Vec<PendingDispatch>> {
         validate_event(event)?;
         ensure_binding(
             &self.db,
@@ -703,6 +751,20 @@ impl RuleJournal {
             .query_map([&event.repository], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
+        let mut selected = Vec::new();
+        for body in rows {
+            let rule: PipelineRule = serde_json::from_str(&body)?;
+            if only_rule.is_some_and(|id| id != rule.rule_id)
+                || actor.is_none() && crate::operating_policy::owned(&tx, &rule.rule_id)?
+            {
+                continue;
+            }
+            selected.push(rule);
+        }
+        if selected.is_empty() {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
         let event_body = serde_json::to_string(event)?;
         tx.execute(
             "INSERT OR IGNORE INTO pipeline_events(semantic_key,body) VALUES(?1,?2)",
@@ -716,9 +778,8 @@ impl RuleJournal {
         let event: ConfirmedMerge = serde_json::from_str(&stored)?;
         let event = &event;
         let mut accepted = Vec::new();
-        for body in rows {
-            let rule: PipelineRule = serde_json::from_str(&body)?;
-            let matched = preview(&rule, event);
+        for mut rule in selected {
+            let mut matched = preview(&rule, event);
             // A different repository is rejected before any observation is retained.
             if rule.provider != event.provider
                 || rule.host != event.host
@@ -727,6 +788,25 @@ impl RuleJournal {
                 continue;
             }
             let semantic = semantic_key(event, &rule.rule_id);
+            let duplicate: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pipeline_observations WHERE semantic_key=?1)",
+                [&semantic],
+                |r| r.get(0),
+            )?;
+            let mut operating = None;
+            if let Some((trace, accepted)) =
+                crate::operating_policy::admit(&tx, &rule, event, actor, duplicate)?
+            {
+                matched.matches = accepted.is_some();
+                matched.reasons = if matched.matches {
+                    vec![]
+                } else {
+                    trace.reasons
+                };
+                operating = accepted;
+                // The immutable dispatch is runnable only through the operating-policy guard.
+                rule.enabled = matched.matches;
+            }
             let first = tx.execute("INSERT OR IGNORE INTO pipeline_observations(semantic_key,event_key,rule_id,rule_generation,reasons) VALUES(?1,?2,?3,?4,?5)",
                 params![semantic,event_key(event),rule.rule_id,rule.generation,serde_json::to_string(&matched.reasons)?])?;
             if first == 0 || !matched.matches {
@@ -745,6 +825,14 @@ impl RuleJournal {
             let changed = tx.execute("INSERT OR IGNORE INTO pipeline_dispatches(dispatch_id,run_id,semantic_key,event_key,rule_id,body,state)
               VALUES(?1,?2,?3,?4,?5,?6,'pending')", params![dispatch.dispatch_id,dispatch.run_id,semantic,event_key(event),dispatch.rule.rule_id,serde_json::to_string(&dispatch)?])?;
             if changed == 1 {
+                if let Some(contract) = operating {
+                    crate::operating_policy::reserve(
+                        &tx,
+                        &dispatch.dispatch_id,
+                        &contract,
+                        actor.ok_or_else(|| Error::Invalid("operating actor missing".into()))?,
+                    )?;
+                }
                 accepted.push(dispatch);
             }
         }
@@ -793,20 +881,37 @@ impl RuleJournal {
         })
     }
     pub fn pending(&self, limit: usize) -> Result<Vec<PendingDispatch>> {
+        self.pending_selected(limit, false)
+    }
+    /// Legacy pickup never takes responsibility for a policy-owned dispatch.
+    pub fn pending_legacy(&self, limit: usize) -> Result<Vec<PendingDispatch>> {
+        self.pending_selected(limit, true)
+    }
+    fn pending_selected(&self, limit: usize, legacy: bool) -> Result<Vec<PendingDispatch>> {
         let mut stmt = self.db.prepare(
-            "SELECT body FROM pipeline_dispatches WHERE state='pending' ORDER BY rowid LIMIT ?1",
+            "SELECT body FROM pipeline_dispatches d WHERE state='pending' AND (?2=0 OR NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=d.rule_id)) ORDER BY rowid LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map([limit.min(256) as i64], |r| r.get::<_, String>(0))?
+            .query_map(params![limit.min(256) as i64, legacy], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(|body| Ok(serde_json::from_str(&body)?))
             .collect()
     }
     pub fn claim(&mut self, id: &str) -> Result<DispatchClaim> {
+        self.claim_selected(id, false)?
+            .ok_or_else(|| Error::Conflict("dispatch is policy-owned".into()))
+    }
+    pub fn claim_legacy(&mut self, id: &str) -> Result<Option<DispatchClaim>> {
+        self.claim_selected(id, true)
+    }
+    fn claim_selected(&mut self, id: &str, legacy: bool) -> Result<Option<DispatchClaim>> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if legacy && tx.query_row("SELECT EXISTS(SELECT 1 FROM pipeline_dispatches d JOIN operating_state s ON s.rule_id=d.rule_id WHERE d.dispatch_id=?1)", [id], |r| r.get::<_,bool>(0))? { return Ok(None); }
         if tx.execute("UPDATE pipeline_dispatches SET state='claimed',claim_generation=claim_generation+1,error=NULL WHERE dispatch_id=?1 AND state='pending'",[id])?!=1 {
             return Err(Error::Conflict("dispatch is not pending; explicit generation-fenced recovery required".into()));
         }
@@ -816,10 +921,10 @@ impl RuleJournal {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         tx.commit()?;
-        Ok(DispatchClaim {
+        Ok(Some(DispatchClaim {
             dispatch: serde_json::from_str(&body)?,
             generation,
-        })
+        }))
     }
     pub fn finish(
         &mut self,
@@ -838,9 +943,23 @@ impl RuleJournal {
     }
     /// Caller must hold the local runner lease; a live owner is never displaced.
     pub fn recover(&mut self, id: &str, expected_generation: i64) -> Result<()> {
-        if self.db.execute("UPDATE pipeline_dispatches SET state='pending',claim_generation=claim_generation+1,error='explicit recovery; reuse retained workflow run' WHERE dispatch_id=?1 AND state IN ('claimed','blocked') AND claim_generation=?2",params![id,expected_generation])?!=1 {
+        self.recover_selected(id, expected_generation, false)
+    }
+    /// Legacy recovery cannot requeue Work that requires operating-policy reconciliation.
+    pub fn recover_legacy(&mut self, id: &str, expected_generation: i64) -> Result<()> {
+        self.recover_selected(id, expected_generation, true)
+    }
+    fn recover_selected(&mut self, id: &str, expected_generation: i64, legacy: bool) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if legacy && tx.query_row("SELECT EXISTS(SELECT 1 FROM pipeline_dispatches d JOIN operating_state s ON s.rule_id=d.rule_id WHERE d.dispatch_id=?1)", [id], |r| r.get::<_,bool>(0))? {
+            return Err(Error::Conflict("dispatch is policy-owned; use operating-policy recover to reconcile its Work".into()));
+        }
+        if tx.execute("UPDATE pipeline_dispatches SET state='pending',claim_generation=claim_generation+1,error='explicit recovery; reuse retained workflow run' WHERE dispatch_id=?1 AND state IN ('claimed','blocked') AND claim_generation=?2",params![id,expected_generation])?!=1 {
             return Err(Error::Conflict("dispatch recovery generation conflict".into()));
         }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -1213,6 +1332,38 @@ pub fn deliver_with_cancellation(
     work_dir: &Path,
     cancellation: &crate::execution::Cancellation,
 ) -> Result<skill_workflow::RunView> {
+    deliver_guarded(data_dir, journal, claim, work_dir, cancellation, None)
+}
+
+/// Additional authenticated Work guard for operating-policy dispatch, checked at every action.
+#[cfg(unix)]
+pub fn deliver_with_operating_guard(
+    data_dir: &Path,
+    journal: &mut RuleJournal,
+    claim: &DispatchClaim,
+    work_dir: &Path,
+    cancellation: &crate::execution::Cancellation,
+    authority_guard: &(dyn Fn() -> Result<()> + Send + Sync),
+) -> Result<skill_workflow::RunView> {
+    deliver_guarded(
+        data_dir,
+        journal,
+        claim,
+        work_dir,
+        cancellation,
+        Some(authority_guard),
+    )
+}
+
+#[cfg(unix)]
+fn deliver_guarded(
+    data_dir: &Path,
+    journal: &mut RuleJournal,
+    claim: &DispatchClaim,
+    work_dir: &Path,
+    cancellation: &crate::execution::Cancellation,
+    authority_guard: Option<&(dyn Fn() -> Result<()> + Send + Sync)>,
+) -> Result<skill_workflow::RunView> {
     use skill_workflow::runtime;
     ensure_binding(
         &journal.db,
@@ -1222,11 +1373,30 @@ pub fn deliver_with_cancellation(
         claim.dispatch.rule.provider_repository_id,
     )?;
     let result = (|| {
+        let policy_owned =
+            crate::operating_policy::owned(&journal.db, &claim.dispatch.rule.rule_id)?;
+        if policy_owned && authority_guard.is_none() {
+            return Err(Error::Conflict(
+                "operating work requires its authenticated Work guard; use operating-policy run"
+                    .into(),
+            ));
+        }
+        if let Some(guard) = authority_guard {
+            guard()?;
+        }
+        if policy_owned {
+            crate::operating_policy::action_guard(
+                &journal.db,
+                &claim.dispatch.dispatch_id,
+                &claim.dispatch.rule,
+                &claim.dispatch.event,
+            )?;
+        }
         let current = journal.rule(
             &claim.dispatch.rule.repository,
             &claim.dispatch.rule.rule_id,
         )?;
-        if !current.enabled {
+        if !current.enabled && !policy_owned {
             return Err(Error::Conflict("rule is disabled".into()));
         }
         let rule = &claim.dispatch.rule;
@@ -1288,7 +1458,7 @@ pub fn deliver_with_cancellation(
                 |r| r.get(0),
             )?;
             let current: PipelineRule = serde_json::from_str(&body)?;
-            if !current.enabled {
+            if !current.enabled && !policy_owned {
                 return Err(Error::Conflict("rule disabled during delivery".into()));
             }
             let owns:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM pipeline_dispatches WHERE dispatch_id=?1 AND state='claimed' AND claim_generation=?2)",params![claim.dispatch.dispatch_id,claim.generation],|r|r.get(0))?;
@@ -1296,6 +1466,21 @@ pub fn deliver_with_cancellation(
                 return Err(Error::Conflict(
                     "dispatch claim changed during delivery".into(),
                 ));
+            }
+            let currently_owned = crate::operating_policy::owned(&db, &rule.rule_id)?;
+            if currently_owned && authority_guard.is_none() {
+                return Err(Error::Conflict("operating policy attached during legacy execution; authenticated Work required".into()));
+            }
+            if currently_owned {
+                crate::operating_policy::action_guard(
+                    &db,
+                    &claim.dispatch.dispatch_id,
+                    rule,
+                    event,
+                )?;
+            }
+            if let Some(guard) = authority_guard {
+                guard()?;
             }
             verify_profile_configuration(&rule.profile_path, &profile)?;
             Ok(())
@@ -1360,7 +1545,7 @@ fn ensure_binding(
 pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
     let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if app != APPLICATION_ID || version != SCHEMA_VERSION {
+    if app != APPLICATION_ID || !matches!(version, 1 | SCHEMA_VERSION) {
         return Err(Error::Invalid(
             "unsupported pipeline journal identity/schema".into(),
         ));
@@ -1372,7 +1557,16 @@ pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
         ));
     }
     let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    for ddl in SCHEMA.split(';').map(str::trim).filter(|v| !v.is_empty()) {
+    let full_schema = if version == 1 {
+        SCHEMA.to_owned()
+    } else {
+        format!("{SCHEMA}{}", crate::operating_policy::SCHEMA)
+    };
+    for ddl in full_schema
+        .split(';')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         let name = ddl
             .strip_prefix("CREATE TABLE ")
             .and_then(|v| v.split('(').next())
@@ -1391,10 +1585,13 @@ pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if count != 6 {
+    if count != if version == 1 { 6 } else { 12 } {
         return Err(Error::Invalid(
             "unsupported extra pipeline relations".into(),
         ));
+    }
+    if version == SCHEMA_VERSION {
+        crate::operating_policy::validate_retained(db)?;
     }
     let bound:Option<(String,String,String,i64)>=db.query_row("SELECT native_repository,provider,host,provider_repository_id FROM pipeline_binding WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let mut bytes = 0i64;

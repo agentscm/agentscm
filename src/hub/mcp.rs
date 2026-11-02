@@ -1080,6 +1080,9 @@ pub(super) fn hub_failure(error: &HubError) -> Value {
             "work overlap coverage is incomplete; no new scope was claimed"
         }
         HubError::WorkPreflight(_) => "work preflight requires review; no new work was claimed",
+        HubError::WorkCheckpointSequenceConflict { .. } => {
+            "checkpoint sequence changed; inspect current Work before retry"
+        }
         HubError::Unavailable(_) => "hub unavailable",
         HubError::Invalid(_) => "invalid request",
         HubError::Unauthorized => "token not accepted",
@@ -2455,6 +2458,11 @@ fn work_failure(error: &HubError) -> Value {
                 "Refresh agentscm_work_briefing and inspect the current generation.",
                 "Retry with the same stable identity only when the request is unchanged.",
             ],
+        ),
+        HubError::WorkCheckpointSequenceConflict { .. } => (
+            "work_checkpoint_sequence_conflict",
+            "Checkpoint was not committed because the Work sequence changed.",
+            &["Inspect current Work before preparing a new checkpoint request."],
         ),
         HubError::Busy => (
             "busy",

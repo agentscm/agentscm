@@ -1344,13 +1344,10 @@ fn stale_observed_pause_cannot_overwrite_newer_checkpoint(db: &Db) {
             "automatic session-end pause",
         );
         stale_pause.expected_updated_seq = Some(observed);
-        assert_invalid(
+        assert!(matches!(
             store.work_checkpoint(&lead.token, &stale_pause, now + index as i64 * 10 + 2),
-            &format!(
-                "checkpoint receipt expired or work changed; current updated_seq is {}",
-                fresh.updated_seq
-            ),
-        );
+            Err(HubError::WorkCheckpointSequenceConflict { current_seq }) if current_seq == fresh.updated_seq
+        ));
 
         let retained = store
             .work_get(&lead.token, &started.id, now + index as i64 * 10 + 3)
@@ -1743,6 +1740,8 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.summary == "baseline visible at the old watermark")
     }));
+    // A compacted receipt must remain ambiguous, even when its baseline
+    // snapshot survives. A caller must never mint a fresh retry from this error.
     assert_invalid(
         store.work_checkpoint(&lead.token, &baseline_request, now),
         &format!(
@@ -1750,6 +1749,14 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
             recent.item.updated_seq
         ),
     );
+    let mut definitely_uncommitted = recent_request.clone();
+    definitely_uncommitted.operation_id = "post-compaction-stale-uncommitted".into();
+    // expected=the retained baseline: every later receipt remains available.
+    assert!(matches!(
+        store.work_checkpoint(&lead.token, &definitely_uncommitted, now),
+        Err(HubError::WorkCheckpointSequenceConflict { current_seq })
+            if current_seq == recent.item.updated_seq
+    ));
     assert!(
         store
             .work_checkpoint(&lead.token, &recent_request, now)
@@ -2042,6 +2049,7 @@ conformance!(
     forge_issue_ids_are_canonical_positive_decimals,
     concurrent_deliveries_and_acks_are_monotonic_and_retryable,
     compaction_preserves_baselines_and_expires_old_receipts,
+    checkpoint_rejection_respects_removed_history_without_a_checkpoint_baseline,
     compaction_delete_exception_is_exact_and_updates_remain_prohibited,
     postgres_read_briefings_share_the_repository_maintenance_lock,
     concurrent_delivery_reservations_enforce_capacity_and_roll_back,
@@ -2756,4 +2764,90 @@ fn pr_link_receipts_replay_after_takeover_changes_and_removal(db: &Db) {
         store.work_pr_link_set(&lead.token, &original_request, takeover_at + 4),
         Err(HubError::Unauthorized)
     ));
+}
+
+fn checkpoint_rejection_respects_removed_history_without_a_checkpoint_baseline(db: &Db) {
+    let store = db.open();
+    let lead = agent(&*store, 1);
+    let now = unix_now();
+    let old = now - 200_000;
+    let started = store
+        .work_start(
+            &lead.token,
+            &native_start(
+                "removed-checkpoint",
+                "Removed checkpoint",
+                "retention-session",
+            ),
+            old,
+        )
+        .unwrap()
+        .item;
+    let mut request = checkpoint(
+        &started.id,
+        "removed-operation",
+        1,
+        "retention-session",
+        CheckpointKind::Progress,
+        "Committed operation whose receipt expires",
+    );
+    request.expected_updated_seq = Some(started.updated_seq);
+    let committed = store
+        .work_checkpoint(&lead.token, &request, old + 1)
+        .unwrap();
+    // Keep a PR-link baseline, so no retained checkpoint snapshot can reveal the
+    // missing operation. Only the durable event floor proves history is incomplete.
+    let linked = store
+        .work_pr_link_set(
+            &lead.token,
+            &pr_link_update(&committed.item, "retention-pr-baseline"),
+            old + 2,
+        )
+        .unwrap();
+    let mut recent = request.clone();
+    recent.operation_id = "recent-operation".into();
+    recent.expected_updated_seq = Some(linked.view.updated_seq);
+    let current = store
+        .work_checkpoint(&lead.token, &recent, now - 1)
+        .unwrap();
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let compacted = store.work_compact(&scope, now - 86_400, true, now).unwrap();
+    // Checkpoints and PR-link changes share the operation receipt table. Both
+    // old receipts expire, while the PR-link version is retained as the baseline.
+    assert_eq!(compacted.deleted_operations, 2);
+    assert_eq!(compacted.deleted_versions, 2);
+    assert_eq!(compacted.retention_floor, linked.receipt.event_seq);
+    assert_invalid(
+        store.work_checkpoint(&lead.token, &request, now),
+        &format!(
+            "checkpoint receipt expired or work changed; current updated_seq is {}",
+            current.item.updated_seq
+        ),
+    );
+    let mut uncommitted = recent.clone();
+    uncommitted.operation_id = "never-committed-after-baseline".into();
+    assert!(
+        matches!(store.work_checkpoint(&lead.token, &uncommitted, now),
+        Err(HubError::WorkCheckpointSequenceConflict { current_seq }) if current_seq == current.item.updated_seq)
+    );
+    assert!(
+        store
+            .work_checkpoint(&lead.token, &recent, now)
+            .unwrap()
+            .receipt
+            .replayed
+    );
+    assert_eq!(
+        store
+            .work_get(&lead.token, &started.id, now)
+            .unwrap()
+            .unwrap()
+            .updated_seq,
+        current.item.updated_seq
+    );
 }

@@ -67,6 +67,7 @@ impl WorkspaceGuard<'_> {
                 "workspace task authorization unavailable",
             )),
             HubError::Invalid(_)
+            | HubError::WorkCheckpointSequenceConflict { .. }
             | HubError::Unauthorized
             | HubError::WorkOverlap(_)
             | HubError::WorkCoordinationRequired { .. }
@@ -1106,6 +1107,7 @@ async fn mcp(
         Err(
             HubError::WorkOverlap(_)
             | HubError::WorkCoordinationRequired { .. }
+            | HubError::WorkCheckpointSequenceConflict { .. }
             | HubError::WorkPreflight(_),
         ) => axum::Json(
             json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"AgentSCM task request conflicted with current state; inspect task status or recovery"}],"isError":true}}),

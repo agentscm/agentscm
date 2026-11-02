@@ -345,6 +345,9 @@ fn reason(error: HubError) -> &'static str {
             "work overlap coverage is incomplete; no scope was claimed"
         }
         HubError::WorkPreflight(_) => "work preflight requires review; no scope was claimed",
+        HubError::WorkCheckpointSequenceConflict { .. } => {
+            "checkpoint sequence changed; inspect current Work"
+        }
         HubError::Unauthorized => DENIED,
         HubError::Invalid(_) => "invalid hook payload",
         HubError::Unavailable(detail) => {

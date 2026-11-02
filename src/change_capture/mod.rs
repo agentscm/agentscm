@@ -251,7 +251,7 @@ struct LocalCommandRecord<'a> {
     assurance_limit: &'static str,
 }
 
-fn local_host_identity() -> Option<String> {
+pub(crate) fn local_host_identity() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let mut uuid = [0_u8; 16];
@@ -278,7 +278,7 @@ fn local_host_identity() -> Option<String> {
     }
 }
 
-fn local_boot_identity() -> Option<String> {
+pub(crate) fn local_boot_identity() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let name = CString::new("kern.boottime").ok()?;
@@ -738,12 +738,35 @@ pub fn capture_git_source(
     capture_git_source_opened(request, spool, &opened_root, true)
 }
 
+/// Retains the materialized manifest even for clean source, for exact before/after comparisons.
+/// This preserves the normal capture bounds, path handling and omission metadata.
+#[cfg(unix)]
+pub fn capture_git_source_materialized(
+    request: &GitSourceRequest,
+    spool: &LocalSpool,
+) -> Result<SourceBindingV1> {
+    let root = request.repository_path.canonicalize()?;
+    let opened_root = OpenedGitRoot::open(&root)?;
+    capture_git_source_snapshot(request, spool, &opened_root, true, true)
+}
+
 #[cfg(unix)]
 fn capture_git_source_opened(
     request: &GitSourceRequest,
     spool: &LocalSpool,
     opened_root: &OpenedGitRoot,
     require_configured_path: bool,
+) -> Result<SourceBindingV1> {
+    capture_git_source_snapshot(request, spool, opened_root, require_configured_path, false)
+}
+
+#[cfg(unix)]
+fn capture_git_source_snapshot(
+    request: &GitSourceRequest,
+    spool: &LocalSpool,
+    opened_root: &OpenedGitRoot,
+    require_configured_path: bool,
+    force_materialized: bool,
 ) -> Result<SourceBindingV1> {
     let mut source = observe_git_opened(request, opened_root, require_configured_path)?;
     let SourceBindingV1::Git {
@@ -770,7 +793,10 @@ fn capture_git_source_opened(
         MAX_GIT_OUTPUT,
     )?;
     opened_root.verify_descriptor()?;
-    if !*dirty && !requires_materialized_snapshot_opened(opened_root, &listed)? {
+    if !force_materialized
+        && !*dirty
+        && !requires_materialized_snapshot_opened(opened_root, &listed)?
+    {
         opened_root.verify_descriptor()?;
         // A clean gitlink identifies a commit but does not capture submodule source.
         omissions.retain(|omission| *omission == CaptureOmissionV1::SubmoduleContent);
@@ -1058,6 +1084,114 @@ pub fn run_configured_recipe_with_cancellation(
             Err(error)
         }
     }
+}
+
+/// Bind an operator reservation before launch or receipt lookup, including the opened root inode.
+#[cfg(unix)]
+pub fn operator_recipe_identity(request: &ConfiguredRecipeRunRequest) -> Result<String> {
+    let (recipe_digest, _, binding) = configured_recipe_binding(request)?;
+    operator_identity(request, &recipe_digest, &binding)
+}
+
+#[cfg(unix)]
+fn operator_identity(
+    request: &ConfiguredRecipeRunRequest,
+    recipe_digest: &str,
+    binding: &RecipeAttemptReservationV1,
+) -> Result<String> {
+    Ok(sha256(&serde_json::to_vec(&(
+        "agentscm/operator-recipe/v1",
+        &request.work_id,
+        request.generation,
+        &request.session_id,
+        &request.managed_invocation,
+        &request.setup_digest,
+        recipe_digest,
+        (
+            &request.source.repository,
+            &request.source.worktree_id,
+            &request.source.repository_path,
+            &request.source.base_ref,
+            binding.root_device,
+            binding.root_inode,
+        ),
+    ))?))
+}
+
+/// Runs an owner-selected exact recipe outside native hooks, using stable caller operation IDs.
+/// `reconcile` never launches. Missing starts return None only for the reserved identity;
+/// unfinished starts require independently observed process/group quiescence.
+#[cfg(unix)]
+pub fn run_operator_recipe<After>(
+    request: ConfiguredRecipeRunRequest,
+    spool: &LocalSpool,
+    expected_identity: &str,
+    reconcile: bool,
+    quiescent: bool,
+    after_spawn: After,
+) -> Result<Option<ObservedCommand>>
+where
+    After: FnOnce(u32, u32) -> std::io::Result<()>,
+{
+    let (recipe_digest, opened_root, binding) = configured_recipe_binding(&request)?;
+    let identity = operator_identity(&request, &recipe_digest, &binding)?;
+    if identity != expected_identity {
+        return Err(CaptureError::Conflict(
+            "operator recipe identity changed from its reservation; preserve the original outcome"
+                .into(),
+        ));
+    }
+    let start_operation_id = format!("operator:start:{identity}");
+    let finish_operation_id = format!("operator:finish:{identity}");
+    let retained_start = spool.action_start(&start_operation_id)?;
+    let retained_finish = spool.action_finish(&finish_operation_id)?;
+    if retained_start.is_none() && retained_finish.is_some() {
+        return Err(CaptureError::Conflict(
+            "operator recipe finish exists without its durable start".into(),
+        ));
+    }
+    if reconcile && retained_start.is_none() {
+        return Ok(None);
+    }
+    if retained_start.is_some() && retained_finish.is_none() && (!reconcile || !quiescent) {
+        return Err(CaptureError::Conflict("operator recipe has an unresolved start; observe the recorded process/group stopping before reconciliation".into()));
+    }
+    let command = ObservedCommandRequest {
+        start_operation_id,
+        finish_operation_id,
+        work_id: request.work_id,
+        generation: request.generation,
+        session_id: request.session_id,
+        action_id: format!("operator:{identity}"),
+        source: request.source,
+        argv: request.recipe.argv,
+        setup_digest: request.setup_digest,
+        coverage: request.recipe.coverage,
+        timeout: Duration::from_secs(request.recipe.timeout_seconds),
+        max_output_bytes: request.recipe.max_output_bytes,
+    };
+    validate_command_request(&command)?;
+    let prepared_cwd = if reconcile {
+        None
+    } else {
+        Some(opened_root.prepare_cwd()?)
+    };
+    run_observed_command_inner(
+        command,
+        spool,
+        recipe_digest,
+        ObservedExecution {
+            kind: ActionKindV1::Verification,
+            recipe_provenance: RecipeProvenanceV1::ConfiguredExactMatch,
+            tee: false,
+            opened_root: Some(&opened_root),
+            prepared_cwd,
+            admitted_start: None,
+        },
+        &Cancellation::default(),
+        after_spawn,
+    )
+    .map(Some)
 }
 
 #[cfg(unix)]
@@ -1535,12 +1669,15 @@ where
             after_spawn,
         )
     } else {
-        capture_with_input(
+        capture_with_input_tee_after_spawn(
             &mut command,
             None,
             request.timeout,
             request.max_output_bytes,
             cancellation,
+            std::io::sink(),
+            std::io::sink(),
+            after_spawn,
         )
     };
     let (exit_code, signal, stdout, stderr, stop, outcome) = match captured {

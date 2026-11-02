@@ -100,6 +100,8 @@ Silicon macOS; Docker is an explicit fallback. Server deployment is
 | Connect code and context | Read-only committed Git files, history and diffs beside available local conversations and recorded actions | [Repository explorer](docs/repository-explorer.md) · [Open this computer](docs/connect-this-computer.md) |
 | Make a team's PR process visible | Experimental `pr-gate` v1: adopted steps, head-bound evidence, findings and next actions; opt-in Claude Code/Codex Stop hooks | [Supported skills](docs/design/supported-skills.md) |
 | Reuse skills and workflow definitions | Local versioned authoring, pinned imports, simulation and an explicit export path to native execution | [Workflow library](docs/advanced/workflow-library.md) |
+| Continue a managed task with another agent | Experimental local Claude Code/Codex continuation of enrolled Work, with bounded source edits, artifacts and retained context | [Portable responsibility](docs/advanced/portable-responsibility.md) |
+| Run reviewed team rules | Experimental owner-reviewed contracts, rehearsal and guarded post-merge artifact workflows | [Operating policy](docs/advanced/operating-policy.md) |
 | Retain an owner's commitment | Living Promises keep versioned requests, criteria and constraints; agent proposals and reports remain advisory | [Living Promises](docs/advanced/living-promises.md) |
 | Pilot controlled native landing | Immutable revisions, pinned checks, bounded Claude Code review and human approval checked at native admission | [Native workflow loop](docs/advanced/claude-code-workflows.md) |
 
