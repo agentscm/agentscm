@@ -85,7 +85,7 @@ describe('Landed changes', () => {
     const task = await screen.findByRole('link', { name: 'Refactor the billing module' }, LOAD)
     expect(task.getAttribute('href')).toMatch(/^#work\/wrk_/)
     expect(task.closest('a.landed-row')).toBeNull()
-    expect(task.closest('li')!.textContent).toContain('Task: Refactor the billing module · maria’s claude-code')
+    expect(task.closest('li')!.textContent).toContain('Task: Refactor the billing module · maria’s Claude Code')
   })
 
   it('shows merged rows as Checking… until their detail loads, never as passed', async () => {

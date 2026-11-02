@@ -236,7 +236,7 @@ describe('Inbox', () => {
     expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
     expect(screen.getByText(/Sign in on the web to answer for your Claude Code from here/)).toBeTruthy()
     expect(screen.getByText('Copy a prompt instead')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Copy prompt for maria’s claude-code' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copy prompt for maria’s Claude Code' })).toBeTruthy()
   })
 
   it('offers Open in only for the viewer’s own agent on an overlap', async () => {

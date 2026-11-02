@@ -20,7 +20,8 @@ const BRAND_OF: Record<string, BrandName> = { claude: 'claudecode', 'claude-code
 const NAME_OF: Record<string, string> = { claudecode: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini', grok: 'Grok' }
 
 /** The brand an agent name stands for ("claude-code", "codex"), or null for a name the Hub made up. */
-export const brandOf = (agent: string): BrandName | null => BRAND_OF[agent.toLowerCase()] ?? null
+// Agent names come from Hub records; a record missing one falls back to the plain label instead of throwing.
+export const brandOf = (agent: string): BrandName | null => (typeof agent === 'string' ? BRAND_OF[agent.toLowerCase()] ?? null : null)
 
 /** How people say a known agent ("Claude Code"); null for one that is not. */
 export const brandName = (agent: string): string | null => {

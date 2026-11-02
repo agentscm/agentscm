@@ -6,14 +6,14 @@ import { areas, type Area } from '../needs.ts'
 import { workHref, type WorkOverview } from '../standup.ts'
 import type { PullRequest } from '../types.ts'
 import type { HubData } from '../useHub.ts'
-import { agentLabel, Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, Via } from '../ui.tsx'
+import { Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, Via } from '../ui.tsx'
 import type { Poll } from '../usePoll.ts'
 // nextStep.ts imports Inbox, which shares a module cycle with this page: use `who` only inside render functions.
-import { who } from '../nextStep.ts'
+import { agentName, who } from '../nextStep.ts'
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 /** "sam’s cursor", or just the agent when the hub did not say whose it is. */
-const whose = (owner: string, agent: string) => (owner ? who(owner, agent) : agentLabel(agent))
+const whose = (owner: string, agent: string) => (owner ? who(owner, agent) : agentName(agent))
 /** Paths joined as "a, b and c", each one a code element. */
 function Files({ files }: { files: string[] }) {
   return (
@@ -91,7 +91,7 @@ function ContestedRow({ c }: { c: Contested }) {
       <div className="contested-state">
         {c.refused && (
           <Pill tone="bad" icon="slash-circle">
-            {c.refused.owner}’s {agentLabel(c.refused.name)} refused <Ago at={c.refused.at} />
+            {who(c.refused.owner, c.refused.name)} refused <Ago at={c.refused.at} />
           </Pill>
         )}
         {c.repeated && (

@@ -8,13 +8,13 @@ const row = (agent: string, owner: string) => ({ agent, key: `${agent}${owner}`,
 const setup = vi.hoisted(() => ({ rows: [] as unknown[] }))
 vi.mock('../../src/api.ts', async (orig) => ({ ...(await orig<typeof import('../../src/api.ts')>()), fetchSetup: () => Promise.resolve(setup.rows) }))
 
-const step = (over: Partial<NextStep['prompts'][number]> = {}): NextStep => ({ human: 'Do it', prompts: [{ for: 'maria’s claude-code', text: 'Resume work', login: 'maria', agent: 'claude-code', ...over }] })
+const step = (over: Partial<NextStep['prompts'][number]> = {}): NextStep => ({ human: 'Do it', prompts: [{ for: 'maria’s Claude Code', text: 'Resume work', login: 'maria', agent: 'claude-code', ...over }] })
 const view = (s: NextStep, viewer: string | null) => render(<NextStepView step={s} viewer={viewer} repo="acme/widgets" originUrl="https://github.com/acme/widgets" />)
 
 describe('NextStepView', () => {
   it('offers Open in beside Copy for the viewer’s own agent only', () => {
     view(step(), 'maria')
-    expect(screen.getByRole('button', { name: 'Copy prompt for maria’s claude-code' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copy prompt for maria’s Claude Code' })).toBeTruthy()
     const open = screen.getByRole('link', { name: /Open in Claude Code/ })
     expect(open.getAttribute('href')).toBe('claude-cli://open?repo=acme/widgets&q=Resume%20work')
     expect(open.getAttribute('title')).toMatch(/Nothing is sent until you press Enter/)

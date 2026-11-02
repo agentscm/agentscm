@@ -60,25 +60,25 @@ describe('WorkDetail', () => {
     expect((await step('Merge')).word).toBe('Not seen')
     // The mock has no change record (404), so there is no button.
     expect(screen.queryByRole('link', { name: /Change record/ })).toBeNull()
-    expect(screen.getByText(/Led by maria’s claude-code/).textContent).toBe('Led by maria’s claude-code.')
+    expect(screen.getByText(/Led by maria’s Claude Code/).textContent).toBe('Led by maria’s Claude Code.')
     // The person comes first; the branch, pull request and head follow in the one fact line, once the reads that name them settle.
     await waitFor(() => expect(document.querySelector('.answer-fact')!.textContent).toMatch(/^On feat\/sync-retry-budget.*head [0-9a-f]{7}\. Last check-in /), LOAD)
     expect(screen.getByText('Technical details').closest('details')!.textContent).toContain('feat/sync-retry-budget')
     // The overlap the Dashboard lists for this task, with a copy button per lead's agent.
     expect(screen.getByRole('heading', { name: 'Needs you' })).toBeTruthy()
     expect(screen.getByText('Talk to maria and dev: their agents both plan to change src/billing.rs. Nothing is blocked yet.')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Copy prompt for maria’s claude-code/ })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Copy prompt for dev’s codex/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Copy prompt for maria’s Claude Code/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Copy prompt for dev’s Codex/ })).toBeTruthy()
     // People: one role label, the person first. Reports: person and age, kind only for a blocker, no repeated Next.
     expect(screen.getByText('Files this task plans to change')).toBeTruthy()
     expect(screen.queryByText('current lead')).toBeNull()
     const people = screen.getByRole('heading', { name: /People/ }).closest('section')!
-    expect(people.textContent).toContain('maria’s claude-code')
-    expect(people.querySelector('li')!.textContent).toBe('CCmaria’s claude-code ·lead')
+    expect(people.textContent).toContain('maria’s Claude Code')
+    expect(people.querySelector('li')!.textContent).toBe('CCmaria’s Claude Code ·lead')
     const report = document.querySelector('.report')!
     expect(report.textContent).toContain('Latest report')
     expect(report.textContent).not.toMatch(/checkpoint|progress|Next/)
-    expect(report.textContent).toMatch(/Reported by maria’s claude-code · /)
+    expect(report.textContent).toMatch(/Reported by maria’s Claude Code · /)
     // Claimed is the hub's own record; Finished and Merge have nothing to prove on an open task and draw no badge.
     expect((await step('Claimed')).text).toContain('Hub saw it')
     const finished = await step('Finished')
@@ -103,7 +103,7 @@ describe('WorkDetail', () => {
     await open('c')
     expect(await screen.findByText('Open blocker', {}, LOAD)).toBeTruthy()
     expect(screen.queryByText('No checkpoint yet')).toBeNull()
-    expect(screen.getByText('Answer the blocker where maria’s codex is running, or reassign the task.')).toBeTruthy()
+    expect(screen.getByText('Answer the blocker where maria’s Codex is running, or reassign the task.')).toBeTruthy()
   })
 
   it('shows the Change record button when a record exists, and a record with no action leaves Checks to the skill run', async () => {
@@ -142,7 +142,7 @@ describe('WorkDetail', () => {
     expect(screen.queryByRole('link', { name: /Open in Codex/ })).toBeNull()
     unmount()
     render(<WorkDetail id={wid('a')} token="t" overview={overview} handoff={{ ...mine, me: 'someone-else' }} />)
-    await screen.findByRole('button', { name: /Copy prompt for maria’s claude-code/ }, LOAD)
+    await screen.findByRole('button', { name: /Copy prompt for maria’s Claude Code/ }, LOAD)
     expect(screen.queryByRole('link', { name: /Open in/ })).toBeNull()
   })
 })

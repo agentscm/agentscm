@@ -192,6 +192,9 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     setup: { text: 'Hooks and tokens', tone: 'muted' },
     health: data.failing ? { text: 'Not answering', tone: 'bad' } : data.health ? { text: data.health.status === 'ok' ? 'Answering' : 'Degraded', tone: data.health.status === 'ok' ? 'ok' : 'warn' } : undefined,
     workspace: { text: 'Members and runs', tone: 'muted' },
+    // Computers and Admin read the browser sign-in this shell already loaded, so their tabs say what that sign-in allows.
+    computers: device.auth.kind === 'ready' ? { text: device.auth.value?.kind === 'browser' ? 'Signed in here' : 'Needs a web sign-in', tone: 'muted' } : undefined,
+    admin: device.auth.kind === 'ready' ? { text: device.auth.value?.kind === 'browser' && device.auth.value.session.admin ? 'You are an admin' : 'Admins only', tone: 'muted' } : undefined,
     repositories: { text: 'Every one you can read', tone: 'muted' },
     settings: { text: 'This browser', tone: 'muted' },
   }

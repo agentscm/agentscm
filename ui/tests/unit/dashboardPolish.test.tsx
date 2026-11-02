@@ -86,7 +86,7 @@ describe('a Needs you row', () => {
     render(page(overview([blocked()])))
     const acts = () => row().querySelector<HTMLElement>('.need-acts')!
     // claude-code is the viewer's own agent: Open exists but the prompt still has its blank.
-    expect(within(acts()).getByRole('button', { name: /^Copy prompt for maria’s claude-code$/ })).toBeTruthy()
+    expect(within(acts()).getByRole('button', { name: /^Copy prompt for maria’s Claude Code$/ })).toBeTruthy()
     expect(within(acts()).queryByRole('link')).toBeNull()
     fireEvent.click(within(acts()).getByRole('button', { name: 'More actions' }))
     const open = within(acts()).getByRole('menuitem', { name: /Open in Claude Code/ }) as HTMLButtonElement
@@ -95,12 +95,12 @@ describe('a Needs you row', () => {
     const link = within(row()).getByRole('link', { name: /Open in Claude Code/ })
     expect(link.getAttribute('href')).toMatch(/^claude-cli:\/\/open\?repo=acme\/widgets&q=/)
     expect(link.classList.contains('need-primary')).toBe(true)
-    expect(within(acts()).getByRole('menuitem', { name: /^Copy prompt for maria’s claude-code$/ })).toBeTruthy() // the menu is still open, and every action stays reachable
+    expect(within(acts()).getByRole('menuitem', { name: /^Copy prompt for maria’s Claude Code$/ })).toBeTruthy() // the menu is still open, and every action stays reachable
   })
 
   it('has no menu when there is only one action, and none for a decision with no prompt', () => {
     render(page(overview([blocked('dev')])))
-    expect(within(row()).getByRole('button', { name: /^Copy prompt for dev’s claude-code$/ })).toBeTruthy()
+    expect(within(row()).getByRole('button', { name: /^Copy prompt for dev’s Claude Code$/ })).toBeTruthy()
     expect(within(row()).queryByRole('button', { name: 'More actions' })).toBeNull()
   })
 
@@ -189,7 +189,7 @@ describe('the Agent briefing on the first tab', () => {
     expect(brief.classList.contains('brief-compact')).toBe(true)
     expect(before(document.getElementById('box-needs')!, brief)).toBe(true)
     expect(before(brief, document.getElementById('box-track')!)).toBe(true)
-    expect(brief.textContent).toMatch(/Written by claude-code/)
+    expect(brief.textContent).toMatch(/Written by Claude Code/)
     expect(within(brief).getByRole('heading', { name: 'Reported facts' })).toBeTruthy()
     expect(within(brief).getByText('It was reported finished.')).toBeTruthy()
     expect(within(brief).getByRole('heading', { name: 'What this may mean for your work' })).toBeTruthy()
