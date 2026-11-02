@@ -51,6 +51,10 @@ mod client_plugin;
 #[cfg(unix)]
 mod client_setup;
 mod client_status;
+#[cfg(unix)]
+mod continuity_cli;
+#[cfg(unix)]
+mod continuity_remote;
 mod demo_cli;
 mod distribution;
 #[cfg(unix)]
@@ -140,6 +144,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Prepare local task context, checks and publication drafts during a disconnection.
+    #[cfg(unix)]
+    Continuity(continuity_cli::ContinuityArgs),
     /// Author and inspect durable local source-bound change walkthroughs.
     #[cfg(unix)]
     Walkthrough {
@@ -930,6 +937,13 @@ async fn run(cli: Cli) -> Result<RunExit> {
         #[cfg(unix)]
         Command::AgentTask { command } => {
             print_json(&agent_task_cli::run(&cli.data_dir, command).await?);
+        }
+        #[cfg(unix)]
+        Command::Continuity(args) => {
+            let code = continuity_cli::run(args).await?;
+            if code != 0 {
+                return Ok(RunExit::SpecializedFailure(code));
+            }
         }
         #[cfg(unix)]
         Command::LocalValidation { command } => {

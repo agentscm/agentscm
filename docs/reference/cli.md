@@ -21,6 +21,17 @@ Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no
 - `hook` reads an agent's hook JSON on standard input and prints that agent's reply; it always exits 0, even on usage errors, and prints a valid "no information" reply when the hub cannot be consulted. `init-repo` prints plain text, shows a diff and asks before writing; without a terminal it needs `--yes`. See [supported agents](../agents.md).
 - `quickstart` and `uninstall` are guided and print plain text. Without a terminal they need `--yes`; otherwise they refuse and list their flags. `uninstall` exits nonzero when it could not undo something, and keeps its record of it.
 
+### `continuity` (experimental, Unix)
+
+`start`, `status`, `check`, `draft`, `cancel-draft`, `revalidate` and `delete` retain
+private preparation for an ordinary Git checkout through a GitHub or GitLab
+disconnection. `check` executes only an explicit local command; its receipt is
+caller asserted. A saved publication draft fixes the commit, base and PR/MR text.
+`revalidate --live --draft ID` makes a bounded read through the saved Hub connection;
+an unavailable or changed remote remains an explicit gap. No command fetches,
+pushes, creates a PR/MR or grants approval. See [continuity preparation](../continuity.md)
+and `agentscm continuity --help` for usage and limits.
+
 ### `walkthrough` (experimental, Unix)
 
 `agentscm walkthrough map --root PATH --repository NAMESPACE --base FULL_COMMIT --head FULL_COMMIT

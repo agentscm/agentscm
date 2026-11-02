@@ -1478,7 +1478,7 @@ fn patch_state(state: GitPatchStateV1) -> GitPatchV1 {
     }
 }
 
-fn find_git() -> Result<PathBuf> {
+pub(crate) fn find_git() -> Result<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path) {

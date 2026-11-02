@@ -5,6 +5,7 @@ mod catchup_sync;
 pub mod change_record;
 pub mod change_record_http;
 pub mod connection;
+pub mod continuity;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
@@ -430,6 +431,7 @@ pub fn router(state: HubState) -> Router {
         .merge(slack::routes())
         .merge(change_record_http::routes())
         .merge(pr_context::routes())
+        .merge(continuity::routes())
         .merge(promise_http::routes())
         .merge(skills::routes())
         .merge(work_http::routes())

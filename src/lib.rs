@@ -18,6 +18,8 @@ pub mod change_record;
 pub mod checks;
 pub mod civil;
 pub mod context;
+#[cfg(unix)]
+pub mod continuity;
 pub mod error;
 pub mod evidence;
 pub mod execution;
