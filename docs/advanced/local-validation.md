@@ -4,7 +4,7 @@ title: "Local validation attestations"
 
 # Local validation attestations
 
-> **Experimental (alpha).** Unix only, GitHub only, trusted-local. One maintainer key is enrolled. The verifier workflow was qualified before merge by running it under `act` against live GitHub on pull request #86: a signed failure (`failure` on that head), then a fix and a signed pass (`success` on the new head). Tampered, wrong-repository and other-head attestations were checked with `local-validation verify` against the same live comment bodies and gave `pending`. That workflow has since been replaced by `agentscm local-validation reconcile`, which is tested against a fake GitHub and real local bare Git transports; the authenticated GitHub command boundary is inspected with a test-only local transport reroute. It has not run against live GitHub or a private repository. Contributors without an enrolled key or local PostgreSQL and S3 request `ci-extended` for hosted test coverage.
+> **Experimental (alpha).** Unix only, GitHub only, trusted-local. One maintainer key is enrolled. The verifier workflow was qualified before merge by running it under `act` against live GitHub on pull request #86: a signed failure (`failure` on that head), then a fix and a signed pass (`success` on the new head). Tampered, wrong-repository and other-head attestations were checked with `local-validation verify` against the same live comment bodies and gave `pending`. That workflow has since been replaced by `agentscm local-validation reconcile`, whose adversarial cases are tested against a fake GitHub and real local bare Git transports; the authenticated GitHub command boundary is inspected with a test-only local transport reroute. Individual live public-PR observations do not qualify private acquisition or every event and recovery route. Contributors without an enrolled key or local PostgreSQL and S3 request maintainer help and `ci-extended` diagnostic coverage; hosted tests do not satisfy the required attestation status.
 
 A maintainer can run the repository's gate on their own machine and attach a signed, Git-bound record of the result to a pull request. A separate verifier workflow checks that record and publishes the `agentscm/local-validation` commit status. For pull requests from branches in this repository, this attestation is the expected evidence for the test gate: the expensive hosted suites no longer run on ordinary updates. See [Hosted CI and required checks](#hosted-ci-and-required-checks).
 
@@ -39,7 +39,7 @@ Recipes and policies that do not use `paths` or `exempt_paths` serialize as befo
 
 - A valid signature proves only that the holder of a registered key signed bytes bound to that commit, tree and base. The execution basis is `worker_asserted`: nothing proves the commands ran as recorded.
 - The signing user account and host are trusted. Recipe commands run as the signing user with `HOME` passed, so attested code can read `~/.config/gh`, the signing key, cargo configuration such as `.cargo/config.toml` aliases and anything else that user can read. The environment allowlist only avoids passing tokens through environment variables; it is not a sandbox. Never attest code you would not run as that user, and never attest third-party or fork code on a signing host.
-- Anyone with `statuses: write` can post the same status context. Required-status configuration is operator-owned, and nothing here changes branch protection.
+- Anyone with `statuses: write` can post the same status context. The repository's required check is bound to the GitHub Actions integration, but this is not cryptographic proof that the status writer ran the verifier. Required-status configuration remains operator-owned.
 - Policy, recipe and registry are read from the default branch, not from the PR.
 - This repository's policy requires the PostgreSQL and S3 test services (`AGENTSCM_TEST_DATABASE_URL`, `AGENTSCM_TEST_S3_*`). A run without a service the policy requires is recorded and verifies as a failure; an absent service the policy does not require adds no service coverage omission.
 
@@ -47,11 +47,71 @@ Recipes and policies that do not use `paths` or `exempt_paths` serialize as befo
 
 1. Create a key with `agentscm agent-task key-generate` (owner-private file).
 2. Enroll the public key in `.github/local-validation/registry.json` by a reviewed pull request. Only enrolled, unrevoked and unexpired keys verify; revoke by setting `revoked_at_ms` in a reviewed change.
-3. On a clean checkout of the PR head, run `git fetch origin main` (the merge-base is computed against the local `origin/main`), start the PostgreSQL and S3 test services, then run `agentscm local-validation run --recipe .github/local-validation/recipe.json --policy .github/local-validation/policy.json --registry .github/local-validation/registry.json --key-file KEY --issuer-id ID --state-dir DIR`. `run` has no defaults for the recipe, policy or registry; pass all three. Note the printed envelope digest. Ctrl-C (SIGINT) cancels the running command's process group and signs a failure that records the command as `cancelled`; a second Ctrl-C exits immediately.
-4. `local-validation post` the attestation to the PR (it refuses if the PR head differs from the attested commit). Do not post statuses by hand.
+3. On a clean checkout of the pushed PR head, start the PostgreSQL and S3 test services and use the commands below. Snapshot the trusted configuration from the fetched default branch even when the PR changes it. `run` has no defaults for the recipe, policy or registry; pass all three. Ctrl-C (SIGINT) cancels the running command's process group and signs a failure that records the command as `cancelled`; a second Ctrl-C exits immediately.
+4. Verify the retained envelope against the same trusted configuration, then `local-validation post` it to the PR. Posting refuses if the PR head differs from the attested commit. Do not post statuses by hand.
 5. The verifier workflow reports the status. Its first step sets a previous `success` on an open pull request head to `pending` before any setup. If `reconcile` cannot read or write something it exits 1 and leaves that head `pending`, or its previous status if the invalidating `pending` write itself was refused or uncertain; the next comment, push or daily run retries, or re-run the failed job. Report `pending` or `failure` as it is.
 
 `verify` is forge-neutral and also runs standalone against a local Git checkout; its `--recipe` default, `.github/local-validation/recipe.json`, is relative to the current directory. `reconcile` is anonymous by default; private GitHub repositories require the explicit authenticated-fetch flag and canonical origin described above. The standalone `evidence-verifier` tool has not been exercised on these envelopes.
+
+### Run, verify and post
+
+This example uses the enrolled `boorad` issuer and conventional key location; set `AGENTSCM_LV_DIR` to another absolute private directory when needed. It requires an installed compatible `agentscm`, `gh`, `jq`, the recipe's tools and the service variables already exported. The example never prints private key bytes. Missing prerequisites, services, a dirty checkout or an unpushed head stop the example rather than silently skipping attestation.
+
+```sh
+(
+set -eu
+umask 077
+cd "$(git rev-parse --show-toplevel)"
+lv_root=${AGENTSCM_LV_DIR:-$HOME/.config/agentscm/local-validation}
+lv_key="$lv_root/boorad.ed25519"
+lv_state="$lv_root/agentscm-attestations"
+lv_bin=$(command -v agentscm)
+test -f "$lv_key"
+test -n "${AGENTSCM_TEST_DATABASE_URL:-}"
+test -n "${AGENTSCM_TEST_S3_ENDPOINT:-}"
+test -n "${AGENTSCM_TEST_S3_BUCKET:-}"
+test -n "${AGENTSCM_TEST_S3_ACCESS_KEY_ID:-}"
+test -n "${AGENTSCM_TEST_S3_SECRET_ACCESS_KEY:-}"
+test -z "$(git status --porcelain)"
+lv_head=$(git rev-parse HEAD)
+lv_pr=$(gh pr view --json number --jq .number)
+test "$(gh pr view "$lv_pr" --json headRefOid --jq .headRefOid)" = "$lv_head"
+git fetch origin main
+lv_base=$(git rev-parse origin/main)
+lv_tmp=$(mktemp -d)
+trap 'rm -rf "$lv_tmp"' EXIT
+for file in recipe policy registry; do
+  git show "$lv_base:.github/local-validation/$file.json" >"$lv_tmp/$file.json"
+done
+mkdir "$lv_tmp/home"
+printf '[core]\n\tautocrlf = false\n' >"$lv_tmp/home/.gitconfig"
+lv_cargo=${CARGO_HOME:-$HOME/.cargo}
+lv_rustup=${RUSTUP_HOME:-$HOME/.rustup}
+HOME="$lv_tmp/home" CARGO_HOME="$lv_cargo" RUSTUP_HOME="$lv_rustup" \
+  "$lv_bin" local-validation run --repo . \
+  --config-dir .github/local-validation \
+  --verifier-workflow .github/workflows/local-validation.yml \
+  --recipe "$lv_tmp/recipe.json" --policy "$lv_tmp/policy.json" \
+  --registry "$lv_tmp/registry.json" --key-file "$lv_key" --issuer-id boorad \
+  --state-dir "$lv_state" --base-ref main --base-rev "$lv_base" >"$lv_tmp/result.json"
+test "$(jq -r .outcome "$lv_tmp/result.json")" = pass
+lv_sha=$(jq -r .envelope_sha256 "$lv_tmp/result.json")
+git fetch origin main
+git diff --quiet "$lv_base" origin/main -- .github/local-validation
+"$lv_bin" local-validation verify --repo . --head "$lv_head" --base-rev origin/main \
+  --repository github.com/agentscm/agentscm \
+  --recipe "$lv_tmp/recipe.json" --policy "$lv_tmp/policy.json" \
+  --registry "$lv_tmp/registry.json" \
+  --envelope "$lv_state/$lv_sha.envelope.json" --record "$lv_state/$lv_sha.record.json"
+gh auth token >"$lv_tmp/github-token"
+"$lv_bin" local-validation post --state-dir "$lv_state" --attestation "$lv_sha" \
+  --github-repo agentscm/agentscm --pr "$lv_pr" --token-file "$lv_tmp/github-token"
+)
+```
+
+Use absolute key, state, Cargo and Rustup paths. The temporary `HOME` gives recipe fixtures a stable Git line-ending configuration without changing the user's Git configuration. `HOME`, `CARGO_HOME`, `RUSTUP_HOME` and `PATH` are allowlisted; `GIT_CONFIG_GLOBAL` is not. This reduces accidental host-configuration effects but is not isolation from candidate code running as the signing user.
+
+If a PR changes the policy or recipe, its accepted pre-merge attestation still uses the current default branch's configuration. Qualify the candidate recipe separately and retain that result locally; do not post it before its policy lands, because a newer applicable attestation with a mismatched recipe can replace an older success with failure. After merge, new attestations use the newly trusted configuration. A configuration freshness or verification failure requires inspecting the change and rerunning, not changing the signed record.
 
 ## Hosted CI and required checks
 
@@ -62,9 +122,9 @@ Routine formatting, host Clippy, release-metadata checks, Linux nextest/doctests
 - Windows npm installer tests remain automatic for matching installer paths on pull requests and `main`. Windows build/tests, musl/macOS release-target builds, container checks, Hub end-to-end and live execution keep their existing `main`, `ci-extended` and manual coverage. Platform jobs establish their own coverage; a local host pass does not qualify them.
 - Documentation publishing still builds and checks its artifact on matching `main` pushes. Its routine audit and pull-request build/check move to the local recipe, with `ci-extended` and manual build/audit/check fallback; only `main` pushes publish. Release automation and tagged release qualification, PR-title validation and the local-validation verifier remain hosted.
 
-For a same-repository pull request without an enrolled key or required services, request `ci-extended` in the pull request. Without an attestation or that opt-in, routine tests do not run. Hosted fallback results remain separate from `agentscm/local-validation`; they never manufacture a signed local success. There is no automatic weekly dependency audit: run the local audits periodically for new advisories even when no source changes select them.
+For a pull request without an enrolled key or required services, request maintainer help and `ci-extended` diagnostic coverage. Hosted fallback results remain separate from `agentscm/local-validation`; they never manufacture a signed local success or satisfy its required check. Without an accepted attestation the normal merge path remains blocked, even when hosted tests pass. A maintainer may deliberately review and adopt trusted changes into a same-repository branch and new pull request before signing. Moving code between branches alone establishes no trust; never automatically run unreviewed fork code on a signing host to clear the gate. There is no automatic weekly dependency audit: run the local audits periodically for new advisories even when no source changes select them.
 
-Branch protection is operator-owned and unchanged by these files. `CI / static` is now opt-in and must not be made a required automatic check. If a requirement is added, require an evidence check that is produced for every admitted change, such as the configured `agentscm/local-validation` path, rather than a label-gated job. The verifier status is not currently required. Workflow syntax and local command checks do not establish live GitHub event scheduling, private-repository behavior or measured cost savings.
+The operator-managed `main` ruleset requires `agentscm/local-validation` and `Conventional PR title`, both bound to the GitHub Actions integration. The existing administrator bypass, signing rules and other protections remain in place. These settings are separate from committed workflow files. A missing, pending, failure or error attestation status does not satisfy the normal merge gate; a successful verifier workflow job alone is insufficient. `CI / static` is opt-in and must not be made a required automatic check. Workflow syntax and local command checks do not establish live GitHub event scheduling, private-repository behavior or measured cost savings.
 
 ## What invalidates an attestation
 
@@ -89,11 +149,11 @@ A command skipped by `paths` is listed as `not required: <id>`. Missing PostgreS
 
 ## Not done
 
-Routine hosted jobs are gated on the `ci-extended` label or manual dispatch, not on the presence of an attestation, so a pull request with neither has no routine hosted test coverage. The verifier status is not a required check, `reconcile`, including path-scoped commands and exempt paths, is tested only against a fake GitHub, and its first live run, on GitHub-hosted Actions, is after merge.
+Routine hosted jobs are gated on the `ci-extended` label or manual dispatch, not on the presence of an attestation, so a pull request with neither has no routine hosted test coverage and cannot satisfy the required attestation gate. Required-status enforcement does not prove execution or remove the existing administrator bypass. Fake-provider tests remain the evidence for path-scoped, exempt-path and adversarial reconciliation cases; one successful public-PR signing and verification run does not qualify private acquisition, every event route or all failure recovery behavior.
 
 ## Adopting in another repository
 
-This is a design for adoption, not a qualified one: no repository other than this one uses it, and `reconcile` has had no live run. Synthetic tests cover fake GitHub API behavior, real local bare Git transport, hostile checkout/global Git configuration, canonical-origin refusal, authenticated command construction and secret non-persistence. They do not exercise live private-repository credentials, TLS behavior, HTTP redirects or transport timeouts, so authenticated private fetch remains unqualified against GitHub. Syntax checks and local workflow runners do not qualify GitHub Actions scheduling or concurrency behavior.
+Qualify adoption separately in each repository. Synthetic tests cover fake GitHub API behavior, real local bare Git transport, hostile checkout/global Git configuration, canonical-origin refusal, authenticated command construction and secret non-persistence. They do not exercise live private-repository credentials, TLS behavior, HTTP redirects or transport timeouts, so authenticated private fetch remains unqualified against GitHub. Syntax checks and local workflow runners do not qualify GitHub Actions scheduling or concurrency behavior.
 
 1. Add `.github/local-validation/policy.json` with `repository` (`github.com/OWNER/NAME`), `recipe_sha256`, `required_services` set to `{"postgres":false,"s3":false}`, `max_age_seconds` and `epoch`, and `registry.json` with the maintainer's enrolled public key. Create keys and enroll them as in the maintainer workflow above.
 2. Add a recipe. For a Bun repository:
