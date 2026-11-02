@@ -406,6 +406,11 @@ A sentence, not a header. There is no rule under it and nothing visible above it
 - **Head:** transparent, with no divider, no icon and no tinted band. The title is 16px 600; the count sits plain on the right in 13px 500 text-3, or coral 700 when the box's tone is bad; the explanation spans the full width beneath.
 - **Internal Padding:** head 22px 26px 6px and body 14px 26px 26px; Condensed 12px 16px 2px and 8px 16px 14px; mobile 18px 18px 4px and 10px 18px 20px.
 
+### Skills library
+The answer names the adopted skills and their open runs ("Agents here are asked to follow 1 skill, pr-gate. 2 runs are open; 1 is waiting at a stop gate."), with the open-runs count linking to the runs; the fact line carries the caveat (how many steps the opt-in Stop hook can stop, and that agents report their own evidence) and the adoption source. A pinned skill that is not in force comes first as a plain warn notice, never boxed. An adopted skill shows its head (name at Group size, the run counts and View runs on the right), summary, applicability, steps and command. An available skill shows only its head, summary and adopt command; How it works and Settings wait behind disclosures. Status pills are short words with the detail in their tip: "Can stop the agent (opt-in)", "Merge check: planned", and on a step "Can stop the agent", "Warns only" or "Recorded only", inline after who does the step. Commands never break mid-word; they scroll sideways.
+
+**The Disclosure Row Rule.** A disclosure on the Skills pages is a 44px row in a 12px hairline frame with its label on the left and a chevron on the right that turns when open; its contents sit inside that frame, so nothing below it reads as its contents.
+
 ### Intent review
 On the local Work detail, keep the human request, amendments and agent focus distinct. Show candidate identity and source coverage beside criterion findings; make supported, mismatch and unknown states explicit, with evidence origin and assurance visible. Label findings stale when their intent or candidate binding differs. Keep execution status separate from semantic outcome, retain attempt history, and make incomplete coverage visible. A human disposition records a view; it never grants admission.
 
