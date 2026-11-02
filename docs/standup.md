@@ -64,7 +64,7 @@ The dashboard reads current Work without changing assignments or acknowledging c
 
 ### Since you last checked
 
-The Hub's Dashboard › Catch up tab and the inline MCP Work app show a personal return-to-work
+The Hub's Dashboard › Catch up tab shows a personal return-to-work
 delivery. It combines retained Work/checkpoint and coordination events
 with immutable merge observations. Human review state belongs to the authenticated
 person and repository, so it survives token rotation and is shared across that
@@ -94,12 +94,12 @@ They cannot supply merge observations or mutate Work, publications or the forge.
 The CLI exposes `work catchup` (optional `--request` query JSON) and
 `work catchup-ack --request` (exact acknowledgement JSON). MCP exposes
 `agentscm_work_catchup` and `agentscm_work_catchup_ack`. The HTTP/CLI default subscriber is `human`; MCP and supported agent startup paths
-select namespaced independent agent subscribers. Browser/MCP App instances supply
+select namespaced independent agent subscribers. Browser instances supply
 an opaque `delivery_client` so two devices or tabs page independently while sharing
 the person’s review position. With browser Web Locks, Hub tabs retain a bounded set
 of client slots across reloads and acquire exclusive ownership before using a stored
 client; a copied busy client is replaced. Browsers without that facility use a
-volatile client. MCP App instances also keep independent volatile clients. Reuse
+volatile client. Reuse
 one client identity throughout a delivery. Idle
 deliveries expire after 24 hours without moving the review position; an expired
 continuation must reload. Recent acknowledgement receipts are retained for retry.
