@@ -241,6 +241,7 @@ mod tests {
             state,
             claim_status,
             last_checkin_at: 1_000,
+            reported_at: None,
             generation: 1,
             lead_token: "tok".into(),
             lead_agent: "agent".into(),

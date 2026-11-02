@@ -773,7 +773,13 @@ fn render_overview(overview: &WorkOverview) -> String {
             bounded_hook_text(summary, 160)
         ));
     }
-    for overlap in overview.overlaps.iter().take(5) {
+    // Only overlaps between live tasks need coordination; paused or quiet pairs stay in the overview.
+    let live_overlaps: Vec<_> = overview
+        .overlaps
+        .iter()
+        .filter(|overlap| super::repository_summary::is_live_overlap(overlap))
+        .collect();
+    for overlap in live_overlaps.iter().take(5) {
         lines.push(format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
             bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&overlap.left.lead_agent, 64),
             bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&overlap.right.lead_agent, 64)));
@@ -782,7 +788,7 @@ fn render_overview(overview: &WorkOverview) -> String {
         || !overview.recent_complete
         || !overview.overlaps_complete
         || overview.recent.len() > 5
-        || overview.overlaps.len() > 5
+        || live_overlaps.len() > 5
     {
         lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
     }
@@ -1143,6 +1149,76 @@ pub fn relative(path: &str, roots: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::work::{ClaimStatus, WorkItem, WorkOverlapPair, WorkSource};
+
+    fn overlap_side(title: &str, state: WorkState, claim_status: ClaimStatus) -> WorkItem {
+        WorkItem {
+            id: format!("wrk_{title}"),
+            repository: "example-org/api".into(),
+            owner: "usr_1".into(),
+            owner_login: "example-user".into(),
+            source: WorkSource::Native {
+                request_key: title.into(),
+            },
+            title: title.into(),
+            state,
+            claim_status,
+            last_checkin_at: 1_000,
+            reported_at: None,
+            generation: 1,
+            lead_token: "tok".into(),
+            lead_agent: "agent".into(),
+            lead_session: "session".into(),
+            participants: vec![],
+            scope: vec![],
+            branch: None,
+            worktree: None,
+            next_action: None,
+            current: None,
+            blocker: None,
+            depends_on: vec![],
+            related_work: vec![],
+            created_at: 1_000,
+            updated_at: 1_000,
+            created_seq: 1,
+            updated_seq: 1,
+        }
+    }
+
+    #[test]
+    fn startup_recap_lists_only_overlaps_between_live_tasks() {
+        let pair = |left: (&str, WorkState), right: (&str, WorkState)| WorkOverlapPair {
+            left: overlap_side(left.0, left.1, ClaimStatus::Active),
+            right: overlap_side(right.0, right.1, ClaimStatus::Active),
+            reasons: vec![],
+            reasons_complete: true,
+        };
+        let overview = WorkOverview {
+            recent_since: 0,
+            until: 100,
+            current: vec![],
+            recent: vec![],
+            overlaps: vec![
+                pair(
+                    ("LiveOne", WorkState::Active),
+                    ("LiveTwo", WorkState::Blocked),
+                ),
+                pair(
+                    ("PausedOne", WorkState::Paused),
+                    ("LiveThree", WorkState::Active),
+                ),
+            ],
+            current_complete: true,
+            recent_complete: true,
+            overlaps_complete: true,
+            history_retention_gap: false,
+            settled_count: 0,
+        };
+        let text = render_overview(&overview);
+        assert!(text.contains("LiveOne") && text.contains("LiveTwo"));
+        assert!(!text.contains("PausedOne") && !text.contains("LiveThree"));
+        assert!(!text.contains("startup recap is partial"));
+    }
 
     #[test]
     fn native_start_context_supplies_only_a_validated_literal_session() {

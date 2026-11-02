@@ -64,19 +64,21 @@ The dashboard reads current Work without changing assignments or acknowledging c
 
 ### Work with a merged pull request
 
-When a Work item's branch has a merged pull request, the Hub stops listing it as current work in the overview, briefings, the session-start recap and the dashboard (all read the same overview). This is a read-time filter. The Work record, its state and its history are unchanged, and it stays available through `work_get`, search and history. "Settled" never means finished: the overview reports `settled_count`, and the MCP overview view says "with a merged PR".
+When a Work item's branch has a merged pull request, the Hub stops listing it as current work in the overview, briefings, the session-start recap and the dashboard (all read the same overview). This is a read-time filter. The Work record, its state and its history are unchanged, and it stays available through search (`agentscm_work_search`) and history. "Settled" never means finished: the overview reports `settled_count`, and the MCP overview view says "with a merged PR".
 
 An item is hidden only when all of these hold:
 
 - its branch matches a merged pull request observed from the same repository (a fork's branch name does not count) at or after the item's last check-in, and the branch is not the base of any observed merge, so default and release branches never hide;
 - it is not blocked and has no unresolved blocker; and
-- a check-in after the merge has not brought it back. A resumed paused item returns once its owner checks in or takes it over. An item paused automatically at session end is hidden by any observed merge of its branch since it was created.
+- a check-in after the merge has not brought it back. A resumed paused item returns once its owner checks in or takes it over. An item paused automatically at session end is judged by the time of its last check-in before that pause (`reported_at`), not by the pause itself. If it was created and never checked in, any observed merge of its branch since it was created hides it. A check-in after the merge keeps it listed even if the session then ends.
 
 Limits:
 
+- A merge counts only when the forge reports when it happened. A tracked publication whose merge has no forge time is recorded as a merge observation but does not hide Work, because the time it was observed says nothing about when it merged. That Work stays listed, which is the safe direction.
+- A merge observed while a briefing is being delivered changes later pages only. Pages already delivered, and the fixed watermark of the delivery, are not rewritten.
 - The Hub needs merge observations. With none, nothing is hidden, and a repository whose merges are not synced keeps every item visible.
 - Merges observed before this rule existed carry no head-repository information. They hide matching items, including a fork's same-named branch, until the next check-in.
-- Hiding does not release anything. Scope admission, conflict checks, coordination requests, held files and preflight still treat a hidden item as unfinished, so a start can conflict with an item the overview no longer lists. Use `work_get` or search to find it.
+- Hiding does not release anything. Scope admission, conflict checks, coordination requests, held files and preflight still treat a hidden item as unfinished, so a start can conflict with an item the overview no longer lists. Use `agentscm_work_search` to find it.
 
 ### Since you last checked
 

@@ -408,6 +408,65 @@ describe('Since you last checked', () => {
       expect(catchupCalls(fetchMock).some(([input]) => String(input).endsWith('/ack'))).toBe(false)
     })
 
+    it('does not carry an open confirmation to another token', async () => {
+      mockCatchup(response(partial()), response(partial({ delivery: delivery('b') })))
+      const view = render(<CatchupPanel token="old-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      expect(screen.getByText(confirmText)).toBeTruthy()
+      view.rerender(<CatchupPanel token="new-token" />)
+      expect(await screen.findByText(delivery('b'))).toBeTruthy()
+      expect(screen.queryByText(confirmText)).toBeNull()
+      expect(screen.getByRole('button', { name: 'Mark all reviewed' }).getAttribute('aria-expanded')).toBe('false')
+    })
+
+    it('sends one run when the confirmation is clicked twice', async () => {
+      const fetchMock = mockCatchup(
+        response(partial()),
+        response(page({ event_through: 5, event_after: 3, next_event_after: 5 })),
+        response(ackBody),
+        response(page({ delivery: delivery('b') })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      const confirm = screen.getByRole('button', { name: 'Mark everything reviewed' })
+      fireEvent.click(confirm)
+      fireEvent.click(confirm)
+      expect(await screen.findByText('Marked retained records reviewed')).toBeTruthy()
+      const calls = catchupCalls(fetchMock)
+      expect(calls).toHaveLength(4)
+      expect(calls.filter(([input]) => String(input).endsWith('/ack'))).toHaveLength(1)
+    })
+
+    it('moves focus into the panel once the delivery is complete', async () => {
+      mockCatchup(
+        response(partial()),
+        response(page({ event_through: 5, event_after: 3, next_event_after: 5 })),
+        response(ackBody),
+        response(page({ delivery: delivery('b') })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Marked retained records reviewed')).toBeTruthy()
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Since you last checked' })))
+    })
+
+    it('keeps the success message when the reload after it fails', async () => {
+      mockCatchup(
+        response(partial()),
+        response(page({ event_through: 5, event_after: 3, next_event_after: 5 })),
+        response(ackBody),
+        new Error('connection refused'),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Marked retained records reviewed')).toBeTruthy()
+      await waitFor(() => expect(screen.getByText(/could not be refreshed/)).toBeTruthy())
+      expect(screen.getByText('Marked retained records reviewed')).toBeTruthy()
+      expect(screen.queryByText('Could not refresh catch-up')).toBeNull()
+    })
+
     it('says the records are only the available ones when retention has a gap', async () => {
       mockCatchup(response(partial({ retention: { work_gap: true, coordination_gap: false, merge_gap: false, event_available_from: 2, merge_available_from: 0 } })))
       render(<CatchupPanel token="read-token" />)

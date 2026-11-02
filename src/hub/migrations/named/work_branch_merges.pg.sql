@@ -1,7 +1,9 @@
 -- requires: catchup
 -- Derived from catch-up merge observations, which compaction prunes. A row says the branch had a
 -- merged pull request at merged_at, or was the base of one (is_base). The Hub uses it to stop
--- listing Work whose branch merged; it is never an authority for admission or conflicts.
+-- listing Work whose branch merged; it is never an authority for admission or conflicts. A branch
+-- row needs a provider merge time: an observation without one (occurred_at NULL) is not recorded,
+-- so a late-observed merge cannot settle Work that is still active.
 CREATE TABLE hub_catchup_branch_merges (
     provider TEXT NOT NULL,
     host TEXT NOT NULL,
@@ -16,8 +18,9 @@ CREATE TABLE hub_catchup_branch_merges (
 INSERT INTO hub_catchup_branch_merges
     (provider, host, repository, repository_key, branch, merged_at, is_base)
 SELECT provider, host, repository, repository_key, branch,
-       MAX(COALESCE(occurred_at, observed_at)), 0
+       MAX(occurred_at), 0
 FROM hub_catchup_merges
+WHERE occurred_at IS NOT NULL
 GROUP BY provider, host, repository, repository_key, branch;
 
 INSERT INTO hub_catchup_branch_merges

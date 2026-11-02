@@ -489,7 +489,7 @@ fn settled_work_sql(
               AND m.repository_key=?{key} AND m.branch={branch} AND m.is_base=0
               AND m.merged_at >= CASE WHEN {state}='paused'
                     AND json_extract({snapshot},'$.current.summary')=?{auto_pause}
-                  THEN {item}.created_at
+                  THEN COALESCE(json_extract({snapshot},'$.reported_at'), {item}.created_at)
                   ELSE json_extract({snapshot},'$.last_checkin_at') END))"
     )
 }
@@ -1092,7 +1092,8 @@ fn sqlite_record_catchup_merge(
             1
         ],
     )?;
-    if merge.same_repository_head {
+    // A branch row settles Work, so it needs a provider merge time; a tracked publication has none.
+    if let (true, Some(branch_merged_at)) = (merge.same_repository_head, merge.occurred_at) {
         tx.execute(
             base_upsert,
             params![
@@ -1101,7 +1102,7 @@ fn sqlite_record_catchup_merge(
                 repository,
                 repository_key,
                 merge.branch,
-                merged_at,
+                branch_merged_at,
                 0
             ],
         )?;
@@ -3369,6 +3370,7 @@ fn start_in(
         item.state = WorkState::Active;
         item.claim_status = ClaimStatus::Active;
         item.last_checkin_at = now;
+        item.reported_at = None;
         item.updated_at = now;
         let event = work_event("work_takeover", &item)?;
         let seq = append(tx, &event)?;
@@ -3496,6 +3498,7 @@ fn start_in(
         state: WorkState::Active,
         claim_status: ClaimStatus::Active,
         last_checkin_at: now,
+        reported_at: None,
         generation: 1,
         lead_token: who.token.clone(),
         lead_agent: who.agent.clone(),
@@ -8177,6 +8180,13 @@ impl Store for SqliteStore {
         )?;
         item.state = checkpoint.state();
         item.claim_status = ClaimStatus::Active;
+        item.reported_at = if checkpoint.kind == super::work::CheckpointKind::Pause
+            && checkpoint.summary == AUTO_PAUSE_SUMMARY
+        {
+            item.reported_at.or(Some(item.last_checkin_at))
+        } else {
+            None
+        };
         item.last_checkin_at = now;
         item.next_action = checkpoint.next_action.clone();
         if let Some(scope) = checkpoint.normalized_scope()? {

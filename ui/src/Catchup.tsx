@@ -165,6 +165,8 @@ export function CatchupPanel({ token }: { token: string }) {
   const markAllButton = useRef<HTMLButtonElement>(null)
   const confirmButton = useRef<HTMLButtonElement>(null)
   const restoreFocus = useRef(false)
+  const markAllRunningRef = useRef(false)
+  const heading = useRef<HTMLHeadingElement>(null)
   const markAllController = useRef<AbortController | null>(null)
   const generation = useRef(0)
   const deliveryClientEpoch = useRef(0)
@@ -207,7 +209,8 @@ export function CatchupPanel({ token }: { token: string }) {
   useEffect(() => {
     if (!markAllRunning && restoreFocus.current) {
       restoreFocus.current = false
-      markAllButton.current?.focus()
+      // A finished delivery has no Mark all button any more; the heading keeps focus inside the panel.
+      ;(markAllButton.current ?? heading.current)?.focus()
     }
   }, [markAllRunning])
 
@@ -221,7 +224,12 @@ export function CatchupPanel({ token }: { token: string }) {
       return true
     } catch (error) {
       if (!controller.signal.aborted && generation.current === operation) {
-        if (keepCurrent) setNotice({ token, tone: 'bad', title: 'Could not refresh catch-up', detail: message(error) })
+        if (keepCurrent) {
+          // After a successful action, keep what it reported and add that the reload failed.
+          setNotice((previous) => previous?.token === token && previous.tone !== 'bad'
+            ? { ...previous, detail: `${previous.detail} The delivery could not be refreshed, so this panel may be out of date: ${message(error)}` }
+            : { token, tone: 'bad', title: 'Could not refresh catch-up', detail: message(error) })
+        }
         else setState({ kind: 'error', token, message: message(error) })
       }
       return false
@@ -231,6 +239,10 @@ export function CatchupPanel({ token }: { token: string }) {
   useEffect(() => {
     if (deliveryClient === null) return
     const operation = ++generation.current
+    // A new token or delivery client starts a new delivery: nothing from the last one carries over.
+    markAllRunningRef.current = false
+    setBusy(null)
+    setConfirming(false)
     const controller = new AbortController()
     void fetchCatchup(token, controller.signal, { subscriber: 'human', deliveryClient: deliveryClient.client }).then(
       (page) => { if (!controller.signal.aborted && generation.current === operation) setState({ kind: 'ready', token, page }) },
@@ -242,6 +254,9 @@ export function CatchupPanel({ token }: { token: string }) {
       invalidateGeneration()
     }
   }, [deliveryClient, invalidateGeneration, token])
+
+  const deliveryId = state.kind === 'ready' && state.token === token ? state.page.delivery : null
+  useEffect(() => { setConfirming(false) }, [deliveryId])
 
   const currentState: LoadState = state.kind !== 'loading' && state.token !== token ? { kind: 'loading' } : state
   const currentBusy = busy?.token === token ? busy.kind : null
@@ -308,7 +323,8 @@ export function CatchupPanel({ token }: { token: string }) {
   }
 
   const acknowledgeAll = async () => {
-    if (currentBusy || page.complete) return
+    if (currentBusy || page.complete || markAllRunningRef.current) return
+    markAllRunningRef.current = true
     const operation = generation.current
     setConfirming(false)
     restoreFocus.current = true
@@ -320,22 +336,30 @@ export function CatchupPanel({ token }: { token: string }) {
     try {
       result = await markAllReviewed(token, controller.signal, page, deliveryClient!.client)
     } catch (error) {
-      if (controller.signal.aborted || generation.current !== operation) return
+      if (controller.signal.aborted || generation.current !== operation) {
+        markAllRunningRef.current = false
+        return
+      }
       // The server's cursors are now ahead of this panel, so Load more would be refused; start the delivery over.
       const reloaded = await loadInitial(true)
       if (generation.current === operation) {
         setNotice({ token, tone: 'bad', title: 'Could not mark everything reviewed', detail: `The review position was not assumed to move. The delivery was ${reloaded ? 'reloaded' : 'not reloaded; reload the page'}. ${message(error)}` })
         setBusy(null)
       }
+      markAllRunningRef.current = false
       return
     }
-    if (generation.current !== operation) return
+    if (generation.current !== operation) {
+      markAllRunningRef.current = false
+      return
+    }
     if (result.status === 'conflict') {
       setNotice({ token, tone: 'warn', title: 'Review position changed', detail: 'Another device advanced this review position. Reloading the current delivery without moving it backwards.' })
     } else {
       setNotice({ token, tone: 'ok', title: 'Marked retained records reviewed', detail: 'The server advanced this repository’s personal review position through the retained records in this fixed delivery. Records newer than it stay unreviewed.' })
     }
     await loadInitial(true)
+    markAllRunningRef.current = false
     if (generation.current === operation) setBusy(null)
   }
 
@@ -365,7 +389,7 @@ export function CatchupPanel({ token }: { token: string }) {
     <section id="since-last-checked" className="since" aria-labelledby="since-title">
       <div className="since-head">
         <div className="since-title">
-          <h2 id="since-title">Since you last checked</h2>
+          <h2 id="since-title" ref={heading} tabIndex={-1}>Since you last checked</h2>
           <Explain text={`${READING_CHANGES_NOTHING} Only marking reviewed moves your own review position. Merge entries are observations AgentSCM recorded; they do not claim all forge history.`} />
         </div>
         {action}

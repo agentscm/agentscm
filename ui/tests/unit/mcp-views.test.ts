@@ -100,12 +100,12 @@ describe('MCP views Twilight restyle', () => {
     for (const t of ['Handed', 'Paused', 'Stale active', 'Overlap side']) expect(root.querySelector('details.f')!.textContent).toContain(t)
   })
 
-  it('overview with only older tasks and complete data says nothing needs a person', () => {
+  it('overview with only older tasks and complete data says nothing is blocked or overlapping', () => {
     const { render } = load(files.overview)
     const root = document.getElementById('app')!
     const current = [item({ id: 'wrk_1', state: 'paused' }), item({ id: 'wrk_2', state: 'handover' }), item({ id: 'wrk_3', claim_status: 'stale' })]
     render(root, { current, recent: [], overlaps: [], ...flags }, new Date())
-    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing needs a person. 3 older tasks in All work.')
+    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing blocked or overlapping. 3 older tasks in All work.')
     root.textContent = ''
     render(root, { current: current.slice(0, 1), recent: [], overlaps: [], ...flags }, new Date())
     expect(root.querySelector('.big')!.textContent).toContain('1 older task in All work.')
@@ -135,12 +135,12 @@ describe('MCP views Twilight restyle', () => {
   })
 
   it.each([{ overlaps_complete: false, current_complete: true }, { overlaps_complete: true, current_complete: false }])(
-    'overview does not claim nothing needs a person on partial data %o',
+    'overview does not claim nothing is blocked or overlapping on partial data %o',
     (flags) => {
       const { render } = load(files.overview)
       const root = document.getElementById('app')!
       render(root, { current: [], recent: [], overlaps: [], recent_complete: true, history_retention_gap: false, ...flags }, new Date())
-      expect(root.querySelector('.big')!.textContent).not.toContain('Nothing needs a person.')
+      expect(root.querySelector('.big')!.textContent).not.toContain('Nothing blocked or overlapping.')
     },
   )
 

@@ -33,7 +33,7 @@ details.f{border-top:1px solid var(--line)}details.f>summary{display:flex;align-
 "use strict";
 var TOOL='agentscm_work_overview';
 var NS='http://www.w3.org/2000/svg',OPEN={};
-var IC={alert:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M8 5v3.4','M8 11h.01'],block:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M4 12 12 4'],hand:['M2.5 6h9M9 3.5 11.5 6 9 8.5','M13.5 10h-9M7 7.5 4.5 10 7 12.5'],pause:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M6.6 6v4M9.4 6v4'],overlap:['M2.4 8a3.6 3.6 0 1 0 7.2 0a3.6 3.6 0 1 0-7.2 0','M6.4 8a3.6 3.6 0 1 0 7.2 0a3.6 3.6 0 1 0-7.2 0'],move:['M2.5 8h8M8 4.5 11.5 8 8 11.5'],refresh:['M13 8a5 5 0 1 1-1.5-3.6','M13 2.5v3h-3'],chev:['M6 3.5 10.5 8 6 12.5'],check:['M3.5 8.5 6.5 11.5 12.5 4.5'],reply:['M6.5 4 2.5 8l4 4','M2.5 8H9a4.5 4.5 0 0 1 4.5 4.5'],arrow:['M3 8h9M9 5l3 3-3 3'],clock:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M8 5v3l2 1.5']};
+var IC={alert:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M8 5v3.4','M8 11h.01'],block:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M4 12 12 4'],hand:['M2.5 6h9M9 3.5 11.5 6 9 8.5','M13.5 10h-9M7 7.5 4.5 10 7 12.5'],pause:['M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0','M6.6 6v4M9.4 6v4'],overlap:['M2.4 8a3.6 3.6 0 1 0 7.2 0a3.6 3.6 0 1 0-7.2 0','M6.4 8a3.6 3.6 0 1 0 7.2 0a3.6 3.6 0 1 0-7.2 0'],move:['M2.5 8h8M8 4.5 11.5 8 8 11.5'],refresh:['M13 8a5 5 0 1 1-1.5-3.6','M13 2.5v3h-3'],chev:['M6 3.5 10.5 8 6 12.5'],check:['M3.5 8.5 6.5 11.5 12.5 4.5'],reply:['M6.5 4 2.5 8l4 4','M2.5 8H9a4.5 4.5 0 0 1 4.5 4.5'],arrow:['M3 8h9M9 5l3 3-3 3']};
 function ic(k,cls){var s=document.createElementNS(NS,'svg');s.setAttribute('viewBox','0 0 16 16');s.setAttribute('class','i'+(cls?' '+cls:''));s.setAttribute('aria-hidden','true');IC[k].forEach(function(d){var p=document.createElementNS(NS,'path');p.setAttribute('d',d);s.appendChild(p)});return s}
 function h(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=String(text);return e}
 function add(p){for(var i=1;i<arguments.length;i++){var a=arguments[i];if(a)p.appendChild(typeof a==='string'?document.createTextNode(a):a)}return p}
@@ -95,7 +95,7 @@ var working=cur.filter(function(i){return i.state==='active'&&i.claim_status==='
 add(root,bar('AgentSCM · '+(repo?clip(repo):'Work overview'),'Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),failNote());
 if(d.current_complete===false)add(root,msg('warn','Showing a partial list.'));
 var big=h('p','big');add(big,plural(working,'agent')+' working. ');
-if(rows.length)add(big,h('em',null,plural(rows.length,'thing needs','things need')+' a person.'));else add(big,d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing needs a person.'+(old>0?' '+plural(old,'older task')+' in All work.':''));
+if(rows.length)add(big,h('em',null,plural(rows.length,'thing needs','things need')+' a person.'));else add(big,d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing blocked or overlapping.'+(old>0?' '+plural(old,'older task')+' in All work.':''));
 add(root,big);
 if(rows.length){var ul=h('ul','needs');rows.forEach(function(x){var li=h('li');add(li,ic(x.icon,x.tone),h('span','t',x.t),h('span','s',x.s));ul.appendChild(li)});add(root,ul)}
 var all=fold('all','All work',plural(cur.length,'task')+(old>0?' · '+old+' older':'')+(d.settled_count>0?' · '+d.settled_count+' with a merged PR':'')+' · '+rec.length+' finished recently'),wl=h('ul','w');

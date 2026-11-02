@@ -217,6 +217,10 @@ pub struct WorkItem {
     /// A request-time projection. Stale and unknown claims remain claimed.
     pub claim_status: ClaimStatus,
     pub last_checkin_at: i64,
+    /// Set only on the automatic pause written at session end: the last check-in time before it.
+    /// Later auto-pauses keep it, so the pause does not make the session look newly checked in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<i64>,
     pub generation: i64,
     pub lead_token: String,
     pub lead_agent: String,

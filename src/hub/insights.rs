@@ -775,6 +775,7 @@ mod tests {
             state: last.state,
             claim_status: ClaimStatus::Active,
             last_checkin_at: last.at,
+            reported_at: None,
             generation: last.generation,
             lead_token: "private-token-id".into(),
             lead_agent: "generic".into(),
