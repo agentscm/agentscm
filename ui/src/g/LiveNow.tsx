@@ -12,7 +12,7 @@ import { fetchLibrary, fetchRuns, type RunView } from '../skills.ts'
 import { fetchSetup } from '../api.ts'
 import { setupState } from '../onboarding.ts'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
-import type { Need } from '../needs.ts'
+import { isLiveOverlap, type Need } from '../needs.ts'
 import type { Derived } from '../derive.ts'
 import type { LiveProps } from './GLive.tsx'
 import { STEPS, dotTone, prFor, stateText, stepOf, toneOf } from './liveModel.ts'
@@ -50,7 +50,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
         fact={loading ? <span className="g-fact">{repo}</span> : <span className="g-fact">
           <span>{repo} · {current.length} unfinished · {plural(people, 'person', 'people')} with {plural(agents, 'live agent')}</span>
           <a href="#contributions" className="g-strip" aria-label="What the Hub has recorded">
-            <span><Icon name="sign-intersection-y" /> {plural(ov?.overlaps.length ?? 0, 'overlap')} open</span>
+            <span><Icon name="sign-intersection-y" /> {plural(ov?.overlaps.filter(isLiveOverlap).length ?? 0, 'overlap')} open</span>
             <span><Icon name="exclamation-diamond" /> {plural(d?.contested.length ?? 0, 'contested file')}</span>
             {data.health?.coordination && <span><Icon name="shield-check" /> {plural(data.health.coordination.denied, 'edit')} refused once</span>}
           </a>
@@ -80,10 +80,10 @@ export function LiveNow({ live }: { live: LiveProps }) {
   )
 }
 
-const KIND_LABEL: Record<Need['kind'], string> = { blocked: 'Blocked', quiet: 'Gone quiet', handover: 'Handover', contested: 'Contested file', overlap: 'Overlap', pr: 'Pull request' }
+const KIND_LABEL: Record<Need['kind'], string> = { blocked: 'Blocked', contested: 'Contested file', overlap: 'Overlap', pr: 'Pull request' }
 
 function LiveNeedCard({ n, i, ov, d, live }: { n: Need; i: number; ov: WorkOverview; d: Derived; live: LiveProps }) {
-  const { icon, title, gist, body, step } = needView(n, ov, d, live.handoff.me)
+  const { icon, title, gist, body, step } = needView(n, ov, d)
   const acts = useStepActions(step, { viewer: live.handoff.me, repo: live.handoff.repo, originUrl: live.handoff.originUrl })
   const [open, setOpen] = useState(false)
   const item = n.item

@@ -71,10 +71,57 @@ describe('MCP views Twilight restyle', () => {
     const root = document.getElementById('app')!
     const data = { current: [item({})], recent: [], overlaps: [], current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false }
     render(root, { ...data, settled_count: 2 }, new Date())
-    expect(root.querySelector('details.f')!.textContent).toContain('1 task · 0 finished recently · 2 with a merged PR')
+    expect(root.querySelector('details.f')!.textContent).toContain('1 task · 2 with a merged PR · 0 finished recently')
     root.textContent = ''
     render(root, data, new Date())
     expect(root.textContent).not.toContain('merged PR')
+  })
+
+  const flags = { current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false }
+  const pair = (l: Record<string, unknown>, r: Record<string, unknown>) => ({ left: item({ id: 'wrk_l', ...l }), right: item({ id: 'wrk_r', ...r }), reasons: [{ left_path: 'src/a.rs', right_path: 'src/a.rs' }] })
+
+  it('overview counts only blocked work and live overlaps; older items fold into All work', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, {
+      current: [
+        item({ id: 'wrk_1', title: 'Handed', state: 'handover', claim_status: 'stale' }),
+        item({ id: 'wrk_2', title: 'Paused', state: 'paused' }),
+        item({ id: 'wrk_3', title: 'Stale active', state: 'active', claim_status: 'stale' }),
+        item({ id: 'wrk_4', title: 'Overlap side', state: 'active', claim_status: 'stale' }),
+        item({ id: 'wrk_5', title: 'Stuck blocker', state: 'blocked', claim_status: 'stale', blocker: { summary: 'waiting on keys' } }),
+      ],
+      recent: [], overlaps: [pair({ claim_status: 'stale' }, {})], ...flags,
+    }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. 1 thing needs a person.')
+    expect(root.querySelectorAll('.needs li')).toHaveLength(1)
+    expect(root.querySelector('.needs')!.textContent).toContain('Stuck blocker')
+    expect(root.querySelector('details.f')!.textContent).toContain('5 tasks · 4 older · 0 finished recently')
+    for (const t of ['Handed', 'Paused', 'Stale active', 'Overlap side']) expect(root.querySelector('details.f')!.textContent).toContain(t)
+  })
+
+  it('overview with only older tasks and complete data says nothing needs a person', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    const current = [item({ id: 'wrk_1', state: 'paused' }), item({ id: 'wrk_2', state: 'handover' }), item({ id: 'wrk_3', claim_status: 'stale' })]
+    render(root, { current, recent: [], overlaps: [], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing needs a person. 3 older tasks in All work.')
+    root.textContent = ''
+    render(root, { current: current.slice(0, 1), recent: [], overlaps: [], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toContain('1 older task in All work.')
+    for (const partial of [{ overlaps_complete: false }, { current_complete: false }]) {
+      root.textContent = ''
+      render(root, { current, recent: [], overlaps: [], ...flags, ...partial }, new Date())
+      expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing flagged in the data shown.')
+    }
+  })
+
+  it('overview still lists an overlap whose sides are both live', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, { current: [item({ id: 'wrk_l' }), item({ id: 'wrk_r', state: 'blocked', blocker: { summary: 'x' } })], recent: [], overlaps: [pair({}, { state: 'blocked' })], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('1 agent working. 2 things need a person.')
+    expect(root.querySelector('.needs')!.textContent).toContain('both declare src/a.rs')
   })
 
   it('starting the overview posts no tool call', () => {

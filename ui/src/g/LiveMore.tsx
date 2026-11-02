@@ -6,6 +6,7 @@ import type { Tone } from '../ui.tsx'
 import { useNow } from '../useHub.ts'
 import { workHref } from '../standup.ts'
 import type { LiveProps } from './GLive.tsx'
+import { isLiveOverlap } from '../needs.ts'
 
 export function LiveContributions({ live }: { live: LiveProps }) {
   const ov = live.overview.kind === 'ready' ? live.overview.value : null
@@ -18,7 +19,7 @@ export function LiveContributions({ live }: { live: LiveProps }) {
   const counts: { n: number | string; label: string; sub: string }[] = [
     { n: c?.denied ?? '—', label: 'first contested edits refused', sub: 'Hub counter since it started; each one asked an agent to coordinate first' },
     { n: c?.repeated ?? '—', label: 'repeated edits let through', sub: 'The agent edited again after the refusal' },
-    { n: ov?.overlaps.length ?? '—', label: 'scope overlaps open', sub: 'Two unfinished changes declared the same paths' },
+    { n: ov ? ov.overlaps.filter(isLiveOverlap).length : '—', label: 'scope overlaps open', sub: 'Two unfinished changes declared the same paths' },
     { n: live.d?.contested.length ?? '—', label: 'contested files now', sub: 'Two agents hold one file' },
     { n: done, label: 'reported finished', sub: since ? `Since ${since}` : 'In the recent window' },
     { n: decisions, label: 'decisions recorded', sub: since ? `Since ${since}` : 'In the recent window' },

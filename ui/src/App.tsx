@@ -43,7 +43,7 @@ import { hashPath } from './Pager.tsx'
 import { GLive } from './g/GLive.tsx'
 import { gAnswer } from './g/answers.tsx'
 import { useLayout } from './g/layout.ts'
-import { needsYou } from './needs.ts'
+import { isLiveOverlap, needsYou } from './needs.ts'
 
 const darkQuery = '(prefers-color-scheme: dark)'
 const subscribeDark = (cb: () => void) => {
@@ -173,7 +173,8 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
   useAppBadge(hubSignedOut ? 0 : dash.needs.length)
   const badges: Badges = {}
   if (dash.needs.length > 0) badges.home = { n: dash.needs.length, tone: dash.needs.some((n) => n.tone === 'bad') ? 'bad' : 'warn', tip: `${dash.needs.length} thing${dash.needs.length === 1 ? ' needs' : 's need'} you` }
-  if (ov && ov.overlaps.length > 0) badges.inbox = { n: ov.overlaps.length, tone: 'warn', tip: `${ov.overlaps.length} overlap${ov.overlaps.length === 1 ? '' : 's'} to talk about` }
+  const liveOverlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
+  if (liveOverlaps > 0) badges.inbox = { n: liveOverlaps, tone: 'warn', tip: `${liveOverlaps} overlap${liveOverlaps === 1 ? '' : 's'} to talk about` }
   const finished = ov?.recent.filter((o) => o.kind === 'completion').length
   const statuses: TabStatuses = {
     home: dash.home,

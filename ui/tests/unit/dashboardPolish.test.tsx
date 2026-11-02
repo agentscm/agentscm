@@ -105,7 +105,7 @@ describe('a Needs you row', () => {
   })
 
   it('keeps Hide reachable inside the opened row, and Unhide on the row while it is hidden', () => {
-    const stale = item('c', 'dev', { claim_status: 'stale', updated_at: now - 3 * 86400, last_checkin_at: now - 3 * 86400 })
+    const stale = item('c', 'dev', { state: 'blocked', claim_status: 'stale', updated_at: now - 3 * 86400, last_checkin_at: now - 3 * 86400 })
     render(page(overview([stale])))
     const hide = within(row()).getByRole('button', { name: 'Hide this item in this browser' })
     expect(hide.closest('.reveal-in')!.hasAttribute('inert')).toBe(true) // inside the row, reachable once it is open

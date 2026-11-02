@@ -20,12 +20,12 @@ use super::super::device::{
 use super::super::forge_api::ForgeApi;
 use super::super::github::GhError;
 use super::super::http::{ApiError, JsonBody, bearer, blocking};
-use super::super::repository_summary::{Facts, summarize};
+use super::super::repository_summary::{Facts, is_live_overlap, summarize};
 use super::super::store::{
     NewAgentToken, Principal, User, agent_token_digest, device_digest, mint_web_read_token,
     unix_now, validate_agent_name, validate_repository,
 };
-use super::super::work::{ClaimStatus, WorkOverviewQuery, WorkState};
+use super::super::work::{WorkOverviewQuery, WorkState};
 use super::super::{HubError, HubState};
 use super::{ApiResult, Human, Login, random_hex, session_digest};
 use crate::team::auth::generate_secret;
@@ -731,13 +731,16 @@ async fn repositories_for_owner(
 fn attention_revision(facts: &Facts, contested_markers: &[String], key: &str) -> String {
     let mut keys = Vec::new();
     for item in &facts.overview.current {
-        if matches!(item.state, WorkState::Blocked | WorkState::Handover)
-            || item.claim_status != ClaimStatus::Active
-        {
+        if item.state == WorkState::Blocked {
             keys.push(format!("work:{}", item.id));
         }
     }
-    for pair in &facts.overview.overlaps {
+    for pair in facts
+        .overview
+        .overlaps
+        .iter()
+        .filter(|pair| is_live_overlap(pair))
+    {
         keys.push(format!("overlap:{}:{}", pair.left.id, pair.right.id));
     }
     // Only contested pairs and their overlapping keys affect this revision.

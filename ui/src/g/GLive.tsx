@@ -19,6 +19,7 @@ import { LiveChanges, LiveChange } from './LiveChanges.tsx'
 import { LiveProcess } from './LiveProcess.tsx'
 import { LiveCode } from './LiveCode.tsx'
 import { LiveContributions, LiveFeatures } from './LiveMore.tsx'
+import { isLiveOverlap } from '../needs.ts'
 import '../proto/proto.css'
 import '../proto/g/g.css'
 import './live.css'
@@ -44,7 +45,7 @@ export function GLive({ live, section, sections, page, showAdmin, hubSignedOut, 
   const [palette, setPalette] = useState(false)
   const { data, overview, needs } = live
   const ov = overview.kind === 'ready' ? overview.value : null
-  const overlaps = ov?.overlaps.length ?? 0
+  const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {

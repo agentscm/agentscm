@@ -33,7 +33,7 @@ Non-goals: writes (ack, reply, resolve, checkpoint), pushing into the conversati
 
 ## Views
 
-Each view is one self-contained HTML file: inline CSS and JS, no external origins, no framework unless the size cap holds. Target under 60 kB. Both render as the same deep-violet "Twilight" panel in light and dark hosts (system fonts, inline SVG icons). Every status colour also has a text label and an icon. The work overview now leads with one sentence and only the rows that need a person; all work is folded; merged pull requests and change history stay in Hub › Catch up, so the view reads only its own tool, on Refresh and on the quiet timer; the in-view search box was dropped. The inbox shows a four-step track per request. The lane layout below is the original proposal.
+Each view is one self-contained HTML file: inline CSS and JS, no external origins, no framework unless the size cap holds. Target under 60 kB. Both render as the same deep-violet "Twilight" panel in light and dark hosts (system fonts, inline SVG icons). Every status colour also has a text label and an icon. The work overview now leads with one sentence and only the rows that need a person (blocked work, and overlaps whose two tasks both hold an active claim and are active or blocked; paused, handover and stale-claim work is counted as older tasks in the All work fold, still claimed); all work is folded; merged pull requests and change history stay in Hub › Catch up, so the view reads only its own tool, on Refresh and on the quiet timer; the in-view search box was dropped. The inbox shows a four-step track per request. The lane layout below is the original proposal.
 
 ### `ui://agentscm/work-overview` (build first)
 

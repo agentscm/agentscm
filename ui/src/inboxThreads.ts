@@ -18,6 +18,7 @@ import { currentAck, currentResponse, pending, RESPONSE_LABEL, stage } from './r
 import type { CoordinationRequest, CoordinationResponseKind, CoordinationTarget, WorkItem, WorkOverlapPair, WorkOverview } from './standup.ts'
 import { agentLabel } from './ui.tsx'
 import { hideKey } from './dismiss.tsx'
+import { isLiveOverlap } from './needs.ts'
 
 export type Group = 'needs' | 'waiting' | 'others' | 'earlier'
 export const GROUPS: Group[] = ['needs', 'waiting', 'others', 'earlier']
@@ -236,7 +237,7 @@ function overlapThread(o: WorkOverlapPair, me: string | null): Thread {
   const B = named(theirLead.login, theirLead.agent, me)
   return {
     id: `overlap:${o.left.id}:${o.right.id}`,
-    group: mine ? 'needs' : 'others',
+    group: mine && isLiveOverlap(o) ? 'needs' : 'others',
     kind: 'overlap',
     icon: 'sign-intersection-y',
     tone: 'warn',

@@ -4,7 +4,7 @@
 import { specKey, type Contested, type Derived } from './derive.ts'
 import type { WorkItem, WorkOverview } from './standup.ts'
 
-export type NeedKind = 'blocked' | 'quiet' | 'handover' | 'contested' | 'overlap' | 'pr'
+export type NeedKind = 'blocked' | 'contested' | 'overlap' | 'pr'
 
 export interface Need {
   key: string
@@ -18,8 +18,12 @@ export interface Need {
   who: 'you' | 'agents'
 }
 
-const TONE: Record<NeedKind, Need['tone']> = { blocked: 'bad', contested: 'bad', quiet: 'warn', overlap: 'warn', pr: 'warn', handover: 'brand' }
-const ORDER: NeedKind[] = ['blocked', 'contested', 'quiet', 'overlap', 'pr', 'handover']
+const TONE: Record<NeedKind, Need['tone']> = { blocked: 'bad', contested: 'bad', overlap: 'warn', pr: 'warn' }
+const ORDER: NeedKind[] = ['blocked', 'contested', 'overlap', 'pr']
+
+/** An overlap is live when both tasks are still being worked: an active claim, and a state of active or blocked. */
+const liveSide = (i: WorkItem) => i.claim_status === 'active' && (i.state === 'active' || i.state === 'blocked')
+export const isLiveOverlap = (o: { left: WorkItem; right: WorkItem }): boolean => liveSide(o.left) && liveSide(o.right)
 
 /** A handoff still waiting for its answer is the agents' to settle; so is a settled or refused-only file one agent holds. */
 export function contestedParty(c: Contested): Need['who'] {
@@ -28,20 +32,18 @@ export function contestedParty(c: Contested): Need['who'] {
 }
 
 /**
- * Only things a person should decide: a reported blocker, a task whose lead went quiet but still
- * holds it, a task offered for handover, two agents holding one file, two tasks declaring the same
- * scope, and a pull request touching held files. Worst first, then newest. A paused lead and an
- * open agent-to-agent file request are marked `who: 'agents'`: listed, never counted.
+ * Only things a person should decide: a reported blocker, two agents holding one file, two live tasks
+ * declaring the same scope, and a pull request touching held files. Worst first, then newest. Paused,
+ * handed-over and stale-claim tasks are not here: they stay in All work, still claimed. An open
+ * agent-to-agent file request is marked `who: 'agents'`: listed, never counted.
  */
 export function needsYou(ov: WorkOverview | null, d: Derived | null): Need[] {
   const out: Need[] = []
   for (const i of ov?.current ?? []) {
     if (i.state === 'blocked') out.push({ key: `blocked:${i.id}`, kind: 'blocked', tone: TONE.blocked, item: i, at: i.blocker?.at ?? i.updated_at, who: 'you' })
-    else if (i.claim_status !== 'active') out.push({ key: `quiet:${i.id}`, kind: 'quiet', tone: TONE.quiet, item: i, at: i.last_checkin_at, who: i.state === 'paused' ? 'agents' : 'you' })
-    else if (i.state === 'handover') out.push({ key: `handover:${i.id}`, kind: 'handover', tone: TONE.handover, item: i, at: i.updated_at, who: 'you' })
   }
   for (const c of d?.contested ?? []) out.push({ key: `contested:${c.path}`, kind: 'contested', tone: TONE.contested, path: c.path, at: c.refused?.at ?? c.handoff?.at ?? 0, who: contestedParty(c) })
-  for (const o of ov?.overlaps ?? []) out.push({ key: `overlap:${o.left.id}:${o.right.id}`, kind: 'overlap', tone: TONE.overlap, item: o.left, path: o.reasons[0]?.left_path, at: Math.max(o.left.updated_at, o.right.updated_at), who: 'you' })
+  for (const o of (ov?.overlaps ?? []).filter(isLiveOverlap)) out.push({ key: `overlap:${o.left.id}:${o.right.id}`, kind: 'overlap', tone: TONE.overlap, item: o.left, path: o.reasons[0]?.left_path, at: Math.max(o.left.updated_at, o.right.updated_at), who: 'you' })
   for (const p of d?.prOverlaps ?? []) out.push({ key: `pr:${p.pr.number}`, kind: 'pr', tone: TONE.pr, path: p.with[0]?.files[0], at: 0, who: 'you' })
   return out.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || b.at - a.at)
 }
@@ -89,7 +91,7 @@ export function areas(ov: WorkOverview | null, d: Derived | null): Area[] {
     for (const [name, p] of paths) at(name).planned.push({ item, paths: p })
   }
   for (const c of d?.contested ?? []) at(areaOf(c.path)).contested++
-  for (const o of ov?.overlaps ?? []) {
+  for (const o of (ov?.overlaps ?? []).filter(isLiveOverlap)) {
     const names = new Set(o.reasons.map((r) => areaOf(r.left_path)))
     for (const name of names) at(name).overlaps++
   }

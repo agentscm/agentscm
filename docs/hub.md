@@ -265,7 +265,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `repository`, `repository_id`, `provider`, `unfinished` (`total`, `moving`, `stuck`),
   `needs_you`, `agents`, `last_activity_at` (or `null`) and `complete` (false when a list was cut
   short, so counts are lower bounds): counts only, never titles, paths or people. `needs_you`
-  counts blockers, quiet leads, handovers, declared-scope overlaps and files two agents hold now;
+  counts blockers, declared-scope overlaps between live tasks (both claims active, both tasks active or blocked) and files two agents hold now; paused, handover and stale-claim work is unfinished and may be stuck, but is not counted;
   pull-request overlaps and files with only a recent refusal are not counted. A refused role or a
   repository no longer connected is left out and not recorded as a refused sign-in; one the forge
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past

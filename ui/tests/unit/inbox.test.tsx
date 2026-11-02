@@ -239,6 +239,16 @@ describe('Inbox', () => {
     expect(screen.getByRole('button', { name: 'Copy prompt for maria’s claude-code' })).toBeTruthy()
   })
 
+  it('lists an overlap with a stale side but does not count it as needing the person', async () => {
+    const staleBilling = { ...billing, claim_status: 'stale' }
+    const ov = overviewOf({ overlaps: [{ left: staleBilling, right: rounding, reasons: [{ left_path: 'src/billing.rs', right_path: 'src/billing.rs' }], reasons_complete: true }] } as Partial<WorkOverview>)
+    render(<InboxPage token="t" overview={ready(ov)} handoff={me} session={session} />)
+    await screen.findAllByText('Both plan to change billing.rs')
+    const group = (name: string) => within(within(list()).getByRole('heading', { name }).closest('.in-group') as HTMLElement).getAllByRole('button').map((b) => b.querySelector('.in-t')!.textContent)
+    expect(group('Between others')).toEqual(['Both plan to change billing.rs'])
+    expect(within(list()).queryByRole('heading', { name: 'Needs you' })).toBeNull()
+  })
+
   it('offers Open in only for the viewer’s own agent on an overlap', async () => {
     const { unmount } = render(<InboxPage token="t" overview={ready()} handoff={me} />)
     await screen.findAllByText('Both plan to change billing.rs')

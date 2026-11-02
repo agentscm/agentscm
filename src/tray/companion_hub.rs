@@ -534,26 +534,13 @@ fn summarize(
         };
     };
     let mut blocked = 0;
-    let mut quiet = 0;
-    let mut handovers = 0;
     let mut keys = Vec::new();
     let mut work = Vec::new();
     for item in current {
         let id = item["id"].as_str().unwrap_or("");
-        match item["state"].as_str() {
-            Some("blocked") => {
-                blocked += 1;
-                keys.push(format!("work:{id}"));
-            }
-            _ if item["claim_status"].as_str() != Some("active") => {
-                quiet += 1;
-                keys.push(format!("work:{id}"));
-            }
-            Some("handover") => {
-                handovers += 1;
-                keys.push(format!("work:{id}"));
-            }
-            _ => {}
+        if item["state"].as_str() == Some("blocked") {
+            blocked += 1;
+            keys.push(format!("work:{id}"));
         }
         work.push(Work {
             agent: bounded_text(&item["lead_agent"], 64, "Unknown agent"),
@@ -570,7 +557,16 @@ fn summarize(
     for request in &open_requests {
         keys.push(format!("request:{}", request["id"].as_str().unwrap_or("")));
     }
-    for overlap in overlaps {
+    // An overlap needs a person only while both tasks are active or blocked on an active claim.
+    let live = |side: &Value| {
+        side["claim_status"].as_str() == Some("active")
+            && matches!(side["state"].as_str(), Some("active" | "blocked"))
+    };
+    let overlaps: Vec<_> = overlaps
+        .iter()
+        .filter(|o| live(&o["left"]) && live(&o["right"]))
+        .collect();
+    for overlap in &overlaps {
         keys.push(format!(
             "overlap:{}:{}",
             overlap["left"]["id"].as_str().unwrap_or(""),
@@ -578,19 +574,13 @@ fn summarize(
         ));
     }
     keys.sort();
-    let count = blocked + quiet + handovers + open_requests.len() + overlaps.len();
+    let count = blocked + open_requests.len() + overlaps.len();
     let complete = overview["current_complete"] == true
         && overview["overlaps_complete"] == true
         && coordination["complete"] == true;
     let mut parts = Vec::new();
     if blocked > 0 {
         parts.push(format!("{blocked} blocked"));
-    }
-    if quiet > 0 {
-        parts.push(format!("{quiet} quiet"));
-    }
-    if handovers > 0 {
-        parts.push(format!("{handovers} handover"));
     }
     if !overlaps.is_empty() {
         parts.push(format!("{} overlap", overlaps.len()));
@@ -645,7 +635,14 @@ mod tests {
                 {"id":"wrk_quiet","state":"active","claim_status":"stale","updated_at":5},
                 {"id":"wrk_handover","state":"handover","claim_status":"active","updated_at":6}
             ],
-            "overlaps": [{"left":{"id":"wrk_a"},"right":{"id":"wrk_b"}}],
+            "overlaps": [
+                {"left":{"id":"wrk_a","state":"active","claim_status":"active"},
+                 "right":{"id":"wrk_b","state":"blocked","claim_status":"active"}},
+                {"left":{"id":"wrk_c","state":"active","claim_status":"stale"},
+                 "right":{"id":"wrk_d","state":"active","claim_status":"active"}},
+                {"left":{"id":"wrk_e","state":"paused","claim_status":"active"},
+                 "right":{"id":"wrk_f","state":"active","claim_status":"active"}}
+            ],
             "current_complete": true, "overlaps_complete": true
         });
         let coordination = json!({"requests": [
@@ -658,13 +655,15 @@ mod tests {
             &overview,
             &coordination,
         );
-        assert_eq!(result.count, 5);
+        // Quiet, paused and handed-over work, and overlaps with a stale or paused side, are not counted.
+        assert_eq!(result.count, 3);
         assert!(result.text.contains("1 blocked"));
-        assert!(result.text.contains("1 quiet"));
-        assert!(result.text.contains("1 handover"));
+        assert!(!result.text.contains("quiet"));
+        assert!(!result.text.contains("handover"));
         assert!(result.text.contains("1 overlap"));
         assert!(result.text.contains("1 Inbox request"));
-        assert_eq!(result.keys.len(), 5);
+        assert_eq!(result.keys.len(), 3);
+        assert_eq!(result.work.len(), 3);
     }
 
     #[test]

@@ -106,6 +106,19 @@ describe('WorkDetail', () => {
     expect(screen.getByText('Answer the blocker where maria’s codex is running, or reassign the task.')).toBeTruthy()
   })
 
+  it('still offers a next step on a stale task’s page, without calling it a need', async () => {
+    stubHub()
+    const value = await fetchOverview('t', new AbortController().signal)
+    const stale = <T extends { id: string; claim_status: string }>(i: T): T => (i.id === wid('a') ? { ...i, claim_status: 'stale' } : i)
+    const quiet = { ...value, current: value.current.map(stale), overlaps: value.overlaps.map((o) => ({ ...o, left: stale(o.left), right: stale(o.right) })) } as WorkOverview
+    const overview = { kind: 'ready', value: quiet, fetchedAt: Date.now(), refreshError: null, retry: () => {} } as Poll<WorkOverview>
+    render(<WorkDetail id={wid('a')} token="t" overview={overview} />)
+    expect(await screen.findByRole('heading', { name: 'Next step' }, LOAD)).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'Needs you' })).toBeNull()
+    expect(screen.getByText('Ask maria before picking it up')).toBeTruthy()
+    expect(screen.queryByText(/both plan to change/)).toBeNull()
+  })
+
   it('shows the Change record button when a record exists, and a record with no action leaves Checks to the skill run', async () => {
     const cov = 'unknown'
     const record = {

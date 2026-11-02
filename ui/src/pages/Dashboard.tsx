@@ -4,8 +4,8 @@ import { NarrativePanel } from '../Narrative.tsx'
 import type { Derived, LiveAgent } from '../derive.ts'
 import { HideButton, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
 import { Gloss } from '../Gloss.tsx'
-import { needHideKey, needsYou, needUpdatedAt, type Need } from '../needs.ts'
-import { blockedStep, contestedStep, handoverStep, overlapSteps, prStep, quietStep, who, type NextStep } from '../nextStep.ts'
+import { isLiveOverlap, needHideKey, needsYou, needUpdatedAt, type Need } from '../needs.ts'
+import { blockedStep, contestedStep, overlapSteps, prStep, who, type NextStep } from '../nextStep.ts'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
 import { handoffOf, type Handoff } from '../launchLink.ts'
 import { StartTask } from '../StartTask.tsx'
@@ -125,7 +125,7 @@ const plainClick = (e: MouseEvent) => !(e.target as HTMLElement).closest('a, but
  * (the chevron, or the row's text) shows the reason, who decides and the box for the person's own words.
  */
 /** What a need says, shared by the classic Needs you list and the G layout: icon, title, one-line gist, reason and next step. */
-export function needView(n: Need, ov: WorkOverview, d: Derived, me: string | null): { icon: string; title: ReactNode; gist: ReactNode; body: ReactNode; step: NextStep | null } {
+export function needView(n: Need, ov: WorkOverview, d: Derived): { icon: string; title: ReactNode; gist: ReactNode; body: ReactNode; step: NextStep | null } {
   const i = n.item
   let icon = 'exclamation-circle'
   let title: ReactNode = null
@@ -140,18 +140,6 @@ export function needView(n: Need, ov: WorkOverview, d: Derived, me: string | nul
     gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · reported {i.blocker ? <Ago at={i.blocker.at} /> : 'recently'}</>
     body = <>“{i.blocker?.summary ?? 'No blocker summary reported'}”</>
     step = blockedStep(i)
-  } else if (n.kind === 'quiet' && i) {
-    icon = 'hourglass-split'
-    title = <>{leadName(i)} has gone quiet</>
-    gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · still assigned</>
-    body = <>{i.claim_status === 'stale' ? <>Last check-in <Ago at={i.last_checkin_at} />.</> : <>Its last check-in is unknown.</>} It is still assigned, so it isn’t free to take.</>
-    step = quietStep(i, me)
-  } else if (n.kind === 'handover' && i) {
-    icon = 'arrow-left-right'
-    title = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> is ready for another agent</>
-    gist = <>offered <Ago at={i.updated_at} /></>
-    body = i.next_action ?? i.current?.summary ?? `${leadName(i)} reported it ready to hand over.`
-    step = handoverStep(i)
   } else if (n.kind === 'contested') {
     const c = d.contested.find((x) => x.path === n.path)
     icon = 'exclamation-diamond'
@@ -186,11 +174,11 @@ export function needView(n: Need, ov: WorkOverview, d: Derived, me: string | nul
   return { icon, title, gist, body, step }
 }
 
-function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff; hidden: boolean }) {
+function NeedRow({ n, ov, d, handoff, hidden }: { n: Need; ov: WorkOverview; d: Derived; handoff: Handoff; hidden: boolean }) {
   const now = useNow() / 1000
   const [open, setOpen] = useState(false)
   const id = useId()
-  const { icon, title, gist, body, step } = needView(n, ov, d, me)
+  const { icon, title, gist, body, step } = needView(n, ov, d)
   const acts = useStepActions(step, { viewer: handoff.me, repo: handoff.repo, originUrl: handoff.originUrl })
   const canHide = !hidden && isStale(needUpdatedAt(n), now)
   return (
@@ -228,13 +216,9 @@ function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview;
 
 /** A need the agents are still settling between themselves: what happened, in one sentence. */
 function SortingRow({ n, d }: { n: Need; d: Derived }) {
-  const i = n.item
   let icon = 'arrow-left-right'
   let text: ReactNode = null
-  if (n.kind === 'quiet' && i) {
-    icon = 'pause-circle'
-    text = <>{leadName(i)} paused “<a className="work-link" href={workHref(i.id)}>{i.title}</a>”: “{i.next_action ?? i.current?.summary ?? 'no reason given'}”. Still assigned.</>
-  } else if (n.kind === 'contested') {
+  if (n.kind === 'contested') {
     const c = d.contested.find((x) => x.path === n.path)
     const h = c?.handoff
     const path = <Path>{n.path ?? ''}</Path>
@@ -298,7 +282,7 @@ function TalkRow({ overlaps, hidden }: { overlaps: Need[]; hidden: boolean }) {
 const MAX_NEEDS = 6
 
 /** `needs` includes the ones hidden in this browser; they stay out of the list until asked for. */
-function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff }) {
+function NeedsYou({ needs: all, ov, d, handoff }: { needs: Need[]; ov: WorkOverview; d: Derived; handoff: Handoff }) {
   const you = all.filter((n) => n.who === 'you')
   const sorting = all.filter((n) => n.who === 'agents')
   const { rows: needs, count: hidden, show, setShow, isHidden } = useHideable(you, needHideKey)
@@ -322,7 +306,7 @@ function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkO
           <Icon name="check2-circle" />
           <div>
             <b>All clear</b>
-            <span>A blocked task, quiet claim, handover or contested file would show up here.</span>
+            <span>A blocked task, an overlap between live tasks or a contested file would show up here.</span>
           </div>
         </div>
       ) : (
@@ -331,7 +315,7 @@ function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkO
             {(expanded ? rows : rows.slice(0, MAX_NEEDS)).map((n) =>
               n.kind === 'overlap' ? (
                 isHidden(n) ? <TalkRow key="overlaps-hidden" overlaps={hiddenOverlaps} hidden /> : <TalkRow key="overlaps" overlaps={overlaps} hidden={false} />
-              ) : <NeedRow key={n.key} n={n} ov={ov} d={d} me={me} handoff={handoff} hidden={isHidden(n)} />,
+              ) : <NeedRow key={n.key} n={n} ov={ov} d={d} handoff={handoff} hidden={isHidden(n)} />,
             )}
           </ul>
           {rows.length > MAX_NEEDS && !expanded && (
@@ -511,7 +495,7 @@ export type DashTab = 'home' | 'now' | 'activity' | 'team'
 export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null, hidden: ReadonlySet<string> = new Set()) {
   const needs = needsYou(ov, d).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   const contested = d?.contested.length ?? 0
-  const overlaps = ov?.overlaps.length ?? 0
+  const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
   const latest = events?.[0]
   const up = d && asOfMs ? d.agents.filter((a) => asOfMs / 1000 - a.lastActive < AWAKE_SECONDS).length : 0
   return {
@@ -547,7 +531,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
           {/* What waits on a person comes first; starting a task is one quiet line until asked for. With nothing waiting, it leads. */}
           {needs.length === 0 && start}
           <Coach id="needs" side="above">These wait on a person. Open a row for the reason and who decides; its button opens or copies the prompt for the agent.</Coach>
-          <NeedsYou needs={all} ov={ov} d={d} me={handoff.me} handoff={handoff} />
+          <NeedsYou needs={all} ov={ov} d={d} handoff={handoff} />
           <NarrativePanel token={token} compact />
           {needs.length > 0 && start}
           <Coach id="track" side="above">Every unfinished task, left to right: claimed, now, next, finished. Open a task for its full story.</Coach>

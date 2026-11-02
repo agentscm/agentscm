@@ -2525,9 +2525,7 @@ fn companion_rows(
                             agent: item.agent.clone(),
                             title: item.title.clone(),
                             detail: companion_work_detail(item),
-                            needs_you: item.state == "blocked"
-                                || item.state == "handover"
-                                || item.claim_status != "active",
+                            needs_you: item.state == "blocked",
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2624,9 +2622,7 @@ fn companion_rows(
                         agent: item.agent.clone(),
                         title: item.title.clone(),
                         detail: companion_work_detail(item),
-                        needs_you: item.state == "blocked"
-                            || item.state == "handover"
-                            || item.claim_status != "active",
+                        needs_you: item.state == "blocked",
                     })
                     .chain(row.live.iter().map(companion_live_row))
                     .collect(),

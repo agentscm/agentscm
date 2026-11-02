@@ -68,8 +68,8 @@ each:
 | Column | Meaning | Source rule |
 | --- | --- | --- |
 | Repository | `owner/name` and forge | the connected repository |
-| Unfinished | count of unfinished tasks, split into *moving* and *stuck* | work items not `finished`; *stuck* is `blocked`, or a lead whose claim is not `active` (the `needsYou` rules in `ui/src/needs.ts:27`) |
-| Needs you | count of things a person should decide | blocked, quiet lead, handover offered, declared-scope overlap and contested file, as in `needsYou` |
+| Unfinished | count of unfinished tasks, split into *moving* and *stuck* | work items not `finished`; *stuck* is `blocked`, or a lead whose claim is not `active` (the `needsYou` rules in `ui/src/needs.ts`); *stuck* is a state, not a call on a person |
+| Needs you | count of things a person should decide | blocked work, a declared-scope overlap between live tasks (both claims active, both tasks active or blocked) and a contested file, as in `needsYou`; paused, handover and stale-claim work is not counted |
 | Agents | agents connected now | distinct live agents, by the rule in `liveAgents` / `sameAgent` (`ui/src/derive.ts`) |
 | Last activity | when the repository last changed | newest Hub event or work update |
 
