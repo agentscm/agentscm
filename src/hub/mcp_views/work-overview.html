@@ -95,7 +95,7 @@ var working=cur.filter(function(i){return i.state==='active'&&i.claim_status==='
 add(root,bar('AgentSCM · '+(repo?clip(repo):'Work overview'),'Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),failNote());
 if(d.current_complete===false)add(root,msg('warn','Showing a partial list.'));
 var big=h('p','big');add(big,plural(working,'agent')+' working. ');
-if(rows.length)add(big,h('em',null,plural(rows.length,'thing needs','things need')+' a person.'));else add(big,d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing blocked or overlapping.'+(old>0?' '+plural(old,'older task')+' in All work.':''));
+if(rows.length)add(big,h('em',null,plural(rows.length,'thing needs','things need')+' a person.'));else add(big,d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing blocked and no live overlaps.'+(old>0?' '+plural(old,'older task')+' in All work.':''));
 add(root,big);
 if(rows.length){var ul=h('ul','needs');rows.forEach(function(x){var li=h('li');add(li,ic(x.icon,x.tone),h('span','t',x.t),h('span','s',x.s));ul.appendChild(li)});add(root,ul)}
 var all=fold('all','All work',plural(cur.length,'task')+(old>0?' · '+old+' older':'')+(d.settled_count>0?' · '+d.settled_count+' with a merged PR':'')+' · '+rec.length+' finished recently'),wl=h('ul','w');

@@ -64,7 +64,7 @@ The dashboard reads current Work without changing assignments or acknowledging c
 
 ### Work with a merged pull request
 
-When a Work item's branch has a merged pull request, the Hub stops listing it as current work in the overview, briefings, the session-start recap and the dashboard (all read the same overview). This is a read-time filter. The Work record, its state and its history are unchanged, and it stays available through search (`agentscm_work_search`) and history. "Settled" never means finished: the overview reports `settled_count`, and the MCP overview view says "with a merged PR".
+When a Work item's branch has a merged pull request, the Hub stops listing it as current work in the overview, briefings, the session-start recap and the dashboard. This is a read-time filter. The Work record, its state and its history are unchanged, and it stays available through search (`agentscm_work_search`) and history. "Settled" never means finished: the overview reports `settled_count`, and the MCP overview view says "with a merged PR".
 
 An item is hidden only when all of these hold:
 
@@ -74,8 +74,10 @@ An item is hidden only when all of these hold:
 
 Limits:
 
+- An item auto-paused before this version has no recorded report time, so the rule compares against its creation time and a post-merge check-in does not keep it listed.
 - A merge counts only when the forge reports when it happened. A tracked publication whose merge has no forge time is recorded as a merge observation but does not hide Work, because the time it was observed says nothing about when it merged. That Work stays listed, which is the safe direction.
-- A merge observed while a briefing is being delivered changes later pages only. Pages already delivered, and the fixed watermark of the delivery, are not rewritten.
+- A merge first recorded as a tracked publication never hides Work. A later forge observation of that same pull request and commit is deduplicated and does not supply the time, so the item stays listed.
+- A merge observed while a briefing is being delivered changes later pages of the current-item list of a durable delivery only. Exact retries return the cached page, the events list is not filtered, read-only briefings are not cached, and an item behind the cursor stays missing until the next delivery. Pages already delivered, and the fixed watermark of the delivery, are not rewritten.
 - The Hub needs merge observations. With none, nothing is hidden, and a repository whose merges are not synced keeps every item visible.
 - Merges observed before this rule existed carry no head-repository information. They hide matching items, including a fork's same-named branch, until the next check-in.
 - Hiding does not release anything. Scope admission, conflict checks, coordination requests, held files and preflight still treat a hidden item as unfinished, so a start can conflict with an item the overview no longer lists. Use `agentscm_work_search` to find it.

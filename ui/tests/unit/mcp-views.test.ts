@@ -100,12 +100,12 @@ describe('MCP views Twilight restyle', () => {
     for (const t of ['Handed', 'Paused', 'Stale active', 'Overlap side']) expect(root.querySelector('details.f')!.textContent).toContain(t)
   })
 
-  it('overview with only older tasks and complete data says nothing is blocked or overlapping', () => {
+  it('overview with only older tasks and complete data says nothing is blocked and no live overlaps', () => {
     const { render } = load(files.overview)
     const root = document.getElementById('app')!
     const current = [item({ id: 'wrk_1', state: 'paused' }), item({ id: 'wrk_2', state: 'handover' }), item({ id: 'wrk_3', claim_status: 'stale' })]
     render(root, { current, recent: [], overlaps: [], ...flags }, new Date())
-    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing blocked or overlapping. 3 older tasks in All work.')
+    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing blocked and no live overlaps. 3 older tasks in All work.')
     root.textContent = ''
     render(root, { current: current.slice(0, 1), recent: [], overlaps: [], ...flags }, new Date())
     expect(root.querySelector('.big')!.textContent).toContain('1 older task in All work.')
@@ -114,6 +114,14 @@ describe('MCP views Twilight restyle', () => {
       render(root, { current, recent: [], overlaps: [], ...flags, ...partial }, new Date())
       expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing flagged in the data shown.')
     }
+  })
+
+  it('overview with a paused-versus-active overlap and complete data shows no needs row', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, { current: [item({ id: 'wrk_l', state: 'paused' }), item({ id: 'wrk_r' })], recent: [], overlaps: [pair({ state: 'paused' }, {})], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('1 agent working. Nothing blocked and no live overlaps. 1 older task in All work.')
+    expect(root.querySelector('.needs')).toBeNull()
   })
 
   it('overview still lists an overlap whose sides are both live', () => {
@@ -135,12 +143,12 @@ describe('MCP views Twilight restyle', () => {
   })
 
   it.each([{ overlaps_complete: false, current_complete: true }, { overlaps_complete: true, current_complete: false }])(
-    'overview does not claim nothing is blocked or overlapping on partial data %o',
+    'overview does not claim nothing is blocked and no live overlaps on partial data %o',
     (flags) => {
       const { render } = load(files.overview)
       const root = document.getElementById('app')!
       render(root, { current: [], recent: [], overlaps: [], recent_complete: true, history_retention_gap: false, ...flags }, new Date())
-      expect(root.querySelector('.big')!.textContent).not.toContain('Nothing blocked or overlapping.')
+      expect(root.querySelector('.big')!.textContent).not.toContain('Nothing blocked and no live overlaps.')
     },
   )
 
