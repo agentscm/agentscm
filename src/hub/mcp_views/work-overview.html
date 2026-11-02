@@ -96,7 +96,7 @@ if(rec.length){var rl=h('ul','w');add(all,h('p','sh','Recently finished ('+rec.l
 if(d.recent_complete===false)add(all,h('p','note','This list may be partial.'));
 add(root,all);
 var f=h('div','foot'),oc=d.overlaps_complete===false;add(f,add(h('span','mut'),ic(oc?'alert':'check',oc?'warn':'ok'),oc?'Overlap check incomplete':'Overlap check complete'),h('span',null,'Read-only. Stale claims stay claimed.'));
-add(root,f,h('p','note','Merged pull requests and change history: Hub › Dashboard › Catch up.'),h('p','note',manage))}
+add(root,f,h('p','note','Merged pull requests and change history: Hub › Catch up.'),h('p','note',manage))}
 function onRefresh(){call({})}
 start();
 </script></body></html>

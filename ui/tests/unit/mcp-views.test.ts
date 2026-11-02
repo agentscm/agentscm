@@ -63,7 +63,7 @@ describe('MCP views Twilight restyle', () => {
     expect(folds).toHaveLength(1)
     expect(folds[0]!.textContent).toContain('All work')
     for (const text of ['merge observation', 'Mark reviewed', 'Briefing', 'Load more']) expect(root.textContent).not.toContain(text)
-    expect(root.textContent).toContain('Hub › Dashboard › Catch up')
+    expect(root.textContent).toContain('Hub › Catch up')
   })
 
   it('starting the overview posts no tool call and schedules no timers', () => {

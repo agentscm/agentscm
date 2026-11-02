@@ -713,7 +713,7 @@ notification is a 202. A batch or a non-object is `-32600`, bad JSON
 `-32700`, an unknown method `-32601`, an unknown tool `-32602`. The body limit
 is 64 KiB.
 
-An agent token sees a default set of tools: the ones the shipped skill, instruction files, hook
+An agent token sees a default set of tools, including the ones the shipped skill, instruction files, hook
 context, server instructions and MCP App views ask agents to call, plus `agentscm_skill_list`,
 `agentscm_skill_status` and `agentscm_skill_evidence` when the repository has adopted supported
 skills. `POST /mcp?tools=all` lists every tool, including `agentscm_change_record`,
