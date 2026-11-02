@@ -391,7 +391,7 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
             format!("a run keeps at most {MAX_RUN_EVIDENCE} evidence records"),
         ));
     }
-    supported::admit(
+    let admitted = supported::admit(
         &entry.manifest,
         &existing,
         &evidence,
@@ -401,12 +401,25 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
         },
     )
     .map_err(|r| {
+        if r.code == "not_independent" {
+            let policy = super::value_metrics::identity(&[&serde_json::to_string(&pin.pin.params).unwrap_or_default()]);
+            let (work_id,generation)=value_work_binding(store,who.token,&session,&evidence.head_sha,now);
+            let observation = super::value_metrics::ValueObservation {work_id,generation,
+                identity: super::value_metrics::identity(&[&run_id, &evidence.gate, &evidence.head_sha, &entry.sha256, &policy, "not_independent"]),
+                kind:"issue".into(), state:"unresolved".into(), branch:branch.clone(),
+                source:evidence.head_sha.clone(),recipe:entry.sha256.clone(),policy,
+                gate:evidence.gate.clone(),evidence_id:None,
+                reason:"Review independence could not be established for this exact source and configured skill".into(),
+            };
+            super::value_metrics::observe(store,who.token,&observation,now);
+        }
         if r.code == "invalid" {
             bad_request(r.message)
         } else {
             conflict(r.code, r.message)
         }
-    })?;
+    });
+    admitted?;
     evidence.skill = Some(skill.clone());
     let stored = StoredEvidence {
         id: new_id("evd")?,
@@ -430,7 +443,72 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
         skill,
         skill_sha256: entry.sha256.clone(),
     };
-    run_view(store, who.repo, &head, &pins)?.ok_or_else(not_found)
+    let view = run_view(store, who.repo, &head, &pins)?.ok_or_else(not_found)?;
+    record_value_followups(store, who.token, &view, &stored, &pin.pin.params, now);
+    Ok(view)
+}
+
+fn value_work_binding(
+    store: &dyn Store,
+    token: &str,
+    session: &str,
+    source: &str,
+    now: i64,
+) -> (Option<String>, Option<i64>) {
+    let item = store
+        .capture_work_for_session(token, session, now)
+        .ok()
+        .flatten();
+    match item.filter(|w| {
+        w.current.as_ref().is_some_and(|c| {
+            c.source_refs
+                .iter()
+                .any(|r| matches!(r,super::work::SourceRef::Commit{oid,..} if oid==source))
+        })
+    }) {
+        Some(item) => (Some(item.id), Some(item.generation)),
+        None => (None, None),
+    }
+}
+
+fn record_value_followups(
+    store: &dyn Store,
+    token: &str,
+    view: &RunView,
+    stored: &StoredEvidence,
+    params: &Option<supported::Params>,
+    now: i64,
+) {
+    let policy =
+        super::value_metrics::identity(&[&serde_json::to_string(params).unwrap_or_default()]);
+    for gate in &view.gates {
+        let (work_id, generation) =
+            value_work_binding(store, token, &stored.session, &view.head_sha, now);
+        let observation=super::value_metrics::ValueObservation {work_id,generation,
+            identity:super::value_metrics::identity(&[&view.run_id,&gate.id,&view.head_sha,&view.skill.sha256,&policy]),
+            kind:"followup".into(),state:if gate.state==GateState::Done {"current"} else {"pending"}.into(),
+            branch:view.branch.clone(),source:view.head_sha.clone(),recipe:view.skill.sha256.clone(),policy:policy.clone(),
+            gate:gate.id.clone(),evidence_id:gate.evidence.last().map(|e|e.id.clone()),
+            reason:"Configured supported-skill gate; evidence is self-reported, not independent verification".into(),
+        };
+        super::value_metrics::observe(store, token, &observation, now);
+    }
+    if stored.evidence.kind == EvidenceKind::IndependentReview {
+        let (work_id, generation) = value_work_binding(
+            store,
+            token,
+            &stored.session,
+            &stored.evidence.head_sha,
+            now,
+        );
+        let observation=super::value_metrics::ValueObservation {work_id,generation,
+            identity:super::value_metrics::identity(&[&view.run_id,&stored.evidence.gate,&stored.evidence.head_sha,&view.skill.sha256,&policy,"not_independent"]),
+            kind:"issue".into(),state:"resolved".into(),branch:view.branch.clone(),source:stored.evidence.head_sha.clone(),
+            recipe:view.skill.sha256.clone(),policy,gate:stored.evidence.gate.clone(),evidence_id:Some(stored.id.clone()),
+            reason:"A subsequent admitted independent review reports this same source and configured skill; original refusal retained".into(),
+        };
+        super::value_metrics::observe(store, token, &observation, now);
+    }
 }
 
 // ---- forge read -----------------------------------------------------------------------------
