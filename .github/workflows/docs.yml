@@ -2,6 +2,7 @@ name: Documentation site
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'docs/**'
       - 'docs-site/**'
@@ -12,16 +13,18 @@ on:
       - 'docs/**'
       - 'docs-site/**'
       - '.github/workflows/docs.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: docs-${{ github.event.pull_request.number || github.ref }}
+  group: docs-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
   cancel-in-progress: true
 
 jobs:
   build:
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,9 +35,10 @@ jobs:
           node-version: 24.22.1
           cache: npm
           cache-dependency-path: docs-site/package-lock.json
-      - run: npm ci
+      - run: npm ci --ignore-scripts
         working-directory: docs-site
-      - run: npm audit --audit-level=low
+      - if: github.event_name != 'push'
+        run: npm audit --audit-level=low
         working-directory: docs-site
       - run: npm run build
         working-directory: docs-site

@@ -165,6 +165,30 @@ fn explorer_http_pins_source_and_enforces_private_read_boundary() {
     assert_eq!(response["commit"], head);
     assert_eq!(response["repository_id"], "owner/example");
     assert!(response["dirty"].is_null());
+    let map_path = format!("/v1/local/explorer/map?commit={head}");
+    assert_eq!(server.request("GET", &map_path, &[]).0, 401);
+    assert_eq!(server.request("POST", &map_path, &headers).0, 405);
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                &map_path,
+                &[
+                    ("Authorization", &auth),
+                    ("Origin", "https://untrusted.invalid")
+                ]
+            )
+            .0,
+        403
+    );
+    let (status, map) = server.get(&map_path);
+    assert_eq!(status, 200, "{map}");
+    assert_eq!(map["head"]["commit"], head);
+    assert_eq!(map["head"]["files"][0]["path"], "source.txt");
+    assert!(map["base"].is_null());
+    assert_eq!(server.get(&format!("{map_path}&root=/etc")).0, 400);
+    assert_eq!(server.get(&format!("{map_path}&path=..%2Foutside")).0, 400);
+    assert_eq!(server.get(&format!("{map_path}&base=HEAD")).0, 400);
     fs::write(repo.join("source.txt"), "uncommitted replacement\n").unwrap();
     let (status, response) = server.get(&format!(
         "/v1/local/explorer/file?commit={head}&path=source.txt"

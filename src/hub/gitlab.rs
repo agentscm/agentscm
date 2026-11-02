@@ -245,7 +245,7 @@ impl Api {
         let body = reply.ok("projects")?;
         // A reply for some other branch is not an answer.
         if body["name"].as_str() != Some(name) {
-            return Ok(None);
+            return Err(GhError::Failed("branch identity mismatch".into()));
         }
         branch_of(&body)
             .map(Some)

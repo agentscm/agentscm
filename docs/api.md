@@ -239,6 +239,14 @@ Read-only tokens may call it. Items of `GET /v1/hub/repos/{repo}/publications` a
 The first stores one idempotent partial usage report; the GET routes return bounded
 work projections. See [work insights](work-insights.md) for pagination and evidence limits.
 
+`POST /v1/hub/standup/checkpoint` returns HTTP 409 with
+`{"error":"work_checkpoint_sequence_conflict","current_seq":N}` only when the
+expected Work sequence is stale and retained history proves that the exact
+operation did not commit. It checks exact operation replay and current lead
+identity/generation first. Receipt compaction can make a missing operation
+ambiguous; that case remains a generic HTTP 400 `invalid_request`, which must not be used
+as proof of noncommit. Inspect current Work before constructing any new checkpoint.
+
 Completion calls on `/mcp`, `/v1/hub/hook/{agent}` and `/v1/hub/standup/checkpoint`
 accept the optional `x-agentscm-completion-reporting: true` header. Exactly one literal `true`
 enables a best-effort, idempotent completion observation; the default is off. It adds no response

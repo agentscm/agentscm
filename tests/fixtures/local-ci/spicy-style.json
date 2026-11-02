@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "repository": "example/project",
+  "policy_epoch": 1,
+  "workflows": [
+    {
+      "path": "ci/reviewed-check.sh",
+      "format": "commands",
+      "sha256": "423d5a573547e13dbffbb5a76b9ed7b6a9baaf4a46d0b7e4df4133977ee54e41"
+    }
+  ],
+  "cells": [
+    {
+      "job": "validation",
+      "id": "unit",
+      "matrix": {
+        "platform": "unit"
+      },
+      "command": {
+        "argv": [
+          "bash",
+          "ci/reviewed-check.sh"
+        ],
+        "working_directory": ".",
+        "environment": {
+          "CI": "1",
+          "PRE_PUSH_WORKERS": "6"
+        },
+        "reviewed_script": "ci/reviewed-check.sh",
+        "resources": {
+          "timeout_secs": 3600,
+          "cpu_millis": 6000,
+          "memory_bytes": 8589934592,
+          "disk_bytes": 34359738368
+        }
+      },
+      "runner": {
+        "id": "synthetic-unit-host",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "platform": "linux",
+        "architecture": "x86_64",
+        "toolchain_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "services": [],
+      "dependencies": [
+        {
+          "identity": "synthetic-lockfile",
+          "state": {
+            "state": "resolved",
+            "revision": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          }
+        }
+      ],
+      "required_capabilities": [
+        "command/v1"
+      ]
+    }
+  ],
+  "permitted_omissions": []
+}

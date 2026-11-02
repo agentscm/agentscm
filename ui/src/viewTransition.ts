@@ -12,6 +12,8 @@ export function morphToApp(apply: () => void): void {
     root.classList.add('vt-app')
     flushSync(apply)
   })
+  // An aborted transition (hidden tab, a second one starting) rejects `ready` too; the swap itself still applied.
+  void run.ready.catch(() => undefined)
   void run.finished.catch(() => undefined).finally(() => root.classList.remove('vt-app'))
 }
 
@@ -29,6 +31,7 @@ export function leaveToProvider(apply: () => void, go: () => void): void {
   const root = document.documentElement
   root.classList.add('vt-leave')
   const run = document.startViewTransition(() => flushSync(apply))
+  void run.ready.catch(() => undefined)
   void run.finished.catch(() => undefined).finally(() => {
     root.classList.remove('vt-leave')
     go()

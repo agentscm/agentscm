@@ -382,6 +382,9 @@ pub(crate) fn direct_client() -> reqwest::Result<reqwest::Client> {
 pub(crate) fn map_hub_error(error: HubError) -> Error {
     match error {
         HubError::Invalid(message) => Error::Invalid(message),
+        HubError::WorkCheckpointSequenceConflict { current_seq } => Error::Conflict(format!(
+            "checkpoint sequence changed to {current_seq}; inspect Work before retry"
+        )),
         HubError::Unauthorized => Error::Invalid("hub authentication required".into()),
         HubError::Busy => Error::Invalid("hub busy".into()),
         HubError::WorkCapacity => Error::Invalid(

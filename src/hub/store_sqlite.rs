@@ -7983,6 +7983,35 @@ impl Store for SqliteStore {
             HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
         })?;
         if expected != item.updated_seq {
+            // A missing receipt alone is not proof of noncommit: compaction can
+            // remove it while retaining its baseline snapshot. Deleted events
+            // are covered by the repository floor; retained snapshots need an
+            // explicit missing-receipt check. Both reads share the write transaction.
+            let event_floor: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(event_floor_seq),0) FROM hub_work_retention
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_id IS ?4",
+                params![
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    item.repository,
+                    who.repository_id
+                ],
+                |row| row.get(0),
+            )?;
+            let missing_receipt: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_work_versions v
+                 JOIN hub_events e ON e.seq=v.event_seq
+                 WHERE v.work=?1 AND v.event_seq>?2 AND e.kind='work_checkpoint'
+                 AND NOT EXISTS(SELECT 1 FROM hub_work_checkpoint_ops o
+                     WHERE o.work=v.work AND o.event_seq=v.event_seq))",
+                params![item.id, expected],
+                |row| row.get(0),
+            )?;
+            if expected >= event_floor && !missing_receipt {
+                return Err(HubError::WorkCheckpointSequenceConflict {
+                    current_seq: item.updated_seq,
+                });
+            }
             return Err(HubError::Invalid(format!(
                 "checkpoint receipt expired or work changed; current updated_seq is {}",
                 item.updated_seq

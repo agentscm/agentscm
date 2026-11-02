@@ -553,6 +553,21 @@ impl Sync {
         api.ok_or_else(|| GhError::Failed("sync is not configured".into()))
     }
 
+    /// Whether this connection still belongs to the configured provider endpoint.
+    /// A fresh read must not label a reconfigured endpoint with an old host identity.
+    pub(super) fn matches_forge(&self, connection: &Connection) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| match connection.provider.as_str() {
+                "github" => connection.host == config.host,
+                "gitlab" => config
+                    .gitlab
+                    .as_ref()
+                    .is_some_and(|gitlab| connection.host == gitlab.host),
+                _ => false,
+            })
+    }
+
     /// The identity hosts of the configured forges.
     pub(super) fn hosts(&self) -> Vec<String> {
         self.config

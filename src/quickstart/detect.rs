@@ -89,15 +89,35 @@ pub(crate) struct Remote {
 }
 
 /// Understands `git@host:owner/name.git`, `https://host/owner/name(.git)` and
-/// `ssh://git@host[:port]/owner/name(.git)`.
+/// `ssh://git@host[:port]/owner/name(.git)`. Unknown hosts retain their full group
+/// path without inferring a provider. Passwords and HTTPS userinfo are refused.
 pub(crate) fn parse_remote(url: &str) -> Option<Remote> {
     let url = url.trim();
-    let (host, path) = match url.split_once("://") {
-        Some((_, rest)) => rest.split_once('/')?,
-        None => url.split_once(':')?,
+    let (parsed, path) = match url.split_once("://") {
+        Some(("https" | "ssh", rest)) => (reqwest::Url::parse(url).ok()?, rest.split_once('/')?.1),
+        Some(_) => return None,
+        None => {
+            let (authority, path) = url.split_once(':')?;
+            if authority.contains('/') {
+                return None;
+            }
+            (
+                reqwest::Url::parse(&format!("ssh://{authority}/{path}")).ok()?,
+                path,
+            )
+        }
     };
-    let host = host.rsplit('@').next()?;
-    let host = host.split(':').next()?.to_ascii_lowercase();
+    // Reject input whose path a URL parser would silently normalize or repair.
+    if parsed.password().is_some()
+        || (parsed.scheme() == "https" && url.split_once("://")?.1.split('/').next()?.contains('@'))
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || path.split('/').any(|part| matches!(part, "." | ".."))
+        || parsed.path() != format!("/{path}")
+    {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let forge = match host.as_str() {
@@ -106,7 +126,7 @@ pub(crate) fn parse_remote(url: &str) -> Option<Remote> {
         _ => Forge::Other,
     };
     let segments = path.split('/').count();
-    if host.is_empty() || !valid_repo(path) || (forge != Forge::Gitlab && segments != 2) {
+    if host.is_empty() || !valid_repo(path) || (forge == Forge::Github && segments != 2) {
         return None;
     }
     Some(Remote {
@@ -261,10 +281,6 @@ mod tests {
             github("acme/widgets")
         );
         assert_eq!(
-            remote("https://user:tok@github.com/acme/widgets.git"),
-            github("acme/widgets")
-        );
-        assert_eq!(
             remote("ssh://git@github.com:22/acme/widgets.git"),
             github("acme/widgets")
         );
@@ -284,6 +300,57 @@ mod tests {
             "github.com",
         ] {
             assert_eq!(remote(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn keeps_nested_gitlab_paths_without_guessing_self_managed_providers() {
+        for (host, forge) in [
+            ("gitlab.com", Forge::Gitlab),
+            ("git.example.org", Forge::Other),
+        ] {
+            for url in [
+                format!("git@{host}:group/sub/project.git"),
+                format!("https://{host}/group/sub/project.git"),
+                format!("https://{host}:8443/group/sub/project.git"),
+                format!("ssh://git@{host}:2222/group/sub/project.git"),
+            ] {
+                assert_eq!(
+                    remote(&url),
+                    Some((forge, host.into(), "group/sub/project".into())),
+                    "{url}"
+                );
+            }
+        }
+        for url in [
+            "git@github.com:group/sub/project.git",
+            "https://github.com/group/sub/project.git",
+            "ssh://git@github.com:2222/group/sub/project.git",
+        ] {
+            assert_eq!(remote(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn refuses_credentials_and_malformed_remote_urls() {
+        for url in [
+            "https://user:synthetic-token@github.com/acme/widgets.git",
+            "https://user@gitlab.com/group/sub/project.git",
+            "https://@git.example.org/group/sub/project.git",
+            "ssh://git:synthetic-token@git.example.org/group/sub/project.git",
+            "https://git.example.org/group/sub/project.git?token=synthetic",
+            "https://git.example.org/group/sub/project.git#fragment",
+            "ssh://git@git.example.org/group/sub/project.git?query",
+            "ssh://git@git.example.org/group/sub/project.git#fragment",
+            "ftp://git.example.org/group/sub/project.git",
+            "https://git.example.org:not-a-port/group/sub/project.git",
+            "https://git.example.org/group/../project.git",
+            "https://git.example.org/group/./project.git",
+            "git@git.example.org:group/../project.git",
+            "git@git.example.org:group/sub/project.git?query",
+            "git@git.example.org:group/sub/project.git#fragment",
+        ] {
+            assert_eq!(remote(url), None, "{url}");
         }
     }
 

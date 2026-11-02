@@ -93,12 +93,15 @@ Silicon macOS; Docker is an explicit fallback. Server deployment is
 
 | Need | Available alpha capability | Start here |
 |---|---|---|
+| Continue during a forge disconnection | Private task context, local command receipts, saved PR/MR drafts and explicit read-only GitHub/GitLab revalidation | [Continuity preparation](docs/continuity.md) |
 | Catch up before taking over | Durable work claims, checkpoints, blockers, handovers and bounded agent briefings | [Stand-up and catch-up](docs/standup.md) |
 | Coordinate concurrent edits | Shared file intents, overlap notices and handoff requests across machines; read-only Git branch/worktree collision checks | [Coordination](docs/intents.md) · [Collision checks](docs/collisions.md) |
 | Inspect what an agent changed and checked | Source-bound action records with separate outcome, coverage, freshness and evidence availability | [Change capture](docs/change-capture.md) |
 | Connect code and context | Read-only committed Git files, history and diffs beside available local conversations and recorded actions | [Repository explorer](docs/repository-explorer.md) · [Open this computer](docs/connect-this-computer.md) |
 | Make a team's PR process visible | Experimental `pr-gate` v1: adopted steps, head-bound evidence, findings and next actions; opt-in Claude Code/Codex Stop hooks | [Supported skills](docs/design/supported-skills.md) |
 | Reuse skills and workflow definitions | Local versioned authoring, pinned imports, simulation and an explicit export path to native execution | [Workflow library](docs/advanced/workflow-library.md) |
+| Continue a managed task with another agent | Experimental local Claude Code/Codex continuation of enrolled Work, with bounded source edits, artifacts and retained context | [Portable responsibility](docs/advanced/portable-responsibility.md) |
+| Run reviewed team rules | Experimental owner-reviewed contracts, rehearsal and guarded post-merge artifact workflows | [Operating policy](docs/advanced/operating-policy.md) |
 | Retain an owner's commitment | Living Promises keep versioned requests, criteria and constraints; agent proposals and reports remain advisory | [Living Promises](docs/advanced/living-promises.md) |
 | Pilot controlled native landing | Immutable revisions, pinned checks, bounded Claude Code review and human approval checked at native admission | [Native workflow loop](docs/advanced/claude-code-workflows.md) |
 

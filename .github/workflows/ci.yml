@@ -18,9 +18,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Formatting and lint: on every trigger, including `labeled`, so a label event never records a
-  # skipped `static` run that a required check would count as passing.
+  # Routine checks run locally; this is the explicit hosted fallback. Platform checks below keep
+  # their main-push coverage. Fork code runs only after a maintainer applies ci-extended.
   static:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -38,23 +39,10 @@ jobs:
           rustc --edition=2024 -D warnings tools/release-files.rs -o "$RUNNER_TEMP/release-files"
           "$RUNNER_TEMP/release-files" --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # Crate-level `warnings = "deny"` turns musl-only deprecations into errors; linting musl here catches
-      # them on every pull request. The labelled `release-targets` job builds every non-Windows release target.
-      - run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl-tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
-      - run: cargo clippy --locked --target x86_64-unknown-linux-musl -- -D warnings
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
 
-  # Hosted tests with PostgreSQL and S3. Always on push to main and manual runs. For a pull request:
-  # fork PRs run on opened, synchronize and reopened (they cannot carry a local validation
-  # attestation); same-repository PRs rely on a signed local validation attestation and run here only
-  # with the `ci-extended` label (on labeling, then on every later update while it stays).
+  # The local recipe requires PostgreSQL and S3; keep the same hosted service-backed fallback.
   tests:
-    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event.action != 'labeled' && (github.event.pull_request.head.repo.full_name != github.repository || contains(github.event.pull_request.labels.*.name, 'ci-extended'))) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:

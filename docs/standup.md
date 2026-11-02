@@ -302,6 +302,11 @@ Compaction also removes coordination requests that were resolved or withdrawn be
 
 This maintenance path can delete `work_started`, `work_joined`, `work_takeover` and `work_checkpoint` events, plus the closed request's `coordination_requested`, `coordination_bound`, `coordination_retargeted`, `coordination_acknowledged`, `coordination_responded`, `coordination_resolved` and `coordination_withdrawn` events. Removed coordination history advances the durable retention floor described above. All event updates remain prohibited, and other Hub event kinds retain their append-only protection. Stand-up history is self-reported coordination context, not retained execution or approval evidence.
 
+A sequence conflict can be classified as a definite rejection only while retained
+history proves that no matching receipt was compacted. The HTTP checkpoint route
+then returns `work_checkpoint_sequence_conflict` with `current_seq`; other errors
+do not prove noncommit. Inspect current Work before preparing a new operation.
+
 Checkpoint retries are supported for at least 24 hours. After a receipt has been compacted, its old version guard prevents the request from being applied again; the caller must inspect current work rather than infer whether the old operation committed. Compaction does not remove current work items, so repositories with many retained items can still reach capacity. Back up the database before maintenance and provision disk space for retained data; compaction does not promise to shrink database files immediately.
 
 ### Repair Work after a repository rename

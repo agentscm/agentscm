@@ -316,15 +316,16 @@ export function TemplatesPage({ repository = null, onDirtyChange }: { repository
     onDirtyChange?.(workflowDirty)
     return () => onDirtyChange?.(false)
   }, [onDirtyChange, workflowDirty])
+  const reachable = localReachable()
   return (
     <div className="page">
       <PageHead
         question="Which reusable workflows can agents configure here?"
-        answer="Build a workflow once, freeze it, and reuse that exact version."
-        fact={<>Draft, publish a version, simulate it, then attach it to <code>{repository ?? 'a repository'}</code>. Nothing here runs a command.</>}
+        answer={reachable ? <>Workflows in your library can be attached to <code>{repository ?? 'a repository'}</code>, one fixed version at a time.</> : 'Your workflow library opens on your computer.'}
+        fact="A published version never changes. Nothing here runs a command."
       />
       <SectionTabs />
-      {!localReachable() ? (
+      {!reachable ? (
         <OnThisComputer what="The library" />
       ) : (
         <>
@@ -340,7 +341,7 @@ export function TemplatesPage({ repository = null, onDirtyChange }: { repository
           {tab === 'inspect' && <InspectorPanel />}
         </>
       )}
-      <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> Workflow authoring is available through the loopback page opened by <code>agentscm open</code>. The shared Hub remains read-only.</p>
+      <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> The library is kept on this computer. The shared Hub stays read-only.</p>
     </div>
   )
 }

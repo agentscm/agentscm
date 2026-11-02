@@ -102,17 +102,17 @@ struct InstallManifest {
 /// explicitly named environment variable and are never retained in rule/event records.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LocalConnection {
-    provider: String,
-    host: String,
-    api_url: String,
-    web_url: String,
-    repository: String,
-    provider_repository_id: i64,
-    token_env: String,
+pub(crate) struct LocalConnection {
+    pub(crate) provider: String,
+    pub(crate) host: String,
+    pub(crate) api_url: String,
+    pub(crate) web_url: String,
+    pub(crate) repository: String,
+    pub(crate) provider_repository_id: i64,
+    pub(crate) token_env: String,
 }
 impl LocalConnection {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if !matches!(self.provider.as_str(), "github" | "gitlab")
             || self.provider_repository_id < 1
             || self.repository.is_empty()
@@ -153,7 +153,7 @@ impl LocalConnection {
         }
         Ok(())
     }
-    fn repository(&self) -> ConnectedRepository {
+    pub(crate) fn repository(&self) -> ConnectedRepository {
         ConnectedRepository {
             id: "operator-local".into(),
             connection: "operator-local".into(),
@@ -167,7 +167,7 @@ impl LocalConnection {
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(Error::Invalid(
@@ -183,7 +183,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
-fn root(data: &Path) -> Result<PathBuf> {
+pub(crate) fn root(data: &Path) -> Result<PathBuf> {
     let root = data.join("pipeline-rules");
     if !data.join("state.sqlite").is_file() {
         return Err(Error::Invalid(
@@ -204,7 +204,7 @@ fn root(data: &Path) -> Result<PathBuf> {
     }
     Ok(root)
 }
-fn runner_lease(root: &Path) -> Result<agentscm::lease::Lease> {
+pub(crate) fn runner_lease(root: &Path) -> Result<agentscm::lease::Lease> {
     let path = root.join("runner.lock");
     if path.exists() && std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
         return Err(Error::Invalid("runner lease cannot be a symlink".into()));
@@ -219,7 +219,7 @@ fn runner_lease(root: &Path) -> Result<agentscm::lease::Lease> {
     )
     .map_err(|_| Error::Conflict("another local pipeline runner is active".into()))
 }
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -276,6 +276,32 @@ fn install(
     Ok(
         json!({"rule":rule,"source_commit":manifest.source_commit,"note":"exact resource identity pinned; local commands use operator privileges"}),
     )
+}
+
+pub(crate) async fn confirm(config_path: &Path, proposal: i64) -> Result<ConfirmedMerge> {
+    let config: LocalConnection = read_json(config_path)?;
+    config.validate()?;
+    let token = std::env::var(&config.token_env)
+        .map_err(|_| Error::Invalid("configured forge credential is unavailable".into()))?;
+    if token.is_empty() {
+        return Err(Error::Invalid(
+            "configured forge credential is empty".into(),
+        ));
+    }
+    let github;
+    let gitlab;
+    let api = if config.provider == "github" {
+        github = agentscm::hub::github::Api::new(&config.api_url, &config.web_url)
+            .map_err(|_| Error::Invalid("forge client configuration".into()))?;
+        ForgeApi::Github(&github)
+    } else {
+        gitlab = agentscm::hub::gitlab::Api::new(&config.api_url)
+            .map_err(|_| Error::Invalid("forge client configuration".into()))?;
+        ForgeApi::Gitlab(&gitlab)
+    };
+    pipeline_rules::confirm_merge(api, &token, &config.repository(), proposal, now(), None)
+        .await?
+        .ok_or_else(|| Error::Conflict("proposal is not confirmed merged".into()))
 }
 
 async fn observe_one(
@@ -354,11 +380,13 @@ fn pickup(
         std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))?;
     }
     let mut results = Vec::new();
-    for dispatch in journal.pending(32)? {
+    for dispatch in journal.pending_legacy(32)? {
         if cancellation.is_cancelled() {
             break;
         }
-        let claim = journal.claim(&dispatch.dispatch_id)?;
+        let Some(claim) = journal.claim_legacy(&dispatch.dispatch_id)? else {
+            continue;
+        };
         results.push(
             match pipeline_rules::deliver_with_cancellation(
                 data,
@@ -441,7 +469,7 @@ pub async fn run(data: &Path, command: PipelineCommand) -> Result<Value> {
             expected_generation,
         } => {
             let _lease = runner_lease(&root)?;
-            journal.recover(&dispatch_id, expected_generation)?;
+            journal.recover_legacy(&dispatch_id, expected_generation)?;
             Ok(
                 json!({"dispatch_id":dispatch_id,"state":"pending","run_identity":"retained; interrupted attempts are never replayed"}),
             )
