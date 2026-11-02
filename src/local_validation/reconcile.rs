@@ -24,7 +24,9 @@ use serde_json::Value;
 use super::comment::MARKER_PREFIX;
 use super::fetch::FetchContext;
 use super::run::{observe, only_exempt, required_commands, trust_paths};
-use super::{Observed, ValidationPolicy, ValidationRecipe, VerdictState, select};
+use super::{
+    Observed, ValidationPolicy, ValidationRecipe, ValidationRecord, VerdictState, assess, select,
+};
 use crate::evidence::EvaluationClock;
 use crate::hub::github::{Api, CommitStatus, Gh, GhError, StatusState};
 
@@ -54,8 +56,8 @@ impl IssueComment {
     }
 }
 
-/// Attestation comments a maintainer posted: trusted association and the marker. The signature
-/// still decides; this limits what is read.
+/// Association-only discovery hints. Reconciliation also authenticates enrolled signatures
+/// when association visibility is weaker. Neither discovery route replaces the final verdict.
 pub fn trusted(comments: &[IssueComment]) -> Vec<&IssueComment> {
     comments
         .iter()
@@ -66,9 +68,19 @@ pub fn trusted(comments: &[IssueComment]) -> Vec<&IssueComment> {
         .collect()
 }
 
-/// Sorted `id:updated_at` of the trusted comments; any edit, deletion or addition changes it.
-pub fn fingerprint(trusted: &[&IssueComment]) -> Vec<String> {
-    let mut out: Vec<String> = trusted
+fn clock() -> EvaluationClock {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .map_or(EvaluationClock::Uncertain, |unix_ms| {
+            EvaluationClock::Known { unix_ms }
+        })
+}
+
+/// Sorted `id:updated_at` of the eligible comments; any edit, deletion or addition changes it.
+pub fn fingerprint(eligible: &[&IssueComment]) -> Vec<String> {
+    let mut out: Vec<String> = eligible
         .iter()
         .map(|c| format!("{}:{}", c.id, c.updated_at))
         .collect();
@@ -161,6 +173,49 @@ fn unread(what: &str) -> GhError {
 }
 
 impl Context<'_> {
+    /// Association visibility depends on the API viewer. An otherwise unrecognized author
+    /// can opt in only with fresh, currently trusted signed evidence for this repository,
+    /// head and base. The record's tree and merge-base are used here only for discovery;
+    /// `verdict` still fetches Git and independently checks every source binding.
+    fn eligible<'a>(&self, comments: &'a [IssueComment], pull: &OpenPull) -> Vec<&'a IssueComment> {
+        let required: Vec<String> = self.recipe.commands.iter().map(|c| c.id.clone()).collect();
+        let now = clock();
+        comments
+            .iter()
+            .filter(|comment| {
+                if !comment.body.starts_with(MARKER_PREFIX) {
+                    return false;
+                }
+                if TRUSTED_ASSOCIATIONS.contains(&comment.author_association.as_str()) {
+                    return true;
+                }
+                let Ok((envelope, bytes)) = super::comment::parse(&comment.body) else {
+                    return false;
+                };
+                let Ok(record) = ValidationRecord::from_slice(&bytes) else {
+                    return false;
+                };
+                assess(
+                    &envelope,
+                    &bytes,
+                    self.recipe,
+                    self.registry,
+                    self.policy,
+                    Observed {
+                        repository: self.repository,
+                        commit: &pull.head,
+                        tree: &record.subject.tree,
+                        base_ref: &pull.base,
+                        merge_base: &record.context.merge_base,
+                        required: &required,
+                    },
+                    now,
+                )
+                .applies_to_head
+            })
+            .collect()
+    }
+
     async fn open_pulls(&self) -> Gh<Vec<OpenPull>> {
         let path = format!("/repos/{}/pulls?state=open", self.github_repo);
         let paged = self.api.get_all(self.token, &path, MAX_PULL_PAGES).await?;
@@ -250,7 +305,7 @@ impl Context<'_> {
         false
     }
 
-    /// Re-reads the pull requests and the trusted comments just before a write.
+    /// Re-reads the pull requests and the eligible comments just before a write.
     async fn recheck(&self, c: &Candidate) -> Gh<Recheck> {
         let pulls = self.open_pulls().await?;
         let Some(pull) = pulls.iter().find(|p| p.number == c.number) else {
@@ -260,7 +315,7 @@ impl Context<'_> {
             return Ok(Recheck::Changed("head or base changed"));
         }
         let comments = self.comments(c.number).await?;
-        if fingerprint(&trusted(&comments)) != c.fingerprint {
+        if fingerprint(&self.eligible(&comments, pull)) != c.fingerprint {
             return Ok(Recheck::Changed("attestation comments changed"));
         }
         Ok(if shared(&pulls, &c.head) {
@@ -300,13 +355,7 @@ impl Context<'_> {
             Ok(_) => return Err("fetched commit differs from the head".into()),
             Err(error) => return Err(format!("{error:?}")),
         };
-        let clock = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| u64::try_from(d.as_millis()).ok())
-            .map_or(EvaluationClock::Uncertain, |unix_ms| {
-                EvaluationClock::Known { unix_ms }
-            });
+        let clock = clock();
         let trust = trust_paths(self.config_dir, self.verifier_workflow);
         let required = match tokio::task::block_in_place(|| {
             required_commands(
@@ -363,7 +412,7 @@ impl Context<'_> {
                 Ok(comments) => comments,
                 Err(error) => return read_error("comments", &error),
             };
-            let attestations = trusted(&comments);
+            let attestations = self.eligible(&comments, pull);
             let opted_in = if attestations.is_empty() {
                 match self.has_status(&pull.head).await {
                     Ok(has) => has,

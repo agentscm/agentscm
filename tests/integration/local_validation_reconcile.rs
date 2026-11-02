@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+use agentscm::evidence::{EvidenceEnvelope, EvidenceOutcome, TerminalState, sign_evidence};
 use agentscm::local_validation::{
-    CHECK_KIND, RecipeCommand, Services, ValidationPolicy, ValidationRecipe,
+    CHECK_KIND, Issuance, RecipeCommand, Services, ValidationPolicy, ValidationRecipe,
+    ValidationRecord, evidence_payload,
 };
 use agentscm::policy::issuers::{
     CommonControl, IssuerKeyRecord, IssuerRecord, IssuerRegistrySnapshot, issuer_key_id,
@@ -412,6 +414,70 @@ fn code(out: &Output) -> i32 {
     out.status.code().unwrap()
 }
 
+fn altered_attestation(
+    body: &str,
+    change: impl FnOnce(&mut EvidenceEnvelope, &mut Vec<u8>),
+) -> String {
+    let (envelope, mut record) = agentscm::local_validation::comment::parse(body).unwrap();
+    let mut envelope = EvidenceEnvelope::from_slice(&envelope).unwrap();
+    change(&mut envelope, &mut record);
+    agentscm::local_validation::comment::render(&serde_json::to_vec(&envelope).unwrap(), &record)
+        .unwrap()
+}
+
+fn resign(envelope: &mut EvidenceEnvelope) {
+    *envelope = sign_evidence(
+        envelope.payload.clone(),
+        &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+    )
+    .unwrap();
+}
+
+fn signed_record_change(
+    env: &Env,
+    body: &str,
+    change: impl FnOnce(&mut ValidationRecord),
+) -> String {
+    let (envelope, bytes) = agentscm::local_validation::comment::parse(body).unwrap();
+    let old = EvidenceEnvelope::from_slice(&envelope).unwrap().payload;
+    let mut record = ValidationRecord::from_slice(&bytes).unwrap();
+    change(&mut record);
+    let config = env.root().join("config");
+    let recipe =
+        ValidationRecipe::from_slice(&fs::read(config.join("recipe.json")).unwrap()).unwrap();
+    let policy =
+        ValidationPolicy::from_slice(&fs::read(config.join("policy.json")).unwrap()).unwrap();
+    let dependencies = old
+        .dependencies
+        .iter()
+        .map(|d| {
+            let agentscm::context::DependencyState::Resolved { revision } = &d.state else {
+                panic!("producer dependency was not resolved");
+            };
+            (d.identity.clone(), revision.clone())
+        })
+        .collect::<Vec<_>>();
+    let (payload, record) = evidence_payload(
+        &record,
+        &recipe,
+        &policy,
+        &Issuance {
+            issuer_id: &old.issuer_id,
+            key_id: &old.key_id,
+            attempt_id: &old.attempt_id,
+            run_generation: old.run_generation,
+            issued_at_ms: old.issued_at_ms,
+            expires_at_ms: old.expires_at_ms,
+            issuer_registry_sha256: &old.issuer_registry_sha256,
+            dependencies: &dependencies,
+        },
+    )
+    .unwrap();
+    let signed = sign_evidence(payload, &ed25519_dalek::SigningKey::from_bytes(&[7; 32])).unwrap();
+    agentscm::local_validation::comment::render(&serde_json::to_vec(&signed).unwrap(), &record)
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pull_request_that_never_opted_in_gets_no_status() {
     let env = Env::new().await;
@@ -477,13 +543,176 @@ async fn a_valid_attestation_posts_pending_then_success_on_that_head() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_untrusted_author_association_is_ignored() {
+async fn an_enrolled_signature_discovers_comments_without_a_recognized_association() {
+    for association in ["CONTRIBUTOR", "NONE", ""] {
+        let env = Env::new().await;
+        let body = tokio::task::block_in_place(|| env.attest());
+        env.attest_comment(10, association, body);
+        let out = tokio::task::block_in_place(|| env.reconcile());
+        assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            env.states(&env.head),
+            ["pending", "success"],
+            "{association}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_authors_cannot_opt_in_with_unusable_evidence() {
     let env = Env::new().await;
     let body = tokio::task::block_in_place(|| env.attest());
+    let invalid = [
+        format!("{MARKED}junk -->"),
+        altered_attestation(&body, |e, _| {
+            let replacement = if e.signature_hex.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            };
+            e.signature_hex.replace_range(..1, replacement);
+        }),
+        altered_attestation(&body, |e, _| {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+            let public = key
+                .verifying_key()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            e.payload.key_id = issuer_key_id(&public).unwrap();
+            *e = sign_evidence(e.payload.clone(), &key).unwrap();
+        }),
+        altered_attestation(&body, |e, _| {
+            e.payload.issued_at_ms -= 7_200_000;
+            e.payload.expires_at_ms = e.payload.issued_at_ms + 3_600_000;
+            resign(e);
+        }),
+        altered_attestation(&body, |e, _| {
+            e.payload.installed_policy_sha256 = "0".repeat(64);
+            resign(e);
+        }),
+        altered_attestation(&body, |_, record| {
+            let mut value: serde_json::Value = serde_json::from_slice(record).unwrap();
+            value["subject"]["tree"] = "0".repeat(40).into();
+            *record = serde_json::to_vec(&value).unwrap();
+        }),
+        signed_record_change(&env, &body, |record| {
+            record.subject.repository = "github.com/another/repository".into();
+        }),
+        signed_record_change(&env, &body, |record| {
+            record.context.base_ref = "another-base".into();
+        }),
+    ];
+    for body in invalid {
+        env.attest_comment(10, "CONTRIBUTOR", body);
+        let out = tokio::task::block_in_place(|| env.reconcile());
+        assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(env.posts(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replayed_or_revoked_signatures_cannot_discover_a_head() {
+    let mut env = Env::new().await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    env.push_head(&[("another.txt", "new head")]);
+    env.attest_comment(10, "NONE", body);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0);
+    assert_eq!(env.posts(), 0);
+
+    let env = Env::new().await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    let checkout = env.root().join("checkout");
+    let path = checkout.join(".github/local-validation/registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry["issuers"][0]["keys"][0]["revoked_at_ms"] = 1.into();
+    fs::write(path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    git(&checkout, &["commit", "-qam", "revoke synthetic issuer"]);
+    git(&checkout, &["push", "-q", "origin", "HEAD:main"]);
     env.attest_comment(10, "CONTRIBUTOR", body);
     let out = tokio::task::block_in_place(|| env.reconcile());
     assert_eq!(code(&out), 0);
     assert_eq!(env.posts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authenticated_failure_discovers_a_head_and_invalidates_success() {
+    let env = Env::new().await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    let body = altered_attestation(&body, |e, _| {
+        e.payload.outcome = EvidenceOutcome::Fail;
+        e.payload.terminal_state = TerminalState::Failed;
+        resign(e);
+    });
+    env.prior_success();
+    env.attest_comment(10, "NONE", body);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["success", "pending", "failure"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_comments_cannot_override_authenticated_comments() {
+    let env = Env::new().await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    env.attest_comment(10, "CONTRIBUTOR", body);
+    env.fake.with(|s| {
+        s.repos
+            .get_mut(&1)
+            .unwrap()
+            .comments
+            .get_mut(&1)
+            .unwrap()
+            .push(Comment {
+                id: 11,
+                body: format!("{MARKED}junk -->"),
+                author: "outside-author".into(),
+                author_association: "NONE".into(),
+                updated_at: "2026-02-02T00:00:00Z".into(),
+            });
+    });
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0);
+    assert_eq!(env.states(&env.head), ["pending", "success"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_discovery_does_not_trust_the_claimed_git_source() {
+    for wrong_tree in [true, false] {
+        let env = Env::new().await;
+        let body = tokio::task::block_in_place(|| env.attest());
+        let body = signed_record_change(&env, &body, |record| {
+            if wrong_tree {
+                record.subject.tree = "0".repeat(40);
+            } else {
+                record.context.merge_base = "0".repeat(40);
+            }
+        });
+        env.attest_comment(10, "CONTRIBUTOR", body);
+        let out = tokio::task::block_in_place(|| env.reconcile());
+        assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(env.states(&env.head), ["pending", "pending"]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn association_visibility_changes_do_not_change_authenticated_comment_fingerprints() {
+    let env = Env::new().await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    env.attest_comment(10, "CONTRIBUTOR", body);
+    let out = env
+        .reconcile_stalled(&format!("/statuses/{}", env.head), |fake| {
+            fake.with(|s| {
+                s.repos.get_mut(&1).unwrap().comments.get_mut(&1).unwrap()[0].author_association =
+                    "NONE".into();
+            });
+        })
+        .await;
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending", "success"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -557,7 +786,7 @@ async fn a_pull_request_closed_before_the_verdict_gets_no_verdict() {
 async fn attestation_comments_that_change_during_the_run_get_no_verdict() {
     let env = Env::new().await;
     let body = env.attest();
-    env.attest_comment(10, "OWNER", body);
+    env.attest_comment(10, "CONTRIBUTOR", body);
     let out = env
         .reconcile_stalled(&format!("/statuses/{}", env.head), |fake| {
             fake.with(|s| {
@@ -1140,7 +1369,7 @@ async fn an_attestation_listing_a_path_scoped_command_as_not_required_passes() {
     )
     .await;
     let body = tokio::task::block_in_place(|| env.attest());
-    env.attest_comment(10, "OWNER", body);
+    env.attest_comment(10, "CONTRIBUTOR", body);
     let out = tokio::task::block_in_place(|| env.reconcile());
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(env.states(&env.head), ["pending", "success"]);
