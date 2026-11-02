@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SECTIONS, sectionFromHash } from '../../src/App.tsx'
 import { SkillsPage } from '../../src/pages/Skills.tsx'
 import {
-  addCommand, adoptionLabel, stepCounts, assuranceView, decodeRun, enforcement, gateSteps, isSelfReported, removeCommand, runMatches, runStateLabel, skillsRoute, type Gate, type RunView,
+  addCommand, adoptedSummary, adoptionLabel, stepCounts, assuranceView, decodeRun, enforcement, gateSteps, isSelfReported, removeCommand, runMatches, runStateLabel, skillsRoute, type Gate, type RunView,
 } from '../../src/skills.ts'
 import { crumbsFor } from '../../src/TopNav.tsx'
 import { fromMock, stubHub, type Override } from '../fixtures/mockFetch.ts'
@@ -52,6 +52,10 @@ describe('labels', () => {
     // native is planned, not enforced, for skill gates.
     expect(enforcement([{ enforce: ['native'] }])).toEqual({ enforced: [], planned: ['native approval and landing'] })
   })
+  it('sums open runs for adopted skills only, from the counts the hub sends', () => {
+    const lib = { adoption: { pins: [{ name: 'a', status: 'adopted' }, { name: 'b', status: 'adopted' }, { name: 'c', status: 'unknown_version' }] }, counts: { a: { open: 2, at_stop_gate: 1, completed: 3 }, c: { open: 9, at_stop_gate: 9, completed: 0 } } }
+    expect(adoptedSummary(lib as never)).toEqual({ names: ['a', 'b'], open: 2, atStop: 1 })
+  })
   it('builds the exact CLI commands', () => {
     const defs = [{ name: 'merge_method', description: '', type: 'string', default: 'any', enum: [] }]
     expect(addCommand('pr-gate')).toBe('agentscm skill add pr-gate')
@@ -98,15 +102,29 @@ describe('Skills page against the mock hub', () => {
     expect(document.body.textContent).toContain('same agent token and session')
     // Adopted pr-gate uses the pin's walkthrough (merge method squash); numbers come from the track, not the text.
     expect(screen.getAllByText('The author runs the tests on the exact head commit.').length).toBe(1)
-    expect(screen.getAllByText('Blocks the author’s session where the Stop hook is installed').length).toBe(3)
+    expect(screen.getAllByText('Can stop the agent').length).toBe(3)
     expect(screen.getAllByRole('heading', { name: 'pr-gate v1' }).length).toBe(1)
     expect(document.body.textContent).not.toContain('name: pr-gate')
     expect(screen.getAllByText(/Needs: the merge \(squash\)/).length).toBe(1)
     expect(screen.queryByText(/^1\. /)).toBeNull()
-    expect(screen.getByText(/Planned: merge check/)).toBeTruthy()
-    expect(screen.getByText('Available: Stop hook (opt-in, fails open)')).toBeTruthy()
+    expect(screen.getByText('Merge check: planned')).toBeTruthy()
+    expect(screen.getByText('Can stop the agent (opt-in)')).toBeTruthy()
     expect(document.body.textContent).not.toMatch(/Enforced/i)
-    expect(document.body.textContent).toMatch(/\d+ of \d+ steps can stop an agent \(opt-in Stop hook\); evidence is reported by the agent/)
+    // The headline answers from the counts the hub already sends; the caveat moves to the fact line.
+    const answer = document.querySelector('.answer-text')!.textContent!.replace(/\s+/g, ' ').trim()
+    expect(answer).toMatch(/^Agents here are asked to follow 1 skill, pr-gate\. \d+ runs? (is|are) open(; \d+ (is|are) waiting at a stop gate)?\.$/)
+    expect(document.body.textContent).toMatch(/\d+ of \d+ steps can stop an agent, where the opt-in Stop hook is installed; agents report their own evidence/)
+    expect(screen.queryByText(/Adoption takes effect/)).toBeNull()
+    // Available skills stay collapsed to head, summary and command; How it works waits behind a disclosure.
+    const avail = screen.getByText('agentscm skill add post-merge-check').closest('li')!
+    const how = within(avail).getByText('How it works').closest('details')!
+    expect(how.open).toBe(false)
+    expect(how.contains(within(avail).getByText('Full procedure'))).toBe(true)
+    expect(how.contains(within(avail).getAllByText('When to use')[0]!)).toBe(true)
+    // Needs attention leads, without a box around its notice.
+    const notice = screen.getByText('legacy-review is pinned but not in force')
+    expect(notice.closest('.hub-box, .box')).toBeNull()
+    expect(notice.compareDocumentPosition(screen.getByText('Adopted')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(screen.getByText('agentscm skill add post-merge-check')).toBeTruthy()
     expect(screen.getByText('agentscm skill remove pr-gate')).toBeTruthy()
     expect(screen.getByText('Unknown version')).toBeTruthy()

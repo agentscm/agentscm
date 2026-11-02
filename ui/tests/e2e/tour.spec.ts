@@ -191,7 +191,7 @@ test('the Skills tour spotlights the live page and quotes its plain-English step
   await expect(page.locator('[data-tour="skills-how"]').first()).toBeVisible()
   await trigger(page).click()
   await expect(title(page)).toHaveText('Which workflows agents are expected to follow')
-  for (const [name, live] of [['Adopted skills', /adopted here/], ['What can stop an agent, and what is planned', /Available: Stop hook/], ['How it works, in plain English', /Step 1 says: “.+”/], ['Adopt or remove with a command', /Copy this: agentscm skill (add|remove) /]] as const) {
+  for (const [name, live] of [['Adopted skills', /adopted here/], ['What can stop an agent, and what is planned', /Can stop the agent \(opt-in\)/], ['How it works, in plain English', /Step 1 says: “.+”/], ['Adopt or remove with a command', /Copy this: agentscm skill (add|remove) /]] as const) {
     await page.keyboard.press('ArrowRight')
     await expect(title(page)).toHaveText(name)
     await expect(page.locator('.tour-hole')).toBeVisible()

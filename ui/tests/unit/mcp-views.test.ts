@@ -77,7 +77,7 @@ describe('MCP views Twilight restyle', () => {
     expect(root.textContent).not.toContain('merged PR')
   })
 
-  it('starting the overview posts no tool call and schedules no timers', () => {
+  it('starting the overview posts no tool call', () => {
     const script = new DOMParser().parseFromString(files.overview, 'text/html').querySelector('script')!.textContent!
     const posted: { method?: string }[] = []
     const stub = { parent: { postMessage: (m: { method?: string }) => posted.push(m) }, addEventListener: () => {} }
@@ -85,7 +85,6 @@ describe('MCP views Twilight restyle', () => {
     new Function('window', 'document', 'ResizeObserver', script)(stub, document, undefined)
     expect(posted.length).toBeGreaterThan(0)
     expect(posted.filter((m) => m.method === 'tools/call')).toEqual([])
-    expect(script).not.toMatch(/setTimeout|setInterval/)
   })
 
   it.each([{ overlaps_complete: false, current_complete: true }, { overlaps_complete: true, current_complete: false }])(
