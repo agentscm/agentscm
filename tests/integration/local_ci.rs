@@ -573,6 +573,15 @@ fn git_loader_uses_trusted_configuration_and_exact_workflow_bytes() {
     };
     let reader = GitSourceReader::new(root, "example/project".into()).unwrap();
     let trusted = TrustedRequirements::load(binding.clone(), &reader).unwrap();
+    git(
+        root,
+        &["tag", "-a", "fixture-tag", "-m", "annotated tag fixture"],
+    );
+    let mut tag_source = base.clone();
+    if let SourceIdentity::Git { subject } = &mut tag_source {
+        subject.commit = git(root, &["rev-parse", "refs/tags/fixture-tag"]);
+    }
+    assert!(reader.verify_source(&tag_source).is_err());
     req.cells.pop();
     req.cells[0].services.clear();
     req.policy_epoch += 1;

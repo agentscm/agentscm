@@ -96,6 +96,9 @@ impl GitSourceReader {
 impl SourceReader for GitSourceReader {
     fn verify_source(&self, source: &SourceIdentity) -> Result<()> {
         let subject = self.subject(source)?;
+        if self.run(&["cat-file", "-t", &subject.commit], 1024)? != b"commit\n" {
+            return Err(Error::Invalid("Git source identity is not a commit".into()));
+        }
         let commit = self.run(&["cat-file", "commit", &subject.commit], 64 * 1024)?;
         let expected = format!("tree {}\n", subject.tree);
         if !commit.starts_with(expected.as_bytes()) {
