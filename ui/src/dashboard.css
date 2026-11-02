@@ -72,6 +72,9 @@
   color: var(--hub-text-3);
   transition: background-color 0.2s, color 0.2s;
 }
+.need-slot {
+  pointer-events: none;
+}
 .need-btn:hover,
 .need-btn[aria-expanded='true'] {
   background: var(--hub-sunken);
@@ -136,7 +139,7 @@
     gap: 6px;
   }
   .need-primary {
-    flex: 1 1 auto;
+    flex: 1 1 0;
     min-height: 44px;
     white-space: normal;
     line-height: 1.25;

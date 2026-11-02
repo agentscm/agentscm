@@ -33,12 +33,12 @@ export function LiveProcess({ live }: { live: LiveProps }) {
           {adopted.map((a) => (
             <button key={a.name} type="button" className={`g-flowitem${skill?.name === a.name ? ' on' : ''}`} aria-pressed={skill?.name === a.name} onClick={() => { setPick(a.name); setGate(null) }}>
               <span><b>{a.name}</b><small>v{a.workflow_version} · {a.gates.length} steps</small></span>
-              <span className="g-state-chip s-active">Adopted</span>
+              <Pill tone="ok">Adopted</Pill>
             </button>
           ))}
           {v && adopted.length === 0 && <p className="small muted">Nothing adopted yet.</p>}
           {available.length > 0 && <span className="g-k mt-3">Available</span>}
-          {available.map((a) => <a key={a.name} href="#skills" className="g-flowitem g-flowitem-avail"><span><b>{a.name}</b><small>{a.summary}</small></span><span className="g-state-chip">Not adopted</span></a>)}
+          {available.map((a) => <a key={a.name} href="#skills" className="g-flowitem g-flowitem-avail"><span><b>{a.name}</b><small>{a.summary}</small></span><Pill tone="muted">Not adopted</Pill></a>)}
           <a href="#templates" className="g-flowitem add"><Icon name="journal-code" /> Workflow library</a>
           <a href="#workflows" className="g-flowitem add"><Icon name="play-circle" /> Recorded runs</a>
         </aside>
@@ -53,7 +53,7 @@ export function LiveProcess({ live }: { live: LiveProps }) {
                 <li className="past"><span><Icon name="shield-check" /></span>{counts?.at_stop_gate ?? 0} at a gate that can stop an agent</li>
                 <li className="past"><span><Icon name="check2" /></span>{counts?.completed ?? 0} completed</li>
               </ul>
-              <a href="#skills" className="btn btn-light btn-sm">Adoption and evidence</a>
+              <a href="#skills" className="rp-open">Adoption and evidence</a>
             </div>
           </section>
         ) : (
@@ -61,7 +61,7 @@ export function LiveProcess({ live }: { live: LiveProps }) {
             <span className="g-ring huge tone-brand"><Icon name="diagram-3" /></span>
             <h2>No process adopted yet</h2>
             <p>Adopt a skill such as <code>pr-gate</code> by pinning it in <code>agentscm-skills.lock.json</code> on the default branch. Agents then read its steps at session start and record evidence per step.</p>
-            <a href="#skills" className="btn btn-light">See available skills</a>
+            <a href="#skills" className="rp-open">See available skills</a>
           </section>
         )}
         {skill && sel && <aside className="g-inspector" aria-label="Step">

@@ -202,6 +202,23 @@ impl Fixture {
         })
     }
 
+    /// A touch that collects the handoff answers waiting for the session.
+    fn listen(&self, token: &str, session: &str) -> crate::hub::session::Touched {
+        let call = SessionCall {
+            session: Some(session.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: Vec::new(),
+            deny: false,
+            report: true,
+        };
+        tokio::task::block_in_place(|| {
+            self.store()
+                .touch_session(token, &call, unix_now())
+                .unwrap()
+        })
+    }
+
     /// Bob edits the file alice's agent holds: refused once, then repeated.
     fn contest(&self) {
         self.edit(&self.alice, "a");
@@ -232,22 +249,48 @@ impl Fixture {
             .clone()
     }
 
-    /// The `chat.update` a button click sent; it runs after the click is acknowledged.
-    async fn update(&self) -> Value {
+    /// The first `method` call (`/api/chat.update`...) the fake Slack saw; a click's follow-up
+    /// runs after the click is acknowledged.
+    async fn call(&self, method: &str) -> Value {
         for _ in 0..100 {
-            let update = self
+            let found = self
                 .calls
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|(path, _)| path == "/api/chat.update")
+                .find(|(path, _)| path == method)
                 .map(|(_, body)| body.clone());
-            if let Some(update) = update {
-                return update;
+            if let Some(found) = found {
+                return found;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("no chat.update was sent");
+        panic!("no {method} was sent");
+    }
+
+    /// The `chat.update` a button click sent.
+    async fn update(&self) -> Value {
+        self.call("/api/chat.update").await
+    }
+
+    /// The Hub user id of binding `index` (0 is alice's, 1 bob's).
+    fn owner(&self, index: usize) -> String {
+        tokio::task::block_in_place(|| {
+            self.store()
+                .authenticate(&self.slack().bindings[index].digest, unix_now())
+                .unwrap()
+                .unwrap()
+                .owner
+                .id
+        })
+    }
+
+    /// Where the Open Hub button of `user`'s latest message goes.
+    fn link(&self, user: &str) -> String {
+        let message = self.sent_body(user);
+        let elements = message["blocks"][2]["elements"].as_array().unwrap();
+        let open = elements.iter().find(|e| e["action_id"] == OPEN).unwrap();
+        open["url"].as_str().unwrap().to_owned()
     }
 
     fn state_of_messages(&self) -> Vec<String> {
@@ -369,12 +412,17 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     let holder = &sent.iter().find(|(user, _)| user == "U1").unwrap().1;
     assert_eq!(
         holder,
-        "Another agent edited a file your agent holds | File: src/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Hand it over, or keep it and agree who goes first."
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Hand it over, or keep it and agree who goes first."
     );
     let repeater = &sent.iter().find(|(user, _)| user == "U2").unwrap().1;
     assert_eq!(
         repeater,
-        "Your agent edited a file another agent holds | File: src/widget.rs | Repository: acme/widgets | Your agent: codex | Their agent: alice's claude | Agree with them who goes first."
+        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+    );
+    // The notification names the file once.
+    assert_eq!(
+        f.sent_body("U1")["text"],
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds"
     );
     // Only the holder's message carries the handoff buttons; both link the Hub.
     let buttons = |user: &str| {
@@ -385,33 +433,68 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
             .map(|e| e["action_id"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>()
     };
-    assert_eq!(buttons("U1"), [YES, NO, "agentscm_open_hub"]);
-    assert_eq!(buttons("U2"), ["agentscm_open_hub"]);
+    assert_eq!(buttons("U1"), [YES, NO, OPEN]);
+    assert_eq!(buttons("U2"), [OPEN]);
+    // Both buttons are the same colour, and the link goes to the contested file's box.
+    let sent_buttons = f.sent_body("U1")["blocks"][2]["elements"].clone();
+    assert!(
+        sent_buttons
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("style").is_none())
+    );
+    assert_eq!(f.link("U1"), "https://hub.example.test/ui/#box-contested");
+    assert_eq!(f.link("U2"), "https://hub.example.test/ui/#box-contested");
 
-    // Bob cannot answer for alice's agent with her button.
+    // Bob cannot answer for alice's agent with her button: only he sees why, nothing changes.
     let alice_message = f.sent_body("U1");
     let value = &alice_message["blocks"][2]["elements"][0]["value"];
     assert_eq!(
         f.click_value("U2", YES, value, &alice_message).await,
-        StatusCode::FORBIDDEN
+        StatusCode::OK
+    );
+    let notice = f.call("/api/chat.postEphemeral").await;
+    assert_eq!(
+        (notice["channel"].as_str(), notice["user"].as_str()),
+        (Some("D1"), Some("U2"))
+    );
+    assert_eq!(
+        notice["text"],
+        "The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in the Hub."
+    );
+    assert!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(path, _)| path != "/api/chat.update")
     );
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
     let update = f.update().await;
     assert_eq!(update["channel"], "D1");
     assert_eq!(update["ts"], "1.2");
-    // The header and fields stay; the buttons and guidance become the outcome.
+    // The header, fields and link to the Hub stay; the handoff buttons and guidance become the
+    // outcome.
     let kinds: Vec<_> = update["blocks"]
         .as_array()
         .unwrap()
         .iter()
         .map(|b| b["type"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["header", "section", "context"]);
+    assert_eq!(kinds, ["header", "section", "actions", "context"]);
+    assert_eq!(
+        update["blocks"][2]["elements"],
+        json!([open_button("https://hub.example.test/ui/#box-contested")])
+    );
     assert_eq!(
         rendered(&update),
-        "Another agent edited a file your agent holds | File: src/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Handed to bob's codex"
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
-    assert_eq!(update["text"], "Handed to bob's codex");
+    assert_eq!(
+        update["text"],
+        "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+    );
     let holders: Vec<String> = tokio::task::block_in_place(|| {
         f.store()
             .live_intents(REPO, unix_now(), 10)
@@ -422,8 +505,48 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
             .collect()
     });
     assert_eq!(holders, std::slice::from_ref(&f.bob));
-    // A second click finds nothing open; the same events never message again.
+    // The Hub records it as answered from Slack, not by the agent or from its web pages.
+    let alice = f.owner(0);
+    let handoffs = tokio::task::block_in_place(|| {
+        f.store()
+            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .unwrap()
+    });
+    assert_eq!(handoffs.len(), 1);
+    assert_eq!(handoffs[0].state, "granted");
+    assert!(handoffs[0].answered_via_slack && !handoffs[0].answered_via_hub);
+    // Bob's agent is told at its next edit, and by whom.
+    let told = f.listen(&f.bob, "b").handoffs;
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].via, Via::Slack);
+    // A second click finds nothing open and says nothing changed; the same events never
+    // message again.
     assert_eq!(f.click("U1", NO).await, StatusCode::OK);
+    for _ in 0..100 {
+        if f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/api/chat.update")
+            .count()
+            == 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let updates: Vec<Value> = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.update")
+        .map(|(_, body)| body.clone())
+        .collect();
+    assert_eq!(
+        updates[1]["text"],
+        "Nothing changed. There is no open request for src/widget.rs any more: it was answered or lapsed."
+    );
     f.run().await;
     assert_eq!(f.sent().len(), 2);
 }
@@ -493,8 +616,8 @@ async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
     let update = f.update().await;
     assert_eq!(
-        update["blocks"][2]["elements"][0]["text"],
-        "Handed to bob's codex"
+        update["blocks"][3]["elements"][0]["text"],
+        "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
 }
 
@@ -515,8 +638,8 @@ async fn a_slow_message_update_does_not_delay_the_button_acknowledgement() {
             .any(|(path, _)| path == "/api/chat.update")
     );
     assert_eq!(
-        f.update().await["blocks"][2]["elements"][0]["text"],
-        "Handed to bob's codex"
+        f.update().await["blocks"][3]["elements"][0]["text"],
+        "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
 }
 
@@ -561,7 +684,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
     assert_eq!(holder.len(), 1, "{holder:?}");
     assert_eq!(
         holder[0].1,
-        "Another agent edited files your agent holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Hand them over, or keep them and agree who goes first."
+        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Open the Hub to hand them over or keep them, or agree who goes first."
     );
     let buttons: Vec<_> = f.sent_body("U1")["blocks"][2]["elements"]
         .as_array()
@@ -569,7 +692,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
         .iter()
         .map(|e| e["action_id"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(buttons, ["agentscm_open_hub"]);
+    assert_eq!(buttons, [OPEN]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -596,12 +719,15 @@ async fn a_declined_handoff_messages_both_people_with_the_reason() {
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(sent.contains(&(
         "U2".into(),
-        "Another agent kept a file your agent asked for | File: src/widget.rs | Repository: acme/widgets | Your agent: codex | Their agent: alice's claude | Reason: mid-refactor | Agree with them who goes first.".into()
+        "Another agent kept a file your agent asked for | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | Reason: mid-refactor | Agree with them who goes first.".into()
     )));
     assert!(sent.contains(&(
         "U1".into(),
-        "Your agent kept a file | File: src/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Reason: mid-refactor | Agree with them who goes first.".into()
+        "Your agent kept a file | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Reason: mid-refactor | Agree with them who goes first.".into()
     )));
+    // Both messages open the Inbox, where the request's thread is.
+    assert_eq!(f.link("U1"), "https://hub.example.test/ui/#inbox");
+    assert_eq!(f.link("U2"), "https://hub.example.test/ui/#inbox");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -630,12 +756,16 @@ async fn similar_work_messages_the_starter_and_the_lead() {
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(sent.contains(&(
         "U2".into(),
-        "Your agent started similar work | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Your agent: codex | Reads like: alice's claude: make db migrations filename based\nOpen pull request #9 | Check whether it is the same work.".into()
+        "Your agent started similar work | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Your agent: Codex | Reads like: alice’s Claude Code: make db migrations filename based\nOpen pull request #9 | Check whether it is the same work.".into()
     )));
     assert!(sent.contains(&(
         "U1".into(),
-        "Similar work started | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Their agent: bob's codex | Your agent: claude | Your work: make db migrations filename based | Check with them whether it is the same work.".into()
+        "Similar work started | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Their agent: bob’s Codex | Your agent: Claude Code | Your work: make db migrations filename based | Check with them whether it is the same work.".into()
     )));
+    // Each message opens the work it is about.
+    let page = format!("https://hub.example.test/ui/#work/{}", work.item.id);
+    assert_eq!(f.link("U1"), page);
+    assert_eq!(f.link("U2"), page);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -704,6 +834,201 @@ async fn uninstall_stops_messages_and_survives_restart() {
     let reopened = Slack::from_file(&f.dir.path().join("config")).unwrap();
     assert!(reopened.active().is_err());
     assert!(f.sent().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeping_a_file_from_slack_tells_the_requester_but_not_the_person_who_clicked() {
+    let f = Fixture::new().await;
+    f.contest();
+    f.run().await;
+    assert_eq!(f.sent().len(), 2);
+    assert_eq!(f.click("U1", NO).await, StatusCode::OK);
+    let update = f.update().await;
+    assert_eq!(
+        update["text"],
+        "Kept src/widget.rs for now. bob’s Codex sees that on their next edit."
+    );
+    f.run().await;
+    // Bob hears that alice's agent kept the file; alice, who just said so, gets nothing new.
+    let sent = f.sent();
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(sent[2].0 == "U2" && sent[2].1.starts_with("Another agent kept a file"));
+    // The record says it was Slack, and bob's agent reads it as the person's answer.
+    let told = f.listen(&f.bob, "b").handoffs;
+    assert_eq!(told.len(), 1);
+    assert_eq!((told[0].kind, told[0].via), ("decline", Via::Slack));
+    let alice = f.owner(0);
+    let handoffs = tokio::task::block_in_place(|| {
+        f.store()
+            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .unwrap()
+    });
+    assert!(handoffs[0].answered_via_slack && !handoffs[0].answered_via_hub);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_click_the_hub_cannot_take_is_answered_privately_with_what_to_do() {
+    let f = Fixture::new().await;
+    f.contest();
+    f.run().await;
+    let message = f.sent_body("U1");
+    let value = message["blocks"][2]["elements"][0]["value"].clone();
+
+    // A button that is not one of ours.
+    assert_eq!(
+        f.click_value("U1", YES, &json!("not json"), &message).await,
+        StatusCode::OK
+    );
+    let notice = f.call("/api/chat.postEphemeral").await;
+    assert_eq!(
+        notice["text"],
+        "The Hub did not accept that answer. Nothing changed. Answer in the Hub instead."
+    );
+
+    // Alice's read-only token no longer works: the click names that and who can fix it.
+    let alice = f.owner(0);
+    let tokens = tokio::task::block_in_place(|| f.store().list_agent_tokens(&alice).unwrap());
+    let binding = tokens.iter().find(|t| t.name == "slack").unwrap();
+    tokio::task::block_in_place(|| f.store().revoke_agent_token(&binding.id).unwrap());
+    f.calls.lock().unwrap().clear();
+    assert_eq!(
+        f.click_value("U1", YES, &value, &message).await,
+        StatusCode::OK
+    );
+    let notice = f.call("/api/chat.postEphemeral").await;
+    assert_eq!(
+        notice["text"],
+        "Your Slack link to the Hub has ended. Nothing changed. Ask whoever runs this Hub to renew your read-only Slack token, or answer in the Hub."
+    );
+    assert_eq!(
+        (notice["channel"].as_str(), notice["user"].as_str()),
+        (Some("D1"), Some("U1"))
+    );
+    // Nothing was answered: the request is still open.
+    assert!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(path, _)| path != "/api/chat.update")
+    );
+    let handoffs = tokio::task::block_in_place(|| {
+        f.store()
+            .handoffs_of_owner(&alice, REPO, unix_now(), 10)
+            .unwrap()
+    });
+    assert_eq!(handoffs[0].state, "pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_message_update_still_reports_the_outcome() {
+    let f = Fixture::new().await;
+    f.contest();
+    f.run().await;
+    // The next Slack call after the click, the update, fails.
+    f.replies
+        .lock()
+        .unwrap()
+        .push((200, json!({"ok":false,"error":"message_not_found"})));
+    assert_eq!(f.click("U1", YES).await, StatusCode::OK);
+    // The two earlier direct messages are the first postMessage calls; the report is the third.
+    let mut reported = None;
+    for _ in 0..100 {
+        reported = f
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/api/chat.postMessage")
+            .map(|(_, body)| body.clone())
+            .nth(2);
+        if reported.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reported = reported.expect("the outcome was reported in a new message");
+    assert_eq!(reported["channel"], "U1");
+    assert_eq!(
+        reported["text"],
+        "Handed src/widget.rs to bob’s Codex. They see it on their next edit. Slack could not update the original message, so its buttons may still show."
+    );
+}
+
+#[test]
+fn agents_are_named_the_way_the_hub_names_them() {
+    for (name, said) in [
+        ("claude", "Claude Code"),
+        ("Claude-Code", "Claude Code"),
+        ("codex", "Codex"),
+        ("CURSOR", "Cursor"),
+        ("copilot", "Copilot"),
+        ("gemini", "Gemini"),
+        ("grok", "Grok"),
+        // A generated client token is told apart by its id.
+        ("client-Jonnys-MacBook-Pro-d6442b23", "Agent d644"),
+        ("client-mac-6A36AB", "Agent 6A36"),
+        // Not a client token: too short an id, no host, or not hex.
+        ("client-mac-6a36", "client-mac-6a36"),
+        ("client--6a36ab", "client--6a36ab"),
+        ("client-mac-6a36zz", "client-mac-6a36zz"),
+        ("slack-live-test-agent", "slack-live-test-agent"),
+        ("my \"agent\"\u{7}", "my 'agent'"),
+    ] {
+        assert_eq!(agent_name(name), said, "{name}");
+    }
+    assert_eq!(label("bob", "codex"), "bob’s Codex");
+    assert_eq!(label("alice", "client-host-6a36ab"), "alice’s Agent 6a36");
+}
+
+#[test]
+fn a_message_names_its_subject_once_and_keeps_text_as_typed() {
+    let fields = [("File", "src/a.rs".to_owned())];
+    let link = "https://hub.example.test/ui/#inbox";
+    // A header that already names the file is the whole notification.
+    assert_eq!(
+        message("bob’s Codex edited src/a.rs", &fields, "g", None, link)["text"],
+        "bob’s Codex edited src/a.rs"
+    );
+    assert_eq!(
+        message("Your agent kept a file", &fields, "g", None, link)["text"],
+        "Your agent kept a file: src/a.rs"
+    );
+    // `:rocket:` in a path or name is not turned into an emoji.
+    let body = message(
+        "h :rocket:",
+        &[("File", ":tada:".to_owned())],
+        ":smile:",
+        None,
+        link,
+    );
+    assert_eq!(body["blocks"][0]["text"]["emoji"], false);
+    assert_eq!(body["blocks"][1]["fields"][0]["emoji"], false);
+    assert_eq!(body["blocks"][3]["elements"][0]["emoji"], false);
+}
+
+#[test]
+fn a_clicked_message_keeps_only_a_link_that_points_into_this_hub() {
+    let hub = "https://hub.example.test/ui/";
+    let actions = |url: &str| {
+        json!({"type":"actions","elements":[
+            {"type":"button","action_id":YES,"value":"{}","text":plain_text("Hand it over",30)},
+            open_button(url)]})
+    };
+    let expected =
+        json!({"type":"actions","elements":[open_button("https://hub.example.test/ui/#inbox")]});
+    assert_eq!(
+        kept(&actions("https://hub.example.test/ui/#inbox"), hub),
+        Some(expected)
+    );
+    assert_eq!(
+        kept(&actions("https://elsewhere.example.test/"), hub),
+        Some(json!({"type":"actions","elements":[open_button(hub)]}))
+    );
+    // Without a link the buttons just go.
+    let none = json!({"type":"actions","elements":[
+        {"type":"button","action_id":NO,"value":"{}","text":plain_text("Keep it",30)}]});
+    assert_eq!(kept(&none, hub), None);
 }
 
 #[test]

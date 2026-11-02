@@ -14,7 +14,7 @@ Agents already get every coordination warning in their own replies. People hear 
 | `handoff_decline` | A holder's agent declines a handoff request. | Both people. |
 | `task_overlap` | An `agentscm_start` creates work that reads like other ongoing work or an open pull request. | The starting agent's person and the person leading each matched work item. |
 
-Everything else (overlap notes, refusals, open or merged pull request notices, granted handoffs) stays between agents. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and every message links to it.
+Everything else (overlap notes, refusals, open or merged pull request notices, granted handoffs) stays between agents. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and every message links to the page about its item: the contested-file box (`#box-contested`) for a repeated edit, the Inbox (`#inbox`) for a declined handoff, and the Work page (`#work/<id>`) for similar work.
 
 The adapter does not read channel history, post to channels, copy raw Slack messages, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. The only write a Slack user can make is answering a handoff for their own agent. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
 
@@ -136,21 +136,46 @@ An app created from an earlier version of this manifest (Home tab, `/agentscm` c
 
 ## Messages and buttons
 
-A background worker reads the Hub event log every two seconds, and every half second while it has just delivered something. On its first run it starts at the newest event, so history from before installation is never sent. Each event becomes at most one message per person. A message has a short header saying what happened, two columns of fields (the files, up to five then `+N more`; the repository; your agent; their agent with its owner's login), the buttons, and one line of guidance. For example, the holder of a file another agent edited again sees:
+A background worker reads the Hub event log every two seconds, and every half second while it has just delivered something. On its first run it starts at the newest event, so history from before installation is never sent. Each event becomes at most one message per person. A message has a header saying what happened and who did it, two columns of fields (the files, up to five then `+N more`; the repository; your agent; their agent with its owner's login), the buttons, and a few lines of guidance. For example, the holder of a file another agent edited again sees:
 
 ```text
-Another agent edited a file your agent holds
+slack-live-test’s Codex edited docs/slack-live-check.md, which your Claude Code holds
 File                      Repository
 docs/slack-live-check.md  counterbranch/agentscm
 Your agent                Their agent
-slack-live-holder         slack-live-test's slack-live-test-agent
+Claude Code               slack-live-test’s Codex
 [Hand it over] [Keep it] [Open Hub]
-Hand it over, or keep it and agree who goes first.
+The Hub warned slack-live-test’s Codex once; a repeat edit goes ahead by design. Files are never locked. Hand it over, or keep it and agree who goes first.
 ```
 
-Every header, field and line is plain text (Slack never reads it as markup), and teammate text gets the same filtering agents get. The notification text is the header and the file; it has `&`, `<` and `>` escaped, so it cannot mention a channel or add a link. Several held files come in one message without the handoff buttons.
+Agents are named as the Hub's pages name them: a known tool by its brand (`Claude Code`, `Codex`, `Cursor`, `Copilot`, `Gemini`, `Grok`), someone else's agent as `bob’s Codex`, and a generated `client-<host>-<id>` token as `Agent 6a36`; any other name is shown as given. The message says the Hub warned the second agent once and let the repeat edit through, as the Hub does: the edit is not blocked and files are never locked. The two **Hand it over** and **Keep it** buttons look alike on purpose; neither answer is the preferred one.
 
-**Hand it over** and **Keep it** answer the oldest open handoff request for that file addressed to the holder's agent, exactly as `agentscm_handoff` would: a yes moves the file to the requesting session, and both agents are told on their next call. The button works only for the person bound to the holder agent's owner, rechecked at click time. The message's buttons and guidance are then replaced with the outcome, such as `Handed to bob's claude` or `Kept; bob's claude is told on its next call`. A click after the request lapsed or was answered says so and changes nothing.
+Every header, field and line is plain text (Slack never reads it as markup, and `:name:` is not turned into an emoji), and teammate text gets the same filtering agents get. The notification text is the header (and the first file, when the header does not already name it); it has `&`, `<` and `>` escaped, so it cannot mention a channel or add a link. Several held files come in one message without the handoff buttons; open the Hub to answer each one.
+
+**Open Hub** goes to the page about the message, not to the front page: `#box-contested` for a repeated edit, `#inbox` for a declined handoff, and `#work/<id>` for similar work (the first work it reads like for the starter, the person's own work for its lead; the pull-request box if only open pull requests matched).
+
+**Hand it over** and **Keep it** answer the oldest open handoff request for that file addressed to the holder's agent, exactly as `agentscm_handoff` would: a yes moves the file to the requesting session, and both agents are told on their next call. The Hub records the answer as given from Slack, never as the agent's own word: the Inbox shows it as `· from Slack`, as it shows a web answer as `· from the Hub`, and the requesting agent is told "amy (from Slack, for their agent codex) …". The button works only for the person bound to the holder agent's owner, rechecked at click time. The message's handoff buttons and guidance are then replaced with the outcome, and the link to the Hub stays:
+
+| Click | Outcome line |
+|---|---|
+| **Hand it over** | `Handed src/x.rs to bob’s Codex. They see it on their next edit.` |
+| **Keep it** | `Kept src/x.rs for now. bob’s Codex sees that on their next edit.` |
+| Request already answered or lapsed | `Nothing changed. There is no open request for src/x.rs any more: it was answered or lapsed.` |
+| The agent no longer holds the file | `Nothing changed. Your Claude Code no longer holds src/x.rs, so there is nothing to hand over.` |
+
+If Slack refuses to update the message, the same outcome is sent as a new direct message that also says the buttons may still show. A holder who answers in Slack is not sent the "Your agent kept a file" message about their own answer; the requester still is. (An answer given on the Hub's web pages is treated the same way.)
+
+A click the Hub cannot take is answered with an ephemeral message that only the clicker sees; it says what happened, that nothing changed, and what to do (sentences follow the Hub's own, in `ui/src/inboxApi.ts`):
+
+| Cause | Message |
+|---|---|
+| Not the holder's person, or the agent is no longer connected | `The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in the Hub.` |
+| The binding token was revoked or expired, or the installation was revoked | `Your Slack link to the Hub has ended. Nothing changed. Ask whoever runs this Hub to renew your read-only Slack token, or answer in the Hub.` |
+| The Hub is at its store limit | `The Hub is busy right now. Nothing changed; press the button again in a moment.` |
+| A button the adapter does not recognise | `The Hub did not accept that answer. Nothing changed. Answer in the Hub instead.` |
+| A store failure | `The Hub could not record that answer. Nothing changed; press the button again in a moment, or answer in the Hub.` |
+
+The ephemeral message is sent with `chat.postEphemeral`, which uses the same `chat:write` scope. A request that fails Slack's signature, workspace or app checks still returns an HTTP error without a message, and so does one that does not finish within the 2.5-second admission window.
 
 ## Delivery and recovery behavior
 
@@ -165,8 +190,9 @@ Local checks use synthetic IDs, signed requests and a fake Slack API; they do no
 - Config and secret files reject relative paths, symlinks, wrong ownership, and group/world-readable permissions; the database parent rejects unsafe permissions.
 - The Hub starts with `AGENTSCM_SLACK_FILE`, exposes `POST /v1/hub/slack`, and rejects missing or invalid Slack signatures, app IDs, team IDs, and slash commands.
 - The manifest is valid JSON and has exactly the endpoint, scope, Messages tab setting, interactivity setting, and two event subscriptions shown in the example.
-- A repeated contested edit messages both people once; only the holder's message has buttons; another person cannot use them; a click hands the file over and replaces the buttons.
+- A repeated contested edit messages both people once; only the holder's message has buttons; another person's click gets a private explanation and changes nothing; a click hands the file over, records it as from Slack, replaces the buttons with the outcome and keeps the Open Hub link to `#box-contested`.
+- A declined handoff from the **Keep it** button messages the requester but not the clicker.
 - A declined handoff and similar work at start message both people; events from before installation are not sent.
 - A rate-limited send stays queued; a mismatched bot, a revoked binding token, `tokens_revoked` and `app_uninstalled` stop delivery.
 
-Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, makes one agent repeat an edit of a file another agent holds, checks both direct messages arrive, answers with a button, and confirms revoke/uninstall behavior in the actual workspace.
+Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, makes one agent repeat an edit of a file another agent holds, checks both direct messages arrive and read as shown above, answers with a button, checks the outcome line, the Open Hub link and the ephemeral explanation (a click by the wrong person is the easy one to try), and confirms revoke/uninstall behavior in the actual workspace. The local tests use a fake Slack API, so how Slack renders the header, the fields, the ephemeral message and a message sent after a failed update has not been seen.

@@ -1,6 +1,7 @@
 // The G layout: a second chrome over the same pages and routes. Opening `#g` (or `#g/<route>`) turns it on for this browser;
 // "Classic layout" in its top bar turns it off. Routes stay the Hub's own, plus a few G-only pages.
 import { useEffect, useState } from 'react'
+import { workIdFromHash } from '../standup.ts'
 
 const KEY = 'agentscm.layout'
 
@@ -57,7 +58,8 @@ export function gRoute(hash: string): { page: GPage; id?: string } | null {
   const [first = '', second] = h.split('/')
   if (first === '' || first === 'home' || first === 'coordination') return { page: 'now' }
   if (first === 'work' && (!second || second === 'working')) return { page: 'now' }
-  if (first === 'work' && second?.startsWith('wrk_')) return { page: 'change', id: second }
+  const id = workIdFromHash(`#${h}`)
+  if (id) return { page: 'change', id }
   if (first === 'changes') return { page: 'changes' }
   if (first === 'process') return { page: 'process' }
   if (first === 'code') return { page: 'code' }

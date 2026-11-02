@@ -196,6 +196,15 @@ describe('Inbox', () => {
     expect(rows.at(-1)).toContain('sees it at its next edit')
   })
 
+  it('marks a handoff answered from a Slack button as the person’s, from Slack', async () => {
+    hub([], [handoffRow('hof_4', 'declined', 'holder', { path: 'src/tax.rs', decided_at: now - 100, requester_told: true, answered_via_slack: true })])
+    render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} session={session} />)
+    await userEvent.click(await screen.findByRole('switch', { name: /Include resolved/ }))
+    await userEvent.click(await screen.findByText('Hand over tax.rs?'))
+    const rows = within(timeline()).getAllByRole('listitem').map((x) => x.textContent ?? '')
+    expect(rows.some((x) => x.includes('You, as your Claude Code') && x.includes('kept it for now · from Slack'))).toBe(true)
+  })
+
   it('offers "Ask … to hand it over" only where their agent holds a file and the person’s agent wants it', async () => {
     const agents = [{ id: 'ses_1', owner: 'maria', token: 'tok_maria', name: 'claude-code', holdings: [{ spec: 'src/billing.rs', contested: true }], intent: { id: 'int_1', via: ['hook:claude'] } }] as unknown as LiveAgent[]
     const contested = [{ path: 'src/billing.rs', holders: [{ id: 'maria\u0000tok_maria', owner: 'maria', name: 'claude-code' }, { id: 'dev\u0000tok_dev', owner: 'dev', name: 'codex' }] }] as unknown as Contested[]

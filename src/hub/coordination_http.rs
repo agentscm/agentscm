@@ -395,6 +395,7 @@ async fn person_handoffs(
                 "reply": h.reply, "created_at": h.created_at, "decided_at": h.decided_at,
                 "holder_told": h.holder_told, "requester_told": h.requester_told,
                 "asked_via_hub": h.asked_via_hub, "answered_via_hub": h.answered_via_hub,
+                "answered_via_slack": h.answered_via_slack,
                 "requester": party_json(&h.requester, &me), "holder": party_json(&h.holder, &me)})
         })
         .collect();

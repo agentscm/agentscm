@@ -4511,7 +4511,8 @@ fn handoffs_in(
         &[&token, &session, &cutoff(now), &PER_TOUCH],
     )?;
     let answers = tx.query(
-        "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub
+        "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
+                h.answered_via_slack
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
          JOIN hub_users u ON u.id = t.owner
          WHERE h.requester_token = $1 AND h.requester_session = $2
@@ -4528,7 +4529,7 @@ fn handoffs_in(
     };
     told(tx, "holder_told", &requests)?;
     told(tx, "requester_told", &answers)?;
-    let note = |kind, path, note, reason, agent, login, hub| HandoffNote {
+    let note = |kind, path, note, reason, agent, login, via| HandoffNote {
         kind,
         path,
         note,
@@ -4536,7 +4537,7 @@ fn handoffs_in(
         agent,
         login,
         session: session.to_owned(),
-        hub,
+        via,
     };
     Ok(requests
         .iter()
@@ -4548,7 +4549,7 @@ fn handoffs_in(
                 None,
                 row.get(3),
                 row.get(4),
-                row.get(5),
+                Via::stored(row.get(5), false),
             )
         })
         .chain(answers.iter().map(|row| {
@@ -4560,7 +4561,7 @@ fn handoffs_in(
                 row.get(5),
                 row.get(3),
                 row.get(4),
-                row.get(6),
+                Via::stored(row.get(6), row.get(7)),
             )
         }))
         .collect())
@@ -6020,13 +6021,15 @@ impl Store for PgStore {
             }
             tx.execute(
                 "UPDATE hub_handoffs SET state = $2, decided_at = $3, reply = $4,
-                     answered_via_hub = $5 WHERE id = $1",
+                     answered_via_hub = $5,
+                     answered_via_slack = $6 WHERE id = $1",
                 &[
                     &request.id,
                     &if accept { "granted" } else { "declined" },
                     &now,
                     &reason,
                     &via.hub(),
+                    &via.slack(),
                 ],
             )?;
             let kind = if accept {
@@ -6065,7 +6068,8 @@ impl Store for PgStore {
                 "SELECT h.id, h.path, h.state, h.note, h.reply, h.created_at, h.decided_at,
                         h.holder_told, h.requester_told, h.asked_via_hub, h.answered_via_hub,
                         h.requester_token, h.requester_session, rt.name, rt.owner, ru.login,
-                        h.holder_token, h.holder_session, ht.name, ht.owner, hu.login
+                        h.holder_token, h.holder_session, ht.name, ht.owner, hu.login,
+                        h.answered_via_slack
                  FROM hub_handoffs h
                  JOIN hub_agent_tokens rt ON rt.id = h.requester_token
                  JOIN hub_users ru ON ru.id = rt.owner
@@ -6091,6 +6095,7 @@ impl Store for PgStore {
                         requester_told: row.get(8),
                         asked_via_hub: row.get(9),
                         answered_via_hub: row.get(10),
+                        answered_via_slack: row.get(21),
                         requester: HandoffParty {
                             token: row.get(11),
                             session: row.get(12),
@@ -7941,6 +7946,36 @@ impl Store for PgStore {
                 HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
             })?;
             if expected != item.updated_seq {
+                // See SQLite parity: receipt absence is definitive only when
+                // neither removed events nor a retained baseline can hide it.
+                let event_floor: i64 = tx
+                    .query_one(
+                        "SELECT COALESCE(MAX(event_floor_seq),0) FROM hub_work_retention
+                     WHERE provider=$1 AND host=$2 AND repository=$3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                        &[
+                            &who.owner.identity.provider,
+                            &who.owner.identity.host,
+                            &item.repository,
+                            &who.repository_id,
+                        ],
+                    )?
+                    .get(0);
+                let missing_receipt: bool = tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM hub_work_versions v
+                     JOIN hub_events e ON e.seq=v.event_seq
+                     WHERE v.work=$1 AND v.event_seq>$2 AND e.kind='work_checkpoint'
+                     AND NOT EXISTS(SELECT 1 FROM hub_work_checkpoint_ops o
+                         WHERE o.work=v.work AND o.event_seq=v.event_seq))",
+                        &[&item.id, &expected],
+                    )?
+                    .get(0);
+                if expected >= event_floor && !missing_receipt {
+                    return Err(HubError::WorkCheckpointSequenceConflict {
+                        current_seq: item.updated_seq,
+                    });
+                }
                 return Err(HubError::Invalid(format!(
                     "checkpoint receipt expired or work changed; current updated_seq is {}",
                     item.updated_seq

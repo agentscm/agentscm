@@ -4,6 +4,7 @@ import type { CSSProperties } from 'react'
 import { Ago, Box, Icon, PageHead, Pill, relative } from '../ui.tsx'
 import type { Tone } from '../ui.tsx'
 import { useNow } from '../useHub.ts'
+import { workHref } from '../standup.ts'
 import type { LiveProps } from './GLive.tsx'
 
 export function LiveContributions({ live }: { live: LiveProps }) {
@@ -30,7 +31,7 @@ export function LiveContributions({ live }: { live: LiveProps }) {
       </div>
       <Box icon="clock-history" title="Recently reported" count={recent.length} explain="Completions and decisions agents reported. Reported finished does not confirm review, verification or merge.">
         {recent.length === 0 && <p className="small muted mb-0">Nothing reported in this window.</p>}
-        <ul className="g-stories">{recent.slice(0, 12).map((o, i) => <li key={o.seq} style={{ '--i': i } as CSSProperties}><span className={`g-ring tone-${o.kind === 'completion' ? 'ok' : 'brand'}`}><Icon name={o.kind === 'completion' ? 'flag' : 'signpost-split'} /></span><span><b>{o.item.title}</b><span className="small muted d-block">{o.item.owner_login} · {o.kind === 'completion' ? 'reported finished' : 'decision'} · <Ago at={o.at} /></span></span><a href={`#work/${o.item.id}`} className="px-link">Record</a></li>)}</ul>
+        <ul className="g-stories">{recent.slice(0, 12).map((o, i) => <li key={o.seq} style={{ '--i': i } as CSSProperties}><span className={`g-ring tone-${o.kind === 'completion' ? 'ok' : 'brand'}`}><Icon name={o.kind === 'completion' ? 'flag' : 'signpost-split'} /></span><span><b>{o.item.title}</b><span className="small muted d-block">{o.item.owner_login} · {o.kind === 'completion' ? 'reported finished' : 'decision'} · <Ago at={o.at} /></span></span><a href={workHref(o.item.id)} className="px-link">Record</a></li>)}</ul>
       </Box>
       <p className="small muted g-measure"><Icon name="info-circle" /> More history: <a href="#activity">Catch up</a> for what happened since you last looked, <a href="#work/finished">Finished and history</a> for every change.</p>
     </>

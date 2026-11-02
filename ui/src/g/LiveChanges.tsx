@@ -3,14 +3,14 @@
 import { useState } from 'react'
 import { Ago, Avatar, Box, Icon, Notice, PageHead, Pill, Reveal, Skeleton } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
-import { fetchStandupWork, fetchCoordination, type WorkItem } from '../standup.ts'
+import { fetchStandupWork, fetchCoordination, workHref, type WorkItem } from '../standup.ts'
 import { fetchChangeRecord } from '../changeRecord.ts'
 import { httpsOnly, listPublications } from '../publications.ts'
 import { fetchWork } from '../api.ts'
 import { lifecycle } from '../lifecycle.ts'
 import { fetchRuns } from '../skills.ts'
 import { PROOF } from '../proof.ts'
-import { lead } from '../pages/workParts.tsx'
+import { lead, plural } from '../pages/workParts.tsx'
 import { blockedStep, handoverStep, quietStep, who } from '../nextStep.ts'
 import { scrollToAnchor } from '../LifecycleStrip.tsx'
 import { StepAction, useStepActions } from '../NextStep.tsx'
@@ -37,7 +37,7 @@ export function LiveChanges({ live }: { live: LiveProps }) {
   const finished = (ov?.recent ?? []).filter((o) => o.kind === 'completion')
   return (
     <>
-      <PageHead question="Where is each change?" answer={ov ? <>{all.length} unfinished {all.length === 1 ? 'change' : 'changes'}.<br /><span className="g-quiet">{waiting} {waiting === 1 ? 'waits' : 'wait'} on people; the rest {all.length - waiting === 1 ? 'is' : 'are'} moving.</span></> : <>Reading the Hub…</>} />
+      <PageHead question="Where is each change?" answer={ov ? <>{plural(all.length, 'unfinished change')}.<br /><span className="g-quiet">{plural(waiting, 'waits', 'wait')} on people; the rest {all.length - waiting === 1 ? 'is' : 'are'} moving.</span></> : <>Reading the Hub…</>} />
       {ov && !ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
       <div className="g-filters" role="group" aria-label="Show">
         {FILTERS.map((x) => <button key={x.id} type="button" aria-pressed={f === x.id} className={f === x.id ? 'on' : ''} onClick={() => setF(x.id)}>{x.label}<span>{all.filter(x.test).length}</span></button>)}
@@ -48,7 +48,7 @@ export function LiveChanges({ live }: { live: LiveProps }) {
       <div className="g-two">
         <Box icon="flag" title="Recently reported finished" count={finished.length} explain="Reported finished by the agent. That does not confirm review, verification or merge.">
           {finished.length === 0 && <p className="small muted mb-0">Nothing reported finished in this window.</p>}
-          <ul className="g-links">{finished.slice(0, 6).map((o) => <li key={o.seq}><Icon name="flag" /><span><a href={`#work/${o.item.id}`} className="px-link-quiet"><b>{o.item.title}</b></a><small>{o.item.owner_login} · <Ago at={o.at} /></small></span></li>)}</ul>
+          <ul className="g-links">{finished.slice(0, 6).map((o) => <li key={o.seq}><Icon name="flag" /><span><a href={workHref(o.item.id)} className="px-link-quiet"><b>{o.item.title}</b></a><small>{o.item.owner_login} · <Ago at={o.at} /></small></span></li>)}</ul>
           <a href="#work/finished" className="px-link">Finished and history <Icon name="arrow-right" /></a>
         </Box>
         <StartTask token={live.token} me={live.handoff.me} repo={live.handoff.repo} originUrl={live.handoff.originUrl} />
@@ -105,7 +105,7 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
       <header className="g-work-hero" style={{ viewTransitionName: `g-w-${item.id}` }}>
         <div>
           <h1 className="g-work-title">{item.title}</h1>
-          <p className="g-work-context"><Avatar name={`${l.login}-${l.agent}`} size={22} /> {who(l.login, l.agent)}{branch ? <> · <code>{branch}</code></> : null}{prNumber !== null ? <> · {prUrl ? <a href={prUrl} target="_blank" rel="noreferrer noopener">PR #{prNumber}</a> : `PR #${prNumber}`}</> : null} · checked in <Ago at={item.last_checkin_at} /></p>
+          <p className="g-work-context"><Avatar name={l.agent} size={22} /> {who(l.login, l.agent)}{branch ? <> · <code>{branch}</code></> : null}{prNumber !== null ? <> · {prUrl ? <a href={prUrl} target="_blank" rel="noreferrer noopener">PR #{prNumber}</a> : `PR #${prNumber}`}</> : null} · checked in <Ago at={item.last_checkin_at} /></p>
         </div>
       </header>
 
@@ -115,7 +115,7 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
         {acts.primary && <div className="g-acts"><StepAction a={acts.primary} className="btn btn-primary g-cta" /></div>}
       </section>
 
-      <LiveLane at={at} tone={tone} holder={`${l.login}-${l.agent}`} label={`${item.title}: ${STEPS[at]?.label}`} note={stateText(item)} />
+      <LiveLane at={at} tone={tone} holder={l.agent} label={`${item.title}: ${STEPS[at]?.label}`} note={stateText(item)} />
 
       <div className="g-work-grid">
         <div className="g-col">
@@ -140,7 +140,7 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
         <aside className="g-col">
           <Box icon="people" title="People and agents" count={item.participants.length}>
             <ul className="g-people compact">
-              {item.participants.map((p) => <li key={`${p.login}${p.agent}${p.session}`}><Avatar name={`${p.login}-${p.agent}`} size={30} /><span className="g-person"><b>{p.login}</b><span className="small muted">{p.agent} · {p.role}</span></span></li>)}
+              {item.participants.map((p) => <li key={`${p.login}${p.agent}${p.session}`}><Avatar name={p.agent} size={30} /><span className="g-person"><b>{p.login}</b><span className="small muted">{p.agent} · {p.role}</span></span></li>)}
             </ul>
           </Box>
           <Box id="agent-reports" icon="clock-history" title="Latest reports">
@@ -152,7 +152,7 @@ function Change({ item, live }: { item: WorkItem; live: LiveProps }) {
           </Box>
           {acts.more.length > 0 && <Box icon="terminal" title="Other ways to act"><div className="g-acts">{acts.more.map((a) => <StepAction key={a.key} a={a} className="btn btn-sm btn-outline-secondary" />)}</div></Box>}
           {item.depends_on.length + item.related_work.length > 0 && <Box icon="link-45deg" title="Linked work">
-            <ul className="g-links">{[...item.depends_on.map((x) => ['Depends on', x]), ...item.related_work.map((x) => ['Related', x])].map(([k, x]) => <li key={`${k}${x}`}><Icon name="link-45deg" /><span><a href={`#work/${x}`} className="px-link-quiet"><b>{x}</b></a><small>{k}</small></span></li>)}</ul>
+            <ul className="g-links">{[...item.depends_on.map((x) => ['Depends on', x] as const), ...item.related_work.map((x) => ['Related', x] as const)].map(([k, x]) => <li key={`${k}${x}`}><Icon name="link-45deg" /><span><a href={workHref(x)} className="px-link-quiet"><b>{x}</b></a><small>{k}</small></span></li>)}</ul>
           </Box>}
         </aside>
       </div>

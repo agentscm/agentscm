@@ -66,6 +66,7 @@ pub(super) fn routes() -> Router<AppState> {
 #[derive(Clone, Copy)]
 enum Operation {
     Summary,
+    Map,
     Walkthroughs,
     Walkthrough,
     WalkthroughSource,
@@ -84,6 +85,7 @@ impl Operation {
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "summary" => Self::Summary,
+            "map" => Self::Map,
             "walkthroughs" => Self::Walkthroughs,
             "walkthrough" => Self::Walkthrough,
             "walkthrough-source" => Self::WalkthroughSource,
@@ -103,6 +105,7 @@ impl Operation {
     fn fields(self) -> &'static [&'static str] {
         match self {
             Self::Summary => &["ref"],
+            Self::Map => &["commit", "base", "path"],
             Self::Walkthroughs => &["limit"],
             Self::Walkthrough | Self::WalkthroughContext => &["id", "current_head"],
             Self::WalkthroughSource => &["id", "anchor"],
@@ -269,6 +272,11 @@ fn project(
             explorer.evidence.as_ref(),
         )?,
         Operation::Summary => serde_json::to_value(explorer.git.summary(optional("ref"))?)?,
+        Operation::Map => serde_json::to_value(explorer.git.repository_map(
+            required(fields, "commit")?,
+            optional("base"),
+            optional("path"),
+        )?)?,
         Operation::Tree => serde_json::to_value(explorer.git.tree(
             required(fields, "commit")?,
             optional("path"),

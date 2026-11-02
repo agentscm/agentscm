@@ -349,7 +349,7 @@ export function InboxPage({ token, overview, handoff, session = null, live = nul
         const h = plan.handoff
         const outcome = await answerHandoff(session, { token: h.holder.token!, ...(h.holder.session ? { session: h.holder.session } : {}), path: h.path, accept, ...(note && !accept ? { reason: note } : {}) })
         const done = outcome === 'granted' || outcome === 'declined'
-        if (done) setHandoffOverrides((o) => ({ ...o, [h.id]: { ...h, state: outcome, decidedAt: nowSeconds(), reply: note && !accept ? note : null, answeredViaHub: true, requesterTold: false } }))
+        if (done) setHandoffOverrides((o) => ({ ...o, [h.id]: { ...h, state: outcome, decidedAt: nowSeconds(), reply: note && !accept ? note : null, answeredViaHub: true, answeredViaSlack: false, requesterTold: false } }))
         setLocal(t.id, { status: done ? 'sent' : 'error', ...(done ? { done: `Sent as your ${agentName(h.holder.agent)}: ${accept ? 'handed it over' : 'kept it'}. ${h.requester.login}’s agent sees it at its next edit.` } : { message: OUTCOME_SENTENCE[outcome] }) })
       }
     } catch (e) {

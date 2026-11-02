@@ -4626,14 +4626,15 @@ fn handoffs_in(
                     agent: row.get(3)?,
                     login: row.get(4)?,
                     session: session.to_owned(),
-                    hub: row.get(5)?,
+                    via: Via::stored(row.get(5)?, false),
                 },
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let answers = tx
         .prepare_cached(
-            "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub
+            "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
+                    h.answered_via_slack
              FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
              JOIN hub_users u ON u.id = t.owner
              WHERE h.requester_token = ?1 AND h.requester_session = ?2
@@ -4651,7 +4652,7 @@ fn handoffs_in(
                     agent: row.get(3)?,
                     login: row.get(4)?,
                     session: session.to_owned(),
-                    hub: row.get(6)?,
+                    via: Via::stored(row.get(6)?, row.get(7)?),
                 },
             ))
         })?
@@ -6128,14 +6129,16 @@ impl Store for SqliteStore {
             touch_in(&tx, &requester_who, &check(&call)?, now)?;
         }
         tx.execute(
-            "UPDATE hub_handoffs SET state = ?2, decided_at = ?3, reply = ?4, answered_via_hub = ?5
+            "UPDATE hub_handoffs SET state = ?2, decided_at = ?3, reply = ?4, answered_via_hub = ?5,
+                 answered_via_slack = ?6
              WHERE id = ?1",
             params![
                 request.id,
                 if accept { "granted" } else { "declined" },
                 now,
                 reason,
-                via.hub()
+                via.hub(),
+                via.slack()
             ],
         )?;
         let kind = if accept {
@@ -6173,7 +6176,8 @@ impl Store for SqliteStore {
             "SELECT h.id, h.path, h.state, h.note, h.reply, h.created_at, h.decided_at,
                     h.holder_told, h.requester_told, h.asked_via_hub, h.answered_via_hub,
                     h.requester_token, h.requester_session, rt.name, rt.owner, ru.login,
-                    h.holder_token, h.holder_session, ht.name, ht.owner, hu.login
+                    h.holder_token, h.holder_session, ht.name, ht.owner, hu.login,
+                    h.answered_via_slack
              FROM hub_handoffs h
              JOIN hub_agent_tokens rt ON rt.id = h.requester_token
              JOIN hub_users ru ON ru.id = rt.owner
@@ -6199,6 +6203,7 @@ impl Store for SqliteStore {
                         requester_told: row.get(8)?,
                         asked_via_hub: row.get(9)?,
                         answered_via_hub: row.get(10)?,
+                        answered_via_slack: row.get(21)?,
                         requester: HandoffParty {
                             token: row.get(11)?,
                             session: row.get(12)?,
@@ -7978,6 +7983,35 @@ impl Store for SqliteStore {
             HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
         })?;
         if expected != item.updated_seq {
+            // A missing receipt alone is not proof of noncommit: compaction can
+            // remove it while retaining its baseline snapshot. Deleted events
+            // are covered by the repository floor; retained snapshots need an
+            // explicit missing-receipt check. Both reads share the write transaction.
+            let event_floor: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(event_floor_seq),0) FROM hub_work_retention
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_id IS ?4",
+                params![
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    item.repository,
+                    who.repository_id
+                ],
+                |row| row.get(0),
+            )?;
+            let missing_receipt: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_work_versions v
+                 JOIN hub_events e ON e.seq=v.event_seq
+                 WHERE v.work=?1 AND v.event_seq>?2 AND e.kind='work_checkpoint'
+                 AND NOT EXISTS(SELECT 1 FROM hub_work_checkpoint_ops o
+                     WHERE o.work=v.work AND o.event_seq=v.event_seq))",
+                params![item.id, expected],
+                |row| row.get(0),
+            )?;
+            if expected >= event_floor && !missing_receipt {
+                return Err(HubError::WorkCheckpointSequenceConflict {
+                    current_seq: item.updated_seq,
+                });
+            }
             return Err(HubError::Invalid(format!(
                 "checkpoint receipt expired or work changed; current updated_seq is {}",
                 item.updated_seq

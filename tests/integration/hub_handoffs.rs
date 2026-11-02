@@ -847,7 +847,7 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     // Alice's agent is told at its next touch, and the line names a person, not the agent.
     let told = touch(&*store, &alice, "ha", &[], T0 + 3);
     assert_eq!(told.handoffs.len(), 1);
-    assert!(told.handoffs[0].hub && told.handoffs[0].kind == "request");
+    assert!(told.handoffs[0].via == Via::Hub && told.handoffs[0].kind == "request");
 
     // Each person reads their own side, with a third person seeing nothing.
     let (alice_owner, bob_owner) = (owner_of(&*store, 1), owner_of(&*store, 2));
@@ -886,7 +886,7 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     assert_eq!(events(&*store, "handoff_grant")[0].1["via"], "hub");
     let heard = touch(&*store, &bob, "hb", &[A], T0 + 6);
     assert_eq!(heard.handoffs.len(), 1);
-    assert!(heard.handoffs[0].hub && heard.handoffs[0].kind == "grant");
+    assert!(heard.handoffs[0].via == Via::Hub && heard.handoffs[0].kind == "grant");
     let alices = store
         .handoffs_of_owner(&alice_owner, REPO, T0 + 7, 10)
         .unwrap();
@@ -915,6 +915,46 @@ fn a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told(db: &Db) 
     assert!(all[2].1.get("via").is_none());
 }
 
+fn a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    touch(&*store, &alice, "ha", &[A], T0);
+    touch_silent(&*store, &bob, "hb", T0 + 1);
+    let asked = store
+        .ask_handoff(&bob.token, Some("hb"), A, Some("need it"), T0 + 2)
+        .unwrap();
+    assert!(matches!(asked, Asked::Requested { .. }), "{asked:?}");
+
+    // Alice keeps the file with a Slack button: neither "from the Hub" nor the agent's own word.
+    let kept = store
+        .answer_handoff_via(
+            &alice.token,
+            Some("ha"),
+            A,
+            (false, None),
+            Via::Slack,
+            T0 + 3,
+        )
+        .unwrap();
+    assert!(matches!(kept, Answered::Declined { .. }), "{kept:?}");
+    assert_eq!(events(&*store, "handoff_decline")[0].1["via"], "slack");
+    let heard = touch(&*store, &bob, "hb", &[], T0 + 4);
+    assert_eq!(heard.handoffs.len(), 1);
+    assert!(heard.handoffs[0].via == Via::Slack && heard.handoffs[0].kind == "decline");
+    let alices = store
+        .handoffs_of_owner(&owner_of(&*store, 1), REPO, T0 + 5, 10)
+        .unwrap();
+    assert_eq!(
+        (
+            alices[0].state,
+            alices[0].answered_via_hub,
+            alices[0].answered_via_slack
+        ),
+        ("declined", false, true)
+    );
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -930,6 +970,7 @@ macro_rules! conformance {
 
 conformance!(
     a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told,
+    a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told,
     a_grant_moves_the_file_and_is_told_once,
     a_decline_is_told_once_and_the_retry_passes,
     a_decline_reason_is_filtered_and_told_once,

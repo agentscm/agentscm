@@ -79,11 +79,14 @@ The flags `--hub-url`, `--yes`, `--only`, `--dry-run` and `--json` are the ones 
 | `--agent claude\|codex\|cursor\|copilot\|gemini` | Set up this coding agent (repeatable; alias of `--only`). Default: every detected agent on supported Unix hosts. |
 | `--no-agents` | Do not set up any coding agent. |
 | `--slack-config-file ABSOLUTE_PATH` | Install a prepared private Slack bundle into a managed local Hub. See [Slack setup](slack.md). Requires `--hub local`; `--yes` alone never enables it. |
-| `--provider github\|gitlab` | Forge to sign in with (default: from `origin`). |
+| `--provider github\|gitlab` | Forge to sign in with (inferred from `github.com` or `gitlab.com`; select explicitly for a self-managed forge, including nested GitLab groups). |
 | `--github-login LOGIN` | Your GitHub login for the local hub's administrator. With `--yes` it is required unless `gh api user` works; an unverified `git config github.user` is only offered in the interactive prompt. |
 | `--init` | Also run `agentscm init-repo` for this repository. Without it, quickstart writes nothing to the repository. |
 | `--tray` | On macOS, open the optional status-bar companion after setup succeeds. `--yes` does not open it unless this flag is present. |
 | `--no-collisions` | Skip the collision check. |
+
+Quickstart's origin detection ignores URLs containing passwords, HTTPS userinfo, queries or fragments.
+Use SSH or an HTTPS credential helper instead of embedding credentials in the origin URL.
 
 With `--yes` or without a terminal quickstart never starts a browser or device sign-in. If there is no saved sign-in, or the hub no longer accepts it (it expired, or the hub restarted), quickstart says so at once and sets up no agent: run it at a terminal, or pass `--agent-token-file`. A new local hub still requires GitHub App setup in a browser; `--yes` prints the link and returns exit status **3** without waiting. Finish that step, then resume with the printed command, which includes the runtime, port and project. Exit status **0** means the requested setup completed; other failures exit non-zero.
 

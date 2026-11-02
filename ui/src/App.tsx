@@ -41,6 +41,7 @@ import { InstallOffer } from './InstallOffer.tsx'
 import { useAppBadge } from './install.ts'
 import { hashPath } from './Pager.tsx'
 import { GLive } from './g/GLive.tsx'
+import { gAnswer } from './g/answers.tsx'
 import { useLayout } from './g/layout.ts'
 import { needsYou } from './needs.ts'
 
@@ -210,7 +211,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
       case 'now':
       case 'activity':
       case 'team':
-        return <DashboardPage section={s} question={SECTIONS.find((x) => x.key === s)!.question} token={token} repo={repo} data={data} d={d} overview={overview} />
+        return <DashboardPage section={s} question={SECTIONS.find((x) => x.key === s)!.question} token={token} repo={repo} data={data} d={d} overview={overview} answer={layout === 'g' ? gAnswer(s, d, data.activity?.events ?? null, data.lastOk) : undefined} />
       case 'inbox':
         return <InboxPage token={token} overview={overview} handoff={handoff} session={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session : null} live={d ? { agents: d.agents, contested: d.contested } : null} />
       case 'work':
@@ -261,7 +262,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     return (
       <LocalComputerProvider token={isLocalCredential(token) ? token : null}>
         <ComputerNotices />
-        <GLive live={{ token, repo, data, d, overview, needs, handoff }} section={section} page={page} showAdmin={!!showAdmin} hubSignedOut={hubSignedOut} onClassic={() => setLayout('classic')} banner={banner} />
+        <GLive live={{ token, repo, data, d, overview, needs, handoff }} section={section} sections={sections} page={page} showAdmin={!!showAdmin} hubSignedOut={hubSignedOut} onClassic={() => setLayout('classic')} banner={banner} />
       </LocalComputerProvider>
     )
   }

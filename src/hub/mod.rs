@@ -5,6 +5,7 @@ mod catchup_sync;
 pub mod change_record;
 pub mod change_record_http;
 pub mod connection;
+pub mod continuity;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
@@ -95,6 +96,12 @@ pub enum HubError {
     /// Atomic admission found that an explicitly supplied source/merge preflight is not clear.
     /// The structured evidence is returned to the caller and no new Work is claimed.
     WorkPreflight(Box<work_preflight::WorkPreflightResult>),
+    /// Exact checkpoint operation was absent and cannot have been compacted,
+    /// then its expected Work sequence was stale. Emitted only after operation-ID
+    /// replay, current lead/generation checks and retained-history proof.
+    WorkCheckpointSequenceConflict {
+        current_seq: i64,
+    },
     /// Internal detail for the operator's stderr only; never sent to a client.
     Unavailable(String),
 }
@@ -119,6 +126,10 @@ impl fmt::Display for HubError {
                 write!(f, "work overlap scan is incomplete; claim refused")
             }
             Self::WorkPreflight(_) => write!(f, "work preflight requires review; claim refused"),
+            Self::WorkCheckpointSequenceConflict { current_seq } => write!(
+                f,
+                "checkpoint was not committed because work changed; current updated_seq is {current_seq}"
+            ),
             Self::Unavailable(message) => write!(f, "unavailable: {message}"),
         }
     }
@@ -430,6 +441,7 @@ pub fn router(state: HubState) -> Router {
         .merge(slack::routes())
         .merge(change_record_http::routes())
         .merge(pr_context::routes())
+        .merge(continuity::routes())
         .merge(promise_http::routes())
         .merge(skills::routes())
         .merge(work_http::routes())

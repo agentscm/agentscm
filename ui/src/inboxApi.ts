@@ -36,6 +36,8 @@ export interface MyHandoff {
   requesterTold: boolean
   askedViaHub: boolean
   answeredViaHub: boolean
+  /** The answer came from a Slack button, not the agent or the Hub's pages. */
+  answeredViaSlack: boolean
   requester: HandoffSide
   holder: HandoffSide
 }
@@ -82,6 +84,7 @@ export function decodeHandoffs(raw: unknown): MyHandoff[] {
       requesterTold: h['requester_told'] === true,
       askedViaHub: h['asked_via_hub'] === true,
       answeredViaHub: h['answered_via_hub'] === true,
+      answeredViaSlack: h['answered_via_slack'] === true,
       requester,
       holder,
     })

@@ -299,6 +299,11 @@ impl From<HubError> for ApiError {
     fn from(error: HubError) -> Self {
         match error {
             HubError::Invalid(_) => Self::invalid(),
+            HubError::WorkCheckpointSequenceConflict { current_seq } => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_checkpoint_sequence_conflict",
+                detail: serde_json::Map::from_iter([("current_seq".into(), json!(current_seq))]),
+            },
             HubError::Unauthorized => Self::unauthorized(),
             HubError::Busy => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -579,6 +584,32 @@ mod tests {
         assert!(parse(r#"{"name":"a"}"#).await.is_ok());
         let error = parse(r#"{"name":"a","extra":1}"#).await.err().unwrap();
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_definite_rejection_has_a_distinct_code_from_uncertain_conflicts() {
+        let response = ApiError::from(HubError::WorkCheckpointSequenceConflict { current_seq: 17 })
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error":"work_checkpoint_sequence_conflict", "current_seq":17})
+        );
+        let uncertain = ApiError::from(HubError::Invalid(
+            "checkpoint receipt expired or work changed".into(),
+        ))
+        .into_response();
+        assert_eq!(uncertain.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(uncertain.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error":"invalid_request"})
+        );
     }
 
     #[tokio::test]

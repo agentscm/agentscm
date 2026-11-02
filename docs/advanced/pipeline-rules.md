@@ -265,5 +265,11 @@ controller executable or subscription credentials. Restored work can remain
 blocked until the operator supplies the same pinned files and locally available
 Git objects; it never fetches, authenticates or runs automatically. Unsupported
 schemas, untagged earlier development journals, damaged tables and inconsistent
-payloads fail closed. No deployed-format migration is claimed for
-this experimental journal.
+payloads fail closed. Opening a schema 1 journal migrates it transactionally to
+schema 2, which adds [operating-policy](operating-policy.md) contracts, decisions
+and reservations. Backup, verification and restore accept both exact schemas and
+preserve the saved version; opening a restored schema 1 journal then migrates it.
+Older binaries reject schema 2, and no downgrade is provided. Take a consistent
+backup before upgrading valuable state. This remains an experimental journal;
+the migration and restore checks are local qualification, not a deployed-service
+upgrade guarantee.

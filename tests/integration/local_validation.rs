@@ -981,7 +981,7 @@ fn repository_policy_and_recipe_keep_their_canonical_bytes() {
     let policy = ValidationPolicy::from_slice(&policy_bytes).unwrap();
     assert_eq!(
         recipe.sha256().unwrap(),
-        "861a8d7f5eccc82b89bd4e06a6460cef6c7b7dcbeb67af39e2248d1a5f705504"
+        "785f621dac4fec9c34fd23d201ac4a7de164ff769280dba72b9a3c9d656240ef"
     );
     assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
     assert_eq!(
@@ -1177,6 +1177,67 @@ mod scoped {
         assert_eq!(required(d.path(), &b, &h), ["always", "docs"]);
         let (d, b, h) = repo(|p| write(p, "src/a.rs"));
         assert_eq!(required(d.path(), &b, &h), ["always", "rust"]);
+    }
+
+    #[test]
+    fn repository_recipe_selects_local_checks_from_real_git_changes() {
+        let recipe = ValidationRecipe::from_slice(include_bytes!(
+            "../../.github/local-validation/recipe.json"
+        ))
+        .unwrap();
+        let cases: &[(&str, &[&str])] = &[
+            ("src/a.rs", &[]),
+            (
+                "ui/src/example.tsx",
+                &["ui-install", "ui-lint", "ui-build", "ui-notices"],
+            ),
+            ("install.sh", &["shellcheck", "npm-installer"]),
+            (
+                "docs/example.md",
+                &["docs-install", "docs-audit", "docs-build", "docs-check"],
+            ),
+            (".github/workflows/zizmor.yml", &["workflow-lint"]),
+            ("tools/portable-verifier/Cargo.lock", &["deny-portable"]),
+            ("deny.toml", &["deny", "deny-portable"]),
+            (
+                "Cargo.toml",
+                &[
+                    "deny",
+                    "release-fmt",
+                    "release-dir",
+                    "release-test-build",
+                    "release-test",
+                    "release-build",
+                    "release-check",
+                ],
+            ),
+        ];
+        for (path, extra) in cases {
+            let (dir, base, head) = repo(|p| write(p, path));
+            let mut expected = vec!["fmt", "clippy", "nextest", "doctest"];
+            expected.extend_from_slice(extra);
+            assert_eq!(
+                required_commands(dir.path(), &base, &head, &recipe, &trust()).unwrap(),
+                expected,
+                "{path}"
+            );
+        }
+        for path in [
+            ".github/local-validation/recipe.json",
+            ".github/local-validation/policy.json",
+            DEFAULT_VERIFIER_WORKFLOW,
+        ] {
+            let (dir, base, head) = repo(|p| write(p, path));
+            assert_eq!(
+                required_commands(dir.path(), &base, &head, &recipe, &trust()).unwrap(),
+                recipe
+                    .commands
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>(),
+                "{path}"
+            );
+        }
     }
 
     #[test]
