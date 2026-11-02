@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Contested, Derived } from '../../src/derive.ts'
-import { areaOf, areas, needsYou } from '../../src/needs.ts'
+import { areaOf, areas, inboxBadge, needsYou } from '../../src/needs.ts'
 import type { CoordinationRequest, WorkItem, WorkOverview } from '../../src/standup.ts'
 
 const item = (id: string, over: Partial<WorkItem>): WorkItem =>
@@ -46,6 +46,13 @@ describe('a request to an idle task', () => {
     expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ responses: [reply] })], me: 'dev' }).map((n) => n.kind)).toEqual(['quiet'])
     expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ status: 'withdrawn' })], me: 'dev' }).map((n) => n.kind)).toEqual(['quiet'])
     expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request()], me: 'maria' }).map((n) => n.kind)).toEqual(['quiet'])
+  })
+  it('the Inbox badge counts overlaps and every unanswered request to the viewer’s agents, running or not', () => {
+    const reply = { target_work_id: 'mine', target_generation: 1, seq: 9 } as unknown as CoordinationRequest['responses'][number]
+    const ov = overview([item('mine', { owner_login: 'dev' })], [{}] as unknown as WorkOverview['overlaps'])
+    expect(inboxBadge(ov, { requests: [request(), request({ id: 'crq_2', responses: [reply] }), request({ id: 'crq_3', status: 'resolved' })], me: 'dev' })).toEqual({ n: 2, tip: '1 overlap to talk about · 1 request waiting on you' })
+    expect(inboxBadge(ov, { requests: [request()], me: 'maria' })).toEqual({ n: 1, tip: '1 overlap to talk about' })
+    expect(inboxBadge(null, undefined)).toEqual({ n: 0, tip: '' })
   })
 })
 

@@ -7,7 +7,7 @@ import { fragmentLinkRefused, LINK_REFUSED } from './fragmentToken.ts'
 import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, signInAfterRefusal, type Density, type ThemePref } from './storage.ts'
 import { useHub } from './useHub.ts'
 import { useHidden } from './dismiss.tsx'
-import { needHideKey, needsYou, type Asked } from './needs.ts'
+import { inboxBadge, needHideKey, needsYou, type Asked } from './needs.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
@@ -175,7 +175,8 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
   useAppBadge(hubSignedOut ? 0 : dash.needs.length)
   const badges: Badges = {}
   if (dash.needs.length > 0) badges.home = { n: dash.needs.length, tone: dash.needs.some((n) => n.tone === 'bad') ? 'bad' : 'warn', tip: `${dash.needs.length} thing${dash.needs.length === 1 ? ' needs' : 's need'} you` }
-  if (ov && ov.overlaps.length > 0) badges.inbox = { n: ov.overlaps.length, tone: 'warn', tip: `${ov.overlaps.length} overlap${ov.overlaps.length === 1 ? '' : 's'} to talk about` }
+  const inbox = inboxBadge(ov, asked)
+  if (inbox.n > 0) badges.inbox = { n: inbox.n, tone: 'warn', tip: inbox.tip }
   const finished = ov?.recent.filter((o) => o.kind === 'completion').length
   const statuses: TabStatuses = {
     home: dash.home,
@@ -267,7 +268,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     return (
       <LocalComputerProvider token={isLocalCredential(token) ? token : null}>
         <ComputerNotices />
-        <GLive live={{ token, repo, data, d, overview, needs, handoff }} section={section} sections={sections} page={page} showAdmin={!!showAdmin} hubSignedOut={hubSignedOut} onClassic={() => setLayout('classic')} banner={banner} />
+        <GLive live={{ token, repo, data, d, overview, needs, inbox, handoff }} section={section} sections={sections} page={page} showAdmin={!!showAdmin} hubSignedOut={hubSignedOut} onClassic={() => setLayout('classic')} banner={banner} />
       </LocalComputerProvider>
     )
   }

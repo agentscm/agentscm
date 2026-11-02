@@ -71,6 +71,15 @@ export function needsYou(ov: WorkOverview | null, d: Derived | null, asked?: Ask
   return out.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || b.at - a.at)
 }
 
+/** What the Inbox badge counts: overlaps to talk about, and open requests to the viewer's agents that they have not answered. */
+export function inboxBadge(ov: WorkOverview | null, asked?: Asked): { n: number; tip: string } {
+  const overlaps = ov?.overlaps.length ?? 0
+  const me = asked?.me
+  const waiting = me == null ? 0 : (asked?.requests ?? []).filter((r) => pending(r) && r.targets.some((t) => t.lead.login === me && !currentResponse(r, t))).length
+  const parts = [overlaps ? `${overlaps} overlap${overlaps === 1 ? '' : 's'} to talk about` : '', waiting ? `${waiting} request${waiting === 1 ? '' : 's'} waiting on you` : '']
+  return { n: overlaps + waiting, tip: parts.filter(Boolean).join(' · ') }
+}
+
 /** When a need last changed: its own time or its task's last update, whichever is newer. */
 export const needUpdatedAt = (n: Need): number => Math.max(n.at, n.item?.updated_at ?? 0)
 /** The browser-only hide key: a need that changes gets a new key, so it shows again. */
