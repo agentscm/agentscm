@@ -48,6 +48,45 @@ describe('MCP views Twilight restyle', () => {
     expect(root.querySelector('input')).toBeNull()
   })
 
+  it('overview names no tool but its own', () => {
+    const names = new Set((files.overview.match(/agentscm_[a-z_]+/g) ?? []).filter((n) => n !== 'agentscm_view_settings'))
+    expect([...names]).toEqual(['agentscm_work_overview'])
+  })
+
+  it('overview folds only All work and points to the Hub for catch-up', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, {
+      current: [item({})], recent: [], overlaps: [], current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false,
+    }, new Date())
+    const folds = root.querySelectorAll('details.f')
+    expect(folds).toHaveLength(1)
+    expect(folds[0]!.textContent).toContain('All work')
+    for (const text of ['merge observation', 'Mark reviewed', 'Briefing', 'Load more']) expect(root.textContent).not.toContain(text)
+    expect(root.textContent).toContain('Hub › Dashboard › Catch up')
+  })
+
+  it('starting the overview posts no tool call and schedules no timers', () => {
+    const script = new DOMParser().parseFromString(files.overview, 'text/html').querySelector('script')!.textContent!
+    const posted: { method?: string }[] = []
+    const stub = { parent: { postMessage: (m: { method?: string }) => posted.push(m) }, addEventListener: () => {} }
+    document.body.innerHTML = '<div id="app"></div>'
+    new Function('window', 'document', 'ResizeObserver', script)(stub, document, undefined)
+    expect(posted.length).toBeGreaterThan(0)
+    expect(posted.filter((m) => m.method === 'tools/call')).toEqual([])
+    expect(script).not.toMatch(/setTimeout|setInterval/)
+  })
+
+  it.each([{ overlaps_complete: false, current_complete: true }, { overlaps_complete: true, current_complete: false }])(
+    'overview does not claim nothing needs a person on partial data %o',
+    (flags) => {
+      const { render } = load(files.overview)
+      const root = document.getElementById('app')!
+      render(root, { current: [], recent: [], overlaps: [], recent_complete: true, history_retention_gap: false, ...flags }, new Date())
+      expect(root.querySelector('.big')!.textContent).not.toContain('Nothing needs a person.')
+    },
+  )
+
   it('inbox shows the track, withdrawn state, two path chips and folded history', () => {
     const { render } = load(files.inbox)
     const root = document.getElementById('app')!
