@@ -366,6 +366,7 @@ mod tests {
             recent_complete: true,
             overlaps_complete: true,
             history_retention_gap: false,
+            settled_count: 0,
         }
     }
     fn row(number: i64, head: &str, paths: &[&str]) -> Observation {

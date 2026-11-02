@@ -87,7 +87,7 @@ var big=h('p','big');add(big,plural(working,'agent')+' working. ');
 if(rows.length)add(big,h('em',null,plural(rows.length,'thing needs','things need')+' a person.'));else add(big,d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing needs a person.');
 add(root,big);
 if(rows.length){var ul=h('ul','needs');rows.forEach(function(x){var li=h('li');add(li,ic(x.icon,x.tone),h('span','t',x.t),h('span','s',x.s));ul.appendChild(li)});add(root,ul)}
-var all=fold('all','All work',plural(cur.length,'task')+' · '+rec.length+' finished recently'),wl=h('ul','w');
+var all=fold('all','All work',plural(cur.length,'task')+' · '+rec.length+' finished recently'+(d.settled_count>0?' · '+d.settled_count+' with a merged PR':'')),wl=h('ul','w');
 if(!cur.length)add(all,h('p','note','No current work reported.'));
 cur.forEach(function(i){var st=own(STATE,i.state)?STATE[i.state]:[String(i.state),'move',''];wl.appendChild(workRow(i,st[0],st[2],who(i)+(i.owner_login?' for '+clip(i.owner_login):'')+(i.next_action?' · Next: '+clip(i.next_action):'')+(i.claim_status!=='active'?' · Claim '+i.claim_status+', stays claimed':'')+' · '+ago(i.last_checkin_at)))});
 if(cur.length)add(all,wl);

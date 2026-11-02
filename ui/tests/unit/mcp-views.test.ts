@@ -66,6 +66,17 @@ describe('MCP views Twilight restyle', () => {
     expect(root.textContent).toContain('Hub › Catch up')
   })
 
+  it('overview says how many unfinished items are not listed because their branch merged', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    const data = { current: [item({})], recent: [], overlaps: [], current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false }
+    render(root, { ...data, settled_count: 2 }, new Date())
+    expect(root.querySelector('details.f')!.textContent).toContain('1 task · 0 finished recently · 2 with a merged PR')
+    root.textContent = ''
+    render(root, data, new Date())
+    expect(root.textContent).not.toContain('merged PR')
+  })
+
   it('starting the overview posts no tool call and schedules no timers', () => {
     const script = new DOMParser().parseFromString(files.overview, 'text/html').querySelector('script')!.textContent!
     const posted: { method?: string }[] = []

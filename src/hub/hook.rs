@@ -890,7 +890,7 @@ async fn pause_known_work(
         expected_updated_seq: Some(item.updated_seq),
         session,
         kind: CheckpointKind::Pause,
-        summary: "Session ended without a reported final work outcome.".into(),
+        summary: super::work::AUTO_PAUSE_SUMMARY.into(),
         next_action: item
             .next_action
             .or_else(|| Some("Resume or deliberately hand over this unfinished work.".into())),

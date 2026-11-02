@@ -93,6 +93,7 @@ describe('Since you last checked', () => {
       recent_complete: true,
       overlaps_complete: true,
       history_retention_gap: false,
+      settled_count: 0,
     }
     vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}))
     window.location.hash = '#activity'

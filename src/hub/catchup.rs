@@ -107,6 +107,9 @@ pub struct NewCatchupMerge {
     pub pull_number: i64,
     pub paths: Vec<String>,
     pub paths_complete: bool,
+    /// The pull request's head branch lives in the repository it merged into. A fork's branch
+    /// name says nothing about same-named Work here, so it never settles Work.
+    pub same_repository_head: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -507,6 +510,7 @@ pub(super) fn tracked_publication_merge(
             .ok_or_else(|| HubError::Unavailable("merged publication lacks pull request".into()))?,
         paths,
         paths_complete,
+        same_repository_head: true,
     };
     merge.validate(observed_at)?;
     Ok(merge)

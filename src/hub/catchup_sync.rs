@@ -392,6 +392,11 @@ fn projection(
         _ => return Err(invalid()),
     };
     let number = pull["number"].as_i64().ok_or_else(invalid)?;
+    // Missing or null identities are unknown, which is not the same repository.
+    let same_repository_head = match conn.provider.as_str() {
+        "gitlab" => same_id(&pull["source_project_id"], &pull["target_project_id"]),
+        _ => same_id(&pull["head"]["repo"]["id"], &pull["base"]["repo"]["id"]),
+    };
     let merge = NewCatchupMerge {
         source: CatchupMergeSource::ForgePull,
         source_id: format!("pull:{number}"),
@@ -404,9 +409,14 @@ fn projection(
         pull_number: number,
         paths,
         paths_complete,
+        same_repository_head,
     };
     merge.validate(observed_at).map_err(failure)?;
     Ok(merge)
+}
+
+fn same_id(head: &Value, base: &Value) -> bool {
+    head.as_i64().is_some() && head.as_i64() == base.as_i64()
 }
 
 fn failure(error: HubError) -> GhError {
@@ -483,6 +493,36 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn projection_marks_a_head_in_the_same_repository() {
+        let same = |provider: &str, edit: &dyn Fn(&mut Value)| {
+            let (connection, repository) = identities(provider);
+            let mut body = pull();
+            edit(&mut body);
+            projection(
+                &connection,
+                &repository,
+                &body,
+                Vec::new(),
+                true,
+                1_800_000_000,
+            )
+            .unwrap()
+            .same_repository_head
+        };
+        // GitHub compares the head and base repository ids.
+        assert!(same("github", &|b| b["head"]["repo"] = json!({"id": 42})));
+        assert!(!same("github", &|b| b["head"]["repo"] = json!({"id": 7})));
+        // A deleted fork, or a pull without the identity, is not known to be the same repository.
+        assert!(!same("github", &|b| b["head"]["repo"] = Value::Null));
+        assert!(!same("github", &|_| {}));
+        // GitLab compares the source and target project ids.
+        assert!(same("gitlab", &|b| b["source_project_id"] = json!(42)));
+        assert!(!same("gitlab", &|b| b["source_project_id"] = json!(7)));
+        assert!(!same("gitlab", &|b| b["source_project_id"] = Value::Null));
+        assert!(!same("gitlab", &|_| {}));
     }
 
     #[test]

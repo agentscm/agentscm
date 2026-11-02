@@ -145,6 +145,8 @@ export interface WorkOverview {
   recent_complete: boolean
   overlaps_complete: boolean
   history_retention_gap: boolean
+  /** Unfinished Work hidden because its branch has a merged pull request. Not finished. */
+  settled_count: number
 }
 
 export interface CoordinationAgent {
@@ -553,6 +555,7 @@ export function decodeOverview(value: unknown): WorkOverview {
   const recentComplete = bool(item['recent_complete'], 'overview.recent_complete')
   const overlapsComplete = bool(item['overlaps_complete'], 'overview.overlaps_complete')
   const historyRetentionGap = bool(item['history_retention_gap'], 'overview.history_retention_gap')
+  const settledCount = item['settled_count'] === undefined ? 0 : safeInteger(item['settled_count'], 'overview.settled_count')
   if (overlapsComplete && !currentComplete) fail('overview.overlaps_complete')
   if (historyRetentionGap && recentComplete) fail('overview.recent_complete')
   return {
@@ -565,6 +568,7 @@ export function decodeOverview(value: unknown): WorkOverview {
     recent_complete: recentComplete,
     overlaps_complete: overlapsComplete,
     history_retention_gap: historyRetentionGap,
+    settled_count: settledCount,
   }
 }
 

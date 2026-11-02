@@ -8,7 +8,7 @@ title: "Asynchronous agent stand-up"
 
 The Hub keeps durable engineering work separate from short-lived sessions and file intents. Before starting a task, an agent can retrieve:
 
-- the current unfinished work for the token's repository, including old, stale and unknown claims;
+- the current unfinished work for the token's repository, including old, stale and unknown claims, except Work whose branch has a merged pull request (see [Work with a merged pull request](#work-with-a-merged-pull-request));
 - an ordered, bounded change history since this agent token and subscriber/session last acknowledged a briefing; and
 - blockers, decisions, next actions, participants, dependencies and related work reported at checkpoints.
 
@@ -53,14 +53,30 @@ The first briefing page fixes an upper event watermark. Continue with the exact 
 
 The response contains two independent sections:
 
-- `items`: a page from the current unfinished-work snapshot. Work created before the acknowledgement boundary still appears here.
+- `items`: a page from the current unfinished-work snapshot, without Work that has a merged pull request. Work created before the acknowledgement boundary still appears here.
 - `events`: ordered changes after the previous acknowledged cursor and no later than the fixed watermark.
 
 `retention_gap: true` means some requested history is no longer retained. Do not turn that gap into an empty or complete history claim. A writable agent briefing has a delivery identifier. Acknowledge it only after every page was delivered successfully; acknowledgement advances only that token and subscriber/session's boundary for the repository. Repeat `subscriber` on each continuation; the delivery records which subscriber an acknowledgement advances. Separate sessions cannot consume each other's recap when they use distinct subscriber identities. Omitting `subscriber` on the HTTP API keeps a token-level compatibility cursor. MCP and supported startup hooks resolve the current session automatically. A read-only token receives authorized inspection data without a delivery identifier and cannot acknowledge or mutate work.
 
-The Hub spreads this across three places. **Dashboard › Now** lists what needs a person, then every unfinished task as one lane (claimed, where it is now with its lead, its next step, finished) with the lead's latest report. **History › Finished** uses a server-reported time window, independent of acknowledgement, and includes actual reported completion and decision checkpoints. The **Inbox** shows durable directed requests, per-lead receipt and reply state, and recorded resolutions. Detected scope overlaps are listed separately there: detection alone is not delivery or resolution.
+The Hub spreads this across three places. **Dashboard › Now** lists what needs a person, then every listed unfinished task as one lane (claimed, where it is now with its lead, its next step, finished) with the lead's latest report. **History › Finished** uses a server-reported time window, independent of acknowledgement, and includes actual reported completion and decision checkpoints. The **Inbox** shows durable directed requests, per-lead receipt and reply state, and recorded resolutions. Detected scope overlaps are listed separately there: detection alone is not delivery or resolution.
 
 The dashboard reads current Work without changing assignments or acknowledging coordination requests or agent briefings. Its separate personal catch-up panel advances only the signed-in person’s review position after an explicit action. Each bounded section states its completeness; request pages retain their fixed upper watermark, and Change history retains the briefing cursor tuple. Stale and unknown claims remain assigned. Finished work carries no assignment claim and does not imply tests, review or merge.
+
+### Work with a merged pull request
+
+When a Work item's branch has a merged pull request, the Hub stops listing it as current work in the overview, briefings, the session-start recap and the dashboard (all read the same overview). This is a read-time filter. The Work record, its state and its history are unchanged, and it stays available through `work_get`, search and history. "Settled" never means finished: the overview reports `settled_count`, and the MCP overview view says "with a merged PR".
+
+An item is hidden only when all of these hold:
+
+- its branch matches a merged pull request observed from the same repository (a fork's branch name does not count) at or after the item's last check-in, and the branch is not the base of any observed merge, so default and release branches never hide;
+- it is not blocked and has no unresolved blocker; and
+- a check-in after the merge has not brought it back. A resumed paused item returns once its owner checks in or takes it over. An item paused automatically at session end is hidden by any observed merge of its branch since it was created.
+
+Limits:
+
+- The Hub needs merge observations. With none, nothing is hidden, and a repository whose merges are not synced keeps every item visible.
+- Merges observed before this rule existed carry no head-repository information. They hide matching items, including a fork's same-named branch, until the next check-in.
+- Hiding does not release anything. Scope admission, conflict checks, coordination requests, held files and preflight still treat a hidden item as unfinished, so a start can conflict with an item the overview no longer lists. Use `work_get` or search to find it.
 
 ### Since you last checked
 
@@ -231,7 +247,7 @@ An incomplete merge path inventory does not block source freshness when the sour
 
 ## Before work and after an overlap
 
-1. Read `agentscm_work_overview` (or `agentscm work overview`) before planning. It shows unfinished assignments, declared overlaps, and reported outcomes in the last 24 hours by default. `recent_since` selects another starting time. A compacted history is explicitly incomplete.
+1. Read `agentscm_work_overview` (or `agentscm work overview`) before planning. It shows unfinished assignments (not Work with a merged pull request; `settled_count` counts those), declared overlaps, and reported outcomes in the last 24 hours by default. `recent_since` selects another starting time. A compacted history is explicitly incomplete.
 2. Read the personal/agent catch-up delivery, session briefing and coordination inbox. Retrieve every page before relying on coverage. Reconnect with the same subscriber/session; acknowledge only deliberately received data.
 3. Inspect the proposed source and scope with preflight, then start with a stable work identity, explicit session, intended paths and the same checked merge watermark. HTTP/CLI and MCP starts return a pre-claim overview in `context`. The database serializes scope admission with the claim, so simultaneous different work identities cannot both claim the same declared scope unnoticed. Empty scope is unknown coverage; declare scope before editing.
 4. A conflicting lead start creates an idempotent durable coordination request, addressed to the affected current leads, without creating a competing assignment or announcing paths. A conflicting scope checkpoint also records a request while leaving the work unchanged. Exact files and `directory/**` scopes use component-aware overlap matching; related meaning in task titles is not automatically inferred.
