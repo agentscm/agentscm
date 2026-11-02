@@ -71,6 +71,38 @@ are Git's similarity interpretation. Symlinks and submodules are
 shown as entries and never followed. Binary and oversized files are identified without rendering
 their content. Source search matches literal, case-sensitive text.
 
+## Explore component connections and history
+
+Open **Map** for the selected committed source, **View map** on a history entry, or
+**Map this change** on a comparison. Choose a directory in the diagram or its component
+buttons, drill into it, and open a file at the exact selected revision. **Before** and **After**
+keep the comparison pinned even when it differs from the currently browsed commit.
+
+The map groups files by directory and shows **static reference candidates** from Rust module/use
+statements and JavaScript/TypeScript imports and re-exports. It is a lexical navigation aid,
+not a complete dependency graph, execution trace or impact analysis. Unsupported syntax,
+conditional compilation, aliases, runtime imports and generated code may be missing or ambiguous.
+Rust references under `src/bin` remain unresolved because binary module roots need manifest context.
+Module declarations and `use` references in files with detected path attributes remain unresolved.
+Outside-view references remain distinct from unresolved references. Symlinks and submodules
+are listed but never followed. No source, package resolver or model is executed.
+
+Each side returns at most 384 files, 128 blob reads (64 KiB each, 4 MiB total), 1,024
+connections and 128 unresolved references. Directory selection is deterministic, not a relevance
+ranking. Both sides share one 30-second deadline. Coverage reports known omissions and unknown
+remainders; choose a smaller directory when a view is incomplete. A failed read shows an error,
+not an empty graph. Source changes use blob identities, so body-only edits remain visible even
+when connections are unchanged. Incomplete reference comparisons never assert a removed dependency.
+Renames appear as removal and addition. Repository-wide reference comparisons often remain
+incomplete because unresolved-reference limits are reached; use a smaller directory for better
+coverage. Grouped Rust `use` imports may remain unresolved. If a shallow checkout lacks a
+comparison parent, **Map this commit only** preserves the chosen head without claiming a comparison.
+
+**Explanations & evidence** opens authored walkthrough versions for the repository, marking
+versions that match the selected comparison. Those declarations, decisions and recorded checks
+retain their own source identities and assurance. A map connection does not establish that a
+check covered a component, or that a decision caused a change. Working-tree edits are excluded.
+
 ## Follow a change walkthrough
 
 The **Walkthrough** tab opens immutable, locally authored versions for this checkout and repository.
@@ -137,6 +169,7 @@ use an explicitly allowed origin. Unknown or duplicate query fields are rejected
 | Route | Required query | Optional query |
 | --- | --- | --- |
 | `summary` | — | `ref` (defaults to `HEAD`) |
+| `map` | `commit` | `base`, `path` |
 | `tree` | `commit` | `path`, `after`, `limit` |
 | `file` | `commit`, `path` | — |
 | `history` | `commit` | `path`, `cursor`, `limit` |

@@ -25,6 +25,8 @@ use crate::execution::Cancellation;
 use crate::execution::process::{Stop, capture_with_input};
 use crate::{Error, Result};
 
+pub mod map;
+
 const VERSION: u32 = 1;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_CURSOR_BYTES: usize = 2 * 1024;

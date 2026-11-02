@@ -1,0 +1,44 @@
+.repository-map { display: grid; gap: 1.25rem; min-width: 0; }
+.repository-map h3, .repository-map h4, .repository-map p { margin: 0; }
+.repository-map-heading, .repository-map-controls, .repository-map-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.repository-map-heading p { margin-top: .5rem; max-width: 65ch; }
+.repository-map-controls nav, .repository-map-controls [role='group'] { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.repository-map-canvas { background: var(--hub-sunken); border-radius: 20px; overflow: hidden; }
+.repository-map-canvas svg { display: block; width: 100%; }
+.repository-map-wire { fill: none; stroke: var(--hub-text-3); opacity: .35; stroke-width: 1.5; }
+.repository-map-wire.is-selected { stroke: var(--hub-brand); opacity: .9; stroke-width: 2; }
+.repository-map-canvas marker path { fill: var(--hub-text-3); }
+.repository-map-node rect { fill: var(--hub-surface); stroke: var(--hub-rule-strong); }
+.repository-map-node.is-selected rect { stroke: var(--hub-brand); stroke-width: 2; }
+.repository-map-node text { fill: var(--hub-text); font-family: inherit; font-size: 14px; font-weight: 600; }
+.repository-map-node .repository-map-node-count { fill: var(--hub-text-2); font-size: 12px; font-weight: 400; }
+.repository-map-components { display: flex; flex-wrap: wrap; gap: .5rem; }
+.repository-map [aria-pressed='true'] { box-shadow: inset 0 0 0 1px currentColor; }
+.repository-map-coverage { font-size: .875rem; color: var(--hub-text-2); }
+.repository-map details > :not(summary) { margin-top: .75rem; }
+.repository-map summary { cursor: pointer; font-weight: 600; }
+.repository-map-files, .repository-map-relations { list-style: none; padding: 0; margin: 0; }
+.repository-map-files { max-height: 20rem; overflow: auto; }
+.repository-map-files li { display: flex; align-items: center; gap: .75rem; padding: .6rem 0; border-bottom: 1px solid var(--hub-rule-strong); }
+.repository-map-files button, .repository-map-relations button { border: 0; background: none; color: var(--hub-brand-ink); text-align: left; overflow-wrap: anywhere; padding: .25rem; }
+.repository-map-files button { display: flex; align-items: baseline; gap: .5rem; flex: 1; min-width: 0; }
+.repository-map-files li > span { flex-shrink: 0; }
+.repository-map-relations { max-height: 24rem; overflow: auto; }
+.repository-map-relations li { display: flex; align-items: baseline; flex-wrap: wrap; gap: .5rem; padding: .4rem 0; }
+.repository-map-source { display: grid; gap: .75rem; min-width: 0; }
+.repository-map-source h4, .repository-map code { overflow-wrap: anywhere; }
+.repository-map-source pre { max-height: 28rem; overflow: auto; }
+.repository-map-change { display: grid; gap: .75rem; padding-top: .75rem; border-top: 1px solid var(--hub-rule-strong); }
+.repository-map-change li { margin: .5rem 0; overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .repository-map-heading > .btn { width: 100%; }
+  .repository-map-canvas { overflow-x: auto; }
+  .repository-map-canvas svg { min-width: 600px; }
+  .repository-map-files li { flex-wrap: wrap; }
+  .repository-map-files button { flex-basis: 100%; min-height: 44px; }
+  .repository-map-components .btn, .repository-map-controls .btn { min-height: 44px; }
+}
+
+.repository-map-node { cursor: pointer; outline: none; }
+.repository-map-node:hover rect { fill: var(--hub-brand-soft); }
+.repository-map-node:focus-visible rect { stroke: var(--hub-brand); stroke-width: 3; }

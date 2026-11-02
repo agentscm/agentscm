@@ -13,6 +13,12 @@ This alpha slice uses authored JSON and observed Git facts. It does not generate
 with a model, infer which prompt caused a hunk, establish semantic correctness or grant approval.
 A source anchor establishes where to inspect a claim; it does not prove the claim.
 
+The Repository explorer **Map** tab provides a separate directory/reference view of committed
+source and historical comparisons. Its **Explanations & evidence** action carries the selected
+commit pair into walkthrough history. See [Repository explorer](repository-explorer.md#explore-component-connections-and-history).
+Recorded actions explain source applicability and observed source/setup/recipe drift in plain
+language. These historical observations do not establish freshness against today's configuration.
+
 ## Start with a deterministic map
 
 For a compact starting point without authoring or storing a walkthrough:
