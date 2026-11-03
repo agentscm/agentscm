@@ -1268,6 +1268,14 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     // Before auto-connect is on, an agent in the checkout is only told how to connect.
     let reply = machine.session_start("s0");
     assert!(context(&reply).contains("no client connection"), "{reply}");
+    // whoami says what the unchosen setting does and how to choose it.
+    let (ok, whoami, stderr) = machine.run(&["hub", "whoami"]);
+    assert!(ok, "{stderr}");
+    assert!(whoami.contains("auto-connect not chosen yet"), "{whoami}");
+    assert!(
+        whoami.contains(&format!("agentscm hub auto-connect on|off --hub {hub}")),
+        "{whoami}"
+    );
     let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
     assert!(ok, "{stderr}");
 
