@@ -5635,24 +5635,31 @@ impl Store for PgStore {
             let mut tx = client.transaction()?;
             // The inserts below take FOR KEY SHARE on these rows through their foreign keys, while
             // other writers lock a row FOR UPDATE and then take the event lock. Taking the row
-            // locks first keeps one lock order: row locks, then the event lock.
-            let label = tx
-                .query_opt(
-                    "SELECT host, full_name FROM hub_repositories WHERE id = $1 FOR KEY SHARE",
-                    &[&repository],
-                )?
-                .map(|row| local_ci_label(&row.get::<_, String>(0), &row.get::<_, String>(1)));
-            let enabled = tx
-                .query_opt(
-                    "SELECT NOT disabled FROM hub_users WHERE id = $1 FOR KEY SHARE",
-                    &[&owner],
-                )?
-                .map(|row| row.get::<_, bool>(0));
+            // locks first keeps one lock order: row locks, then the event lock. FOR KEY SHARE
+            // does not conflict with a disable or a rename, so the label and the disabled flag
+            // are read below, after the event lock that those writers hold until they commit.
+            tx.execute(
+                "SELECT 1 FROM hub_repositories WHERE id = $1 FOR KEY SHARE",
+                &[&repository],
+            )?;
+            tx.execute(
+                "SELECT 1 FROM hub_users WHERE id = $1 FOR KEY SHARE",
+                &[&owner],
+            )?;
             // Serializes device writes.
             tx.execute("SELECT pg_advisory_xact_lock($1)", &[&EVENT_LOCK])?;
             if let Some(write) = local_ci_replay(&mut tx, request, &authorization.device_id)? {
                 return Ok(write);
             }
+            let label = tx
+                .query_opt(
+                    "SELECT host, full_name FROM hub_repositories WHERE id = $1",
+                    &[&repository],
+                )?
+                .map(|row| local_ci_label(&row.get::<_, String>(0), &row.get::<_, String>(1)));
+            let enabled = tx
+                .query_opt("SELECT NOT disabled FROM hub_users WHERE id = $1", &[&owner])?
+                .map(|row| row.get::<_, bool>(0));
             if label.as_deref() != Some(authorization.repository.as_str()) {
                 return Err(HubError::Invalid("unknown repository for that label".into()));
             }

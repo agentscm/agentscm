@@ -113,9 +113,11 @@ fn request(request_id: &str, what: &Value) -> std::result::Result<LocalCiRequest
     })
 }
 
-/// An exact replay of an applied request answers before any check that depends on the clock,
-/// the owner, the forge or the repository, so a retry after a lost response gets the original
-/// answer. The same id with a different request or device conflicts.
+/// An exact replay of an applied request answers before the checks that depend on the clock,
+/// the owner and the forge role. The repository is looked up first, because the request
+/// fingerprint includes its id, so a retry after the repository was renamed or disconnected gets
+/// the repository error. The answer is the device as stored now, which may be newer than the
+/// one the first response described. The same id with a different request or device conflicts.
 async fn replay(
     state: &HubState,
     request: &LocalCiRequest,
@@ -306,6 +308,15 @@ async fn enroll(
     .map_err(|_| enrollment_invalid())?;
     let now = now_ms();
     check_expiry(body.not_after_ms, now)?;
+    // The role lookup trusts the caller to have matched hosts: a GitLab member id means
+    // nothing against another host's user ids.
+    if owner.identity.host != repo.host {
+        return Err(refused(
+            StatusCode::CONFLICT,
+            "owner_wrong_forge",
+            "that Hub user signed in on another forge than the repository's",
+        ));
+    }
     repository_role(&state, &owner, &repo)
         .await
         .map_err(role_error)?;
@@ -560,6 +571,9 @@ pub async fn authorize_offline_result(
     // The row is stable across a rename; the authorization names the label it was enrolled for.
     if local_ci_label(&repository.host, &repository.full_name) != device.authorization.repository {
         return DeviceDecision::Refused(DeviceRefusal::WrongRepository);
+    }
+    if owner.identity.host != repository.host {
+        return DeviceDecision::Refused(DeviceRefusal::WrongOwner);
     }
     let standing = if owner.disabled {
         OwnerStanding::Disabled

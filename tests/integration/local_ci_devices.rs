@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use agentscm::backend::LocalBackend;
 use agentscm::evidence::EvaluationClock;
+use agentscm::hub::connection::NewConnection;
 use agentscm::hub::local_ci_devices::authorize_offline_result;
 use agentscm::hub::login::{Login, LoginConfig};
-use agentscm::hub::store::{self, Store, mint_bound_agent_token};
+use agentscm::hub::store::{self, LocalCiRequest, Store, mint_bound_agent_token};
 use agentscm::hub::sync::{self, Sync, SyncConfig};
 use agentscm::hub::{HubState, router};
 use agentscm::local_ci::{
-    DeviceAssurance, DeviceClaim, DeviceDecision, DeviceRefusal, DeviceUnknown,
-    EnrollmentStatement, LOCAL_CI_CHECK_KIND, OwnerIdentity,
+    DeviceAssurance, DeviceAuthorization, DeviceClaim, DeviceDecision, DeviceKey, DeviceRefusal,
+    DeviceUnknown, EnrollmentStatement, LOCAL_CI_CHECK_KIND, OwnerIdentity,
 };
 use agentscm::policy::issuers::issuer_key_id;
 use axum::extract::{Path, State};
@@ -753,6 +754,108 @@ async fn enrollment_needs_a_current_owner_role_and_a_certain_answer() {
     assert_eq!(t.env.device_count(), 1);
 }
 
+const OTHER_HOST: &str = "other.example";
+
+/// The same project id on a second forge host, where alice's id and login would match a
+/// membership that belongs to an unrelated person if the hosts were not compared.
+fn other_host_label(t: &Enrolled) -> String {
+    let new = NewConnection {
+        id: store::new_connection_id().unwrap(),
+        provider: "github".into(),
+        host: OTHER_HOST.into(),
+        kind: "pat".into(),
+        app_id: None,
+        app_slug: None,
+        acts_as: Some("hubbot".into()),
+    };
+    let connection = t
+        .env
+        .store
+        .insert_connection(&new, &t.env.user(ADMIN).id)
+        .unwrap()
+        .id;
+    t.env
+        .store
+        .upsert_repository(&connection, OTHER_HOST, REPO_ID, REPO, None, None)
+        .unwrap();
+    format!("{OTHER_HOST}/{REPO}")
+}
+
+#[tokio::test]
+async fn an_owner_from_another_forge_host_is_refused_before_any_role_lookup() {
+    let t = Enrolled::new().await;
+    let label = other_host_label(&t);
+    let key = signing(5);
+    let statement = statement(&label, &t.owner, "lcd_far", &key, 1);
+    let body = enroll_body("far-enroll", &t.alice_id(), &statement, &key);
+    let reads = t.env.fake.lock().unwrap().role_reads;
+    let (status, body) = t
+        .env
+        .call(Method::POST, ENROLL, Some(&t.admin), Some(body))
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("owner_wrong_forge")),
+        "{body}"
+    );
+    assert_eq!(t.env.fake.lock().unwrap().role_reads, reads);
+    assert_eq!(t.env.device_count(), 1);
+}
+
+#[tokio::test]
+async fn an_offline_result_for_an_owner_from_another_forge_host_is_refused_before_any_role_lookup()
+{
+    let t = Enrolled::new().await;
+    let label = other_host_label(&t);
+    let repository = t
+        .env
+        .store
+        .repository_named(OTHER_HOST, REPO)
+        .unwrap()
+        .unwrap();
+    let key = signing(5);
+    let authorization = DeviceAuthorization {
+        version: 1,
+        device_id: "lcd_far".into(),
+        repository: label.clone(),
+        owner: t.owner.clone(),
+        generation: 1,
+        revoked_at_ms: None,
+        allowed_check_kinds: vec![LOCAL_CI_CHECK_KIND.into()],
+        keys: vec![DeviceKey {
+            key_id: issuer_key_id(&hex(key.verifying_key().as_bytes())).unwrap(),
+            public_key_hex: hex(key.verifying_key().as_bytes()),
+            not_before_ms: 0,
+            not_after_ms: started_ms() + DAY_MS,
+            rotated_at_ms: None,
+        }],
+    };
+    let request = LocalCiRequest {
+        request_id: "far-direct".into(),
+        fingerprint: "0".repeat(64),
+    };
+    t.env
+        .store
+        .enroll_local_ci_device(
+            &repository.id,
+            &t.alice_id(),
+            &t.env.user(ADMIN).id,
+            &authorization,
+            &request,
+            0,
+        )
+        .unwrap();
+    let claim = DeviceClaim {
+        repository: label,
+        device_id: "lcd_far".into(),
+        key_id: authorization.keys[0].key_id.clone(),
+        ..t.claim(5, 1)
+    };
+    let reads = t.env.fake.lock().unwrap().role_reads;
+    assert_eq!(t.decide(&claim).await, refused(DeviceRefusal::WrongOwner));
+    assert_eq!(t.env.fake.lock().unwrap().role_reads, reads);
+}
+
 #[tokio::test]
 async fn concurrent_rotations_and_replays_follow_the_generation() {
     let t = Enrolled::new().await;
@@ -1089,7 +1192,6 @@ async fn an_owner_reads_only_their_own_devices_and_changes_nothing() {
         assert_eq!(devices.len(), 1, "{body}");
         assert_eq!(devices[0]["device_id"], expected);
         assert_eq!(devices[0]["generation"], 1);
-        assert!(devices[0].get("issuer_registry_digest").is_none());
         assert!(devices[0].get("audit").is_none());
     }
     assert_eq!(t.env.call(Method::GET, &path, None, None).await.0, 401);

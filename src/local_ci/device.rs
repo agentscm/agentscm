@@ -256,6 +256,10 @@ impl DeviceAuthorization {
 
 fn device_id(value: &str) -> Result<()> {
     validate_identifier("device id", value)?;
+    // The device id is a URL path segment of the revoke and rotate routes.
+    if value.contains('/') {
+        return Err(Error::Invalid("device id must not contain '/'".into()));
+    }
     if value.len() <= DEVICE_ID_PREFIX.len() || !value.starts_with(DEVICE_ID_PREFIX) {
         return Err(Error::Invalid(format!(
             "device id must start with {DEVICE_ID_PREFIX}"
@@ -660,6 +664,8 @@ mod tests {
         mutate(&|a| a.generation = 0);
         mutate(&|a| a.device_id = "dev_one".into());
         mutate(&|a| a.device_id = "lcd_".into());
+        mutate(&|a| a.device_id = "lcd_a/b".into());
+        mutate(&|a| a.device_id = "lcd_a/../b".into());
         mutate(&|a| a.repository = "a|b".into());
         mutate(&|a| a.repository = "r".repeat(129));
         mutate(&|a| a.owner.person_id = "a|b".into());
