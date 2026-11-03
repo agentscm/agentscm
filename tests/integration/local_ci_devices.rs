@@ -990,6 +990,74 @@ async fn an_owner_reads_only_their_own_devices_and_changes_nothing() {
     assert_eq!(t.env.device_count(), 2);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn the_device_cli_request_is_accepted_by_the_enroll_route() {
+    let env = Env::start().await;
+    let (admin, _) = env.sign_in(ADMIN).await;
+    env.sign_in(ALICE).await;
+    let (owner, label) = (env.identity(ALICE), env.label());
+    let dir = TempDir::new().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let key = dir.path().canonicalize().unwrap().join("device.key");
+    // The server runs on this runtime, so the child process is awaited off-thread.
+    let run = |args: Vec<String>| {
+        let cwd = dir.path().to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_agentscm"))
+                .current_dir(cwd)
+                .args(["local-ci", "device"])
+                .args(args)
+                .output()
+                .unwrap()
+        })
+    };
+    let key_path = key.display().to_string();
+    let generated = run(vec![
+        "key-generate".into(),
+        "--key".into(),
+        key_path.clone(),
+    ])
+    .await
+    .unwrap();
+    assert!(generated.status.success(), "{generated:?}");
+    let request = run([
+        "enroll-request",
+        "--key",
+        &key_path,
+        "--device-id",
+        "lcd_cli",
+        "--repository",
+        &label,
+        "--owner-provider",
+        &owner.provider,
+        "--owner-host",
+        &owner.host,
+        "--owner-person",
+        &owner.person_id,
+        "--generation",
+        "1",
+    ]
+    .map(String::from)
+    .to_vec())
+    .await
+    .unwrap();
+    assert!(request.status.success(), "{request:?}");
+    let request: Value = serde_json::from_slice(&request.stdout).unwrap();
+    let body = json!({"request_id": "cli-enroll", "repository": label,
+        "owner": env.user(ALICE).id, "not_after_ms": started_ms() + DAY_MS,
+        "statement": request["statement"], "signature": request["signature"]});
+    let (status, reply) = env
+        .call(Method::POST, ENROLL, Some(&admin), Some(body))
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(env.device_count(), 1);
+}
+
 #[tokio::test]
 async fn no_secret_or_extra_surface_is_exposed() {
     let env = Env::start().await;

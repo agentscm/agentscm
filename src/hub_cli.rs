@@ -130,6 +130,12 @@ pub enum HubCommand {
         #[command(subcommand)]
         command: ConnectionCommand,
     },
+    /// [experimental] Enroll, rotate, revoke and list trusted local CI devices (administrators).
+    #[command(hide = true)]
+    LocalCiDevice {
+        #[command(subcommand)]
+        command: LocalCiDeviceCommand,
+    },
     /// Publish a git-export mirror's exported revision as a GitHub branch and pull request,
     /// through the hub. Uses the agent token configured like `agentscm intent`.
     #[cfg(unix)]
@@ -269,7 +275,8 @@ pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
         | HubCommand::AutoConnect { .. }
         | HubCommand::Token { .. }
         | HubCommand::Github { .. }
-        | HubCommand::Connections { .. } => true,
+        | HubCommand::Connections { .. }
+        | HubCommand::LocalCiDevice { .. } => true,
         #[cfg(unix)]
         HubCommand::Publish(_) => true,
     }
@@ -365,6 +372,7 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
         HubCommand::Token { command } => token(command).await,
         HubCommand::Github { command } => github(command).await,
         HubCommand::Connections { command } => connections(command).await,
+        HubCommand::LocalCiDevice { command } => local_ci_device(command).await,
         #[cfg(unix)]
         HubCommand::Publish(args) => crate::publish_cli::run(args, data_dir).await,
     }
@@ -2226,6 +2234,124 @@ fn connection_id(id: &str) -> Result<()> {
     } else {
         Err(invalid("connection id must look like con_..."))
     }
+}
+
+/// `--request` is the JSON `local-ci device enroll-request` printed. `--request-id` makes a
+/// retry a replay instead of a second change.
+#[derive(Debug, Subcommand)]
+pub enum LocalCiDeviceCommand {
+    /// Enroll a device at generation 1 for a Hub user.
+    Enroll {
+        #[arg(long)]
+        request: PathBuf,
+        /// Hub user ID (usr_...) of the owner.
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        request_id: String,
+        /// When the enrolled key stops being valid, in Unix milliseconds.
+        #[arg(long)]
+        not_after_ms: u64,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Replace the device key; the request must be for generation `--expected-generation` + 1.
+    Rotate {
+        id: String,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        not_after_ms: u64,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Revoke the device.
+    Revoke {
+        id: String,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// List a repository's devices with their audit events.
+    List {
+        /// host/owner/name of a connected repository.
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+}
+
+async fn local_ci_device(command: LocalCiDeviceCommand) -> Result<()> {
+    const BASE: &str = "/v1/hub/admin/local-ci/devices";
+    let read = |path: &PathBuf| -> Result<Value> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 64 * 1024 {
+            return Err(invalid("request file is too large"));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| invalid("request file is not valid JSON"))
+    };
+    let (hub, method, path, body) = match command {
+        LocalCiDeviceCommand::Enroll {
+            request,
+            owner,
+            request_id,
+            not_after_ms,
+            hub,
+        } => {
+            let signed = read(&request)?;
+            let body = json!({"request_id": request_id, "repository": signed["statement"]["repository"],
+                "owner": owner, "not_after_ms": not_after_ms,
+                "statement": signed["statement"], "signature": signed["signature"]});
+            (hub, Method::POST, BASE.to_owned(), Some(body))
+        }
+        LocalCiDeviceCommand::Rotate {
+            id,
+            request,
+            expected_generation,
+            request_id,
+            not_after_ms,
+            hub,
+        } => {
+            let signed = read(&request)?;
+            let body = json!({"request_id": request_id, "expected_generation": expected_generation,
+                "not_after_ms": not_after_ms,
+                "statement": signed["statement"], "signature": signed["signature"]});
+            (hub, Method::POST, format!("{BASE}/{id}/rotate"), Some(body))
+        }
+        LocalCiDeviceCommand::Revoke {
+            id,
+            expected_generation,
+            request_id,
+            hub,
+        } => {
+            let body =
+                json!({"request_id": request_id, "expected_generation": expected_generation});
+            (hub, Method::POST, format!("{BASE}/{id}/revoke"), Some(body))
+        }
+        LocalCiDeviceCommand::List { repository, hub } => {
+            let mut url = reqwest::Url::parse("http://x").map_err(|_| invalid("url"))?;
+            url.query_pairs_mut().append_pair("repository", &repository);
+            let path = format!("{BASE}?{}", url.query().unwrap_or_default());
+            (hub, Method::GET, path, None)
+        }
+    };
+    let (status, reply) = admin_call(&hub, method, &path, body).await?;
+    if status != 200 {
+        return Err(unexpected(status, &reply));
+    }
+    println!("{reply}");
+    Ok(())
 }
 
 async fn github(command: GithubCommand) -> Result<()> {
