@@ -194,6 +194,8 @@ mod issue_workflow_recovery;
 mod license;
 mod local_ci;
 #[cfg(unix)]
+mod local_ci_devices;
+#[cfg(unix)]
 mod local_read_http;
 #[cfg(unix)]
 mod local_recovery;

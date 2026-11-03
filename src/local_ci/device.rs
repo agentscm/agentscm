@@ -326,6 +326,8 @@ pub enum DeviceRefusal {
 pub enum DeviceUnknown {
     ClockUncertain,
     OwnerRoleUnavailable,
+    /// The stored authorization, repository or owner could not be read.
+    AuthorizationUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

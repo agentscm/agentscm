@@ -5897,6 +5897,35 @@ impl Store for SqliteStore {
         .collect()
     }
 
+    fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>> {
+        Ok(self
+            .repository_query("WHERE id = ?1", params![id])?
+            .into_iter()
+            .next())
+    }
+
+    fn local_ci_device_events(&self, device_id: &str) -> Result<Vec<HubEvent>> {
+        let conn = self.conn();
+        conn.prepare(
+            "SELECT seq, id, at, kind, subject, data FROM hub_events
+             WHERE subject = ?1 AND kind IN ('local_ci_device_enrolled', 'local_ci_device_rotated',
+                           'local_ci_device_revoked')
+             ORDER BY seq LIMIT ?2",
+        )?
+        .query_map(params![device_id, LIST_LIMIT], |row| {
+            Ok(HubEvent {
+                seq: row.get(0)?,
+                id: row.get(1)?,
+                at: row.get(2)?,
+                kind: row.get(3)?,
+                subject: row.get(4)?,
+                data: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
     fn authenticate_device(
         &self,
         digest: &TokenDigest,

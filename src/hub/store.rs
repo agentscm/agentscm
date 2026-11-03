@@ -280,6 +280,10 @@ pub trait Store: Send + Sync {
     fn local_ci_device(&self, device_id: &str) -> Result<Option<LocalCiDevice>>;
     /// The repository row's devices ordered by device id, at most 1000.
     fn local_ci_devices(&self, repository: &str) -> Result<Vec<LocalCiDevice>>;
+    /// The repository row by its stable `rep_` id, under its current host and name.
+    fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>>;
+    /// The device's enrolled, rotated and revoked events, oldest first, at most 1000.
+    fn local_ci_device_events(&self, device_id: &str) -> Result<Vec<HubEvent>>;
     /// Like `insert_agent_token`, minted through `device` (which must be live and `token.owner`'s).
     /// `auto` (auto-connect) records an `auto_connected` event.
     fn insert_device_token(

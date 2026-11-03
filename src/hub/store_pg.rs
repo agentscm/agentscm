@@ -5733,6 +5733,36 @@ impl Store for PgStore {
         })
     }
 
+    fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>> {
+        Ok(self
+            .repository_query("WHERE id = $1", &[&id])?
+            .into_iter()
+            .next())
+    }
+
+    fn local_ci_device_events(&self, device_id: &str) -> Result<Vec<HubEvent>> {
+        self.run(true, |client| {
+            let rows = client.query(
+                "SELECT seq, id, at, kind, subject, data FROM hub_events
+                 WHERE subject = $1 AND kind IN ('local_ci_device_enrolled', 'local_ci_device_rotated',
+                           'local_ci_device_revoked')
+                 ORDER BY seq LIMIT $2",
+                &[&device_id, &LIST_LIMIT],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|row| HubEvent {
+                    seq: row.get(0),
+                    id: row.get(1),
+                    at: row.get(2),
+                    kind: row.get(3),
+                    subject: row.get(4),
+                    data: row.get(5),
+                })
+                .collect())
+        })
+    }
+
     fn authenticate_device(
         &self,
         digest: &TokenDigest,
