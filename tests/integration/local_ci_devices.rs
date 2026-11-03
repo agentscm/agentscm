@@ -525,6 +525,15 @@ async fn admin_enrolls_rotates_revokes_and_reads_the_audit_trail() {
     assert_eq!(device["generation"], 1);
     assert_eq!(device["repository"], t.label);
     assert_eq!(device["audit"][0]["kind"], "local_ci_device_enrolled");
+    let admin_id = t.env.user(ADMIN).id;
+    let enrolled = t.env.store.events_after(0, 1000).unwrap();
+    let enrolled = enrolled
+        .iter()
+        .find(|e| e.kind == "local_ci_device_enrolled")
+        .unwrap();
+    let data: Value = serde_json::from_str(&enrolled.data).unwrap();
+    assert_eq!(data["by"], admin_id);
+    assert_ne!(data["by"], t.alice_id());
 
     let (status, rotated) = t.rotate("lcd_one", 1, 2, "rotate-two").await;
     assert_eq!(

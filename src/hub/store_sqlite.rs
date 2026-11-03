@@ -5785,11 +5785,12 @@ impl Store for SqliteStore {
         &self,
         repository: &str,
         owner: &str,
+        by: &str,
         authorization: &DeviceAuthorization,
         request: &LocalCiRequest,
         now: i64,
     ) -> Result<LocalCiDeviceWrite> {
-        let plan = plan_local_ci_enroll(repository, owner, authorization, request)?;
+        let plan = plan_local_ci_enroll(repository, by, authorization, request)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(write) = local_ci_replay(&tx, request, &authorization.device_id)? {

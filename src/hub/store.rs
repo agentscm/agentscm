@@ -256,11 +256,13 @@ pub trait Store: Send + Sync {
     fn rename_device(&self, device: &str, owner: &str, name: &str) -> Result<bool>;
     /// Authorizes a local CI device (generation 1) for the repository row `repository`
     /// (`hub_repositories.id`) and the enabled Hub user `owner`, and appends an event, in one
-    /// transaction. A key id is enrolled once ever. A replayed `request` returns the device.
+    /// transaction. `by` is the administrator who acted; the event names them, not `owner`.
+    /// A key id is enrolled once ever. A replayed `request` returns the device.
     fn enroll_local_ci_device(
         &self,
         repository: &str,
         owner: &str,
+        by: &str,
         authorization: &DeviceAuthorization,
         request: &LocalCiRequest,
         now: i64,
@@ -1597,7 +1599,7 @@ fn plan_local_ci(
 
 pub(super) fn plan_local_ci_enroll(
     repository: &str,
-    owner: &str,
+    by: &str,
     authorization: &DeviceAuthorization,
     request: &LocalCiRequest,
 ) -> Result<LocalCiPlan> {
@@ -1612,7 +1614,7 @@ pub(super) fn plan_local_ci_enroll(
         None,
         authorization,
         repository,
-        owner,
+        by,
         request,
     )
 }

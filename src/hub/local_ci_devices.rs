@@ -234,7 +234,7 @@ async fn enroll(
     human: HumanSession,
     JsonBody(body): JsonBody<EnrollBody>,
 ) -> ApiResult<Value> {
-    human.admin()?;
+    let by = human.admin()?.user.id.clone();
     let repo = repository_for(&state, &body.repository).await?;
     let label = local_ci_label(&repo.host, &repo.full_name);
     let (store, id) = (state.store.clone(), body.owner.clone());
@@ -283,7 +283,14 @@ async fn enroll(
     )?;
     let (store, repository, owner) = (state.store.clone(), repo.id, owner.id);
     let write = blocking(&state, move || {
-        store.enroll_local_ci_device(&repository, &owner, &authorization, &request, unix_now())
+        store.enroll_local_ci_device(
+            &repository,
+            &owner,
+            &by,
+            &authorization,
+            &request,
+            unix_now(),
+        )
     })
     .await?;
     written(write)

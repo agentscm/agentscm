@@ -2693,6 +2693,9 @@ fn skill_adoption_and_evidence(db: &Db) {
 
 const CI_LABEL: &str = "github.com/acme/widgets";
 
+/// The administrator who acts in the device tests; not the device owner.
+const CI_ADMIN: &str = "usr_admin";
+
 struct Ci {
     store: Arc<dyn Store>,
     owner: String,
@@ -2762,6 +2765,7 @@ fn ci_enroll(ci: &Ci, auth: &DeviceAuthorization, request: &str) -> LocalCiDevic
         .enroll_local_ci_device(
             &ci.repository,
             &ci.owner,
+            CI_ADMIN,
             auth,
             &ci_request(request, 1),
             unix_now(),
@@ -2894,8 +2898,14 @@ fn local_ci_enroll_read_list_and_advance(db: &Db) {
         ..ci
     };
     let enroll = |owner: &str, auth: &DeviceAuthorization, id: &str| {
-        ci.store
-            .enroll_local_ci_device(&ci.repository, owner, auth, &ci_request(id, 9), 1)
+        ci.store.enroll_local_ci_device(
+            &ci.repository,
+            owner,
+            CI_ADMIN,
+            auth,
+            &ci_request(id, 9),
+            1,
+        )
     };
     let mut wrong_generation = ci_auth("lcd_c", 4);
     wrong_generation.generation = 2;
@@ -2909,6 +2919,7 @@ fn local_ci_enroll_read_list_and_advance(db: &Db) {
             .enroll_local_ci_device(
                 &ci.repository,
                 &ci.owner,
+                CI_ADMIN,
                 &ci_auth("lcd_c", 4),
                 &ci_request("bad id", 1),
                 1
@@ -2939,7 +2950,14 @@ fn local_ci_replay_and_conflicts(db: &Db) {
     // Same id, other fingerprint or other device.
     let other = ci
         .store
-        .enroll_local_ci_device(&ci.repository, &ci.owner, &auth, &ci_request("req_a", 7), 1)
+        .enroll_local_ci_device(
+            &ci.repository,
+            &ci.owner,
+            CI_ADMIN,
+            &auth,
+            &ci_request("req_a", 7),
+            1,
+        )
         .unwrap();
     assert_eq!(
         other,
@@ -3328,7 +3346,7 @@ fn local_ci_events_carry_ids_only(db: &Db) {
     assert_eq!(
         data,
         [
-            json!({"repository": ci.repository, "generation": 1, "key_ids": [ci_key(1).key_id], "by": by}),
+            json!({"repository": ci.repository, "generation": 1, "key_ids": [ci_key(1).key_id], "by": CI_ADMIN}),
             json!({"repository": ci.repository, "generation": 2, "key_ids": [ci_key(2).key_id], "by": by}),
             json!({"repository": ci.repository, "generation": 3, "key_ids": [], "by": by}),
         ]
