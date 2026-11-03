@@ -767,7 +767,12 @@ async fn enrollment_needs_a_current_owner_role_and_a_certain_answer() {
         ),
         "{body}"
     );
-    assert!(!body["message"].as_str().unwrap().contains("try again"));
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("owner must sign in to this Hub again"),
+        "{message}"
+    );
+    assert!(!message.contains("try again in a minute"), "{message}");
     t.env.fake.lock().unwrap().users.remove(&77);
     t.env
         .fake

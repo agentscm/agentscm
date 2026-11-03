@@ -520,13 +520,22 @@ pub enum KeyLocationRefusal {
 ///
 /// An environment value names the key if it contains the key's path, or if any path-like token
 /// in it is the key or one of its ancestor directories except `/`. Tokens are split on `:`, `=`,
-/// quotes and whitespace, so `PATH`-style lists and `NAME=value` text are covered; repeated and
-/// trailing separators and `.` and `..` components are resolved first. `/home/u/keys-other` does
-/// not name `/home/u/keys/dev.key`, and `/` alone names nothing.
+/// `,`, `;`, `(`, `)`, `<`, `>`, `|`, quotes and whitespace, and each is read from its first
+/// `/`, so `PATH`-style lists, `NAME=value` text, `-L/home/u/keys` and
+/// `source=/home/u/keys,target=/k` are covered. A token's components stop at the first one with
+/// a glob character (`*`, `?`, `[`), so `/home/u/keys/*` is read as `/home/u/keys`; a token with
+/// no components left is ignored. Repeated and trailing separators and `.` and `..` components
+/// are resolved first. `/home/u/keys-other` does not name `/home/u/keys/dev.key`, and `/` alone
+/// names nothing.
 ///
-/// This checks declared values only, not what a job can reach by other means. It does not defend
-/// against host compromise, and other processes of the same user may still read the key file;
-/// those limits are explicit.
+/// This is a best-effort match on declared values. `~`, `$VAR`, relative values and symlink
+/// aliases are not resolved, and `HOME=/home/u` or `TMPDIR=/tmp` refuses a key beneath them on
+/// purpose. Callers must keep job environments explicit and must not treat this as a
+/// reachability guarantee. It does not defend against host compromise, and other processes of
+/// the same user may still read the key file; those limits are explicit.
+///
+/// The check is exercised on Unix only, where its only caller (a Unix-only CLI) runs, and
+/// environment-value matching understands `/` paths only.
 pub fn key_location_refused(
     key_path: &Path,
     source_roots: &[&Path],
@@ -562,9 +571,32 @@ pub fn key_location_refused(
             let value = value.as_encoded_bytes();
             value.windows(needle.len()).any(|window| window == needle)
                 || value
-                    .split(|b| matches!(b, b':' | b'=' | b'"' | b'\'') || b.is_ascii_whitespace())
-                    .filter(|token| token.starts_with(b"/"))
-                    .map(path_parts)
+                    .split(|b| {
+                        matches!(
+                            b,
+                            b':' | b'='
+                                | b'"'
+                                | b'\''
+                                | b','
+                                | b';'
+                                | b'('
+                                | b')'
+                                | b'<'
+                                | b'>'
+                                | b'|'
+                        ) || b.is_ascii_whitespace()
+                    })
+                    .filter_map(|token| {
+                        let start = token.iter().position(|b| *b == b'/')?;
+                        let mut parts = path_parts(&token[start..]);
+                        if let Some(glob) = parts
+                            .iter()
+                            .position(|part| part.iter().any(|b| matches!(b, b'*' | b'?' | b'[')))
+                        {
+                            parts.truncate(glob);
+                        }
+                        Some(parts)
+                    })
                     .any(|parts| !parts.is_empty() && key_parts.starts_with(&parts))
         })
         .then_some(NamedInEnvironment)
@@ -1034,6 +1066,7 @@ mod tests {
         assert!(verify(&s, "zz").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn key_location_rules() {
         use KeyLocationRefusal::*;
@@ -1090,6 +1123,25 @@ mod tests {
         assert_eq!(env("/usr/bin:/bin KEY=/home/u/other"), None);
         assert_eq!(env("/"), None);
         assert_eq!(env("//"), None);
+        // Extra separators, and a token is read from its first `/`.
+        assert_eq!(env("a,/home/u/keys"), Some(NamedInEnvironment));
+        assert_eq!(env("a;/home/u/keys"), Some(NamedInEnvironment));
+        assert_eq!(env("(/home/u/keys)"), Some(NamedInEnvironment));
+        assert_eq!(env("cat</home/u/keys/dev.key"), Some(NamedInEnvironment));
+        assert_eq!(env("x|/home/u/keys"), Some(NamedInEnvironment));
+        assert_eq!(env("-L/home/u/keys"), Some(NamedInEnvironment));
+        assert_eq!(
+            env("source=/home/u/keys,target=/k"),
+            Some(NamedInEnvironment)
+        );
+        assert_eq!(env("-L/home/u/keys-other"), None);
+        // A glob cuts the token at its first glob component.
+        assert_eq!(env("/home/u/keys/*"), Some(NamedInEnvironment));
+        assert_eq!(env("/home/u/k?ys/dev.key"), Some(NamedInEnvironment));
+        assert_eq!(env("/home/x/k?ys/dev.key"), None);
+        assert_eq!(env("/home/u/[a]/x"), Some(NamedInEnvironment));
+        assert_eq!(env("/*"), None);
+        assert_eq!(env("/*/keys"), None);
         assert_eq!(check(&[p("work")], &[], &[]), Some(NotNormalized));
         assert_eq!(
             check(&[p("/home/u/work/../keys")], &[], &[]),

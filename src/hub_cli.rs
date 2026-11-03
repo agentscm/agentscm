@@ -2270,6 +2270,9 @@ fn local_ci_error(status: u16, reply: &Value) -> Error {
     if let Some(message) = reply["message"].as_str() {
         text.push_str(&format!(": {}", clean(message)));
     }
+    if let Some(reason) = reply["reason"].as_str() {
+        text.push_str(&format!(" (reason {})", clean(reason)));
+    }
     if let Some(generation) = reply["current_generation"].as_u64() {
         text.push_str(&format!(" (current generation {generation})"));
     }
@@ -2698,6 +2701,12 @@ mod tests {
         let text = local_ci_error(404, &missing).to_string();
         assert!(text.contains("unknown_device") && text.contains("no such local CI device"));
         assert!(!text.contains("connection"));
+        let unavailable = json!({"error": "role_check_unavailable", "message": "m",
+            "reason": "sign_in_required"});
+        assert_eq!(
+            local_ci_error(503, &unavailable).to_string(),
+            "invalid: hub replied 503: role_check_unavailable: m (reason sign_in_required)"
+        );
     }
 
     #[test]

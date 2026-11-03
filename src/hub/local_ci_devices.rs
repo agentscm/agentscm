@@ -261,6 +261,8 @@ fn role_error(denial: Denial) -> ApiError {
         Denial::Kind(kind) => {
             let message = if kind == "permission_unavailable" {
                 "the Hub couldn't check the owner's role right now; try again in a minute"
+            } else if kind == "sign_in_required" {
+                "the owner must sign in to this Hub again; retrying won't help until they do"
             } else {
                 "the Hub can't check the owner's role until its connection to the forge is fixed; retrying won't help"
             };
@@ -556,7 +558,9 @@ async fn own(
 /// The device is read again after the forge answers and that copy is judged, so a revocation or
 /// rotation committed during the role lookup is seen. That only narrows the window: a change can
 /// still land after this returns. Issue #273 must commit acceptance conditional on
-/// `DeviceDecision::Current.generation` still being the stored generation.
+/// `DeviceDecision::Current.generation` still being the stored generation. That fence does not
+/// cover a repository rename or an owner disable during the role lookup: neither is re-read and
+/// neither bumps the generation.
 pub async fn authorize_offline_result(
     state: &HubState,
     claim: &DeviceClaim,
