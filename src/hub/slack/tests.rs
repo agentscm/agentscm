@@ -816,53 +816,87 @@ async fn a_request_to_an_idle_lead_messages_its_person_once() {
     assert_eq!(f.link("U1"), "https://hub.example.test/ui/#inbox");
 }
 
+#[test]
+fn entered_needs_a_transition_into_blocked_or_handover() {
+    let moved =
+        |state: &str, previous: &str| entered(&json!({"state": state, "previous": previous}));
+    // An event recorded before the Hub kept `previous` moved nothing.
+    assert_eq!(entered(&json!({"state": "blocked"})), None);
+    assert_eq!(moved("blocked", "active"), Some(WorkState::Blocked));
+    assert_eq!(moved("handover", "blocked"), Some(WorkState::Handover));
+    assert_eq!(moved("blocked", "blocked"), None);
+    assert_eq!(moved("active", "blocked"), None);
+}
+
+/// Work that `token` starts in `session` on `path`: its id and latest `updated_seq`.
+fn begin(f: &Fixture, token: &str, session: &str, title: &str, path: &str) -> (String, i64) {
+    let start: WorkStart = serde_json::from_value(json!({"title": title, "session": session,
+        "scope": [path], "work_id": null, "source": null, "request_key": null, "branch": null,
+        "worktree": null, "next_action": null, "takeover_generation": null}))
+    .unwrap();
+    let item = tokio::task::block_in_place(|| f.store().work_start_auto(token, &start, unix_now()))
+        .unwrap()
+        .item;
+    (item.id, item.updated_seq)
+}
+
+/// A checkpoint of `kind` on `work`, whose `updated_seq` moves on. Its summary is `<kind> note`.
+fn checkpoint(f: &Fixture, token: &str, session: &str, work: &mut (String, i64), kind: &str) {
+    let request: WorkCheckpoint = serde_json::from_value(json!({"work_id": work.0,
+        "operation_id": format!("op-{}", work.1), "generation": 1, "session": session,
+        "expected_updated_seq": work.1, "kind": kind, "summary": format!("{kind} note"),
+        "next_action": null, "scope": null, "branch": null, "worktree": null}))
+    .unwrap();
+    let done =
+        tokio::task::block_in_place(|| f.store().work_checkpoint(token, &request, unix_now()))
+            .unwrap();
+    work.1 = done.item.updated_seq;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_and_handover_message_the_lead_once_per_transition() {
     let f = Fixture::new().await;
-    let start: WorkStart = serde_json::from_value(json!({"title": "readable catch up",
-        "session": "a1", "scope": ["ui/catchup.tsx"], "work_id": null, "source": null,
-        "request_key": null, "branch": null, "worktree": null, "next_action": null,
-        "takeover_generation": null}))
-    .unwrap();
-    let started =
-        tokio::task::block_in_place(|| f.store().work_start_auto(&f.alice, &start, unix_now()))
-            .unwrap()
-            .item;
-    let (id, seq) = (started.id, std::cell::Cell::new(started.updated_seq));
-    let checkpoint = |kind: &str, operation: &str, summary: &str| {
-        let request: WorkCheckpoint = serde_json::from_value(json!({"work_id": id,
-            "operation_id": operation, "generation": 1, "session": "a1",
-            "expected_updated_seq": seq.get(), "kind": kind, "summary": summary,
-            "next_action": null, "scope": null, "branch": null, "worktree": null}))
-        .unwrap();
-        let done = tokio::task::block_in_place(|| {
-            f.store().work_checkpoint(&f.alice, &request, unix_now())
-        })
-        .unwrap();
-        seq.set(done.item.updated_seq);
-    };
-    // Each transition is read while the work is still in that state.
-    checkpoint("progress", "op-1", "started");
+    let mut alice = begin(&f, &f.alice, "a1", "readable catch up", "ui/catchup.tsx");
+    let mut bob = begin(&f, &f.bob, "b1", "dashboard", "ui/dashboard.tsx");
+    checkpoint(&f, &f.alice, "a1", &mut alice, "progress");
     f.run().await;
     assert_eq!(f.sent(), vec![]);
 
-    checkpoint("blocker", "op-2", "needs the API key");
+    // Only the lead's person hears of it, though Alice is the first person bound.
+    checkpoint(&f, &f.bob, "b1", &mut bob, "blocker");
     f.run().await;
-    let blocked = "Your agent’s work is blocked | Your work: readable catch up | Repository: acme/widgets | Your agent: Claude Code | Blocked on: needs the API key | Answer the blocker where your agent is running, or reassign the task.";
-    assert_eq!(f.sent(), vec![("U1".into(), blocked.into())]);
+    let bobs = "Your agent’s work is blocked | Your work: dashboard | Repository: acme/widgets | Your agent: Codex | Blocked on: blocker note | Answer the blocker where your agent is running, or reassign the task.";
+    assert_eq!(f.sent(), vec![("U2".into(), bobs.into())]);
     assert_eq!(
-        f.link("U1"),
-        format!("https://hub.example.test/ui/#work/{id}")
+        f.link("U2"),
+        format!("https://hub.example.test/ui/#work/{}", bob.0)
     );
 
-    checkpoint("blocker", "op-3", "still needs the API key");
+    checkpoint(&f, &f.alice, "a1", &mut alice, "blocker");
     f.run().await;
-    assert_eq!(f.sent().len(), 1);
+    let blocked = "Your agent’s work is blocked | Your work: readable catch up | Repository: acme/widgets | Your agent: Claude Code | Blocked on: blocker note | Answer the blocker where your agent is running, or reassign the task.";
+    assert_eq!(f.sent()[1], ("U1".into(), blocked.into()));
+    assert_eq!(
+        f.link("U1"),
+        format!("https://hub.example.test/ui/#work/{}", alice.0)
+    );
 
-    checkpoint("handover", "op-4", "ready for someone else");
+    checkpoint(&f, &f.alice, "a1", &mut alice, "blocker");
     f.run().await;
-    assert_eq!(f.sent()[1], ("U1".into(), "Your agent offered its work for handover | Your work: readable catch up | Repository: acme/widgets | Your agent: Claude Code | Handover note: ready for someone else | Pick an agent to take it over.".into()));
     assert_eq!(f.sent().len(), 2);
+
+    checkpoint(&f, &f.alice, "a1", &mut alice, "handover");
+    f.run().await;
+    assert_eq!(f.sent()[2], ("U1".into(), "Your agent offered its work for handover | Your work: readable catch up | Repository: acme/widgets | Your agent: Claude Code | Handover note: handover note | Pick an agent to take it over.".into()));
+    assert_eq!(f.sent().len(), 3);
+
+    // A transition is read while the work is still in that state: Bob's work is unblocked
+    // before the next pass, so the blocker that came and went sends nothing.
+    checkpoint(&f, &f.bob, "b1", &mut bob, "progress");
+    checkpoint(&f, &f.bob, "b1", &mut bob, "blocker");
+    checkpoint(&f, &f.bob, "b1", &mut bob, "progress");
+    f.run().await;
+    assert_eq!(f.sent().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
