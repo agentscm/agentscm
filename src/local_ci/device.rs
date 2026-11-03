@@ -518,9 +518,15 @@ pub enum KeyLocationRefusal {
 /// (`source_roots`), inside a declared mount, or named in a declared
 /// environment value. A sibling mount is not a match. Callers must canonicalize paths first; unnormalized input is refused.
 ///
-/// This enforces only the declared mounts and environment. It does not defend
-/// against host compromise, and other processes of the same user may still read
-/// the key file; that limit is explicit.
+/// An environment value names the key if it contains the key's path, or if any path-like token
+/// in it is the key or one of its ancestor directories except `/`. Tokens are split on `:`, `=`,
+/// quotes and whitespace, so `PATH`-style lists and `NAME=value` text are covered; repeated and
+/// trailing separators and `.` and `..` components are resolved first. `/home/u/keys-other` does
+/// not name `/home/u/keys/dev.key`, and `/` alone names nothing.
+///
+/// This checks declared values only, not what a job can reach by other means. It does not defend
+/// against host compromise, and other processes of the same user may still read the key file;
+/// those limits are explicit.
 pub fn key_location_refused(
     key_path: &Path,
     source_roots: &[&Path],
@@ -549,15 +555,35 @@ pub fn key_location_refused(
         return Some(InsideDeclaredMount);
     }
     let needle = key_path.as_os_str().as_encoded_bytes();
+    let key_parts = path_parts(needle);
     environment_values
         .iter()
         .any(|value| {
-            value
-                .as_encoded_bytes()
-                .windows(needle.len())
-                .any(|window| window == needle)
+            let value = value.as_encoded_bytes();
+            value.windows(needle.len()).any(|window| window == needle)
+                || value
+                    .split(|b| matches!(b, b':' | b'=' | b'"' | b'\'') || b.is_ascii_whitespace())
+                    .filter(|token| token.starts_with(b"/"))
+                    .map(path_parts)
+                    .any(|parts| !parts.is_empty() && key_parts.starts_with(&parts))
         })
         .then_some(NamedInEnvironment)
+}
+
+/// The components of an absolute path given as bytes, with repeated and trailing separators
+/// collapsed and `.` and `..` resolved lexically.
+fn path_parts(path: &[u8]) -> Vec<&[u8]> {
+    let mut parts = Vec::new();
+    for part in path.split(|b| *b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -1049,7 +1075,21 @@ mod tests {
             check(&[], &[], &[OsStr::new("/home/u/keys/dev.keys2x")]),
             Some(NamedInEnvironment)
         );
-        assert_eq!(check(&[], &[], &[OsStr::new("/home/u/keys")]), None);
+        let env = |value: &'static str| check(&[], &[], &[OsStr::new(value)]);
+        // The key's directory and its ancestors are reachable; `/` alone would refuse everything.
+        assert_eq!(env("/home/u/keys"), Some(NamedInEnvironment));
+        assert_eq!(env("KEY_DIR=/home/u/keys"), Some(NamedInEnvironment));
+        assert_eq!(env("/home/u"), Some(NamedInEnvironment));
+        assert_eq!(env("/home/u//keys/dev.key"), Some(NamedInEnvironment));
+        assert_eq!(env("/home//u/keys//"), Some(NamedInEnvironment));
+        assert_eq!(env("/home/u/keys/"), Some(NamedInEnvironment));
+        assert_eq!(env("/usr/bin:/home/u/keys:/bin"), Some(NamedInEnvironment));
+        assert_eq!(env("/home/u/other/../keys"), Some(NamedInEnvironment));
+        assert_eq!(env("/home/u/keys-other"), None);
+        assert_eq!(env("/home/u/keys-other/dev.key"), None);
+        assert_eq!(env("/usr/bin:/bin KEY=/home/u/other"), None);
+        assert_eq!(env("/"), None);
+        assert_eq!(env("//"), None);
         assert_eq!(check(&[p("work")], &[], &[]), Some(NotNormalized));
         assert_eq!(
             check(&[p("/home/u/work/../keys")], &[], &[]),

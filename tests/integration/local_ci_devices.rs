@@ -49,6 +49,8 @@ struct Fake {
     roles: HashMap<i64, &'static str>,
     hub_reads_roles: bool,
     role_reads: u32,
+    /// Runs once while the next role lookup is in flight.
+    during_role_read: Option<Box<dyn FnOnce() + Send>>,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -85,6 +87,9 @@ fn github_repo(fake: &Shared, headers: &HeaderMap) -> Response {
 fn github_permission(fake: &Shared, headers: &HeaderMap, login: String) -> Response {
     let mut fake = fake.lock().unwrap();
     fake.role_reads += 1;
+    if let Some(hook) = fake.during_role_read.take() {
+        hook();
+    }
     if caller(&fake, headers) != Some(HUB_BOT) {
         return status(StatusCode::UNAUTHORIZED);
     }
@@ -743,6 +748,33 @@ async fn enrollment_needs_a_current_owner_role_and_a_certain_answer() {
         "{body}"
     );
     t.env.fake.lock().unwrap().hub_reads_roles = true;
+    // A lasting failure names its reason and doesn't promise a retry: the forge now reports the
+    // login as another person's id.
+    t.env
+        .fake
+        .lock()
+        .unwrap()
+        .users
+        .insert(ALICE, "other".into());
+    t.env.fake.lock().unwrap().users.insert(77, "alice".into());
+    let (status, body) = t.enroll("lcd_new", 4, "r2b").await;
+    assert_eq!(
+        (status, body["error"].as_str(), body["reason"].as_str()),
+        (
+            503,
+            Some("role_check_unavailable"),
+            Some("sign_in_required")
+        ),
+        "{body}"
+    );
+    assert!(!body["message"].as_str().unwrap().contains("try again"));
+    t.env.fake.lock().unwrap().users.remove(&77);
+    t.env
+        .fake
+        .lock()
+        .unwrap()
+        .users
+        .insert(ALICE, "alice".into());
     // A disabled owner.
     t.env.store.set_user_disabled(&t.alice_id(), true).unwrap();
     let (status, body) = t.enroll("lcd_new", 4, "r3").await;
@@ -974,6 +1006,29 @@ async fn offline_results_are_accepted_only_while_authorization_is_current() {
     );
     t.env.fake.lock().unwrap().roles.insert(ALICE, "write");
     assert_eq!(t.decide(&t.claim(1, 1)).await, current);
+}
+
+#[tokio::test]
+async fn a_revocation_during_the_role_lookup_is_seen() {
+    let t = Enrolled::new().await;
+    let (store, request) = (
+        t.env.store.clone(),
+        LocalCiRequest {
+            request_id: "revoke-during".into(),
+            fingerprint: "f".repeat(64),
+        },
+    );
+    t.env.fake.lock().unwrap().during_role_read = Some(Box::new(move || {
+        let stored = store.local_ci_device("lcd_one").unwrap().unwrap();
+        let next = stored.authorization.revoke(now_ms()).unwrap();
+        store
+            .change_local_ci_device("lcd_one", 1, &stored.owner, &next, &request, 0)
+            .unwrap();
+    }));
+    assert_eq!(
+        t.decide(&t.claim(1, 1)).await,
+        refused(DeviceRefusal::StaleAuthorization)
+    );
 }
 
 #[tokio::test]

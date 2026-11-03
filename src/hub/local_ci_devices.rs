@@ -114,10 +114,10 @@ fn request(request_id: &str, what: &Value) -> std::result::Result<LocalCiRequest
 }
 
 /// An exact replay of an applied request answers before the checks that depend on the clock,
-/// the owner and the forge role. The repository is looked up first, because the request
-/// fingerprint includes its id, so a retry after the repository was renamed or disconnected gets
-/// the repository error. The answer is the device as stored now, which may be newer than the
-/// one the first response described. The same id with a different request or device conflicts.
+/// the owner and the forge role. Enrollment looks the repository up first, because the request
+/// fingerprint includes its id, so a retry of an enrollment after the repository was renamed gets
+/// the repository error; rotate and revoke replay with no repository lookup. The answer is the device as stored
+/// now, which may be newer than the one the first response described. The same id with a different request or device conflicts.
 async fn replay(
     state: &HubState,
     request: &LocalCiRequest,
@@ -258,11 +258,19 @@ fn role_error(denial: Denial) -> ApiError {
             "owner_role_missing",
             "the owner doesn't currently have a role on this repository",
         ),
-        Denial::Kind(_) => refused(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "role_check_unavailable",
-            "the Hub couldn't check the owner's role right now; try again in a minute",
-        ),
+        Denial::Kind(kind) => {
+            let message = if kind == "permission_unavailable" {
+                "the Hub couldn't check the owner's role right now; try again in a minute"
+            } else {
+                "the Hub can't check the owner's role until its connection to the forge is fixed; retrying won't help"
+            };
+            refused(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "role_check_unavailable",
+                message,
+            )
+            .with_field("reason", json!(kind))
+        }
     }
 }
 
@@ -544,6 +552,11 @@ async fn own(
 /// current label, the owner's standing and their role through the Hub's own connection
 /// credential, never a cached answer. An unreadable or uncertain input is `Unknown`, never
 /// `Current`; an unknown device id is a refusal. Issue #273 calls this; it has no route.
+///
+/// The device is read again after the forge answers and that copy is judged, so a revocation or
+/// rotation committed during the role lookup is seen. That only narrows the window: a change can
+/// still land after this returns. Issue #273 must commit acceptance conditional on
+/// `DeviceDecision::Current.generation` still being the stored generation.
 pub async fn authorize_offline_result(
     state: &HubState,
     claim: &DeviceClaim,
@@ -583,6 +596,12 @@ pub async fn authorize_offline_result(
             Err(Denial::Role(_)) => OwnerStanding::RoleMissing,
             Err(Denial::Kind(_)) => OwnerStanding::Unavailable,
         }
+    };
+    let (store, id) = (state.store.clone(), claim.device_id.clone());
+    let device = match blocking(state, move || store.local_ci_device(&id)).await {
+        Err(_) => return unavailable,
+        Ok(None) => return DeviceDecision::Refused(DeviceRefusal::UnknownKey),
+        Ok(Some(device)) => device,
     };
     assess_device(&device.authorization, claim, standing, clock)
 }

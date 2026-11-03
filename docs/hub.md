@@ -412,9 +412,11 @@ status shown; clients show `message` as is.
   (`unknown_repository`, `unknown_owner`, `unknown_device`), 409 (`stale_generation`,
   `device_exists`, `duplicate_key`, `request_conflict`, `device_revoked`, `owner_disabled`,
   `owner_wrong_forge`, `owner_role_missing`, `repository_renamed`) and 503
-  (`role_check_unavailable`) when the forge role check is uncertain. An exact replay of an
-  applied `request_id` returns the device as stored now, before the expiry, owner and role
-  checks; the repository is still looked up first. No route accepts a result.
+  (`role_check_unavailable`) when the forge role check is uncertain; its `reason` field is the
+  denial kind, and only `permission_unavailable` is temporary (`sign_in_required`,
+  `not_connected` and `access_check_unavailable` need the Hub's forge connection fixed). An exact
+  replay of an applied `request_id` returns the device as stored now, before the expiry, owner
+  and role checks; enrollment still looks the repository up first. No route accepts a result.
 - A signed-in person or their computer credential (not an agent token, read-only token or
   administrator-only credential): `GET /v1/hub/local-ci/devices?repository=host/owner/name` lists
   that person's own devices on the repository, and an unknown repository gives an empty list.
