@@ -333,7 +333,7 @@ impl Env {
             .repository_named(&self.host, REPO)
             .unwrap()
             .unwrap();
-        self.store.local_ci_devices(&repo.id).unwrap().len()
+        self.store.local_ci_devices(&repo.id, None).unwrap().len()
     }
 }
 
@@ -374,7 +374,6 @@ fn statement(
         key_id: issuer_key_id(&public_key_hex).unwrap(),
         public_key_hex,
         generation,
-        issued_at_ms: started_ms(),
     }
 }
 
@@ -940,6 +939,128 @@ async fn a_renamed_repository_is_not_current() {
     );
 }
 
+impl Enrolled {
+    fn rename_repository(&self, name: &str) {
+        let connection = self
+            .env
+            .store
+            .pat_connection(&self.env.host)
+            .unwrap()
+            .unwrap()
+            .id;
+        self.env
+            .store
+            .upsert_repository(&connection, &self.env.host, REPO_ID, name, None, None)
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rotation_is_refused_while_the_repository_name_differs() {
+    let t = Enrolled::new().await;
+    t.rename_repository("acme/renamed");
+    let (status, body) = t.rotate("lcd_one", 1, 2, "rotate-renamed").await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("repository_renamed")),
+        "{body}"
+    );
+    // Renaming back restores authorization, and rotation then works.
+    t.rename_repository(REPO);
+    assert!(matches!(
+        t.decide(&t.claim(1, 1)).await,
+        DeviceDecision::Current { .. }
+    ));
+    assert_eq!(t.rotate("lcd_one", 1, 2, "rotate-back").await.0, 200);
+}
+
+#[tokio::test]
+async fn a_retry_after_a_lost_response_replays_before_other_checks() {
+    let t = Enrolled::new().await;
+    let (status, first) = t.enroll("lcd_new", 4, "retry-1").await;
+    assert_eq!(status, 200, "{first}");
+    // The owner is disabled and the forge is unavailable by the time the retry arrives.
+    t.env.fake.lock().unwrap().hub_reads_roles = false;
+    t.env.store.set_user_disabled(&t.alice_id(), true).unwrap();
+    let (status, again) = t.enroll("lcd_new", 4, "retry-1").await;
+    assert_eq!((status, &again["replayed"]), (200, &json!(true)), "{again}");
+    assert_eq!(again["device"]["device_id"], "lcd_new");
+    // The same id with a different request still conflicts.
+    let (status, other) = t.enroll("lcd_new", 5, "retry-1").await;
+    assert_eq!(
+        (status, other["error"].as_str()),
+        (409, Some("request_conflict")),
+        "{other}"
+    );
+    // A new request still meets the owner check.
+    assert_eq!(
+        t.enroll("lcd_other", 6, "retry-2").await.1["error"],
+        "owner_disabled"
+    );
+    assert_eq!(t.env.device_count(), 2);
+}
+
+#[tokio::test]
+async fn malformed_requests_are_client_errors() {
+    let t = Enrolled::new().await;
+    let key = signing(4);
+    let enroll = statement(&t.label, &t.owner, "lcd_new", &key, 1);
+    let rotation = statement(&t.label, &t.owner, "lcd_one", &key, 2);
+    let mut cases = vec![];
+    for (request_id, not_after, error) in [
+        ("bad id", None, "invalid_request_id"),
+        ("", None, "invalid_request_id"),
+        ("ok-id", Some(u64::MAX), "invalid_expiry"),
+        ("ok-id", Some(0), "invalid_expiry"),
+    ] {
+        let mut enrolling = enroll_body(request_id, &t.alice_id(), &enroll, &key);
+        let mut rotating = rotate_body(request_id, 1, &rotation, &key);
+        if let Some(not_after) = not_after {
+            enrolling["not_after_ms"] = json!(not_after);
+            rotating["not_after_ms"] = json!(not_after);
+        }
+        cases.push((ENROLL.to_owned(), enrolling, error));
+        cases.push((format!("{ENROLL}/lcd_one/rotate"), rotating, error));
+    }
+    cases.push((
+        format!("{ENROLL}/lcd_one/revoke"),
+        json!({"request_id": "bad id", "expected_generation": 1}),
+        "invalid_request_id",
+    ));
+    for (path, body, error) in cases {
+        let (status, reply) = t
+            .env
+            .call(Method::POST, &path, Some(&t.admin), Some(body))
+            .await;
+        assert_eq!(
+            (status, reply["error"].as_str()),
+            (400, Some(error)),
+            "{path} {reply}"
+        );
+    }
+    // Only a key already enrolled on the device is a duplicate key.
+    let (status, reply) = t.rotate("lcd_one", 1, 1, "duplicate").await;
+    assert_eq!(
+        (status, reply["error"].as_str()),
+        (409, Some("duplicate_key")),
+        "{reply}"
+    );
+    assert_eq!(t.env.device_count(), 1);
+}
+
+/// Pins today's threshold: the sign-in rule, so any permission above `none` passes on a
+/// private repository, including read. Issue #273 or a maintainer may tighten it.
+#[tokio::test]
+async fn a_read_only_owner_of_a_private_repository_still_passes_the_role_check() {
+    let t = Enrolled::new().await;
+    t.env.fake.lock().unwrap().roles.insert(ALICE, "read");
+    assert!(matches!(
+        t.decide(&t.claim(1, 1)).await,
+        DeviceDecision::Current { .. }
+    ));
+    assert_eq!(t.enroll("lcd_reader", 4, "reader").await.0, 200);
+}
+
 #[tokio::test]
 async fn an_owner_reads_only_their_own_devices_and_changes_nothing() {
     let t = Enrolled::new().await;
@@ -968,13 +1089,34 @@ async fn an_owner_reads_only_their_own_devices_and_changes_nothing() {
         assert_eq!(devices.len(), 1, "{body}");
         assert_eq!(devices[0]["device_id"], expected);
         assert_eq!(devices[0]["generation"], 1);
-        assert_eq!(
-            devices[0]["issuer_registry_digest"].as_str().unwrap().len(),
-            64
-        );
+        assert!(devices[0].get("issuer_registry_digest").is_none());
         assert!(devices[0].get("audit").is_none());
     }
     assert_eq!(t.env.call(Method::GET, &path, None, None).await.0, 401);
+    // An agent token is not an owner credential.
+    let (_, agent, _) = mint_bound_agent_token(
+        &*t.env.store,
+        &t.alice_id(),
+        "synthetic-agent",
+        REPO,
+        REPO_ID,
+        600,
+        false,
+    )
+    .unwrap();
+    let (status, _) = t
+        .env
+        .call(Method::GET, &path, Some(agent.expose()), None)
+        .await;
+    assert!(matches!(status, 401 | 403), "agent token: {status}");
+    // An unknown repository is an empty list, like a repository with no devices, so the
+    // route doesn't reveal which repositories are connected.
+    let path = format!(
+        "/v1/hub/local-ci/devices?repository={}/acme/unconnected",
+        t.env.host
+    );
+    let (status, body) = t.env.call(Method::GET, &path, Some(&t.alice), None).await;
+    assert_eq!((status, &body["devices"]), (200, &json!([])), "{body}");
     for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
         let (status, _) = t
             .env

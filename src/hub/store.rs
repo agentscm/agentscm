@@ -280,8 +280,12 @@ pub trait Store: Send + Sync {
     ) -> Result<LocalCiDeviceWrite>;
     /// A corrupt stored record is an error, never a default.
     fn local_ci_device(&self, device_id: &str) -> Result<Option<LocalCiDevice>>;
-    /// The repository row's devices ordered by device id, at most 1000.
-    fn local_ci_devices(&self, repository: &str) -> Result<Vec<LocalCiDevice>>;
+    /// The repository row's devices ordered by device id, at most 1000, only those of the Hub
+    /// user `owner` when given (filtered before the limit).
+    fn local_ci_devices(&self, repository: &str, owner: Option<&str>)
+    -> Result<Vec<LocalCiDevice>>;
+    /// The device and fingerprint recorded for a request id, if it was applied.
+    fn local_ci_request(&self, request_id: &str) -> Result<Option<(String, String)>>;
     /// The repository row by its stable `rep_` id, under its current host and name.
     fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>>;
     /// The device's enrolled, rotated and revoked events, oldest first, at most 1000.

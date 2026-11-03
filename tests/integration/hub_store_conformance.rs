@@ -2725,7 +2725,6 @@ fn ci_key(seed: u8) -> DeviceKey {
         not_before_ms: 1_000,
         not_after_ms: 9_000_000_000_000,
         rotated_at_ms: None,
-        revoked_at_ms: None,
     }
 }
 
@@ -2800,7 +2799,7 @@ fn local_ci_enroll_read_list_and_advance(db: &Db) {
     assert_eq!(ci.store.local_ci_device("lcd_none").unwrap(), None);
     let listed = |store: &dyn Store, repo: &str| {
         store
-            .local_ci_devices(repo)
+            .local_ci_devices(repo, None)
             .unwrap()
             .into_iter()
             .map(|d| (d.authorization.device_id, d.authorization.generation))
@@ -2811,6 +2810,13 @@ fn local_ci_enroll_read_list_and_advance(db: &Db) {
         [("lcd_a".to_owned(), 1), ("lcd_b".to_owned(), 1)]
     );
     assert!(listed(&*ci.store, "rep_other").is_empty());
+    let owned = |owner: &str| {
+        ci.store
+            .local_ci_devices(&ci.repository, Some(owner))
+            .unwrap()
+            .len()
+    };
+    assert_eq!((owned(&ci.owner), owned("usr_nobody")), (2, 0));
 
     // Rotation and revocation each advance the generation by one.
     let current = ci.store.local_ci_device("lcd_a").unwrap().unwrap();
@@ -2934,7 +2940,15 @@ fn local_ci_enroll_read_list_and_advance(db: &Db) {
 fn local_ci_replay_and_conflicts(db: &Db) {
     let ci = ci_setup(db);
     let auth = ci_auth("lcd_a", 1);
+    assert_eq!(ci.store.local_ci_request("req_a").unwrap(), None);
     let first = ci_applied(ci_enroll(&ci, &auth, "req_a"));
+    assert_eq!(
+        ci.store
+            .local_ci_request("req_a")
+            .unwrap()
+            .map(|(device, _)| device),
+        Some("lcd_a".to_owned())
+    );
     // Same id and fingerprint: the stored result, with no second event.
     assert_eq!(
         ci_enroll(&ci, &auth, "req_a"),
@@ -3384,7 +3398,10 @@ fn local_ci_corrupt_records_are_refused(db: &Db) {
         ))
         .unwrap();
         assert!(ci.store.local_ci_device("lcd_a").is_err(), "{set}");
-        assert!(ci.store.local_ci_devices(&ci.repository).is_err(), "{set}");
+        assert!(
+            ci.store.local_ci_devices(&ci.repository, None).is_err(),
+            "{set}"
+        );
         let next = ci_auth("lcd_a", 1).revoke(8_000).unwrap();
         let change = ci.store.change_local_ci_device(
             "lcd_a",

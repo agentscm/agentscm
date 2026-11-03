@@ -25,7 +25,7 @@ use super::store::{
     LocalCiDevice, LocalCiDeviceWrite, LocalCiRefusal, LocalCiRequest, User, local_ci_label,
     lower_hex_of, unix_now,
 };
-use crate::evidence::EvaluationClock;
+use crate::evidence::{EvaluationClock, validate_identifier};
 use crate::local_ci::{
     DeviceAuthorization, DeviceClaim, DeviceDecision, DeviceKey, DeviceRefusal, DeviceUnknown,
     EnrollmentExpectation, EnrollmentStatement, LOCAL_CI_CHECK_KIND, OwnerIdentity, OwnerStanding,
@@ -97,29 +97,65 @@ fn owner_identity(user: &User) -> OwnerIdentity {
     }
 }
 
-fn request(request_id: String, what: &Value) -> std::result::Result<LocalCiRequest, ApiError> {
+fn request(request_id: &str, what: &Value) -> std::result::Result<LocalCiRequest, ApiError> {
+    // The store would report a bad id as unavailable; it is the caller's mistake.
+    validate_identifier("request id", request_id).map_err(|_| {
+        refused(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_id",
+            "the request id must be 1 to 128 letters, digits or - _ . : /",
+        )
+    })?;
     let bytes = serde_json::to_vec(what).map_err(|_| ApiError::invalid())?;
     Ok(LocalCiRequest {
-        request_id,
+        request_id: request_id.to_owned(),
         fingerprint: lower_hex_of(&bytes),
     })
+}
+
+/// An exact replay of an applied request answers before any check that depends on the clock,
+/// the owner, the forge or the repository, so a retry after a lost response gets the original
+/// answer. The same id with a different request or device conflicts.
+async fn replay(
+    state: &HubState,
+    request: &LocalCiRequest,
+    device_id: &str,
+) -> std::result::Result<Option<Json<Value>>, ApiError> {
+    let (store, id) = (state.store.clone(), request.request_id.clone());
+    let Some((seen_device, fingerprint)) =
+        blocking(state, move || store.local_ci_request(&id)).await?
+    else {
+        return Ok(None);
+    };
+    if seen_device != device_id || fingerprint != request.fingerprint {
+        return Err(refusal(LocalCiRefusal::RequestConflict));
+    }
+    written(LocalCiDeviceWrite::Replayed(
+        current(state, device_id).await?,
+    ))
+    .map(Some)
+}
+
+async fn find_repository(
+    state: &HubState,
+    label: &str,
+) -> std::result::Result<Option<ConnectedRepository>, ApiError> {
+    let (host, name) = label.split_once('/').ok_or_else(ApiError::invalid)?;
+    let (store, host, name) = (state.store.clone(), host.to_owned(), name.to_owned());
+    Ok(blocking(state, move || store.repository_named(&host, &name)).await?)
 }
 
 async fn repository_for(
     state: &HubState,
     label: &str,
 ) -> std::result::Result<ConnectedRepository, ApiError> {
-    let (host, name) = label.split_once('/').ok_or_else(ApiError::invalid)?;
-    let (store, host, name) = (state.store.clone(), host.to_owned(), name.to_owned());
-    blocking(state, move || store.repository_named(&host, &name))
-        .await?
-        .ok_or_else(|| {
-            refused(
-                StatusCode::NOT_FOUND,
-                "unknown_repository",
-                "that repository isn't connected to this Hub",
-            )
-        })
+    find_repository(state, label).await?.ok_or_else(|| {
+        refused(
+            StatusCode::NOT_FOUND,
+            "unknown_repository",
+            "that repository isn't connected to this Hub",
+        )
+    })
 }
 
 fn key_from(statement: &EnrollmentStatement, now: u64, not_after_ms: u64) -> DeviceKey {
@@ -129,18 +165,17 @@ fn key_from(statement: &EnrollmentStatement, now: u64, not_after_ms: u64) -> Dev
         not_before_ms: now,
         not_after_ms,
         rotated_at_ms: None,
-        revoked_at_ms: None,
     }
 }
 
 fn check_expiry(not_after_ms: u64, now: u64) -> std::result::Result<(), ApiError> {
-    if not_after_ms > now {
+    if not_after_ms > now && not_after_ms <= i64::MAX as u64 {
         return Ok(());
     }
     Err(refused(
         StatusCode::BAD_REQUEST,
         "invalid_expiry",
-        "the key expiry must be in the future",
+        "the key expiry must be in the future and fit a signed 64-bit millisecond count",
     ))
 }
 
@@ -203,7 +238,7 @@ fn device_json(device: &LocalCiDevice) -> Value {
         .map(|key| {
             json!({"key_id": key.key_id, "public_key_hex": key.public_key_hex,
                 "not_before_ms": key.not_before_ms, "not_after_ms": key.not_after_ms,
-                "rotated_at_ms": key.rotated_at_ms, "revoked_at_ms": key.revoked_at_ms})
+                "rotated_at_ms": key.rotated_at_ms})
         })
         .collect();
     json!({"device_id": a.device_id, "repository": a.repository, "owner": device.owner,
@@ -224,7 +259,7 @@ fn role_error(denial: Denial) -> ApiError {
         Denial::Kind(_) => refused(
             StatusCode::SERVICE_UNAVAILABLE,
             "role_check_unavailable",
-            "the Hub couldn't check the owner's role; nothing changed, so try again in a minute",
+            "the Hub couldn't check the owner's role right now; try again in a minute",
         ),
     }
 }
@@ -237,6 +272,15 @@ async fn enroll(
     let by = human.admin()?.user.id.clone();
     let repo = repository_for(&state, &body.repository).await?;
     let label = local_ci_label(&repo.host, &repo.full_name);
+    let request = request(
+        &body.request_id,
+        &json!({"op": "enroll", "repository": repo.id, "owner": body.owner,
+            "not_after_ms": body.not_after_ms, "statement": body.statement,
+            "signature": body.signature}),
+    )?;
+    if let Some(replayed) = replay(&state, &request, &body.statement.device_id).await? {
+        return Ok(replayed);
+    }
     let (store, id) = (state.store.clone(), body.owner.clone());
     let owner = blocking(&state, move || store.user_by_id(&id))
         .await?
@@ -275,12 +319,6 @@ async fn enroll(
         allowed_check_kinds: vec![LOCAL_CI_CHECK_KIND.to_owned()],
         keys: vec![key_from(&body.statement, now, body.not_after_ms)],
     };
-    let request = request(
-        body.request_id,
-        &json!({"op": "enroll", "repository": repo.id, "owner": owner.id,
-            "not_after_ms": body.not_after_ms, "statement": body.statement,
-            "signature": body.signature}),
-    )?;
     let (store, repository, owner) = (state.store.clone(), repo.id, owner.id);
     let write = blocking(&state, move || {
         store.enroll_local_ci_device(
@@ -334,6 +372,15 @@ async fn rotate(
     JsonBody(body): JsonBody<RotateBody>,
 ) -> ApiResult<Value> {
     let by = human.admin()?.user.id.clone();
+    let request = request(
+        &body.request_id,
+        &json!({"op": "rotate", "device": id, "expected_generation": body.expected_generation,
+            "not_after_ms": body.not_after_ms, "statement": body.statement,
+            "signature": body.signature}),
+    )?;
+    if let Some(replayed) = replay(&state, &request, &id).await? {
+        return Ok(replayed);
+    }
     let stored = current(&state, &id).await?;
     let a = &stored.authorization;
     let produced = body
@@ -358,18 +405,31 @@ async fn rotate(
         if a.revoked_at_ms.is_some() {
             return Err(device_revoked());
         }
+        // The authorization names the label it was enrolled for. After a rename the device is
+        // unusable, and a new key would be too, so rotation waits until the name matches again.
+        let (store, repository) = (state.store.clone(), stored.repository.clone());
+        let renamed = blocking(&state, move || store.repository_row(&repository))
+            .await?
+            .is_none_or(|row| local_ci_label(&row.host, &row.full_name) != a.repository);
+        if renamed {
+            return Err(refused(
+                StatusCode::CONFLICT,
+                "repository_renamed",
+                "the repository was renamed since this device was enrolled; enroll a new device or rename it back",
+            ));
+        }
         check_expiry(body.not_after_ms, now)?;
-        a.rotate(key_from(&body.statement, now, body.not_after_ms), now)
-            .map_err(|_| refusal(LocalCiRefusal::DuplicateKey))?
+        let key = key_from(&body.statement, now, body.not_after_ms);
+        a.rotate(key, now).map_err(|_| {
+            if a.keys.iter().any(|k| k.key_id == body.statement.key_id) {
+                refusal(LocalCiRefusal::DuplicateKey)
+            } else {
+                ApiError::invalid()
+            }
+        })?
     } else {
         a.clone()
     };
-    let request = request(
-        body.request_id,
-        &json!({"op": "rotate", "device": id, "expected_generation": body.expected_generation,
-            "not_after_ms": body.not_after_ms, "statement": body.statement,
-            "signature": body.signature}),
-    )?;
     change(&state, id, by, body.expected_generation, next, request).await
 }
 
@@ -380,6 +440,13 @@ async fn revoke(
     JsonBody(body): JsonBody<RevokeBody>,
 ) -> ApiResult<Value> {
     let by = human.admin()?.user.id.clone();
+    let request = request(
+        &body.request_id,
+        &json!({"op": "revoke", "device": id, "expected_generation": body.expected_generation}),
+    )?;
+    if let Some(replayed) = replay(&state, &request, &id).await? {
+        return Ok(replayed);
+    }
     let stored = current(&state, &id).await?;
     let a = &stored.authorization;
     let next = if a.generation == body.expected_generation {
@@ -390,10 +457,6 @@ async fn revoke(
     } else {
         a.clone()
     };
-    let request = request(
-        body.request_id,
-        &json!({"op": "revoke", "device": id, "expected_generation": body.expected_generation}),
-    )?;
     change(&state, id, by, body.expected_generation, next, request).await
 }
 
@@ -415,7 +478,7 @@ async fn list(
     let store = state.store.clone();
     let rows = blocking(&state, move || {
         let mut rows = Vec::new();
-        for device in store.local_ci_devices(&repo.id)? {
+        for device in store.local_ci_devices(&repo.id, None)? {
             let events = store.local_ci_device_events(&device.authorization.device_id)?;
             rows.push((device, events));
         }
@@ -439,28 +502,30 @@ async fn list(
 }
 
 /// The signed-in owner's own devices on one repository, for a device that signs with them.
-/// Read only: it changes nothing.
+/// Read only: it changes nothing. An unknown repository gives an empty list, so the route
+/// doesn't reveal which repositories are connected.
 async fn own(
     State(state): State<HubState>,
     owner: Owner,
     repository: std::result::Result<Query<RepositoryQuery>, QueryRejection>,
 ) -> ApiResult<Value> {
-    let repo = repository_for(&state, &query(repository)?).await?;
+    let Some(repo) = find_repository(&state, &query(repository)?).await? else {
+        return Ok(Json(json!({"devices": []})));
+    };
     let (store, user) = (state.store.clone(), owner.user().id.clone());
-    let devices = blocking(&state, move || store.local_ci_devices(&repo.id)).await?;
-    let mut rows = Vec::new();
-    for device in devices.iter().filter(|device| device.owner == user) {
-        let registry = device
-            .authorization
-            .issuer_registry()
-            .and_then(|registry| registry.digest())
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
-        rows.push(json!({"device_id": device.authorization.device_id,
-            "repository": device.authorization.repository,
-            "generation": device.authorization.generation, "digest": device.digest,
-            "issuer_registry_digest": registry,
-            "revoked_at_ms": device.authorization.revoked_at_ms}));
-    }
+    let devices = blocking(&state, move || {
+        store.local_ci_devices(&repo.id, Some(&user))
+    })
+    .await?;
+    let rows: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            json!({"device_id": device.authorization.device_id,
+                "repository": device.authorization.repository,
+                "generation": device.authorization.generation, "digest": device.digest,
+                "revoked_at_ms": device.authorization.revoked_at_ms})
+        })
+        .collect();
     Ok(Json(json!({"devices": rows})))
 }
 

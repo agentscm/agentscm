@@ -13,9 +13,7 @@ use std::path::{Component, Path};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    LOCAL_CI_CHECK_KIND, MAX_ITEMS, bounded_bytes, count, domain_digest, json, unique, version,
-};
+use super::{MAX_ITEMS, bounded_bytes, count, domain_digest, json, unique, version};
 use crate::evidence::{
     EvaluationClock, is_canonical_ed25519_encoding, validate_identifier, validate_lower_hex,
 };
@@ -55,7 +53,6 @@ pub struct DeviceKey {
     pub not_before_ms: u64,
     pub not_after_ms: u64,
     pub rotated_at_ms: Option<u64>,
-    pub revoked_at_ms: Option<u64>,
 }
 
 impl DeviceKey {
@@ -72,7 +69,7 @@ impl DeviceKey {
         }
         for time in [Some(self.not_before_ms), Some(self.not_after_ms)]
             .into_iter()
-            .chain([self.rotated_at_ms, self.revoked_at_ms])
+            .chain([self.rotated_at_ms])
             .flatten()
         {
             sql_time(time)?;
@@ -82,7 +79,7 @@ impl DeviceKey {
 
     /// Earliest time at which the registry schema must treat the key as revoked.
     fn retired_at_ms(&self, device_revoked: Option<u64>) -> Option<u64> {
-        [self.rotated_at_ms, self.revoked_at_ms, device_revoked]
+        [self.rotated_at_ms, device_revoked]
             .into_iter()
             .flatten()
             .min()
@@ -98,10 +95,6 @@ fn sql_time(value: u64) -> Result<()> {
     Ok(())
 }
 
-fn default_check_kinds() -> Vec<String> {
-    vec![LOCAL_CI_CHECK_KIND.to_owned()]
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceAuthorization {
@@ -111,7 +104,6 @@ pub struct DeviceAuthorization {
     pub owner: OwnerIdentity,
     pub generation: u64,
     pub revoked_at_ms: Option<u64>,
-    #[serde(default = "default_check_kinds")]
     pub allowed_check_kinds: Vec<String>,
     pub keys: Vec<DeviceKey>,
 }
@@ -173,7 +165,7 @@ impl DeviceAuthorization {
         if self.revoked_at_ms.is_some() {
             return Err(Error::Invalid("device authorization is revoked".into()));
         }
-        if new_key.rotated_at_ms.is_some() || new_key.revoked_at_ms.is_some() {
+        if new_key.rotated_at_ms.is_some() {
             return Err(Error::Invalid("a new device key must be unretired".into()));
         }
         if self
@@ -229,6 +221,10 @@ impl DeviceAuthorization {
     /// Projects this device as one issuer in the existing registry schema,
     /// which has no rotated state: rotation and device revocation both appear
     /// as `revoked_at_ms`, the earliest applicable time. The epoch is the generation.
+    ///
+    /// The registry compares that time with the evaluation clock, so with a clock
+    /// behind it a retired key can read as trusted. `verify_evidence` alone cannot
+    /// replace [`assess_device`], which refuses retired state without reading the clock.
     pub fn issuer_registry(&self) -> Result<IssuerRegistrySnapshot> {
         self.validate()?;
         let registry = IssuerRegistrySnapshot {
@@ -342,8 +338,8 @@ pub enum DeviceDecision {
 
 /// Rechecks current authorization for a claim. A definite refusal wins over
 /// `Unknown`, and `Current` is returned only when nothing is uncertain.
-/// Revoked and rotated keys are refused whatever `issued_at_ms` says, since
-/// that time is worker-asserted; there is no rotation grace period.
+/// Revoked and rotated keys are refused whatever `issued_at_ms` or the clock say,
+/// since that time is worker-asserted; there is no rotation grace period.
 pub fn assess_device(
     authorization: &DeviceAuthorization,
     claim: &DeviceClaim,
@@ -379,18 +375,18 @@ pub fn assess_device(
         OwnerStanding::RoleMissing => return refuse(OwnerRoleMissing),
         OwnerStanding::Current | OwnerStanding::Unavailable => {}
     }
+    // A stored revocation or rotation is a settled fact, so it refuses before the clock is read.
+    if authorization.revoked_at_ms.is_some() {
+        return refuse(Revoked);
+    }
+    if key.rotated_at_ms.is_some() {
+        return refuse(Rotated);
+    }
     let now = match clock {
         EvaluationClock::Known { unix_ms } if unix_ms <= i64::MAX as u64 => Some(unix_ms),
         _ => None,
     };
     if let Some(now) = now {
-        let reached = |time: Option<u64>| time.is_some_and(|time| time <= now);
-        if reached(authorization.revoked_at_ms) || reached(key.revoked_at_ms) {
-            return refuse(Revoked);
-        }
-        if reached(key.rotated_at_ms) {
-            return refuse(Rotated);
-        }
         if claim.issued_at_ms > now {
             return refuse(FutureIssued);
         }
@@ -425,7 +421,6 @@ pub struct EnrollmentStatement {
     pub public_key_hex: String,
     /// Authorization generation this enrollment applies to.
     pub generation: u64,
-    pub issued_at_ms: u64,
 }
 
 /// Values the enrolling administrator expects, from trusted state.
@@ -448,8 +443,7 @@ impl EnrollmentStatement {
                 "enrollment key ID does not match its public key".into(),
             ));
         }
-        generation(self.generation)?;
-        sql_time(self.issued_at_ms)
+        generation(self.generation)
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
@@ -513,15 +507,12 @@ pub enum KeyLocationRefusal {
     NotNormalized,
     InsideSourceRoot,
     InsideDeclaredMount,
-    ContainsDeclaredMount,
     NamedInEnvironment,
 }
 
 /// Lexically refuses a key path inside the checkout or run workspace
-/// (`source_roots`), inside or containing a declared mount, or named in a
-/// declared environment value. A mount that is a sibling or parent-adjacent
-/// path is not a match; only a mount the key is under, or one under the key
-/// path, is. Callers must canonicalize paths first; unnormalized input is refused.
+/// (`source_roots`), inside a declared mount, or named in a declared
+/// environment value. A sibling mount is not a match. Callers must canonicalize paths first; unnormalized input is refused.
 ///
 /// This enforces only the declared mounts and environment. It does not defend
 /// against host compromise, and other processes of the same user may still read
@@ -553,12 +544,6 @@ pub fn key_location_refused(
     {
         return Some(InsideDeclaredMount);
     }
-    if declared_mounts
-        .iter()
-        .any(|mount| mount.starts_with(key_path))
-    {
-        return Some(ContainsDeclaredMount);
-    }
     let needle = key_path.as_os_str().as_encoded_bytes();
     environment_values
         .iter()
@@ -573,6 +558,7 @@ pub fn key_location_refused(
 
 #[cfg(test)]
 mod tests {
+    use super::super::LOCAL_CI_CHECK_KIND;
     use super::*;
     use crate::evidence::SIGNATURE_DOMAIN;
     use crate::policy::issuers::KeyTrustStatus;
@@ -596,7 +582,6 @@ mod tests {
             not_before_ms: 1_000,
             not_after_ms: 9_000,
             rotated_at_ms: None,
-            revoked_at_ms: None,
         }
     }
 
@@ -616,7 +601,7 @@ mod tests {
             owner: owner(),
             generation: 3,
             revoked_at_ms: None,
-            allowed_check_kinds: default_check_kinds(),
+            allowed_check_kinds: vec![LOCAL_CI_CHECK_KIND.to_owned()],
             keys: vec![key(1), key(2)],
         }
     }
@@ -650,7 +635,7 @@ mod tests {
         assert_eq!(a.digest().unwrap(), b.digest().unwrap());
         assert_eq!(
             a.digest().unwrap(),
-            "84a1c97818f8d36ed311983c0cd9c9b65640c19b3fc52105f642a78cdd469a43"
+            "c30d2c7bb90c11db051cc5365eadb4fbfaaa4f4935c95b5e85c5e6843c79b579"
         );
     }
 
@@ -683,11 +668,10 @@ mod tests {
         mutate(&|a| a.keys[0].key_id = key(2).key_id);
         mutate(&|a| a.keys[0].not_after_ms = a.keys[0].not_before_ms);
         mutate(&|a| a.allowed_check_kinds = vec!["x".into(), "x".into()]);
-        // Omitted check kinds default to the local CI kind.
+        // Stored documents always carry the check kinds; there is no default.
         let mut value: serde_json::Value = serde_json::from_slice(&good).unwrap();
         value.as_object_mut().unwrap().remove("allowed_check_kinds");
-        let parsed = DeviceAuthorization::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(parsed.allowed_check_kinds, default_check_kinds());
+        reject(serde_json::to_vec(&value).unwrap());
     }
 
     #[test]
@@ -792,7 +776,7 @@ mod tests {
             DeviceRefusal,
             fn(&mut DeviceAuthorization, &mut DeviceClaim),
         );
-        let cases: [Case; 10] = [
+        let cases: [Case; 9] = [
             (WrongRepository, |_, c| {
                 c.repository = "github.com/acme/other".into()
             }),
@@ -802,7 +786,6 @@ mod tests {
             (CheckKindNotAllowed, |_, c| c.check_kind = "other/v1".into()),
             (StaleAuthorization, |_, c| c.authorization_generation = 2),
             (StaleAuthorization, |a, _| a.generation = 4),
-            (Revoked, |a, _| a.keys[0].revoked_at_ms = Some(NOW)),
             (Revoked, |a, _| a.revoked_at_ms = Some(NOW - 1)),
             (Rotated, |a, _| a.keys[0].rotated_at_ms = Some(NOW - 1)),
         ];
@@ -856,7 +839,7 @@ mod tests {
             DeviceDecision::Refused(DeviceRefusal::WrongRepository)
         );
         let mut a = auth();
-        a.keys[0].revoked_at_ms = Some(10);
+        a.revoked_at_ms = Some(10);
         assert_eq!(
             assess_device(
                 &a,
@@ -872,11 +855,10 @@ mod tests {
     fn backdated_claims_on_retired_keys_are_refused() {
         for (field, expected) in [(0, DeviceRefusal::Revoked), (1, DeviceRefusal::Rotated)] {
             let mut a = auth();
-            let k = &mut a.keys[0];
             if field == 0 {
-                k.revoked_at_ms = Some(4_500);
+                a.revoked_at_ms = Some(4_500);
             } else {
-                k.rotated_at_ms = Some(4_500);
+                a.keys[0].rotated_at_ms = Some(4_500);
             }
             let mut c = claim();
             c.issued_at_ms = 1_500;
@@ -885,10 +867,31 @@ mod tests {
     }
 
     #[test]
+    fn retired_state_is_refused_whatever_the_clock_says() {
+        let behind = EvaluationClock::Known { unix_ms: 100 };
+        for clock in [behind, EvaluationClock::Uncertain] {
+            for owner in [OwnerStanding::Current, OwnerStanding::Unavailable] {
+                let mut revoked = auth();
+                revoked.revoked_at_ms = Some(4_500);
+                assert_eq!(
+                    assess_device(&revoked, &claim(), owner, clock),
+                    DeviceDecision::Refused(DeviceRefusal::Revoked)
+                );
+                let mut rotated = auth();
+                rotated.keys[0].rotated_at_ms = Some(4_500);
+                assert_eq!(
+                    assess_device(&rotated, &claim(), owner, clock),
+                    DeviceDecision::Refused(DeviceRefusal::Rotated)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn registry_projection_validates_and_reports_status() {
         let mut a = auth();
         a.keys[0].rotated_at_ms = Some(4_000);
-        a.keys[1].revoked_at_ms = Some(4_500);
+        a.keys[1].rotated_at_ms = Some(4_500);
         a.keys.push(key(3));
         a.keys[2].not_after_ms = 4_000;
         let registry = a.issuer_registry().unwrap();
@@ -934,7 +937,6 @@ mod tests {
             key_id: k.key_id,
             public_key_hex: k.public_key_hex,
             generation: 3,
-            issued_at_ms: NOW,
         }
     }
 
@@ -964,10 +966,6 @@ mod tests {
         verify(&s, &good).unwrap();
 
         assert!(verify(&s, &sign(2, &message)).is_err(), "wrong signer");
-        let mut tampered = s.clone();
-        tampered.issued_at_ms += 1;
-        assert!(verify(&tampered, &good).is_err());
-
         let o = owner();
         let expect = |repository, owner, device_id, generation| {
             verify_enrollment(
@@ -1035,7 +1033,7 @@ mod tests {
                 &[p("/home/u/keys/other")],
                 &[]
             ),
-            Some(ContainsDeclaredMount)
+            None
         );
         assert_eq!(
             check(&[], &[], &[OsStr::new("--key=/home/u/keys/dev.key")]),

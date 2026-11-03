@@ -357,20 +357,23 @@ fn local_ci_load(conn: &Connection, device_id: &str) -> Result<Option<LocalCiDev
     .transpose()
 }
 
+fn local_ci_seen(conn: &Connection, request_id: &str) -> Result<Option<(String, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT device_id, fingerprint FROM local_ci_device_requests WHERE request_id = ?1",
+            [request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?)
+}
+
 /// A recorded request: the same fingerprint replays, any other use of the id conflicts.
 fn local_ci_replay(
     tx: &Transaction<'_>,
     request: &LocalCiRequest,
     device_id: &str,
 ) -> Result<Option<LocalCiDeviceWrite>> {
-    let seen = tx
-        .query_row(
-            "SELECT device_id, fingerprint FROM local_ci_device_requests WHERE request_id = ?1",
-            [&request.request_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let Some((seen_device, fingerprint)) = seen else {
+    let Some((seen_device, fingerprint)) = local_ci_seen(tx, &request.request_id)? else {
         return Ok(None);
     };
     if seen_device != device_id || fingerprint != request.fingerprint {
@@ -402,14 +405,9 @@ fn local_ci_finish(
         }
     }
     tx.execute(
-        "INSERT INTO local_ci_device_requests (request_id, device_id, fingerprint, generation)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            request.request_id,
-            device_id,
-            request.fingerprint,
-            plan.generation
-        ],
+        "INSERT INTO local_ci_device_requests (request_id, device_id, fingerprint)
+         VALUES (?1, ?2, ?3)",
+        params![request.request_id, device_id, request.fingerprint],
     )?;
     append(&tx, &plan.event)?;
     let device = local_ci_load(&tx, device_id)?
@@ -5888,14 +5886,23 @@ impl Store for SqliteStore {
         local_ci_load(&self.conn(), device_id)
     }
 
-    fn local_ci_devices(&self, repository: &str) -> Result<Vec<LocalCiDevice>> {
+    fn local_ci_devices(
+        &self,
+        repository: &str,
+        owner: Option<&str>,
+    ) -> Result<Vec<LocalCiDevice>> {
         let conn = self.conn();
         conn.prepare(&format!(
-            "{LOCAL_CI_SELECT} WHERE repository = ?1 ORDER BY device_id LIMIT ?2"
+            "{LOCAL_CI_SELECT} WHERE repository = ?1 AND (?2 IS NULL OR owner = ?2)
+             ORDER BY device_id LIMIT ?3"
         ))?
-        .query_map(params![repository, LIST_LIMIT], local_ci_row)?
+        .query_map(params![repository, owner, LIST_LIMIT], local_ci_row)?
         .map(|row| row?.verify())
         .collect()
+    }
+
+    fn local_ci_request(&self, request_id: &str) -> Result<Option<(String, String)>> {
+        local_ci_seen(&self.conn(), request_id)
     }
 
     fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>> {

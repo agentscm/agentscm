@@ -137,7 +137,7 @@ fn a_key_path_inside_a_git_checkout_is_refused() {
     let out = cli(&root, &["key-generate", "--key", inside.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(
-        text(&out).contains("inside the current Git checkout"),
+        text(&out).contains("inside a Git checkout"),
         "{}",
         text(&out)
     );
@@ -156,8 +156,40 @@ fn a_key_path_inside_a_git_checkout_is_refused() {
     fs::set_permissions(&moved, fs::Permissions::from_mode(0o600)).unwrap();
     let out = cli(&root, &enroll_args(moved.to_str().unwrap(), "1"));
     assert!(!out.status.success());
-    assert!(text(&out).contains("inside the current Git checkout"));
+    assert!(text(&out).contains("inside a Git checkout"));
     // The same key outside the checkout still signs when run from inside it.
     let out = cli(&root, &enroll_args(outside_key.to_str().unwrap(), "1"));
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn the_keys_own_checkout_is_found_wherever_the_command_runs() {
+    let checkout = tempfile::tempdir().unwrap();
+    let root = checkout.path().canonicalize().unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    let nested = root.join("keys");
+    fs::create_dir(&nested).unwrap();
+    let elsewhere = private_tempdir();
+
+    // Run from outside the checkout: the key's own ancestors still refuse it.
+    let inside = nested.join("device.key");
+    let out = cli(
+        elsewhere.path(),
+        &["key-generate", "--key", inside.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("inside a Git checkout"),
+        "{}",
+        text(&out)
+    );
+    assert!(!inside.exists());
+
+    // A clean path is accepted from the same directory.
+    let clean = elsewhere.path().canonicalize().unwrap().join("device.key");
+    let out = cli(
+        elsewhere.path(),
+        &["key-generate", "--key", clean.to_str().unwrap()],
+    );
     assert!(out.status.success(), "{}", text(&out));
 }

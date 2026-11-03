@@ -1,10 +1,8 @@
 //! `local-ci device key-generate|enroll-request`: create a trusted local CI device key and a
 //! signed enrollment request for an administrator to submit. Neither command prints private
-//! key bytes. A key location inside the current Git checkout is refused.
+//! key bytes. A key location inside a Git checkout is refused.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscm::local_ci::{
     EnrollmentStatement, KeyLocationRefusal, OwnerIdentity, key_location_refused,
@@ -74,13 +72,6 @@ fn enroll_request(args: EnrollRequestArgs) -> Result<Value> {
     check_location(&args.key, true)?;
     let key = read_signing_key(&args.key)?;
     let public_key_hex = public_hex(&key);
-    let issued_at_ms = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::Invalid("system clock is before 1970".into()))?
-            .as_millis(),
-    )
-    .map_err(|_| Error::Invalid("system clock is out of range".into()))?;
     let statement = EnrollmentStatement {
         version: 1,
         repository: args.repository,
@@ -93,7 +84,6 @@ fn enroll_request(args: EnrollRequestArgs) -> Result<Value> {
         key_id: issuer_key_id(&public_key_hex)?,
         public_key_hex,
         generation: args.generation,
-        issued_at_ms,
     };
     let signature: String = key
         .sign(&statement.signing_message()?)
@@ -104,8 +94,10 @@ fn enroll_request(args: EnrollRequestArgs) -> Result<Value> {
     Ok(json!({"statement": statement, "signature": signature}))
 }
 
-/// Refuses a key path inside the Git checkout enclosing the current directory, if any.
-/// Declared mounts and environment belong to an execution profile, which does not call this yet.
+/// Refuses a key path inside a Git checkout: one enclosing the key itself, wherever the command
+/// runs, or one enclosing the current directory. A checkout is any ancestor holding a `.git`
+/// entry. Declared mounts and environment belong to an execution profile, which does not call
+/// this yet.
 fn check_location(key: &Path, exists: bool) -> Result<()> {
     if !key.is_absolute() {
         return Err(Error::Invalid("key path must be absolute".into()));
@@ -121,24 +113,29 @@ fn check_location(key: &Path, exists: bool) -> Result<()> {
             .canonicalize()?
             .join(name)
     };
-    let root = checkout_root()?;
-    let roots: Vec<&Path> = root.iter().map(PathBuf::as_path).collect();
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| Error::Invalid("key path has no parent".into()))?;
+    let mut roots = checkout_roots(parent)?;
+    roots.extend(checkout_roots(&std::env::current_dir()?.canonicalize()?)?);
+    let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
     match key_location_refused(&canonical, &roots, &[], &[]) {
         None => Ok(()),
         Some(KeyLocationRefusal::InsideSourceRoot) => Err(Error::Invalid(
-            "key path is inside the current Git checkout; choose a path outside it".into(),
+            "key path is inside a Git checkout; choose a path outside it".into(),
         )),
         Some(_) => Err(Error::Invalid("key path is not acceptable".into())),
     }
 }
 
-fn checkout_root() -> Result<Option<PathBuf>> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
-    if !out.status.success() {
-        return Ok(None);
+/// Every canonical ancestor of the directory `path` (and `path` itself) that has a `.git` entry. A failure
+/// to stat an ancestor other than "not found" is an error: an unknown is not "no checkout".
+fn checkout_roots(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for ancestor in path.ancestors() {
+        if ancestor.join(".git").try_exists()? {
+            roots.push(ancestor.to_path_buf());
+        }
     }
-    let root = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    Ok(Some(PathBuf::from(root).canonicalize()?))
+    Ok(roots)
 }

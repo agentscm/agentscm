@@ -436,20 +436,28 @@ fn local_ci_load(
         .transpose()
 }
 
+fn local_ci_seen(
+    client: &mut impl postgres::GenericClient,
+    request_id: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(client
+        .query_opt(
+            "SELECT device_id, fingerprint FROM local_ci_device_requests WHERE request_id = $1",
+            &[&request_id],
+        )?
+        .map(|row| (row.get(0), row.get(1))))
+}
+
 /// A recorded request: the same fingerprint replays, any other use of the id conflicts.
 fn local_ci_replay(
     tx: &mut postgres::Transaction<'_>,
     request: &LocalCiRequest,
     device_id: &str,
 ) -> Result<Option<LocalCiDeviceWrite>> {
-    let seen = tx.query_opt(
-        "SELECT device_id, fingerprint FROM local_ci_device_requests WHERE request_id = $1",
-        &[&request.request_id],
-    )?;
-    let Some(seen) = seen else {
+    let Some((seen_device, fingerprint)) = local_ci_seen(tx, &request.request_id)? else {
         return Ok(None);
     };
-    if seen.get::<_, String>(0) != device_id || seen.get::<_, String>(1) != request.fingerprint {
+    if seen_device != device_id || fingerprint != request.fingerprint {
         return Ok(Some(LocalCiDeviceWrite::Refused(
             LocalCiRefusal::RequestConflict,
         )));
@@ -478,14 +486,9 @@ fn local_ci_finish(
         }
     }
     tx.execute(
-        "INSERT INTO local_ci_device_requests (request_id, device_id, fingerprint, generation)
-         VALUES ($1, $2, $3, $4)",
-        &[
-            &request.request_id,
-            &device_id,
-            &request.fingerprint,
-            &plan.generation,
-        ],
+        "INSERT INTO local_ci_device_requests (request_id, device_id, fingerprint)
+         VALUES ($1, $2, $3)",
+        &[&request.request_id, &device_id, &request.fingerprint],
     )?;
     append(&mut tx, &plan.event)?;
     let device = local_ci_load(&mut tx, device_id)?
@@ -5630,23 +5633,29 @@ impl Store for PgStore {
         let plan = plan_local_ci_enroll(repository, by, authorization, request)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
-            // Serializes device writes; no user or repository row is locked after it.
+            // The inserts below take FOR KEY SHARE on these rows through their foreign keys, while
+            // other writers lock a row FOR UPDATE and then take the event lock. Taking the row
+            // locks first keeps one lock order: row locks, then the event lock.
+            let label = tx
+                .query_opt(
+                    "SELECT host, full_name FROM hub_repositories WHERE id = $1 FOR KEY SHARE",
+                    &[&repository],
+                )?
+                .map(|row| local_ci_label(&row.get::<_, String>(0), &row.get::<_, String>(1)));
+            let enabled = tx
+                .query_opt(
+                    "SELECT NOT disabled FROM hub_users WHERE id = $1 FOR KEY SHARE",
+                    &[&owner],
+                )?
+                .map(|row| row.get::<_, bool>(0));
+            // Serializes device writes.
             tx.execute("SELECT pg_advisory_xact_lock($1)", &[&EVENT_LOCK])?;
             if let Some(write) = local_ci_replay(&mut tx, request, &authorization.device_id)? {
                 return Ok(write);
             }
-            let label = tx
-                .query_opt(
-                    "SELECT host, full_name FROM hub_repositories WHERE id = $1",
-                    &[&repository],
-                )?
-                .map(|row| local_ci_label(&row.get::<_, String>(0), &row.get::<_, String>(1)));
             if label.as_deref() != Some(authorization.repository.as_str()) {
                 return Err(HubError::Invalid("unknown repository for that label".into()));
             }
-            let enabled = tx
-                .query_opt("SELECT NOT disabled FROM hub_users WHERE id = $1", &[&owner])?
-                .map(|row| row.get::<_, bool>(0));
             if enabled != Some(true) {
                 return Err(HubError::Invalid("unknown or disabled owner".into()));
             }
@@ -5721,17 +5730,28 @@ impl Store for PgStore {
         self.run(true, |client| local_ci_load(client, device_id))
     }
 
-    fn local_ci_devices(&self, repository: &str) -> Result<Vec<LocalCiDevice>> {
+    fn local_ci_devices(
+        &self,
+        repository: &str,
+        owner: Option<&str>,
+    ) -> Result<Vec<LocalCiDevice>> {
         self.run(true, |client| {
             client
                 .query(
-                    &format!("{LOCAL_CI_SELECT} WHERE repository = $1 ORDER BY device_id LIMIT $2"),
-                    &[&repository, &LIST_LIMIT],
+                    &format!(
+                        "{LOCAL_CI_SELECT} WHERE repository = $1 AND ($2::TEXT IS NULL OR owner = $2)
+                         ORDER BY device_id LIMIT $3"
+                    ),
+                    &[&repository, &owner, &LIST_LIMIT],
                 )?
                 .iter()
                 .map(|row| local_ci_row(row).verify())
                 .collect()
         })
+    }
+
+    fn local_ci_request(&self, request_id: &str) -> Result<Option<(String, String)>> {
+        self.run(true, |client| local_ci_seen(client, request_id))
     }
 
     fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>> {

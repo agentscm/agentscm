@@ -2199,6 +2199,21 @@ async fn admin_call(
     path: &str,
     body: Option<Value>,
 ) -> Result<(u16, Value)> {
+    match admin_request(hub, method, path, body).await? {
+        (404, _) => Err(invalid(
+            "no such connection (or GitHub is not configured on this hub)",
+        )),
+        reply => Ok(reply),
+    }
+}
+
+/// Like [`admin_call`] but a 404 is returned for the caller to explain.
+async fn admin_request(
+    hub: &Option<String>,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<(u16, Value)> {
     let client = forge_http::client().map_err(map_hub_error)?;
     let (hub, session) = load_session(hub.as_deref())?;
     let (status, reply) = call(
@@ -2213,9 +2228,6 @@ async fn admin_call(
         401 => Err(invalid(SESSION_EXPIRED)),
         403 => Err(invalid(
             "refused: administrators only, or the connection cannot read that repository",
-        )),
-        404 => Err(invalid(
-            "no such connection (or GitHub is not configured on this hub)",
         )),
         _ => Ok((status, reply)),
     }
@@ -2234,6 +2246,34 @@ fn connection_id(id: &str) -> Result<()> {
     } else {
         Err(invalid("connection id must look like con_..."))
     }
+}
+
+fn local_ci_device_id(id: &str) -> Result<()> {
+    let rest = id.strip_prefix("lcd_").unwrap_or_default();
+    if !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+    {
+        Ok(())
+    } else {
+        Err(invalid("device id must look like lcd_..."))
+    }
+}
+
+/// The route's own words: its error code, message and, for a stale change, the generation to retry with.
+fn local_ci_error(status: u16, reply: &Value) -> Error {
+    let mut text = format!(
+        "hub replied {status}: {}",
+        clean(reply["error"].as_str().unwrap_or("error"))
+    );
+    if let Some(message) = reply["message"].as_str() {
+        text.push_str(&format!(": {}", clean(message)));
+    }
+    if let Some(generation) = reply["current_generation"].as_u64() {
+        text.push_str(&format!(" (current generation {generation})"));
+    }
+    Error::Invalid(text)
 }
 
 /// `--request` is the JSON `local-ci device enroll-request` printed. `--request-id` makes a
@@ -2323,6 +2363,7 @@ async fn local_ci_device(command: LocalCiDeviceCommand) -> Result<()> {
             not_after_ms,
             hub,
         } => {
+            local_ci_device_id(&id)?;
             let signed = read(&request)?;
             let body = json!({"request_id": request_id, "expected_generation": expected_generation,
                 "not_after_ms": not_after_ms,
@@ -2335,6 +2376,7 @@ async fn local_ci_device(command: LocalCiDeviceCommand) -> Result<()> {
             request_id,
             hub,
         } => {
+            local_ci_device_id(&id)?;
             let body =
                 json!({"request_id": request_id, "expected_generation": expected_generation});
             (hub, Method::POST, format!("{BASE}/{id}/revoke"), Some(body))
@@ -2346,9 +2388,9 @@ async fn local_ci_device(command: LocalCiDeviceCommand) -> Result<()> {
             (hub, Method::GET, path, None)
         }
     };
-    let (status, reply) = admin_call(&hub, method, &path, body).await?;
+    let (status, reply) = admin_request(&hub, method, &path, body).await?;
     if status != 200 {
-        return Err(unexpected(status, &reply));
+        return Err(local_ci_error(status, &reply));
     }
     println!("{reply}");
     Ok(())
@@ -2624,6 +2666,38 @@ mod tests {
             );
         }
         assert_eq!(version_note("not a version"), None);
+    }
+
+    #[test]
+    fn local_ci_device_ids_are_checked_before_they_reach_a_url() {
+        for good in ["lcd_one", "lcd_a-b.c:d"] {
+            assert!(local_ci_device_id(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "lcd_",
+            "dev_one",
+            "lcd_a/../b",
+            "lcd_a?x=1",
+            "lcd_a b",
+            "lcd_a%2f",
+        ] {
+            assert!(local_ci_device_id(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn local_ci_errors_carry_the_routes_message_and_generation() {
+        let stale = json!({"error": "stale_generation", "message": "read it again\u{7}",
+            "current_generation": 4});
+        assert_eq!(
+            local_ci_error(409, &stale).to_string(),
+            "invalid: hub replied 409: stale_generation: read it again (current generation 4)"
+        );
+        let missing = json!({"error": "unknown_device", "message": "no such local CI device"});
+        let text = local_ci_error(404, &missing).to_string();
+        assert!(text.contains("unknown_device") && text.contains("no such local CI device"));
+        assert!(!text.contains("connection"));
     }
 
     #[test]

@@ -25,6 +25,5 @@ CREATE INDEX local_ci_device_keys_device ON local_ci_device_keys (device_id);
 CREATE TABLE local_ci_device_requests (
     request_id TEXT PRIMARY KEY,
     device_id TEXT NOT NULL REFERENCES local_ci_devices (device_id),
-    fingerprint TEXT NOT NULL,
-    generation BIGINT NOT NULL
+    fingerprint TEXT NOT NULL
 );
