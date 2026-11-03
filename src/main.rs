@@ -788,7 +788,7 @@ fn with_default_quickstart(mut argv: Vec<OsString>) -> Vec<OsString> {
     argv
 }
 
-fn parse_cli(argv: Vec<OsString>, terminal: bool) -> ParsedCli {
+fn parse_cli(argv: Vec<OsString>) -> ParsedCli {
     let argv = with_default_quickstart(argv);
     if is_help_all(&argv) {
         let _ = <Cli as clap::CommandFactory>::command().print_help();
@@ -807,12 +807,8 @@ fn parse_cli(argv: Vec<OsString>, terminal: bool) -> ParsedCli {
             }
             // Exit 2 blocks a Stop hook, so a parse error there is a non-blocking error.
             let code = if is_stop_hook_invocation(&argv) { 1 } else { 2 };
-            if terminal {
-                // A person at a terminal gets clap's normal usage text, not a JSON blob.
-                let _ = error.print();
-            } else {
-                print_error(&Error::Invalid(error.to_string()));
-            }
+            // Usage text is for a reader, so it is never wrapped in the JSON error.
+            let _ = error.print();
             ParsedCli::Exit(code)
         }
         Err(error) => {
@@ -830,7 +826,7 @@ fn parse_cli_on_bounded_stack() -> Result<ParsedCli> {
     let thread = std::thread::Builder::new()
         .name("agentscm-cli-parser".into())
         .stack_size(PARSER_STACK_BYTES)
-        .spawn(move || parse_cli(argv, io::IsTerminal::is_terminal(&io::stderr())))?;
+        .spawn(move || parse_cli(argv))?;
     match thread.join() {
         Ok(parsed) => Ok(parsed),
         Err(panic) => std::panic::resume_unwind(panic),
@@ -1824,12 +1820,12 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_hook_parse_error_never_blocks_even_at_a_terminal() {
-        let exit = |args: &[&str], terminal: bool| {
+    fn a_stop_hook_parse_error_never_blocks() {
+        let exit = |args: &[&str]| {
             let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
             let parsed = std::thread::Builder::new()
                 .stack_size(4 * 1024 * 1024)
-                .spawn(move || parse_cli(argv, terminal))
+                .spawn(move || parse_cli(argv))
                 .unwrap()
                 .join()
                 .unwrap();
@@ -1838,20 +1834,14 @@ mod tests {
                 _ => panic!("expected a parse error"),
             }
         };
-        for terminal in [false, true] {
-            let stop = [
-                "agentscm",
-                "skill-workflow",
-                "claude-stop",
-                "--no-such-flag",
-            ];
-            assert_eq!(exit(&stop, terminal), 1, "terminal={terminal}");
-            assert_eq!(
-                exit(&["agentscm", "quikstart"], terminal),
-                2,
-                "terminal={terminal}"
-            );
-        }
+        let stop = [
+            "agentscm",
+            "skill-workflow",
+            "claude-stop",
+            "--no-such-flag",
+        ];
+        assert_eq!(exit(&stop), 1);
+        assert_eq!(exit(&["agentscm", "quikstart"]), 2);
     }
 
     #[tokio::test]

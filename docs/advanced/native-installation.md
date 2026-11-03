@@ -83,8 +83,8 @@ Successful operations print one JSON value to stdout. `ok: true` means the
 operation returned a report, including reports with blocked fields; it does not
 mean installation or service readiness. Setup failures exit 1, print no stdout,
 and emit a redacted JSON error object with `operation`, `kind`, `message` and an
-optional typed `blocker` on stderr. Argument errors retain the ordinary CLI JSON
-error convention and exit 2. Underlying native/filesystem error sources are not
+optional typed `blocker` on stderr. Argument errors print the parser's plain
+usage text on stderr and exit 2. Underlying native/filesystem error sources are not
 serialized into the setup error object.
 
 ## Durable steps and resume
