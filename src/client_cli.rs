@@ -684,6 +684,15 @@ impl Verified {
     }
 }
 
+/// Only a token this client minted renews; one given to `client setup` is never renewed.
+fn renewal_note(connection: &Connection) -> &'static str {
+    if connection.owned_token_id.is_some() {
+        " The token renews automatically before it ends; if renewal fails, run `agentscm client renew`."
+    } else {
+        ""
+    }
+}
+
 fn identity_hostname(host: &str) -> Option<String> {
     reqwest::Url::parse(&format!("https://{host}"))
         .ok()?
@@ -1330,10 +1339,11 @@ async fn connect_inner(
             }
             if !quiet {
                 println!(
-                    "Connection is already valid for {} at {} {} and permits coordination.",
+                    "Connection is already valid for {} at {} {} and permits coordination.{}",
                     saved.repo,
                     saved.hub,
-                    verified.as_who()
+                    verified.as_who(),
+                    renewal_note(saved)
                 );
             }
             return Ok(());
@@ -1500,11 +1510,12 @@ async fn connect_inner(
         return Ok(());
     }
     println!(
-        "Connected {} to {} for {} {} and permits coordination.",
+        "Connected {} to {} for {} {} and permits coordination.{}",
         connection.root.display(),
         connection.hub,
         connection.repo,
-        verified.as_who()
+        verified.as_who(),
+        renewal_note(&connection)
     );
     Ok(())
 }
@@ -1672,10 +1683,11 @@ async fn check(args: RootArgs) -> Result<()> {
     }
     let verified = verify(&connection).await?;
     println!(
-        "Connection is valid for {} at {} {} and permits coordination.",
+        "Connection is valid for {} at {} {} and permits coordination.{}",
         connection.repo,
         connection.hub,
-        verified.as_who()
+        verified.as_who(),
+        renewal_note(&connection)
     );
     println!(
         "This checks only the Hub binding. Use client doctor and agentscm_setup_status in your native MCP client to verify hooks and MCP."
@@ -1821,6 +1833,24 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn only_a_managed_token_is_described_as_renewing() {
+        let mut connection = Connection {
+            root: PathBuf::from("/synthetic/checkout"),
+            origin_host: "github.com".into(),
+            hub: "https://hub.example.test".into(),
+            repo: "acme/widgets".into(),
+            token_file: PathBuf::from("/synthetic/token"),
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: Vec::new(),
+        };
+        assert_eq!(renewal_note(&connection), "");
+        connection.owned_token_id = Some("synthetic-id".into());
+        assert!(renewal_note(&connection).contains("`agentscm client renew`"));
+    }
 
     #[test]
     fn doctor_summarizes_onboarding_sessions_newest_first() {

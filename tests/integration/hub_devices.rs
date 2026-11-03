@@ -1216,7 +1216,7 @@ async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
     env.fake.lock().unwrap().approve = ALICE;
     let machine = Machine::new(REPO);
     let (hub, root) = (env.hub.clone(), machine.root());
-    let (ok, _, stderr) = machine.run(&[
+    let (ok, connected, stderr) = machine.run(&[
         "--no-telemetry",
         "client",
         "connect",
@@ -1228,6 +1228,10 @@ async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
         root.to_str().unwrap(),
     ]);
     assert!(ok, "{stderr}");
+    assert!(
+        connected.contains("renews automatically") && connected.contains("agentscm client renew"),
+        "{connected}"
+    );
     let expires = machine.connection()["owned_token_expires_at"]
         .as_i64()
         .unwrap();
