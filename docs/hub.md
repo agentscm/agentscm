@@ -1128,8 +1128,10 @@ sign-in (and no PAT) makes a one-time setup link itself.
    first decides which GitHub App the hub trusts, so keep it out of proxy access logs.
    Optional `AGENTSCM_GITHUB_APP_NAME` (default `agentscm-hub`) and `AGENTSCM_GITHUB_APP_ORG`
    choose the app's name and owner.
-3. Open the link in a browser signed in to GitHub, create the app, then follow the install link on
-   the success page and choose one repository.
+3. Open the link in a browser signed in to GitHub. The page names the owner (your personal
+   account or the organization) and the app name, taken from step 2's variables; change either in
+   its form if they are wrong, then click Continue to GitHub, create the app, follow the install
+   link on the success page and choose one repository. Nothing is sent to GitHub until you click.
 4. The success page and the hub log print `AGENTSCM_GITHUB_CLIENT_ID=...` and
    `AGENTSCM_GITHUB_CLIENT_SECRET_FILE=...`. The second is a path inside the hub's own secrets
    directory, so it works as printed (with compose too); never loosen that file's mode. Set them
