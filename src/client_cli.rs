@@ -1683,6 +1683,41 @@ async fn check(args: RootArgs) -> Result<()> {
     Ok(())
 }
 
+/// One readable line per session in an onboarding reply (a list, or one status), newest first.
+fn session_lines(reply: &Value) -> Vec<String> {
+    let mut statuses: Vec<&Value> = match reply {
+        Value::Array(list) => list.iter().collect(),
+        one => vec![one],
+    };
+    statuses.sort_by_key(|status| std::cmp::Reverse(status["expires_at"].as_i64()));
+    statuses
+        .into_iter()
+        .map(|status| {
+            let text = |key: &str| status[key].as_str().unwrap_or("unknown");
+            let seen = |key: &str| {
+                if status[key].as_bool() == Some(true) {
+                    "seen"
+                } else {
+                    "not seen"
+                }
+            };
+            let mut line = format!(
+                "{} session {}: {} (MCP {}, native edit hook {}).",
+                text("agent"),
+                text("session"),
+                text("state"),
+                seen("mcp_verified"),
+                seen("native_verified")
+            );
+            if status["state"] != "ready" {
+                line.push(' ');
+                line.push_str(text("next_action"));
+            }
+            line
+        })
+        .collect()
+}
+
 async fn doctor(args: DoctorArgs) -> Result<()> {
     use agentscm::hub::onboarding::{Agent, Blocker, CLIENT_HEADER};
     let session = args
@@ -1757,7 +1792,9 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
             "Hub onboarding check failed; review the Hub binding and server version",
         ));
     }
-    println!("{}", serde_json::to_string_pretty(&reply)?);
+    for line in session_lines(&reply) {
+        println!("{line}");
+    }
     let checked = computer::check(&connection).await;
     match &checked {
         Some(Ok(verified)) => println!("{verified}"),
@@ -1784,6 +1821,28 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn doctor_summarizes_onboarding_sessions_newest_first() {
+        let reply = json!([
+            {"agent":"claude","session":"old","state":"unverified","mcp_verified":true,
+             "native_verified":false,"expires_at":10,"next_action":"Edit a file."},
+            {"agent":"claude","session":"new","state":"ready","mcp_verified":true,
+             "native_verified":true,"expires_at":20,"next_action":"Continue."},
+        ]);
+        assert_eq!(
+            session_lines(&reply),
+            [
+                "claude session new: ready (MCP seen, native edit hook seen).",
+                "claude session old: unverified (MCP seen, native edit hook not seen). Edit a file."
+            ]
+        );
+        assert!(session_lines(&json!([])).is_empty());
+        assert_eq!(
+            session_lines(&json!({"agent":"claude"})),
+            ["claude session unknown: unknown (MCP not seen, native edit hook not seen). unknown"]
+        );
+    }
 
     #[cfg(target_os = "macos")]
     fn integration_connection(agents: Vec<String>) -> Connection {
