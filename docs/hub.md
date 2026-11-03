@@ -407,10 +407,16 @@ status shown; clients show `message` as is.
   `owner` as a Hub user id, `not_after_ms`, `statement`, `signature`; enrolls generation 1),
   `POST .../devices/{id}/rotate` (`request_id`, `expected_generation`, `not_after_ms`, `statement`,
   `signature`), `POST .../devices/{id}/revoke` (`request_id`, `expected_generation`) and
-  `GET .../devices?repository=host/owner/name` (devices with audit events). Refusals are 400 for an
-  invalid statement or signature, 404 for an unknown device or owner, 409 for a stale generation,
-  a taken device or key, a revoked device, a disabled owner or a missing owner role, and 503 when
-  the forge role check is uncertain. No route accepts a result.
+  `GET .../devices?repository=host/owner/name` (devices with audit events). Refusals are 400
+  (`invalid_request`, `invalid_request_id`, `invalid_expiry`, `enrollment_invalid`), 404
+  (`unknown_repository`, `unknown_owner`, `unknown_device`), 409 (`stale_generation`,
+  `device_exists`, `duplicate_key`, `request_conflict`, `device_revoked`, `owner_disabled`,
+  `owner_role_missing`, `repository_renamed`) and 503 (`role_check_unavailable`) when the forge
+  role check is uncertain. An exact replay of an applied `request_id` returns the stored result
+  before those checks. No route accepts a result.
+- A signed-in person or their computer credential (not an agent token, read-only token or
+  administrator-only credential): `GET /v1/hub/local-ci/devices?repository=host/owner/name` lists
+  that person's own devices on the repository, and an unknown repository gives an empty list.
 
 ## Read-only tokens
 
