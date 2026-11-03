@@ -438,6 +438,18 @@ fn live_dispatch_cannot_be_claimed_twice_and_recovery_fences_late_result() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // A journal writer holding the lease is not a cancellation of the live dispatch,
+    // however long it holds it; load stretches the competing calls below the same way.
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(f.root.path().join("skill-workflows/journal.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    lock.unlock().unwrap();
+    // Give a wrongly stopped dispatch time to retain its outcome before recovery fences it.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let competing = runtime::advance_with_actions(
         f.root.path(),
         "concurrent",
