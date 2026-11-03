@@ -5,11 +5,13 @@ import { agentSetupPrompt } from '../connectAgent.ts'
 import { fetchRepositoryList, type DeviceAuth, type RepositoryRow } from '../devices.ts'
 import { FINISHED_MEANS_AGENT_SAID } from '../copy.ts'
 import { fetchNarrative } from '../narrative.ts'
+import { agentName, who } from '../nextStep.ts'
 import { RefusalNotice } from '../Refusal.tsx'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
 import { SectionTabs, type WebChoice } from '../TopNav.tsx'
 import { Ago, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
+import { ValueMetricsSection } from '../ValueMetrics.tsx'
 import type { Load } from './Computers.tsx'
 import { workTabHref } from './Work.tsx'
 
@@ -127,6 +129,7 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
                 </>
               )}
               {quiet.length > 0 && <QuietDrawer rows={quiet} hint={newHere ? 'No agents or unfinished work yet' : 'Nothing in progress'} {...rowProps} />}
+              <ValueMetricsSection session={session} repositories={v.rows} onOpen={web ? open : undefined} />
               {!v.complete && <p className="muted small">Only the first 200 connected repositories are checked.</p>}
               {current && overview && v.rows.length > 0 && !newHere && <Done repo={current} overview={overview} token={token} />}
             </div>
@@ -335,7 +338,7 @@ function DoneBriefing({ token }: { token: string }) {
     <div className="rp-brief">
       <p className="rp-brief-h">{view.output.headline}</p>
       <p className="rp-brief-by">
-        Written by {view.generated_by ?? 'a connected agent'}{view.generated_at !== null && <> · <Ago at={view.generated_at} /></>}
+        Written by {view.generated_by ? agentName(view.generated_by) : 'a connected agent'}{view.generated_at !== null && <> · <Ago at={view.generated_at} /></>}
         {' · '}<a href="#activity">Read the full briefing</a>
       </p>
     </div>
@@ -366,7 +369,7 @@ function Done({ repo, overview, token }: { repo: string; overview: WorkOverview;
             <li key={o.seq}>
               <a className="rp-done-t" href={workHref(o.item.id)}>{o.item.title}</a>
               <span className="rp-done-at"><Ago at={o.at} /></span>
-              <span className="rp-done-who">{o.kind === 'completion' ? 'Finished' : 'Decision'} · {o.item.owner_login} with {o.item.lead_agent}</span>
+              <span className="rp-done-who">{o.kind === 'completion' ? 'Finished' : 'Decision'} · {who(o.item.owner_login, o.item.lead_agent)}</span>
               {o.item.current && <span className="rp-done-say">{o.item.current.summary}</span>}
             </li>
           ))}

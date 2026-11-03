@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Json, Response};
@@ -38,6 +38,7 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/device/tokens/{id}", delete(revoke_token))
         .route("/v1/hub/session/read-token", post(web_read_token))
         .route("/v1/hub/session/repositories", get(session_repositories))
+        .route("/v1/hub/session/value-metrics", get(session_value_metrics))
         .route("/v1/hub/device/repositories", get(device_repositories))
         .route("/v1/hub/devices", get(list).post(enroll))
         .route("/v1/hub/devices/{id}", delete(revoke))
@@ -524,6 +525,58 @@ const LIST_LIVE_LIMIT: usize = 500;
 /// counts each, for the web pages' All repositories list. Each passes the role check a mint makes,
 /// with no token stored. A refused one is left out without a refusal row; one the forge could not
 /// answer for is only counted, never named.
+async fn session_value_metrics(
+    State(state): State<HubState>,
+    super::HumanSession(human): super::HumanSession,
+    query: std::result::Result<
+        Query<super::super::value_metrics::ValueMetricsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> ApiResult<Json<super::super::value_metrics::ValueMetrics>> {
+    if human.browser.is_none() {
+        return Err(super::forbidden());
+    }
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    query.window(unix_now()).map_err(ApiError::from)?;
+    let owner = human.user;
+    let (store, host) = (state.store.clone(), owner.identity.host.clone());
+    let mut candidates = blocking(&state, move || {
+        store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
+    })
+    .await?;
+    let repositories_complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
+    candidates.truncate(super::MAX_SIGN_IN_PROBES);
+    // A fresh role check applies to every aggregate and every detail page.
+    let (mut readable, unchecked) = readable(&state, &owner, candidates, false).await;
+    if let Some(name) = &query.repository {
+        readable.retain(|r| &r.full_name == name);
+        if readable.is_empty() {
+            return Err(super::forbidden());
+        }
+    }
+    let store = state.store.clone();
+    let metrics=blocking(&state,move||{
+        let now=unix_now();
+        let mut facts=Vec::new();
+        for repo in readable {
+            let principal=Principal{token_id:String::new(),name:String::new(),repository:repo.full_name,repository_id:Some(repo.repository_id),expires_at:now,read_only:true,owner:owner.clone()};
+            let scoped=store.repository_value_facts(&principal,&query,now)?;
+            // Only a missing requested Work is skipped; every store/auth error propagates.
+            if query.work_id.is_none() || !scoped.works.is_empty(){facts.push(scoped);}
+
+        }
+        if query.work_id.is_some() && facts.is_empty(){return Ok(None);}
+        let mut projected=super::super::value_metrics::project(facts,&query,now)?;
+        if !repositories_complete || unchecked>0 {
+            projected.coverage.complete=false;
+            projected.coverage.eligible_works=None;
+            projected.coverage.gaps.push("Repository access checks were bounded or unavailable; authorized scope is incomplete".into());
+        }
+        Ok(Some(projected))
+    }).await?;
+    Ok(Json(metrics.ok_or_else(ApiError::not_found)?))
+}
+
 async fn session_repositories(
     State(state): State<HubState>,
     super::HumanSession(human): super::HumanSession,

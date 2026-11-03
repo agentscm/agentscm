@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Contested, Derived } from '../../src/derive.ts'
-import { areaOf, areas, needsYou } from '../../src/needs.ts'
-import type { WorkItem, WorkOverview } from '../../src/standup.ts'
+import { areaOf, areas, inboxBadge, needsYou } from '../../src/needs.ts'
+import type { CoordinationRequest, WorkItem, WorkOverview } from '../../src/standup.ts'
 
 const item = (id: string, over: Partial<WorkItem>): WorkItem =>
   ({ id, title: id, state: 'active', claim_status: 'active', updated_at: 100, last_checkin_at: 100, blocker: null, scope: [], lead_agent: 'codex', owner_login: 'dev', ...over }) as WorkItem
@@ -36,6 +36,35 @@ describe('needsYou', () => {
   })
   it('nothing loaded is nothing to decide, not an error', () => {
     expect(needsYou(null, null)).toEqual([])
+  })
+})
+
+describe('a request to an idle task', () => {
+  const lead = (login: string) => ({ token: `t-${login}`, agent: 'claude-code', session: 's', owner: login, login })
+  const request = (over: Partial<CoordinationRequest> = {}) => ({
+    id: 'crq_1', requester: lead('maria'), status: 'pending', responses: [], acknowledgements: [], created_at: 50,
+    targets: [{ work_id: 'mine', lead: lead('dev'), generation: 1, reasons: [{ your_path: 'ui/src/pages/Catchup.tsx', their_path: 'ui/src/pages/Catchup.tsx' }], reasons_complete: true }],
+    ...over,
+  }) as unknown as CoordinationRequest
+  const mine = (over: Partial<WorkItem>) => overview([item('mine', { owner_login: 'dev', ...over })])
+  it('needs the owner when their task is paused or quiet, even though a quiet task alone is not listed', () => {
+    for (const over of [{ state: 'paused', claim_status: 'stale' }, { claim_status: 'stale' }, { state: 'paused' }] as Partial<WorkItem>[]) {
+      expect(needsYou(mine(over), null, { requests: [request()], me: 'dev' }).map((n) => [n.kind, n.who, n.path])).toEqual([['asked', 'you', 'ui/src/pages/Catchup.tsx']])
+    }
+  })
+  it('leaves it to the agents while the lead is running, answered, closed, or someone else’s', () => {
+    const reply = { target_work_id: 'mine', target_generation: 1, seq: 9 } as unknown as CoordinationRequest['responses'][number]
+    expect(needsYou(mine({}), null, { requests: [request()], me: 'dev' })).toEqual([])
+    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ responses: [reply] })], me: 'dev' }).map((n) => n.kind)).toEqual([])
+    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ status: 'withdrawn' })], me: 'dev' }).map((n) => n.kind)).toEqual([])
+    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request()], me: 'maria' }).map((n) => n.kind)).toEqual([])
+  })
+  it('the Inbox badge counts live overlaps and every unanswered request to the viewer’s agents, running or not', () => {
+    const reply = { target_work_id: 'mine', target_generation: 1, seq: 9 } as unknown as CoordinationRequest['responses'][number]
+    const ov = overview([item('mine', { owner_login: 'dev' })], [{ left: item('l', {}), right: item('r', {}), reasons: [] }, { left: item('l', {}), right: item('s', { claim_status: 'stale' }), reasons: [] }] as unknown as WorkOverview['overlaps'])
+    expect(inboxBadge(ov, { requests: [request(), request({ id: 'crq_2', responses: [reply] }), request({ id: 'crq_3', status: 'resolved' })], me: 'dev' })).toEqual({ n: 2, tip: '1 overlap to talk about · 1 request waiting on you' })
+    expect(inboxBadge(ov, { requests: [request()], me: 'maria' })).toEqual({ n: 1, tip: '1 overlap to talk about' })
+    expect(inboxBadge(null, undefined)).toEqual({ n: 0, tip: '' })
   })
 })
 

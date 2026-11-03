@@ -47,7 +47,7 @@ test('runs list leads with the next action and labels self-reported gates', asyn
   await expect(main.getByText('Self-reported').first()).toBeVisible()
   await expect(main.getByText('Waiting on ci')).toBeVisible()
   // The mock's billing task is on run_41's branch, so its row names the task and person first.
-  await expect(main.getByRole('link', { name: /feat\/sync-retry-budget/ })).toContainText('Refactor the billing module · maria’s claude-code')
+  await expect(main.getByRole('link', { name: /feat\/sync-retry-budget/ })).toContainText('Refactor the billing module · maria’s Claude Code')
   await main.getByRole('tab', { name: /Completed/ }).click()
   await expect(main.getByText('Completed', { exact: true }).last()).toBeVisible()
   await expect(main.getByText('chore/tighten-upload-limits')).toBeVisible()

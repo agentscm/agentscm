@@ -80,7 +80,7 @@ describe('G palette', () => {
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
-  const live = { token: 't', repo: 'acme/widgets', data, d, overview: poll, needs: [], handoff: { me: 'maya', repo: 'acme/widgets', originUrl: null } } as LiveProps
+  const live = { token: 't', repo: 'acme/widgets', data, d, overview: poll, needs: [], inbox: { n: 0, tip: '' }, handoff: { me: 'maya', repo: 'acme/widgets', originUrl: null } } as LiveProps
   const open = (showAdmin: boolean) => {
     render(<GLive live={live} section="home" sections={SECTIONS} page={() => null} showAdmin={showAdmin} hubSignedOut={false} onClassic={() => {}} />)
     fireEvent.keyDown(window, { key: 'k', ctrlKey: true })

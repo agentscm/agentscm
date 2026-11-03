@@ -37,7 +37,7 @@ use super::store::{Principal, unix_now};
 use super::view_settings::{ViewOverride, ViewSettings};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, ForgeWorkRef, WorkCheckpoint,
-    WorkConflictKind, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
+    WorkConflictKind, WorkItem, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
 };
 use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult, WorkPreflightStatus};
 #[cfg(not(unix))]
@@ -92,8 +92,13 @@ const UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
 const UI_MIME: &str = "text/html;profile=mcp-app";
 const OVERVIEW_URI: &str = "ui://agentscm/work-overview";
 const INBOX_URI: &str = "ui://agentscm/coordination-inbox";
+const VALUE_URI: &str = "ui://agentscm/value-metrics";
 const OVERVIEW_HTML: &str = include_str!("mcp_views/work-overview.html");
 const INBOX_HTML: &str = include_str!("mcp_views/coordination-inbox.html");
+const VALUE_HTML: &str = include_str!("mcp_views/value-metrics.html");
+
+#[path = "contribution_receipt.rs"]
+mod contribution_receipt;
 
 const PARSE_ERROR: (i32, &str) = (-32700, "parse error");
 const INVALID_REQUEST: (i32, &str) = (-32600, "invalid request");
@@ -436,6 +441,8 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_work_overview"
                     | "agentscm_work_insight"
                     | "agentscm_work_insights"
+                    | "agentscm_value_metrics"
+                    | "agentscm_contribution_receipt"
                     | "agentscm_change_record"
                     | "agentscm_pr_context"
                     | "agentscm_work_pr_link"
@@ -464,6 +471,7 @@ fn views(settings: &ViewSettings) -> Vec<(&'static str, &'static str)> {
     let mut views = Vec::new();
     if settings.enabled && settings.work_overview {
         views.push((OVERVIEW_URI, OVERVIEW_HTML));
+        views.push((VALUE_URI, VALUE_HTML));
     }
     if settings.enabled && settings.coordination_inbox {
         views.push((INBOX_URI, INBOX_HTML));
@@ -675,6 +683,20 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             "after":{"type":"string","maxLength":512}, "through":{"type":"integer","minimum":0},
             "limit":{"type":"integer","minimum":1,"maximum":20,"default":20}
         }), &[])});
+    let mut value_metrics = json!({"name":"agentscm_value_metrics",
+        "description":"Reads the same deterministic observed-contribution projection as the Hub for this repository only. Unknown coverage and costs remain unknown. Bounded evidence; no provider polling or model generation. Continue using next_after when present.",
+        "annotations":{"readOnlyHint":true},
+        "inputSchema":schema(json!({"since":{"type":"integer","minimum":0},"until":{"type":"integer","minimum":0},"work_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50,"default":20},"after":{"type":"string","maxLength":256}}), &[])});
+    if settings.enabled && settings.work_overview {
+        value_metrics["_meta"] = json!({"ui":{"resourceUri":VALUE_URI}});
+    }
+    let contribution_receipt = json!({"name":"agentscm_contribution_receipt",
+        "description":"Explicitly reads a compact contribution receipt for one Work, including unresolved evidence and coverage limits. Completion is separate from provider-observed merge and never grants merge authority. Reading is repeatable and does not acknowledge evidence.",
+        "annotations":{"readOnlyHint":true},
+        "inputSchema":schema(json!({"work_id":{"type":"string"},"session":{"type":"string","maxLength":255}}), &["work_id"])});
+    let receipt_settings = json!({"name":"agentscm_receipt_settings",
+        "description":"Read or set this repository token and session's contribution receipt mode. Legacy sessions default to requested_only; automatic appends once per evidence version at supported completion/check/premerge calls. Disabled suppresses automatic receipts and explicit receipt reads.",
+        "inputSchema":schema(json!({"session":{"type":"string","maxLength":255},"mode":{"type":"string","enum":["automatic","requested_only","disabled"]}}), &[])});
     let work_search = json!({"name": "agentscm_work_search",
         "description": "Finds work in this repository by text, finished work included, in creation order, newest first. q matches title, branch, lead agent, owner, work id, scope paths or a source issue number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
         "annotations": {"readOnlyHint": true},
@@ -803,6 +825,8 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             shared_conversation,
             insight,
             insights,
+            value_metrics,
+            contribution_receipt,
             work_search,
             publications,
             workflow_runs,
@@ -946,6 +970,9 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         shared_conversation,
         insight,
         insights,
+        value_metrics,
+        contribution_receipt,
+        receipt_settings,
         work_search,
         publications,
         workflow_runs,
@@ -1111,6 +1138,14 @@ async fn call(
         return Ok(value);
     }
     let name = params.and_then(|p| p["name"].as_str()).unwrap_or("");
+    contribution_receipt::append(
+        state,
+        principal,
+        name,
+        params.and_then(|p| p.get("arguments")),
+        &mut value,
+    )
+    .await;
     if matches!(
         name,
         "agentscm_work_overview" | "agentscm_coordination_inbox"
@@ -1530,6 +1565,9 @@ async fn call_inner(
             | "agentscm_work_overview"
             | "agentscm_work_insight"
             | "agentscm_work_insights"
+            | "agentscm_value_metrics"
+            | "agentscm_contribution_receipt"
+            | "agentscm_receipt_settings"
             | "agentscm_change_record"
             | "agentscm_pr_context"
             | "agentscm_work_pr_link"
@@ -1561,6 +1599,39 @@ async fn call_inner(
         return Ok(refused("this token is for another repository"));
     }
     let arguments = params.and_then(|params| params.get("arguments"));
+    if name == "agentscm_value_metrics" {
+        let query = match try_args::<super::value_metrics::ValueMetricsQuery>(arguments) {
+            Ok(query) => query,
+            Err(detail) => return Ok(invalid_args(name, &detail)),
+        };
+        if query
+            .repository
+            .as_ref()
+            .is_some_and(|repository| repository != &principal.repository)
+        {
+            return Ok(refused("this token is for another repository"));
+        }
+        let scope = json!({"work_id":query.work_id,"since":query.since,"until":query.until});
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        return Ok(
+            match blocking(state, move || {
+                store.value_metrics(&token, &query, unix_now())
+            })
+            .await
+            {
+                Ok(projection) => {
+                    let mut result = structured(&projection);
+                    result["_meta"] = json!({"agentscm/value-metrics-scope":scope});
+                    result
+                }
+                Err(error) => work_failure(&error),
+            },
+        );
+    }
+    if name == "agentscm_contribution_receipt" || name == "agentscm_receipt_settings" {
+        return Ok(contribution_receipt::call(state, principal, name, arguments).await);
+    }
     if super::skills::is_tool(name) {
         return Ok(super::skills::mcp_call(state, principal, name, arguments).await);
     }
@@ -2905,6 +2976,22 @@ fn start_result(
     text.push_str(&catchup_summary(catchup.as_ref()));
     if let Some(request) = &work.coordination_request {
         text.push_str(&format!("\nCoordination request {} is queued for the affected leads. Queued is not received; inspect agentscm_coordination_inbox for receipts and replies.", request.id));
+        // A paused or quiet lead will not answer; the Hub's Needs you asks the person who owns it instead.
+        for target in &request.targets {
+            let idle = work
+                .context
+                .as_ref()
+                .and_then(|context| {
+                    context
+                        .current
+                        .iter()
+                        .find(|item| item.id == target.work_id)
+                })
+                .is_some_and(WorkItem::lead_idle);
+            if idle {
+                text.push_str(&format!("\nThe agent leading {} is not running (paused or no recent check-in), so it cannot answer. Its person, {}, is asked in the AgentSCM Hub's Needs you instead and can answer for it.", target.work_id, target.lead.login));
+            }
+        }
     }
     if work.item.scope.is_empty() {
         text.push_str("\nScope is undeclared and coverage is unknown. Have the lead checkpoint the intended scope before editing.");

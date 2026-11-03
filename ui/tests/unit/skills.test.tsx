@@ -153,7 +153,7 @@ describe('Skills page against the mock hub', () => {
     stubHub(onBranch)
     at('#skills/runs')
     const { unmount } = render(<SkillsPage repo="acme/widgets" token="read" />)
-    const row = (await screen.findByText('Refactor the billing module · maria’s claude-code')).closest('a')!
+    const row = (await screen.findByText('Refactor the billing module · maria’s Claude Code')).closest('a')!
     expect(row.textContent!.indexOf('Refactor the billing module')).toBeLessThan(row.textContent!.indexOf('feat/sync-retry-budget'))
     unmount()
     at('#skills/runs/run_41')

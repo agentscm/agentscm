@@ -645,3 +645,156 @@ async fn a_forge_connected_repository_refuses_checkout_adoption_reports() {
     );
     assert_eq!(hub.store.skill_adoption(REPO).unwrap(), before);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_metrics_observe_same_source_refusal_resolution_and_configured_followups() {
+    let hub = Hub::start().await;
+    hub.adopt();
+    assert_eq!(
+        hub.record("author", "branch", "task_branch", H1).await.0,
+        200
+    );
+    assert_eq!(
+        hub.record("author", "tests", "revision_tests", H1).await.0,
+        200
+    );
+    let (status, refusal) = hub
+        .record("author", "review", "independent_review", H1)
+        .await;
+    assert_eq!(status, 409, "{refusal}");
+    let path = "/v1/hub/standup/value-metrics";
+    let (status, before) = hub.send(Method::GET, path, &hub.writer, None).await;
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(before["issues"]["unresolved"], 1);
+    assert_eq!(before["issues"]["resolved"], 0);
+    assert!(before["followups"]["current"].as_u64().unwrap() >= 2);
+    assert_eq!(
+        hub.record("reviewer", "review", "independent_review", H1)
+            .await
+            .0,
+        200
+    );
+    let (_, after) = hub.send(Method::GET, path, &hub.writer, None).await;
+    assert_eq!(after["issues"]["resolved"], 1, "{after}");
+    assert_eq!(after["issues"]["unresolved"], 0);
+    assert_ne!(before["assessment_id"], after["assessment_id"]);
+    // A duplicate admitted review cannot create a second episode.
+    assert_eq!(
+        hub.record("reviewer", "review", "independent_review", H1)
+            .await
+            .0,
+        200
+    );
+    let (_, retry) = hub.send(Method::GET, path, &hub.writer, None).await;
+    assert_eq!(retry["issues"]["resolved"], 1, "{retry}");
+    // A changed head does not inherit prior current evidence.
+    assert_eq!(
+        hub.record("author", "tests", "revision_tests", H2).await.0,
+        200
+    );
+    let (_, moved) = hub.send(Method::GET, path, &hub.writer, None).await;
+    assert!(moved["followups"]["stale"].as_u64().unwrap() > 0, "{moved}");
+    assert!(moved["followups"]["pending"].as_u64().unwrap() > 0);
+    assert_eq!(moved["resources"]["input_tokens"], Value::Null);
+    assert_eq!(moved["resources"]["unallocated_overhead"], Value::Null);
+    assert_eq!(moved["coverage"]["state"], "unknown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_metrics_checkpoint_only_source_move_stales_current_skill_evidence() {
+    let hub = Hub::start().await;
+    hub.adopt();
+    let (status,start)=hub.send(Method::POST,"/v1/hub/standup/start",&hub.writer,Some(json!({"request_key":"source-move","title":"Synthetic source movement","session":"author","scope":["src/synthetic.rs"],"branch":"feat/x"}))).await;
+    assert_eq!(status, 200, "{start}");
+    let id = start["item"]["id"].as_str().unwrap();
+    let checkpoint = |seq: &Value, source: &str, operation: &str| json!({"work_id":id,"operation_id":operation,"generation":1,"session":"author","expected_updated_seq":seq,"kind":"progress","summary":"Synthetic current source","source_refs":[{"kind":"commit","oid":source} ]});
+    let (status, first) = hub
+        .send(
+            Method::POST,
+            "/v1/hub/standup/checkpoint",
+            &hub.writer,
+            Some(checkpoint(&start["item"]["updated_seq"], H1, "source-a")),
+        )
+        .await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(
+        hub.record("author", "branch", "task_branch", H1).await.0,
+        200
+    );
+    assert_eq!(
+        hub.record("author", "tests", "revision_tests", H1).await.0,
+        200
+    );
+    let path = format!("/v1/hub/standup/value-metrics?work_id={id}");
+    let (_, before) = hub.send(Method::GET, &path, &hub.writer, None).await;
+    assert!(
+        before["followups"]["current"].as_u64().unwrap() > 0,
+        "{before}"
+    );
+    let (status, second) = hub
+        .send(
+            Method::POST,
+            "/v1/hub/standup/checkpoint",
+            &hub.writer,
+            Some(checkpoint(&first["item"]["updated_seq"], H2, "source-b")),
+        )
+        .await;
+    assert_eq!(status, 200, "{second}");
+    let (_, after) = hub.send(Method::GET, &path, &hub.writer, None).await;
+    assert_eq!(after["followups"]["current"], 0, "{after}");
+    assert!(after["followups"]["stale"].as_u64().unwrap() > 0);
+    assert_ne!(before["assessment_id"], after["assessment_id"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_metrics_unbound_review_resolution_keeps_original_episode_generation() {
+    let hub = Hub::start().await;
+    hub.adopt();
+    let (status,start)=hub.send(Method::POST,"/v1/hub/standup/start",&hub.writer,Some(json!({"request_key":"bound-refusal","title":"Bound refusal","session":"author","scope":["src/bound.rs"],"branch":"feat/x"}))).await;
+    assert_eq!(status, 200, "{start}");
+    let id = start["item"]["id"].as_str().unwrap();
+    let (status,checkpoint)=hub.send(Method::POST,"/v1/hub/standup/checkpoint",&hub.writer,Some(json!({"work_id":id,"operation_id":"bound-source","generation":1,"session":"author","expected_updated_seq":start["item"]["updated_seq"],"kind":"progress","summary":"Bound current source","source_refs":[{"kind":"commit","oid":H1}]}))).await;
+    assert_eq!(status, 200, "{checkpoint}");
+    assert_eq!(
+        hub.record("author", "branch", "task_branch", H1).await.0,
+        200
+    );
+    assert_eq!(
+        hub.record("author", "tests", "revision_tests", H1).await.0,
+        200
+    );
+    assert_eq!(
+        hub.record("author", "review", "independent_review", H1)
+            .await
+            .0,
+        409
+    );
+    // This admitted reviewer has no participating Work session, so its observation is
+    // deliberately unbound. Resolution must retain the original refusal's Work/gen pair.
+    assert_eq!(
+        hub.record("reviewer-without-work", "review", "independent_review", H1)
+            .await
+            .0,
+        200
+    );
+    let (status, metrics) = hub
+        .send(
+            Method::GET,
+            &format!("/v1/hub/standup/value-metrics?work_id={id}"),
+            &hub.writer,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{metrics}");
+    assert_eq!(metrics["issues"]["resolved"], 1);
+    assert_eq!(metrics["issues"]["unresolved"], 0);
+    let issue = metrics["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "issue")
+        .unwrap();
+    assert_eq!(issue["work_id"], id);
+    assert_eq!(issue["state"], "resolved");
+    assert_eq!(issue["applicability"], "current");
+}

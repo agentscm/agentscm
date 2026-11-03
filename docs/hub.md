@@ -886,7 +886,7 @@ live agents and the last activity, worst first; a row opens that repository's Da
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
-person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)), History (Finished, Changes, Change records, and Files from this
+person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request that waits on the viewer's own paused or stale work also shows in the Dashboard's Needs you, since that agent cannot answer it, and the refused agent's `agentscm_start` reply says its lead is not running, History (Finished, Changes, Change records, and Files from this
 computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
 Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
 [local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in

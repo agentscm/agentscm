@@ -4,7 +4,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Icon } from '../ui.tsx'
 import { CommandPalette, type Hit, type SectionDef } from '../TopNav.tsx'
-import { plural } from '../pages/workParts.tsx'
 import logoDark from '../logo-dark.png'
 import type { Derived } from '../derive.ts'
 import type { HubData } from '../useHub.ts'
@@ -19,7 +18,6 @@ import { LiveChanges, LiveChange } from './LiveChanges.tsx'
 import { LiveProcess } from './LiveProcess.tsx'
 import { LiveCode } from './LiveCode.tsx'
 import { LiveContributions, LiveFeatures } from './LiveMore.tsx'
-import { isLiveOverlap } from '../needs.ts'
 import '../proto/proto.css'
 import '../proto/g/g.css'
 import './live.css'
@@ -31,6 +29,8 @@ export interface LiveProps {
   d: Derived | null
   overview: Poll<WorkOverview>
   needs: Need[]
+  /** The Inbox badge: overlaps and requests waiting on the viewer. */
+  inbox: { n: number; tip: string }
   handoff: Handoff
 }
 
@@ -43,9 +43,8 @@ export function GLive({ live, section, sections, page, showAdmin, hubSignedOut, 
   const cur = g?.page ?? null
   const [drawer, setDrawer] = useState(false)
   const [palette, setPalette] = useState(false)
-  const { data, overview, needs } = live
+  const { data, overview, needs, inbox } = live
   const ov = overview.kind === 'ready' ? overview.value : null
-  const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -101,7 +100,7 @@ export function GLive({ live, section, sections, page, showAdmin, hubSignedOut, 
     { label: 'Preferences', href: '#settings', icon: 'sliders', on: s('settings') },
   ]
   const utils: Group[] = [
-    { label: 'Inbox', href: '#inbox', icon: 'inbox', hint: 'Overlaps that need a conversation', badge: overlaps, badgeTone: 'warn', on: s('inbox'), subs: [] },
+    { label: 'Inbox', href: '#inbox', icon: 'inbox', hint: 'Overlaps and requests that need a conversation', badge: inbox.n, badgeTone: 'warn', on: s('inbox'), subs: [] },
     { label: 'Setup', href: '#setup', icon: 'plug', dot: data.failing || data.health?.status === 'unavailable', on: s('setup', 'computers', 'workspace', 'health', 'admin', 'settings'), subs: setupSubs },
     { label: 'Contributions', href: '#contributions', icon: 'stars', hint: 'What the Hub has recorded', on: gp('contributions'), subs: [] },
     { label: 'Feature map', href: '#features', icon: 'compass', hint: 'What is built and what is only proposed', on: gp('features'), subs: [] },
@@ -119,7 +118,7 @@ export function GLive({ live, section, sections, page, showAdmin, hubSignedOut, 
         </button>}
         <div className="topbar-right">
           <a href="#health" className={`health-chip${data.failing || (data.health && data.health.status !== 'ok') ? ' is-bad' : ''}`}><span className="live-dot" aria-hidden="true" /><span className="health-text">{data.failing ? 'Reconnecting' : data.health ? (data.health.status === 'ok' ? 'Hub live' : 'Degraded') : '…'}</span></a>
-          <a href="#inbox" className="top-icon bell" aria-label={`Inbox, ${plural(overlaps, 'overlap')}`}><Icon name="bell" />{overlaps > 0 && <span className="bell-count tone-warn" aria-hidden="true">{overlaps}</span>}</a>
+          <a href="#inbox" className="top-icon bell" aria-label={inbox.n ? `Inbox, ${inbox.tip}` : 'Inbox'}><Icon name="bell" />{inbox.n > 0 && <span className="bell-count tone-warn" aria-hidden="true">{inbox.n}</span>}</a>
           <button type="button" className="g-classic" onClick={onClassic} title="Switch back to the classic Hub layout"><Icon name="layout-sidebar" /> <span>Classic layout</span></button>
         </div>
       </header>

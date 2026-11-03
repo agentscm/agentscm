@@ -4,7 +4,7 @@ import type { Derived } from '../../src/derive.ts'
 import { STALE_SECONDS } from '../../src/dismiss.tsx'
 import { needHideKey, needsYou } from '../../src/needs.ts'
 import { DashboardPage, dashboardStatus } from '../../src/pages/Dashboard.tsx'
-import type { WorkItem, WorkOverview } from '../../src/standup.ts'
+import type { CoordinationRequest, WorkItem, WorkOverview } from '../../src/standup.ts'
 import type { HubData } from '../../src/useHub.ts'
 import type { Poll } from '../../src/usePoll.ts'
 
@@ -55,6 +55,18 @@ describe('Needs you', () => {
     render(<DashboardPage section="home" question="q" token="t" repo="acme/widgets" data={data} d={dd} overview={ready(overview([]))} />)
     expect(needsBox().getByText('Agents are sorting it out · 1')).toBeTruthy()
     expect(needsBox().getByText(/kept/).textContent).toMatch(/^maria’s .+ kept src\/ledger\.rs: “Mid-refactor”\.$/)
+  })
+
+  it('tells the owner of a paused task that another agent asked for its file, and counts it', () => {
+    const mine = item('a', 'maria', { state: 'paused' })
+    const agent = (login: string) => ({ token: `t-${login}`, agent: 'codex', session: 's', owner: login, login })
+    const request = { id: 'crq_1', requester: agent('dev'), status: 'pending', responses: [], acknowledgements: [], created_at: now,
+      targets: [{ work_id: mine.id, lead: agent('maria'), generation: 1, reasons: [{ your_path: 'ui/src/pages/Catchup.tsx', their_path: 'ui/src/pages/Catchup.tsx' }], reasons_complete: true }] } as unknown as CoordinationRequest
+    const asked = { requests: [request], me: 'maria' }
+    expect(dashboardStatus(overview([mine]), d, null, null, new Set(), asked).needs.map((n) => n.kind)).toEqual(['asked'])
+    render(<DashboardPage section="home" question="q" token="t" repo="acme/widgets" data={data} d={d} overview={ready(overview([mine]))} asked={asked} />)
+    expect(needsBox().getByText(/asked for/).textContent).toBe('dev’s Codex asked for ui/src/pages/Catchup.tsx you hold, and your agent isn’t running')
+    expect(needsBox().getByText(/Answer for it in the Inbox/)).toBeTruthy()
   })
 
   it('folds overlaps into one row that leads to the Inbox, still counting each', () => {

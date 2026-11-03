@@ -19,13 +19,13 @@ import { HideButton, hideKey, isStale, ShowHidden, useHidden, useHideable } from
 import { answerHandoff, askHandoff, fetchMyHandoffs, operationId, OUTCOME_SENTENCE, replyToRequest, sendError, type MyHandoff } from '../inboxApi.ts'
 import { IdleScene } from '../InboxIdle.tsx'
 import { agentName, askOption, buildThreads, GROUP_TITLE, GROUPS, named, REPLY_CHOICES, type Group, type Row, type Say, type SideView, type Thread } from '../inboxThreads.ts'
-import { OVERLAP_IS_SIGNAL, READING_CHANGES_NOTHING } from '../copy.ts'
+import { OVERLAP_IS_SIGNAL } from '../copy.ts'
 import type { Handoff } from '../launchLink.ts'
 import { NextStepView } from '../NextStep.tsx'
 import { clean, DATA_NOTE, overlapSteps, requestStep, type NextStep } from '../nextStep.ts'
 import { pending, currentAck, currentResponse, RESPONSE_LABEL, stage } from '../requests.ts'
 import { fetchCoordination, type CoordinationRequest, type CoordinationResponseKind, type WorkItem, type WorkOverview } from '../standup.ts'
-import { agentLabel, Ago, Icon, Notice, PageHead, Pill, relative, Skeleton } from '../ui.tsx'
+import { Ago, Icon, Notice, PageHead, Pill, relative, Skeleton } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { useNow } from '../useHub.ts'
 import { lead, plural, Search, WorkLink, ClaimPill } from './workParts.tsx'
@@ -231,10 +231,12 @@ function Pane({ thread, local, draft, canSend, handoff, ask, onDraft, onSend, on
         </p>
       )}
       {step && (
-        <details className="in-prompt" data-tour="inbox-talk">
-          <summary>Copy a prompt instead</summary>
-          <NextStepView step={step} viewer={handoff?.me} repo={handoff?.repo} originUrl={handoff?.originUrl} />
-        </details>
+        <div className="in-prompt" data-tour="inbox-talk">
+          <details className="disc-row">
+            <summary><Icon name="clipboard" /> Copy a prompt instead</summary>
+            <NextStepView step={step} viewer={handoff?.me} repo={handoff?.repo} originUrl={handoff?.originUrl} />
+          </details>
+        </div>
       )}
     </div>
   )
@@ -383,7 +385,7 @@ export function InboxPage({ token, overview, handoff, session = null, live = nul
 
   return (
     <div className="page in-page">
-      <PageHead question="Which overlaps need a conversation?" answer={headline} live fact={<>Answers reach the agents’ running sessions at their next edit. Nothing here merges or approves work. {READING_CHANGES_NOTHING} {OVERLAP_IS_SIGNAL} Agents answer <Gloss term="directedRequest">requests</Gloss> themselves too.</>} />
+      <PageHead question="Which overlaps need a conversation?" answer={headline} live fact={<>Answers reach the agents’ running sessions at their next edit. Nothing here merges or approves work. {OVERLAP_IS_SIGNAL} Agents answer <Gloss term="directedRequest">requests</Gloss> themselves too.</>} />
       {overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
           {overview.message}
@@ -461,7 +463,7 @@ export function InboxPage({ token, overview, handoff, session = null, live = nul
                 {signals.rows.map((i) => (
                   <li key={i.id} className={signals.isHidden(i) ? 'is-hidden' : undefined}>
                     <WorkLink id={i.id}>{i.title}</WorkLink>
-                    <span className="muted small"> · {agentLabel(lead(i).agent)}</span>
+                    <span className="muted small"> · {agentName(lead(i).agent)}</span>
                     <div className="pills">
                       {i.claim_status !== 'active' && <ClaimPill item={i} />}
                       {i.scope.length === 0 && <Pill tone="muted" icon="question-circle">Scope unknown</Pill>}

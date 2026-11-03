@@ -2,9 +2,10 @@
 // shared by the dashboard's answer, its tabs and the rail badges so they always count the same things.
 // No DOM, no React.
 import { specKey, type Contested, type Derived } from './derive.ts'
-import type { WorkItem, WorkOverview } from './standup.ts'
+import { currentResponse, pending } from './requests.ts'
+import type { CoordinationRequest, WorkItem, WorkOverview } from './standup.ts'
 
-export type NeedKind = 'blocked' | 'contested' | 'overlap' | 'pr'
+export type NeedKind = 'blocked' | 'asked' | 'contested' | 'overlap' | 'pr'
 
 export interface Need {
   key: string
@@ -13,13 +14,15 @@ export interface Need {
   /** The work item it is about, when there is one. */
   item?: WorkItem
   path?: string
+  /** For `asked`: the request waiting on the viewer's agent. */
+  request?: CoordinationRequest
   at: number
   /** `you`: a person can act on it now. `agents`: the agents are still sorting it out, so no count includes it. */
   who: 'you' | 'agents'
 }
 
-const TONE: Record<NeedKind, Need['tone']> = { blocked: 'bad', contested: 'bad', overlap: 'warn', pr: 'warn' }
-const ORDER: NeedKind[] = ['blocked', 'contested', 'overlap', 'pr']
+const TONE: Record<NeedKind, Need['tone']> = { blocked: 'bad', asked: 'bad', contested: 'bad', overlap: 'warn', pr: 'warn' }
+const ORDER: NeedKind[] = ['blocked', 'asked', 'contested', 'overlap', 'pr']
 
 /** An overlap is live when both tasks are still being worked: an active claim, and a state of active or blocked. */
 const liveSide = (i: WorkItem) => i.claim_status === 'active' && (i.state === 'active' || i.state === 'blocked')
@@ -31,14 +34,33 @@ export function contestedParty(c: Contested): Need['who'] {
   return c.repeated || (c.holders.length >= 2 && !pending) ? 'you' : 'agents'
 }
 
+/** Open requests from other agents, and the viewer's login, so a request their idle agent cannot answer reaches them. */
+export interface Asked {
+  requests: CoordinationRequest[]
+  me: string | null
+}
+
+/** True when a task's lead will not answer anything soon: it paused, or stopped checking in. */
+const idle = (i: WorkItem) => i.state === 'paused' || i.claim_status !== 'active'
+
 /**
- * Only things a person should decide: a reported blocker, two agents holding one file, two live tasks
- * declaring the same scope, and a pull request touching held files. Worst first, then newest. Paused,
- * handed-over and stale-claim tasks are not here: they stay in All work, still claimed. An open
- * agent-to-agent file request is marked `who: 'agents'`: listed, never counted.
+ * Only things a person should decide: a reported blocker, another agent's request to the viewer's
+ * own idle task, two agents holding one file, two live tasks declaring the same scope, and a pull
+ * request touching held files. Worst first, then newest. Paused, handed-over and stale-claim tasks
+ * are not here unless another agent is waiting on them: they stay in All work, still claimed. An
+ * open agent-to-agent file request is marked `who: 'agents'`: listed, never counted.
  */
-export function needsYou(ov: WorkOverview | null, d: Derived | null): Need[] {
+export function needsYou(ov: WorkOverview | null, d: Derived | null, asked?: Asked): Need[] {
   const out: Need[] = []
+  const works = new Map((ov?.current ?? []).map((i) => [i.id, i]))
+  for (const r of asked?.requests ?? []) {
+    if (!pending(r) || asked?.me == null) continue
+    for (const t of r.targets) {
+      const i = works.get(t.work_id)
+      if (t.lead.login !== asked.me || !i || !idle(i) || currentResponse(r, t)) continue
+      out.push({ key: `asked:${r.id}:${t.work_id}`, kind: 'asked', tone: TONE.asked, item: i, path: t.reasons[0]?.your_path, request: r, at: r.created_at, who: 'you' })
+    }
+  }
   for (const i of ov?.current ?? []) {
     if (i.state === 'blocked') out.push({ key: `blocked:${i.id}`, kind: 'blocked', tone: TONE.blocked, item: i, at: i.blocker?.at ?? i.updated_at, who: 'you' })
   }
@@ -46,6 +68,15 @@ export function needsYou(ov: WorkOverview | null, d: Derived | null): Need[] {
   for (const o of (ov?.overlaps ?? []).filter(isLiveOverlap)) out.push({ key: `overlap:${o.left.id}:${o.right.id}`, kind: 'overlap', tone: TONE.overlap, item: o.left, path: o.reasons[0]?.left_path, at: Math.max(o.left.updated_at, o.right.updated_at), who: 'you' })
   for (const p of d?.prOverlaps ?? []) out.push({ key: `pr:${p.pr.number}`, kind: 'pr', tone: TONE.pr, path: p.with[0]?.files[0], at: 0, who: 'you' })
   return out.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || b.at - a.at)
+}
+
+/** What the Inbox badge counts: overlaps to talk about, and open requests to the viewer's agents that they have not answered. */
+export function inboxBadge(ov: WorkOverview | null, asked?: Asked): { n: number; tip: string } {
+  const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
+  const me = asked?.me
+  const waiting = me == null ? 0 : (asked?.requests ?? []).filter((r) => pending(r) && r.targets.some((t) => t.lead.login === me && !currentResponse(r, t))).length
+  const parts = [overlaps ? `${overlaps} overlap${overlaps === 1 ? '' : 's'} to talk about` : '', waiting ? `${waiting} request${waiting === 1 ? '' : 's'} waiting on you` : '']
+  return { n: overlaps + waiting, tip: parts.filter(Boolean).join(' · ') }
 }
 
 /** When a need last changed: its own time or its task's last update, whichever is newer. */

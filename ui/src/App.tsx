@@ -2,12 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import { ComputerNotices, LocalComputerProvider } from './ComputerBar.tsx'
 import { derive } from './derive.ts'
 import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
-import { fetchOverview } from './standup.ts'
+import { fetchCoordination, fetchOverview } from './standup.ts'
 import { fragmentLinkRefused, LINK_REFUSED } from './fragmentToken.ts'
 import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, signInAfterRefusal, type Density, type ThemePref } from './storage.ts'
 import { useHub } from './useHub.ts'
 import { useHidden } from './dismiss.tsx'
-import { needHideKey } from './needs.ts'
+import { inboxBadge, needHideKey, needsYou, type Asked } from './needs.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
@@ -43,7 +43,6 @@ import { hashPath } from './Pager.tsx'
 import { GLive } from './g/GLive.tsx'
 import { gAnswer } from './g/answers.tsx'
 import { useLayout } from './g/layout.ts'
-import { isLiveOverlap, needsYou } from './needs.ts'
 
 const darkQuery = '(prefers-color-scheme: dark)'
 const subscribeDark = (cb: () => void) => {
@@ -162,6 +161,9 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
   const overview = usePoll((signal) => token ? fetchOverview(token, signal) : Promise.reject(new Error('Hub pages are signed out')), 15_000, token)
   const repo = data.whoami?.token.repository ?? 'this repository'
   const handoff = handoffOf(data.whoami)
+  // Open requests, so one aimed at the viewer's idle task shows in Needs you, not only in the Inbox.
+  const requests = usePoll((signal) => token ? fetchCoordination(token, signal, { limit: 100, activeOnly: true }) : Promise.reject(new Error('Hub pages are signed out')), 15_000, `asked|${token}`)
+  const asked = useMemo<Asked>(() => ({ requests: requests.kind === 'ready' ? requests.value.requests : [], me: handoff.me }), [requests, handoff.me])
   const device = useDeviceAuth(token)
   const provider = data.whoami?.owner.provider === 'gitlab' ? 'gitlab' : 'github'
   // The Admin tab is only for a browser signed in as a Hub admin; someone who opens #admin anyway keeps the tabs and is told why.
@@ -169,12 +171,12 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
   const sections = useMemo(() => (showAdmin ? SECTIONS : SECTIONS.filter((s) => s.key !== 'admin')), [showAdmin])
   const ov = overview.kind === 'ready' ? overview.value : null
   // Measured against the last successful poll, not the 1-second clock, so the whole shell re-renders only when data arrives.
-  const dash = dashboardStatus(ov, d, data.activity?.events ?? null, data.lastOk, useHidden())
+  const dash = dashboardStatus(ov, d, data.activity?.events ?? null, data.lastOk, useHidden(), asked)
   useAppBadge(hubSignedOut ? 0 : dash.needs.length)
   const badges: Badges = {}
   if (dash.needs.length > 0) badges.home = { n: dash.needs.length, tone: dash.needs.some((n) => n.tone === 'bad') ? 'bad' : 'warn', tip: `${dash.needs.length} thing${dash.needs.length === 1 ? ' needs' : 's need'} you` }
-  const liveOverlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
-  if (liveOverlaps > 0) badges.inbox = { n: liveOverlaps, tone: 'warn', tip: `${liveOverlaps} overlap${liveOverlaps === 1 ? '' : 's'} to talk about` }
+  const inbox = inboxBadge(ov, asked)
+  if (inbox.n > 0) badges.inbox = { n: inbox.n, tone: 'warn', tip: inbox.tip }
   const finished = ov?.recent.filter((o) => o.kind === 'completion').length
   const statuses: TabStatuses = {
     home: dash.home,
@@ -193,6 +195,9 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     setup: { text: 'Hooks and tokens', tone: 'muted' },
     health: data.failing ? { text: 'Not answering', tone: 'bad' } : data.health ? { text: data.health.status === 'ok' ? 'Answering' : 'Degraded', tone: data.health.status === 'ok' ? 'ok' : 'warn' } : undefined,
     workspace: { text: 'Members and runs', tone: 'muted' },
+    // Computers and Admin read the browser sign-in this shell already loaded, so their tabs say what that sign-in allows.
+    computers: device.auth.kind === 'ready' ? { text: device.auth.value?.kind === 'browser' ? 'Signed in here' : 'Needs a web sign-in', tone: 'muted' } : undefined,
+    admin: device.auth.kind === 'ready' ? { text: device.auth.value?.kind === 'browser' && device.auth.value.session.admin ? 'You are an admin' : 'Admins only', tone: 'muted' } : undefined,
     repositories: { text: 'Every one you can read', tone: 'muted' },
     settings: { text: 'This browser', tone: 'muted' },
   }
@@ -212,7 +217,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
       case 'now':
       case 'activity':
       case 'team':
-        return <DashboardPage section={s} question={SECTIONS.find((x) => x.key === s)!.question} token={token} repo={repo} data={data} d={d} overview={overview} answer={layout === 'g' ? gAnswer(s, d, data.activity?.events ?? null, data.lastOk) : undefined} />
+        return <DashboardPage section={s} question={SECTIONS.find((x) => x.key === s)!.question} token={token} repo={repo} data={data} d={d} overview={overview} asked={asked} answer={layout === 'g' ? gAnswer(s, d, data.activity?.events ?? null, data.lastOk) : undefined} />
       case 'inbox':
         return <InboxPage token={token} overview={overview} handoff={handoff} session={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session : null} live={d ? { agents: d.agents, contested: d.contested } : null} />
       case 'work':
@@ -250,7 +255,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     }
   }
   if (layout === 'g') {
-    const needs = needsYou(ov, d).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
+    const needs = needsYou(ov, d, asked).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
     const banner = (hubSignOutError || hubUnavailable || (hubChecking && hubSessionKnown) || data.health?.demo)
       ? <>
         {(hubSignOutError || hubUnavailable || (hubChecking && hubSessionKnown)) && <Notice tone={hubSignOutError || hubUnavailable ? 'bad' : 'muted'} title={hubSignOutError ? 'Hub sign-out failed' : hubUnavailable ? hubUnavailable.title : 'Checking Hub connection'}>
@@ -263,7 +268,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     return (
       <LocalComputerProvider token={isLocalCredential(token) ? token : null}>
         <ComputerNotices />
-        <GLive live={{ token, repo, data, d, overview, needs, handoff }} section={section} sections={sections} page={page} showAdmin={!!showAdmin} hubSignedOut={hubSignedOut} onClassic={() => setLayout('classic')} banner={banner} />
+        <GLive live={{ token, repo, data, d, overview, needs, inbox, handoff }} section={section} sections={sections} page={page} showAdmin={!!showAdmin} hubSignedOut={hubSignedOut} onClassic={() => setLayout('classic')} banner={banner} />
       </LocalComputerProvider>
     )
   }
