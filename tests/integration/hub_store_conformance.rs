@@ -12,9 +12,12 @@ use agentscm::hub::external_runs::{ExternalKind, ExternalObserved, ExternalOutco
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::skills::{EvidenceRow, SkillAdoption};
 use agentscm::hub::store::{
-    self, ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, NewAgentToken, Store, agent_token_digest,
-    mint_agent_token, mint_bound_agent_token, new_connection_id, unix_now,
+    self, ForgeIdentity, LocalCiDevice, LocalCiDeviceWrite, LocalCiRefusal, LocalCiRequest,
+    MAX_AGENT_TOKEN_TTL_SECONDS, NewAgentToken, Store, agent_token_digest, mint_agent_token,
+    mint_bound_agent_token, new_connection_id, unix_now,
 };
+use agentscm::local_ci::{DeviceAuthorization, DeviceKey, OwnerIdentity};
+use agentscm::policy::issuers::issuer_key_id;
 use hub_pg::PgSchema;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -2688,6 +2691,706 @@ fn skill_adoption_and_evidence(db: &Db) {
     assert!(runs(Some("feat/b"), Some("run_a"), 10).is_empty());
 }
 
+const CI_LABEL: &str = "github.com/acme/widgets";
+
+struct Ci {
+    store: Arc<dyn Store>,
+    owner: String,
+    repository: String,
+}
+
+fn ci_setup(db: &Db) -> Ci {
+    let store = db.open();
+    let owner = store.upsert_user(&identity(7), "alice").unwrap().id;
+    let con = store.insert_connection(&app("github.com"), &owner).unwrap();
+    let repository = store
+        .upsert_repository(&con.id, "github.com", 4242, "acme/widgets", None, None)
+        .unwrap()
+        .id;
+    Ci {
+        store,
+        owner,
+        repository,
+    }
+}
+
+fn ci_key(seed: u8) -> DeviceKey {
+    let public_key_hex = format!("{seed:02x}").repeat(32);
+    DeviceKey {
+        key_id: issuer_key_id(&public_key_hex).unwrap(),
+        public_key_hex,
+        not_before_ms: 1_000,
+        not_after_ms: 9_000_000_000_000,
+        rotated_at_ms: None,
+        revoked_at_ms: None,
+    }
+}
+
+fn ci_auth(device: &str, seed: u8) -> DeviceAuthorization {
+    DeviceAuthorization {
+        version: 1,
+        device_id: device.into(),
+        repository: CI_LABEL.into(),
+        owner: OwnerIdentity {
+            provider: "oidc".into(),
+            host: "idp.example".into(),
+            person_id: "person:1".into(),
+        },
+        generation: 1,
+        revoked_at_ms: None,
+        allowed_check_kinds: vec!["local-ci".into()],
+        keys: vec![ci_key(seed)],
+    }
+}
+
+fn ci_request(id: &str, fingerprint: u8) -> LocalCiRequest {
+    LocalCiRequest {
+        request_id: id.into(),
+        fingerprint: format!("{fingerprint:02x}").repeat(32),
+    }
+}
+
+fn ci_applied(write: LocalCiDeviceWrite) -> LocalCiDevice {
+    match write {
+        LocalCiDeviceWrite::Applied(device) => device,
+        other => panic!("expected applied, got {other:?}"),
+    }
+}
+
+fn ci_enroll(ci: &Ci, auth: &DeviceAuthorization, request: &str) -> LocalCiDeviceWrite {
+    ci.store
+        .enroll_local_ci_device(
+            &ci.repository,
+            &ci.owner,
+            auth,
+            &ci_request(request, 1),
+            unix_now(),
+        )
+        .unwrap()
+}
+
+fn ci_change(
+    store: &dyn Store,
+    ci: &Ci,
+    id: &str,
+    expected: u64,
+    next: &DeviceAuthorization,
+    request: &LocalCiRequest,
+) -> LocalCiDeviceWrite {
+    store
+        .change_local_ci_device(id, expected, &ci.owner, next, request, unix_now())
+        .unwrap()
+}
+
+fn local_ci_enroll_read_list_and_advance(db: &Db) {
+    let ci = ci_setup(db);
+    let b = ci_applied(ci_enroll(&ci, &ci_auth("lcd_b", 2), "req_b"));
+    ci_applied(ci_enroll(&ci, &ci_auth("lcd_a", 1), "req_a"));
+    assert_eq!(b.authorization, ci_auth("lcd_b", 2));
+    assert_eq!(b.digest, ci_auth("lcd_b", 2).digest().unwrap());
+    assert_eq!(
+        (b.repository.as_str(), b.owner.as_str()),
+        (ci.repository.as_str(), ci.owner.as_str())
+    );
+    assert_eq!(ci.store.local_ci_device("lcd_b").unwrap(), Some(b));
+    assert_eq!(ci.store.local_ci_device("lcd_none").unwrap(), None);
+    let listed = |store: &dyn Store, repo: &str| {
+        store
+            .local_ci_devices(repo)
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.authorization.device_id, d.authorization.generation))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed(&*ci.store, &ci.repository),
+        [("lcd_a".to_owned(), 1), ("lcd_b".to_owned(), 1)]
+    );
+    assert!(listed(&*ci.store, "rep_other").is_empty());
+
+    // Rotation and revocation each advance the generation by one.
+    let current = ci.store.local_ci_device("lcd_a").unwrap().unwrap();
+    let rotated = current.authorization.rotate(ci_key(3), 5_000).unwrap();
+    let write = ci_change(
+        &*ci.store,
+        &ci,
+        "lcd_a",
+        1,
+        &rotated,
+        &ci_request("req_a2", 2),
+    );
+    assert_eq!(ci_applied(write).authorization.generation, 2);
+    let revoked = rotated.revoke(6_000).unwrap();
+    let write = ci_change(
+        &*ci.store,
+        &ci,
+        "lcd_a",
+        2,
+        &revoked,
+        &ci_request("req_a3", 3),
+    );
+    let device = ci_applied(write);
+    assert_eq!(device.authorization.generation, 3);
+    assert_eq!(device.authorization.revoked_at_ms, Some(6_000));
+
+    // A rename keeps the binding to the repository row; the label is not rewritten.
+    let con = ci.store.connections().unwrap().remove(0);
+    ci.store
+        .upsert_repository(&con.id, "github.com", 4242, "acme/renamed", None, None)
+        .unwrap();
+    assert_eq!(listed(&*ci.store, &ci.repository).len(), 2);
+    assert_eq!(
+        ci.store
+            .local_ci_device("lcd_b")
+            .unwrap()
+            .unwrap()
+            .authorization
+            .repository,
+        CI_LABEL
+    );
+
+    // Signing in again on a Hub computer does not touch device authorizations.
+    let now = unix_now();
+    let first = ci
+        .store
+        .insert_device(
+            &ci.owner,
+            "laptop",
+            &store::device_digest(&"1".repeat(64)).unwrap(),
+            None,
+            now,
+        )
+        .unwrap();
+    ci.store
+        .insert_device(
+            &ci.owner,
+            "laptop",
+            &store::device_digest(&"2".repeat(64)).unwrap(),
+            Some(&first),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        ci.store
+            .local_ci_device("lcd_b")
+            .unwrap()
+            .unwrap()
+            .authorization
+            .revoked_at_ms,
+        None
+    );
+
+    // Everything survives a reopen, revoked state included.
+    drop(ci.store);
+    let reopened = db.open();
+    let after = reopened.local_ci_device("lcd_a").unwrap().unwrap();
+    assert_eq!(after.digest, revoked.digest().unwrap());
+    assert_eq!(after.authorization.generation, 3);
+    assert_eq!(after.authorization.revoked_at_ms, Some(6_000));
+
+    // Enrollment preconditions are errors, not refusals.
+    let ci = Ci {
+        store: reopened,
+        ..ci
+    };
+    let enroll = |owner: &str, auth: &DeviceAuthorization, id: &str| {
+        ci.store
+            .enroll_local_ci_device(&ci.repository, owner, auth, &ci_request(id, 9), 1)
+    };
+    let mut wrong_generation = ci_auth("lcd_c", 4);
+    wrong_generation.generation = 2;
+    assert!(enroll(&ci.owner, &wrong_generation, "req_c1").is_err());
+    let mut wrong_label = ci_auth("lcd_c", 4);
+    wrong_label.repository = "github.com/acme/other".into();
+    assert!(enroll(&ci.owner, &wrong_label, "req_c2").is_err());
+    assert!(enroll("usr_missing", &ci_auth("lcd_c", 4), "req_c3").is_err());
+    assert!(
+        ci.store
+            .enroll_local_ci_device(
+                &ci.repository,
+                &ci.owner,
+                &ci_auth("lcd_c", 4),
+                &ci_request("bad id", 1),
+                1
+            )
+            .is_err()
+    );
+    ci.store.set_user_disabled(&ci.owner, true).unwrap();
+    assert!(enroll(&ci.owner, &ci_auth("lcd_c", 4), "req_c4").is_err());
+    assert_eq!(ci.store.local_ci_device("lcd_c").unwrap(), None);
+}
+
+fn local_ci_replay_and_conflicts(db: &Db) {
+    let ci = ci_setup(db);
+    let auth = ci_auth("lcd_a", 1);
+    let first = ci_applied(ci_enroll(&ci, &auth, "req_a"));
+    // Same id and fingerprint: the stored result, with no second event.
+    assert_eq!(
+        ci_enroll(&ci, &auth, "req_a"),
+        LocalCiDeviceWrite::Replayed(first.clone())
+    );
+    assert_eq!(
+        kinds(&*ci.store)
+            .iter()
+            .filter(|k| k.starts_with("local_ci"))
+            .count(),
+        1
+    );
+    // Same id, other fingerprint or other device.
+    let other = ci
+        .store
+        .enroll_local_ci_device(&ci.repository, &ci.owner, &auth, &ci_request("req_a", 7), 1)
+        .unwrap();
+    assert_eq!(
+        other,
+        LocalCiDeviceWrite::Refused(LocalCiRefusal::RequestConflict)
+    );
+    let other = ci_enroll(&ci, &ci_auth("lcd_b", 2), "req_a");
+    assert_eq!(
+        other,
+        LocalCiDeviceWrite::Refused(LocalCiRefusal::RequestConflict)
+    );
+    assert_eq!(ci.store.local_ci_device("lcd_b").unwrap(), None);
+    // A new request for an existing device.
+    assert_eq!(
+        ci_enroll(&ci, &auth, "req_again"),
+        LocalCiDeviceWrite::Refused(LocalCiRefusal::DeviceExists)
+    );
+
+    let rotated = auth.rotate(ci_key(2), 5_000).unwrap();
+    let request = ci_request("req_rot", 4);
+    let applied = ci_applied(ci_change(&*ci.store, &ci, "lcd_a", 1, &rotated, &request));
+    // The retry is a replay even though the generation has moved on.
+    assert_eq!(
+        ci_change(&*ci.store, &ci, "lcd_a", 1, &rotated, &request),
+        LocalCiDeviceWrite::Replayed(applied)
+    );
+    assert_eq!(
+        ci_change(
+            &*ci.store,
+            &ci,
+            "lcd_a",
+            1,
+            &rotated,
+            &ci_request("req_rot", 5)
+        ),
+        LocalCiDeviceWrite::Refused(LocalCiRefusal::RequestConflict)
+    );
+    // Stale generation, unknown device, and a next document that is not one step ahead.
+    let next = rotated.revoke(6_000).unwrap();
+    assert_eq!(
+        ci_change(
+            &*ci.store,
+            &ci,
+            "lcd_a",
+            1,
+            &next,
+            &ci_request("req_stale", 6)
+        ),
+        LocalCiDeviceWrite::Refused(LocalCiRefusal::StaleGeneration { current: 2 })
+    );
+    assert_eq!(
+        ci_change(
+            &*ci.store,
+            &ci,
+            "lcd_none",
+            2,
+            &next,
+            &ci_request("req_none", 6)
+        ),
+        LocalCiDeviceWrite::Refused(LocalCiRefusal::UnknownDevice)
+    );
+    assert!(
+        ci.store
+            .change_local_ci_device(
+                "lcd_a",
+                2,
+                &ci.owner,
+                &rotated,
+                &ci_request("req_skip", 6),
+                1
+            )
+            .is_err()
+    );
+    let mut moved = next.clone();
+    moved.owner.person_id = "person:2".into();
+    assert!(
+        ci.store
+            .change_local_ci_device(
+                "lcd_a",
+                2,
+                &ci.owner,
+                &moved,
+                &ci_request("req_owner", 6),
+                1
+            )
+            .is_err()
+    );
+    // Refusals recorded nothing: the same request id works once the cause is gone.
+    assert_eq!(
+        ci_applied(ci_change(
+            &*ci.store,
+            &ci,
+            "lcd_a",
+            2,
+            &next,
+            &ci_request("req_stale", 6)
+        ))
+        .authorization
+        .generation,
+        3
+    );
+}
+
+fn local_ci_keys_are_enrolled_once_ever(db: &Db) {
+    let ci = ci_setup(db);
+    let a = ci_auth("lcd_a", 1);
+    ci_applied(ci_enroll(&ci, &a, "req_a"));
+    let refused = LocalCiDeviceWrite::Refused(LocalCiRefusal::DuplicateKey);
+    // Another device cannot enroll the same key, and a failed enroll leaves nothing.
+    assert_eq!(ci_enroll(&ci, &ci_auth("lcd_b", 1), "req_b"), refused);
+    assert_eq!(ci.store.local_ci_device("lcd_b").unwrap(), None);
+    ci_applied(ci_enroll(&ci, &ci_auth("lcd_b", 2), "req_b"));
+    // Nor can it rotate to it.
+    let steal = ci
+        .store
+        .local_ci_device("lcd_b")
+        .unwrap()
+        .unwrap()
+        .authorization
+        .rotate(ci_key(1), 5_000)
+        .unwrap();
+    assert_eq!(
+        ci_change(
+            &*ci.store,
+            &ci,
+            "lcd_b",
+            1,
+            &steal,
+            &ci_request("req_steal", 2)
+        ),
+        refused
+    );
+    // A superseded key cannot come back, on the same device or another.
+    let rotated = a.rotate(ci_key(3), 5_000).unwrap();
+    ci_applied(ci_change(
+        &*ci.store,
+        &ci,
+        "lcd_a",
+        1,
+        &rotated,
+        &ci_request("req_rot", 3),
+    ));
+    assert!(rotated.rotate(ci_key(1), 6_000).is_err());
+    // Nor a revoked device's key.
+    let revoked = rotated.revoke(7_000).unwrap();
+    ci_applied(ci_change(
+        &*ci.store,
+        &ci,
+        "lcd_a",
+        2,
+        &revoked,
+        &ci_request("req_rev", 5),
+    ));
+    assert_eq!(ci_enroll(&ci, &ci_auth("lcd_c", 3), "req_c"), refused);
+    // A key dropped at the key bound stays spent.
+    let mut dropping = ci_auth("lcd_d", 20);
+    ci_applied(ci_enroll(&ci, &dropping, "req_d"));
+    for seed in 21..=28 {
+        let next = dropping
+            .rotate(ci_key(seed), 8_000 + u64::from(seed))
+            .unwrap();
+        let request = ci_request(&format!("req_d{seed}"), seed);
+        ci_applied(ci_change(
+            &*ci.store,
+            &ci,
+            "lcd_d",
+            dropping.generation,
+            &next,
+            &request,
+        ));
+        dropping = next;
+    }
+    assert!(dropping.keys.iter().all(|k| k.key_id != ci_key(20).key_id));
+    let reuse = dropping.rotate(ci_key(20), 9_000).unwrap();
+    assert_eq!(
+        ci_change(
+            &*ci.store,
+            &ci,
+            "lcd_d",
+            dropping.generation,
+            &reuse,
+            &ci_request("req_reuse", 30)
+        ),
+        refused
+    );
+    assert_eq!(
+        ci.store
+            .local_ci_device("lcd_a")
+            .unwrap()
+            .unwrap()
+            .authorization
+            .generation,
+        3
+    );
+    assert_eq!(
+        ci.store
+            .local_ci_device("lcd_b")
+            .unwrap()
+            .unwrap()
+            .authorization
+            .generation,
+        1
+    );
+}
+
+fn local_ci_concurrent_changes_have_one_winner(db: &Db) {
+    let ci = ci_setup(db);
+    let auth = ci_auth("lcd_a", 1);
+    ci_applied(ci_enroll(&ci, &auth, "req_a"));
+    let race = |device: &'static str, jobs: Vec<(DeviceAuthorization, LocalCiRequest)>| {
+        let barrier = Arc::new(std::sync::Barrier::new(jobs.len()));
+        let runs: Vec<_> = jobs
+            .into_iter()
+            .map(|(next, request)| {
+                let store = db.open();
+                let barrier = Arc::clone(&barrier);
+                let owner = ci.owner.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .change_local_ci_device(
+                            device,
+                            next.generation - 1,
+                            &owner,
+                            &next,
+                            &request,
+                            unix_now(),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        runs.into_iter()
+            .map(|run| run.join().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let count = |results: &[LocalCiDeviceWrite], want: &dyn Fn(&LocalCiDeviceWrite) -> bool| {
+        results.iter().filter(|r| want(r)).count()
+    };
+
+    // Two rotations at one generation.
+    let results = race(
+        "lcd_a",
+        vec![
+            (
+                auth.rotate(ci_key(2), 5_000).unwrap(),
+                ci_request("req_r1", 1),
+            ),
+            (
+                auth.rotate(ci_key(3), 5_000).unwrap(),
+                ci_request("req_r2", 2),
+            ),
+        ],
+    );
+    assert_eq!(
+        count(&results, &|r| matches!(r, LocalCiDeviceWrite::Applied(_))),
+        1,
+        "{results:?}"
+    );
+    assert_eq!(
+        count(&results, &|r| *r
+            == LocalCiDeviceWrite::Refused(
+                LocalCiRefusal::StaleGeneration { current: 2 }
+            )),
+        1,
+        "{results:?}"
+    );
+    let stored = ci
+        .store
+        .local_ci_device("lcd_a")
+        .unwrap()
+        .unwrap()
+        .authorization;
+    assert_eq!((stored.generation, stored.keys.len()), (2, 2));
+
+    // Revoke racing rotate.
+    let results = race(
+        "lcd_a",
+        vec![
+            (
+                stored.rotate(ci_key(4), 6_000).unwrap(),
+                ci_request("req_r3", 3),
+            ),
+            (stored.revoke(6_000).unwrap(), ci_request("req_v1", 4)),
+        ],
+    );
+    assert_eq!(
+        count(&results, &|r| matches!(r, LocalCiDeviceWrite::Applied(_))),
+        1,
+        "{results:?}"
+    );
+    assert_eq!(
+        count(&results, &|r| matches!(
+            r,
+            LocalCiDeviceWrite::Refused(LocalCiRefusal::StaleGeneration { .. })
+        )),
+        1,
+        "{results:?}"
+    );
+    let after = ci
+        .store
+        .local_ci_device("lcd_a")
+        .unwrap()
+        .unwrap()
+        .authorization;
+    assert_eq!(after.generation, 3);
+
+    // The same request sent twice at once applies once.
+    let fresh = ci_auth("lcd_e", 6);
+    ci_applied(ci_enroll(&ci, &fresh, "req_e"));
+    let next = fresh.rotate(ci_key(7), 7_000).unwrap();
+    let results = race(
+        "lcd_e",
+        vec![
+            (next.clone(), ci_request("req_same", 5)),
+            (next, ci_request("req_same", 5)),
+        ],
+    );
+    assert_eq!(
+        count(&results, &|r| matches!(r, LocalCiDeviceWrite::Applied(_))),
+        1,
+        "{results:?}"
+    );
+    assert_eq!(
+        count(&results, &|r| matches!(r, LocalCiDeviceWrite::Replayed(_))),
+        1,
+        "{results:?}"
+    );
+    let changes = kinds(&*ci.store)
+        .iter()
+        .filter(|k| k.starts_with("local_ci"))
+        .count();
+    assert_eq!(changes, 5);
+}
+
+fn local_ci_events_carry_ids_only(db: &Db) {
+    let ci = ci_setup(db);
+    let auth = ci_auth("lcd_a", 1);
+    ci_applied(ci_enroll(&ci, &auth, "req_a"));
+    let rotated = auth.rotate(ci_key(2), 5_000).unwrap();
+    ci_applied(ci_change(
+        &*ci.store,
+        &ci,
+        "lcd_a",
+        1,
+        &rotated,
+        &ci_request("req_rot", 2),
+    ));
+    // A refused write appends nothing.
+    ci_change(
+        &*ci.store,
+        &ci,
+        "lcd_a",
+        1,
+        &rotated,
+        &ci_request("req_late", 3),
+    );
+    ci_applied(ci_change(
+        &*ci.store,
+        &ci,
+        "lcd_a",
+        2,
+        &rotated.revoke(6_000).unwrap(),
+        &ci_request("req_rev", 4),
+    ));
+
+    let events: Vec<_> = ci
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind.starts_with("local_ci"))
+        .collect();
+    assert_eq!(
+        events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        [
+            "local_ci_device_enrolled",
+            "local_ci_device_rotated",
+            "local_ci_device_revoked"
+        ]
+    );
+    let data: Vec<Value> = events
+        .iter()
+        .map(|e| serde_json::from_str(&e.data).unwrap())
+        .collect();
+    let by = ci.owner.as_str();
+    assert_eq!(
+        data,
+        [
+            json!({"repository": ci.repository, "generation": 1, "key_ids": [ci_key(1).key_id], "by": by}),
+            json!({"repository": ci.repository, "generation": 2, "key_ids": [ci_key(2).key_id], "by": by}),
+            json!({"repository": ci.repository, "generation": 3, "key_ids": [], "by": by}),
+        ]
+    );
+    for event in &events {
+        assert_eq!(event.subject, "lcd_a");
+        assert!(!event.data.contains(&ci_key(1).public_key_hex));
+        assert!(!event.data.contains(&ci_key(2).public_key_hex));
+    }
+}
+
+fn local_ci_corrupt_records_are_refused(db: &Db) {
+    let ci = ci_setup(db);
+    ci_applied(ci_enroll(&ci, &ci_auth("lcd_a", 1), "req_a"));
+    ci_applied(ci_enroll(&ci, &ci_auth("lcd_b", 2), "req_b"));
+    let good = ci.store.local_ci_device("lcd_b").unwrap().unwrap();
+    let other = ci_auth("lcd_a", 1).rotate(ci_key(9), 5_000).unwrap();
+    let text =
+        |auth: &DeviceAuthorization| String::from_utf8(auth.canonical_bytes().unwrap()).unwrap();
+    let cases = [
+        "document = '{}'".to_owned(),
+        "document = 'not json'".to_owned(),
+        format!("document = '{}'", text(&other)),
+        "digest = 'abc'".to_owned(),
+        "generation = 7".to_owned(),
+        format!("document = '{}'", text(&ci_auth("lcd_x", 2))),
+        format!(
+            "document = '{}'",
+            text(&good.authorization).replacen('{', "{\"extra\":1,", 1)
+        ),
+    ];
+    for set in cases {
+        db.exec(&format!(
+            "UPDATE local_ci_devices SET {set} WHERE device_id = 'lcd_a'"
+        ))
+        .unwrap();
+        assert!(ci.store.local_ci_device("lcd_a").is_err(), "{set}");
+        assert!(ci.store.local_ci_devices(&ci.repository).is_err(), "{set}");
+        let next = ci_auth("lcd_a", 1).revoke(8_000).unwrap();
+        let change = ci.store.change_local_ci_device(
+            "lcd_a",
+            1,
+            &ci.owner,
+            &next,
+            &ci_request("req_c", 1),
+            1,
+        );
+        assert!(change.is_err(), "{set}");
+        db.exec(&format!(
+            "UPDATE local_ci_devices SET document = '{}', digest = '{}', generation = 1 WHERE device_id = 'lcd_a'",
+            text(&ci_auth("lcd_a", 1)),
+            ci_auth("lcd_a", 1).digest().unwrap()
+        ))
+        .unwrap();
+        assert!(
+            ci.store.local_ci_device("lcd_a").unwrap().is_some(),
+            "{set}"
+        );
+    }
+    assert_eq!(ci.store.local_ci_device("lcd_b").unwrap().unwrap(), good);
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -2737,6 +3440,12 @@ conformance!(
     skill_adoption_and_evidence,
     devices_and_refusals,
     browser_sessions,
+    local_ci_enroll_read_list_and_advance,
+    local_ci_replay_and_conflicts,
+    local_ci_keys_are_enrolled_once_ever,
+    local_ci_concurrent_changes_have_one_winner,
+    local_ci_events_carry_ids_only,
+    local_ci_corrupt_records_are_refused,
 );
 
 #[cfg(unix)]

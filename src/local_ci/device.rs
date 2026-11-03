@@ -166,6 +166,66 @@ impl DeviceAuthorization {
         domain_digest(DIGEST_DOMAIN, &self.canonical_bytes()?)
     }
 
+    /// Supersedes every current key with `new_key` and advances the generation by one.
+    /// At the key bound the oldest superseded key is dropped, ordered by supersession
+    /// time, start time and key ID; its ID then assesses as unknown, which fails closed.
+    pub fn rotate(&self, new_key: DeviceKey, now_ms: u64) -> Result<Self> {
+        if self.revoked_at_ms.is_some() {
+            return Err(Error::Invalid("device authorization is revoked".into()));
+        }
+        if new_key.rotated_at_ms.is_some() || new_key.revoked_at_ms.is_some() {
+            return Err(Error::Invalid("a new device key must be unretired".into()));
+        }
+        if self
+            .keys
+            .iter()
+            .any(|key| key.key_id == new_key.key_id || key.public_key_hex == new_key.public_key_hex)
+        {
+            return Err(Error::Invalid("device key is already enrolled".into()));
+        }
+        let mut next = self.advanced()?;
+        for key in &mut next.keys {
+            key.rotated_at_ms.get_or_insert(now_ms);
+        }
+        if next.keys.len() >= MAX_KEYS_PER_ISSUER {
+            let oldest = next
+                .keys
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, key)| (key.rotated_at_ms, key.not_before_ms, key.key_id.clone()))
+                .map(|(index, _)| index);
+            if let Some(index) = oldest {
+                next.keys.remove(index);
+            }
+        }
+        next.keys.push(new_key);
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Revokes the whole device and advances the generation by one.
+    pub fn revoke(&self, now_ms: u64) -> Result<Self> {
+        if self.revoked_at_ms.is_some() {
+            return Err(Error::Invalid(
+                "device authorization is already revoked".into(),
+            ));
+        }
+        let mut next = self.advanced()?;
+        next.revoked_at_ms = Some(now_ms);
+        next.validate()?;
+        Ok(next)
+    }
+
+    fn advanced(&self) -> Result<Self> {
+        self.validate()?;
+        let mut next = self.clone();
+        next.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Limit("authorization generation overflow".into()))?;
+        Ok(next)
+    }
+
     /// Projects this device as one issuer in the existing registry schema,
     /// which has no rotated state: rotation and device revocation both appear
     /// as `revoked_at_ms`, the earliest applicable time. The epoch is the generation.
@@ -626,6 +686,94 @@ mod tests {
         value.as_object_mut().unwrap().remove("allowed_check_kinds");
         let parsed = DeviceAuthorization::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(parsed.allowed_check_kinds, default_check_kinds());
+    }
+
+    #[test]
+    fn rotation_supersedes_keys_and_advances_generation() {
+        let rotated = auth().rotate(key(3), 4_500).unwrap();
+        assert_eq!(rotated.generation, 4);
+        assert_eq!(rotated.keys.len(), 3);
+        assert!(
+            rotated.keys[..2]
+                .iter()
+                .all(|k| k.rotated_at_ms == Some(4_500))
+        );
+        assert_eq!(rotated.keys[2], key(3));
+        // Keys superseded earlier keep their original time.
+        let again = rotated.rotate(key(4), 4_800).unwrap();
+        assert_eq!(again.generation, 5);
+        assert_eq!(again.keys[0].rotated_at_ms, Some(4_500));
+        assert_eq!(again.keys[2].rotated_at_ms, Some(4_800));
+        // The old key no longer assesses as current; the new one does.
+        let mut old = claim();
+        old.authorization_generation = 4;
+        assert!(matches!(assess(&rotated, &old), DeviceDecision::Refused(_)));
+        let mut fresh = claim();
+        fresh.key_id = key(3).key_id;
+        fresh.authorization_generation = 4;
+        assert!(matches!(
+            assess(&rotated, &fresh),
+            DeviceDecision::Current { .. }
+        ));
+    }
+
+    #[test]
+    fn rotation_refusals() {
+        let a = auth();
+        assert!(a.rotate(key(1), 4_500).is_err());
+        let mut same_public = key(3);
+        same_public.key_id = key(1).key_id;
+        assert!(a.rotate(same_public, 4_500).is_err());
+        let mut retired = key(3);
+        retired.rotated_at_ms = Some(1);
+        assert!(a.rotate(retired, 4_500).is_err());
+        assert!(a.revoke(4_500).unwrap().rotate(key(3), 4_600).is_err());
+        assert!(a.rotate(key(3), u64::MAX).is_err());
+        let mut top = a.clone();
+        top.generation = i64::MAX as u64;
+        assert!(top.rotate(key(3), 4_500).is_err());
+        assert!(top.revoke(4_500).is_err());
+    }
+
+    #[test]
+    fn rotation_at_the_key_bound_drops_the_oldest_superseded_key() {
+        let mut a = auth();
+        a.keys = (1..=8).map(key).collect();
+        for (n, k) in a.keys.iter_mut().enumerate() {
+            k.rotated_at_ms = Some(2_000 + [5, 3, 4, 9, 8, 7, 6, 10][n]);
+        }
+        let next = a.rotate(key(9), 4_000).unwrap();
+        assert_eq!(next.keys.len(), 8);
+        assert!(!next.keys.iter().any(|k| k.key_id == key(2).key_id));
+        assert!(next.keys.iter().any(|k| k.key_id == key(9).key_id));
+        // The dropped key is unknown, so a claim signed by it fails closed.
+        let mut dropped = claim();
+        dropped.key_id = key(2).key_id;
+        dropped.authorization_generation = 4;
+        assert_eq!(
+            assess(&next, &dropped),
+            DeviceDecision::Refused(DeviceRefusal::UnknownKey)
+        );
+        // All unrotated at the bound: the earliest start time then key ID decide.
+        let mut b = auth();
+        b.keys = (1..=8).map(key).collect();
+        b.keys[3].not_before_ms = 500;
+        let next = b.rotate(key(9), 4_000).unwrap();
+        assert!(!next.keys.iter().any(|k| k.key_id == key(4).key_id));
+        assert_eq!(next.keys.len(), 8);
+    }
+
+    #[test]
+    fn revoke_advances_once_and_refuses_repeats() {
+        let revoked = auth().revoke(4_500).unwrap();
+        assert_eq!(
+            (revoked.generation, revoked.revoked_at_ms),
+            (4, Some(4_500))
+        );
+        assert!(revoked.revoke(4_600).is_err());
+        let mut c = claim();
+        c.authorization_generation = 4;
+        assert!(matches!(assess(&revoked, &c), DeviceDecision::Refused(_)));
     }
 
     #[test]
