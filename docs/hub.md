@@ -402,6 +402,15 @@ status shown; clients show `message` as is.
   `GET /v1/hub/users`,
   `POST /v1/hub/users/{id}/disable` and `/enable` (204; 404 for an unknown
   user; an administrator cannot disable themselves, 400). Disabling also ends that person's sessions on this hub process.
+- Administrators only, experimental ([trusted local CI devices](advanced/local-ci-devices.md)):
+  `POST /v1/hub/admin/local-ci/devices` (`request_id`, `repository` as `host/owner/name`,
+  `owner` as a Hub user id, `not_after_ms`, `statement`, `signature`; enrolls generation 1),
+  `POST .../devices/{id}/rotate` (`request_id`, `expected_generation`, `not_after_ms`, `statement`,
+  `signature`), `POST .../devices/{id}/revoke` (`request_id`, `expected_generation`) and
+  `GET .../devices?repository=host/owner/name` (devices with audit events). Refusals are 400 for an
+  invalid statement or signature, 404 for an unknown device or owner, 409 for a stale generation,
+  a taken device or key, a revoked device, a disabled owner or a missing owner role, and 503 when
+  the forge role check is uncertain. No route accepts a result.
 
 ## Read-only tokens
 
