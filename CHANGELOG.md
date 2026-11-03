@@ -2,6 +2,12 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.3.0](https://github.com/agentscm/agentscm/compare/v0.2.1...v0.3.0) - 2026-11-03
+
+### Added
+
+- Enroll and revoke trusted local CI devices ([#307](https://github.com/agentscm/agentscm/pull/307))
+
 ## [0.2.1](https://github.com/agentscm/agentscm/compare/v0.2.0...v0.2.1) - 2026-11-03
 
 ### Fixed
