@@ -9,8 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 const STEP: &str = "- name: Invalidate stale successes";
-const FILES: [&str; 3] = [
-    ".github/workflows/local-validation.yml",
+const FILES: [&str; 2] = [
     ".github/workflows/local-validation-reconcile.yml",
     "docs/advanced/local-validation.md",
 ];

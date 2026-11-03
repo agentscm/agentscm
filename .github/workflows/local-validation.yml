@@ -1,119 +1,39 @@
 name: Local validation verifier
 
 # Reconciles the `agentscm/local-validation` commit status of every open pull request on the
-# default branch from maintainer-signed attestation comments. It builds only the default
-# branch; pull request heads are fetched as Git data by `agentscm local-validation reconcile`
-# and are never checked out, built or run. Policy, recipe and registry come from the default
-# branch checkout. It also runs on pull request events so a head that changes only exempt paths
-# gets its status promptly.
+# default branch from maintainer-signed attestation comments. It calls the reusable verifier,
+# which installs an exact published, provenance-checked release and runs
+# `agentscm local-validation reconcile`; nothing in this repository is built. Pull request heads
+# are fetched as Git data and are never checked out, built or run. Policy, recipe and registry
+# come from the default branch checkout. It also runs on pull request events so a head that
+# changes only exempt paths gets its status promptly.
 
 on:
-  issue_comment: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
+  issue_comment: # zizmor: ignore[dangerous-triggers] default-branch code only; the PR head is fetched as Git data, never built or run
     types: [created, edited, deleted]
-  pull_request_target: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
-    types: [opened, synchronize, reopened, edited] # edited runs only for a base change, see the job `if:`
+  pull_request_target: # zizmor: ignore[dangerous-triggers] default-branch code only; the PR head is fetched as Git data, never built or run
+    types: [opened, synchronize, reopened, edited] # edited runs only for a base change, see the reusable job's `if:`
   push:
     branches: [main]
     paths:
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
       - ".github/local-validation/**"
-      - ".github/workflows/local-validation-reconcile.yml"
       - ".github/workflows/local-validation.yml"
   schedule:
     - cron: '17 6 * * *' # replaces the success of an aged-out attestation on the head
 
 permissions: {}
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   reconcile:
-    # Job-level on purpose: a workflow-level group is entered before the `if:` below runs, so an
-    # untrusted commenter's run would cancel the pending queued run and then do nothing.
-    concurrency:
-      group: local-validation
-      cancel-in-progress: false
-    # For comments: only pull request comments from trusted associations that start with the
-    # attestation marker, or that did before an edit removed it so the old success is replaced
-    # (the signature still decides; this limits compute abuse and replay). For pull_request_target,
-    # `edited` runs only when the base changed, not for any title or body edit by any author.
-    if: ${{ (github.event_name != 'pull_request_target' || github.event.action != 'edited' || github.event.changes.base) && (github.event_name != 'issue_comment' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ') || (github.event.action == 'edited' && startsWith(github.event.changes.body.from, '<!-- agentscm-local-validation:v1 '))) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: read
       statuses: write
-    steps:
-      - name: Invalidate stale successes
-        shell: bash
-        timeout-minutes: 5
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          # A listing error or an invalid head SHA fails the step before any write. Pagination is bounded by the step timeout.
-          heads=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base="$DEFAULT_BRANCH" -f per_page=100 --paginate --jq '.[].head.sha' </dev/null)
-          # Validate every line before any write; a jq null prints as "null" and fails here.
-          if [[ -n "$heads" ]] && printf '%s\n' "$heads" | grep -qvE '^[0-9a-f]{40}$'; then
-            echo "unexpected head SHA in the pull request listing" >&2
-            exit 1
-          fi
-          count=0
-          failed=0
-          for sha in $(printf '%s\n' "$heads" | sort -u); do
-            # --paginate reads every page of the combined status, which has at most one entry for our context.
-            # Take the first non-empty line; no output means the head never opted in ("none"). A failed read
-            # is "unknown": invalidate anyway, because a stale success is worse than an extra pending.
-            if out=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --paginate --jq '.statuses[] | select(.context == "agentscm/local-validation") | .state' </dev/null); then
-              state=$(printf '%s\n' "$out" | grep -m1 . || true)
-              state=${state:-none}
-            else
-              echo "::warning::could not read the status of $sha; setting it to pending anyway"
-              state=unknown
-            fi
-            # Only success (or a failed read) can satisfy a required check. "none" means the head never opted
-            # in, and writing would opt it in forever. pending, failure and error already block merging.
-            if [[ "$state" != success && "$state" != unknown ]]; then
-              continue
-            fi
-            if ! reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context=agentscm/local-validation -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null); then
-              echo "::error::failed to set $sha to pending"
-              failed=$((failed + 1))
-              continue
-            fi
-            if [[ "$reply" != pending ]]; then
-              echo "::error::unexpected reply writing status for $sha: $reply"
-              failed=$((failed + 1))
-              continue
-            fi
-            echo "$sha: $state -> pending"
-            count=$((count + 1))
-          done
-          echo "set $count stale success(es) to pending; $failed failure(s)"
-          # Exit 0 even after per-head failures so setup and reconcile still run; reconcile retries and reports its own errors.
-          exit 0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.repository.default_branch || github.ref_name }}
-          fetch-depth: 0
-          persist-credentials: false
-      - run: rustup toolchain install # reads rust-toolchain.toml
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo build --locked --bin agentscm
-      - name: Reconcile statuses
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          # Every run sweeps all open PRs, so the latest queued run is enough.
-          target/debug/agentscm local-validation reconcile --github-repo "$REPO" --base "$DEFAULT_BRANCH" --target-url "$RUN_URL"
+    # v0.2.1. Bump the SHA and release-version together; tools/attest-pr.sh reads release-version
+    # so the local producer runs the same binary. See docs/releasing.md before bumping.
+    uses: agentscm/agentscm/.github/workflows/local-validation-reconcile.yml@5cd629e46a895655a404ccb5baa33e30859dfdb8
+    with:
+      release-version: 0.2.1
+      config-dir: .github/local-validation
+      verifier-workflow: .github/workflows/local-validation.yml
+      github-authenticated-fetch: false

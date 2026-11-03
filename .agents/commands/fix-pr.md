@@ -73,6 +73,8 @@ git rev-parse HEAD
 gh pr view --json headRefOid --jq .headRefOid
 ```
 
+A new head has no valid attestation, so after pushing run `tools/attest-pr.sh <PR#>` as in step 11 of `.agents/commands/pr.md` and report the result.
+
 If nothing changed, do not create an empty commit.
 
 ### 6. Reply after the push
