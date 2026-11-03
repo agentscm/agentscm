@@ -49,7 +49,7 @@ pub(super) fn routes() -> Router<HubState> {
 
 /// Why a mint was refused: a kind, or a role from [`super::missing_role`].
 #[derive(Debug, PartialEq, Eq)]
-enum Denial {
+pub(in crate::hub) enum Denial {
     Kind(&'static str),
     Role((&'static str, &'static str, &'static str)),
 }
@@ -108,13 +108,13 @@ impl FromRequestParts<HubState> for DeviceAuth {
 }
 
 /// A human session or a computer credential: the routes a person uses about their computers.
-enum Owner {
+pub(in crate::hub) enum Owner {
     Human(Human),
     Device(DevicePrincipal),
 }
 
 impl Owner {
-    fn user(&self) -> &User {
+    pub(in crate::hub) fn user(&self) -> &User {
         match self {
             Self::Human(human) => &human.user,
             Self::Device(device) => &device.owner,
@@ -984,7 +984,7 @@ async fn fork_parent(state: &HubState, owner: &User, repository: &str) -> Option
 ///
 /// The only source today is the forge; an administrator-issued grant for other Git hosts would
 /// be a second source here.
-async fn repository_role(
+pub(in crate::hub) async fn repository_role(
     state: &HubState,
     owner: &User,
     repo: &ConnectedRepository,

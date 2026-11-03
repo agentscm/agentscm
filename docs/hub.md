@@ -402,6 +402,25 @@ status shown; clients show `message` as is.
   `GET /v1/hub/users`,
   `POST /v1/hub/users/{id}/disable` and `/enable` (204; 404 for an unknown
   user; an administrator cannot disable themselves, 400). Disabling also ends that person's sessions on this hub process.
+- Administrators only, experimental ([trusted local CI devices](advanced/local-ci-devices.md)):
+  `POST /v1/hub/admin/local-ci/devices` (`request_id`, `repository` as `host/owner/name`,
+  `owner` as a Hub user id, `not_after_ms`, `statement`, `signature`; enrolls generation 1),
+  `POST .../devices/{id}/rotate` (`request_id`, `expected_generation`, `not_after_ms`, `statement`,
+  `signature`), `POST .../devices/{id}/revoke` (`request_id`, `expected_generation`) and
+  `GET .../devices?repository=host/owner/name` (devices with audit events). Refusals are 400
+  (`invalid_request`, `invalid_request_id`, `invalid_expiry`, `enrollment_invalid`), 404
+  (`unknown_repository`, `unknown_owner`, `unknown_device`), 409 (`stale_generation`,
+  `device_exists`, `duplicate_key`, `request_conflict`, `device_revoked`, `owner_disabled`,
+  `owner_wrong_forge`, `owner_role_missing`, `repository_renamed`) and 503
+  (`role_check_unavailable`) when the forge role check is uncertain; its `reason` field is the
+  denial kind, and only `permission_unavailable` is temporary (`not_connected` and
+  `access_check_unavailable` need the Hub's forge connection fixed; `sign_in_required` needs the
+  owner to sign in to the Hub again). An exact
+  replay of an applied `request_id` returns the device as stored now, before the expiry, owner
+  and role checks; enrollment still looks the repository up first. No route accepts a result.
+- A signed-in person or their computer credential (not an agent token, read-only token or
+  administrator-only credential): `GET /v1/hub/local-ci/devices?repository=host/owner/name` lists
+  that person's own devices on the repository, and an unknown repository gives an empty list.
 
 ## Read-only tokens
 
