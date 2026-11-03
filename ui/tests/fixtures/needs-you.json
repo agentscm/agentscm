@@ -1,0 +1,101 @@
+{
+  "now": 10000,
+  "me": "ana",
+  "whoami": { "owner": { "login": "ana" } },
+  "overview": {
+    "current": [
+      { "id": "wrk_blocked", "state": "blocked", "claim_status": "stale", "updated_at": 5 },
+      { "id": "wrk_paused", "state": "paused", "claim_status": "active", "updated_at": 5 },
+      { "id": "wrk_quiet", "state": "active", "claim_status": "stale", "updated_at": 5 },
+      { "id": "wrk_running", "state": "active", "claim_status": "active", "updated_at": 5 },
+      { "id": "wrk_theirs", "state": "paused", "claim_status": "active", "updated_at": 5 },
+      { "id": "wrk_handover", "state": "handover", "claim_status": "active", "updated_at": 5 }
+    ],
+    "overlaps": [
+      {
+        "left": { "id": "wrk_a", "state": "active", "claim_status": "active", "updated_at": 5 },
+        "right": { "id": "wrk_b", "state": "blocked", "claim_status": "active", "updated_at": 5 },
+        "reasons": []
+      },
+      {
+        "left": { "id": "wrk_c", "state": "active", "claim_status": "stale", "updated_at": 5 },
+        "right": { "id": "wrk_d", "state": "active", "claim_status": "active", "updated_at": 5 },
+        "reasons": []
+      },
+      {
+        "left": { "id": "wrk_e", "state": "paused", "claim_status": "active", "updated_at": 5 },
+        "right": { "id": "wrk_f", "state": "active", "claim_status": "active", "updated_at": 5 },
+        "reasons": []
+      }
+    ],
+    "current_complete": true,
+    "overlaps_complete": true
+  },
+  "coordination": {
+    "requests": [
+      { "id": "crq_paused", "status": "pending", "created_at": 50, "responses": [], "targets": [{ "work_id": "wrk_paused", "lead": { "login": "ana" }, "generation": 1, "reasons": [] }] },
+      { "id": "crq_quiet", "status": "pending", "created_at": 50, "responses": [], "targets": [{ "work_id": "wrk_quiet", "lead": { "login": "ana" }, "generation": 1, "reasons": [] }] },
+      {
+        "id": "crq_regenerated", "status": "pending", "created_at": 50,
+        "responses": [{ "target_work_id": "wrk_paused", "target_generation": 1 }],
+        "targets": [{ "work_id": "wrk_paused", "lead": { "login": "ana" }, "generation": 2, "reasons": [] }]
+      },
+      {
+        "id": "crq_answered", "status": "responded", "created_at": 50,
+        "responses": [{ "target_work_id": "wrk_paused", "target_generation": 1 }],
+        "targets": [{ "work_id": "wrk_paused", "lead": { "login": "ana" }, "generation": 1, "reasons": [] }]
+      },
+      { "id": "crq_running", "status": "pending", "created_at": 50, "responses": [], "targets": [{ "work_id": "wrk_running", "lead": { "login": "ana" }, "generation": 1, "reasons": [] }] },
+      { "id": "crq_theirs", "status": "pending", "created_at": 50, "responses": [], "targets": [{ "work_id": "wrk_theirs", "lead": { "login": "bob" }, "generation": 1, "reasons": [] }] },
+      { "id": "crq_done", "status": "resolved", "created_at": 50, "responses": [], "targets": [{ "work_id": "wrk_paused", "lead": { "login": "ana" }, "generation": 1, "reasons": [] }] },
+      { "id": "crq_withdrawn", "status": "withdrawn", "created_at": 50, "responses": [], "targets": [{ "work_id": "wrk_quiet", "lead": { "login": "ana" }, "generation": 1, "reasons": [] }] }
+    ],
+    "complete": true
+  },
+  "work": {
+    "intents": [
+      { "id": "int_1", "owner": { "login": "ana" }, "agent": { "token": "tok_a", "name": "tok_a" }, "via": ["hook"], "paths": ["src/**", "docs/guide.md"], "updated_at": 5 },
+      { "id": "int_2", "owner": { "login": "bob" }, "agent": { "token": "tok_b", "name": "tok_b" }, "via": ["hook"], "paths": ["src/lib.rs"], "updated_at": 5 },
+      { "id": "int_3", "owner": { "login": "cy" }, "agent": { "token": "tok_c", "name": "tok_c" }, "via": ["mcp"], "paths": ["shared.rs"], "updated_at": 5 },
+      { "id": "int_4", "owner": { "login": "cy" }, "agent": { "token": "tok_c", "name": "tok_c" }, "via": ["hook"], "paths": ["shared.rs"], "updated_at": 5 },
+      { "id": "int_5", "owner": { "login": "dee" }, "agent": { "token": "tok_d", "name": "tok_d" }, "via": ["hook"], "paths": ["waiting/held.rs"], "updated_at": 5 },
+      { "id": "int_6", "owner": { "login": "eli" }, "agent": { "token": "tok_e", "name": "tok_e" }, "via": ["hook"], "paths": ["waiting/held.rs"], "updated_at": 5 },
+      { "id": "int_7", "owner": { "login": "dee" }, "agent": { "token": "tok_d", "name": "tok_d" }, "via": ["hook"], "paths": ["granted/held.rs"], "updated_at": 5 },
+      { "id": "int_8", "owner": { "login": "eli" }, "agent": { "token": "tok_e", "name": "tok_e" }, "via": ["hook"], "paths": ["granted/held.rs"], "updated_at": 5 },
+      { "id": "int_9", "owner": { "login": "dee" }, "agent": { "token": "tok_d", "name": "tok_d" }, "via": ["hook"], "paths": ["lapsed/held.rs"], "updated_at": 5 },
+      { "id": "int_10", "owner": { "login": "eli" }, "agent": { "token": "tok_e", "name": "tok_e" }, "via": ["hook"], "paths": ["lapsed/held.rs"], "updated_at": 5 }
+    ],
+    "intents_truncated": false,
+    "pull_requests": [
+      { "number": 7, "state": "open", "files": ["docs/guide.md"] },
+      { "number": 8, "state": "open", "files": ["elsewhere.rs"] },
+      { "number": 9, "state": "closed", "files": ["src/lib.rs"] }
+    ]
+  },
+  "activity": {
+    "sessions": [
+      { "key": "s1", "agent": { "token": "tok_b", "name": "tok_b" }, "owner": { "login": "bob" }, "intent": "int_2", "task": null, "via": ["hook"], "created_at": 1, "updated_at": 5 }
+    ],
+    "events": [
+      { "kind": "handoff_grant", "at": 9995, "agent": { "token": "tok_e", "name": "tok_e" }, "owner": { "login": "eli" }, "data": { "paths": ["granted/held.rs"], "request": "hnd_granted" } },
+      { "kind": "handoff_request", "at": 9990, "agent": { "token": "tok_d", "name": "tok_d" }, "owner": { "login": "dee" }, "data": { "paths": ["waiting/held.rs"], "request": "hnd_waiting" } },
+      { "kind": "handoff_request", "at": 9980, "agent": { "token": "tok_d", "name": "tok_d" }, "owner": { "login": "dee" }, "data": { "paths": ["granted/held.rs"], "request": "hnd_granted" } },
+      { "kind": "handoff_request", "at": 6400, "agent": { "token": "tok_d", "name": "tok_d" }, "owner": { "login": "dee" }, "data": { "paths": ["lapsed/held.rs"], "request": "hnd_lapsed" } },
+      { "kind": "edit_repeated", "at": 110, "agent": { "token": "tok_x", "name": "tok_x" }, "owner": { "login": "xia" }, "data": { "paths": ["story/kept.rs"] } },
+      { "kind": "edit_denied", "at": 100, "agent": { "token": "tok_x", "name": "tok_x" }, "owner": { "login": "xia" }, "data": { "paths": ["story/kept.rs"] } },
+      { "kind": "edit_denied", "at": 90, "agent": { "token": "tok_y", "name": "tok_y" }, "owner": { "login": "yan" }, "data": { "paths": ["story/once.rs"] } }
+    ]
+  },
+  "expected": [
+    "asked:crq_paused:wrk_paused",
+    "asked:crq_quiet:wrk_quiet",
+    "asked:crq_regenerated:wrk_paused",
+    "blocked:wrk_blocked",
+    "contested:granted/held.rs",
+    "contested:lapsed/held.rs",
+    "contested:src/lib.rs",
+    "contested:story/kept.rs",
+    "overlap:wrk_a:wrk_b",
+    "pr:7"
+  ]
+}

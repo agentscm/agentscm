@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use agentscm::hub::session::HOLD_CAP_SECONDS;
 use reqwest::Method;
 use serde_json::Value;
 
@@ -22,8 +23,6 @@ use super::hub_open::OpenRequest;
 const POLL_SECONDS: u64 = 60;
 const CATALOG_POLL_SECONDS: u64 = 120;
 const TOKEN_NAME: &str = "agentscm-tray-attention";
-/// A handoff request unanswered this long can no longer be granted, as in `derive.ts`.
-const HANDOFF_LAPSE_SECONDS: i64 = 1800;
 
 pub(super) struct Worker {
     command: std::sync::mpsc::Sender<WorkerCommand>,
@@ -563,7 +562,7 @@ fn summarize(root: &std::path::Path, repository: &str, reads: &Reads) -> Signal 
     let mut work_rows = Vec::new();
     for item in current {
         if item["state"].as_str() == Some("blocked") {
-            blocked.push(format!("work:{}", item["id"].as_str().unwrap_or("")));
+            blocked.push(format!("blocked:{}", item["id"].as_str().unwrap_or("")));
         }
         work_rows.push(Work {
             agent: bounded_text(&item["lead_agent"], 64, "Unknown agent"),
@@ -591,8 +590,10 @@ fn summarize(root: &std::path::Path, repository: &str, reads: &Reads) -> Signal 
         })
         .collect();
     let agents = live_agents(work, activity);
-    let events = activity["events"].as_array().map_or(&[][..], Vec::as_slice);
-    let contested = contested_for_you(&agents, events, now);
+    // Without the events a pending handoff cannot be seen, so contested files stay uncounted.
+    let contested = activity["events"]
+        .as_array()
+        .map_or_else(Vec::new, |events| contested_for_you(&agents, events, now));
     let prs = pull_request_overlaps(work, &agents);
     let kinds = [
         (&blocked, "blocked"),
@@ -668,7 +669,7 @@ fn requests_for(me: Option<&str>, current: &[Value], requests: &[Value]) -> Vec<
                 });
             if target["lead"]["login"].as_str() == Some(me) && idle && !answered {
                 keys.push(format!(
-                    "request:{}:{}",
+                    "asked:{}:{}",
                     request["id"].as_str().unwrap_or(""),
                     work_id.as_str().unwrap_or("")
                 ));
@@ -816,7 +817,8 @@ fn contested_for_you(agents: &[Agent], events: &[Value], now: i64) -> Vec<String
                             Some("handoff_grant" | "handoff_decline")
                         ) && e["data"]["request"].as_str() == Some(id)
                     });
-                !answered && now - request["at"].as_i64().unwrap_or(0) <= HANDOFF_LAPSE_SECONDS
+                // A request unanswered for the hold cap can no longer be granted, as in `derive.ts`.
+                !answered && now - request["at"].as_i64().unwrap_or(0) <= HOLD_CAP_SECONDS
             });
             repeated || (holders.len() >= 2 && !waiting)
         })
@@ -861,190 +863,111 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const NOW: i64 = 10_000;
+    /// One overview, read as the viewer `ana`, shared with `ui/tests/unit/needs.test.ts`, which
+    /// asserts the same keys from the Hub page's `needsYou`.
+    fn fixture() -> Value {
+        serde_json::from_str(include_str!("../../ui/tests/fixtures/needs-you.json"))
+            .expect("needs-you fixture")
+    }
 
-    fn summarize_all(
-        overview: &Value,
-        coordination: &Value,
-        whoami: &Value,
-        work: &Value,
-        activity: &Value,
-    ) -> Signal {
+    fn summarize_fixture(fixture: &Value, activity: &Value) -> Signal {
         summarize(
             std::path::Path::new("/demo"),
             "example/repo",
             &Reads {
-                overview,
-                coordination,
-                whoami,
-                work,
+                overview: &fixture["overview"],
+                coordination: &fixture["coordination"],
+                whoami: &fixture["whoami"],
+                work: &fixture["work"],
                 activity,
-                now: NOW,
+                now: fixture["now"].as_i64().expect("now"),
             },
         )
     }
 
-    fn item(id: &str, state: &str, claim: &str) -> Value {
-        json!({"id": id, "state": state, "claim_status": claim, "updated_at": 5})
+    fn expected(fixture: &Value) -> Vec<String> {
+        let mut keys: Vec<String> = fixture["expected"]
+            .as_array()
+            .expect("expected")
+            .iter()
+            .map(|key| key.as_str().expect("key").to_owned())
+            .collect();
+        keys.sort();
+        keys
     }
 
-    fn lead(login: &str) -> Value {
-        json!({"login": login})
-    }
-
-    fn request(id: &str, status: &str, work: &str, login: &str, generation: u64) -> Value {
-        json!({
-            "id": id, "status": status, "responses": [],
-            "targets": [{"work_id": work, "lead": lead(login), "generation": generation}]
-        })
-    }
-
-    fn intent(id: &str, owner: &str, token: &str, via: &[&str], paths: &[&str]) -> Value {
-        json!({"id": id, "owner": lead(owner), "agent": {"token": token, "name": token},
-               "via": via, "paths": paths})
-    }
-
-    fn event(kind: &str, token: &str, at: i64, path: &str, request: &str) -> Value {
-        json!({"kind": kind, "at": at, "agent": {"token": token},
-               "data": {"paths": [path], "request": request}})
-    }
-
-    /// One overview, read as the viewer `ana`, with the count `needsYou` in `ui/src/needs.ts` gives it.
     #[test]
     fn count_follows_the_hub_needs_you_rules() {
-        let overview = json!({
-            "current": [
-                item("wrk_blocked", "blocked", "stale"),
-                item("wrk_mine_paused", "paused", "stale"),
-                item("wrk_mine_running", "active", "active"),
-                item("wrk_theirs_paused", "paused", "active"),
-                item("wrk_quiet", "active", "stale"),
-                item("wrk_handover", "handover", "active")
-            ],
-            "overlaps": [
-                {"left": item("wrk_a", "active", "active"), "right": item("wrk_b", "blocked", "active")},
-                {"left": item("wrk_c", "active", "stale"), "right": item("wrk_d", "active", "active")},
-                {"left": item("wrk_e", "paused", "active"), "right": item("wrk_f", "active", "active")}
-            ],
-            "current_complete": true, "overlaps_complete": true
-        });
-        let mut regenerated = request("crq_regenerated", "pending", "wrk_mine_paused", "ana", 2);
-        regenerated["responses"] =
-            json!([{"target_work_id": "wrk_mine_paused", "target_generation": 1}]);
-        let mut answered = request("crq_answered", "responded", "wrk_mine_paused", "ana", 1);
-        answered["responses"] =
-            json!([{"target_work_id": "wrk_mine_paused", "target_generation": 1}]);
-        let coordination = json!({"requests": [
-            request("crq_waiting", "pending", "wrk_mine_paused", "ana", 1),
-            regenerated,
-            answered,
-            request("crq_running", "pending", "wrk_mine_running", "ana", 1),
-            request("crq_theirs", "pending", "wrk_theirs_paused", "bob", 1),
-            request("crq_done", "resolved", "wrk_mine_paused", "ana", 1),
-            request("crq_withdrawn", "withdrawn", "wrk_mine_paused", "ana", 1)
-        ], "complete": true});
-        let whoami = json!({"owner": lead("ana")});
-        let work = json!({
-            "intents": [
-                intent("int_1", "ana", "tok_a", &["hook"], &["src/**", "docs/guide.md"]),
-                intent("int_2", "bob", "tok_b", &["hook"], &["src/lib.rs"]),
-                // One token, one side MCP-only: the same agent, so not contested.
-                intent("int_3", "cy", "tok_c", &["mcp"], &["shared.rs"]),
-                intent("int_4", "cy", "tok_c", &["hook"], &["shared.rs"]),
-                // Two agents hold each of these; the handoff decides who settles it.
-                intent("int_5", "dee", "tok_d", &["hook"], &["waiting/held.rs"]),
-                intent("int_6", "eli", "tok_e", &["hook"], &["waiting/held.rs"]),
-                intent("int_7", "dee", "tok_d", &["hook"], &["granted/held.rs"]),
-                intent("int_8", "eli", "tok_e", &["hook"], &["granted/held.rs"]),
-                intent("int_9", "dee", "tok_d", &["hook"], &["lapsed/held.rs"]),
-                intent("int_10", "eli", "tok_e", &["hook"], &["lapsed/held.rs"])
-            ],
-            "intents_truncated": false,
-            "pull_requests": [
-                {"number": 7, "state": "open", "files": ["docs/guide.md"]},
-                {"number": 8, "state": "open", "files": ["elsewhere.rs"]},
-                {"number": 9, "state": "closed", "files": ["src/lib.rs"]}
-            ]
-        });
-        let activity = json!({
-            "sessions": [{"key": "s1", "agent": {"token": "tok_b"}, "owner": lead("bob"), "intent": "int_2"}],
-            "events": [
-                event("handoff_grant", "tok_e", NOW - 5, "granted/held.rs", "hnd_granted"),
-                event("handoff_request", "tok_d", NOW - 10, "waiting/held.rs", "hnd_waiting"),
-                event("handoff_request", "tok_d", NOW - 20, "granted/held.rs", "hnd_granted"),
-                event("handoff_request", "tok_d", NOW - 3600, "lapsed/held.rs", "hnd_lapsed"),
-                event("edit_repeated", "tok_x", 110, "story/kept.rs", ""),
-                event("edit_denied", "tok_x", 100, "story/kept.rs", ""),
-                event("edit_denied", "tok_y", 90, "story/once.rs", "")
-            ]
-        });
-        let result = summarize_all(&overview, &coordination, &whoami, &work, &activity);
-        let mut expected = vec![
-            // Blocked work counts even when its claim is stale; paused, quiet and handed-over work does not.
-            "work:wrk_blocked",
-            // Live overlaps only: not one with a stale or paused side.
-            "overlap:wrk_a:wrk_b",
-            // Requests to the viewer's own idle work with no reply at its generation; not their running
-            // task, someone else's, answered, resolved or withdrawn ones.
-            "request:crq_waiting:wrk_mine_paused",
-            "request:crq_regenerated:wrk_mine_paused",
-            // Files two agents hold (once, by the more specific path) and one kept after a refusal,
-            // not the same agent's two sessions, a refusal alone, or a handoff still waiting.
-            "contested:src/lib.rs",
-            "contested:granted/held.rs",
-            "contested:lapsed/held.rs",
-            "contested:story/kept.rs",
-            // Open pull requests touching held files.
-            "pr:7",
-        ];
-        expected.sort_unstable();
-        assert_eq!(result.keys, expected);
-        assert_eq!(result.count, 9);
+        let fixture = fixture();
+        let result = summarize_fixture(&fixture, &fixture["activity"]);
+        // Counted: blocked work even with a stale claim; requests to the viewer's own work that is
+        // paused with an active claim, or active with a stale one, and has no reply at its generation;
+        // a live overlap; files two agents hold or one kept after a refusal; an open PR on held files.
+        // Not counted: running, handed-over or someone else's work, answered, resolved and withdrawn
+        // requests, overlaps with a stale or paused side, one agent's own sessions, a refusal alone,
+        // a handoff still waiting for its answer, and PRs that are closed or touch no held file.
+        assert_eq!(result.keys, expected(&fixture));
+        assert_eq!(result.count, 10);
         assert!(result.complete);
         assert_eq!(
             result.text,
-            "example/repo · 1 blocked · 1 overlap · 2 Inbox request · 4 contested file · 1 PR overlap"
+            "example/repo · 1 blocked · 1 overlap · 3 Inbox request · 4 contested file · 1 PR overlap"
         );
         assert_eq!(result.work.len(), 6);
     }
 
     #[test]
+    fn failed_activity_read_counts_no_contested_files() {
+        let fixture = fixture();
+        let result = summarize_fixture(&fixture, &Value::Null);
+        // Without events a pending handoff cannot be seen, so a held file would be a false alarm.
+        let mut rest = expected(&fixture);
+        rest.retain(|key| !key.starts_with("contested:"));
+        assert_eq!(result.keys, rest);
+        assert_eq!(result.count, 6);
+        assert!(!result.complete);
+        assert!(result.text.ends_with("(partial)"));
+    }
+
+    #[test]
     fn missing_reads_are_not_an_all_clear() {
-        let overview = json!({"current": [item("wrk_blocked", "blocked", "active")],
+        let overview = json!({"current": [{"id": "wrk_blocked", "state": "blocked", "claim_status": "active"}],
             "overlaps": [], "current_complete": true, "overlaps_complete": true});
         let coordination = json!({"requests": [], "complete": true});
-        let result = summarize_all(
-            &overview,
-            &coordination,
-            &Value::Null,
-            &Value::Null,
-            &Value::Null,
-        );
+        let null = Value::Null;
+        let summarize_with = |overview: &Value| {
+            summarize(
+                std::path::Path::new("/demo"),
+                "example/repo",
+                &Reads {
+                    overview,
+                    coordination: &coordination,
+                    whoami: &null,
+                    work: &null,
+                    activity: &null,
+                    now: 0,
+                },
+            )
+        };
         // The overview's own rules still count; the rest need whoami, work and activity.
+        let result = summarize_with(&overview);
         assert_eq!(result.count, 1);
         assert!(!result.complete);
         assert!(result.text.contains("(partial)"));
         let quiet = json!({"current": [], "overlaps": [], "current_complete": true, "overlaps_complete": true});
-        let result = summarize_all(
-            &quiet,
-            &coordination,
-            &Value::Null,
-            &Value::Null,
-            &Value::Null,
-        );
+        let result = summarize_with(&quiet);
         assert_eq!(result.count, 0);
         assert!(result.text.contains("partial"));
     }
 
     #[test]
     fn incomplete_read_is_not_an_all_clear() {
-        let overview =
+        let mut fixture = fixture();
+        fixture["overview"] =
             json!({"current":[],"overlaps":[],"current_complete":false,"overlaps_complete":true});
-        let coordination = json!({"requests":[],"complete":true});
-        let whoami = json!({"owner": lead("ana")});
-        let work = json!({"intents": [], "intents_truncated": false, "pull_requests": []});
-        let activity = json!({"sessions": [], "events": []});
-        let result = summarize_all(&overview, &coordination, &whoami, &work, &activity);
+        fixture["coordination"] = json!({"requests":[],"complete":true});
+        fixture["work"] = json!({"intents": [], "intents_truncated": false, "pull_requests": []});
+        let result = summarize_fixture(&fixture, &json!({"sessions": [], "events": []}));
         assert!(result.text.contains("partial"));
         assert_eq!(result.count, 0);
     }

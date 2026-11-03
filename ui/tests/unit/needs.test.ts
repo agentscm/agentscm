@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import type { Contested, Derived } from '../../src/derive.ts'
+import { derive, type Contested, type Derived } from '../../src/derive.ts'
 import { areaOf, areas, inboxBadge, needsYou } from '../../src/needs.ts'
 import type { CoordinationRequest, WorkItem, WorkOverview } from '../../src/standup.ts'
+import type { Activity, Work } from '../../src/types.ts'
+import wire from '../fixtures/needs-you.json'
 
 const item = (id: string, over: Partial<WorkItem>): WorkItem =>
   ({ id, title: id, state: 'active', claim_status: 'active', updated_at: 100, last_checkin_at: 100, blocker: null, scope: [], lead_agent: 'codex', owner_login: 'dev', ...over }) as WorkItem
@@ -106,5 +108,17 @@ describe('areas', () => {
       ['web', 0, 1, 1, 0],
       ['docs', 1, 1, 0, 0],
     ])
+  })
+})
+
+describe('the menu-bar companion', () => {
+  // The tray (`src/tray/companion_hub.rs`) reads the same fixture and asserts the same keys.
+  it('counts what needsYou lists for a person, for one shared fixture', () => {
+    const d = derive(wire.work as unknown as Work, wire.activity as unknown as Activity, wire.now)
+    const asked = { requests: wire.coordination.requests as unknown as CoordinationRequest[], me: wire.me }
+    const keys = needsYou(wire.overview as unknown as WorkOverview, d, asked)
+      .filter((n) => n.who === 'you')
+      .map((n) => n.key)
+    expect(keys.sort()).toEqual([...wire.expected].sort())
   })
 })
