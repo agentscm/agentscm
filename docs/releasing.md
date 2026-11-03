@@ -54,11 +54,11 @@ turn off verification to work around a failure.
 
 ## Activating the reusable local-validation workflow
 
-The reusable `.github/workflows/local-validation-reconcile.yml` interface must not be adopted before its exact npm release exists. The current source-build verifier remains active until a release contains `reconcile`, path-scoped recipes and exempt paths, the opt-in authenticated GitHub fetch boundary, and the reusable workflow itself.
+This repository's `.github/workflows/local-validation.yml` calls the reusable `.github/workflows/local-validation-reconcile.yml` at v0.2.1: the exact SemVer and the tag's full commit SHA, which must move together. A version must not be pinned before its exact npm release exists. Use these steps for each bump.
 
 After npm publication succeeds, qualify the exact version from an empty directory and private home with `AGENTSCM_REQUIRE_PROVENANCE=1` and `AGENTSCM_TELEMETRY=off`: run `npx --yes --ignore-scripts --registry=https://registry.npmjs.org agentscm@VERSION local-validation reconcile --help` with stdin closed, then invoke `~/.agentscm/bin/agentscm-VERSION --version` directly and require the exact reported version. `npx agentscm@VERSION --version` is only the npm launcher's shortcut and does not install or verify the binary.
 
-Only after that acquisition check and the release's required qualification should a follow-up change replace the source-build verifier or the adoption guide's placeholders with the exact SemVer and full reusable-workflow commit SHA. Exercise a public repository first; private GitHub fetch, redirect and timeout behavior remains unqualified until it is run and recorded separately. Do not add an automatic source fallback to the reusable interface, accept a mutable tag/range, pass a PAT, GitHub App secret or OIDC input, or use `secrets: inherit`.
+Only after that acquisition check and the release's required qualification should a follow-up change update the pin. Exercise a public repository first; private GitHub fetch, redirect and timeout behavior remains unqualified until it is run and recorded separately. Do not add an automatic source fallback to the reusable interface, accept a mutable tag/range, pass a PAT, GitHub App secret or OIDC input, or use `secrets: inherit`.
 
 ## Third-party software in the container image
 

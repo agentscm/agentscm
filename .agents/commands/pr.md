@@ -23,7 +23,7 @@ Prepare and create a pull request for the current branch. Invoking `/pr` is the 
    Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
 
    Stop if a check fails. Keep missing prerequisites and unverified behavior explicit.
-   For a same-repository PR the expected test evidence is a local validation attestation: with an enrolled key and local PostgreSQL and S3 test services, after the gate run `agentscm local-validation run` and then `post` (see `docs/advanced/local-validation.md`) once the PR exists. Without a key or services, put a `ci-extended` label request in the PR body instead of claiming coverage. Never post commit statuses yourself, and report a Pending, Failure or Error verdict as it is.
+   Do not decide here whether the attestation will happen; step 11 does that by running its script.
 6. Determine related issues only from reliable evidence such as branch names, commit messages, and issue or PR links. Do not add `Fixes` or `Closes` based on a loose title match.
 7. If `$ARGUMENTS` supplies a title, use it after checking it against the diff and repository writing rules. Otherwise write a factual title, under 72 characters, that describes the primary observable change. Follow the branch's established commit style; do not invent a scope that the repository does not use.
 8. Draft the body from the repository template:
@@ -43,4 +43,10 @@ Prepare and create a pull request for the current branch. Invoking `/pr` is the 
     gh pr create --base main --assignee @me --title "<title>" --body-file <temporary-file>
     ```
 
-11. Report the PR URL, title, head SHA, validation results, and known limitations. Do not merge or enable auto-merge.
+11. Attest the pushed head by running `tools/attest-pr.sh <PR#>` from a clean checkout. This is a required step, not optional evidence: `agentscm/local-validation` is required on `main`, so the PR cannot go green without it. The script finds the key, starts disposable PostgreSQL and S3 services when none are configured, signs, verifies and posts. It re-runs the whole recipe, so run it in the background.
+
+    - If it reports no signing key, say so in the report and add a `ci-extended` label request to the PR body. That is the only reason to skip this step.
+    - If it fails, say why and do not claim coverage. A failure does not undo the PR.
+    - Afterwards confirm that `agentscm/local-validation` reports on the head. The verifier takes a few minutes, and a PR with no status yet is not green. Never post commit statuses yourself, and report a Pending, Failure or Error verdict as it is.
+
+12. Report the PR URL, title, head SHA, validation results, attestation result, and known limitations. Do not merge or enable auto-merge.
