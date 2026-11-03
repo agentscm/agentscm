@@ -127,7 +127,7 @@ pub(super) fn repair(
             *repository = repair.destination.clone();
         }
         item.updated_at = now;
-        let mut event = work_event("work_checkpoint", &item)?;
+        let mut event = work_event("work_checkpoint", &item, None)?;
         event.data = json!({"operation": "repository_namespace_repaired", "previous_repository": scope.repository, "repository": repair.destination, "repository_id": id, "generation": item.generation}).to_string();
         let seq = append(tx, &event)?;
         item.updated_seq = seq;

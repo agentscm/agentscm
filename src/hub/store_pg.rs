@@ -1768,13 +1768,14 @@ fn work_scope_overlaps(
     Ok(found)
 }
 
-fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
-    let mut event = Event::new(
-        kind,
-        &item.id,
-        json!({"generation": item.generation, "owner": item.owner,
-            "repository": item.repository, "state": state_name(item.state)}),
-    )?;
+/// `previous` is the state a checkpoint left, so a reader can tell a transition from a repeat.
+fn work_event(kind: &'static str, item: &WorkItem, previous: Option<WorkState>) -> Result<Event> {
+    let mut data = json!({"generation": item.generation, "owner": item.owner,
+        "repository": item.repository, "state": state_name(item.state)});
+    if let Some(previous) = previous {
+        data["previous"] = state_name(previous).into();
+    }
+    let mut event = Event::new(kind, &item.id, data)?;
     event.at = item.updated_at;
     Ok(event)
 }
@@ -3076,7 +3077,7 @@ fn start_in(
                 (&a.owner, &a.token, &a.session).cmp(&(&b.owner, &b.token, &b.session))
             });
             item.updated_at = now;
-            let event = work_event("work_joined", &item)?;
+            let event = work_event("work_joined", &item, None)?;
             let seq = append(tx, &event)?;
             item.updated_seq = seq;
             tx.execute(
@@ -3251,7 +3252,7 @@ fn start_in(
         item.last_checkin_at = now;
         item.reported_at = None;
         item.updated_at = now;
-        let event = work_event("work_takeover", &item)?;
+        let event = work_event("work_takeover", &item, None)?;
         let seq = append(tx, &event)?;
         item.updated_seq = seq;
         tx.execute(
@@ -3395,7 +3396,7 @@ fn start_in(
         created_seq: 0,
         updated_seq: 0,
     };
-    let event = work_event("work_started", &item)?;
+    let event = work_event("work_started", &item, None)?;
     let seq = append(tx, &event)?;
     item.created_seq = seq;
     item.updated_seq = seq;
@@ -8147,6 +8148,7 @@ impl Store for PgStore {
                 &checkpoint.depends_on,
                 &checkpoint.related_work,
             )?;
+            let previous = item.state;
             item.state = checkpoint.state();
             item.claim_status = ClaimStatus::Active;
             item.reported_at = if checkpoint.kind == super::work::CheckpointKind::Pause
@@ -8187,7 +8189,7 @@ impl Store for PgStore {
             item.depends_on = checkpoint.depends_on.clone();
             item.related_work = checkpoint.related_work.clone();
             item.updated_at = now;
-            let event = work_event("work_checkpoint", &item)?;
+            let event = work_event("work_checkpoint", &item, Some(previous))?;
             let seq = append(&mut tx, &event)?;
             item.updated_seq = seq;
             let snapshot = save_work_version(&mut tx, &item, seq)?;

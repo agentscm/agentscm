@@ -2,7 +2,7 @@ use super::*;
 use crate::backend::LocalBackend;
 use crate::hub::session::SessionCall;
 use crate::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token};
-use crate::hub::work::WorkStart;
+use crate::hub::work::{WorkCheckpoint, WorkStart};
 use axum::extract::OriginalUri;
 use tempfile::TempDir;
 
@@ -814,6 +814,55 @@ async fn a_request_to_an_idle_lead_messages_its_person_once() {
         "Another agent asked for files your agent holds | File: ui/catchup.tsx | Repository: acme/widgets | Their agent: bob’s Codex | Your agent: Claude Code | Your work: readable catch up | Your agent isn’t running, so it can’t answer. Answer for it in the Hub Inbox.".into()
     )]);
     assert_eq!(f.link("U1"), "https://hub.example.test/ui/#inbox");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_and_handover_message_the_lead_once_per_transition() {
+    let f = Fixture::new().await;
+    let start: WorkStart = serde_json::from_value(json!({"title": "readable catch up",
+        "session": "a1", "scope": ["ui/catchup.tsx"], "work_id": null, "source": null,
+        "request_key": null, "branch": null, "worktree": null, "next_action": null,
+        "takeover_generation": null}))
+    .unwrap();
+    let started =
+        tokio::task::block_in_place(|| f.store().work_start_auto(&f.alice, &start, unix_now()))
+            .unwrap()
+            .item;
+    let (id, seq) = (started.id, std::cell::Cell::new(started.updated_seq));
+    let checkpoint = |kind: &str, operation: &str, summary: &str| {
+        let request: WorkCheckpoint = serde_json::from_value(json!({"work_id": id,
+            "operation_id": operation, "generation": 1, "session": "a1",
+            "expected_updated_seq": seq.get(), "kind": kind, "summary": summary,
+            "next_action": null, "scope": null, "branch": null, "worktree": null}))
+        .unwrap();
+        let done = tokio::task::block_in_place(|| {
+            f.store().work_checkpoint(&f.alice, &request, unix_now())
+        })
+        .unwrap();
+        seq.set(done.item.updated_seq);
+    };
+    // Each transition is read while the work is still in that state.
+    checkpoint("progress", "op-1", "started");
+    f.run().await;
+    assert_eq!(f.sent(), vec![]);
+
+    checkpoint("blocker", "op-2", "needs the API key");
+    f.run().await;
+    let blocked = "Your agent’s work is blocked | Your work: readable catch up | Repository: acme/widgets | Your agent: Claude Code | Blocked on: needs the API key | Answer the blocker where your agent is running, or reassign the task.";
+    assert_eq!(f.sent(), vec![("U1".into(), blocked.into())]);
+    assert_eq!(
+        f.link("U1"),
+        format!("https://hub.example.test/ui/#work/{id}")
+    );
+
+    checkpoint("blocker", "op-3", "still needs the API key");
+    f.run().await;
+    assert_eq!(f.sent().len(), 1);
+
+    checkpoint("handover", "op-4", "ready for someone else");
+    f.run().await;
+    assert_eq!(f.sent()[1], ("U1".into(), "Your agent offered its work for handover | Your work: readable catch up | Repository: acme/widgets | Your agent: Claude Code | Handover note: ready for someone else | Pick an agent to take it over.".into()));
+    assert_eq!(f.sent().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

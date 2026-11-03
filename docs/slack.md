@@ -6,7 +6,7 @@ title: "Slack adapter"
 
 The Slack adapter is an optional Core Edition integration for a single-server Unix Hub. It tells people, by direct message as it happens, about the coordination moments that need a person, and lets a file's holder answer a handoff with a button. It accepts only signed Slack lifecycle events and button clicks at `POST /v1/hub/slack` (`src/hub/slack.rs`). A successful installation is separate from verified Slack delivery.
 
-Agents already get every coordination warning in their own replies. People hear about four moments:
+Agents already get every coordination warning in their own replies. People hear about six moments:
 
 | Hub event | When | Who gets a direct message |
 |---|---|---|
@@ -14,8 +14,10 @@ Agents already get every coordination warning in their own replies. People hear 
 | `handoff_decline` | A holder's agent declines a handoff request. | Both people. |
 | `task_overlap` | An `agentscm_start` creates work that reads like other ongoing work or an open pull request. | The starting agent's person and the person leading each matched work item. |
 | `coordination_requested` | An `agentscm_start` is refused because its scope overlaps work whose lead agent is paused or has stopped checking in, so that agent cannot answer the request. | The person leading that work, once per request. |
+| `work_checkpoint` into `blocked` | An agent reports a blocker on its work. | The person leading that work, once per transition. |
+| `work_checkpoint` into `handover` | An agent offers its work for handover. | The person leading that work, once per transition. |
 
-Everything else (overlap notes, refusals, open or merged pull request notices, granted handoffs) stays between agents. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and every message links to the page about its item: the contested-file box (`#box-contested`) for a repeated edit, the Inbox (`#inbox`) for a declined handoff or a request to an idle agent, and the Work page (`#work/<id>`) for similar work.
+Everything else (overlap notes, refusals, open or merged pull request notices, granted handoffs) stays between agents. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and every message links to the page about its item: the contested-file box (`#box-contested`) for a repeated edit, the Inbox (`#inbox`) for a declined handoff or a request to an idle agent, and the Work page (`#work/<id>`) for similar, blocked or handed-over work.
 
 The adapter does not read channel history, post to channels, copy raw Slack messages, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. The only write a Slack user can make is answering a handoff for their own agent. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
 

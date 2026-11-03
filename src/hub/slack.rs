@@ -1,6 +1,7 @@
 //! Optional Slack app that tells people, by direct message as it happens, about the
 //! coordination moments that need a person: an agent edited a file again after AgentSCM
-//! refused it, a handoff was declined, or new work reads like work already under way.
+//! refused it, a handoff was declined, new work reads like work already under way, or a
+//! person's own work became blocked or was offered for handover.
 //! Each binding links one Slack user to their forge identity in one repository through a
 //! dedicated, revocable read-only token. A file's holder can answer a handoff for their own
 //! agent with a button; nothing else is written from Slack.
@@ -28,6 +29,7 @@ use super::handoff::{Answered, Via};
 use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
+use super::work::WorkState;
 use super::{HubError, HubState, Result};
 
 pub const CONFIG_ENV: &str = "AGENTSCM_SLACK_FILE";
@@ -45,6 +47,9 @@ const KINDS: [&str; 4] = [
     "task_overlap",
     "coordination_requested",
 ];
+/// The checkpoint event that also becomes a direct message when it moves work into `blocked` or
+/// `handover`; see [`entered`].
+const CHECKPOINT: &str = "work_checkpoint";
 const NAME_CHARS: usize = 64;
 const TEXT_CHARS: usize = 120;
 /// List lines a message field shows before `+N more`.
@@ -335,6 +340,25 @@ fn agent_name(agent: &str) -> String {
 /// `bob’s Claude Code`, the way the Hub names someone else's agent.
 fn label(login: &str, agent: &str) -> String {
     format!("{}’s {}", sanitize(login, NAME_CHARS), agent_name(agent))
+}
+
+/// The state a checkpoint moved work into, when a person has to act on it: `blocked` or
+/// `handover`, from another state. A repeated checkpoint, and an event recorded before the Hub
+/// kept `previous`, moved nothing.
+fn entered(data: &Value) -> Option<WorkState> {
+    let state = serde_json::from_value::<WorkState>(data["state"].clone()).ok()?;
+    let previous = serde_json::from_value::<WorkState>(data["previous"].clone()).ok()?;
+    (matches!(state, WorkState::Blocked | WorkState::Handover) && state != previous)
+        .then_some(state)
+}
+
+/// Whether an event becomes a direct message.
+fn wanted(event: &HubEvent) -> bool {
+    KINDS.contains(&event.kind.as_str())
+        || event.kind == CHECKPOINT
+            && serde_json::from_str(&event.data)
+                .ok()
+                .is_some_and(|data| entered(&data).is_some())
 }
 
 fn strings(value: &Value) -> Vec<String> {
@@ -706,14 +730,14 @@ impl Slack {
             }
             return Ok(());
         }
-        let people = if events.iter().any(|e| KINDS.contains(&e.kind.as_str())) {
+        let people = if events.iter().any(wanted) {
             self.people(state)?
         } else {
             Vec::new()
         };
         let mut batches = Vec::new();
         for event in &events {
-            let messages = if KINDS.contains(&event.kind.as_str()) {
+            let messages = if wanted(event) {
                 self.messages_for(state, &people, event)?
             } else {
                 Vec::new()
@@ -783,6 +807,7 @@ impl Slack {
             "handoff_decline" => self.declined(state, people, &event.subject, &data)?,
             "task_overlap" => self.similar(state, people, &event.subject, &data)?,
             "coordination_requested" => self.asked(state, people, &data)?,
+            CHECKPOINT => self.waiting(state, people, &event.subject, &data)?,
             _ => Vec::new(),
         };
         Ok(messages
@@ -1229,6 +1254,58 @@ impl Slack {
             }
         }
         Ok(out)
+    }
+
+    /// `work_checkpoint` (subject: the work) that moved it into `blocked` or `handover`: the
+    /// person leading it, once per transition, while the work is still in that state.
+    fn waiting(
+        &self,
+        state: &HubState,
+        people: &[Person],
+        id: &str,
+        data: &Value,
+    ) -> Result<Vec<(String, String, Value)>> {
+        let (Some(entered), Some(repository)) = (entered(data), data["repository"].as_str()) else {
+            return Ok(Vec::new());
+        };
+        let Some(reader) = people.iter().find(|p| p.repository == repository) else {
+            return Ok(Vec::new());
+        };
+        let Some(item) = state.store.work_get(&reader.token, id, unix_now())? else {
+            return Ok(Vec::new());
+        };
+        if item.state != entered {
+            return Ok(Vec::new());
+        }
+        let Some(person) = Self::bound(people, repository, &item.lead_token) else {
+            return Ok(Vec::new());
+        };
+        let (headline, why, guidance) = if entered == WorkState::Blocked {
+            (
+                "Your agent’s work is blocked",
+                "Blocked on",
+                "Answer the blocker where your agent is running, or reassign the task.",
+            )
+        } else {
+            (
+                "Your agent offered its work for handover",
+                "Handover note",
+                "Pick an agent to take it over.",
+            )
+        };
+        let mut fields = vec![
+            ("Your work", sanitize(&item.title, TEXT_CHARS)),
+            ("Repository", sanitize(repository, TEXT_CHARS)),
+            ("Your agent", agent_name(&item.lead_agent)),
+        ];
+        if let Some(current) = &item.current {
+            fields.push((why, sanitize(&current.summary, TEXT_CHARS)));
+        }
+        Ok(vec![(
+            person.slack_user.clone(),
+            "lead".into(),
+            message(headline, &fields, guidance, None, &self.work_link(id)),
+        )])
     }
 
     /// The oldest due message whose person is still authorized, marked as sending; a message
