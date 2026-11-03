@@ -93,6 +93,7 @@ describe('Since you last checked', () => {
       recent_complete: true,
       overlaps_complete: true,
       history_retention_gap: false,
+      settled_count: 0,
     }
     vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}))
     window.location.hash = '#activity'
@@ -319,5 +320,157 @@ describe('Since you last checked', () => {
     await screen.findByRole('button', { name: /Mark reviewed/ })
     const remountedClient = new URL(String(catchupCalls(fetchMock)[0]?.[0]), 'http://hub.test').searchParams.get('delivery_client')
     expect(remountedClient).toBe(persistedClient)
+  })
+  describe('Mark all reviewed', () => {
+    const partial = (over: Record<string, unknown> = {}) => page({ event_through: 5, next_event_after: 3, complete: false, ...over })
+    const ackBody = { status: 'advanced', event_through: 5, merge_through: 1, current_event_ack: 5, current_merge_ack: 1 }
+    const confirmText = /Mark everything in this delivery reviewed without opening it\?/
+    const urlOf = (call: Parameters<typeof fetch>) => new URL(String(call[0]), 'http://hub.test')
+
+    it('moves nothing before confirm or on cancel', async () => {
+      const fetchMock = mockCatchup(response(partial()))
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      expect(screen.getByText(confirmText)).toBeTruthy()
+      expect(catchupCalls(fetchMock)).toHaveLength(1)
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      expect(screen.queryByText(confirmText)).toBeNull()
+      expect(catchupCalls(fetchMock)).toHaveLength(1)
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Mark all reviewed' }))
+    })
+
+    it('pages through at the page limit, then sends one acknowledgement from the final delivery', async () => {
+      const fetchMock = mockCatchup(
+        response(partial()),
+        response(partial({ event_after: 3, next_event_after: 4 })),
+        response(page({ event_through: 5, event_after: 4, next_event_after: 5 })),
+        response(ackBody),
+        response(page({ delivery: delivery('b'), event_from: 5, event_through: 5, event_after: 5, next_event_after: 5 })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Marked retained records reviewed')).toBeTruthy()
+      const calls = catchupCalls(fetchMock)
+      expect(calls).toHaveLength(5)
+      expect(urlOf(calls[1]!).searchParams.get('limit')).toBe('50')
+      expect(urlOf(calls[1]!).searchParams.get('event_after')).toBe('3')
+      expect(urlOf(calls[2]!).searchParams.get('event_after')).toBe('4')
+      expect(urlOf(calls[2]!).searchParams.get('delivery_client')).toBe(urlOf(calls[0]!).searchParams.get('delivery_client'))
+      expect(calls.filter(([input]) => String(input).endsWith('/ack'))).toHaveLength(1)
+      expect(calls[3]?.[1]).toMatchObject({ method: 'POST', body: JSON.stringify({ delivery: delivery(), expected_event_from: 3, expected_merge_from: 1 }) })
+    })
+
+    it('uses the existing conflict handling', async () => {
+      mockCatchup(
+        response(partial()),
+        response(page({ event_through: 5, event_after: 3, next_event_after: 5 })),
+        response({ status: 'conflict', event_through: 5, merge_through: 1, current_event_ack: 9, current_merge_ack: 1 }),
+        response(page({ delivery: delivery('b') })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Review position changed')).toBeTruthy()
+      await waitFor(() => expect(screen.getByText(delivery('b'))).toBeTruthy())
+    })
+
+    it('reloads and sends no acknowledgement when a page fails mid-loop', async () => {
+      const fetchMock = mockCatchup(
+        response(partial()),
+        response(partial({ event_after: 3, next_event_after: 4 })),
+        new Error('connection refused'),
+        response(page({ delivery: delivery('b') })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Could not mark everything reviewed')).toBeTruthy()
+      expect(screen.getByText(/review position was not assumed to move/)).toBeTruthy()
+      await waitFor(() => expect(screen.getByText(delivery('b'))).toBeTruthy())
+      const calls = catchupCalls(fetchMock)
+      expect(calls).toHaveLength(4)
+      expect(calls.some(([input]) => String(input).endsWith('/ack'))).toBe(false)
+      expect(urlOf(calls[3]!).searchParams.has('delivery')).toBe(false)
+    })
+
+    it('refuses a page that moves neither cursor instead of looping', async () => {
+      const fetchMock = mockCatchup(
+        response(partial()),
+        response(partial({ event_after: 3, next_event_after: 3 })),
+        response(page({ delivery: delivery('b') })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Could not mark everything reviewed')).toBeTruthy()
+      expect(screen.getByText(/continuation progress/)).toBeTruthy()
+      expect(catchupCalls(fetchMock).some(([input]) => String(input).endsWith('/ack'))).toBe(false)
+    })
+
+    it('does not carry an open confirmation to another token', async () => {
+      mockCatchup(response(partial()), response(partial({ delivery: delivery('b') })))
+      const view = render(<CatchupPanel token="old-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      expect(screen.getByText(confirmText)).toBeTruthy()
+      view.rerender(<CatchupPanel token="new-token" />)
+      expect(await screen.findByText(delivery('b'))).toBeTruthy()
+      expect(screen.queryByText(confirmText)).toBeNull()
+      expect(screen.getByRole('button', { name: 'Mark all reviewed' }).getAttribute('aria-expanded')).toBe('false')
+    })
+
+    it('sends one run when the confirmation is clicked twice', async () => {
+      const fetchMock = mockCatchup(
+        response(partial()),
+        response(page({ event_through: 5, event_after: 3, next_event_after: 5 })),
+        response(ackBody),
+        response(page({ delivery: delivery('b') })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      const confirm = screen.getByRole('button', { name: 'Mark everything reviewed' })
+      fireEvent.click(confirm)
+      fireEvent.click(confirm)
+      expect(await screen.findByText('Marked retained records reviewed')).toBeTruthy()
+      const calls = catchupCalls(fetchMock)
+      expect(calls).toHaveLength(4)
+      expect(calls.filter(([input]) => String(input).endsWith('/ack'))).toHaveLength(1)
+    })
+
+    it('moves focus into the panel once the delivery is complete', async () => {
+      mockCatchup(
+        response(partial()),
+        response(page({ event_through: 5, event_after: 3, next_event_after: 5 })),
+        response(ackBody),
+        response(page({ delivery: delivery('b') })),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Marked retained records reviewed')).toBeTruthy()
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Since you last checked' })))
+    })
+
+    it('keeps the success message when the reload after it fails', async () => {
+      mockCatchup(
+        response(partial()),
+        response(page({ event_through: 5, event_after: 3, next_event_after: 5 })),
+        response(ackBody),
+        new Error('connection refused'),
+      )
+      render(<CatchupPanel token="read-token" />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Mark all reviewed' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Mark everything reviewed' }))
+      expect(await screen.findByText('Marked retained records reviewed')).toBeTruthy()
+      await waitFor(() => expect(screen.getByText(/could not be refreshed/)).toBeTruthy())
+      expect(screen.getByText('Marked retained records reviewed')).toBeTruthy()
+      expect(screen.queryByText('Could not refresh catch-up')).toBeNull()
+    })
+
+    it('says the records are only the available ones when retention has a gap', async () => {
+      mockCatchup(response(partial({ retention: { work_gap: true, coordination_gap: false, merge_gap: false, event_available_from: 2, merge_available_from: 0 } })))
+      render(<CatchupPanel token="read-token" />)
+      expect(await screen.findByRole('button', { name: 'Mark all available records reviewed' })).toBeTruthy()
+    })
   })
 })

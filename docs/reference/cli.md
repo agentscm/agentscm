@@ -340,8 +340,9 @@ client exit is a process fact, not proof that its task completed. The panel sepa
 process from recent hook/MCP sightings, whose live task state is unknown. Existing checkout
 attention appears with an action to use its tray menu. When a saved Hub sign-in permits it, the
 tray checks connected checkouts about once a minute with short-lived read-only tokens and
-shows Hub Work and Inbox signals: blocked or quiet tasks, handovers, declared-scope overlaps and
-active coordination requests. It refreshes the cross-repository list about every two minutes.
+shows Hub Work and Inbox signals: blocked tasks, overlaps between live tasks and active
+coordination requests. Quiet, paused and handed-over tasks stay listed as unfinished work and are
+not counted as needing a person. It refreshes the cross-repository list about every two minutes.
 A newly observed signal opens a small attention notice, or marks **New attention** when the
 Now card is fully visible; a partial
 read may reveal an older signal later. The summary marks incomplete reads and does not include

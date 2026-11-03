@@ -48,6 +48,110 @@ describe('MCP views Twilight restyle', () => {
     expect(root.querySelector('input')).toBeNull()
   })
 
+  it('overview names no tool but its own', () => {
+    const names = new Set((files.overview.match(/agentscm_[a-z_]+/g) ?? []).filter((n) => n !== 'agentscm_view_settings'))
+    expect([...names]).toEqual(['agentscm_work_overview'])
+  })
+
+  it('overview folds only All work and points to the Hub for catch-up', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, {
+      current: [item({})], recent: [], overlaps: [], current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false,
+    }, new Date())
+    const folds = root.querySelectorAll('details.f')
+    expect(folds).toHaveLength(1)
+    expect(folds[0]!.textContent).toContain('All work')
+    for (const text of ['merge observation', 'Mark reviewed', 'Briefing', 'Load more']) expect(root.textContent).not.toContain(text)
+    expect(root.textContent).toContain('Hub › Catch up')
+  })
+
+  it('overview says how many unfinished items are not listed because their branch merged', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    const data = { current: [item({})], recent: [], overlaps: [], current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false }
+    render(root, { ...data, settled_count: 2 }, new Date())
+    expect(root.querySelector('details.f')!.textContent).toContain('1 task · 2 with a merged PR · 0 finished recently')
+    root.textContent = ''
+    render(root, data, new Date())
+    expect(root.textContent).not.toContain('merged PR')
+  })
+
+  const flags = { current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false }
+  const pair = (l: Record<string, unknown>, r: Record<string, unknown>) => ({ left: item({ id: 'wrk_l', ...l }), right: item({ id: 'wrk_r', ...r }), reasons: [{ left_path: 'src/a.rs', right_path: 'src/a.rs' }] })
+
+  it('overview counts only blocked work and live overlaps; older items fold into All work', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, {
+      current: [
+        item({ id: 'wrk_1', title: 'Handed', state: 'handover', claim_status: 'stale' }),
+        item({ id: 'wrk_2', title: 'Paused', state: 'paused' }),
+        item({ id: 'wrk_3', title: 'Stale active', state: 'active', claim_status: 'stale' }),
+        item({ id: 'wrk_4', title: 'Overlap side', state: 'active', claim_status: 'stale' }),
+        item({ id: 'wrk_5', title: 'Stuck blocker', state: 'blocked', claim_status: 'stale', blocker: { summary: 'waiting on keys' } }),
+      ],
+      recent: [], overlaps: [pair({ claim_status: 'stale' }, {})], ...flags,
+    }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. 1 thing needs a person.')
+    expect(root.querySelectorAll('.needs li')).toHaveLength(1)
+    expect(root.querySelector('.needs')!.textContent).toContain('Stuck blocker')
+    expect(root.querySelector('details.f')!.textContent).toContain('5 tasks · 4 older · 0 finished recently')
+    for (const t of ['Handed', 'Paused', 'Stale active', 'Overlap side']) expect(root.querySelector('details.f')!.textContent).toContain(t)
+  })
+
+  it('overview with only older tasks and complete data says nothing is blocked and no live overlaps', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    const current = [item({ id: 'wrk_1', state: 'paused' }), item({ id: 'wrk_2', state: 'handover' }), item({ id: 'wrk_3', claim_status: 'stale' })]
+    render(root, { current, recent: [], overlaps: [], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing blocked and no live overlaps. 3 older tasks in All work.')
+    root.textContent = ''
+    render(root, { current: current.slice(0, 1), recent: [], overlaps: [], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toContain('1 older task in All work.')
+    for (const partial of [{ overlaps_complete: false }, { current_complete: false }]) {
+      root.textContent = ''
+      render(root, { current, recent: [], overlaps: [], ...flags, ...partial }, new Date())
+      expect(root.querySelector('.big')!.textContent).toBe('0 agents working. Nothing flagged in the data shown.')
+    }
+  })
+
+  it('overview with a paused-versus-active overlap and complete data shows no needs row', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, { current: [item({ id: 'wrk_l', state: 'paused' }), item({ id: 'wrk_r' })], recent: [], overlaps: [pair({ state: 'paused' }, {})], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('1 agent working. Nothing blocked and no live overlaps. 1 older task in All work.')
+    expect(root.querySelector('.needs')).toBeNull()
+  })
+
+  it('overview still lists an overlap whose sides are both live', () => {
+    const { render } = load(files.overview)
+    const root = document.getElementById('app')!
+    render(root, { current: [item({ id: 'wrk_l' }), item({ id: 'wrk_r', state: 'blocked', blocker: { summary: 'x' } })], recent: [], overlaps: [pair({}, { state: 'blocked' })], ...flags }, new Date())
+    expect(root.querySelector('.big')!.textContent).toBe('1 agent working. 2 things need a person.')
+    expect(root.querySelector('.needs')!.textContent).toContain('both declare src/a.rs')
+  })
+
+  it('starting the overview posts no tool call', () => {
+    const script = new DOMParser().parseFromString(files.overview, 'text/html').querySelector('script')!.textContent!
+    const posted: { method?: string }[] = []
+    const stub = { parent: { postMessage: (m: { method?: string }) => posted.push(m) }, addEventListener: () => {} }
+    document.body.innerHTML = '<div id="app"></div>'
+    new Function('window', 'document', 'ResizeObserver', script)(stub, document, undefined)
+    expect(posted.length).toBeGreaterThan(0)
+    expect(posted.filter((m) => m.method === 'tools/call')).toEqual([])
+  })
+
+  it.each([{ overlaps_complete: false, current_complete: true }, { overlaps_complete: true, current_complete: false }])(
+    'overview does not claim nothing is blocked and no live overlaps on partial data %o',
+    (flags) => {
+      const { render } = load(files.overview)
+      const root = document.getElementById('app')!
+      render(root, { current: [], recent: [], overlaps: [], recent_complete: true, history_retention_gap: false, ...flags }, new Date())
+      expect(root.querySelector('.big')!.textContent).not.toContain('Nothing blocked and no live overlaps.')
+    },
+  )
+
   it('inbox shows the track, withdrawn state, two path chips and folded history', () => {
     const { render } = load(files.inbox)
     const root = document.getElementById('app')!

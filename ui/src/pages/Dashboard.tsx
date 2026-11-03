@@ -4,8 +4,8 @@ import { NarrativePanel } from '../Narrative.tsx'
 import type { Derived, LiveAgent } from '../derive.ts'
 import { HideButton, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
 import { Gloss } from '../Gloss.tsx'
-import { needHideKey, needsYou, needUpdatedAt, type Asked, type Need } from '../needs.ts'
-import { askedStep, blockedStep, contestedStep, handoverStep, overlapSteps, prStep, quietStep, who, type NextStep } from '../nextStep.ts'
+import { isLiveOverlap, needHideKey, needsYou, needUpdatedAt, type Asked, type Need } from '../needs.ts'
+import { askedStep, blockedStep, contestedStep, overlapSteps, prStep, who, type NextStep } from '../nextStep.ts'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
 import { named } from '../inboxThreads.ts'
 import { handoffOf, type Handoff } from '../launchLink.ts'
@@ -148,18 +148,6 @@ export function needView(n: Need, ov: WorkOverview, d: Derived, me: string | nul
     gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · asked <Ago at={r.created_at} /> · <a href="#inbox">open the Inbox</a></>
     body = <>{i.state === 'paused' ? <>Your agent paused this task</> : i.claim_status === 'stale' ? <>Your agent last checked in <Ago at={i.last_checkin_at} /></> : <>Your agent’s last check-in is unknown</>}, so it can’t answer. The other agent waits until someone does.</>
     step = askedStep(r, i)
-  } else if (n.kind === 'quiet' && i) {
-    icon = 'hourglass-split'
-    title = <>{leadName(i)} has gone quiet</>
-    gist = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> · still assigned</>
-    body = <>{i.claim_status === 'stale' ? <>Last check-in <Ago at={i.last_checkin_at} />.</> : <>Its last check-in is unknown.</>} It is still assigned, so it isn’t free to take.</>
-    step = quietStep(i, me)
-  } else if (n.kind === 'handover' && i) {
-    icon = 'arrow-left-right'
-    title = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> is ready for another agent</>
-    gist = <>offered <Ago at={i.updated_at} /></>
-    body = i.next_action ?? i.current?.summary ?? `${leadName(i)} reported it ready to hand over.`
-    step = handoverStep(i)
   } else if (n.kind === 'contested') {
     const c = d.contested.find((x) => x.path === n.path)
     icon = 'exclamation-diamond'
@@ -236,13 +224,9 @@ function NeedRow({ n, ov, d, me, handoff, hidden }: { n: Need; ov: WorkOverview;
 
 /** A need the agents are still settling between themselves: what happened, in one sentence. */
 function SortingRow({ n, d }: { n: Need; d: Derived }) {
-  const i = n.item
   let icon = 'arrow-left-right'
   let text: ReactNode = null
-  if (n.kind === 'quiet' && i) {
-    icon = 'pause-circle'
-    text = <>{leadName(i)} paused “<a className="work-link" href={workHref(i.id)}>{i.title}</a>”: “{i.next_action ?? i.current?.summary ?? 'no reason given'}”. Still assigned.</>
-  } else if (n.kind === 'contested') {
+  if (n.kind === 'contested') {
     const c = d.contested.find((x) => x.path === n.path)
     const h = c?.handoff
     const path = <Path>{n.path ?? ''}</Path>
@@ -330,7 +314,7 @@ function NeedsYou({ needs: all, ov, d, me, handoff }: { needs: Need[]; ov: WorkO
           <Icon name="check2-circle" />
           <div>
             <b>All clear</b>
-            <span>A blocked task, quiet claim, handover or contested file would show up here.</span>
+            <span>A blocked task, an overlap between live tasks or a contested file would show up here.</span>
           </div>
         </div>
       ) : (
@@ -519,7 +503,7 @@ export type DashTab = 'home' | 'now' | 'activity' | 'team'
 export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null, hidden: ReadonlySet<string> = new Set(), asked?: Asked) {
   const needs = needsYou(ov, d, asked).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   const contested = d?.contested.length ?? 0
-  const overlaps = ov?.overlaps.length ?? 0
+  const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
   const latest = events?.[0]
   const up = d && asOfMs ? d.agents.filter((a) => asOfMs / 1000 - a.lastActive < AWAKE_SECONDS).length : 0
   return {

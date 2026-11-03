@@ -8,7 +8,7 @@ title: "Asynchronous agent stand-up"
 
 The Hub keeps durable engineering work separate from short-lived sessions and file intents. Before starting a task, an agent can retrieve:
 
-- the current unfinished work for the token's repository, including old, stale and unknown claims;
+- the current unfinished work for the token's repository, including old, stale and unknown claims, except Work whose branch has a merged pull request (see [Work with a merged pull request](#work-with-a-merged-pull-request));
 - an ordered, bounded change history since this agent token and subscriber/session last acknowledged a briefing; and
 - blockers, decisions, next actions, participants, dependencies and related work reported at checkpoints.
 
@@ -53,18 +53,38 @@ The first briefing page fixes an upper event watermark. Continue with the exact 
 
 The response contains two independent sections:
 
-- `items`: a page from the current unfinished-work snapshot. Work created before the acknowledgement boundary still appears here.
+- `items`: a page from the current unfinished-work snapshot, without Work that has a merged pull request. Work created before the acknowledgement boundary still appears here.
 - `events`: ordered changes after the previous acknowledged cursor and no later than the fixed watermark.
 
 `retention_gap: true` means some requested history is no longer retained. Do not turn that gap into an empty or complete history claim. A writable agent briefing has a delivery identifier. Acknowledge it only after every page was delivered successfully; acknowledgement advances only that token and subscriber/session's boundary for the repository. Repeat `subscriber` on each continuation; the delivery records which subscriber an acknowledgement advances. Separate sessions cannot consume each other's recap when they use distinct subscriber identities. Omitting `subscriber` on the HTTP API keeps a token-level compatibility cursor. MCP and supported startup hooks resolve the current session automatically. A read-only token receives authorized inspection data without a delivery identifier and cannot acknowledge or mutate work.
 
-The Hub spreads this across three places. **Dashboard › Now** lists what needs a person, then every unfinished task as one lane (claimed, where it is now with its lead, its next step, finished) with the lead's latest report. **History › Finished** uses a server-reported time window, independent of acknowledgement, and includes actual reported completion and decision checkpoints. The **Inbox** shows durable directed requests, per-lead receipt and reply state, and recorded resolutions. Detected scope overlaps are listed separately there: detection alone is not delivery or resolution.
+The Hub spreads this across three places. **Dashboard › Now** lists what needs a person, then every listed unfinished task as one lane (claimed, where it is now with its lead, its next step, finished) with the lead's latest report. **History › Finished** uses a server-reported time window, independent of acknowledgement, and includes actual reported completion and decision checkpoints. The **Inbox** shows durable directed requests, per-lead receipt and reply state, and recorded resolutions. Detected scope overlaps are listed separately there: detection alone is not delivery or resolution. Only blocked work and overlaps between live tasks (both claims active, both tasks active or blocked) count as needing a person. Paused, handover and stale or unknown-claim tasks stay listed as unfinished work and stay claimed, but no count or "needs you" list includes them.
 
 The dashboard reads current Work without changing assignments or acknowledging coordination requests or agent briefings. Its separate personal catch-up panel advances only the signed-in person’s review position after an explicit action. Each bounded section states its completeness; request pages retain their fixed upper watermark, and Change history retains the briefing cursor tuple. Stale and unknown claims remain assigned. Finished work carries no assignment claim and does not imply tests, review or merge.
 
+### Work with a merged pull request
+
+When a Work item's branch has a merged pull request, the Hub stops listing it as current work in the overview, briefings, the session-start recap and the dashboard. This is a read-time filter. The Work record, its state and its history are unchanged, and it stays available through search (`agentscm_work_search`) and history. "Settled" never means finished: the overview reports `settled_count`, and the MCP overview view says "with a merged PR".
+
+An item is hidden only when all of these hold:
+
+- its branch matches a merged pull request observed from the same repository (a fork's branch name does not count) at or after the item's last check-in, and the branch is not the base of any observed merge, so default and release branches never hide;
+- it is not blocked and has no unresolved blocker; and
+- a check-in after the merge has not brought it back. A resumed paused item returns once its owner checks in or takes it over. An item paused automatically at session end is judged by the time of its last check-in before that pause (`reported_at`), not by the pause itself. If it was created and never checked in, any observed merge of its branch since it was created hides it. A check-in after the merge keeps it listed even if the session then ends.
+
+Limits:
+
+- An item auto-paused before this version has no recorded report time, so the rule compares against its creation time and a post-merge check-in does not keep it listed.
+- A merge counts only when the forge reports when it happened. A tracked publication whose merge has no forge time is recorded as a merge observation but does not hide Work, because the time it was observed says nothing about when it merged. That Work stays listed, which is the safe direction.
+- A merge first recorded as a tracked publication never hides Work. A later forge observation of that same pull request and commit is deduplicated and does not supply the time, so the item stays listed.
+- A merge observed while a briefing is being delivered changes later pages of the current-item list of a durable delivery only. Exact retries return the cached page, the events list is not filtered, read-only briefings are not cached, and an item behind the cursor stays missing until the next delivery. Pages already delivered, and the fixed watermark of the delivery, are not rewritten.
+- The Hub needs merge observations. With none, nothing is hidden, and a repository whose merges are not synced keeps every item visible.
+- Merges observed before this rule existed carry no head-repository information. They hide matching items, including a fork's same-named branch, until the next check-in.
+- Hiding does not release anything. Scope admission, conflict checks, coordination requests, held files and preflight still treat a hidden item as unfinished, so a start can conflict with an item the overview no longer lists. Use `agentscm_work_search` to find it.
+
 ### Since you last checked
 
-The Hub's Dashboard › Catch up tab and the inline MCP Work app show a personal return-to-work
+The Hub's Dashboard › Catch up tab shows a personal return-to-work
 delivery. It combines retained Work/checkpoint and coordination events
 with immutable merge observations. Human review state belongs to the authenticated
 person and repository, so it survives token rotation and is shared across that
@@ -72,6 +92,13 @@ person’s devices. A verified repository ID keeps that history and readership p
 through a repository rename; unbound repositories retain name-based isolation.
 Agent subscribers retain separate token/session positions.
 Opening a page, login, polling, dismissal and startup never mark records reviewed.
+The Hub's Catch up tab also has a confirmed **Mark all reviewed** action while a
+delivery is only partly loaded. It pages through the rest of the fixed delivery
+without showing it, then sends the one usual acknowledgement. It records that the
+person chose to mark the delivery, not that they read it. The review position moves
+only to the delivery's fixed watermark, so records newer than that stay unreviewed.
+Work, claims and the forge do not change. If any page or the acknowledgement fails,
+the panel reloads the delivery and does not assume the position moved.
 The personal position is an authenticated owner’s readership assertion. An owner’s
 bearer credentials, including read-only tokens, can advance it; the protocol does
 not attest human presence, understanding or approval. Agents use their separate
@@ -94,12 +121,12 @@ They cannot supply merge observations or mutate Work, publications or the forge.
 The CLI exposes `work catchup` (optional `--request` query JSON) and
 `work catchup-ack --request` (exact acknowledgement JSON). MCP exposes
 `agentscm_work_catchup` and `agentscm_work_catchup_ack`. The HTTP/CLI default subscriber is `human`; MCP and supported agent startup paths
-select namespaced independent agent subscribers. Browser/MCP App instances supply
+select namespaced independent agent subscribers. Browser instances supply
 an opaque `delivery_client` so two devices or tabs page independently while sharing
 the person’s review position. With browser Web Locks, Hub tabs retain a bounded set
 of client slots across reloads and acquire exclusive ownership before using a stored
 client; a copied busy client is replaced. Browsers without that facility use a
-volatile client. MCP App instances also keep independent volatile clients. Reuse
+volatile client. Reuse
 one client identity throughout a delivery. Idle
 deliveries expire after 24 hours without moving the review position; an expired
 continuation must reload. Recent acknowledgement receipts are retained for retry.
@@ -231,7 +258,7 @@ An incomplete merge path inventory does not block source freshness when the sour
 
 ## Before work and after an overlap
 
-1. Read `agentscm_work_overview` (or `agentscm work overview`) before planning. It shows unfinished assignments, declared overlaps, and reported outcomes in the last 24 hours by default. `recent_since` selects another starting time. A compacted history is explicitly incomplete.
+1. Read `agentscm_work_overview` (or `agentscm work overview`) before planning. It shows unfinished assignments (not Work with a merged pull request; `settled_count` counts those), declared overlaps, and reported outcomes in the last 24 hours by default. `recent_since` selects another starting time. A compacted history is explicitly incomplete.
 2. Read the personal/agent catch-up delivery, session briefing and coordination inbox. Retrieve every page before relying on coverage. Reconnect with the same subscriber/session; acknowledge only deliberately received data.
 3. Inspect the proposed source and scope with preflight, then start with a stable work identity, explicit session, intended paths and the same checked merge watermark. HTTP/CLI and MCP starts return a pre-claim overview in `context`. The database serializes scope admission with the claim, so simultaneous different work identities cannot both claim the same declared scope unnoticed. Empty scope is unknown coverage; declare scope before editing.
 4. A conflicting lead start creates an idempotent durable coordination request, addressed to the affected current leads, without creating a competing assignment or announcing paths. A conflicting scope checkpoint also records a request while leaving the work unchanged. Exact files and `directory/**` scopes use component-aware overlap matching; related meaning in task titles is not automatically inferred.

@@ -1686,6 +1686,7 @@ fn value_history_membership_is_bounded_and_work_target_explicit(db: &Db) {
                 pull_number: 42,
                 paths: vec![],
                 paths_complete: true,
+                same_repository_head: true,
             },
             now,
         )
@@ -2231,6 +2232,7 @@ fn value_history_merge_linkage_retains_aged_candidates_and_rejects_incomplete_un
                     pull_number,
                     paths: vec![],
                     paths_complete: true,
+                    same_repository_head: true,
                 },
                 now,
             )

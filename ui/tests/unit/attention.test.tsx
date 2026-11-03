@@ -27,18 +27,17 @@ const page = (ov: WorkOverview) => <DashboardPage section="home" question="q" to
 const needsBox = () => within(document.getElementById('box-needs')!)
 
 describe('Needs you', () => {
-  it('ages a quiet check-in like the track does, never as a bare clock time', () => {
-    render(page(overview([item('a', 'dev')])))
-    const body = needsBox().getByText(/Last check-in/).textContent
-    expect(body).toContain('Last check-in 2 days ago.')
-    expect(body).not.toMatch(/\d:\d\d/)
+  it('ages a blocker report like the track does, never as a bare clock time', () => {
+    render(page(overview([item('a', 'dev', { state: 'blocked', blocker: { at: twoDays, summary: 'Needs a key' } as WorkItem['blocker'] })])))
+    const gist = needsBox().getByText(/reported/).textContent
+    expect(gist).toContain('reported 2 days ago')
+    expect(gist).not.toMatch(/\d:\d\d/)
   })
 
-  it('tells the viewer to resume their own quiet task, and to ask the lead about anyone else’s', () => {
-    render(page(overview([item('a', 'maria'), item('b', 'dev', { last_checkin_at: twoDays - 60 })])))
-    expect(needsBox().getByText('Resume it or hand it over')).toBeTruthy()
-    expect(needsBox().getByText('Ask dev before picking it up')).toBeTruthy()
-    expect(needsBox().queryByText(/Ask maria/)).toBeNull()
+  it('a stale, paused or handover task is no row, whoever owns it', () => {
+    render(page(overview([item('a', 'maria'), item('b', 'dev', { state: 'paused' }), item('c', 'dev', { state: 'handover', claim_status: 'active' })])))
+    expect(needsBox().queryByRole('listitem')).toBeNull()
+    expect(needsBox().getByText('All clear')).toBeTruthy()
   })
 
   it('names the requester of a contested file from its handoff, and offers the words to paste', () => {
@@ -113,7 +112,7 @@ describe('Needs you', () => {
   })
 
   it('offers to show all of the needs the box counts, overlaps included', () => {
-    const quiet = '012345'.split('').map((id) => item(id, 'dev'))
+    const quiet = '012345'.split('').map((id) => item(id, 'dev', { state: 'blocked' }))
     const [a, b, c] = [item('a', 'maria', { claim_status: 'active' }), item('b', 'dev', { claim_status: 'active' }), item('c', 'sam', { claim_status: 'active' })]
     render(page({ ...overview([...quiet, a, b, c]), overlaps: [pair(a, b, 'src/billing.rs'), pair(a, c, 'src/tax.rs')] } as unknown as WorkOverview))
     expect(needsBox().getByText('8')).toBeTruthy()
@@ -132,21 +131,34 @@ describe('Headline', () => {
       item('f', 'sam', { state: 'handover', claim_status: 'active' }),
     ])
     render(page(ov))
-    expect(document.querySelector('.answer-text')!.textContent).toBe('5 unfinished tasks: 2 moving, 3 stuck. 2 things need you.')
+    expect(document.querySelector('.answer-text')!.textContent).toBe('5 unfinished tasks: 2 moving, 3 stuck. 1 thing needs you.')
     expect(document.querySelector('.answer-fact')!.textContent).toBe('Stuck: 1 blocked, 1 paused, 1 waiting for another agent. 0 agents are connected.')
     expect(dashboardStatus(ov, d, null, null).home?.text).toBe('Waiting on you')
   })
 })
 
+describe('Live overlaps', () => {
+  it('only an overlap between live tasks reaches the Needs you count and the Now status', () => {
+    const [a, b] = [item('a', 'maria', { claim_status: 'active' }), item('b', 'dev', { claim_status: 'active' })]
+    const staleB = item('b', 'dev')
+    const live = { ...overview([a, b]), overlaps: [pair(a, b, 'src/a.rs')] } as unknown as WorkOverview
+    const quiet = { ...overview([a, staleB]), overlaps: [pair(a, staleB, 'src/a.rs')] } as unknown as WorkOverview
+    expect(dashboardStatus(live, d, null, null).home?.text).toBe('Waiting on you')
+    expect(dashboardStatus(live, d, null, null).now?.text).toBe('0 contested files · 1 overlap')
+    expect(dashboardStatus(quiet, d, null, null).home).toEqual({ text: 'Nothing needs you', tone: 'ok' })
+    expect(dashboardStatus(quiet, d, null, null).now).toEqual({ text: 'No contested files', tone: 'muted' })
+  })
+})
+
 describe('Hide in this browser', () => {
   it('offers Hide only on rows untouched for a day, and hides without asking the hub', () => {
-    const fresh = item('f', 'dev', { updated_at: now - 60, last_checkin_at: now - 60 })
-    render(page(overview([item('a', 'dev'), fresh])))
+    const fresh = item('f', 'dev', { state: 'blocked', updated_at: now - 60, last_checkin_at: now - 60 })
+    render(page(overview([item('a', 'dev', { state: 'blocked' }), fresh])))
     expect(needsBox().getAllByRole('button', { name: /^Hide / })).toHaveLength(1)
     fireEvent.click(needsBox().getByRole('button', { name: /^Hide / }))
     expect(needsBox().queryByText('Task a')).toBeNull()
     expect(needsBox().getByText('Task f')).toBeTruthy()
-    expect(localStorage.getItem('agentscm.hidden.v1')).toContain(`quiet:${'wrk_' + 'a'.repeat(32)}@${twoDays}`)
+    expect(localStorage.getItem('agentscm.hidden.v1')).toContain(`blocked:${'wrk_' + 'a'.repeat(32)}@${twoDays}`)
     fireEvent.click(needsBox().getByRole('button', { name: 'Show 1 hidden' }))
     expect(needsBox().getByText('Task a')).toBeTruthy()
     fireEvent.click(needsBox().getByRole('button', { name: 'Show this item again' }))
@@ -155,7 +167,7 @@ describe('Hide in this browser', () => {
   })
 
   it('a hidden row comes back by itself once its task changes, and no count includes it while hidden', () => {
-    const quiet = item('a', 'dev')
+    const quiet = item('a', 'dev', { state: 'blocked' })
     const ov = overview([quiet])
     const [need] = needsYou(ov, d)
     localStorage.setItem('agentscm.hidden.v1', JSON.stringify([needHideKey(need!)]))

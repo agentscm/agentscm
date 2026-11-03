@@ -10,14 +10,15 @@ use serde::Serialize;
 use super::intent::{Intent, key_of, overlaps};
 use super::session::same_agent;
 use super::store::SessionView;
-use super::work::{ClaimStatus, WorkOverview, WorkState};
+use super::work::{ClaimStatus, WorkItem, WorkOverlapPair, WorkOverview, WorkState};
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Unfinished {
     pub total: usize,
     /// Active, with a lead that is checking in.
     pub moving: usize,
-    /// Blocked, or a lead gone quiet while still holding it.
+    /// Blocked, or a lead gone quiet while still holding it. Stuck is a state, not a call on a person:
+    /// only blocked work counts in `needs_you`.
     pub stuck: usize,
 }
 
@@ -27,7 +28,8 @@ pub struct RepositorySummary {
     pub repository_id: i64,
     pub provider: String,
     pub unfinished: Unfinished,
-    /// Blockers, quiet leads, handovers, declared-scope overlaps and files two agents hold.
+    /// Blockers, declared-scope overlaps between live tasks and files two agents hold. Paused,
+    /// handed-over and stale-claim work stays in the unfinished count, never here.
     /// Pull-request overlaps and files with only a recent refusal are not counted.
     pub needs_you: usize,
     pub agents: usize,
@@ -59,7 +61,7 @@ pub(super) fn summarize(
     let (unfinished, decisions) =
         work_counts(current.iter().map(|item| (&item.state, &item.claim_status)));
     let (contested_count, contested_markers) = contested_files_and_markers(&facts.intents);
-    let needs_you = decisions + facts.overview.overlaps.len() + contested_count;
+    let needs_you = decisions + live_overlaps(&facts.overview.overlaps) + contested_count;
     let last_activity_at = current
         .iter()
         .map(|item| item.updated_at)
@@ -82,8 +84,8 @@ pub(super) fn summarize(
     }
 }
 
-/// Unfinished work and how many items need a person, by `needsYou`'s order: a blocker first, then
-/// a quiet lead, then a handover, each item counted once.
+/// Unfinished work and how many items need a person: only blocked work does. A quiet claim, a pause
+/// or a handover is counted as unfinished (and a quiet claim as stuck) but waits for no one.
 fn work_counts<'a>(
     items: impl IntoIterator<Item = (&'a WorkState, &'a ClaimStatus)>,
 ) -> (Unfinished, usize) {
@@ -92,16 +94,29 @@ fn work_counts<'a>(
     for (state, claim) in items {
         counts.total += 1;
         let quiet = *claim != ClaimStatus::Active;
+        if *state == WorkState::Blocked {
+            decisions += 1;
+        }
         if *state == WorkState::Blocked || quiet {
             counts.stuck += 1;
-            decisions += 1;
-        } else if *state == WorkState::Handover {
-            decisions += 1;
         } else if *state == WorkState::Active {
             counts.moving += 1;
         }
     }
     (counts, decisions)
+}
+
+/// An overlap where both tasks hold an active claim and are active or blocked.
+pub(super) fn is_live_overlap(pair: &WorkOverlapPair) -> bool {
+    let live = |item: &WorkItem| {
+        item.claim_status == ClaimStatus::Active
+            && matches!(item.state, WorkState::Active | WorkState::Blocked)
+    };
+    live(&pair.left) && live(&pair.right)
+}
+
+fn live_overlaps(pairs: &[WorkOverlapPair]) -> usize {
+    pairs.iter().filter(|pair| is_live_overlap(pair)).count()
 }
 
 /// Files held by two different agents now, each counted once by its more specific key.
@@ -143,6 +158,7 @@ fn agent_count(sessions: &[SessionView], intents: &[Intent]) -> usize {
 mod tests {
     use super::super::store::{ForgeIdentity, User};
     use super::*;
+    use crate::hub::work::WorkSource;
 
     fn intent(id: &str, token: &str, via: &[&str], paths: &[&str]) -> Intent {
         Intent {
@@ -209,7 +225,66 @@ mod tests {
                 stuck: 3
             }
         );
-        assert_eq!(decisions, 4);
+        assert_eq!(decisions, 2);
+    }
+
+    fn work_item(state: WorkState, claim_status: ClaimStatus) -> WorkItem {
+        WorkItem {
+            id: "wrk_0123456789abcdef0123456789abcdef".into(),
+            repository: "example-org/api".into(),
+            owner: "usr_1".into(),
+            owner_login: "example-user".into(),
+            source: WorkSource::Native {
+                request_key: "fixture".into(),
+            },
+            title: "Synthetic work".into(),
+            state,
+            claim_status,
+            last_checkin_at: 1_000,
+            reported_at: None,
+            generation: 1,
+            lead_token: "tok".into(),
+            lead_agent: "agent".into(),
+            lead_session: "session".into(),
+            participants: vec![],
+            scope: vec![],
+            branch: None,
+            worktree: None,
+            next_action: None,
+            current: None,
+            blocker: None,
+            depends_on: vec![],
+            related_work: vec![],
+            created_at: 1_000,
+            updated_at: 1_000,
+            created_seq: 1,
+            updated_seq: 1,
+        }
+    }
+
+    fn pair(left: (WorkState, ClaimStatus), right: (WorkState, ClaimStatus)) -> WorkOverlapPair {
+        WorkOverlapPair {
+            left: work_item(left.0, left.1),
+            right: work_item(right.0, right.1),
+            reasons: vec![],
+            reasons_complete: true,
+        }
+    }
+
+    #[test]
+    fn only_overlaps_between_live_tasks_count() {
+        use ClaimStatus::{Active, Stale, Unknown};
+        use WorkState::{Active as Working, Blocked, Handover, Paused};
+        let pairs = [
+            pair((Working, Active), (Blocked, Active)),
+            pair((Working, Active), (Working, Stale)),
+            pair((Working, Unknown), (Working, Active)),
+            pair((Paused, Active), (Working, Active)),
+            pair((Working, Active), (Handover, Active)),
+        ];
+        assert_eq!(live_overlaps(&pairs), 1);
+        assert!(is_live_overlap(&pairs[0]));
+        assert!(pairs[1..].iter().all(|p| !is_live_overlap(p)));
     }
 
     #[test]

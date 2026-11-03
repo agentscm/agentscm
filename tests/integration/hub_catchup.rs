@@ -16,7 +16,8 @@ use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
 };
 use agentscm::hub::work::{
-    CheckpointKind, WorkCheckpoint, WorkRepositoryScope, WorkRole, WorkStart,
+    BriefingQuery, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverviewQuery,
+    WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
 use agentscm::hub::work_preflight::{
     WorkPreflightReason, WorkPreflightRequest, WorkPreflightStatus,
@@ -284,6 +285,7 @@ fn scope(repository_id: i64) -> CatchupRepositoryScope {
 fn merge(number: i64, observed_at: i64) -> (NewCatchupMerge, i64) {
     (
         NewCatchupMerge {
+            same_repository_head: true,
             source: CatchupMergeSource::ForgePull,
             source_id: format!("pull:{number}"),
             occurred_at: Some(observed_at - 100),
@@ -2799,3 +2801,701 @@ fn postgres_repository_namespace_repair() {
         repository_namespace_repair(&Fixture::postgres().unwrap(), true);
     }
 }
+
+// Work whose branch has a merged pull request is not listed as current work. These cases pin the
+// read-time rule; the Work rows themselves never change.
+
+const SETTLED_RID: i64 = 237;
+const AUTO_PAUSE: &str = "Session ended without a reported final work outcome.";
+
+fn begin(
+    fixture: &Fixture,
+    token: &str,
+    key: &str,
+    branch: Option<&str>,
+    path: &str,
+    at: i64,
+) -> WorkItem {
+    fixture
+        .store
+        .work_start(
+            token,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: Some(key.into()),
+                title: format!("Work {key}"),
+                session: format!("session-{key}"),
+                role: WorkRole::Lead,
+                scope: vec![path.into()],
+                branch: branch.map(str::to_owned),
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            at,
+        )
+        .unwrap()
+        .item
+}
+
+fn checkin(
+    fixture: &Fixture,
+    token: &str,
+    item: &WorkItem,
+    kind: CheckpointKind,
+    summary: &str,
+    at: i64,
+) -> WorkItem {
+    fixture
+        .store
+        .work_checkpoint(
+            token,
+            &WorkCheckpoint {
+                work_id: item.id.clone(),
+                operation_id: format!("op-{}-{at}", item.id),
+                generation: item.generation,
+                session: format!("session-{}", item.title.trim_start_matches("Work ")),
+                expected_updated_seq: Some(item.updated_seq),
+                kind,
+                summary: summary.into(),
+                next_action: None,
+                scope: None,
+                branch: None,
+                worktree: None,
+                resolve_blocker: false,
+                source_refs: Vec::new(),
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+            },
+            at,
+        )
+        .unwrap()
+        .item
+}
+
+fn merged(fixture: &Fixture, number: i64, branch: &str, base: &str, same_repo: bool, at: i64) {
+    merged_observed(fixture, number, branch, base, same_repo, Some(at), at);
+}
+
+/// A merge whose provider time may be unknown, as a tracked publication's is.
+fn merged_observed(
+    fixture: &Fixture,
+    number: i64,
+    branch: &str,
+    base: &str,
+    same_repo: bool,
+    occurred_at: Option<i64>,
+    observed_at: i64,
+) {
+    let merge = NewCatchupMerge {
+        branch: branch.into(),
+        base: base.into(),
+        same_repository_head: same_repo,
+        occurred_at,
+        ..merge(number, observed_at).0
+    };
+    fixture
+        .store
+        .record_catchup_merge(&scope(SETTLED_RID), &merge, observed_at)
+        .unwrap();
+}
+
+fn listed(fixture: &Fixture, token: &str, limit: usize, now: i64) -> (Vec<String>, u64, bool) {
+    let overview = fixture
+        .store
+        .work_overview(
+            token,
+            &WorkOverviewQuery {
+                recent_since: None,
+                limit,
+            },
+            now,
+        )
+        .unwrap();
+    (
+        overview.current.into_iter().map(|item| item.id).collect(),
+        overview.settled_count,
+        overview.current_complete,
+    )
+}
+
+fn briefing_ids(fixture: &Fixture, token: &str, now: i64) -> Vec<String> {
+    let mut query = BriefingQuery {
+        limit: 1,
+        ..BriefingQuery::default()
+    };
+    let mut ids = Vec::new();
+    loop {
+        let page = fixture.store.work_briefing(token, &query, now).unwrap();
+        ids.extend(page.items.iter().map(|item| item.id.clone()));
+        if page.complete {
+            return ids;
+        }
+        query = BriefingQuery {
+            after: Some(page.next_after),
+            work_after: page.next_work_after,
+            work_done: page.next_work_done,
+            through: Some(page.through),
+            limit: 1,
+            ..BriefingQuery::default()
+        };
+    }
+}
+
+fn settled_work(fixture: &Fixture) -> (String, String, i64) {
+    let owner = fixture.owner(SETTLED_RID);
+    let token = fixture.token(&owner, "settled-lead", SETTLED_RID, false);
+    let reader = fixture.token(&owner, "settled-reader", SETTLED_RID, true);
+    (token, reader, unix_now() - 10_000)
+}
+
+fn settles_and_returns_on_a_later_check_in(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let now = t0 + 5_000;
+    let item = begin(fixture, &token, "a", Some("feat/a"), "src/a.rs", t0);
+    assert_eq!(
+        listed(fixture, &reader, 100, now),
+        (vec![item.id.clone()], 0, true)
+    );
+
+    merged(fixture, 1, "feat/a", "main", true, t0 + 100);
+    assert_eq!(listed(fixture, &reader, 100, now), (Vec::new(), 1, true));
+    assert!(briefing_ids(fixture, &reader, now).is_empty());
+    // The record is untouched and still readable.
+    let kept = fixture
+        .store
+        .work_get(&reader, &item.id, now)
+        .unwrap()
+        .unwrap();
+    assert_ne!(kept.state, WorkState::Finished);
+
+    let again = checkin(
+        fixture,
+        &token,
+        &item,
+        CheckpointKind::Progress,
+        "more work",
+        t0 + 200,
+    );
+    assert_eq!(
+        listed(fixture, &reader, 100, now),
+        (vec![item.id.clone()], 0, true)
+    );
+    assert_eq!(briefing_ids(fixture, &reader, now), vec![item.id.clone()]);
+    assert_eq!(again.state, WorkState::Active);
+}
+
+fn nothing_settles_without_merge_data_or_a_branch(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let branchless = begin(fixture, &token, "nb", None, "src/nb.rs", t0);
+    let unmerged = begin(
+        fixture,
+        &token,
+        "um",
+        Some("feat/unmerged"),
+        "src/um.rs",
+        t0,
+    );
+    let mut expected = vec![branchless.id, unmerged.id];
+    expected.sort();
+    assert_eq!(listed(fixture, &reader, 100, t0 + 500), (expected, 0, true));
+}
+
+fn blocked_work_never_settles(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let item = begin(fixture, &token, "blk", Some("feat/blk"), "src/blk.rs", t0);
+    let blocked = checkin(
+        fixture,
+        &token,
+        &item,
+        CheckpointKind::Blocker,
+        "waiting",
+        t0 + 10,
+    );
+    assert!(blocked.blocker.is_some());
+    merged(fixture, 2, "feat/blk", "main", true, t0 + 100);
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (vec![item.id.clone()], 0, true)
+    );
+    assert_eq!(briefing_ids(fixture, &reader, t0 + 500), vec![item.id]);
+}
+
+fn forks_and_bases_never_settle(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let forked = begin(
+        fixture,
+        &token,
+        "fork",
+        Some("feat/fork"),
+        "src/fork.rs",
+        t0,
+    );
+    let default = begin(fixture, &token, "main", Some("main"), "src/main.rs", t0);
+    let release = begin(fixture, &token, "rel", Some("release"), "src/rel.rs", t0);
+    // A fork's branch name says nothing about same-named Work here.
+    merged(fixture, 3, "feat/fork", "main", false, t0 + 100);
+    // A branch that is a merge base never settles, whichever order the merges arrive in.
+    merged(fixture, 4, "main", "develop", true, t0 + 100);
+    merged(fixture, 5, "release", "main", true, t0 + 100);
+    merged(fixture, 6, "feat/into-release", "release", true, t0 + 101);
+    let mut expected = vec![forked.id, default.id, release.id];
+    expected.sort();
+    assert_eq!(listed(fixture, &reader, 100, t0 + 500), (expected, 0, true));
+}
+
+fn a_merge_at_the_check_in_instant_settles(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let item = begin(fixture, &token, "tie", Some("feat/tie"), "src/tie.rs", t0);
+    let item = checkin(
+        fixture,
+        &token,
+        &item,
+        CheckpointKind::Progress,
+        "p",
+        t0 + 50,
+    );
+    assert_eq!(item.last_checkin_at, t0 + 50);
+    merged(fixture, 7, "feat/tie", "main", true, t0 + 49);
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500).0,
+        vec![item.id.clone()]
+    );
+    merged(fixture, 8, "feat/tie", "main", true, t0 + 50);
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (Vec::new(), 1, true)
+    );
+}
+
+fn an_automatic_pause_after_the_merge_settles_until_resumed(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let auto = begin(
+        fixture,
+        &token,
+        "auto",
+        Some("feat/auto"),
+        "src/auto.rs",
+        t0,
+    );
+    let manual = begin(fixture, &token, "man", Some("feat/man"), "src/man.rs", t0);
+    merged(fixture, 9, "feat/auto", "main", true, t0 + 100);
+    merged(fixture, 10, "feat/man", "main", true, t0 + 100);
+    // The session outlived the merge, so ending it writes a check-in after the merge.
+    let auto = checkin(
+        fixture,
+        &token,
+        &auto,
+        CheckpointKind::Pause,
+        AUTO_PAUSE,
+        t0 + 200,
+    );
+    let manual = checkin(
+        fixture,
+        &token,
+        &manual,
+        CheckpointKind::Pause,
+        "stepping away",
+        t0 + 200,
+    );
+    assert_eq!(auto.state, WorkState::Paused);
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (vec![manual.id], 1, true)
+    );
+
+    // A resume through takeover keeps the pause summary but changes the state.
+    let resumed = fixture
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                work_id: Some(auto.id.clone()),
+                source: None,
+                request_key: None,
+                title: auto.title.clone(),
+                session: "resumed-session".into(),
+                role: WorkRole::Lead,
+                scope: auto.scope.clone(),
+                branch: auto.branch.clone(),
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: Some(auto.generation),
+                preflight: None,
+            },
+            t0 + 300,
+        )
+        .unwrap();
+    assert!(resumed.took_over);
+    assert_ne!(resumed.item.state, WorkState::Paused);
+    assert!(listed(fixture, &reader, 100, t0 + 500).0.contains(&auto.id));
+}
+
+fn the_limit_counts_only_visible_items_and_paging_skips_hidden_ones(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let mut visible = Vec::new();
+    for n in 0..5 {
+        let branch = format!("feat/page-{n}");
+        let item = begin(
+            fixture,
+            &token,
+            &format!("pg{n}"),
+            Some(&branch),
+            &format!("src/pg{n}.rs"),
+            t0,
+        );
+        if n < 3 {
+            merged(fixture, 20 + n, &branch, "main", true, t0 + 100);
+        } else {
+            visible.push(item.id);
+        }
+    }
+    visible.sort();
+    assert_eq!(
+        listed(fixture, &reader, 2, t0 + 500),
+        (visible.clone(), 3, true)
+    );
+    let (first, settled, complete) = listed(fixture, &reader, 1, t0 + 500);
+    assert_eq!((first.len(), settled, complete), (1, 3, false));
+    assert_eq!(briefing_ids(fixture, &reader, t0 + 500), visible);
+}
+
+fn a_hidden_item_still_conflicts_with_a_new_start(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let item = begin(fixture, &token, "adm", Some("feat/adm"), "src/adm.rs", t0);
+    merged(fixture, 30, "feat/adm", "main", true, t0 + 100);
+    assert_eq!(listed(fixture, &reader, 100, t0 + 500).1, 1);
+    let other_owner = fixture.owner(SETTLED_RID + 1);
+    let other = fixture.token(&other_owner, "settled-other", SETTLED_RID, false);
+    let result = fixture
+        .store
+        .work_start(
+            &other,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: Some("adm-other".into()),
+                title: "Overlapping start".into(),
+                session: "other-session".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/adm.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            t0 + 500,
+        )
+        .unwrap();
+    let conflict = result
+        .conflict
+        .expect("admission still sees the hidden item");
+    assert!(
+        conflict
+            .overlaps
+            .iter()
+            .any(|overlap| overlap.item.id == item.id)
+    );
+}
+
+fn settled_state_survives_compaction_of_merge_observations(fixture: &Fixture) {
+    let owner = fixture.owner(SETTLED_RID);
+    let token = fixture.token(&owner, "settled-lead", SETTLED_RID, false);
+    let reader = fixture.token(&owner, "settled-reader", SETTLED_RID, true);
+    let now = unix_now();
+    let t0 = now - 3 * 86_400;
+    let item = begin(fixture, &token, "cmp", Some("feat/cmp"), "src/cmp.rs", t0);
+    merged(fixture, 40, "feat/cmp", "main", true, t0 + 100);
+    assert_eq!(listed(fixture, &reader, 100, now), (Vec::new(), 1, true));
+
+    let work_scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: Some(SETTLED_RID),
+    };
+    let compacted = fixture
+        .store
+        .work_compact(&work_scope, now - 86_400, true, now)
+        .unwrap();
+    assert_eq!(compacted.deleted_merge_observations, 1);
+    assert!(fixture.merge_ids(SETTLED_RID).is_empty());
+
+    // The observation is gone, the derived branch record is not.
+    assert_eq!(listed(fixture, &reader, 100, now), (Vec::new(), 1, true));
+    assert!(
+        fixture
+            .store
+            .work_get(&reader, &item.id, now)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Rows of the derived table as (branch, is_base, merged_at), after dropping it and its
+/// migration record and reopening the database, which replays the migration over the
+/// merge observations that already exist.
+fn replayed_branch_merges(fixture: &Fixture) -> Vec<(String, i64, i64)> {
+    const READ: &str = "SELECT branch, CAST(is_base AS BIGINT), merged_at
+        FROM hub_catchup_branch_merges ORDER BY branch";
+    const DROP: [&str; 2] = [
+        "DROP TABLE hub_catchup_branch_merges",
+        "DELETE FROM hub_named_migrations WHERE name='work_branch_merges'",
+    ];
+    if let Some(database) = &fixture.database {
+        let connection = rusqlite::Connection::open(database).unwrap();
+        DROP.iter().for_each(|sql| {
+            connection.execute(sql, []).unwrap();
+        });
+        drop(connection);
+        store::open(&format!("sqlite://{}", database.display())).unwrap();
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let mut statement = connection.prepare(READ).unwrap();
+        return statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    }
+    let url = &fixture._pg.as_ref().unwrap().url;
+    let mut client = Client::connect(url, NoTls).unwrap();
+    DROP.iter().for_each(|sql| {
+        client.execute(*sql, &[]).unwrap();
+    });
+    store::open(url).unwrap();
+    client
+        .query(READ, &[])
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+
+fn the_migration_backfills_branch_merges_from_existing_observations(fixture: &Fixture) {
+    let t0 = unix_now() - 10_000;
+    merged(fixture, 50, "feat/x", "main", true, t0 + 100);
+    merged(fixture, 51, "feat/y", "feat/x", true, t0 + 200);
+    merged(fixture, 52, "feat/x", "main", true, t0 + 300);
+    merged(fixture, 53, "feat/z", "main", false, t0 + 150);
+    // A tracked publication has no merge time: its base is recorded, its branch is not.
+    merged_observed(fixture, 54, "feat/n", "release", true, None, t0 + 400);
+    assert_eq!(
+        replayed_branch_merges(fixture),
+        vec![
+            // A base of any merge is marked, with the latest merge that named it.
+            ("feat/x".to_owned(), 1, t0 + 300),
+            ("feat/y".to_owned(), 0, t0 + 200),
+            // Legacy rows cannot tell a fork, so the head branch settles.
+            ("feat/z".to_owned(), 0, t0 + 150),
+            ("main".to_owned(), 1, t0 + 300),
+            ("release".to_owned(), 1, t0 + 400),
+        ]
+    );
+}
+
+fn a_merge_without_a_provider_time_does_not_settle(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let item = begin(fixture, &token, "nt", Some("feat/nt"), "src/nt.rs", t0);
+    // Observed long after the check-in, but with no merge time it cannot say the Work ended.
+    merged_observed(fixture, 60, "feat/nt", "main", true, None, t0 + 400);
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (vec![item.id.clone()], 0, true)
+    );
+    assert_eq!(
+        briefing_ids(fixture, &reader, t0 + 500),
+        vec![item.id.clone()]
+    );
+    // A later observation that carries the time settles it.
+    merged(fixture, 61, "feat/nt", "main", true, t0 + 100);
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (Vec::new(), 1, true)
+    );
+}
+
+fn a_branch_that_is_also_a_base_stays_listed_in_either_order(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let merged_first = begin(fixture, &token, "mf", Some("feat/mf"), "src/mf.rs", t0);
+    let base_first = begin(fixture, &token, "bf", Some("feat/bf"), "src/bf.rs", t0);
+    merged(fixture, 62, "feat/mf", "main", true, t0 + 100);
+    merged(fixture, 63, "feat/mf-child", "feat/mf", true, t0 + 110);
+    merged(fixture, 64, "feat/bf-child", "feat/bf", true, t0 + 100);
+    merged(fixture, 65, "feat/bf", "main", true, t0 + 110);
+    let mut expected = vec![merged_first.id, base_first.id];
+    expected.sort();
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (expected.clone(), 0, true)
+    );
+    assert_eq!(briefing_ids(fixture, &reader, t0 + 500), expected);
+}
+
+fn settling_works_in_an_unbound_repository(fixture: &Fixture) {
+    let owner = fixture.owner(SETTLED_RID);
+    let token = mint_agent_token(&*fixture.store, &owner, "unbound", REPOSITORY, 3600)
+        .unwrap()
+        .0;
+    let t0 = unix_now() - 10_000;
+    let item = begin(fixture, &token, "ub", Some("feat/ub"), "src/ub.rs", t0);
+    let unbound = CatchupRepositoryScope {
+        repository_id: None,
+        ..scope(SETTLED_RID)
+    };
+    let record = NewCatchupMerge {
+        branch: "feat/ub".into(),
+        base: "main".into(),
+        occurred_at: Some(t0 + 100),
+        ..merge(66, t0 + 100).0
+    };
+    assert_eq!(
+        listed(fixture, &token, 100, t0 + 500),
+        (vec![item.id.clone()], 0, true)
+    );
+    fixture
+        .store
+        .record_catchup_merge(&unbound, &record, t0 + 100)
+        .unwrap();
+    assert_eq!(
+        listed(fixture, &token, 100, t0 + 500),
+        (Vec::new(), 1, true)
+    );
+}
+
+fn a_check_in_after_the_merge_survives_the_automatic_pause(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let late = begin(
+        fixture,
+        &token,
+        "late",
+        Some("feat/late"),
+        "src/late.rs",
+        t0,
+    );
+    let early = begin(
+        fixture,
+        &token,
+        "early",
+        Some("feat/early"),
+        "src/early.rs",
+        t0,
+    );
+    merged(fixture, 67, "feat/late", "main", true, t0 + 100);
+    merged(fixture, 68, "feat/early", "main", true, t0 + 100);
+    // late: real check-in after the merge, then the session ends.
+    let late = checkin(
+        fixture,
+        &token,
+        &late,
+        CheckpointKind::Progress,
+        "more",
+        t0 + 150,
+    );
+    let late = checkin(
+        fixture,
+        &token,
+        &late,
+        CheckpointKind::Pause,
+        AUTO_PAUSE,
+        t0 + 300,
+    );
+    assert_eq!(late.reported_at, Some(t0 + 150));
+    // early: the last real check-in preceded the merge.
+    let early = checkin(
+        fixture,
+        &token,
+        &early,
+        CheckpointKind::Progress,
+        "p",
+        t0 + 50,
+    );
+    let early = checkin(
+        fixture,
+        &token,
+        &early,
+        CheckpointKind::Pause,
+        AUTO_PAUSE,
+        t0 + 300,
+    );
+    assert_eq!(early.reported_at, Some(t0 + 50));
+    assert_eq!(
+        listed(fixture, &reader, 100, t0 + 500),
+        (vec![late.id.clone()], 1, true)
+    );
+    assert_eq!(
+        briefing_ids(fixture, &reader, t0 + 500),
+        vec![late.id.clone()]
+    );
+
+    // A repeated automatic pause keeps the value; a real checkpoint clears it.
+    let again = checkin(
+        fixture,
+        &token,
+        &late,
+        CheckpointKind::Pause,
+        AUTO_PAUSE,
+        t0 + 400,
+    );
+    assert_eq!(again.reported_at, Some(t0 + 150));
+    let real = checkin(
+        fixture,
+        &token,
+        &again,
+        CheckpointKind::Progress,
+        "back",
+        t0 + 450,
+    );
+    assert_eq!(real.reported_at, None);
+}
+
+macro_rules! settled_cases {
+    ($($case:ident),* $(,)?) => {
+        mod settled {
+            use super::*;
+            $(
+                #[test]
+                fn $case() {
+                    super::$case(&Fixture::sqlite());
+                }
+            )*
+            mod postgres {
+                use super::*;
+                $(
+                    #[test]
+                    fn $case() {
+                        let Some(fixture) = Fixture::postgres() else {
+                            return;
+                        };
+                        super::super::$case(&fixture);
+                    }
+                )*
+            }
+        }
+    };
+}
+
+settled_cases!(
+    settles_and_returns_on_a_later_check_in,
+    nothing_settles_without_merge_data_or_a_branch,
+    blocked_work_never_settles,
+    forks_and_bases_never_settle,
+    a_merge_at_the_check_in_instant_settles,
+    an_automatic_pause_after_the_merge_settles_until_resumed,
+    the_limit_counts_only_visible_items_and_paging_skips_hidden_ones,
+    a_hidden_item_still_conflicts_with_a_new_start,
+    settled_state_survives_compaction_of_merge_observations,
+    the_migration_backfills_branch_merges_from_existing_observations,
+    a_merge_without_a_provider_time_does_not_settle,
+    a_branch_that_is_also_a_base_stays_listed_in_either_order,
+    settling_works_in_an_unbound_repository,
+    a_check_in_after_the_merge_survives_the_automatic_pause,
+);

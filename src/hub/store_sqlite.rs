@@ -95,15 +95,15 @@ use super::store::{
     validate_display_name, validate_login,
 };
 use super::work::{
-    Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt, ClaimStatus,
-    MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES,
-    WorkCheckpoint, WorkCheckpointResult, WorkCompaction, WorkConflictKind, WorkEvent, WorkItem,
-    WorkOutcome, WorkOutcomeKind, WorkOverview, WorkOverviewQuery, WorkParticipant, WorkReader,
-    WorkRepositoryScope, WorkRole, WorkScopeCheck, WorkScopeOverlap, WorkSearchItem,
-    WorkSearchPage, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState, WorkWho,
-    check_work_delivery_page, check_work_payload_capacity, claim_status, fit_json_budget,
-    normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
-    work_payload_row_bytes,
+    AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
+    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
+    WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
+    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
+    WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
+    WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
+    WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
+    claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
+    work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
@@ -486,6 +486,32 @@ fn json_value<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
 fn enum_name<T: serde::Serialize>(value: &T) -> Result<String> {
     let value = json_string(value)?;
     Ok(value.trim_matches('"').to_owned())
+}
+
+/// SQL for "this Work's branch has a merged pull request that postdates its last check-in".
+/// `item` aliases `hub_work_items`; `state`, `branch` and `snapshot` are the expressions to judge
+/// (the live row for overviews, the version for a briefing). `p` are the numbered placeholders for
+/// provider, host, catch-up repository namespace, repository key and the auto-pause summary.
+/// Blocked or blocker-bearing Work and merge bases never settle.
+fn settled_work_sql(
+    item: &str,
+    state: &str,
+    branch: &str,
+    snapshot: &str,
+    p: [usize; 5],
+) -> String {
+    let [provider, host, repository, key, auto_pause] = p;
+    format!(
+        "({branch} IS NOT NULL AND {state} NOT IN ('finished','blocked')
+          AND json_extract({snapshot},'$.blocker') IS NULL
+          AND EXISTS (SELECT 1 FROM hub_catchup_branch_merges m
+            WHERE m.provider=?{provider} AND m.host=?{host} AND m.repository=?{repository}
+              AND m.repository_key=?{key} AND m.branch={branch} AND m.is_base=0
+              AND m.merged_at >= CASE WHEN {state}='paused'
+                    AND json_extract({snapshot},'$.current.summary')=?{auto_pause}
+                  THEN COALESCE(json_extract({snapshot},'$.reported_at'), {item}.created_at)
+                  ELSE json_extract({snapshot},'$.last_checkin_at') END))"
+    )
 }
 
 fn catchup_repository_key(repository_id: Option<i64>) -> i64 {
@@ -1067,6 +1093,40 @@ fn sqlite_record_catchup_merge(
             observed_at
         ],
     )?;
+    let merged_at = merge.occurred_at.unwrap_or(observed_at);
+    let base_upsert = "INSERT INTO hub_catchup_branch_merges
+            (provider,host,repository,repository_key,branch,merged_at,is_base)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT (provider,host,repository,repository_key,branch)
+         DO UPDATE SET merged_at=MAX(merged_at,excluded.merged_at),
+                       is_base=MAX(is_base,excluded.is_base)";
+    tx.execute(
+        base_upsert,
+        params![
+            scope.provider,
+            scope.host,
+            repository,
+            repository_key,
+            merge.base,
+            merged_at,
+            1
+        ],
+    )?;
+    // A branch row settles Work, so it needs a provider merge time; a tracked publication has none.
+    if let (true, Some(branch_merged_at)) = (merge.same_repository_head, merge.occurred_at) {
+        tx.execute(
+            base_upsert,
+            params![
+                scope.provider,
+                scope.host,
+                repository,
+                repository_key,
+                merge.branch,
+                branch_merged_at,
+                0
+            ],
+        )?;
+    }
     sqlite_catchup_merge(tx.query_row(
         &format!("SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges WHERE id=?1"),
         [&id],
@@ -3330,6 +3390,7 @@ fn start_in(
         item.state = WorkState::Active;
         item.claim_status = ClaimStatus::Active;
         item.last_checkin_at = now;
+        item.reported_at = None;
         item.updated_at = now;
         let event = work_event("work_takeover", &item)?;
         let seq = append(tx, &event)?;
@@ -3457,6 +3518,7 @@ fn start_in(
         state: WorkState::Active,
         claim_status: ClaimStatus::Active,
         last_checkin_at: now,
+        reported_at: None,
         generation: 1,
         lead_token: who.token.clone(),
         lead_agent: who.agent.clone(),
@@ -3589,15 +3651,22 @@ fn briefing_page(
     let mut more_work = false;
     let mut bytes = 0_usize;
     if !work_done {
-        let mut statement = tx.prepare(
+        let settled = settled_work_sql(
+            "w",
+            "v.state",
+            "json_extract(v.snapshot,'$.branch')",
+            "v.snapshot",
+            [1, 2, 8, 9, 10],
+        );
+        let mut statement = tx.prepare(&format!(
             "SELECT v.snapshot FROM hub_work_items w JOIN hub_work_versions v ON v.work = w.id
              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                AND w.repository_id IS ?4 AND w.id > ?5 AND v.event_seq = (
                    SELECT MAX(v2.event_seq) FROM hub_work_versions v2
                    WHERE v2.work = w.id AND v2.event_seq <= ?6)
-               AND v.state <> 'finished'
-             ORDER BY w.id LIMIT ?7",
-        )?;
+               AND v.state <> 'finished' AND NOT {settled}
+             ORDER BY w.id LIMIT ?7"
+        ))?;
         let snapshots = statement
             .query_map(
                 params![
@@ -3607,7 +3676,10 @@ fn briefing_page(
                     who.repository_id,
                     work_after.as_deref().unwrap_or(""),
                     through,
-                    (limit + 1) as i64
+                    (limit + 1) as i64,
+                    repository_namespace(&who.repository, who.repository_id),
+                    catchup_repository_key(who.repository_id),
+                    AUTO_PAUSE_SUMMARY
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -5209,12 +5281,15 @@ impl SqliteStore {
         let tx = conn.transaction()?;
         let who = reader.who(|token| work_who(&tx, token, now))?;
         let fetch_limit = i64::try_from(query.limit + 1).unwrap_or(101);
+        let catchup_repository = repository_namespace(&who.repository, who.repository_id);
+        let catchup_key = catchup_repository_key(who.repository_id);
+        let settled = settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 6, 7, 8]);
         let current_rows = {
-            let mut statement = tx.prepare(
-                "SELECT snapshot FROM hub_work_items
-                 WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-                   AND state <> 'finished' ORDER BY id LIMIT ?5",
-            )?;
+            let mut statement = tx.prepare(&format!(
+                "SELECT w.snapshot FROM hub_work_items w
+                 WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
+                   AND w.state <> 'finished' AND NOT {settled} ORDER BY w.id LIMIT ?5"
+            ))?;
             statement
                 .query_map(
                     params![
@@ -5222,12 +5297,33 @@ impl SqliteStore {
                         who.owner.identity.host,
                         who.repository,
                         who.repository_id,
-                        fetch_limit
+                        fetch_limit,
+                        catchup_repository,
+                        catchup_key,
+                        AUTO_PAUSE_SUMMARY
                     ],
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
+        let settled_count: i64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM hub_work_items w
+                 WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
+                   AND w.state <> 'finished' AND {settled}"
+            ),
+            params![
+                who.owner.identity.provider,
+                who.owner.identity.host,
+                who.repository,
+                who.repository_id,
+                0,
+                catchup_repository,
+                catchup_key,
+                AUTO_PAUSE_SUMMARY
+            ],
+            |row| row.get(0),
+        )?;
         let mut current = current_rows
             .into_iter()
             .map(|snapshot| json_value::<WorkItem>(&snapshot))
@@ -5313,6 +5409,7 @@ impl SqliteStore {
             recent_complete,
             overlaps_complete,
             history_retention_gap,
+            settled_count: u64::try_from(settled_count).unwrap_or(0),
         })
     }
 }
@@ -8103,6 +8200,13 @@ impl Store for SqliteStore {
         )?;
         item.state = checkpoint.state();
         item.claim_status = ClaimStatus::Active;
+        item.reported_at = if checkpoint.kind == super::work::CheckpointKind::Pause
+            && checkpoint.summary == AUTO_PAUSE_SUMMARY
+        {
+            item.reported_at.or(Some(item.last_checkin_at))
+        } else {
+            None
+        };
         item.last_checkin_at = now;
         item.next_action = checkpoint.next_action.clone();
         if let Some(scope) = checkpoint.normalized_scope()? {

@@ -265,7 +265,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `repository`, `repository_id`, `provider`, `unfinished` (`total`, `moving`, `stuck`),
   `needs_you`, `agents`, `last_activity_at` (or `null`) and `complete` (false when a list was cut
   short, so counts are lower bounds): counts only, never titles, paths or people. `needs_you`
-  counts blockers, quiet leads, handovers, declared-scope overlaps and files two agents hold now;
+  counts blockers, declared-scope overlaps between live tasks (both claims active, both tasks active or blocked) and files two agents hold now; paused, handover and stale-claim work is unfinished and may be stuck, but is not counted;
   pull-request overlaps and files with only a recent refusal are not counted. A refused role or a
   repository no longer connected is left out and not recorded as a refused sign-in; one the forge
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
@@ -713,7 +713,7 @@ notification is a 202. A batch or a non-object is `-32600`, bad JSON
 `-32700`, an unknown method `-32601`, an unknown tool `-32602`. The body limit
 is 64 KiB.
 
-An agent token sees a default set of tools: the ones the shipped skill, instruction files, hook
+An agent token sees a default set of tools, including the ones the shipped skill, instruction files, hook
 context, server instructions and MCP App views ask agents to call, plus `agentscm_skill_list`,
 `agentscm_skill_status` and `agentscm_skill_evidence` when the repository has adopted supported
 skills. `POST /mcp?tools=all` lists every tool, including `agentscm_change_record`,

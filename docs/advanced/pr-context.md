@@ -29,7 +29,9 @@ This display heuristic does not establish provider freshness.
   started. The provider may have changed since then.
 - PR overlap uses exact retained paths. Work overlap uses the existing declared
   scope matcher. Both are advisory; they do not prove a conflict or link Work to
-  a PR. Quiet assignments remain assigned.
+  a PR. Quiet assignments remain assigned. Work whose branch has a merged pull
+  request is not in the Work overlap list; coverage reports the repository's
+  count of such hidden Work as `work_settled_count`.
 - Workflow records are selected by an explicit PR number within the token's
   repository, never by branch name alone. Their head must match the retained PR
   head for applicability. They remain self-reported, even when the recorded

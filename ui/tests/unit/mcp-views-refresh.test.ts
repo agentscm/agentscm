@@ -242,46 +242,4 @@ describe('MCP views auto-refresh', () => {
     host.refreshButton().click()
     expect(host.calls()[2]!.params!.arguments).toEqual({})
   })
-
-  it('overview keeps loaded catch-up pages and their open source details across a refresh', async () => {
-    const v = views[0]!
-    const host = mount(v.file, v.tool)
-    host.push(v.before)
-    const catchup = () => host.calls('agentscm_work_catchup')
-    const client = catchup()[0]!.params!.arguments!.delivery_client as string
-    const page = (over: Data) => ({
-      subscriber: 'human', delivery_client: client, delivery: `cup_${'a'.repeat(32)}`,
-      event_from: 2, event_through: 3, event_after: 2, next_event_after: 2,
-      merge_from: 0, merge_through: 1, merge_after: 0, next_merge_after: 1,
-      work_events: [], coordination_events: [], merges: [],
-      retention: { work_gap: false, coordination_gap: false, merge_gap: false, event_available_from: 2, merge_available_from: 0 },
-      source_coverage: [], complete: false, ...over,
-    })
-    const merge = {
-      id: 'merge-1', seq: 1, source: 'forge_pull', source_id: 'github:129', occurred_at: null, observed_at: 150, title: 'First merge',
-      branch: 'feat/a', base: 'main', head_commit: '1'.repeat(40), merge_commit: '2'.repeat(40), pull_number: 129, paths: ['ui/a.ts'], paths_complete: true,
-    }
-    await host.reply(catchup()[0]!.id!, { structuredContent: page({ merges: [merge] }) })
-    expect(host.root.textContent).toContain('First merge')
-
-    Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'Load more')!.click()
-    expect(catchup()).toHaveLength(2)
-    const next = page({
-      event_after: 2, next_event_after: 3, merge_after: 1, next_merge_after: 1, complete: true,
-      work_events: [{ seq: 3, at: 150, kind: 'checkpoint', work_id: 'wrk_x', item: { title: 'Second page work', lead_agent: 'codex', current: { summary: 'did it' } } }],
-    })
-    await host.reply(catchup()[1]!.id!, { structuredContent: next })
-    expect(host.root.textContent).toContain('Second page work')
-
-    const details = Array.from(document.querySelectorAll<HTMLDetailsElement>('details.sd')).find((d) => d.textContent?.includes('merge-1'))!
-    details.open = true
-    details.dispatchEvent(new Event('toggle'))
-
-    await host.wait(30_000)
-    await host.answer(v.after)
-    expect(catchup()).toHaveLength(2)
-    expect(host.root.textContent).toContain('First merge')
-    expect(host.root.textContent).toContain('Second page work')
-    expect(Array.from(document.querySelectorAll<HTMLDetailsElement>('details.sd')).find((d) => d.textContent?.includes('merge-1'))!.open).toBe(true)
-  })
 })

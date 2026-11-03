@@ -110,6 +110,19 @@ test('complete fixed delivery is required before a stale acknowledgement conflic
   await exercise(page, 'catchup-desktop.png')
 })
 
+test('Mark all reviewed pages through the delivery after a confirm and sends one acknowledgement', async ({ page }) => {
+  const { acknowledgements } = await stubHub(page)
+  await page.goto(`/#token=${TOKEN}`)
+  await page.evaluate(() => { window.location.hash = '#activity' })
+  const main = page.locator('#main')
+  await main.getByRole('button', { name: 'Mark all available records reviewed' }).click()
+  await expect(main).toContainText('Mark everything in this delivery reviewed without opening it?')
+  expect(acknowledgements).toHaveLength(0)
+  await main.getByRole('button', { name: 'Mark everything reviewed' }).click()
+  await expect(main).toContainText('Another device advanced this review position')
+  expect(acknowledgements).toEqual([{ delivery: DELIVERY, expected_event_from: 3, expected_merge_from: 0 }])
+})
+
 test('a cloned tab gets an independent fixed delivery client while the original remains active', async ({ page }) => {
   const { deliveryClients } = await stubHub(page)
   await page.goto(`/#token=${TOKEN}`)

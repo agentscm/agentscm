@@ -22,6 +22,7 @@ fn plan(root: &std::path::Path) -> TransferPlan {
         state: WorkState::Active,
         claim_status: ClaimStatus::Active,
         last_checkin_at: 1,
+        reported_at: None,
         generation: 1,
         lead_token: "token-a".into(),
         lead_agent: "claude".into(),

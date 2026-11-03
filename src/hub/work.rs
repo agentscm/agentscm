@@ -217,6 +217,10 @@ pub struct WorkItem {
     /// A request-time projection. Stale and unknown claims remain claimed.
     pub claim_status: ClaimStatus,
     pub last_checkin_at: i64,
+    /// Set only on the automatic pause written at session end: the last check-in time before it.
+    /// Later auto-pauses keep it, so the pause does not make the session look newly checked in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<i64>,
     pub generation: i64,
     pub lead_token: String,
     pub lead_agent: String,
@@ -445,6 +449,10 @@ impl WorkSearchPage {
 pub const DEFAULT_WORK_SEARCH: usize = 20;
 pub const MAX_WORK_SEARCH: usize = 50;
 
+/// Summary of the pause checkpoint written when a session ends without a reported outcome. Work
+/// holding it is not settled by a merge that predates the session's last check-in.
+pub(super) const AUTO_PAUSE_SUMMARY: &str = "Session ended without a reported final work outcome.";
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkOverview {
@@ -457,6 +465,10 @@ pub struct WorkOverview {
     pub recent_complete: bool,
     pub overlaps_complete: bool,
     pub history_retention_gap: bool,
+    /// Unfinished Work not listed in `current` because its branch has a merged pull request.
+    /// "Settled" never means finished. It does not affect `current_complete`.
+    #[serde(default)]
+    pub settled_count: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -2645,6 +2645,7 @@ async fn value_metrics_and_receipts_are_scoped_and_automatic_delivery_is_idempot
                 pull_number: 501,
                 paths: vec!["src/parser.rs".into()],
                 paths_complete: true,
+                same_repository_head: true,
             },
             unix_now(),
         )

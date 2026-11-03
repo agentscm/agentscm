@@ -248,6 +248,7 @@ fn project(
             "pull_requests": "retained_only", "pull_requests_complete": false,
             "retained_pr_scan_saturated": rows.len() >= 1000, "last_sync_partial": null, "files_partial": true,
             "work_complete": overview.current_complete, "work_observed_at": overview.until,
+            "work_settled_count": overview.settled_count,
             "workflows": "newest_25_runs_only", "workflows_complete": false,
             "workflow_scan_limit": RUN_SCAN, "atomic_snapshot": false,
             "local_source": "not_observed", "base_revision": "not_retained",
@@ -366,6 +367,7 @@ mod tests {
             recent_complete: true,
             overlaps_complete: true,
             history_retention_gap: false,
+            settled_count: 0,
         }
     }
     fn row(number: i64, head: &str, paths: &[&str]) -> Observation {
@@ -578,6 +580,20 @@ mod tests {
         assert_eq!(result["coverage"]["retained_pr_scan_saturated"], true);
         assert_eq!(result["coverage"]["pull_requests_complete"], false);
         assert!(result["coverage"]["last_sync_partial"].is_null());
+    }
+    #[test]
+    fn coverage_reports_work_hidden_by_a_merged_pull_request() {
+        let rows = vec![row(1, &"a".repeat(40), &[])];
+        let request = Request {
+            number: 1,
+            expected_head: None,
+        };
+        let overview = WorkOverview {
+            settled_count: 3,
+            ..overview()
+        };
+        let result = project("acme/widgets", &request, &rows, &overview, &[]).unwrap();
+        assert_eq!(result["coverage"]["work_settled_count"], 3);
     }
     #[test]
     fn multibyte_and_escaped_paths_fit_without_losing_omission_counts() {

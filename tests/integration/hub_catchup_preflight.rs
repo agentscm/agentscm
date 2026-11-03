@@ -530,6 +530,7 @@ async fn changed_merge_highwater_refuses_new_work_without_claiming_it() {
             .record_catchup_merge(
                 &scope,
                 &NewCatchupMerge {
+                    same_repository_head: true,
                     source: CatchupMergeSource::ForgePull,
                     source_id: "forge-pr-17".into(),
                     occurred_at: Some(9),
@@ -655,6 +656,7 @@ async fn only_explicit_work_id_can_retry_already_owned_work_with_unknown_preflig
                     repository_id: Some(101),
                 },
                 &NewCatchupMerge {
+                    same_repository_head: true,
                     source: CatchupMergeSource::ForgePull,
                     source_id: "forge-pr-22".into(),
                     occurred_at: Some(20),
@@ -773,6 +775,7 @@ async fn native_partial_delivery_can_be_continued_through_mcp() {
                 repository_id: Some(101),
             },
             &NewCatchupMerge {
+                same_repository_head: true,
                 source: CatchupMergeSource::ForgePull,
                 source_id: "pull:7".into(),
                 occurred_at: None,
@@ -1234,6 +1237,7 @@ fn empty_window_still_detects_exact_retained_source_head(fixture: &StoreFixture)
         .record_catchup_merge(
             &repository_scope(),
             &NewCatchupMerge {
+                same_repository_head: true,
                 source: CatchupMergeSource::ForgePull,
                 source_id: "source-head-pr-31".into(),
                 occurred_at: Some(now - 1),
@@ -1385,6 +1389,7 @@ fn included_merge_does_not_require_complete_paths(fixture: &StoreFixture) {
     let now = store::unix_now();
     observe_complete_sources(&*fixture.store, now);
     let merge = NewCatchupMerge {
+        same_repository_head: true,
         source: CatchupMergeSource::ForgePull,
         source_id: "pull:32".into(),
         occurred_at: Some(now - 1),

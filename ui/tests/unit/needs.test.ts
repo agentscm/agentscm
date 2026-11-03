@@ -9,18 +9,30 @@ const overview = (current: WorkItem[], overlaps: WorkOverview['overlaps'] = []) 
 const derived = (over: Partial<Derived>) => ({ agents: [], groups: [], filesHeld: 0, contested: [], prOverlaps: [], otherOpenPrs: 0, intentById: new Map(), ...over }) as Derived
 
 describe('needsYou', () => {
-  it('lists only decisions, worst first: a blocker before a contested file before a quiet claim before a handover', () => {
-    const ov = overview([
-      item('handover', { state: 'handover' }),
-      item('quiet', { claim_status: 'stale' }),
-      item('fine', {}),
-      item('blocked', { state: 'blocked' }),
-    ])
+  const pair = (l: Partial<WorkItem>, r: Partial<WorkItem>) => ({ left: item('l', l), right: item('r', r), reasons: [] }) as unknown as WorkOverview['overlaps'][number]
+  it('lists only decisions, worst first: a blocker before a contested file before an overlap', () => {
+    const ov = overview([item('fine', {}), item('blocked', { state: 'blocked' })], [pair({}, {})])
     const d = derived({ contested: [{ path: 'src/a.rs', holders: [] }] })
-    expect(needsYou(ov, d).map((n) => n.key)).toEqual(['blocked:blocked', 'contested:src/a.rs', 'quiet:quiet', 'handover:handover'])
+    expect(needsYou(ov, d).map((n) => n.key)).toEqual(['blocked:blocked', 'contested:src/a.rs', 'overlap:l:r'])
   })
-  it('a quiet lead counts once as quiet, even when the task is also offered for handover', () => {
-    expect(needsYou(overview([item('h', { state: 'handover', claim_status: 'unknown' })]), null).map((n) => n.kind)).toEqual(['quiet'])
+  it('paused, handover and stale-claim tasks are not decisions, but a blocked one stays even when its claim is stale', () => {
+    const ov = overview([
+      item('handover', { state: 'handover', claim_status: 'stale' }),
+      item('paused', { state: 'paused' }),
+      item('stale', { claim_status: 'stale' }),
+      item('unknown', { claim_status: 'unknown' }),
+      item('stuck', { state: 'blocked', claim_status: 'stale' }),
+    ])
+    expect(needsYou(ov, null).map((n) => n.key)).toEqual(['blocked:stuck'])
+  })
+  it('an overlap is live only when both sides hold an active claim and are active or blocked', () => {
+    const keys = (o: ReturnType<typeof pair>) => needsYou(overview([], [o]), null).map((n) => n.kind)
+    expect(keys(pair({}, {}))).toEqual(['overlap'])
+    expect(keys(pair({ state: 'blocked' }, {}))).toEqual(['overlap'])
+    expect(keys(pair({ claim_status: 'stale' }, {}))).toEqual([])
+    expect(keys(pair({}, { claim_status: 'unknown' }))).toEqual([])
+    expect(keys(pair({ state: 'paused' }, {}))).toEqual([])
+    expect(keys(pair({}, { state: 'handover' }))).toEqual([])
   })
   it('nothing loaded is nothing to decide, not an error', () => {
     expect(needsYou(null, null)).toEqual([])
@@ -35,7 +47,7 @@ describe('a request to an idle task', () => {
     ...over,
   }) as unknown as CoordinationRequest
   const mine = (over: Partial<WorkItem>) => overview([item('mine', { owner_login: 'dev', ...over })])
-  it('needs the owner when their task is paused or quiet, in place of the quiet row', () => {
+  it('needs the owner when their task is paused or quiet, even though a quiet task alone is not listed', () => {
     for (const over of [{ state: 'paused', claim_status: 'stale' }, { claim_status: 'stale' }, { state: 'paused' }] as Partial<WorkItem>[]) {
       expect(needsYou(mine(over), null, { requests: [request()], me: 'dev' }).map((n) => [n.kind, n.who, n.path])).toEqual([['asked', 'you', 'ui/src/pages/Catchup.tsx']])
     }
@@ -43,13 +55,13 @@ describe('a request to an idle task', () => {
   it('leaves it to the agents while the lead is running, answered, closed, or someone else’s', () => {
     const reply = { target_work_id: 'mine', target_generation: 1, seq: 9 } as unknown as CoordinationRequest['responses'][number]
     expect(needsYou(mine({}), null, { requests: [request()], me: 'dev' })).toEqual([])
-    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ responses: [reply] })], me: 'dev' }).map((n) => n.kind)).toEqual(['quiet'])
-    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ status: 'withdrawn' })], me: 'dev' }).map((n) => n.kind)).toEqual(['quiet'])
-    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request()], me: 'maria' }).map((n) => n.kind)).toEqual(['quiet'])
+    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ responses: [reply] })], me: 'dev' }).map((n) => n.kind)).toEqual([])
+    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request({ status: 'withdrawn' })], me: 'dev' }).map((n) => n.kind)).toEqual([])
+    expect(needsYou(mine({ claim_status: 'stale' }), null, { requests: [request()], me: 'maria' }).map((n) => n.kind)).toEqual([])
   })
-  it('the Inbox badge counts overlaps and every unanswered request to the viewer’s agents, running or not', () => {
+  it('the Inbox badge counts live overlaps and every unanswered request to the viewer’s agents, running or not', () => {
     const reply = { target_work_id: 'mine', target_generation: 1, seq: 9 } as unknown as CoordinationRequest['responses'][number]
-    const ov = overview([item('mine', { owner_login: 'dev' })], [{}] as unknown as WorkOverview['overlaps'])
+    const ov = overview([item('mine', { owner_login: 'dev' })], [{ left: item('l', {}), right: item('r', {}), reasons: [] }, { left: item('l', {}), right: item('s', { claim_status: 'stale' }), reasons: [] }] as unknown as WorkOverview['overlaps'])
     expect(inboxBadge(ov, { requests: [request(), request({ id: 'crq_2', responses: [reply] }), request({ id: 'crq_3', status: 'resolved' })], me: 'dev' })).toEqual({ n: 2, tip: '1 overlap to talk about · 1 request waiting on you' })
     expect(inboxBadge(ov, { requests: [request()], me: 'maria' })).toEqual({ n: 1, tip: '1 overlap to talk about' })
     expect(inboxBadge(null, undefined)).toEqual({ n: 0, tip: '' })
@@ -60,13 +72,10 @@ describe('who can act', () => {
   const agent = (owner: string, name = 'codex') => ({ id: `${owner}:${name}`, owner, name })
   const ask = (over: Partial<NonNullable<Contested['handoff']>> = {}) => ({ request: 'r', at: 1, from: { owner: 'dev', name: 'cursor' }, to: { owner: 'maria', name: 'claude-code' }, note: null, ...over })
   const party = (c: Omit<Contested, 'path'>) => needsYou(null, derived({ contested: [{ path: 'src/a.rs', ...c }] }))[0]!.who
-  it('blockers, quiet claims, handovers, overlaps and pull requests are a person’s to act on', () => {
-    const ov = overview([item('b', { state: 'blocked' }), item('q', { claim_status: 'stale' }), item('h', { state: 'handover' })], [{ left: item('l', {}), right: item('r', {}), reasons: [] }] as unknown as WorkOverview['overlaps'])
+  it('blockers, overlaps and pull requests are a person’s to act on', () => {
+    const ov = overview([item('b', { state: 'blocked' })], [{ left: item('l', {}), right: item('r', {}), reasons: [] }] as unknown as WorkOverview['overlaps'])
     const d = derived({ prOverlaps: [{ pr: { number: 7 }, with: [] }] as unknown as Derived['prOverlaps'] })
-    expect(needsYou(ov, d).map((n) => n.who)).toEqual(['you', 'you', 'you', 'you', 'you'])
-  })
-  it('a paused lead gave its reason, so the agents have it in hand', () => {
-    expect(needsYou(overview([item('p', { state: 'paused', claim_status: 'stale' })]), null).map((n) => [n.kind, n.who])).toEqual([['quiet', 'agents']])
+    expect(needsYou(ov, d).map((n) => n.who)).toEqual(['you', 'you', 'you'])
   })
   it('two holders, or an edit let through after a refusal, need a person', () => {
     expect(party({ holders: [agent('dev'), agent('maria')] })).toBe('you')

@@ -1720,6 +1720,7 @@ mod tests {
             state: WorkState::Active,
             claim_status: ClaimStatus::Active,
             last_checkin_at: 90,
+            reported_at: None,
             generation: 1,
             lead_token: "token".into(),
             lead_agent: "client".into(),

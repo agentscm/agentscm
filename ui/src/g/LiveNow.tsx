@@ -12,7 +12,7 @@ import { fetchLibrary, fetchRuns, type RunView } from '../skills.ts'
 import { fetchSetup } from '../api.ts'
 import { setupState } from '../onboarding.ts'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
-import type { Need } from '../needs.ts'
+import { isLiveOverlap, type Need } from '../needs.ts'
 import type { Derived } from '../derive.ts'
 import type { LiveProps } from './GLive.tsx'
 import { STEPS, dotTone, prFor, stateText, stepOf, toneOf } from './liveModel.ts'
@@ -50,7 +50,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
         fact={loading ? <span className="g-fact">{repo}</span> : <span className="g-fact">
           <span>{repo} · {current.length} unfinished · {plural(people, 'person', 'people')} with {plural(agents, 'live agent')}</span>
           <a href="#contributions" className="g-strip" aria-label="What the Hub has recorded">
-            <span><Icon name="sign-intersection-y" /> {plural(ov?.overlaps.length ?? 0, 'overlap')} open</span>
+            <span><Icon name="sign-intersection-y" /> {plural(ov?.overlaps.filter(isLiveOverlap).length ?? 0, 'overlap')} open</span>
             <span><Icon name="exclamation-diamond" /> {plural(d?.contested.length ?? 0, 'contested file')}</span>
             {data.health?.coordination && <span><Icon name="shield-check" /> {plural(data.health.coordination.denied, 'edit')} refused once</span>}
           </a>
@@ -61,7 +61,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
       <div className="g-now">
         <section className="g-needs" aria-label="Needs you">
           {ov && d && needs.map((need, i) => <LiveNeedCard key={need.key} n={need} i={i} ov={ov} d={d} live={live} />)}
-          {ov && d && needs.length === 0 && <article className="g-need is-done"><span className="g-ring tone-ok"><Icon name="check2" /></span><div className="g-need-body"><span className="g-need-title small">Nothing is waiting on you</span><span className="g-need-outcome">Blocked work, contested files, overlaps and handovers show up here first.</span></div></article>}
+          {ov && d && needs.length === 0 && <article className="g-need is-done"><span className="g-ring tone-ok"><Icon name="check2" /></span><div className="g-need-body"><span className="g-need-title small">Nothing is waiting on you</span><span className="g-need-outcome">Blocked work, requests your idle agent can’t answer, contested files and overlaps show up here first.</span></div></article>}
           {loading && <Skeleton rows={3} />}
         </section>
         <aside className="g-col g-side" aria-label="Around you">
@@ -80,7 +80,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
   )
 }
 
-const KIND_LABEL: Record<Need['kind'], string> = { blocked: 'Blocked', asked: 'Asked while idle', quiet: 'Gone quiet', handover: 'Handover', contested: 'Contested file', overlap: 'Overlap', pr: 'Pull request' }
+const KIND_LABEL: Record<Need['kind'], string> = { blocked: 'Blocked', asked: 'Asked while idle', contested: 'Contested file', overlap: 'Overlap', pr: 'Pull request' }
 
 function LiveNeedCard({ n, i, ov, d, live }: { n: Need; i: number; ov: WorkOverview; d: Derived; live: LiveProps }) {
   const { icon, title, gist, body, step } = needView(n, ov, d, live.handoff.me)

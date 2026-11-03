@@ -64,16 +64,32 @@ function Report({ c, item, title }: { c: WorkCheckpoint; item: WorkItem; title: 
 /** A poll as a lifecycle input: null while loading, 'failed' when the read failed. */
 const input = <T, U>(p: Poll<T>, pick: (v: T) => U): U | null | 'failed' => (p.kind === 'ready' ? pick(p.value) : p.kind === 'error' ? 'failed' : null)
 
-/** What the Dashboard's Needs-you list would show for this task, as next steps. Contested files and pull requests need live-agent data this page does not load. */
-function needsFor(id: string, overview: WorkOverview | null): NextStep[] {
+/**
+ * The next steps this task's page offers. A blocked task and a live overlap are on the Dashboard's Needs-you list;
+ * a handover, paused or stale-claim task is not, but its own page still says what to do about it. Contested files
+ * and pull requests need live-agent data this page does not load.
+ */
+function needsFor(id: string, overview: WorkOverview | null): { steps: NextStep[]; listed: boolean } {
   const steps: NextStep[] = []
-  for (const n of needsYou(overview, null)) {
-    if (n.kind === 'overlap') {
-      const o = overview?.overlaps.find((x) => `overlap:${x.left.id}:${x.right.id}` === n.key)
-      if (o && (o.left.id === id || o.right.id === id)) steps.push(overlapSteps(o))
-    } else if (n.item?.id === id) steps.push(n.kind === 'blocked' ? blockedStep(n.item) : n.kind === 'handover' ? handoverStep(n.item) : quietStep(n.item, null))
+  let listed = false
+  const item = overview?.current.find((i) => i.id === id)
+  if (item?.state === 'blocked') {
+    steps.push(blockedStep(item))
+    listed = true
+  } else if (item?.state === 'handover') {
+    steps.push(handoverStep(item))
+  } else if (item && (item.state === 'paused' || item.claim_status !== 'active')) {
+    steps.push(quietStep(item, null))
   }
-  return steps
+  for (const n of needsYou(overview, null)) {
+    if (n.kind !== 'overlap') continue
+    const o = overview?.overlaps.find((x) => `overlap:${x.left.id}:${x.right.id}` === n.key)
+    if (o && (o.left.id === id || o.right.id === id)) {
+      steps.push(overlapSteps(o))
+      listed = true
+    }
+  }
+  return { steps, listed }
 }
 
 /** One task: where it is in its lifecycle, state, claim, people, declared scope, agent reports and technical details. */
@@ -120,7 +136,7 @@ function Task({ item, token, overview, handoff, refreshWork }: { item: WorkItem;
   const head = pub?.commit || run?.head_sha
   const quiet = item.state !== 'finished' && item.claim_status !== 'active'
   const leads = item.participants.filter((p) => p.role === 'lead').length
-  const needSteps = needsFor(item.id, overview)
+  const { steps: needSteps, listed } = needsFor(item.id, overview)
   return (
     <div className="stack">
       <PageHead className="detail-head" question={item.title} answer={<>Led by {who(l.login, l.agent)}.</>} fact={
@@ -143,7 +159,7 @@ function Task({ item, token, overview, handoff, refreshWork }: { item: WorkItem;
         <LifecycleStrip steps={steps} />
       </Box>
       {needSteps.length > 0 && (
-        <Box icon="exclamation-circle" title="Needs you" tone="warn">
+        <Box icon="exclamation-circle" title={listed ? 'Needs you' : 'Next step'} tone="warn">
           <div className="stack">
             {needSteps.map((n, i) => <NextStepView key={i} step={n} viewer={handoff?.me} repo={handoff?.repo} originUrl={handoff?.originUrl} />)}
           </div>

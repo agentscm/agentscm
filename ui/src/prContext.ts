@@ -18,7 +18,7 @@ export interface PrContext {
   work_overlaps_omitted?: number
   workflows?: { run_id: string; head_sha: string | null; applicability: 'matches_observed_head' | 'earlier_or_other_head' | 'unknown'; current_gate: string | null; next_action: string; blocks_finish: boolean; updated_at: number; basis: 'self_reported' }[]
   workflows_omitted?: number
-  coverage?: { files_partial: boolean; work_complete: boolean; work_observed_at: number; pull_requests_complete: false; workflows_complete: false; last_sync_partial: boolean | null; retained_pr_scan_saturated: boolean }
+  coverage?: { files_partial: boolean; work_complete: boolean; work_observed_at: number; work_settled_count?: number; pull_requests_complete: false; workflows_complete: false; last_sync_partial: boolean | null; retained_pr_scan_saturated: boolean }
 }
 
 const SHA = /^([a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/
@@ -38,7 +38,7 @@ const paths = (v: unknown) => list(v).map(string)
 function decodeCoverage(value: unknown): NonNullable<PrContext['coverage']> {
   const c = object(value)
   if (c.pull_requests_complete !== false || c.workflows_complete !== false) throw new Error('Unsupported context coverage')
-  return { files_partial: boolean(c.files_partial), work_complete: boolean(c.work_complete), work_observed_at: number(c.work_observed_at), pull_requests_complete: false, workflows_complete: false, last_sync_partial: c.last_sync_partial === null ? null : boolean(c.last_sync_partial), retained_pr_scan_saturated: boolean(c.retained_pr_scan_saturated) }
+  return { files_partial: boolean(c.files_partial), work_complete: boolean(c.work_complete), work_observed_at: number(c.work_observed_at), ...(c.work_settled_count === undefined ? {} : { work_settled_count: number(c.work_settled_count) }), pull_requests_complete: false, workflows_complete: false, last_sync_partial: c.last_sync_partial === null ? null : boolean(c.last_sync_partial), retained_pr_scan_saturated: boolean(c.retained_pr_scan_saturated) }
 }
 
 export function decodePrContext(value: unknown, repo: string, pr: number): PrContext {

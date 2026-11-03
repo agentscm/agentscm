@@ -2,6 +2,7 @@
 // Plain language: short sentences, say what the reader sees and what to do next.
 import type { Section } from '../App.tsx'
 import type { Derived } from '../derive.ts'
+import { isLiveOverlap } from '../needs.ts'
 import type { WorkOverview } from '../standup.ts'
 import type { HubData } from '../useHub.ts'
 
@@ -39,6 +40,7 @@ export interface TourDef {
   steps: TourStep[]
 }
 
+const liveOverlaps = (o: WorkOverview) => o.overlaps.filter(isLiveOverlap).length
 export const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 
 // Targets are stable data-tour anchors, never classes or DOM shape, so restyling a page keeps its tour.
@@ -72,7 +74,7 @@ export const WELCOME: TourDef = {
       target: T('needs'),
       title: 'Needs you is your to-do list',
       what: 'Each row names the person and agent and has one button: Open in your agent when there is a link for it, otherwise Copy prompt. Open a row for the reason and who decides.',
-      why: 'Each one stays stuck until someone decides. Blocked tasks, agents that went quiet, handovers (one agent passing a task to another) and files two agents are both editing all land here.',
+      why: 'Each one stays stuck until someone decides. Blocked tasks, files two agents are both holding and overlaps between two live tasks land here. Quiet, paused and handed-over tasks stay in All work, still assigned.',
       how: 'Open the prompt in the agent, or copy it and paste it there. The agent shows it and waits for you to press Enter.',
       empty: 'When nothing needs you, this box says so in green.',
     },
@@ -96,7 +98,7 @@ export const WELCOME: TourDef = {
       what: 'Tasks that plan to change the same files, and the requests agents sent each other to split the work, join it or pass it on.',
       why: 'An overlap (two tasks plan to change the same file) is a signal to talk, not proof of a conflict. Reading the Inbox never answers a request for anyone.',
       how: 'Open a request to see who asked whom, and whether they received and replied.',
-      tip: (c) => (c.overview ? (c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'overlap')} waiting in the Inbox.` : 'No two tasks plan to change the same file right now.') : null),
+      tip: (c) => (c.overview ? (liveOverlaps(c.overview) > 0 ? `${plural(liveOverlaps(c.overview), 'live overlap')} waiting in the Inbox.` : 'No two live tasks plan to change the same file right now.') : null),
     },
     {
       target: NAV('history'),
@@ -208,7 +210,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
         what: 'How many overlapping plans and open requests there are.',
         why: 'An overlap (two tasks plan to change the same file) is a signal to talk before two agents write the same code. Detecting one sends nothing.',
         how: 'Pick a conversation on the left to see both agents, their files and a timeline of what happened. A request shows who asked whom, and whether they received and replied.',
-        tip: (c) => (c.overview ? (c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'overlap')} right now.` : 'No overlaps right now.') : null),
+        tip: (c) => (c.overview ? (liveOverlaps(c.overview) > 0 ? `${plural(liveOverlaps(c.overview), 'live overlap')} right now.` : 'No live overlaps right now.') : null),
       },
       {
         target: T('inbox-talk'),

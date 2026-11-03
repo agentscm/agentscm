@@ -577,7 +577,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
     );
     let briefing = json!(
         {"name": "agentscm_work_briefing",
-         "description": "Reads a bounded snapshot of unfinished shared work plus changes after this agent token's acknowledged cursor. Writer tokens receive a durable delivery to page and deliberately acknowledge; read-only tokens perform a pure read. Different tokens have independent catch-up; sessions sharing a token share the cursor.",
+         "description": "Reads a bounded snapshot of unfinished shared work, except Work whose branch has a merged pull request, plus changes after this agent token's acknowledged cursor. Writer tokens receive a durable delivery to page and deliberately acknowledge; read-only tokens perform a pure read. Different tokens have independent catch-up; sessions sharing a token share the cursor.",
          "annotations": {"readOnlyHint": true},
          "inputSchema": schema(json!({
              "delivery": {"type": "string", "description": "Durable delivery id returned by the first writer page; repeat the same cursors to retry the exact page."},
@@ -667,7 +667,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
          }), &["task"])}
     );
     let mut overview = json!({"name": "agentscm_work_overview",
-        "description": "Read before planning: ongoing assignments, reported completions and decisions in the last 24 hours, and declared scope overlaps. Pure read; never acknowledges catch-up. Inspect completeness flags before relying on this bounded overview. Path overlap is not proof of a Git conflict or semantic duplication.",
+        "description": "Read before planning: ongoing assignments, reported completions and decisions in the last 24 hours, and declared scope overlaps. Work whose branch has a merged pull request is not listed as ongoing; settled_count says how many. Pure read; never acknowledges catch-up. Inspect completeness flags before relying on this bounded overview. Path overlap is not proof of a Git conflict or semantic duplication.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({"recent_since": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}}), &[])});
@@ -2708,7 +2708,7 @@ async fn done(
         expected_updated_seq: Some(item.updated_seq),
         session: item.lead_session,
         kind: CheckpointKind::Pause,
-        summary: "Session ended without a reported final work outcome.".into(),
+        summary: super::work::AUTO_PAUSE_SUMMARY.into(),
         next_action: item
             .next_action
             .or_else(|| Some("Resume or deliberately hand over this unfinished work.".into())),
