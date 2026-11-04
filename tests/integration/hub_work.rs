@@ -80,6 +80,7 @@ impl Db {
             "work_checkpoint",
             "work_pr_link",
             "work_transition",
+            "work_lead_credential",
             "coordination_target_released",
         ];
         if self._pg.is_some() {
@@ -179,6 +180,16 @@ impl Db {
                        WHERE w.provider = 'github' AND w.host = 'github.com'
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                      UNION ALL
+                     SELECT octet_length(d.snapshot)::bigint + 256 FROM hub_work_declarations d
+                       JOIN hub_work_items w ON w.id = d.work
+                       WHERE w.provider = 'github' AND w.host = 'github.com'
+                         AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
+                     UNION ALL
+                     SELECT octet_length(d.snapshot)::bigint + 256 FROM hub_work_reconciliation_state d
+                       JOIN hub_work_items w ON w.id = d.work
+                       WHERE w.provider = 'github' AND w.host = 'github.com'
+                         AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
+                     UNION ALL
                      SELECT octet_length(l.snapshot)::bigint + 256 FROM hub_work_pr_links l
                        JOIN hub_work_items w ON w.id = l.work
                        WHERE w.provider = 'github' AND w.host = 'github.com'
@@ -202,7 +213,7 @@ impl Db {
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                          AND e.kind IN
                             ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link',
-                             'work_transition')";
+                             'work_transition', 'work_lead_credential')";
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
             let used: i64 = client
@@ -244,6 +255,14 @@ impl Db {
                           FROM hub_work_versions v JOIN hub_work_items w ON w.id = v.work
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
+                         UNION ALL SELECT length(CAST(d.snapshot AS BLOB)) + 256
+                          FROM hub_work_declarations d JOIN hub_work_items w ON w.id = d.work
+                          WHERE w.provider = 'github' AND w.host = 'github.com'
+                            AND w.repository = ?1 AND w.repository_id IS ?2
+                         UNION ALL SELECT length(CAST(d.snapshot AS BLOB)) + 256
+                          FROM hub_work_reconciliation_state d JOIN hub_work_items w ON w.id = d.work
+                          WHERE w.provider = 'github' AND w.host = 'github.com'
+                            AND w.repository = ?1 AND w.repository_id IS ?2
                          UNION ALL SELECT length(CAST(l.snapshot AS BLOB)) + 256
                           FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
                           WHERE w.provider = 'github' AND w.host = 'github.com'
@@ -262,7 +281,8 @@ impl Db {
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
                             AND e.kind IN ('work_started', 'work_joined', 'work_takeover',
-                                           'work_checkpoint', 'work_pr_link', 'work_transition')
+                                           'work_checkpoint', 'work_pr_link', 'work_transition',
+                                           'work_lead_credential')
                      )",
                     rusqlite::params![REPO, REPOSITORY_ID],
                     |row| row.get(0),
@@ -1145,7 +1165,7 @@ fn participants_replays_and_takeovers_are_fenced(db: &Db) {
         attempted.expected_updated_seq = Some(joined.updated_seq);
         assert_invalid(
             store.work_checkpoint(&who.token, &attempted, now + 2),
-            "only the current lead session may checkpoint work",
+            "LEAD_SESSION_MISMATCH",
         );
     }
 
@@ -1255,7 +1275,10 @@ fn participants_replays_and_takeovers_are_fenced(db: &Db) {
     late.expected_updated_seq = Some(taken.item.updated_seq);
     assert_invalid(
         store.work_checkpoint(&alice.token, &late, now + 10),
-        "only the current lead session may checkpoint work",
+        &format!(
+            "LEAD_SESSION_MISMATCH: recorded lead agent agent4, session successor. Take over with agentscm_start work_id {} takeover_generation 2.",
+            started.id
+        ),
     );
 
     let read_only = agent_with(
@@ -2116,6 +2139,215 @@ fn briefing_sessions_on_one_token_have_independent_cursors(db: &Db) {
     );
 }
 
+fn lead_credential_events(store: &dyn Store, work_id: &str) -> Vec<serde_json::Value> {
+    store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "work_lead_credential" && event.subject == work_id)
+        .map(|event| {
+            assert!(!event.data.contains("tok_"), "{data}", data = event.data);
+            serde_json::from_str(&event.data).unwrap()
+        })
+        .collect()
+}
+
+fn lead_credential_carries_for_the_same_owner_and_session(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let replacement = another_token(&*store, &alice, "replacement");
+    let outsider = agent(&*store, 2);
+    let now = unix_now();
+    let started = store
+        .work_start(
+            &alice.token,
+            &native_start("lead-credential", "lead credential", "live"),
+            now,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(started.generation, 1);
+    assert_eq!(started.lead_agent, "agent1");
+
+    let mut fenced = checkpoint(
+        &started.id,
+        "fenced-generation",
+        2,
+        "live",
+        CheckpointKind::Progress,
+        "too new",
+    );
+    fenced.expected_updated_seq = Some(started.updated_seq);
+    assert_invalid(
+        store.work_checkpoint(&replacement.token, &fenced, now + 1),
+        "checkpoint generation is fenced; current generation is 1",
+    );
+    let unchanged = store
+        .work_get(&alice.token, &started.id, now + 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.updated_seq, started.updated_seq);
+    assert_eq!(unchanged.lead_token, alice.token);
+    assert!(lead_credential_events(&*store, &started.id).is_empty());
+
+    let mut carried = checkpoint(
+        &started.id,
+        "carry-credential",
+        1,
+        "live",
+        CheckpointKind::Progress,
+        "same session, new token",
+    );
+    carried.expected_updated_seq = Some(started.updated_seq);
+    let result = store
+        .work_checkpoint(&replacement.token, &carried, now + 2)
+        .unwrap();
+    assert_eq!(result.item.generation, 1);
+    assert_eq!(result.item.lead_token, replacement.token);
+    assert_eq!(result.item.lead_agent, "replacement");
+    assert_eq!(result.item.lead_session, "live");
+    let lead = result
+        .item
+        .participants
+        .iter()
+        .find(|participant| participant.role == WorkRole::Lead)
+        .unwrap();
+    assert_eq!(lead.token, replacement.token);
+    assert_eq!(lead.agent, "replacement");
+    assert_eq!(lead.session, "live");
+    let events = lead_credential_events(&*store, &started.id);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["session"], "live");
+    assert_eq!(events[0]["previous_agent"], "agent1");
+    assert_eq!(events[0]["agent"], "replacement");
+    assert_eq!(events[0]["generation"], 1);
+
+    let mut foreign = checkpoint(
+        &started.id,
+        "other-owner",
+        1,
+        "live",
+        CheckpointKind::Progress,
+        "different owner",
+    );
+    foreign.expected_updated_seq = Some(result.item.updated_seq);
+    assert_invalid(
+        store.work_checkpoint(&outsider.token, &foreign, now + 3),
+        "LEAD_SESSION_MISMATCH",
+    );
+    let after_foreign = store
+        .work_get(&alice.token, &started.id, now + 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_foreign.updated_seq, result.item.updated_seq);
+    assert_eq!(lead_credential_events(&*store, &started.id).len(), 1);
+
+    let mut other_session = checkpoint(
+        &started.id,
+        "other-session",
+        1,
+        "other",
+        CheckpointKind::Progress,
+        "same owner, different session",
+    );
+    other_session.expected_updated_seq = Some(result.item.updated_seq);
+    let refusal = format!(
+        "LEAD_SESSION_MISMATCH: recorded lead agent replacement, session live. Take over with agentscm_start work_id {} takeover_generation 1.",
+        started.id
+    );
+    assert!(!refusal.contains("tok_"));
+    assert_invalid(
+        store.work_checkpoint(&alice.token, &other_session, now + 4),
+        &refusal,
+    );
+    let after_other = store
+        .work_get(&alice.token, &started.id, now + 4)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_other.updated_seq, result.item.updated_seq);
+
+    let mut touch_start = native_start("touch-credential", "touch credential", "touch");
+    touch_start.scope = vec!["docs/**".into()];
+    let touch_result = store
+        .work_start(&alice.token, &touch_start, now + 5)
+        .unwrap();
+    assert!(touch_result.created);
+    let touch_work = touch_result.item;
+    db.sql(&format!(
+        "INSERT INTO hub_sessions (token, session, via, created_at, updated_at) VALUES ('{token}', 'touch', '[\"hook:claude\"]', {at}, {at})",
+        token = replacement.token,
+        at = now + 5,
+    ));
+    let omitted = store
+        .touch_session(
+            &replacement.token,
+            &agentscm::hub::session::SessionCall {
+                session: None,
+                via: "mcp".into(),
+                task: None,
+                paths: vec![],
+                deny: false,
+                report: true,
+            },
+            now + 6,
+        )
+        .unwrap();
+    assert!(omitted.lead_notes.is_empty());
+    let still = store
+        .work_get(&alice.token, &touch_work.id, now + 6)
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.lead_token, alice.token);
+    assert_eq!(still.generation, 1);
+    assert!(lead_credential_events(&*store, &touch_work.id).is_empty());
+
+    let named = store
+        .touch_session(
+            &replacement.token,
+            &agentscm::hub::session::SessionCall {
+                session: Some("touch".into()),
+                via: "mcp".into(),
+                task: None,
+                paths: vec![],
+                deny: false,
+                report: true,
+            },
+            now + 7,
+        )
+        .unwrap();
+    assert!(
+        named
+            .lead_notes
+            .iter()
+            .any(|note| note.contains(&touch_work.id) && note.contains("agent1"))
+    );
+    assert!(named.lead_notes.iter().all(|note| !note.contains("tok_")));
+    let healed = store
+        .work_get(&replacement.token, &touch_work.id, now + 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(healed.lead_token, replacement.token);
+    assert_eq!(healed.lead_agent, "replacement");
+    assert_eq!(healed.lead_session, "touch");
+    assert_eq!(healed.generation, 1);
+    assert!(healed.updated_seq > still.updated_seq);
+    assert_eq!(lead_credential_events(&*store, &touch_work.id).len(), 1);
+
+    let mut follow = checkpoint(
+        &touch_work.id,
+        "after-touch",
+        1,
+        "touch",
+        CheckpointKind::Progress,
+        "credential already carried",
+    );
+    follow.expected_updated_seq = Some(healed.updated_seq);
+    store
+        .work_checkpoint(&replacement.token, &follow, now + 8)
+        .unwrap();
+    assert_eq!(lead_credential_events(&*store, &touch_work.id).len(), 1);
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -2143,6 +2375,7 @@ conformance!(
     repository_namespaces_fence_work_and_relations,
     intent_provenance_refs_require_exact_same_work_versions_and_replay,
     participants_replays_and_takeovers_are_fenced,
+    lead_credential_carries_for_the_same_owner_and_session,
     blocker_metadata_and_restart_are_durable,
     stale_observed_pause_cannot_overwrite_newer_checkpoint,
     forge_issue_ids_are_canonical_positive_decimals,

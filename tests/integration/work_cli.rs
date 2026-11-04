@@ -698,3 +698,34 @@ fn explicit_pr_link_cli_uses_work_service_and_stale_fence() {
             .success()
     );
 }
+
+#[test]
+fn reconcile_cli_prints_the_report_and_fails_for_unknown_work() {
+    let hub = Hub::start();
+    let client = hub.bound_client(1, "alice", 42);
+    let started =
+        client.start(r#"{"request_key":"reconcile-task","title":"A task","session":"s"}"#);
+    assert!(started.status.success(), "{started:?}");
+    let start: WorkStartResult = serde_json::from_slice(&started.stdout).unwrap();
+    let run = |id: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(["work", "reconcile", id])
+            .env_clear()
+            .env("HOME", client.config.path())
+            .env("XDG_CONFIG_HOME", client.config.path())
+            .env("AGENTSCM_HUB_URL", &client.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+            .output()
+            .unwrap()
+    };
+    let ok = run(&start.item.id);
+    assert!(ok.status.success(), "{ok:?}");
+    let report: serde_json::Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(report["work_id"], start.item.id);
+    assert_eq!(report["provider"]["status"], "not_linked");
+    assert_eq!(report["atomic_snapshot"], false);
+
+    let missing = run("wrk_00000000000000000000000000000001");
+    let error = cli_error(&missing);
+    assert_eq!(error["error"], "invalid: hub error 404", "{error}");
+}

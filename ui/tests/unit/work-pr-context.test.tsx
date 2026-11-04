@@ -20,9 +20,9 @@ describe('explicit Work PR relationship', () => {
   it('renders relationship changes without replaying a prior checkpoint or finish status', () => {
     const changed = { ...item, state: 'finished', lead_agent: 'codex', title: 'Fixture Work', current: { summary: 'Prior checkpoint text' } } as WorkItem
     render(<WorkUpdate event={{ seq: 16, at: 1_793_387_000, kind: 'work_pr_link', work_id: item.id, item: changed }} />)
-    expect(screen.getByText('Relationship changed')).toBeTruthy()
+    expect(screen.getByText('PR evidence or prerequisites changed')).toBeTruthy()
     expect(screen.queryByText(/Prior checkpoint text/)).toBeNull()
-    expect(screen.getByText('Relationship changed').closest('li')?.className).not.toContain('tone-ok')
+    expect(screen.getByText('PR evidence or prerequisites changed').closest('li')?.className).not.toContain('tone-ok')
   })
   it('fetches the exact Work sequence, linked number and caller-asserted head', async () => {
     const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response(relationship())).mockResolvedValueOnce(response(linkedContext(42)))

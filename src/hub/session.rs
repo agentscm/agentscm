@@ -85,6 +85,9 @@ pub struct Touched {
     pub handoffs: Vec<HandoffNote>,
     /// Refused files this call asked the holder to hand over (best effort).
     pub requested: Vec<String>,
+    /// Same-owner notice that this touch kept a lead whose recorded token or
+    /// agent label did not match the caller. Empty when nothing was carried.
+    pub lead_notes: Vec<String>,
 }
 
 pub struct Advice {
@@ -550,6 +553,7 @@ impl Guarded {
     }
 
     /// The result of the call; `announced` is the announce of `step.new`, if one was made.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn touched(
         self,
         token: &str,
@@ -558,6 +562,7 @@ impl Guarded {
         notices: Vec<HubEvent>,
         handoffs: Vec<HandoffNote>,
         requested: Vec<String>,
+        lead_notes: Vec<String>,
     ) -> Touched {
         let Self {
             step,
@@ -595,6 +600,7 @@ impl Guarded {
             rate_limited,
             handoffs,
             requested,
+            lead_notes,
         }
     }
 }
@@ -696,6 +702,12 @@ pub(super) async fn announce_reading<T: Send + 'static>(
             text.push('\n');
         }
         text.push_str(&unknown);
+    }
+    for note in &touched.lead_notes {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(note);
     }
     let deny = (!touched.denied.is_empty()).then(|| {
         advice::deny_reason(
@@ -963,6 +975,7 @@ mod tests {
             rate_limited: false,
             handoffs: Vec::new(),
             requested: Vec::new(),
+            lead_notes: Vec::new(),
         };
         let woken = |touched: &Touched| {
             let notified = waiters.notified();

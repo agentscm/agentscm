@@ -68,6 +68,7 @@ use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
     finish, notice_events, plan, probe_set, validate_ttl,
 };
+use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1,
     PromiseCurrentAdmissionsV1, PromiseHistoryPageV1, PromiseInputPageV1, PromiseInputReceiptV1,
@@ -116,6 +117,10 @@ use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
+use super::work_reconciliation::{
+    self as declarations, WorkDeclarations, WorkDeclarationsResult, WorkDeclarationsUpdate,
+    WorkDeclarationsView,
+};
 use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
     WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
@@ -2248,6 +2253,16 @@ fn work_payload_bytes(
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
              UNION ALL
+             SELECT length(CAST(d.snapshot AS BLOB)) + 256 FROM hub_work_declarations d
+              JOIN hub_work_items w ON w.id = d.work
+              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
+                AND w.repository_id IS ?4
+             UNION ALL
+             SELECT length(CAST(d.snapshot AS BLOB)) + 256 FROM hub_work_reconciliation_state d
+              JOIN hub_work_items w ON w.id = d.work
+              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
+                AND w.repository_id IS ?4
+             UNION ALL
              SELECT length(CAST(l.snapshot AS BLOB)) + 256 FROM hub_work_pr_links l
               JOIN hub_work_items w ON w.id = l.work
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
@@ -2273,7 +2288,7 @@ fn work_payload_bytes(
                FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
-                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'reservation_lapsed')
+                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential', 'reservation_lapsed')
              UNION ALL
              SELECT length(CAST(r.proposed_scope AS BLOB))
                     + length(CAST(r.proposed_title AS BLOB)) + 256
@@ -2394,6 +2409,169 @@ fn stored_work_item_bytes(tx: &Transaction<'_>, id: &str) -> Result<i64> {
     )?)
 }
 
+/// Same owner, same session, new token or agent label. Generation, session, role,
+/// last check-in and claim status stay. Coordination requests stay with this lead.
+fn carry_lead_credential(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    item: &mut WorkItem,
+    now: i64,
+) -> Result<()> {
+    let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+    let carried = apply_carry(
+        item,
+        &who.token,
+        &who.agent,
+        &who.owner.id,
+        &who.owner.login,
+    );
+    let session = item.lead_session.clone();
+    if carried.previous_token != who.token {
+        tx.execute(
+            "DELETE FROM hub_work_participants
+             WHERE work = ?1 AND token = ?2 AND session = ?3",
+            params![item.id, who.token, session],
+        )?;
+        let updated = tx.execute(
+            "UPDATE hub_work_participants SET token = ?2, agent = ?3, updated_at = ?4
+             WHERE work = ?1 AND token = ?5 AND session = ?6 AND role = 'lead'",
+            params![
+                item.id,
+                who.token,
+                who.agent,
+                now,
+                carried.previous_token,
+                session
+            ],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO hub_work_participants
+                    (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'lead', ?6, ?7, ?7)",
+                params![
+                    item.id,
+                    who.token,
+                    who.owner.id,
+                    who.agent,
+                    session,
+                    item.generation,
+                    now
+                ],
+            )?;
+        }
+    } else {
+        let updated = tx.execute(
+            "UPDATE hub_work_participants SET agent = ?2, updated_at = ?3
+             WHERE work = ?1 AND token = ?4 AND session = ?5 AND role = 'lead'",
+            params![item.id, who.agent, now, who.token, session],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO hub_work_participants
+                    (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'lead', ?6, ?7, ?7)",
+                params![
+                    item.id,
+                    who.token,
+                    who.owner.id,
+                    who.agent,
+                    session,
+                    item.generation,
+                    now
+                ],
+            )?;
+        }
+    }
+    item.updated_at = now;
+    let mut event = Event::new(
+        KIND,
+        &item.id,
+        json!({
+            "generation": item.generation,
+            "owner": item.owner,
+            "repository": item.repository,
+            "state": state_name(item.state),
+            "session": item.lead_session,
+            "previous_agent": carried.previous_agent,
+            "agent": item.lead_agent,
+        }),
+    )?;
+    event.at = now;
+    let seq = append(tx, &event)?;
+    item.updated_seq = seq;
+    let snapshot = save_work_version(tx, item, seq)?;
+    let delta = work_transition_payload_bytes(&snapshot, &event)?
+        .checked_sub(previous_item_bytes)
+        .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    adjust_work_payload_capacity(tx, who, delta, now)?;
+    Ok(())
+}
+
+fn carry_identified_leads(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Vec<String>> {
+    let mut statement = tx.prepare(
+        "SELECT snapshot FROM hub_work_items
+         WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
+           AND owner = ?5 AND lead_session = ?6
+           AND state IN ('active', 'blocked', 'paused', 'handover')
+           AND (lead_token <> ?7 OR lead_agent <> ?8)
+         ORDER BY id",
+    )?;
+    let snapshots = statement
+        .query_map(
+            params![
+                who.owner.identity.provider,
+                who.owner.identity.host,
+                who.repository,
+                who.repository_id,
+                who.owner.id,
+                session,
+                who.token,
+                who.agent
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut notes = Vec::new();
+    for snapshot in snapshots {
+        let mut item: WorkItem = json_value(&snapshot)?;
+        if !matches!(
+            lead_access(&item, &who.owner.id, &who.token, &who.agent, session),
+            LeadAccess::Carry
+        ) {
+            continue;
+        }
+        let note = carry_notice(&item);
+        carry_lead_credential(tx, who, &mut item, now)?;
+        notes.push(note);
+    }
+    Ok(notes)
+}
+
+fn identified_lead_notes(
+    tx: &Transaction<'_>,
+    token: &str,
+    call: &Checked,
+    session: &str,
+    now: i64,
+) -> Result<Vec<String>> {
+    if call.session.is_none() && !call.via.starts_with("hook:") {
+        return Ok(Vec::new());
+    }
+    let who = match work_who(tx, token, now) {
+        Ok(who) if !who.read_only => who,
+        Ok(_) => return Ok(Vec::new()),
+        Err(HubError::Unauthorized) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    carry_identified_leads(tx, &who, session, now)
+}
+
 fn adjust_work_payload_capacity(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -2486,6 +2664,150 @@ fn work_retention_floors(tx: &Transaction<'_>, who: &WorkWho) -> Result<(i64, i6
         )
         .optional()?
         .unwrap_or((0, 0)))
+}
+
+fn reconciliation_evidence(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    view: &WorkDeclarationsView,
+    now: i64,
+) -> Result<declarations::ReconciliationEvidence> {
+    let repository = repository_namespace(&who.repository, who.repository_id);
+
+    let key = catchup_repository_key(who.repository_id);
+
+    let (through,floor)=tx.query_row("SELECT next_merge_seq-1,merge_floor_seq FROM hub_catchup_repositories WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4",params![who.owner.identity.provider,who.owner.identity.host,repository,key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.unwrap_or((0,0));
+
+    let sources = {
+        let mut st=tx.prepare("SELECT source,state,checked_at,unread_pages,deferred FROM hub_catchup_sources WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 ORDER BY source COLLATE BINARY LIMIT 3")?;
+
+        st.query_map(
+            params![
+                who.owner.identity.provider,
+                who.owner.identity.host,
+                repository,
+                key
+            ],
+            |r| {
+                Ok(declarations::SourceEvidence {
+                    source: r.get(0)?,
+                    state: r.get(1)?,
+                    checked_at_seconds: r.get(2)?,
+                    unread_pages: r.get(3)?,
+                    deferred: r.get(4)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let connected:Option<String>=tx.query_row("SELECT r.id FROM hub_repositories r JOIN hub_connections c ON c.id=r.connection WHERE c.provider=?1 AND r.host=?2 AND r.repository_id IS ?3",params![who.owner.identity.provider,who.owner.identity.host,who.repository_id],|r|r.get(0)).optional()?;
+
+    let mut pulls = Vec::new();
+
+    for target in declarations::ReconciliationEvidence::targets(view) {
+        let merges = {
+            let mut st=tx.prepare(&format!("SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 AND pull_number=?5 ORDER BY merge_commit COLLATE BINARY LIMIT 17"))?;
+
+            let rows = st.query_map(
+                params![
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    repository,
+                    key,
+                    target.number
+                ],
+                sqlite_catchup_merge_row,
+            )?;
+
+            rows.map(|r| sqlite_catchup_merge(r?))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        let observation = if let Some(repo) = &connected {
+            tx.query_row("SELECT data,observed_at,deleted FROM hub_observations WHERE repository=?1 AND kind='pull_request' AND key=?2",params![repo,target.number.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?
+        } else {
+            None
+        };
+
+        pulls.push(declarations::pull_evidence(target, merges, observation));
+    }
+
+    let mut prerequisites = Vec::new();
+
+    let ids: BTreeSet<_> = view.declarations.targets().into_iter().collect();
+
+    for id in ids {
+        let item = scoped_work(tx, who, &id, now)?;
+
+        prerequisites.push(declarations::PrerequisiteVersion {
+            work_id: id,
+            updated_seq: item.map(|w| w.updated_seq),
+        });
+    }
+
+    Ok(declarations::ReconciliationEvidence {
+        provider: who.owner.identity.provider.clone(),
+        host: who.owner.identity.host.clone(),
+        repository_id: who.repository_id,
+        merge_through: through,
+        merge_floor: floor,
+        sources,
+        pulls,
+        prerequisites,
+    })
+}
+
+fn reconciliation_read(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    item: &WorkItem,
+    now: i64,
+) -> Result<declarations::ReconciliationView> {
+    let view = declaration_view(tx, item)?;
+
+    let evidence = reconciliation_evidence(tx, who, &view, now)?;
+
+    let retained: Option<String> = tx
+        .query_row(
+            "SELECT snapshot FROM hub_work_reconciliation_state WHERE work=?1",
+            [&item.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    Ok(declarations::reconciliation_view(
+        item,
+        &view,
+        &evidence,
+        retained.as_deref().map(json_value).transpose()?,
+    ))
+}
+
+fn declaration_view(tx: &Transaction<'_>, item: &WorkItem) -> Result<WorkDeclarationsView> {
+    let (snapshot, seq): (String, i64) = tx.query_row(
+        "SELECT snapshot,event_seq FROM hub_work_declarations WHERE work=?1",
+        [&item.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let link: Option<String> = tx
+        .query_row(
+            "SELECT snapshot FROM hub_work_pr_links WHERE work=?1",
+            [&item.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let compatibility = link
+        .as_deref()
+        .map(json_value::<WorkPrLink>)
+        .transpose()?
+        .map(|l| l.target);
+    Ok(declarations::view(
+        item,
+        seq,
+        json_value(&snapshot)?,
+        compatibility,
+    ))
 }
 
 fn replace_relations(
@@ -4087,6 +4409,12 @@ fn start_in(
         params![id, who.token, who.owner.id, who.agent, start.session, now],
     )?;
     replace_relations(tx, who, &id, &item.depends_on, &item.related_work)?;
+    let declarations_snapshot = json_string(&WorkDeclarations::legacy(&item))?;
+    tx.execute(
+        "INSERT INTO hub_work_declarations (work,snapshot,event_seq) VALUES (?1,?2,?3)",
+        params![id, declarations_snapshot, seq],
+    )?;
+
     tx.execute(
         "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
          VALUES (?1, ?2, 'active', ?3)",
@@ -4096,7 +4424,8 @@ fn start_in(
     adjust_work_payload_capacity(
         tx,
         who,
-        work_transition_payload_bytes(&snapshot, &event)?,
+        work_transition_payload_bytes(&snapshot, &event)?
+            + work_payload_row_bytes(declarations_snapshot.len())?,
         now,
     )?;
     lapse_reservations(tx, who, &lapsed, &id, now)?;
@@ -4155,7 +4484,7 @@ fn briefing_page(
                AND w.repository_id IS ?4 AND w.id > ?5 AND v.event_seq = (
                    SELECT MAX(v2.event_seq) FROM hub_work_versions v2
                    WHERE v2.work = w.id AND v2.event_seq <= ?6)
-               AND v.state <> 'finished' AND NOT {settled}
+               AND v.state <> 'finished' AND (w.reservation_basis IS NOT NULL OR NOT {settled})
              ORDER BY w.id LIMIT ?7"
         ))?;
         let snapshots = statement
@@ -5137,7 +5466,6 @@ fn touch_in(tx: &Transaction<'_>, who: &Who, call: &Checked, now: i64) -> Result
         name = alias_hook_session(tx, token, observed, now)?;
     }
     guard_managed_touch(tx, who, &name, &call.keys, now)?;
-    renew_leases(tx, token, &name, now)?;
     let mut row = session_row(tx, token, &name)?;
     if row.is_none() && name != DEFAULT_SESSION && call.via.starts_with("hook:") {
         // An agent that called agentscm_start before its first hook keeps that session.
@@ -5276,7 +5604,12 @@ fn touch_in(tx: &Transaction<'_>, who: &Who, call: &Checked, now: i64) -> Result
         append(tx, &event)?;
     }
     let requested = auto_ask(tx, who, &name, &guarded.denied_keys(), now);
-    Ok(guarded.touched(token, &name, announced, notices, handoffs, requested))
+    let lead_notes = identified_lead_notes(tx, token, call, &name, now)?;
+    // After the carry above, so a session whose token changed renews in the same touch.
+    renew_leases(tx, token, &name, now)?;
+    Ok(guarded.touched(
+        token, &name, announced, notices, handoffs, requested, lead_notes,
+    ))
 }
 
 /// Files a handoff request from the session for `key`, if the limits and the holders allow.
@@ -6007,7 +6340,7 @@ impl SqliteStore {
             let mut statement = tx.prepare(&format!(
                 "SELECT w.snapshot, w.reservation_basis IS NOT NULL FROM hub_work_items w
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
-                   AND w.state <> 'finished' AND NOT {settled} ORDER BY w.id LIMIT ?5"
+                   AND w.state <> 'finished' AND (w.reservation_basis IS NOT NULL OR NOT {settled}) ORDER BY w.id LIMIT ?5"
             ))?;
             statement
                 .query_map(
@@ -6029,7 +6362,7 @@ impl SqliteStore {
             &format!(
                 "SELECT COUNT(*) FROM hub_work_items w
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
-                   AND w.state <> 'finished' AND {settled}"
+                   AND w.state <> 'finished' AND w.reservation_basis IS NULL AND {settled}"
             ),
             params![
                 who.owner.identity.provider,
@@ -7673,6 +8006,13 @@ impl Store for SqliteStore {
             .optional()?;
         let previous = match existing {
             Some((_, at, _)) if at > observed_at => return Ok(Observed::Stale),
+            Some((old, at, deleted))
+                if kind == "pull_request" && at == observed_at && (deleted || old != data) =>
+            {
+                tx.execute("UPDATE hub_observations SET data = '{\"state\":\"unknown\",\"observation_conflict\":true}', deleted = 1 WHERE repository = ?1 AND kind = ?2 AND key = ?3", params![repo, kind, key])?;
+                tx.commit()?;
+                return Ok(Observed::Stale);
+            }
             Some((old, _, false)) if old == data => {
                 tx.execute(
                     "UPDATE hub_observations SET observed_at = ?4
@@ -7716,15 +8056,28 @@ impl Store for SqliteStore {
         let repository = repository_by_rep(&tx, repo)?;
         let existing = tx
             .query_row(
-                "SELECT observed_at, deleted FROM hub_observations
+                "SELECT observed_at, deleted, data FROM hub_observations
                  WHERE repository = ?1 AND kind = ?2 AND key = ?3",
                 params![repo, kind, key],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
         let gone = match existing {
-            Some((at, _)) if at > observed_at => return Ok(false),
-            Some((_, deleted)) => deleted,
+            Some((at, _, _)) if at > observed_at => return Ok(false),
+            Some((at, deleted, old))
+                if kind == "pull_request" && at == observed_at && (!deleted || old != data) =>
+            {
+                tx.execute("UPDATE hub_observations SET data = '{\"state\":\"unknown\",\"observation_conflict\":true}', deleted = 1 WHERE repository = ?1 AND kind = ?2 AND key = ?3", params![repo, kind, key])?;
+                tx.commit()?;
+                return Ok(false);
+            }
+            Some((_, deleted, _)) => deleted,
             // Never seen: leave a marker so an older read cannot add it later.
             None => true,
         };
@@ -7748,6 +8101,19 @@ impl Store for SqliteStore {
         Ok(self.conn().query_row(
             "SELECT kind,key,data,observed_at FROM hub_observations WHERE repository=?1 AND kind=?2 AND key=?3 AND deleted=0",
             params![repo,kind,key], |row| Ok(Observation {kind:row.get(0)?,key:row.get(1)?,data:row.get(2)?,observed_at:row.get(3)?})
+        ).optional()?)
+    }
+
+    fn observation_retained(
+        &self,
+        repo: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<(Observation, bool)>> {
+        observation_kinds(kind)?;
+        Ok(self.conn().query_row(
+            "SELECT kind,key,data,observed_at,deleted FROM hub_observations WHERE repository=?1 AND kind=?2 AND key=?3",
+            params![repo,kind,key], |row| Ok((Observation {kind:row.get(0)?,key:row.get(1)?,data:row.get(2)?,observed_at:row.get(3)?}, row.get(4)?))
         ).optional()?)
     }
 
@@ -8780,6 +9146,34 @@ impl Store for SqliteStore {
         )?)
     }
 
+    fn catchup_merges_for_pull(
+        &self,
+        scope: &CatchupRepositoryScope,
+        pull_number: i64,
+    ) -> Result<Vec<CatchupMergeObservation>> {
+        scope.validate()?;
+        if pull_number < 1 {
+            return Err(HubError::Invalid("pull number must be positive".into()));
+        }
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
+            WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 AND pull_number=?5
+            ORDER BY merge_commit COLLATE BINARY LIMIT 17"
+        ))?;
+        let rows = statement.query_map(
+            params![
+                scope.provider,
+                scope.host,
+                repository_namespace(&scope.repository, scope.repository_id),
+                catchup_repository_key(scope.repository_id),
+                pull_number
+            ],
+            sqlite_catchup_merge_row,
+        )?;
+        rows.map(|row| sqlite_catchup_merge(row?)).collect()
+    }
+
     fn record_catchup_source_status(
         &self,
         scope: &CatchupRepositoryScope,
@@ -8988,12 +9382,12 @@ impl Store for SqliteStore {
                 item.generation
             )));
         }
-        if item.lead_token != token || item.lead_session != checkpoint.session {
-            return Err(HubError::Invalid(
-                "only the current lead session may checkpoint work".into(),
-            ));
-        }
-        renew_leases(&tx, token, &checkpoint.session, now)?;
+        let carry = match lead_access(&item, &who.owner.id, token, &who.agent, &checkpoint.session)
+        {
+            LeadAccess::Current => false,
+            LeadAccess::Carry => true,
+            LeadAccess::Refuse { message } => return Err(HubError::Invalid(message)),
+        };
         let prior_basis = work_reservation_basis(&tx, &item.id)?;
         let held = prior_basis.is_some();
         if !held {
@@ -9092,6 +9486,13 @@ impl Store for SqliteStore {
                 });
             }
         }
+        if carry {
+            // The sequence check above used the seq from before this bump.
+            // A refused checkpoint returns before this point and writes nothing.
+            carry_lead_credential(&tx, &who, &mut item, now)?;
+        }
+        // After a carry the lead token is the caller's, so the renewal follows the credential.
+        renew_leases(&tx, token, &checkpoint.session, now)?;
         let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
         let referenced = checkpoint
             .source_refs
@@ -9538,6 +9939,250 @@ impl Store for SqliteStore {
         let item = scoped_work(&tx, &who, id, now)?;
         tx.commit()?;
         Ok(item)
+    }
+
+    fn work_reconciliation_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<declarations::ReconciliationView>> {
+        super::work::validate_id("work", id, "wrk")?;
+
+        let mut conn = self.conn();
+
+        let tx = conn.transaction()?;
+
+        let who = work_who(&tx, token, now)?;
+
+        let Some(item) = scoped_work(&tx, &who, id, now)? else {
+            return Ok(None);
+        };
+
+        let view = reconciliation_read(&tx, &who, &item, now)?;
+
+        tx.commit()?;
+
+        Ok(Some(view))
+    }
+
+    fn work_reconciliation_apply(
+        &self,
+        token: &str,
+        update: &declarations::ReconciliationApply,
+        now: i64,
+    ) -> Result<declarations::ReconciliationResult> {
+        update.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        };
+        let request = json_string(&json!({
+        "operation":"work_reconciliation","update":update}
+        ))?;
+        let mut item = scoped_work(&tx, &who, &update.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        let sql = "SELECT o.request,v.snapshot,o.event_seq FROM hub_work_checkpoint_ops o
+            JOIN hub_work_versions v ON v.work=o.work AND v.event_seq=o.event_seq
+            WHERE o.work=?1 AND o.operation_id=?2";
+        let previous = tx
+            .query_row(sql, params![item.id, update.operation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()?;
+        if let Some((previous, snapshot, seq)) = previous {
+            if previous != request {
+                return Err(HubError::Invalid(
+                    "operation_id was already used for another request".into(),
+                ));
+            }
+            let committed: WorkItem = json_value(&snapshot)?;
+            update.authorize(&who, &committed)?;
+            let view = reconciliation_read(&tx, &who, &item, now)?;
+            tx.commit()?;
+            return Ok(declarations::ReconciliationResult {
+                view,
+                receipt: CheckpointReceipt {
+                    work_id: item.id,
+                    operation_id: update.operation_id.clone(),
+                    generation: committed.generation,
+                    event_seq: seq,
+                    replayed: true,
+                },
+            });
+        }
+        update.authorize(&who, &item)?;
+        let declared = declaration_view(&tx, &item)?;
+        if item.updated_seq != update.expected_updated_seq
+            || declared.declaration_seq != update.declaration_seq
+        {
+            return Err(HubError::Invalid(
+                "Work or declarations changed; reread before reconciliation".into(),
+            ));
+        };
+        let evidence = reconciliation_evidence(&tx, &who, &declared, now)?;
+        let basis: Option<String> = tx.query_row(
+            "SELECT reservation_basis FROM hub_work_items WHERE id=?1",
+            [&item.id],
+            |r| r.get(0),
+        )?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT snapshot FROM hub_work_reconciliation_state WHERE work=?1",
+                [&item.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let prior_bytes = stored_work_item_bytes(&tx, &item.id)?;
+        let mut evaluated = declarations::evaluate(&item, &declared, evidence, basis.as_deref());
+        let mut event = Event::new(
+            "work_pr_link",
+            &item.id,
+            json!({
+            "operation":"reconciliation_applied","generation":item.generation,"owner":item.owner,"repository":item.repository,"evidence_digest":evaluated.evidence_digest,"reassessments":evaluated.reassessments,"conditions":evaluated.conditions,"reservation_disposition":evaluated.reservation_disposition}
+            ),
+        )?;
+        event.at = now;
+        let seq = append(&tx, &event)?;
+        item.updated_seq = seq;
+        item.updated_at = now;
+        evaluated.work_seq = seq;
+        let snapshot = json_string(&evaluated)?;
+        if snapshot.len() > 131072 {
+            return Err(HubError::Invalid(
+                "reconciliation evidence exceeds bounded snapshot capacity".into(),
+            ));
+        };
+        let work_snapshot = save_work_version(&tx, &item, seq)?;
+        tx.execute("INSERT INTO hub_work_reconciliation_state(work,snapshot) VALUES (?1,?2) ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",params![item.id,snapshot])?;
+        tx.execute("INSERT INTO hub_work_checkpoint_ops(work,operation_id,request,event_seq) VALUES (?1,?2,?3,?4)",params![item.id,update.operation_id,request,seq])?;
+        let delta = work_transition_payload_bytes(&work_snapshot, &event)?
+            .checked_sub(prior_bytes)
+            .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
+            .and_then(|v| v.checked_add(work_payload_row_bytes(snapshot.len()).ok()?))
+            .and_then(|v| {
+                v.checked_sub(
+                    old.as_ref()
+                        .map_or(Some(0), |s| work_payload_row_bytes(s.len()).ok())?,
+                )
+            })
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        let view = reconciliation_read(&tx, &who, &item, now)?;
+        tx.commit()?;
+        Ok(declarations::ReconciliationResult {
+            view,
+            receipt: CheckpointReceipt {
+                work_id: item.id,
+                operation_id: update.operation_id.clone(),
+                generation: update.generation,
+                event_seq: seq,
+                replayed: false,
+            },
+        })
+    }
+    fn work_declarations_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<WorkDeclarationsView>> {
+        super::work::validate_id("work", id, "wrk")?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let Some(item) = scoped_work(&tx, &who, id, now)? else {
+            return Ok(None);
+        };
+        let view = declaration_view(&tx, &item)?;
+        tx.commit()?;
+        Ok(Some(view))
+    }
+
+    fn work_declarations_set(
+        &self,
+        token: &str,
+        update: &WorkDeclarationsUpdate,
+        now: i64,
+    ) -> Result<WorkDeclarationsResult> {
+        update.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let repository_id = work_links::trusted_repository_id(&who)?;
+        let normalized = update
+            .declarations
+            .normalized(repository_id, &update.work_id)?;
+        let mut canonical = update.clone();
+        canonical.declarations = normalized;
+        let request = json_string(&json!({"operation":"work_declarations", "update":canonical}))?;
+        let mut item = scoped_work(&tx, &who, &update.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        if let Some((previous,snapshot,seq))=tx.query_row(
+            "SELECT o.request,v.snapshot,o.event_seq FROM hub_work_checkpoint_ops o JOIN hub_work_versions v ON v.work=o.work AND v.event_seq=o.event_seq WHERE o.work=?1 AND o.operation_id=?2",
+            params![item.id,update.operation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).optional()? {
+            if previous!=request {return Err(HubError::Invalid("operation_id was already used for another request".into()));}
+            let committed:WorkItem=json_value(&snapshot)?; update.authorize(&who,&committed)?;
+            let view=declaration_view(&tx,&item)?; tx.commit()?;
+            return Ok(WorkDeclarationsResult {view,receipt:CheckpointReceipt{work_id:item.id,operation_id:update.operation_id.clone(),generation:committed.generation,event_seq:seq,replayed:true}});
+        }
+        update.authorize(&who, &item)?;
+        update.check_current(&item)?;
+        relation_targets(&tx, &who, &canonical.declarations.targets())?;
+        let (old, declaration_seq): (String, i64) = tx.query_row(
+            "SELECT snapshot,event_seq FROM hub_work_declarations WHERE work=?1",
+            [&item.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let old_declarations: WorkDeclarations = json_value(&old)?;
+        if declaration_seq > 0 && old_declarations == canonical.declarations {
+            return Err(HubError::Invalid("declarations are unchanged".into()));
+        }
+        let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
+        item.updated_at = now;
+        let mut event = Event::new(
+            "work_pr_link",
+            &item.id,
+            json!({"operation":"declarations_set","generation":item.generation,"owner":item.owner,"repository":item.repository,"repository_id":repository_id,"declarations":canonical.declarations,"author":who.owner.id,"agent":who.agent,"session":update.session}),
+        )?;
+        event.at = now;
+        let seq = append(&tx, &event)?;
+        item.updated_seq = seq;
+        let snapshot = save_work_version(&tx, &item, seq)?;
+        let declared = json_string(&canonical.declarations)?;
+        tx.execute(
+            "UPDATE hub_work_declarations SET snapshot=?2,event_seq=?3 WHERE work=?1",
+            params![item.id, declared, seq],
+        )?;
+        tx.execute("INSERT INTO hub_work_checkpoint_ops (work,operation_id,request,event_seq) VALUES (?1,?2,?3,?4)",params![item.id,update.operation_id,request,seq])?;
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
+            .and_then(|v| v.checked_add(work_payload_row_bytes(declared.len()).ok()?))
+            .and_then(|v| v.checked_sub(work_payload_row_bytes(old.len()).ok()?))
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        let view = declaration_view(&tx, &item)?;
+        tx.commit()?;
+        Ok(WorkDeclarationsResult {
+            view,
+            receipt: CheckpointReceipt {
+                work_id: item.id,
+                operation_id: update.operation_id.clone(),
+                generation: update.generation,
+                event_seq: seq,
+                replayed: false,
+            },
+        })
     }
 
     fn work_pr_link_get(
@@ -12821,7 +13466,7 @@ impl Store for SqliteStore {
                  JOIN hub_work_items w ON w.id = e.subject
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at < ?5
-                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
+                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
                    AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                    AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                 params![
@@ -12839,7 +13484,7 @@ impl Store for SqliteStore {
                      JOIN hub_work_items w ON w.id = e.subject
                      WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                        AND w.repository_id IS ?4 AND e.at < ?5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)
                  )",

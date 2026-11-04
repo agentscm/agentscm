@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use super::work::{CheckpointKind, ClaimStatus, WorkItem, WorkState};
 
-/// 2 adds the reservation lease to `activity`.
-pub(super) const SCHEMA_VERSION: u16 = 2;
+/// Version 1 of the reports that embed these types without `activity`, such as reconciliation.
+pub(super) const SCHEMA_VERSION_V1: u16 = 1;
+/// The operational projection's version: 2 added the reservation lease to `activity`.
+pub(super) const OPERATIONAL_SCHEMA_VERSION: u16 = 2;
 /// A reservation lapses this long after its lead session last renewed it.
 pub const LEASE_SECONDS: i64 = 1200;
 /// A `retain` keeps the reservation at most this long without lead activity.
@@ -463,7 +465,7 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
     }
     let unknown: Vec<String> = unknown.into_iter().collect();
     WorkOperationalV1 {
-        schema_version: SCHEMA_VERSION,
+        schema_version: OPERATIONAL_SCHEMA_VERSION,
         work_id: item.id.clone(),
         state: item.state,
         generation: item.generation,
@@ -536,7 +538,7 @@ pub(super) fn operational_overview(
     let truncated = work.len() > MAX_OPERATIONAL_WORK;
     work.truncate(MAX_OPERATIONAL_WORK);
     OperationalOverviewV1 {
-        schema_version: SCHEMA_VERSION,
+        schema_version: OPERATIONAL_SCHEMA_VERSION,
         work,
         complete: !more && !truncated,
     }

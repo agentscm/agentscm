@@ -471,6 +471,8 @@ pub trait Store: Send + Sync {
     /// Sync reads this once per repository and process to seed its monotonic read clock.
     fn observation_floor(&self, repo: &str) -> Result<i64>;
     /// Record what a read of the forge (started at `observed_at`, unix ms) showed.
+    /// Conflicting pull-request reads at one timestamp retain an unknown tombstone until
+    /// a strictly newer observation. Exact equal replay is unchanged.
     fn observe(
         &self,
         repo: &str,
@@ -493,6 +495,14 @@ pub trait Store: Send + Sync {
     ) -> Result<bool>;
     /// Read one current observation by its exact key, independent of list pagination.
     fn observation(&self, repo: &str, kind: &str, key: &str) -> Result<Option<Observation>>;
+    /// Exact retained observation including a tombstone. The boolean is true when forgotten;
+    /// a tombstone does not by itself establish that a pull request closed unmerged.
+    fn observation_retained(
+        &self,
+        repo: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<(Observation, bool)>>;
     /// Present (not forgotten) observations of `kind`, ordered by key, at most 1000.
     fn observations(&self, repo: &str, kind: &str) -> Result<Vec<Observation>>;
     /// Drops forgotten markers last read before `before` (unix ms); no event. Returns how many.
@@ -696,6 +706,13 @@ pub trait Store: Send + Sync {
         pull_number: i64,
         merge_commit: Option<&str>,
     ) -> Result<bool>;
+    /// Exact retained provider merge facts for this PR, ordered by merge commit. At most 17;
+    /// 17 means the caller must treat evidence as incomplete rather than infer a single head.
+    fn catchup_merges_for_pull(
+        &self,
+        scope: &CatchupRepositoryScope,
+        pull_number: i64,
+    ) -> Result<Vec<CatchupMergeObservation>>;
     fn record_catchup_source_status(
         &self,
         scope: &CatchupRepositoryScope,
@@ -731,6 +748,34 @@ pub trait Store: Send + Sync {
         update: &WorkPrLinkUpdate,
         now: i64,
     ) -> Result<WorkPrLinkResult>;
+    /// Read retained reconciliation and expose it as current only while its facts still match.
+    fn work_reconciliation_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_reconciliation::ReconciliationView>>;
+    /// Persist server-read evidence with Work/declaration fences and an idempotent receipt.
+    fn work_reconciliation_apply(
+        &self,
+        token: &str,
+        request: &super::work_reconciliation::ReconciliationApply,
+        now: i64,
+    ) -> Result<super::work_reconciliation::ReconciliationResult>;
+    /// Read durable declarations without modifying legacy checkpoint relations.
+    fn work_declarations_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_reconciliation::WorkDeclarationsView>>;
+    /// Replace durable declarations as the fenced lead, with an idempotent receipt.
+    fn work_declarations_set(
+        &self,
+        token: &str,
+        update: &super::work_reconciliation::WorkDeclarationsUpdate,
+        now: i64,
+    ) -> Result<super::work_reconciliation::WorkDeclarationsResult>;
     /// Release, retain, finish or reopen Work as its lead, owner or an administrator. One
     /// transaction, idempotent by `operation_id`, fenced by generation and `updated_seq`.
     fn work_transition(

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use super::lead_credential::LEAD_SESSION_MISMATCH;
 use super::login::{Login, LoginConfig};
 use super::session::SESSION_REQUIRED;
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
@@ -314,7 +315,9 @@ impl ApiError {
 impl From<HubError> for ApiError {
     fn from(error: HubError) -> Self {
         match error {
-            HubError::Invalid(message) if message == SESSION_REQUIRED => {
+            HubError::Invalid(message)
+                if message == SESSION_REQUIRED || message.starts_with(LEAD_SESSION_MISMATCH) =>
+            {
                 Self::invalid().with_message(message)
             }
             HubError::Invalid(detail) => {

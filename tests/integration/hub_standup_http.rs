@@ -577,8 +577,8 @@ fn billing(key: &str, session: &str) -> Value {
         "scope": ["src/billing.rs"], "branch": "feat/billing", "next_action": "Continue"})
 }
 
-/// Work hidden by a merged pull request still holds its scope: it stays out of `current`, is
-/// listed in `operational`, and a conflicting start sees it marked, with nothing altered.
+/// Merged Work that still holds its scope stays in `current`. The opt-in `operational` field
+/// adds evidence and reservation details without changing that visibility or strict decoding.
 async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
     let (lead_id, lead) = hub.token(1, "acme/widgets", false).await;
     let (_, other) = hub.token(2, "acme/widgets", false).await;
@@ -602,10 +602,11 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
     assert_eq!(status, 200, "{plain}");
     assert!(plain.get("operational").is_none(), "{plain}");
     let strict: WorkOverview = serde_json::from_value(plain.clone()).unwrap();
-    assert!(strict.current.is_empty());
-    assert_eq!(strict.settled_count, 1);
+    assert_eq!(strict.current.len(), 1);
+    assert_eq!(strict.current[0].id, id);
+    assert_eq!(strict.settled_count, 0);
 
-    // With it, the hidden Work is listed with its state, outcome and reservation unaltered.
+    // With it, the visible Work gains details with its state, outcome and reservation unaltered.
     let (status, rich) = hub
         .call(
             Method::GET,
@@ -642,7 +643,7 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
         );
     }
 
-    // A conflicting start: the conflict names the hidden Work only on request.
+    // A conflicting start always names the holder; operational details remain opt-in.
     let (status, bare) = hub
         .call(
             Method::POST,

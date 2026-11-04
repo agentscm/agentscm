@@ -21,6 +21,7 @@ pub mod hook;
 pub mod http;
 pub mod insights;
 pub mod intent;
+mod lead_credential;
 pub mod local_ci_devices;
 pub mod login;
 pub mod mcp;
@@ -51,6 +52,8 @@ pub mod work_http;
 pub mod work_lifecycle;
 pub mod work_links;
 pub mod work_preflight;
+pub mod work_reconcile;
+pub mod work_reconciliation;
 pub mod work_transition;
 pub mod workspace;
 #[cfg(unix)]

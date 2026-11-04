@@ -21,6 +21,7 @@ import { usePoll, type Poll } from '../usePoll.ts'
 import { localCredential } from '../localApi.ts'
 import { onFrontDoor } from '../frontDoor.ts'
 import { IntentReviewPanel } from '../IntentReviewPanel.tsx'
+import { WorkReconciliation } from '../WorkReconciliation.tsx'
 import { WorkPrContext } from '../WorkPrContext.tsx'
 import { ClaimPill, lead, Source, StatePill, WorkLink } from './workParts.tsx'
 
@@ -166,6 +167,7 @@ function Task({ item, token, overview, handoff, refreshWork }: { item: WorkItem;
         </Box>
       )}
       {quiet && needSteps.length === 0 && <Notice title={item.claim_status === 'stale' ? 'No recent check-in' : 'Check-in unknown'}>{STILL_ASSIGNED}</Notice>}
+      <WorkReconciliation item={item} token={token} refreshWork={refreshWork} />
       <div className="action-grid is-two">
         <div>
           <span className="label">

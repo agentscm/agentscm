@@ -176,6 +176,8 @@ mod hub_work;
 #[cfg(unix)]
 mod hub_work_auto_compaction;
 #[cfg(unix)]
+mod hub_work_reconcile;
+#[cfg(unix)]
 mod hub_workflow;
 #[cfg(unix)]
 mod hub_workspace;

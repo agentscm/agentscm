@@ -6,9 +6,8 @@ title: "Design: Work outcomes and scope reservations"
 
 > **Status: design for issue #310; the rules, store operations, routes and MCP tool are in the
 > tree.** Nothing here is a released capability until the change has merged. Not part of this
-> change: forge reconciliation (#312), a harness preview and apply flow (#313), status
-> relabeling (#315) and claim repair (#316). Liveness leases on every reservation (part of #311)
-> are section 8; renewal on every tool call is not yet built.
+> change: a harness preview and apply flow (#313), status relabeling (#315) and claim repair
+> (#316). Liveness leases on every reservation (#311) are section 8.
 
 Today `WorkState::Finished` is both the end of the Work and the release of its scope. Two things
 are mixed: why the Work ended, and whether it still blocks other agents. This design separates them.
@@ -71,6 +70,22 @@ Actors:
 
 Anything else, and any read-only token, is unauthorized. A revoked or expired lead token does not
 block the owner or an administrator. The actor is recorded as itself and never written as the lead.
+
+The same owner and the same session keep the lead when the presented token or agent label changes.
+That carry updates `lead_token` and `lead_agent` in one transaction, appends `work_lead_credential`,
+and leaves the generation where it is. The event names the session and the previous and new agent
+labels. It carries no token id. A different owner is refused with `LEAD_SESSION_MISMATCH` and
+learns nothing about the lead. The same owner on a different session gets that code, the recorded
+lead agent and session, and the takeover call: `agentscm_start` with `work_id` and the current
+`takeover_generation`. HTTP and MCP pass the code, and any message that starts with it, through
+the way they pass `SESSION_REQUIRED`. Carry runs on checkpoint and on a session touch that
+identified the session, either by naming it or by arriving through a hook. An omitted MCP session
+does not carry, including when session resolution would land on the lead session. Before the touch
+heals the credential, startup context and `agentscm_status` say so, for the same owner only. The
+touch bumps `updated_seq`, so the next checkpoint sends that newer seq. A checkpoint compares
+`expected_updated_seq` before it carries, and a refused checkpoint writes nothing. Generation
+fencing and session resolution stay as they are. This is not a lease. A later renewal that matches
+`lead_token` and `lead_session` still matches, because the carry writes both of those fields.
 
 | Transition | Allowed from | Lead | Owner | Admin | Effect |
 |---|---|---|---|---|---|
@@ -183,7 +198,7 @@ the list of `unknown` field names).
 
 `actionable` is derived from stored facts only (state, reservation, merge observation), so the only
 field that follows the request clock is `freshness`. Finished Work and Work with no reservation name
-no recipient. A held reservation hidden by a merged pull request, or held by paused or handed-over
+no recipient. A held reservation with a legacy merged-branch observation, or held by paused or handed-over
 Work, names the owner. A held reservation on active or blocked Work names the lead. The reason says
 which in plain words. `completeness.unknown` also lists `freshness` when the claim status is unknown
 and `outcome_provenance` when a stated outcome has no surviving event that says who stated it.
@@ -203,7 +218,7 @@ operational projection (outcome and provenance). The Hub records no completion o
 
 Delivery without breaking strict older decoders: `GET /v1/hub/standup/work/{id}/operational`;
 `GET /v1/hub/standup/operational` for every reservation-holding Work in the repository including
-Work hidden by a merged pull request, ordered by id, at most 100, with a `complete` flag. `WorkOverview`
+merged Work that still holds scope, ordered by id, at most 100, with a `complete` flag. `WorkOverview`
 itself is unchanged; the HTTP and MCP surfaces add an `operational` key to its JSON (the projection of every
 reservation-holding Work). `WorkStartConflict` and `WorkPreflightResult` gain an `operational` list of the
 overlapping Work, skipped when empty. Over HTTP all of these are filled only when the request carries
@@ -230,6 +245,10 @@ user-facing recovery. The UI only renders the new event kind in history.
   so rolling the server back requires restoring a backup taken before the migration.
 - Older CLIs that send a start or checkpoint keep working. Taking over finished Work is now refused
   for every client, and the error names reopen.
+
+## Reconciliation visibility
+
+Issue #312 keeps every held reservation visible in overview and briefing pages. The legacy `hidden_by_merged_pr` operational field retains the old heuristic observation for strict compatibility; it does not mean a held reservation is now hidden. Durable reconciliation uses explicit stable-repository PR/head conditions, retains owner-controlled reservation disposition and existing authorized remedies, and never changes outcome or reservation from a merge alone. See [Work reconciliation](work-reconciliation.md).
 
 ## 8. Liveness leases
 

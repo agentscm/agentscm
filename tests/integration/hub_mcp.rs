@@ -556,6 +556,10 @@ async fn protocol_basics() {
             "agentscm_pr_context",
             "agentscm_work_pr_link",
             "agentscm_work_pr_link_set",
+            "agentscm_work_declarations",
+            "agentscm_work_declarations_set",
+            "agentscm_work_reconciliation",
+            "agentscm_work_reconciliation_apply",
             "agentscm_shared_conversation",
             "agentscm_work_insight",
             "agentscm_work_insights",
@@ -2498,7 +2502,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (40, 43, 48));
+    assert_eq!((before.len(), listed.len(), all.len()), (44, 47, 52));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
@@ -3010,4 +3014,165 @@ async fn a_same_lead_start_on_released_work_is_not_ready_for_work() {
     let step = content["alternatives"][0].as_str().unwrap();
     assert!(step.contains("If it is your owner's Work"), "{step}");
     assert!(step.contains("otherwise ask its owner"), "{step}");
+}
+
+#[tokio::test]
+async fn durable_reconciliation_mcp_http_reads_share_state_and_never_apply() {
+    let hub = Hub::start().await;
+    let owner = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 942,
+            },
+            "synthetic-reconcile",
+        )
+        .unwrap();
+    let (id, secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &owner.id,
+        "durable-lead",
+        REPO,
+        100,
+        3600,
+        false,
+    )
+    .unwrap();
+    let (_, reader, _) = mint_bound_agent_token(
+        &*hub.store,
+        &owner.id,
+        "durable-reader",
+        REPO,
+        100,
+        3600,
+        true,
+    )
+    .unwrap();
+    let mut start=hub.store.work_start(&id,&serde_json::from_value(json!({"request_key":"durable-mcp","title":"Durable task","session":"test-session"})).unwrap(),unix_now()).unwrap();
+    let declaration_request = json!({"work_id":start.item.id,"operation_id":"declare-http","generation":start.item.generation,"session":"test-session","expected_updated_seq":start.item.updated_seq,"declarations":{"links":[{"id":"partial-one","target":{"repository_id":100,"number":9,"head_sha":"a".repeat(40)}}],"prerequisites":[]}});
+    let declared = hub
+        .client
+        .post(format!("{}/v1/hub/standup/declarations", hub.base))
+        .bearer_auth(secret.expose())
+        .header("content-type", "application/json")
+        .body(declaration_request.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(declared.status(), 200);
+    start.item = hub
+        .store
+        .work_get(&id, &start.item.id, unix_now())
+        .unwrap()
+        .unwrap();
+    let args = json!({"work_id":start.item.id});
+    for name in ["agentscm_work_declarations", "agentscm_work_reconciliation"] {
+        let reply = hub.tool_result(reader.expose(), name, args.clone()).await;
+        assert_ne!(reply["isError"], true, "{reply}");
+        assert_eq!(
+            reply["structuredContent"]["view"]["updated_seq"],
+            start.item.updated_seq
+        );
+        assert_eq!(
+            hub.store
+                .work_get(&id, &start.item.id, unix_now())
+                .unwrap()
+                .unwrap()
+                .updated_seq,
+            start.item.updated_seq
+        );
+    }
+    let declaration = hub
+        .store
+        .work_declarations_get(&id, &start.item.id, unix_now())
+        .unwrap()
+        .unwrap();
+    let request = json!({"work_id":start.item.id,"operation_id":"apply-durable","generation":start.item.generation,"session":"test-session","expected_updated_seq":start.item.updated_seq,"declaration_seq":declaration.declaration_seq});
+    let call = |name: &str, arguments: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+    assert_eq!(
+        hub.rpc(
+            reader.expose(),
+            &call("agentscm_work_reconciliation_apply", request.clone())
+        )
+        .await
+        .status,
+        403
+    );
+    let http_apply = hub
+        .client
+        .post(format!("{}/v1/hub/standup/reconciliation", hub.base))
+        .bearer_auth(secret.expose())
+        .header("content-type", "application/json")
+        .body(request.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(http_apply.status(), 200);
+    let apply = hub
+        .tool_result(
+            secret.expose(),
+            "agentscm_work_reconciliation_apply",
+            request.clone(),
+        )
+        .await;
+    assert_ne!(apply["isError"], true, "{apply}");
+    let read = hub
+        .tool_result(reader.expose(), "agentscm_work_reconciliation", args)
+        .await;
+    let response = hub
+        .client
+        .get(format!(
+            "{}/v1/hub/standup/work/{}/reconciliation-v2",
+            hub.base, start.item.id
+        ))
+        .bearer_auth(reader.expose())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let http: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(
+        read["structuredContent"]["view"]["current"]["conditions"],
+        http["current"]["conditions"]
+    );
+    assert_eq!(
+        read["structuredContent"]["view"]["current"]["reservation_disposition"],
+        http["current"]["reservation_disposition"]
+    );
+    assert_eq!(
+        read["structuredContent"]["view"]["current"]["next_action"],
+        http["current"]["next_action"]
+    );
+    assert_eq!(read["structuredContent"]["evidence_omitted"], true);
+    let retry = hub
+        .tool_result(
+            secret.expose(),
+            "agentscm_work_reconciliation_apply",
+            request,
+        )
+        .await;
+    assert_eq!(
+        retry["structuredContent"]["view"]["receipt"]["replayed"],
+        true
+    );
+    let list = hub
+        .rpc(
+            reader.expose(),
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .await
+        .json();
+    let names = list["result"]["tools"].as_array().unwrap();
+    assert!(
+        names
+            .iter()
+            .any(|v| v["name"] == "agentscm_work_reconciliation")
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|v| v["name"] == "agentscm_work_reconciliation_apply")
+    );
 }

@@ -622,6 +622,7 @@ mod tests {
             rate_limited: false,
             handoffs: Vec::new(),
             requested: Vec::new(),
+            lead_notes: Vec::new(),
         }
     }
 
