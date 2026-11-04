@@ -59,31 +59,32 @@ After each phase, verify that `HEAD` advanced, the commit matches the assigned s
 
 Propagate corrected reconnaissance to every later phase. If a late structural fork appears, choose the option most consistent with documented behavior only when compatibility and scope remain unchanged; otherwise stop and ask the user.
 
-## Phase 5: Whole-branch validation
+## Phase 5: Whole-branch pre-push checks
 
-Complete the final whole-branch repository gate:
+Run the pre-push checks for the whole branch:
+
+Always run `git diff --check`. For Rust, manifest, toolchain, or build-related changes, also run:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo nextest run --locked
-cargo test --locked --doc
-git diff --check
 ```
 
-When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`; when the container image or its inputs change, also run `docker build -t agentscm . && .github/docker-smoke.sh agentscm`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite before pushing; the PR gate phase attests the final head, including when there is no signing key.
 
-Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
+When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Run `.github/hub-e2e.sh default` when `compose.hub.yaml`, `.github/compose.e2e.yaml`, `.github/hub-e2e.sh`, `examples/hub_seed.rs` or the Dockerfile's `e2e-seed` stages change; the `postgres` profile runs only in the hosted `Hub end-to-end` workflow, so when a change could affect it, report it as not run locally and request `ci-extended`. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
 
-Also run focused synthetic CLI or integration checks identified during reconnaissance when they materially test behavior not covered by the suite. Choose focused tests from the actual changed behavior, its callers and failure paths; these iteration checks do not replace the final whole-branch gate. Do not use real credentials, private documents, production systems, or untrusted repository code with ambient credentials.
+Applicable reviews remain required. Runner or test-configuration changes require the full nextest suite and doctests, which the attestation provides.
 
-If a check fails because of the branch, send the exact failure to one fresh correction subagent on a fast, cost-efficient model, then rerun the full gate. If that coding correction fails, use one fresh correction subagent on a high-capability model, for the second and final attempt. Allow at most two correction attempts. If a prerequisite or external artifact is unavailable, record the resulting coverage limit; never convert it into a pass.
+Also run focused synthetic CLI or integration checks identified during reconnaissance when they materially test behavior not covered by the suite. Choose focused tests from the actual changed behavior, its callers and failure paths; focused checks do not replace the attestation of the final head. Do not use real credentials, private documents, production systems, or untrusted repository code with ambient credentials.
+
+If a check fails because of the branch, send the exact failure to one fresh correction subagent on a fast, cost-efficient model, then rerun the focused checks. If that coding correction fails, use one fresh correction subagent on a high-capability model, for the second and final attempt. Allow at most two correction attempts. If a prerequisite or external artifact is unavailable, record the resulting coverage limit; never convert it into a pass.
 
 ## Phase 6: Independent review
 
 Launch a fresh reviewer on a high-capability model, that did not implement any phase. Give it the concrete issue contract, changed-file list, commit range, and the review criteria from `.agents/commands/review.md`. Require it to inspect every changed file and return severity-ranked findings with `path:line`, reasoning, and proposed action, plus check results and limitations.
 
-Verify each finding against the current code. Delegate every valid, actionable fix to a fresh correction subagent on a fast, cost-efficient model, then rerun the complete gate and repeat independent review. If a coding correction fails, route its retry to a fresh correction subagent on a high-capability model. Stop if the same correction fails twice. A review pass count is not a reason to stop while every remaining finding is an actionable fix. Continue correction, validation, and independent review until no material findings remain.
+Verify each finding against the current code. Delegate every valid, actionable fix to a fresh correction subagent on a fast, cost-efficient model, then rerun the focused checks and repeat independent review. If a coding correction fails, route its retry to a fresh correction subagent on a high-capability model. Stop if the same correction fails twice. A review pass count is not a reason to stop while every remaining finding is an actionable fix. Continue correction, validation, and independent review until no material findings remain.
 
 Resolve a truly structural ambiguity with the user only when repository conventions and the documented issue contract do not provide a safe answer. Otherwise choose the most consistent option, record the assumption, and continue without human intervention. Stop only when the same correction fails twice, a structural fork cannot be resolved without materially changing the requested contract, or required external state or authority is unavailable.
 
@@ -111,4 +112,4 @@ Confirm the branch is clean and summarize:
 - evidence obtained in each evidence class;
 - remaining limitations or user-only verification.
 
-Follow `.agents/commands/pr.md`, push the feature branch, open its pull request, and report the URL. The `/implement` invocation already authorizes this phase. Never merge or enable auto-merge.
+Follow `.agents/commands/pr.md`, push the feature branch, open its pull request, attest the final head as its step 11 requires, and report the URL. If the attestation fails because of the branch, the failure first appears after review: send it back through the Phase 5 correction limits and the Phase 6 independent review, then push the new head and attest it. A failure shown to be unrelated to the change follows the evidence rule in `pr.md` step 11. The `/implement` invocation already authorizes this phase. Never merge or enable auto-merge.

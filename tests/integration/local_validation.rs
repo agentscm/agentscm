@@ -981,7 +981,7 @@ fn repository_policy_and_recipe_keep_their_canonical_bytes() {
     let policy = ValidationPolicy::from_slice(&policy_bytes).unwrap();
     assert_eq!(
         recipe.sha256().unwrap(),
-        "785f621dac4fec9c34fd23d201ac4a7de164ff769280dba72b9a3c9d656240ef"
+        "15bb5b011dd1abf9de64a277271d3f452589a0bf51bad556e7e1e6c7499eb83c"
     );
     assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
     assert_eq!(
@@ -1185,41 +1185,61 @@ mod scoped {
             "../../.github/local-validation/recipe.json"
         ))
         .unwrap();
-        let cases: &[(&str, &[&str])] = &[
-            ("src/a.rs", &[]),
-            (
-                "ui/src/example.tsx",
-                &["ui-install", "ui-lint", "ui-build", "ui-notices"],
-            ),
-            ("install.sh", &["shellcheck", "npm-installer"]),
-            (
-                "docs/example.md",
-                &["docs-install", "docs-audit", "docs-build", "docs-check"],
-            ),
-            (".github/workflows/zizmor.yml", &["workflow-lint"]),
-            ("tools/portable-verifier/Cargo.lock", &["deny-portable"]),
-            ("deny.toml", &["deny", "deny-portable"]),
-            (
-                "Cargo.toml",
-                &[
-                    "deny",
-                    "release-fmt",
-                    "release-dir",
-                    "release-test-build",
-                    "release-test",
-                    "release-build",
-                    "release-check",
-                ],
-            ),
+        const RUST: &[&str] = &["fmt", "clippy", "nextest", "doctest"];
+        const UI: &[&str] = &["ui-install", "ui-lint", "ui-build", "ui-notices"];
+        const DOCS: &[&str] = &["docs-install", "docs-audit", "docs-build", "docs-check"];
+        const RELEASE: &[&str] = &[
+            "release-fmt",
+            "release-dir",
+            "release-test-build",
+            "release-test",
+            "release-build",
+            "release-check",
         ];
-        for (path, extra) in cases {
-            let (dir, base, head) = repo(|p| write(p, path));
-            let mut expected = vec!["fmt", "clippy", "nextest", "doctest"];
-            expected.extend_from_slice(extra);
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["src/a.rs"], RUST),
+            (&["ui/src/example.tsx"], UI),
+            (&["ui/tests/unit/x.test.tsx"], UI),
+            (&["ui/tests/integration/x.test.tsx"], UI),
+            (&["ui/tests/e2e/x.spec.ts"], UI),
+            (&["ui/public/x.png"], UI),
+            (&["DESIGN.md"], &[]),
+            (
+                &["ui/tests/fixtures/workflow-library-router.json"],
+                &[RUST, UI].concat(),
+            ),
+            (&["THIRD_PARTY_NOTICES.md"], &[RUST, UI].concat()),
+            (&["docs/openapi-work-insights.json"], &[RUST, DOCS].concat()),
+            (
+                &["ui/dev-seed/mint/Cargo.lock"],
+                &[RUST, UI, RELEASE].concat(),
+            ),
+            (&["ui/newfile"], &[RUST, UI].concat()),
+            (&["ui/package.json"], &[RUST, UI].concat()),
+            (&["ui/src/x.tsx", "src/a.rs"], &[RUST, UI].concat()),
+            (&["DESIGN.md", "ui/src/x.tsx"], UI),
+            (
+                &["install.sh"],
+                &[RUST, &["shellcheck", "npm-installer"]].concat(),
+            ),
+            (&["docs/example.md"], &[RUST, DOCS].concat()),
+            (
+                &[".github/workflows/zizmor.yml"],
+                &[RUST, &["workflow-lint"]].concat(),
+            ),
+            (
+                &["tools/portable-verifier/Cargo.lock"],
+                &[RUST, &["deny-portable"]].concat(),
+            ),
+            (&["deny.toml"], &[RUST, &["deny", "deny-portable"]].concat()),
+            (&["Cargo.toml"], &[RUST, &["deny"], RELEASE].concat()),
+        ];
+        for (paths, expected) in cases {
+            let (dir, base, head) = repo(|p| paths.iter().for_each(|path| write(p, path)));
             assert_eq!(
                 required_commands(dir.path(), &base, &head, &recipe, &trust()).unwrap(),
-                expected,
-                "{path}"
+                *expected,
+                "{paths:?}"
             );
         }
         for path in [
@@ -1311,6 +1331,24 @@ fn not_required_command_is_reported_apart_from_skipped_and_passes() {
     }
     .body();
     assert!(body.contains("Not required by the changed paths: <code>lint</code>"));
+    expect(c.run(), VerdictState::Success, "validated");
+}
+
+#[test]
+fn a_run_where_no_command_is_required_verifies() {
+    let mut c = scoped(&[], &["test", "lint"]);
+    c.record.results.clear();
+    c.tamper_payload = Some(Box::new(|p| {
+        for id in ["test", "lint"] {
+            assert!(
+                p.coverage
+                    .omissions
+                    .contains(&format!("not required: {id}"))
+            );
+        }
+        assert_eq!(p.coverage.expected_count, 0);
+        assert_eq!(p.coverage.observed_count, 0);
+    }));
     expect(c.run(), VerdictState::Success, "validated");
 }
 

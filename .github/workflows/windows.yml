@@ -11,9 +11,10 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/windows.yml"
-  push:
-    branches: [main]
   workflow_dispatch:
+  # Replaces the push to main; the release PR also runs this workflow through ci-extended.
+  schedule:
+    - cron: '43 7 * * *'
 
 permissions:
   contents: read
@@ -28,7 +29,7 @@ env:
 jobs:
   windows:
     # Gate for cost and abuse control, not isolation: fork code can run on any hosted runner, which is
-    # ephemeral and has a read-only token and no secrets. Pushes to main and manual runs always pass.
+    # ephemeral and has a read-only token and no secrets. Scheduled and manual runs always pass.
     # A pull request runs this job only when a maintainer adds the `ci-extended` label (same-repository
     # PRs rely on a local validation attestation otherwise). A fork PR runs once per labelling, against
     # the head at that moment; pushing again does not re-run it. A same-repository PR also re-runs on
