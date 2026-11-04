@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::work::{CheckpointKind, ClaimStatus, WorkItem, WorkState};
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 pub(super) const SCHEMA_VERSION_V1: u16 = 1;
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Largest number of reservation-holding Work in one operational overview.
 pub(super) const MAX_OPERATIONAL_WORK: usize = 100;
 
@@ -34,7 +32,7 @@ impl TerminalOutcome {
         }
     }
 
-    pub(super) fn from_column(value: &str) -> Option<Self> {
+    pub fn from_column(value: &str) -> Option<Self> {
         match value {
             "completed" => Some(Self::Completed),
             "abandoned" => Some(Self::Abandoned),
@@ -65,7 +63,7 @@ impl ReservationBasis {
         }
     }
 
-    pub(super) fn from_column(value: &str) -> Option<Self> {
+    pub fn from_column(value: &str) -> Option<Self> {
         match value {
             "legacy_implicit" => Some(Self::LegacyImplicit),
             "admitted" => Some(Self::Admitted),
@@ -87,7 +85,6 @@ pub enum WorkTransitionKind {
 }
 
 impl WorkTransitionKind {
-    #[allow(dead_code)] // read by the projection, which the next phase wires in
     pub(super) const ALL: [Self; 6] = [
         Self::Release,
         Self::Retain,
@@ -97,7 +94,6 @@ impl WorkTransitionKind {
         Self::Reopen,
     ];
 
-    #[allow(dead_code)] // read by the projection, which the next phase wires in
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
@@ -172,7 +168,6 @@ pub(super) fn decide_transition(
     }
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Transitions the state allows, sorted by wire name, without regard to who may request them.
 pub(super) fn remedies(state: WorkState, reservation_held: bool) -> Vec<WorkTransitionKind> {
     let mut found: Vec<_> = WorkTransitionKind::ALL
@@ -195,10 +190,9 @@ pub(super) fn remedies(state: WorkState, reservation_held: bool) -> Vec<WorkTran
     found
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum OutcomeValue {
+pub enum OutcomeValue {
     Completed,
     Abandoned,
     Superseded,
@@ -217,7 +211,6 @@ pub enum OutcomeProvenance {
     Unknown,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// A stored outcome with who stated it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct OutcomeFact {
@@ -225,141 +218,126 @@ pub(super) struct OutcomeFact {
     pub(super) provenance: OutcomeProvenance,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct OutcomeV1 {
-    pub(super) value: OutcomeValue,
-    pub(super) provenance: OutcomeProvenance,
+pub struct OutcomeV1 {
+    pub value: OutcomeValue,
+    pub provenance: OutcomeProvenance,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ReservationStatus {
+pub enum ReservationStatus {
     Held,
     None,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// The holder is the lead agent and session only. No token identifier is ever exposed.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReservationV1 {
-    pub(super) status: ReservationStatus,
-    pub(super) basis: Option<ReservationBasis>,
-    pub(super) scope: Vec<String>,
-    pub(super) holder_agent: Option<String>,
-    pub(super) holder_session: Option<String>,
+pub struct ReservationV1 {
+    pub status: ReservationStatus,
+    pub basis: Option<ReservationBasis>,
+    pub scope: Vec<String>,
+    pub holder_agent: Option<String>,
+    pub holder_session: Option<String>,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReportV1 {
-    pub(super) at: i64,
-    pub(super) kind: CheckpointKind,
+pub struct ReportV1 {
+    pub at: i64,
+    pub kind: CheckpointKind,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ActivityStatus {
+pub enum ActivityStatus {
     Unknown,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ActivityV1 {
-    pub(super) status: ActivityStatus,
-    pub(super) reason: String,
+pub struct ActivityV1 {
+    pub status: ActivityStatus,
+    pub reason: String,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum MergeStatus {
+pub enum MergeStatus {
     Observed,
     None,
     Unknown,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct MergeV1 {
-    pub(super) hidden_by_merged_pr: bool,
-    pub(super) status: MergeStatus,
+pub struct MergeV1 {
+    pub hidden_by_merged_pr: bool,
+    pub status: MergeStatus,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Recipient {
+pub enum Recipient {
     Lead,
     Owner,
     Admin,
     None,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ActionableV1 {
-    pub(super) recipient: Recipient,
-    pub(super) reason: String,
+pub struct ActionableV1 {
+    pub recipient: Recipient,
+    pub reason: String,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// A transition the state allows. Whether this caller may request it is decided on request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RemedyV1 {
-    pub(super) transition: WorkTransitionKind,
-    pub(super) requires_authorization: bool,
+pub struct RemedyV1 {
+    pub transition: WorkTransitionKind,
+    pub requires_authorization: bool,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CompletenessV1 {
-    pub(super) complete: bool,
-    pub(super) unknown: Vec<String>,
+pub struct CompletenessV1 {
+    pub complete: bool,
+    pub unknown: Vec<String>,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct WorkOperationalV1 {
-    pub(super) schema_version: u16,
-    pub(super) work_id: String,
-    pub(super) state: WorkState,
-    pub(super) generation: i64,
-    pub(super) updated_seq: i64,
-    pub(super) outcome: OutcomeV1,
-    pub(super) reservation: ReservationV1,
-    pub(super) report: Option<ReportV1>,
+pub struct WorkOperationalV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub state: WorkState,
+    pub generation: i64,
+    pub updated_seq: i64,
+    pub outcome: OutcomeV1,
+    pub reservation: ReservationV1,
+    pub report: Option<ReportV1>,
     /// The existing request-time claim projection.
-    pub(super) freshness: ClaimStatus,
-    pub(super) activity: ActivityV1,
-    pub(super) merge: MergeV1,
-    pub(super) actionable: ActionableV1,
-    pub(super) remedies: Vec<RemedyV1>,
-    pub(super) completeness: CompletenessV1,
+    pub freshness: ClaimStatus,
+    pub activity: ActivityV1,
+    pub merge: MergeV1,
+    pub actionable: ActionableV1,
+    pub remedies: Vec<RemedyV1>,
+    pub completeness: CompletenessV1,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct OperationalOverviewV1 {
-    pub(super) schema_version: u16,
-    pub(super) work: Vec<WorkOperationalV1>,
+pub struct OperationalOverviewV1 {
+    pub schema_version: u16,
+    pub work: Vec<WorkOperationalV1>,
     /// False when more reservation-holding Work exists than `work` lists.
-    pub(super) complete: bool,
+    pub complete: bool,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Facts the caller read for one Work item.
 pub(super) struct OperationalFacts<'a> {
     pub(super) item: &'a WorkItem,
@@ -369,11 +347,9 @@ pub(super) struct OperationalFacts<'a> {
     pub(super) merge: MergeStatus,
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 const ACTIVITY_UNKNOWN_REASON: &str =
     "Activity is not observed; no lease or activity report exists yet.";
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV1 {
     let item = facts.item;
     let finished = item.state == WorkState::Finished;
@@ -438,12 +414,7 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
             hidden_by_merged_pr: facts.hidden_by_merged_pr,
             status: facts.merge,
         },
-        actionable: actionable(
-            item.state,
-            held,
-            item.claim_status,
-            facts.hidden_by_merged_pr,
-        ),
+        actionable: actionable(item.state, held, facts.hidden_by_merged_pr),
         remedies: remedies(item.state, held)
             .into_iter()
             .map(|transition| RemedyV1 {
@@ -458,13 +429,9 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
     }
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
-fn actionable(
-    state: WorkState,
-    held: bool,
-    claim: ClaimStatus,
-    hidden_by_merged_pr: bool,
-) -> ActionableV1 {
+/// Who should look at the Work, from stored facts only. Claim currency is request-time and is
+/// reported as `freshness`; mixing it in here would make this field change with the clock.
+fn actionable(state: WorkState, held: bool, hidden_by_merged_pr: bool) -> ActionableV1 {
     let (recipient, reason) = if state == WorkState::Finished {
         (Recipient::None, "Work is finished.")
     } else if !held {
@@ -474,13 +441,11 @@ fn actionable(
             Recipient::Owner,
             "A merged pull request was observed; the owner decides whether to release or finish.",
         )
-    } else if claim != ClaimStatus::Active {
-        (
-            Recipient::Owner,
-            "The claim is not current; the owner decides whether to retain, release or finish.",
-        )
     } else {
-        (Recipient::None, "The lead has a current claim.")
+        (
+            Recipient::None,
+            "The lead holds the reservation; freshness says whether its claim is current.",
+        )
     };
     ActionableV1 {
         recipient,
@@ -488,7 +453,6 @@ fn actionable(
     }
 }
 
-#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Orders by Work id and bounds the list. `more` says the caller already dropped some Work.
 pub(super) fn operational_overview(
     mut work: Vec<WorkOperationalV1>,
@@ -502,6 +466,77 @@ pub(super) fn operational_overview(
         work,
         complete: !more && !truncated,
     }
+}
+
+/// One Work row as a store read it: the snapshot and the facts kept beside it.
+pub(super) struct OperationalRow {
+    pub(super) item: WorkItem,
+    pub(super) outcome: Option<OutcomeFact>,
+    pub(super) basis: Option<ReservationBasis>,
+    /// Computed by the stores' shared settled rule, never by this module.
+    pub(super) hidden_by_merged_pr: bool,
+}
+
+/// What a merge observation says about one Work item.
+///
+/// A hidden item has an observed merge. Otherwise `none` needs two things: the settled rule
+/// applies to the item (it has a branch, is not blocked or finished, and carries no blocker), and
+/// the forge pull-request source was read for a window that reaches back to the item's creation.
+/// Anything else is unknown, so a merge the rule would not hide is never reported as absent.
+pub(super) fn merge_status(
+    item: &WorkItem,
+    hidden_by_merged_pr: bool,
+    forge_window_from: Option<i64>,
+) -> MergeStatus {
+    if hidden_by_merged_pr {
+        return MergeStatus::Observed;
+    }
+    let judged = item.branch.is_some()
+        && item.blocker.is_none()
+        && !matches!(item.state, WorkState::Finished | WorkState::Blocked);
+    if judged && forge_window_from.is_some_and(|from| from <= item.created_at) {
+        MergeStatus::None
+    } else {
+        MergeStatus::Unknown
+    }
+}
+
+/// Builds the overview from rows ordered or not. `more` says the reader found more rows than it
+/// returned. `forge_window_from` is the start of the last complete forge pull-request read, if any.
+pub(super) fn operational_page(
+    rows: Vec<OperationalRow>,
+    forge_window_from: Option<i64>,
+    more: bool,
+) -> OperationalOverviewV1 {
+    let work = rows
+        .iter()
+        .map(|row| {
+            work_operational(&OperationalFacts {
+                item: &row.item,
+                outcome: row.outcome,
+                basis: row.basis,
+                hidden_by_merged_pr: row.hidden_by_merged_pr,
+                merge: merge_status(&row.item, row.hidden_by_merged_pr, forge_window_from),
+            })
+        })
+        .collect();
+    operational_overview(work, more)
+}
+
+/// A `WorkOverview` with the operational projection beside it, as the HTTP and MCP surfaces
+/// emit it when asked. The projection stays out of `WorkOverview` itself, which older clients
+/// decode strictly.
+pub(super) fn overview_with_operational(
+    overview: &super::work::WorkOverview,
+    operational: &OperationalOverviewV1,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(overview).unwrap_or(serde_json::Value::Null);
+    if let (Some(object), Ok(operational)) =
+        (value.as_object_mut(), serde_json::to_value(operational))
+    {
+        object.insert("operational".to_owned(), operational);
+    }
+    value
 }
 
 #[cfg(test)]
@@ -835,12 +870,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_claim_with_a_reservation_is_for_the_owner() {
+    fn only_freshness_follows_the_claim_clock() {
         let mut item = item(WorkState::Active);
+        let current = work_operational(&facts(&item, Some(ReservationBasis::Admitted)));
         item.claim_status = ClaimStatus::Stale;
-        let view = work_operational(&facts(&item, Some(ReservationBasis::Admitted)));
-        assert_eq!(view.actionable.recipient, Recipient::Owner);
-        assert_eq!(view.freshness, ClaimStatus::Stale);
+        let mut stale = work_operational(&facts(&item, Some(ReservationBasis::Admitted)));
+        assert_eq!(stale.freshness, ClaimStatus::Stale);
+        stale.freshness = current.freshness;
+        assert_eq!(stale, current);
     }
 
     #[test]

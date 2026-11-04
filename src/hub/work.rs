@@ -325,6 +325,10 @@ pub struct WorkStartConflict {
     pub current_generation: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlaps: Vec<WorkScopeOverlap>,
+    /// The operational projection of each overlapping Work. Filled only by a surface that was
+    /// asked for it; the stores leave it empty so an older strict client never sees the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operational: Vec<super::work_lifecycle::WorkOperationalV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

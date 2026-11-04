@@ -109,13 +109,14 @@ use super::work::{
     claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
     work_overlap_pairs, work_payload_row_bytes,
 };
+use super::work_lifecycle::{OperationalRow, OutcomeFact, operational_page};
 use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::work_transition::{
-    self, WorkLifecycleReader, WorkLifecycleView, WorkTransitionActor, WorkTransitionRequest,
-    WorkTransitionResult,
+    self, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkLifecycleView,
+    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
 };
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
@@ -1774,6 +1775,27 @@ fn project_claims(
     Ok(())
 }
 
+/// Who stated the outcome of finished Work, from its latest terminal event. Unknown when that
+/// event was compacted away.
+fn terminal_provenance(
+    tx: &mut postgres::Transaction<'_>,
+    id: &str,
+) -> Result<work_transition::OutcomeProvenance> {
+    let latest = tx.query_opt(
+        "SELECT kind, data FROM hub_events
+         WHERE subject = $1 AND kind IN ('work_checkpoint', 'work_transition')
+         ORDER BY seq DESC LIMIT 1",
+        &[&id],
+    )?;
+    Ok(
+        latest.map_or(work_transition::OutcomeProvenance::Unknown, |row| {
+            let kind: String = row.get(0);
+            let data: String = row.get(1);
+            work_transition::provenance_from_event(&kind, &data)
+        }),
+    )
+}
+
 fn scoped_work(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
@@ -3284,6 +3306,7 @@ fn start_in(
                         kind: WorkConflictKind::MetadataChanged,
                         current_generation: item.generation,
                         overlaps: Vec::new(),
+                        operational: Vec::new(),
                     }),
                     item,
                     created: false,
@@ -3341,6 +3364,7 @@ fn start_in(
                     kind,
                     current_generation: item.generation,
                     overlaps: Vec::new(),
+                    operational: Vec::new(),
                 }),
                 item,
                 created: false,
@@ -3363,6 +3387,7 @@ fn start_in(
                     kind: WorkConflictKind::ClaimHeld,
                     current_generation: item.generation,
                     overlaps: Vec::new(),
+                    operational: Vec::new(),
                 }),
                 item,
                 created: false,
@@ -3382,6 +3407,7 @@ fn start_in(
                         kind: WorkConflictKind::ScopeOverlap,
                         current_generation: first.item.generation,
                         overlaps,
+                        operational: Vec::new(),
                     }),
                     item,
                     created: false,
@@ -3482,6 +3508,7 @@ fn start_in(
                 kind: WorkConflictKind::SessionGoalChanged,
                 current_generation: item.generation,
                 overlaps: Vec::new(),
+                operational: Vec::new(),
             }),
             item,
             created: false,
@@ -3517,6 +3544,7 @@ fn start_in(
                 kind: WorkConflictKind::ScopeOverlap,
                 current_generation: first.item.generation,
                 overlaps,
+                operational: Vec::new(),
             }),
             context: None,
             coordination_request: Some(coordination_request),
@@ -8336,6 +8364,7 @@ impl Store for PgStore {
                     kind: WorkConflictKind::SessionGoalChanged,
                     current_generation: item.generation,
                     overlaps: Vec::new(),
+                    operational: Vec::new(),
                 });
                 let result = WorkStartResult {
                     item,
@@ -8709,6 +8738,7 @@ impl Store for PgStore {
                         kind: WorkConflictKind::ScopeOverlap,
                         current_generation: first.item.generation,
                         overlaps,
+                        operational: Vec::new(),
                     };
                     return Ok(WorkTransitionResult {
                         item,
@@ -8867,19 +8897,7 @@ impl Store for PgStore {
                 .as_deref()
                 .and_then(work_transition::TerminalOutcome::from_column);
             let provenance = if outcome.is_some() && item.state == WorkState::Finished {
-                let latest = tx.query_opt(
-                    "SELECT kind, data FROM hub_events
-                     WHERE subject = $1 AND kind IN ('work_checkpoint', 'work_transition')
-                     ORDER BY seq DESC LIMIT 1",
-                    &[&id],
-                )?;
-                Some(
-                    latest.map_or(work_transition::OutcomeProvenance::Unknown, |row| {
-                        let kind: String = row.get(0);
-                        let data: String = row.get(1);
-                        work_transition::provenance_from_event(&kind, &data)
-                    }),
-                )
+                Some(terminal_provenance(&mut tx, id)?)
             } else {
                 None
             };
@@ -8892,6 +8910,111 @@ impl Store for PgStore {
                     .as_deref()
                     .and_then(work_transition::ReservationBasis::from_column),
             }))
+        })
+    }
+
+    fn work_operational(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        select: &OperationalSelect<'_>,
+        now: i64,
+    ) -> Result<OperationalOverviewV1> {
+        let ids = select.ids()?;
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => work_transition::person_who(owner, repository, *repository_id),
+            };
+            let catchup_repository = repository_namespace(&who.repository, who.repository_id);
+            let catchup_key = catchup_repository_key(who.repository_id);
+            let settled =
+                settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 5, 6, 7]);
+            let filter = if ids.is_some() {
+                "w.id = ANY($8)"
+            } else {
+                "w.reservation_basis IS NOT NULL"
+            };
+            let sql = format!(
+                "SELECT w.snapshot, w.terminal_outcome, w.reservation_basis, {settled}
+                 FROM hub_work_items w
+                 WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                   AND w.repository_id IS NOT DISTINCT FROM $4 AND {filter}
+                 ORDER BY w.id LIMIT 101"
+            );
+            let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &catchup_repository,
+                &catchup_key,
+                &AUTO_PAUSE_SUMMARY,
+            ];
+            if let Some(ids) = &ids {
+                params.push(ids);
+            }
+            let mut found = tx.query(&sql, &params)?;
+            let more = found.len() > super::work_lifecycle::MAX_OPERATIONAL_WORK;
+            found.truncate(super::work_lifecycle::MAX_OPERATIONAL_WORK);
+            let mut items = found
+                .iter()
+                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
+                .collect::<Result<Vec<_>>>()?;
+            project_claims(&mut tx, &mut items, now)?;
+            let mut rows = Vec::new();
+            for (item, row) in items.into_iter().zip(&found) {
+                let outcome = row
+                    .get::<_, Option<String>>(1)
+                    .as_deref()
+                    .and_then(work_transition::TerminalOutcome::from_column)
+                    .filter(|_| item.state == WorkState::Finished);
+                let outcome = match outcome {
+                    Some(outcome) => Some(OutcomeFact {
+                        outcome,
+                        provenance: terminal_provenance(&mut tx, &item.id)?,
+                    }),
+                    None => None,
+                };
+                rows.push(OperationalRow {
+                    item,
+                    outcome,
+                    basis: row
+                        .get::<_, Option<String>>(2)
+                        .as_deref()
+                        .and_then(work_transition::ReservationBasis::from_column),
+                    hidden_by_merged_pr: row.get::<_, bool>(3),
+                });
+            }
+            let forge_window = tx.query_opt(
+                "SELECT state, window_from FROM hub_catchup_sources
+                 WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND source=$5",
+                &[
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &catchup_repository,
+                    &catchup_key,
+                    &source_name(CatchupMergeSource::ForgePull),
+                ],
+            )?;
+            let forge_window_from = match forge_window {
+                Some(row)
+                    if parse_coverage(&row.get::<_, String>(0))?
+                        == super::catchup::CatchupCoverageState::ObservedOnly =>
+                {
+                    row.get::<_, Option<i64>>(1)
+                }
+                _ => None,
+            };
+            tx.commit()?;
+            Ok(operational_page(rows, forge_window_from, more))
         })
     }
 

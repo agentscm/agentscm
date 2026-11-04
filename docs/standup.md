@@ -372,7 +372,7 @@ MCP tool replies carry compact coordination notices in text and `_meta.agentscm.
 
 Coordination admission is bounded to 8 open requests per token, 25 per owner and 100 per repository. Unacknowledged briefing deliveries are bounded to 8 per token and 16 per owner across all subscriber sessions; changing subscriber names does not create more quota. Retrying an existing operation remains idempotent at these limits. A current affected lead can withdraw an abandoned request only when its requester token is revoked or expired, or its owner is disabled; this records the cleanup actor and leaves all work assignments intact.
 
-MCP exposes `agentscm_work_overview`, `agentscm_coordination_inbox`, `agentscm_coordination_ack`, `agentscm_coordination_reply`, `agentscm_coordination_resolve`, `agentscm_coordination_withdraw`, `agentscm_work_briefing`, `agentscm_work_checkpoint` and `agentscm_work_ack`. The existing `agentscm_start` tool accepts an explicit work ID, canonical forge source or stable request key and returns its pre-start briefing with the claim result. Read-only tokens can call `agentscm_work_briefing`; the mutation tools reject them. Implicit MCP pre-start and native session-start briefings are pure previews with no delivery receipt. For deliberate acknowledgement, request a durable `agentscm_work_briefing`, retrieve every page, then acknowledge its delivery identifier.
+MCP exposes `agentscm_work_overview`, `agentscm_coordination_inbox`, `agentscm_coordination_ack`, `agentscm_coordination_reply`, `agentscm_coordination_resolve`, `agentscm_coordination_withdraw`, `agentscm_work_briefing`, `agentscm_work_checkpoint`, `agentscm_work_transition` and `agentscm_work_ack`. The existing `agentscm_start` tool accepts an explicit work ID, canonical forge source or stable request key and returns its pre-start briefing with the claim result. Read-only tokens can call `agentscm_work_briefing`; the mutation tools reject them. Implicit MCP pre-start and native session-start briefings are pure previews with no delivery receipt. For deliberate acknowledgement, request a durable `agentscm_work_briefing`, retrieve every page, then acknowledge its delivery identifier.
 
 ## HTTP surface
 
@@ -392,6 +392,12 @@ All scope comes from the bearer token. There is no repository selector in these 
 | `POST /v1/hub/standup/start` | Writable agent | Create/reuse, join or generation-checked take over a work item. |
 | `POST /v1/hub/standup/checkpoint` | Writable agent | Append one idempotent, generation-checked checkpoint. |
 | `POST /v1/hub/standup/ack` | Writable agent | Advance a fully delivered briefing boundary by delivery identifier. |
+| `POST /v1/hub/standup/work-transition` | Writable agent | Release, retain, complete, abandon, supersede or reopen one work item as its lead or its owner's agent; idempotent by `operation_id`. Release alone does not assert completion. A reopen that overlaps other work returns a result with a conflict and no receipt, like a start. |
+| `GET /v1/hub/standup/work/{id}/operational` | Read-only or writable | The operational projection of one work item: outcome, reservation, merge observation and the transitions its state allows. |
+| `GET /v1/hub/standup/operational` | Read-only or writable | The projection of every reservation-holding work item, including work hidden by a merged pull request, ordered by id, at most 100, with a `complete` flag. |
+| `POST /v1/hub/session/work/transition` | Web sign-in with CSRF | The same transitions for a person: the owner may release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or supersede. No agent token is needed. |
+
+`overview`, `start` and `preflight` add the operational projection only when the request carries `operational=1`; without it the response has no new key. MCP results always include it, and `agentscm_work_transition` is the MCP form of the transition route. See [Work outcomes and scope reservations](design/work-lifecycle.md).
 
 Pages contain at most 100 current items and 100 events. Titles and checkpoint summaries are bounded to 500 bytes; identifiers and labels are bounded to 255 bytes. Scope, participants, relations and source references also have fixed entry limits. Malformed cursors and out-of-scope identifiers are rejected instead of silently widening access.
 

@@ -567,6 +567,7 @@ async fn protocol_basics() {
             "agentscm_workflow_runs_list",
             "agentscm_work_usage",
             "agentscm_work_checkpoint",
+            "agentscm_work_transition",
             "agentscm_work_ack",
             "agentscm_workflow_status",
             "agentscm_skill_list",
@@ -1275,6 +1276,147 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     );
     let (status, _) = call(&bob, "agentscm_status", json!({})).await;
     assert!(!status.contains("keeps src/c.rs"), "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_transition_releases_replays_and_fences_the_old_session() {
+    let hub = Hub::start().await;
+    let (lead_id, alice) = hub.secret_with_id(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "session": "session-a", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let item = started["structuredContent"]["work"]["item"].clone();
+    let work_id = item["id"].as_str().unwrap().to_owned();
+
+    // The overview and a conflicting start carry the operational projection.
+    let overview = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    let held = &overview["structuredContent"]["operational"];
+    assert_eq!(held["schema_version"], 1);
+    assert_eq!(held["work"][0]["work_id"], work_id.as_str());
+    assert_eq!(held["work"][0]["reservation"]["status"], "held");
+    let rival = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "rival", "session": "session-b", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let marked = &rival["structuredContent"]["work"]["conflict"]["operational"][0];
+    assert_eq!(marked["work_id"], work_id.as_str());
+    assert_eq!(marked["merge"]["hidden_by_merged_pr"], false);
+    let preflight = hub
+        .tool_result(
+            &bob,
+            "agentscm_work_preflight",
+            json!({"task": "rival", "session": "session-b", "request_key": "rival-key",
+                "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        preflight["structuredContent"]["operational"][0]["work_id"],
+        work_id.as_str(),
+        "{preflight}"
+    );
+
+    // Another agent's owner cannot release it; the schema documents that release is not a finish.
+    let release = json!({"work_id": work_id, "operation_id": "rel-1",
+        "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+        "session": "session-a", "transition": "release", "reason": "handing the scope back"});
+    let refused = hub
+        .tool_result(&bob, "agentscm_work_transition", release.clone())
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let tools = hub
+        .rpc(
+            &alice,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await
+        .json();
+    let description = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "agentscm_work_transition")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        description.contains("does not assert completion"),
+        "{description}"
+    );
+
+    // The lead releases; the exact retry returns the stored receipt.
+    let done = hub
+        .tool_result(&alice, "agentscm_work_transition", release.clone())
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    let result = &done["structuredContent"];
+    assert_eq!(result["item"]["state"], "paused");
+    assert_eq!(result["receipt"]["replayed"], false);
+    let retry = hub
+        .tool_result(&alice, "agentscm_work_transition", release.clone())
+        .await;
+    assert_eq!(retry["isError"], false, "{retry}");
+    assert_eq!(retry["structuredContent"]["receipt"]["replayed"], true);
+    assert_eq!(
+        retry["structuredContent"]["receipt"]["event_seq"],
+        result["receipt"]["event_seq"]
+    );
+    let mut changed = release;
+    changed["reason"] = json!("a different reason");
+    let altered = hub
+        .tool_result(&alice, "agentscm_work_transition", changed)
+        .await;
+    assert_eq!(altered["isError"], true);
+
+    // The old session is fenced, and the freed scope no longer blocks the rival.
+    let late = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({"work_id": work_id, "operation_id": "late",
+                "generation": item["generation"],
+                "expected_updated_seq": result["item"]["updated_seq"],
+                "session": "session-a", "kind": "progress", "summary": "late"}),
+        )
+        .await;
+    assert_eq!(late["isError"], true, "{late}");
+    let after = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    assert!(
+        after["structuredContent"]["operational"]["work"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{after}"
+    );
+    let taken = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "rival", "session": "session-b", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        taken["structuredContent"]["work"]["created"], true,
+        "{taken}"
+    );
+    // No token identifier is part of the projection.
+    assert!(
+        !after["structuredContent"]["operational"]
+            .to_string()
+            .contains(&lead_id)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2321,7 +2463,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (39, 42, 47));
+    assert_eq!((before.len(), listed.len(), all.len()), (40, 43, 48));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});

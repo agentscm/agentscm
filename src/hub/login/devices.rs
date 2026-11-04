@@ -419,7 +419,7 @@ async fn mint(
 
 /// The connected repository `repository` when `owner` may have a token for it now: the allow
 /// list and their current role, checked for every mint. A refusal is recorded under `via`.
-async fn mint_check(
+pub(in crate::hub) async fn mint_check(
     state: &HubState,
     owner: &User,
     repository: &str,

@@ -4,13 +4,11 @@ title: "Design: Work outcomes and scope reservations"
 
 # Design: Work outcomes and scope reservations
 
-> **Status: design for issue #310; the contract and pure types are in the tree, the rest lands with
-> the same change.** This phase adds the rules and the `WorkOperationalV1` types in
-> `src/hub/work_lifecycle.rs`. The columns, store operation, routes and MCP tool described below
-> are the target of the remaining phases. Nothing here is a released capability until the whole
-> change has merged. Not part of this change: lease expiry and activity observation (#311), forge
-> reconciliation (#312), a harness preview and apply flow (#313), status relabeling (#315) and claim
-> repair (#316). Until #311 exists, the `activity` field of the projection is always `unknown`.
+> **Status: design for issue #310; the rules, store operations, routes and MCP tool are in the
+> tree.** Nothing here is a released capability until the change has merged. Not part of this
+> change: lease expiry and activity observation (#311), forge reconciliation (#312), a harness
+> preview and apply flow (#313), status relabeling (#315) and claim repair (#316). Until #311
+> exists, the `activity` field of the projection is always `unknown`.
 
 Today `WorkState::Finished` is both the end of the Work and the release of its scope. Two things
 are mixed: why the Work ended, and whether it still blocks other agents. This design separates them.
@@ -141,9 +139,14 @@ or `none`, with a `provenance` of `agent_report`, `person`, `admin` or `unknown`
 (`status`, `basis`, `scope`, `holder_agent`, `holder_session`; never a token id); `report` (time and
 kind of the last agent report); `freshness` (the existing claim status); `activity` (always
 `unknown` with a reason until #311, and never inferred from a heartbeat); `merge`
-(`hidden_by_merged_pr` and a status of `observed`, `none` or `unknown`); `actionable` (a recipient of
+(`hidden_by_merged_pr` and a status: `observed` when hidden by a merged pull request, `none` only when
+the Hub knows its forge pull-request read reached back to the Work's creation and the merge rule applies
+to the Work, otherwise `unknown`); `actionable` (a recipient of
 `lead`, `owner`, `admin` or `none`, with a reason); `remedies`; and `completeness` (`complete` and
 the list of `unknown` field names).
+
+`actionable` is derived from stored facts only (state, reservation, merge observation), so the only
+field that follows the request clock is `freshness`.
 
 Remedies are the transitions the matrix allows from the state and reservation, sorted by name and
 marked `requires_authorization`. They are not filtered by caller. Activity is always listed as

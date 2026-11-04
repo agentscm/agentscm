@@ -47,8 +47,8 @@ use super::work::{
 use super::work_links::{WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView};
 use super::work_preflight::WorkPreflightResult;
 use super::work_transition::{
-    WorkLifecycleReader, WorkLifecycleView, WorkTransitionActor, WorkTransitionRequest,
-    WorkTransitionResult,
+    OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkLifecycleView,
+    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
 };
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
@@ -746,6 +746,14 @@ pub trait Store: Send + Sync {
         id: &str,
         now: i64,
     ) -> Result<Option<WorkLifecycleView>>;
+    /// The `WorkOperationalV1` projection of the selected Work, ordered by id and bounded to
+    /// 100, in one snapshot. Never writes.
+    fn work_operational(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        select: &OperationalSelect<'_>,
+        now: i64,
+    ) -> Result<OperationalOverviewV1>;
 
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).

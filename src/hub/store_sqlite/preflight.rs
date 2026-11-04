@@ -121,6 +121,7 @@ pub(super) fn evaluate(
             checked_observations: Vec::new(),
             reasons,
             complete: false,
+            operational: Vec::new(),
         });
     };
     request.validate()?;
@@ -347,5 +348,6 @@ pub(super) fn evaluate(
         checked_observations,
         reasons,
         complete,
+        operational: Vec::new(),
     })
 }

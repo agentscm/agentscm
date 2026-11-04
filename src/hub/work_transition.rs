@@ -13,8 +13,8 @@ use super::work::{
     WorkState, WorkWho, validate_id,
 };
 pub use super::work_lifecycle::{
-    ActorVia, OutcomeProvenance, ReservationBasis, TerminalOutcome, WorkActorKind,
-    WorkTransitionKind,
+    ActorVia, OperationalOverviewV1, OutcomeProvenance, ReservationBasis, TerminalOutcome,
+    WorkActorKind, WorkOperationalV1, WorkTransitionKind,
 };
 use super::work_lifecycle::{Refusal, decide_transition};
 use super::{HubError, Result};
@@ -49,6 +49,42 @@ pub enum WorkLifecycleReader<'a> {
         repository: &'a str,
         repository_id: i64,
     },
+}
+
+/// Which Work an operational read covers.
+#[derive(Clone, Copy, Debug)]
+pub enum OperationalSelect<'a> {
+    /// One Work item; the page is empty when it is not in the reader's repository.
+    One(&'a str),
+    /// These Work items, whether or not they hold a reservation.
+    Many(&'a [String]),
+    /// Every Work item of the repository that holds a reservation, including Work hidden by a
+    /// merged pull request.
+    Holders,
+}
+
+/// The most Work ids one `Many` read accepts.
+pub const MAX_OPERATIONAL_IDS: usize = 100;
+
+impl OperationalSelect<'_> {
+    /// The ids to read, validated, or None for the reservation holders.
+    pub(super) fn ids(&self) -> Result<Option<Vec<String>>> {
+        let ids: Vec<String> = match self {
+            Self::One(id) => vec![(*id).to_owned()],
+            Self::Many(ids) => ids.to_vec(),
+            Self::Holders => return Ok(None),
+        };
+        if ids.len() > MAX_OPERATIONAL_IDS {
+            return Err(invalid("more than 100 work ids"));
+        }
+        for id in &ids {
+            validate_id("work", id, "wrk")?;
+        }
+        let mut ids = ids;
+        ids.sort();
+        ids.dedup();
+        Ok(Some(ids))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
