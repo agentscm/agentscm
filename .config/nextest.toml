@@ -18,7 +18,7 @@ filter = 'binary(integration) & test(/^backend_s3::/)'
 test-group = 'backend-s3'
 
 [[profile.default.overrides]]
-filter = 'test(/(^\w+::(on_postgres::|postgres_)|::postgres$|_on_postgres$)/)'
+filter = 'test(/(^\w+::(on_postgres::|postgres_)|::postgres::|::postgres$|_on_postgres$)/)'
 test-group = 'hub-postgres'
 
 [[profile.default.overrides]]
