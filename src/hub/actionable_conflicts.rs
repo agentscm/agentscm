@@ -51,15 +51,9 @@ fn action(
     }
 }
 
-/// Hash the bounded captured source independently of displayed actions and comparison caps.
-fn capture(hash: &mut Sha256, bytes: &mut usize, limits: &mut BTreeSet<String>, record: &[u8]) {
-    if record.len() > 16 * 1024 * 1024 - (*bytes).min(16 * 1024 * 1024) {
-        limits.insert("conflict_evidence_bytes_truncated".into());
-        hash.update(b"omitted");
-        hash.update((record.len() as u64).to_be_bytes());
-        return;
-    }
-    *bytes += record.len();
+/// Hash every captured byte independently of display and comparison caps. Collection
+/// bounds limit the records; hashing adds no retained copy or separate evidence-size cap.
+fn capture(hash: &mut Sha256, record: &[u8]) {
     hash.update((record.len() as u64).to_be_bytes());
     hash.update(record);
 }
@@ -71,11 +65,8 @@ pub(super) fn read(
 ) -> Result<(Vec<StatusAction>, BTreeSet<String>, String)> {
     let mut limits = BTreeSet::new();
     let mut evidence = Sha256::new();
-    let mut evidence_bytes = 0usize;
     capture(
         &mut evidence,
-        &mut evidence_bytes,
-        &mut limits,
         format!(
             "{}:{}:{}:{:?}",
             who.owner.identity.provider, who.owner.identity.host, who.repository, who.repository_id
@@ -84,12 +75,7 @@ pub(super) fn read(
     );
     let mut intents = store.live_intents_scoped(who, now, LIMIT + 1)?;
     for intent in &intents {
-        capture(
-            &mut evidence,
-            &mut evidence_bytes,
-            &mut limits,
-            intent.to_json().to_string().as_bytes(),
-        );
+        capture(&mut evidence, intent.to_json().to_string().as_bytes());
     }
     if intents.len() > LIMIT {
         limits.insert("live_intents_truncated".into());
@@ -99,8 +85,6 @@ pub(super) fn read(
     for event in &events {
         capture(
             &mut evidence,
-            &mut evidence_bytes,
-            &mut limits,
             format!(
                 "{}:{}:{}:{}:{}",
                 event.event.seq, event.event.kind, event.token, event.event.at, event.event.data
@@ -160,8 +144,6 @@ pub(super) fn read(
     for session in &sessions {
         capture(
             &mut evidence,
-            &mut evidence_bytes,
-            &mut limits,
             format!(
                 "{}:{}:{}:{:?}:{}:{}",
                 session.key,
@@ -319,8 +301,6 @@ pub(super) fn read(
         for pull in &pulls {
             capture(
                 &mut evidence,
-                &mut evidence_bytes,
-                &mut limits,
                 format!(
                     "{}:{}:{}:{}",
                     repo.id, pull.key, pull.observed_at, pull.data
@@ -418,4 +398,24 @@ pub(super) fn read(
         limits,
         crate::hub::store::lower_hex_of(&evidence.finalize()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_length_evidence_changes_beyond_sixteen_mib_change_the_digest() {
+        let prefix = vec![b'x'; 16 * 1024 * 1024];
+        let digest = |record: &[u8]| {
+            let mut hash = Sha256::new();
+            capture(&mut hash, &prefix);
+            capture(&mut hash, record);
+            hash.finalize()
+        };
+        assert_ne!(
+            digest(br#"{"head_sha":"first"}"#),
+            digest(br#"{"head_sha":"other"}"#)
+        );
+    }
 }

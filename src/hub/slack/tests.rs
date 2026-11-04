@@ -1401,8 +1401,8 @@ async fn revoked_escalation_recipient_does_not_block_later_status_queries() {
         .database()
         .unwrap()
         .execute(
-            "UPDATE status_jobs SET due=0,created=0 WHERE kind='escalation'",
-            [],
+            "UPDATE status_jobs SET due=0,created=?1 WHERE kind='escalation'",
+            [now - 1],
         )
         .unwrap();
     f.post(
@@ -1797,7 +1797,7 @@ async fn episode_maintenance_rotates_past_one_hundred_outstanding_subjects() {
             .database()
             .unwrap()
             .query_row::<i64, _, _>(
-                "SELECT count(*) FROM status_episodes WHERE id<'0100' AND state='active'",
+                "SELECT count(*) FROM status_episodes WHERE length(id)=4 AND id<'0100' AND state='active'",
                 [],
                 |r| r.get(0)
             )

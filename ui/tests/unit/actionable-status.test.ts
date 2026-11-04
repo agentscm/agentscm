@@ -55,6 +55,14 @@ describe('shared actionable status', () => {
     const empty = decodeStatus({ ...fixture, work: [], actions: [], counts: { ...fixture.counts, needs_you: 0 } })
     expect(dashboardStatus(null, null, null, null, new Set(), undefined, empty).home?.text).toContain('partial')
   })
+  it('keeps unavailable shared status out of personal badges despite legacy blockers and overlaps', () => {
+    const item = (id: string) => ({ id, title: id, state: 'blocked', claim_status: 'active', owner_login: 'other', updated_at: 100, last_checkin_at: 100, scope: [] })
+    const ov = { current: [item('blocked')], recent: [], overlaps: [{ left: item('left'), right: item('right'), reasons: [] }] } as unknown as WorkOverview
+    expect(needsYou(ov, null, undefined, null)).toHaveLength(2)
+    const unavailable = dashboardStatus(ov, null, null, null, new Set(), undefined, null)
+    expect(unavailable.home?.text).toBe('Shared status unavailable')
+    expect(unavailable.needs).toEqual([])
+  })
   it('shows deterministic status and handover recipient without generated prose', () => {
     const overview = { current: [], recent: [], overlaps: [], current_complete: true, recent_complete: true, overlaps_complete: true } as unknown as WorkOverview
     const d = { agents: [], groups: [], contested: [], prOverlaps: [] } as unknown as Derived

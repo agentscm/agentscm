@@ -507,7 +507,7 @@ export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, even
   const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
   const latest = events?.[0]
   const up = d && asOfMs ? d.agents.filter((a) => asOfMs / 1000 - a.lastActive < AWAKE_SECONDS).length : 0
-  const personal = shared === undefined ? needs : needsYou(ov, d, asked, shared).filter((n) => !hidden.has(needHideKey(n)))
+  const personal = shared === undefined ? needs : needsYou(ov, d, asked, shared).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   return {
     needs: personal,
     home: shared !== undefined ? (shared ? { text: personal.length ? 'Waiting on you' : shared.complete ? 'Nothing needs you' : 'No action observed · partial coverage', tone: personal.length ? 'bad' as const : shared.complete ? 'ok' as const : 'warn' as const } : { text: 'Shared status unavailable', tone: 'warn' as const }) : d && ov ? (needs.length ? { text: 'Waiting on you', tone: 'bad' as const } : { text: 'Nothing needs you', tone: 'ok' as const }) : undefined,
