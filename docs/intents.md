@@ -118,13 +118,20 @@ session take a file lock so none drops another's paths.
 `AgentSCM coordination unknown: <reason>` means the check could not run, so other
 agents' work is not visible. Reasons: no hub configured, hub unreachable (also a
 3-second timeout in a hook), the agent token was rejected (expired or revoked; mint a
-new one), hub busy, or `hub error <status>`. The edit proceeds either way.
+new one), hub busy, or `hub error <status>`, followed by the hub's message when it sends
+one (for example that a path lies in the scope of Work the agent no longer holds and
+should resume). The edit proceeds either way.
 
 ## Limits
 
 - `agentscm intent` only advises and always exits 0. Through the hub's hook endpoints, the
   first contested edit in a session is refused once on Claude Code, Codex and Copilot, and a
   repeat goes through. Nothing is locked.
+- When Work ends or is released, the hub releases the intents it held. If the stored intent
+  id was released, the next `intent check` mints a new id, keeps the session's paths and
+  retries once. An intent from this command is advisory and reserves nothing; the hub
+  refuses it only for a path in the scope of unfinished Work the agent no longer holds,
+  and a token whose Work is finished can still post advisory intents.
 - Only files the agent edits through Edit, Write or MultiEdit are announced, not files
   written by shell commands.
 - An intent expires two hours after its last announce. SessionEnd may not run after a

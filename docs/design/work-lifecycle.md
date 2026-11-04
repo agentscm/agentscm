@@ -134,19 +134,27 @@ In the same transaction, in both stores:
 - The new event kinds are added to the `hub_events_no_delete` trigger in the new migration (recreated
   with the full list), the compaction and history lists in both stores, and the UI event list.
 
-The legacy fallback is closed in the same change. The managed-touch guard refuses sessions linked
-to Work that is finished, fenced by generation or has no reservation, and `announce_intent` runs a
-guard in its transaction too. The plain announce route has no session field, and the session it
-would resolve (the lone recent hook session or `default`) may never have joined Work, so the guard
-is not limited to that session. If the token has any session linked to Work in the repository, the
-announce passes only when its paths are covered by Work on which one of the token's sessions is
-currently eligible (held reservation, `active` or `blocked`, current generation). A token never
-linked to Work keeps the legacy advice. A token that invents a new session name is not linked and
-keeps the legacy advice; that is a documented limit. The plain-announce guard looks the token up by
-its stored repository id and does not refuse a token whose repository was renamed, as the announce
-never did. Release and terminal transitions and the finish checkpoint release the session-less
-intents of the participants' tokens that overlap the scope, so a fenced token has nothing left
-that blocks others.
+The legacy fallback is closed in the same change. The managed-touch guard (named-session routes: touch,
+check, hooks and MCP) refuses sessions linked to Work that is finished, fenced by generation or has no
+reservation, and `announce_intent` runs a guard in its transaction too. The plain announce route has
+no session field and an intent there is advisory, not a reservation, so its guard is narrower. It
+refuses a path only when the path lies in the declared scope of unfinished Work on which the token
+is a participant or lead but none of its sessions is currently eligible (reservation not held,
+`paused` or `handover`, or fenced by generation), and no Work on which one of the token's sessions
+is eligible covers the path. The refusal names the Work and says to resume it. Every other path keeps
+the legacy advice: a token never linked to Work, a token whose only link is finished Work, Work with an
+empty scope, and paths outside every linked scope. A token whose Work is finished can therefore post
+advisory intents; it acquires no reservation and passes no admission. A token that invents a new
+session name is not linked and keeps the legacy advice. These are documented limits. The guard looks
+the token up by its stored repository id and does not refuse a token whose repository was renamed, as
+the announce never did.
+
+Release and terminal transitions and the finish checkpoint release the live intent of each
+participant session and the lead, and, when the Work held a reservation, the session-less intents of
+the participants' tokens that overlap the scope. A session that is currently eligible on other Work
+keeps its intent, and a session-less intent whose paths other Work with an eligible session of the
+token covers is kept. A takeover releases only the previous lead's session intent; the previous
+lead's session-less intents remain until they expire.
 
 Resuming released Work (no reservation) needs a start with the current `takeover_generation`. Any
 token of the owner may do it in any state, and the claim need not be stale; the admission check then
