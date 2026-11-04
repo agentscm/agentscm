@@ -31,6 +31,12 @@ use super::{HubError, Result};
 
 /// Prerequisites read in full; the rest stay `unknown`.
 const MAX_PREREQUISITES_READ: usize = 16;
+/// Row limit for a prerequisite past the read cap.
+const UNREAD_CAP: &str = "prerequisite_not_read";
+/// Row limit for a prerequisite the token cannot read.
+const UNREAD_DENIED: &str = "prerequisite_unreadable";
+/// Row limit for a prerequisite whose link read failed in the Store.
+const UNREAD_FAILED: &str = "prerequisite_read_failed";
 /// The catch-up preview label; a preview reads cursors and creates no delivery.
 const PREVIEW_SUBSCRIBER: &str = "work-reconcile";
 
@@ -58,6 +64,8 @@ pub(super) struct PrerequisiteFacts<'a> {
     pub(super) work_id: &'a str,
     /// `None` when the prerequisite could not be read.
     pub(super) pr: Option<PrFacts<'a>>,
+    /// The row limit when `pr` is `None`.
+    pub(super) unread: &'static str,
     pub(super) outcome: Option<OutcomeValue>,
 }
 
@@ -204,6 +212,11 @@ fn provider_status(
         limits.insert("merge_head_not_compared".to_owned());
         return (ProviderStatus::Merged, HeadRelation::Unknown);
     }
+    // An open observation is a real fact, but without a merge answer it cannot be the whole
+    // story: a merge row may exist that the lookup could not see.
+    if pr.merged.is_none() {
+        limits.insert("merge_lookup_unavailable".to_owned());
+    }
     if let Some(head) = pr.open_head {
         return if head.eq_ignore_ascii_case(&link.target.head_sha) {
             (ProviderStatus::OpenSameHead, HeadRelation::Same)
@@ -211,21 +224,15 @@ fn provider_status(
             (ProviderStatus::OpenHeadChanged, HeadRelation::Changed)
         };
     }
-    match pr.merged {
-        Some(false) => {
-            if pr.observation_limit.is_none() {
-                limits.insert("closed_state_not_readable".to_owned());
-            }
-        }
-        _ => {
-            limits.insert("merge_lookup_unavailable".to_owned());
-        }
+    if pr.merged == Some(false) && pr.observation_limit.is_none() {
+        limits.insert("closed_state_not_readable".to_owned());
     }
     (ProviderStatus::Unknown, HeadRelation::Unknown)
 }
 
-/// An open prerequisite is `not_satisfied` only on complete observation; during an outage the
-/// open status may be stale, so it is `unknown`. A merge row stays `satisfied` either way.
+/// An open prerequisite is `not_satisfied` only on complete observation and a known absence of a
+/// merge row; during an outage, or when the merge lookup failed, the open status may be stale,
+/// so it is `unknown`. A merge row stays `satisfied` either way.
 fn prerequisite(
     facts: Option<&PrerequisiteFacts<'_>>,
     id: &str,
@@ -236,14 +243,15 @@ fn prerequisite(
     let provider = match pr {
         Some(pr) => provider_status(pr, &mut limits).0,
         None => {
-            limits.insert("prerequisite_unreadable".to_owned());
+            limits.insert(facts.map_or(UNREAD_CAP, |f| f.unread).to_owned());
             ProviderStatus::Unknown
         }
     };
     let state = match provider {
         ProviderStatus::Merged => PrerequisiteState::Satisfied,
         ProviderStatus::OpenSameHead | ProviderStatus::OpenHeadChanged
-            if coverage == CatchupCoverageState::ObservedOnly =>
+            if coverage == CatchupCoverageState::ObservedOnly
+                && pr.is_some_and(|p| p.merged == Some(false)) =>
         {
             PrerequisiteState::NotSatisfied
         }
@@ -462,6 +470,23 @@ fn read_coverage(store: &dyn Store, token: &str, now: i64) -> (CatchupCoverageSt
     (state, merge_gap)
 }
 
+enum Recheck {
+    Same,
+    Changed,
+    Gone,
+    Unavailable,
+}
+
+/// The final re-read of the Work. A Work that vanished is not found, not unlinked.
+fn recheck(again: Result<Option<WorkItem>>, updated_seq: i64) -> Recheck {
+    match again {
+        Ok(Some(again)) if again.updated_seq == updated_seq => Recheck::Same,
+        Ok(Some(_)) => Recheck::Changed,
+        Ok(None) => Recheck::Gone,
+        Err(_) => Recheck::Unavailable,
+    }
+}
+
 /// Reconcile one Work from separate read-only Store calls. The reads are not one snapshot; the
 /// result says so, and says when the Work changed between the first and last read. `None` means
 /// the Work is unknown to the token, which is the same answer for a Work in another repository.
@@ -506,32 +531,39 @@ pub fn read(
     };
     // Coverage first, so a backfill during the preview cannot make the PR reads miss a merge.
     let (coverage, merge_gap) = read_coverage(store, token, now);
-    let pr = read_pr(store, principal, &scope, &item.id, now, merge_gap)?.unwrap_or_default();
+    let Some(pr) = read_pr(store, principal, &scope, &item.id, now, merge_gap)? else {
+        return Ok(None);
+    };
     // Only a prerequisite the token can read gets facts; the others stay unknown, unnamed.
     let mut prerequisite_reads = Vec::new();
     for id in &wanted {
         let Some(projection) = operational.iter().find(|w| &w.work_id == id) else {
+            prerequisite_reads.push((id.as_str(), None, None, UNREAD_DENIED));
             continue;
         };
-        let Ok(Some(read)) = read_pr(store, principal, &scope, id, now, merge_gap) else {
-            continue;
+        let (read, unread) = match read_pr(store, principal, &scope, id, now, merge_gap) {
+            Ok(Some(read)) => (Some(read), UNREAD_DENIED),
+            Ok(None) => (None, UNREAD_DENIED),
+            Err(_) => (None, UNREAD_FAILED),
         };
-        prerequisite_reads.push((id.as_str(), read, projection.outcome.value));
+        prerequisite_reads.push((id.as_str(), read, Some(projection.outcome.value), unread));
     }
     let prerequisites: Vec<PrerequisiteFacts<'_>> = prerequisite_reads
         .iter()
-        .map(|(id, read, outcome)| PrerequisiteFacts {
+        .map(|(id, read, outcome, unread)| PrerequisiteFacts {
             work_id: id,
-            pr: Some(read.facts()),
-            outcome: Some(*outcome),
+            pr: read.as_ref().map(PrRead::facts),
+            unread,
+            outcome: *outcome,
         })
         .collect();
-    match store.work_get(token, work_id, now) {
-        Ok(Some(again)) if again.updated_seq == item.updated_seq => {}
-        Ok(_) => {
+    match recheck(store.work_get(token, work_id, now), item.updated_seq) {
+        Recheck::Same => {}
+        Recheck::Changed => {
             limits.insert("work_changed_during_read");
         }
-        Err(_) => {
+        Recheck::Gone => return Ok(None),
+        Recheck::Unavailable => {
             limits.insert("work_recheck_unavailable");
         }
     }
@@ -720,7 +752,7 @@ mod tests {
                 Some("bbb"),
                 P::OpenHeadChanged,
                 Changed,
-                &[],
+                &["merge_lookup_unavailable"],
             ),
             (
                 Some(&l),
@@ -752,10 +784,10 @@ mod tests {
             assert_eq!(out.provider.status, status, "{merged:?} {open:?}");
             assert_eq!(out.provider.head_relation, relation);
             assert_eq!(out.link.is_some(), link.is_some());
-            assert!(out.limits.contains(&"single_pr_link_only".to_owned()));
-            for want in limits {
-                assert!(out.limits.contains(&(*want).to_owned()), "{want}");
-            }
+            let mut expected: Vec<String> = limits.iter().map(|l| (*l).to_owned()).collect();
+            expected.push("single_pr_link_only".to_owned());
+            expected.sort();
+            assert_eq!(out.limits, expected, "{merged:?} {open:?}");
             let mut sorted = out.limits.clone();
             sorted.sort();
             sorted.dedup();
@@ -841,6 +873,13 @@ mod tests {
                     observation_limit: Some("observation_malformed"),
                     ..PrFacts::default()
                 }),
+                unread: "",
+                outcome: None,
+            },
+            PrerequisiteFacts {
+                work_id: "dep-c",
+                pr: None,
+                unread: UNREAD_DENIED,
                 outcome: None,
             },
         ];
@@ -966,8 +1005,74 @@ mod tests {
                 open_head: open,
                 ..PrFacts::default()
             }),
+            unread: "",
             outcome,
         }
+    }
+
+    #[test]
+    fn failed_merge_lookup_leaves_an_open_prerequisite_unknown() {
+        let l = link(8, "ccc");
+        let it = item(WorkState::Blocked, &["dep-a", "dep-b"], true);
+        let prereqs = [
+            prereq("dep-a", Some(&l), None, Some("ccc"), None),
+            prereq("dep-b", Some(&l), Some(false), Some("ccc"), None),
+        ];
+        let out = reconcile(&facts(
+            &it,
+            None,
+            None,
+            PrFacts::default(),
+            CatchupCoverageState::ObservedOnly,
+            &prereqs,
+        ));
+        let a = &out.prerequisites[0];
+        assert_eq!(a.provider, ProviderStatus::OpenSameHead);
+        assert_eq!(a.state, PrerequisiteState::Unknown);
+        assert_eq!(a.limits, ["merge_lookup_unavailable"]);
+        let b = &out.prerequisites[1];
+        assert_eq!(b.state, PrerequisiteState::NotSatisfied);
+        assert!(b.limits.is_empty());
+    }
+
+    #[test]
+    fn unread_prerequisites_say_why() {
+        let it = item(WorkState::Active, &["dep-a", "dep-b", "dep-c"], false);
+        let prereqs = [
+            PrerequisiteFacts {
+                work_id: "dep-a",
+                pr: None,
+                unread: UNREAD_DENIED,
+                outcome: None,
+            },
+            PrerequisiteFacts {
+                work_id: "dep-b",
+                pr: None,
+                unread: UNREAD_FAILED,
+                outcome: None,
+            },
+        ];
+        let out = run(&it, None, None, None, None, &prereqs);
+        let limits: Vec<_> = out.prerequisites.iter().map(|p| &p.limits).collect();
+        assert_eq!(limits[0], &["prerequisite_unreadable"]);
+        assert_eq!(limits[1], &["prerequisite_read_failed"]);
+        assert_eq!(limits[2], &["prerequisite_not_read"]);
+        assert!(
+            out.prerequisites
+                .iter()
+                .all(|p| p.state == PrerequisiteState::Unknown)
+        );
+    }
+
+    #[test]
+    fn recheck_distinguishes_vanished_changed_and_failed() {
+        let it = item(WorkState::Active, &[], false);
+        let seq = it.updated_seq;
+        assert!(matches!(recheck(Ok(Some(it.clone())), seq), Recheck::Same));
+        assert!(matches!(recheck(Ok(Some(it)), seq + 1), Recheck::Changed));
+        assert!(matches!(recheck(Ok(None), seq), Recheck::Gone));
+        let failed = recheck(Err(HubError::Unavailable("x".into())), seq);
+        assert!(matches!(failed, Recheck::Unavailable));
     }
 
     #[test]

@@ -19,7 +19,7 @@ including Work of another repository, gets the same `404` as an unknown id.
 | Field | Meaning and basis |
 |---|---|
 | `link` | The PR number and head the Work's lead reported with `pr-link-set` (`basis: caller_reported`). Provider approval is not implied. The link token is never returned. |
-| `provider.status` | `merged` from a recorded provider merge row for the link's PR number in this repository (by repository id); a merge row wins over any open observation. `open_same_head` or `open_head_changed` from a retained open-PR observation, only when no merge row exists (heads compare case-insensitively). `not_linked` when no link exists. Otherwise `unknown`. |
+| `provider.status` | `merged` from a recorded provider merge row for the link's PR number in this repository (by repository id); a merge row wins over any open observation. `open_same_head` or `open_head_changed` from a retained open-PR observation, only when a merge row is known to be absent (heads compare case-insensitively). If the merge lookup itself failed, the Work still reports `open_*` with `open_observed_at_ms`, because the observation is a real fact, but it carries `merge_lookup_unavailable`: a merge row may exist that the lookup could not see. `not_linked` when no link exists. Otherwise `unknown`. |
 | `provider.head_relation` | `same` or `changed` against the open observation's head. `unknown` for a merge. |
 | `provider.open_observed_at_ms` | Unix milliseconds when the forge read behind an `open_*` status started; that status is as old as this. Absent otherwise. Outside the digest. |
 | `provider.coverage` | The weakest merge-source state from the catch-up preview: `observed_only`, `incomplete` or `unavailable`. |
@@ -35,7 +35,7 @@ including Work of another repository, gets the same `404` as an unknown id.
 Work-level limits include `single_pr_link_only`, `no_pr_link`, `pr_link_unavailable`,
 `merge_lookup_unavailable`, `merge_head_not_compared`, `merge_and_open_observed` (a merge row
 with a stale open observation), `merge_retention_gap` (the catch-up preview reports merge history
-older than retention and there is no merge row), `closed_state_not_readable` (the observation read
+older than retention and there is no merge row). The gap is repository-wide and persists after the first prune, so it does not say this PR's merge was pruned; a per-PR answer needs a store read, which is out of scope here, `closed_state_not_readable` (the observation read
 succeeded and found nothing open), `observation_malformed`, `observation_unavailable`,
 `coverage_incomplete`, `coverage_unavailable`, `prerequisites_truncated`,
 `work_changed_during_read` and `work_recheck_unavailable` (the final re-read of the Work
@@ -48,12 +48,14 @@ A merge never proves that the task succeeded, and never changes `outcome` or `re
 
 A prerequisite is `satisfied` only from an explicit link on that prerequisite plus a provider
 merge; retained merge evidence stays `satisfied` during an outage. An open PR is `not_satisfied`
-only when coverage is `observed_only`; under `incomplete` or `unavailable` coverage the open
-status may be stale, so it is `unknown`. Everything else is `unknown`, including a prerequisite whose
+only when coverage is `observed_only` and the absence of a merge row is known; under `incomplete`
+or `unavailable` coverage, or when the merge lookup failed (`merge_lookup_unavailable` on its
+row), the open status may be stale, so it is `unknown`. Everything else is `unknown`, including a prerequisite whose
 agent reported `completed` with no linked merge: a reported completion alone is not satisfied.
-`reported_outcome` is shown beside the state and never changes it. A prerequisite the token cannot
-read stays `unknown`, carries the limit `prerequisite_unreadable` and is not named beyond its
-id. Each row also shows its own `link` (basis, PR number and head; never the token) and its own
+`reported_outcome` is shown beside the state and never changes it. A prerequisite that is not
+satisfied by evidence stays `unknown` and its row says why it could not be read: `prerequisite_unreadable`
+(the token cannot read it; it is not named beyond its id), `prerequisite_not_read` (past the
+16-prerequisite cap) or `prerequisite_read_failed` (a store error on its link read). Each row also shows its own `link` (basis, PR number and head; never the token) and its own
 sorted `limits`.
 
 ## Cases

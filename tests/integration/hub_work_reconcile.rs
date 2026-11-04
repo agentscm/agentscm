@@ -528,6 +528,13 @@ fn prerequisite_cap(fixture: &StoreFixture) {
         .filter(|p| p.reported_outcome.is_some())
         .count();
     assert_eq!(read, 16);
+    let unread: Vec<_> = out
+        .prerequisites
+        .iter()
+        .filter(|p| p.reported_outcome.is_none())
+        .collect();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].limits, ["prerequisite_not_read"]);
     assert!(
         out.prerequisites
             .iter()
