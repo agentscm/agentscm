@@ -42,6 +42,7 @@ use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, ForgeWorkRef, WorkCheckpoint,
     WorkConflictKind, WorkItem, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
 };
+use super::work_lifecycle::LEASE_LAPSED;
 use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult, WorkPreflightStatus};
 use super::work_transition::{
     OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionRequest,
@@ -1192,7 +1193,9 @@ pub(super) fn hub_failure(error: &HubError) -> Value {
         }
         HubError::Unavailable(_) => "hub unavailable",
         HubError::Invalid(message)
-            if message == SESSION_REQUIRED || message.starts_with(LEAD_SESSION_MISMATCH) =>
+            if message == SESSION_REQUIRED
+                || message.starts_with(LEAD_SESSION_MISMATCH)
+                || message.starts_with(LEASE_LAPSED) =>
         {
             message.as_str()
         }

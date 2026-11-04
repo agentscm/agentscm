@@ -21,6 +21,7 @@ use agentscm::hub::work::{
     SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint,
     WorkConflictKind, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
+use agentscm::hub::work_lifecycle::LEASE_SECONDS as LEASE;
 use agentscm::hub::work_links::{
     WorkPrHeadStatus, WorkPrLinkQuery, WorkPrLinkTarget, WorkPrLinkUpdate, WorkPrSnapshotStatus,
 };
@@ -746,8 +747,18 @@ fn authorization_and_claim_projection_keep_old_claims_visible(db: &Db) {
             .claim_status,
         ClaimStatus::Stale
     );
+    // A stale report alone does not open takeover while the lead's lease is live.
     let contested = store
         .work_start(&viewer.token, &takeover(&id, "viewer", None), stale_at)
+        .unwrap();
+    assert_eq!(
+        contested.conflict.unwrap().kind,
+        WorkConflictKind::ClaimHeld
+    );
+    let lapsed_at = now + LEASE + 1;
+    tick(&*store, now, lapsed_at);
+    let contested = store
+        .work_start(&viewer.token, &takeover(&id, "viewer", None), lapsed_at)
         .unwrap();
     assert_eq!(
         contested.conflict.unwrap().kind,
@@ -2651,11 +2662,12 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
             .is_some()
     );
     let successor = agent(&*store, 6);
+    tick(&*store, now, now + LEASE + 2);
     let taken = store
         .work_start(
             &successor.token,
             &takeover(&item.id, "successor", Some(1)),
-            now + CLAIM_STALE_SECONDS + 2,
+            now + LEASE + 2,
         )
         .unwrap();
     assert!(taken.took_over);
@@ -2664,7 +2676,7 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
             &successor.token,
             &item.id,
             &WorkPrLinkQuery::default(),
-            now + CLAIM_STALE_SECONDS + 3,
+            now + LEASE + 3,
         )
         .unwrap()
         .unwrap();
@@ -2678,7 +2690,7 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
     assert_eq!(original_link.linked_at, now + 1);
     assert_eq!(original_link.event_seq, first.receipt.event_seq);
     let replayed = store
-        .work_pr_link_set(&lead.token, &update, now + CLAIM_STALE_SECONDS + 3)
+        .work_pr_link_set(&lead.token, &update, now + LEASE + 3)
         .unwrap();
     assert!(replayed.receipt.replayed);
     assert_eq!(replayed.receipt.generation, 1);
@@ -2687,17 +2699,13 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
     let mut old_lead_new_operation = update.clone();
     old_lead_new_operation.operation_id = "old-lead-new-operation".into();
     assert_invalid(
-        store.work_pr_link_set(
-            &lead.token,
-            &old_lead_new_operation,
-            now + CLAIM_STALE_SECONDS + 3,
-        ),
+        store.work_pr_link_set(&lead.token, &old_lead_new_operation, now + LEASE + 3),
         "PR link generation is fenced",
     );
     let mut removal = pr_link_update(&taken.item, "successor-remove");
     removal.link = None;
     let removed = store
-        .work_pr_link_set(&successor.token, &removal, now + CLAIM_STALE_SECONDS + 3)
+        .work_pr_link_set(&successor.token, &removal, now + LEASE + 3)
         .unwrap();
     assert!(removed.view.link.is_none());
     assert!(removed.view.updated_seq > first.view.updated_seq);
@@ -3037,7 +3045,8 @@ fn pr_link_receipts_replay_after_takeover_changes_and_removal(db: &Db) {
         .work_pr_link_set(&lead.token, &original_request, now + 1)
         .unwrap();
     let successor = agent(&*store, 2);
-    let takeover_at = now + CLAIM_STALE_SECONDS + 2;
+    let takeover_at = now + LEASE + 2;
+    tick(&*store, now, takeover_at);
     let taken = store
         .work_start(
             &successor.token,
@@ -3521,8 +3530,9 @@ fn announce_intent_refuses_fenced_sessions_but_not_finished_or_unlinked_ones(db:
         .announce_intent(&alice.token, &intent(1, "src/a.rs"), now + 1)
         .unwrap();
 
-    // Bob takes over after the claim went stale; alice's session is now fenced.
-    let later = now + CLAIM_STALE_SECONDS + 10;
+    // Bob takes over after alice's lease lapsed; alice's session is now fenced.
+    let later = now + LEASE + 10;
+    tick(&*store, now, later);
     assert!(
         store
             .work_start(
@@ -4551,8 +4561,9 @@ fn reopen_conflicts_on_overlap_and_fences_the_old_session(db: &Db) {
         Err(HubError::Invalid(_))
     ));
 
-    // The reopened Work is ordinary: once stale, another agent takes it over.
-    let later = now + CLAIM_STALE_SECONDS + 10;
+    // The reopened Work is ordinary: once its lease lapsed, another agent takes it over.
+    let later = now + LEASE + 20;
+    tick(&*store, now, later);
     let taken = store
         .work_start(&bob.token, &takeover(&item.id, "s-bob", Some(2)), later)
         .unwrap();
@@ -4966,10 +4977,11 @@ fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(
     ));
     announce_plain(&alice, 3, &["src/c.rs"], now + 7).unwrap();
 
-    // A stale takeover fences the previous holder's named session.
+    // A takeover after the lease lapsed fences the previous holder's named session.
     let other = start_in(&*store, &bob, "b", "abc", "lib/**", now + 8);
     announce_plain(&bob, 6, &["lib/a.rs"], now + 9).unwrap();
-    let later = now + 8 + CLAIM_STALE_SECONDS + 10;
+    let later = now + 8 + LEASE + 10;
+    tick(&*store, now, later);
     assert!(
         store
             .work_start(&carol.token, &takeover(&other.id, "abc", Some(1)), later)

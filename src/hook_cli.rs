@@ -96,6 +96,14 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
+    if let Some(key) = activity_key(agent, &payload)
+        && let Ok(config) = config_dir()
+    {
+        if marked_within(&config, &key, ACTIVITY_EVERY) {
+            return fail_open(agent, &payload, None);
+        }
+        mark(&config, &key);
+    }
     if is_session_start(agent, &payload) {
         deadline += SESSION_START_LIMIT - LIMIT;
     }
@@ -934,6 +942,8 @@ const NO_EDIT_CONNECTION: &str = "no client connection for an edit path";
 /// How often one agent re-reports the same unconnected checkout to the tray, and how long that
 /// report may hold the hook.
 const UNCONNECTED_EVERY: Duration = Duration::from_secs(5 * 60);
+/// The Hub renews a session's lease at most this often, so activity in between stays local.
+const ACTIVITY_EVERY: Duration = Duration::from_secs(60);
 const UNCONNECTED_WAIT: Duration = Duration::from_millis(500);
 const MAX_EDIT_PATHS: usize = 256;
 const PATCH_HEADERS: [&str; 4] = [
@@ -1569,10 +1579,17 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
             let event = match payload["hook_event_name"].as_str() {
                 Some("SessionStart") => "start",
                 Some("BeforeTool") if !paths.is_empty() => "check",
+                Some("BeforeTool" | "AfterTool") => "activity",
                 Some("SessionEnd") => "done",
                 _ => return Err("hook event not recognised".into()),
             };
             let mut out = json!({"agent":"gemini", "event":event});
+            if event == "activity"
+                && agentscm::hub::hook::is_shell_tool(payload["tool_name"].as_str().unwrap_or(""))
+            {
+                let before = payload["hook_event_name"] == "BeforeTool";
+                out["phase"] = json!(if before { "start" } else { "end" });
+            }
             if let Some(session) = bounded_string(&payload["session_id"], 1024) {
                 out["session"] = json!(session);
             }
@@ -1702,6 +1719,29 @@ fn first_deny(config: Option<&Path>, agent: &str, payload: &Value) -> bool {
             input.unwrap_or(&Value::Null)
         ),
     )
+}
+
+/// The marker key of a tool event that only renews the session's lease: every tool event except
+/// the one that checks an edit (preToolUse, or postToolUse in Cursor) and a shell call's start or
+/// end, which the Hub counts so a long call stays live. None without a session.
+fn activity_key(agent: &str, payload: &Value) -> Option<String> {
+    let session = session_of(payload)?;
+    if agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0) {
+        return None;
+    }
+    // A path that cannot be read is sent on, so the Hub decides.
+    let edit = edit_paths(agent, payload).map_or(true, |paths| !paths.is_empty());
+    let renews = match (agent, payload["hook_event_name"].as_str()) {
+        ("cursor", Some("postToolUse")) => !edit,
+        ("cursor", _) => false,
+        ("gemini", Some("AfterTool")) | (_, Some("PostToolUse")) => true,
+        ("gemini", Some("BeforeTool")) | (_, Some("PreToolUse")) => !edit,
+        ("copilot", None) => {
+            payload.get("toolName").is_some() && (payload.get("toolResult").is_some() || !edit)
+        }
+        _ => false,
+    };
+    renews.then(|| format!("activity\0{agent}\0{session}"))
 }
 
 /// The agent name is argv, so keep it to a safe single path segment.
@@ -1901,6 +1941,80 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_tool_events_that_check_no_edit_are_rate_limited_activity() {
+        let key = |agent: &str, payload: Value| activity_key(agent, &payload);
+        let read = json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Read"});
+        assert_eq!(key("claude", read).as_deref(), Some("activity\0claude\0s"));
+        // A shell call's start and end always reach the Hub, which counts them.
+        let bash = json!({"hook_event_name":"PostToolUse","session_id":"s","tool_name":"Bash"});
+        assert_eq!(key("claude", bash), None);
+        let edit = json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Edit",
+            "tool_input":{"file_path":"/r/a.rs"}});
+        assert_eq!(key("claude", edit), None);
+        let post_edit = json!({"hook_event_name":"PostToolUse","session_id":"s","tool_name":"Edit",
+            "tool_input":{"file_path":"/r/a.rs"}});
+        assert!(key("codex", post_edit).is_some());
+        // Cursor checks edits after the tool ran, so only its other tool events are activity.
+        assert_eq!(
+            key(
+                "cursor",
+                json!({"hook_event_name":"postToolUse","conversation_id":"c",
+                "tool_name":"Write","tool_input":{"file_path":"/r/a.rs"}})
+            ),
+            None
+        );
+        assert!(
+            key(
+                "cursor",
+                json!({"hook_event_name":"postToolUse","conversation_id":"c",
+                "tool_name":"Shell"})
+            )
+            .is_some()
+        );
+        assert!(
+            key(
+                "gemini",
+                json!({"hook_event_name":"AfterTool","session_id":"g"})
+            )
+            .is_some()
+        );
+        assert!(key("copilot", json!({"sessionId":"p","toolName":"view"})).is_some());
+        assert_eq!(
+            key(
+                "copilot",
+                json!({"sessionId":"p","toolName":"edit","toolArgs":{"path":"a.rs"}})
+            ),
+            None
+        );
+        // Without a session nothing is rate limited, and lifecycle events never are.
+        assert_eq!(
+            key(
+                "claude",
+                json!({"hook_event_name":"PreToolUse","tool_name":"Bash"})
+            ),
+            None
+        );
+        assert_eq!(
+            key(
+                "claude",
+                json!({"hook_event_name":"SessionStart","session_id":"s"})
+            ),
+            None
+        );
+        // Gemini's non-edit tool events reach the Hub as generic activity.
+        let tick = sanitized_client(
+            "gemini",
+            &json!({"hook_event_name":"AfterTool","session_id":"g","tool_name":"run_shell_command"}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            tick,
+            json!({"agent":"gemini","event":"activity","phase":"end","session":"g"})
+        );
+    }
 
     #[test]
     fn normalized_lifecycle_alone_marks_session_end() {

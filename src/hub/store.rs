@@ -995,6 +995,16 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
+    /// A tool call a hook reported that is not an edit check: a touch of the session, which
+    /// renews its leases, and for a shell call the start or end that keeps them live while it
+    /// runs, up to the in-flight cap.
+    fn session_activity(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        phase: super::work_lifecycle::CallPhase,
+        now: i64,
+    ) -> Result<()>;
     /// Records that the Hub's clock reads `now`. After a gap longer than a lease since the last
     /// observation, every reservation that was live then gets one lease of grace.
     fn observe_lease_clock(&self, now: i64) -> Result<()>;

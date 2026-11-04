@@ -188,8 +188,9 @@ to `activity`. Fields: `work_id`, `state`,
 or `none`, with a `provenance` of `agent_report`, `person`, `admin` or `unknown`); `reservation`
 (`status`, `basis`, `scope`, `holder_agent`, `holder_session`; never a token id); `report` (time and
 kind of the last agent report); `freshness` (the existing claim status); `activity` (`live` or
-`lapsed` for a held reservation, from its lease at request time, with `lease_renewed_at` and
-`lease_expires_at`; `unknown` when nothing is held); `merge`
+`lapsed` for a held reservation, from its lease at request time, with `lease_renewed_at`,
+`lease_expires_at`, a reason that says what to do, and `coverage`: what renews the lead session's
+lease; `unknown` when nothing is held); `merge`
 (`hidden_by_merged_pr` and a status: `observed` when hidden by a merged pull request, `none` only when
 the Hub knows its forge pull-request read reached back to the Work's creation and the merge rule applies
 to the Work, otherwise `unknown`); `actionable` (a recipient of
@@ -238,7 +239,8 @@ user-facing recovery. The UI only renders the new event kind in history.
 - Old records keep a NULL outcome. Finished Work reported before the migration reads as `unstated`.
 - Every unfinished row is backfilled `legacy_implicit`, so what blocked before blocks after.
 - The lease migration starts every held reservation's lease at migration time: 2 hours for
-  `retained`, 20 minutes for the others. The clock row starts then too.
+  `retained`, 20 minutes for the others. The clock row starts then too. A second migration adds the
+  session columns for tool activity and running shell calls; existing sessions start with none.
 - Older clients decode all existing responses unchanged and read `abandoned` and `superseded` Work
   as `finished`. They do not see the optional `operational` fields unless they ask for them.
 - The schema change is a named migration. After it has applied, an older server binary is refused,
@@ -256,14 +258,29 @@ A reservation blocks other Work only while its lead session is live. Every non-N
 lease, stored as `reservation_renewed_at` and `reservation_expires_at` in server Unix seconds, both
 NULL when nothing is held.
 
+### Expiry and renewal
+
 - `admitted` and `implicit` expire 20 minutes (`LEASE_SECONDS`) after the admission, pause or last
   renewal. There is no absolute cap: a lead that keeps working keeps its reservation.
-- `retained` expires 2 hours (`RETAIN_CAP_SECONDS`) after the retain. Lead activity can extend it
-  by the idle lease but never shortens it, and it never holds indefinitely.
-- Only the lead session's own authenticated activity renews: a hook touch or a named MCP session
-  call (`touch_session`), and a checkpoint, at most once a minute. The renewal is a conditional
-  update that matches only a live lease, so a late touch never revives a lapsed one. Another session
+- `retained` expires 2 hours (`RETAIN_CAP_SECONDS`) after the retain. Lead activity can extend it by
+  the idle lease but never shortens it, and it never holds indefinitely.
+- Only the lead session's own authenticated activity renews, at most once a minute: its hooks'
+  tool calls and edit checks, its named MCP session calls (`touch_session`) and its checkpoints.
+  Renewal follows the lead credential (#337): a checkpoint and a touch renew after the credential
+  carry, so the same owner and session renew under a new token in the same call. Another session
   of the same token, a helper and another token renew nothing.
+- Renewal is a conditional update that matches only a live lease of `active` or `blocked` Work, so
+  a late touch never revives a lapsed lease, and a paused or handed-over item lapses on its own
+  clock even while its session works on something else.
+- A shell call may run longer than a lease. The hooks report its start and end, the session counts
+  the calls still running (`open_calls`), and each start extends the session's live leases to 60
+  minutes ahead (`IN_FLIGHT_CAP_SECONDS`). When the last call ends they fall back to the idle lease;
+  a retain keeps its own longer expiry. A count older than the cap is stale, its end lost, so a call
+  whose agent crashed holds for at most 60 minutes. Nothing renews from the background: every
+  renewal is a call the session made.
+
+### Lapse
+
 - A lapsed reservation is advice. Overlap checks, preflight and coordination ignore it and the
   projection reports `lapsed`, but it keeps its basis until an admission over its scope: a start, a
   takeover or resume of released Work, a reopen, a scope-changing checkpoint, or the lead starting
@@ -273,19 +290,55 @@ NULL when nothing is held.
   prior lead agent and session, the basis, the last renewal, the expiry, the branch, the scope, the
   paths the Hub saw the lead session hold, `push_state: unknown` and the admitting Work. Compaction
   never deletes that event kind.
+- A woken lead whose scope was taken is refused by the managed-edit guard with `LEASE_LAPSED`: when
+  the hold lapsed, which Work and agent hold the scope now, that the branch may hold unpushed work,
+  and the `agentscm_start` with `work_id` and `takeover_generation` that resumes it through fresh
+  admission. Hooks, MCP and HTTP pass that text through. The guard's refusal is not the advisory
+  overlap guard, so the pass-through after three refusals in ten minutes never applies to it.
+- Taking over Work that holds a reservation needs its lease to have lapsed, or, for the Work's own
+  owner, a lead token that can no longer act (revoked, expired, its owner disabled or its repository
+  renamed), since such a token never renews. A stale claim, a progress report older than
+  `CLAIM_STALE_SECONDS`, never opens it alone. Work that holds nothing keeps the claim-age rule, and
+  `handover` Work is open as before.
+
+### Clock
+
 - The Hub observes its own clock once a minute in `hub_lease_clock`. After a gap longer than a lease
   (a restart, or the clock jumping forward), the first observation gives every reservation that was
   live at the previous observation one more lease. Until then the clock is stale and nothing
   lapses. A backward jump only moves the observation back, so leases can last longer by the jump.
-- A woken lead is refused by the managed-edit guard, not by the advisory overlap guard, so the
-  pass-through after three refusals in ten minutes never applies to it. It resumes with a takeover
-  start, which runs fresh admission.
 - In PostgreSQL an admission holds the repository's Work lock, then locks the lapsed candidate rows,
-  then checks overlaps. A touch holds the same lock in shared mode and a checkpoint in exclusive
-  mode before renewing, so a renewal never lands between the check and the lapse. The heartbeat
-  locks only the clock row before extending leases, and admissions only read that row.
+  then checks overlaps. A touch and a reported tool call hold the same lock in shared mode and a
+  checkpoint in exclusive mode before renewing, so a renewal never lands between the check and the
+  lapse. The heartbeat locks only the clock row before extending leases, and admissions only read
+  that row.
 
-Limits: renewal comes from hook edit checks, named MCP session calls and checkpoints. A long
-read-only stretch or a long-running tool call with none of those lapses after 20 minutes; renewal on
-every tool call needs the hook client and is not built yet. Hub fencing cannot stop edits made
-offline, so the lapse event says the branch may hold unpushed work.
+### Coverage and participants
+
+- `activity.coverage` says what renews the lead session: `tool_calls` once a hook reported one of
+  its tool calls, `edits` for hooks that report only edits (an older `client setup`), `mcp_only`,
+  or `unknown` when the Hub keeps no session record. Anything but `tool_calls` adds
+  `activity_coverage` to `completeness.unknown` and a reason that names the fix. The per-agent
+  table is in [Coding agents](../agents.md#holds-stay-live-while-the-agent-works).
+- Any writer on the repository may join Work as a helper or reviewer, but a Work item takes at most
+  25 participants from other owners (`MAX_OTHER_OWNER_PARTICIPANTS`). That bounds what other
+  owners add to cleanup and `updated_seq`, and keeps the rest of the 100 participants for the
+  owner's sessions, so other owners cannot block a resume or reopen.
+
+### Fixed values
+
+The 20-minute lease, the 2-hour retain cap, the 60-minute in-flight cap and the once-a-minute
+renewal are constants, not configuration. They are what makes a hold mean the same thing to every
+agent and owner on a repository: a per-Hub or per-owner setting would let one owner's long lease
+block another owner's agents, which is the failure these leases remove, and it would add a
+compatibility surface every client must read. A change to a value is a code change reviewed like
+any other.
+
+### Runtime limits
+
+- A non-shell tool call that runs longer than 20 minutes, or any call in an agent whose hooks report
+  no tool start (Cursor), lapses meanwhile; the lead re-admits when it next starts its Work.
+- Hub fencing cannot stop edits made offline or by an agent with no hooks. The lapse event says the
+  branch may hold unpushed work, and the woken lead is told to push or set it aside.
+- Leases run on the Hub's clock; a client clock never decides a lapse. A backward jump of the Hub's
+  clock lengthens leases by the jump.

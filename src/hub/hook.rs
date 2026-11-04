@@ -33,6 +33,7 @@ use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{
     Briefing, CheckpointKind, WorkCheckpoint, WorkOverview, WorkOverviewQuery, WorkState,
 };
+use super::work_lifecycle::{CallPhase, LEASE_LAPSED};
 use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
@@ -115,6 +116,9 @@ enum Kind {
     /// The person typed a prompt in this session: delivers pending requests, writes nothing.
     Prompt,
     Check,
+    /// Any other tool call: renews the lead session's lease, writes nothing else, says nothing.
+    /// A shell call's start and end keep the lease live while it runs.
+    Activity(CallPhase),
     Done,
     Fail(&'static str),
 }
@@ -533,6 +537,30 @@ impl Call {
             Kind::Fail(reason) => Err(reason),
             // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
             Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
+            Kind::Activity(phase) => {
+                // Best effort and silent: the touch renews the session's own leases, and a
+                // failure must not disturb the agent. An unnamed session renews nothing.
+                if self.session.is_some()
+                    && let Ok(principal) = authenticate(state, token, repo).await
+                {
+                    let store = state.store.clone();
+                    let heartbeat = call(Vec::new());
+                    let heartbeat = SessionCall {
+                        task: None,
+                        deny: false,
+                        report: false,
+                        ..heartbeat
+                    };
+                    if let Err(error) = blocking(state, move || {
+                        store.session_activity(&principal.token_id, &heartbeat, phase, unix_now())
+                    })
+                    .await
+                    {
+                        eprintln!("hub: activity hook did not renew: {error}");
+                    }
+                }
+                Ok(Outcome::clean())
+            }
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
@@ -569,7 +597,11 @@ impl Call {
                     }
                     Err(HubError::Invalid(detail)) => {
                         eprintln!("hub: edit hook not linked to work: {detail:?}");
-                        let text = "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned();
+                        let text = if detail.starts_with(LEASE_LAPSED) {
+                            format!("AgentSCM: {detail} No new file intent was announced.")
+                        } else {
+                            "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned()
+                        };
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
                             text,
@@ -988,6 +1020,29 @@ fn is_edit(tool: &str) -> bool {
     EDIT_TOOLS.contains(&tool.to_ascii_lowercase().as_str())
 }
 
+/// The agents' shell tools, whose single call can run longer than a lease.
+pub fn is_shell_tool(tool: &str) -> bool {
+    [
+        "bash",
+        "shell",
+        "exec_command",
+        "local_shell",
+        "run_shell_command",
+        "run_terminal_cmd",
+        "run_in_terminal",
+    ]
+    .contains(&tool.to_ascii_lowercase().as_str())
+}
+
+/// The activity phase of a tool event: a shell call starts before and ends after it runs.
+fn phase(tool: &str, before: bool) -> CallPhase {
+    match (is_shell_tool(tool), before) {
+        (false, _) => CallPhase::Tick,
+        (true, true) => CallPhase::Start,
+        (true, false) => CallPhase::End,
+    }
+}
+
 /// The files a tool call edits: patch headers for `apply_patch`, else the first path field.
 fn edit_paths<'a>(tool: &str, input: &'a Value) -> Vec<&'a str> {
     if tool.eq_ignore_ascii_case("apply_patch")
@@ -1037,6 +1092,10 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                 .deny()
                 .paths(edit_paths(tool, input), scope)
         }
+        Some(event @ ("PreToolUse" | "PostToolUse")) => call(
+            Kind::Activity(phase(tool, event == "PreToolUse")),
+            Shape::Silent,
+        ),
         Some("SessionEnd") => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
@@ -1044,7 +1103,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
 
 /// Copilot CLI and cloud agent: camelCase fields and no event name, so the event is read from
 /// the fields. Edits are checked on preToolUse, which can refuse but has no context field;
-/// postToolUse (it has a `toolResult`) is ignored.
+/// every other tool event, postToolUse (it has a `toolResult`) included, is activity.
 fn copilot(v: &Value, scope: &Scope) -> Call {
     let call = |kind, shape| Call::new(Agent::Copilot, kind, shape).session(str_at(v, "sessionId"));
     match str_at(v, "toolName") {
@@ -1058,7 +1117,10 @@ fn copilot(v: &Value, scope: &Scope) -> Call {
                 .deny()
                 .paths(edit_paths(tool, &args), scope)
         }
-        Some(_) => call(Kind::Ignore, Shape::Silent),
+        Some(tool) => call(
+            Kind::Activity(phase(tool, v.get("toolResult").is_none())),
+            Shape::Silent,
+        ),
         None if v.get("reason").is_some() => call(Kind::Done, Shape::Silent),
         None if v.get("source").is_some() || v.get("initialPrompt").is_some() => {
             call(Kind::Start, Shape::Camel)
@@ -1075,21 +1137,30 @@ fn cursor(v: &Value, scope: &Scope) -> Call {
     match event {
         "sessionStart" => call(Kind::Start, Shape::Snake),
         // No non-blocking context field before a tool runs: the check waits for postToolUse.
-        _ if CURSOR_PERMISSION_EVENTS.contains(&event) => call(Kind::Ignore, Shape::Allow),
+        // Cursor reports no tool start, so its calls only renew.
+        _ if CURSOR_PERMISSION_EVENTS.contains(&event) => {
+            call(Kind::Activity(CallPhase::Tick), Shape::Allow)
+        }
         "postToolUse" if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Snake).paths(edit_paths(tool, input), scope)
         }
+        "postToolUse" => call(Kind::Activity(CallPhase::Tick), Shape::Silent),
         "sessionEnd" => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
 }
 
-/// `{agent?, session?, event: start|check|done, paths?, task?, cwd?}`.
+/// `{agent?, session?, event: start|check|activity|done, phase?: start|end, paths?, task?, cwd?}`.
 fn generic(v: &Value, scope: &Scope) -> Call {
     let kind = match str_at(v, "event") {
         Some("start") => Kind::Start,
         Some("check") => Kind::Check,
+        Some("activity") => Kind::Activity(match str_at(v, "phase") {
+            Some("start") => CallPhase::Start,
+            Some("end") => CallPhase::End,
+            _ => CallPhase::Tick,
+        }),
         Some("done") => Kind::Done,
         _ => return Call::failed(Agent::Generic, "hook event not recognised"),
     };
@@ -1479,15 +1550,36 @@ mod tests {
             Agent::Claude,
             &json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": "/r"}),
         );
-        assert_eq!((bash.kind, bash.shape), (Kind::Ignore, Shape::Silent));
+        assert_eq!(
+            (bash.kind, bash.shape),
+            (Kind::Activity(CallPhase::Start), Shape::Silent)
+        );
+        let post = parse(
+            Agent::Codex,
+            &json!({"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "apply_patch"}),
+        );
+        assert_eq!(
+            (post.kind, post.shape),
+            (Kind::Activity(CallPhase::Tick), Shape::Silent)
+        );
+        let bash_done = parse(
+            Agent::Claude,
+            &json!({"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Bash"}),
+        );
+        assert_eq!(bash_done.kind, Kind::Activity(CallPhase::End));
         let cursor_pre = parse(
             Agent::Cursor,
             &json!({"hook_event_name": "preToolUse", "tool_name": "Write"}),
         );
         assert_eq!(
             (cursor_pre.kind, cursor_pre.shape),
-            (Kind::Ignore, Shape::Allow)
+            (Kind::Activity(CallPhase::Tick), Shape::Allow)
         );
+        let cursor_post = parse(
+            Agent::Cursor,
+            &json!({"hook_event_name": "postToolUse", "tool_name": "Shell"}),
+        );
+        assert_eq!(cursor_post.kind, Kind::Activity(CallPhase::Tick));
         let camel_pre = parse(
             Agent::Copilot,
             &json!({"sessionId": "s", "cwd": "/r", "toolName": "edit",
@@ -1509,7 +1601,7 @@ mod tests {
             Agent::Copilot,
             &json!({"sessionId": "s", "toolName": "bash"}),
         );
-        assert_eq!(camel_bash.kind, Kind::Ignore);
+        assert_eq!(camel_bash.kind, Kind::Activity(CallPhase::Start));
         assert!(claude.deny && !cursor_pre.deny);
         // Without a tool or reason, a Copilot event is a start only when it says how it began.
         let camel = |v| parse(Agent::Copilot, &v).kind;
@@ -1540,8 +1632,8 @@ mod tests {
             &json!({"sessionId": "s", "cwd": "/r", "toolName": "edit", "toolResult": {},
                 "toolArgs": {"path": "/r/a.rs"}}),
         );
-        // The check ran on preToolUse; a second one would use up the dedupe.
-        assert_eq!(camel_post.kind, Kind::Ignore);
+        // The check ran on preToolUse; a second one would use up the dedupe, so it is activity.
+        assert_eq!(camel_post.kind, Kind::Activity(CallPhase::Tick));
         let bad_session = parse(
             Agent::Codex,
             &json!({"hook_event_name": "SessionStart", "session_id": "a\nb"}),
@@ -1555,6 +1647,19 @@ mod tests {
             (generic.via.as_str(), generic.paths),
             ("hook:generic", vec!["a.rs".into()])
         );
+        let tick = parse(
+            Agent::Generic,
+            &json!({"event": "activity", "agent": "gemini", "session": "s"}),
+        );
+        assert_eq!(
+            (tick.kind, tick.shape),
+            (Kind::Activity(CallPhase::Tick), Shape::Generic)
+        );
+        let shell = parse(
+            Agent::Generic,
+            &json!({"event": "activity", "phase": "end", "agent": "gemini", "session": "s"}),
+        );
+        assert_eq!(shell.kind, Kind::Activity(CallPhase::End));
         let unreadable = Call::parse(Agent::Claude, b"[1]", None);
         assert_eq!(unreadable.shape, Shape::Unreadable);
         assert!(matches!(

@@ -111,6 +111,23 @@ The hooks written by `client setup` run `agentscm hook <agent> --client-connecti
 - `AGENTSCM_HUB_TOKEN` is sent to whatever hub URL the command carries, because you set it for this purpose. AgentSCM no longer commits hook configuration; if you commit a hook command by hand, treat a change to its `--hub-url` like a change to your CI secrets: review it.
 - It prints only an allowlist of the hub's reply: context and message fields, Cursor's `permission` (always `allow`) and one kind of permission decision, a `deny` with a non-empty reason (the warn-once refusal), and that only for a pre-tool event and once per identical edit per session (a marker file, like the unknown note; a repeat of the same edit passes). It drops everything else (`ask`, `allow`, `defer`, a deny without a reason, `continue`, `decision`, `stopReason`, updated or modified inputs and tool output), so a wrong reply cannot stop the agent or rewrite its call.
 
+### Holds stay live while the agent works
+
+A reservation on shared files is a lease. It blocks other Work only while the lead session is live: 20 minutes from that session's last renewal, or 2 hours from a `retain` (see the [Work lifecycle design](design/work-lifecycle.md#8-liveness-leases)). Only the lead session's own calls renew it, at most once a minute, so the hook client forwards at most one tool event a minute per session and answers the rest locally. A shell call is different: its start and end always reach the Hub, and while one runs the lease stays live for up to 60 minutes, so a long test run or build keeps the hold. A shell call that never reports its end, because the agent crashed, holds for at most those 60 minutes. A lapsed lease, a stopped or idle session and a crash never mark Work finished: the Work stays unfinished, its outcome unstated, and only its hold goes.
+
+| Agent | What renews the lead session's lease | Not covered |
+| --- | --- | --- |
+| Claude Code | every tool call (`PreToolUse` and `PostToolUse` for all tools), prompts, session start, edit checks; `Bash` calls while they run | a non-shell tool call longer than 20 minutes |
+| Codex CLI | `PreToolUse` and `PostToolUse` for shell, `apply_patch`, MCP and local tools; shell calls while they run | hosted tools such as web search |
+| Copilot | `preToolUse` and `postToolUse` for all tools; shell calls while they run | a non-shell tool call longer than 20 minutes |
+| Cursor | `postToolUse` for all tools | time inside a tool call: Cursor reports no tool start the Hub can use |
+| Gemini CLI | `BeforeTool` and `AfterTool` for all tools; `run_shell_command` while it runs | a non-shell tool call longer than 20 minutes |
+| An agent with MCP only | named MCP session calls and checkpoints | everything between them |
+
+The Work projection shows which case applies to a lead session as `activity.coverage`: `tool_calls` once a hook reported one of its tool calls, `edits` for hooks that report only edits, `mcp_only`, or `unknown` when the Hub keeps no record of the session. Anything but `tool_calls` is listed as unknown coverage, with a reason that says what to run.
+
+An agent that is not wired, or wired with an older `client setup` that hooked only edits, renews only on edits, MCP calls and checkpoints; run `agentscm client setup` again to install the tool hooks.
+
 ### Hooks fail open
 
 The command always exits 0. If anything goes wrong (no hub configured, no token, the hub is unreachable or slow, it rejects the token, or it sends something unusable) it prints the agent's valid "no information" reply, which for most events is `{}` and for a few events is a one-line `AgentSCM: coordination unknown (<reason>)` note, given once per agent session (a marker file under `~/.config/agentscm/hook-notes/`, removed after 2 days); later failures in that session print the no-op reply. A broken setup never stops an edit. The same holds on the hub side: its hook endpoint answers HTTP 200 in the agent's format even for a bad token.
@@ -127,7 +144,7 @@ The cost is that failures are quiet. If warnings never appear, run `agentscm int
 - Where the edited file path sits in Cursor, Copilot and Codex payloads is only partly documented; the hub reads the fields that vendor documents and ignores the rest.
 - The hub is trusted. Its replies go into each agent's context, and the URL that decides which hub that is sits in hook and MCP config: a hook's `--hub-url` and the MCP server URL. Whoever controls that URL controls the text the agents using the config see, and receives their token and hook payloads. Review changes to those files, and treat the hub as trusted.
 - Coverage depends on every agent on the team being wired. An unwired agent is invisible. A pull-request check as a backstop is planned, not built.
-- Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim is a freshness label, not a release: a reservation held by paused, handed-over or stale Work keeps blocking overlapping scope until it is released, retained or finished through a work transition, and lease expiry does not exist yet. Inspect the work and use the explicit takeover or reopen flow instead of assuming it is available.
+- Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim is a freshness label, not a release. A reservation blocks only while its lease is live; once it lapses it blocks nobody, and the next admission over its scope clears it and fences the old lead. Inspect the work and use the explicit takeover or reopen flow instead of assuming it is available.
 
 ## Recipes for other agents
 

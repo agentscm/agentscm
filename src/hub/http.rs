@@ -19,6 +19,7 @@ use super::session::SESSION_REQUIRED;
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
 use super::store::{self, Principal, agent_token_digest, unix_now, web_read_token_digest};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
+use super::work_lifecycle::LEASE_LAPSED;
 use super::{HubError, HubState, Result, open_objects, router};
 
 pub struct HubConfig {
@@ -316,7 +317,9 @@ impl From<HubError> for ApiError {
     fn from(error: HubError) -> Self {
         match error {
             HubError::Invalid(message)
-                if message == SESSION_REQUIRED || message.starts_with(LEAD_SESSION_MISMATCH) =>
+                if message == SESSION_REQUIRED
+                    || message.starts_with(LEAD_SESSION_MISMATCH)
+                    || message.starts_with(LEASE_LAPSED) =>
             {
                 Self::invalid().with_message(message)
             }

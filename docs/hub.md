@@ -1790,7 +1790,10 @@ What the hub keeps, in its database and object store:
   and last seen, and how far it has read its notices. For warn-once, each
   session also keeps the files it has been refused once (`denied`, at most
   200) and the times of its recent refusals (`deny_times`, for the limit of 3
-  per 10 minutes). A session row is deleted when the session ends, and rows
+  per 10 minutes). It also keeps when a hook last reported one of its tool
+  calls (`tool_activity_at`) and how many of its shell calls are running
+  (`open_calls`, the last started at `open_call_at`), which keep its Work
+  leases live. A session row is deleted when the session ends, and rows
   untouched for 7 days are deleted the next time the same token is used.
 - The task from a hook payload. A prompt in a `SessionStart` payload
   (`initial_prompt`, or `initialPrompt` in a Copilot CLI one) is not stored:

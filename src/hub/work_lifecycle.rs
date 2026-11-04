@@ -19,6 +19,92 @@ pub const LEASE_SECONDS: i64 = 1200;
 pub const RETAIN_CAP_SECONDS: i64 = 7200;
 /// The lead session renews its lease at most this often.
 pub(super) const RENEW_INTERVAL_SECONDS: i64 = 60;
+/// A shell call that is still running keeps its session's leases live at most this long.
+pub const IN_FLIGHT_CAP_SECONDS: i64 = 3600;
+/// The start of the refusal a lead meets after its reservation lapsed; every surface shows it.
+pub const LEASE_LAPSED: &str = "LEASE_LAPSED";
+/// Participants from owners other than the Work's own. The rest of the 100 participants stay for
+/// the owner's sessions, so other owners cannot block a resume or slow cleanup without bound.
+pub const MAX_OTHER_OWNER_PARTICIPANTS: usize = 25;
+
+/// The refusal of an edit by the lead of Work `id` whose reservation lapsed, from the
+/// `reservation_lapsed` event `data`: when it lapsed, who holds the scope now and how to resume.
+pub(super) fn lapsed_refusal_text(
+    id: &str,
+    generation: i64,
+    data: &serde_json::Value,
+    holder: &str,
+    holder_agent: Option<&str>,
+) -> String {
+    let expired = data["expires_at"].as_i64().unwrap_or_default();
+    let branch = data["branch"].as_str().map_or_else(
+        || "Its branch".to_owned(),
+        |branch| format!("Branch {branch}"),
+    );
+    let holder = match holder_agent {
+        Some(agent) => format!("{holder} (agent {agent})"),
+        None => holder.to_owned(),
+    };
+    format!(
+        "{LEASE_LAPSED}: your hold on {id} lapsed at Unix {expired} because this session did not renew it for {} minutes, and {holder} holds the scope now. {branch} may hold unpushed work: push or set it aside before you continue. Resume with agentscm_start work_id {id} takeover_generation {generation}, a fresh admission that conflicts while the scope is held.",
+        LEASE_SECONDS / 60
+    )
+}
+
+/// Where a hook saw a tool call: a shell call may run longer than a lease, so its start and end
+/// are counted; any other call only renews.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallPhase {
+    Tick,
+    Start,
+    End,
+}
+
+/// What renews the lead session's lease, from what the Hub saw of that session.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenewalCoverage {
+    /// A hook reported the session's tool calls, so every tool call renews.
+    ToolCalls,
+    /// Hooks report only edits (an older `client setup`): edits, MCP calls and checkpoints renew.
+    Edits,
+    /// MCP only: named MCP calls and checkpoints renew.
+    McpOnly,
+    /// The Hub keeps no record of the lead session.
+    Unknown,
+}
+
+impl RenewalCoverage {
+    /// From the lead session's stored `via` modes and whether a hook reported a tool call.
+    pub(super) fn of(via: Option<&str>, tool_activity: bool) -> Self {
+        let Some(via) = via else {
+            return Self::Unknown;
+        };
+        let modes: Vec<String> = serde_json::from_str(via).unwrap_or_default();
+        if tool_activity {
+            Self::ToolCalls
+        } else if modes.iter().any(|mode| mode.starts_with("hook:")) {
+            Self::Edits
+        } else {
+            Self::McpOnly
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::ToolCalls => "It renews on every tool call.",
+            Self::Edits => {
+                "Its agent reports only edits, so a busy session that edits nothing lapses; run agentscm client setup in its checkout to renew on every tool call."
+            }
+            Self::McpOnly => {
+                "It renews only on named MCP calls and checkpoints; a busy session that makes neither lapses."
+            }
+            Self::Unknown => {
+                "The Hub keeps no record of the lead session, so nothing is known to renew it."
+            }
+        }
+    }
+}
 /// Largest number of reservation-holding Work in one operational overview.
 pub(super) const MAX_OPERATIONAL_WORK: usize = 100;
 
@@ -295,6 +381,8 @@ pub struct ActivityV1 {
     pub lease_renewed_at: Option<i64>,
     /// When the lease lapses without another renewal, None while no lease is known.
     pub lease_expires_at: Option<i64>,
+    /// What renews the lease; anything but `tool_calls` lists `activity_coverage` as unknown.
+    pub coverage: RenewalCoverage,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -380,6 +468,7 @@ pub(super) struct OperationalFacts<'a> {
     pub(super) hidden_by_merged_pr: bool,
     pub(super) merge: MergeStatus,
     pub(super) lease: Option<Lease>,
+    pub(super) coverage: RenewalCoverage,
     /// The request time that decides whether the lease is live, like `freshness`.
     pub(super) now: i64,
 }
@@ -387,7 +476,7 @@ pub(super) struct OperationalFacts<'a> {
 const ACTIVITY_UNKNOWN_REASON: &str = "Activity is not observed; the Work holds no lease.";
 const ACTIVITY_LIVE_REASON: &str =
     "The lead session renewed the lease; it lapses at lease_expires_at unless renewed again.";
-const ACTIVITY_LAPSED_REASON: &str = "The lead session did not renew the lease in time; the reservation blocks nobody and the next admission over its scope clears it.";
+const ACTIVITY_LAPSED_REASON: &str = "The lead session did not renew the lease in time. The reservation blocks nobody and the next admission over its scope clears it; the lead resumes with agentscm_start, the work_id and the current takeover_generation.";
 
 pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV1 {
     let item = facts.item;
@@ -431,25 +520,32 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
             } else {
                 ActivityStatus::Lapsed
             },
-            reason: if lease.expires_at > facts.now {
-                ACTIVITY_LIVE_REASON
-            } else {
-                ACTIVITY_LAPSED_REASON
-            }
-            .to_owned(),
+            reason: format!(
+                "{} {}",
+                if lease.expires_at > facts.now {
+                    ACTIVITY_LIVE_REASON
+                } else {
+                    ACTIVITY_LAPSED_REASON
+                },
+                facts.coverage.hint()
+            ),
             lease_renewed_at: Some(lease.renewed_at),
             lease_expires_at: Some(lease.expires_at),
+            coverage: facts.coverage,
         },
         None => ActivityV1 {
             status: ActivityStatus::Unknown,
             reason: ACTIVITY_UNKNOWN_REASON.to_owned(),
             lease_renewed_at: None,
             lease_expires_at: None,
+            coverage: facts.coverage,
         },
     };
     let mut unknown = BTreeSet::new();
     if activity.status == ActivityStatus::Unknown {
         unknown.insert("activity".to_owned());
+    } else if activity.coverage != RenewalCoverage::ToolCalls {
+        unknown.insert("activity_coverage".to_owned());
     }
     if facts.merge == MergeStatus::Unknown {
         unknown.insert("merge".to_owned());
@@ -552,6 +648,7 @@ pub(super) struct OperationalRow {
     /// Computed by the stores' shared settled rule, never by this module.
     pub(super) hidden_by_merged_pr: bool,
     pub(super) lease: Option<Lease>,
+    pub(super) coverage: RenewalCoverage,
 }
 
 /// What a merge observation says about one Work item.
@@ -596,6 +693,7 @@ pub(super) fn operational_page(
                 hidden_by_merged_pr: row.hidden_by_merged_pr,
                 merge: merge_status(&row.item, row.hidden_by_merged_pr, forge_window_from),
                 lease: row.lease,
+                coverage: row.coverage,
                 now,
             })
         })
@@ -884,6 +982,7 @@ mod tests {
             hidden_by_merged_pr: false,
             merge: MergeStatus::None,
             lease: None,
+            coverage: RenewalCoverage::ToolCalls,
             now: 100,
         }
     }
@@ -912,6 +1011,60 @@ mod tests {
         );
         assert_eq!(lease_seconds("retained"), RETAIN_CAP_SECONDS);
         assert_eq!(lease_seconds("legacy_implicit"), LEASE_SECONDS);
+    }
+
+    #[test]
+    fn the_lapse_refusal_says_when_who_and_how_to_resume() {
+        let data = serde_json::json!({"expires_at": 1200, "branch": "feature/a"});
+        let text = lapsed_refusal_text("wrk_a", 2, &data, "wrk_b", Some("agent-b"));
+        assert!(text.starts_with(LEASE_LAPSED));
+        for part in [
+            "lapsed at Unix 1200",
+            "wrk_b (agent agent-b) holds the scope now",
+            "Branch feature/a may hold unpushed work",
+            "agentscm_start work_id wrk_a takeover_generation 2",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+    }
+
+    #[test]
+    fn coverage_follows_what_the_hub_saw_and_is_listed_unless_every_call_renews() {
+        assert_eq!(
+            RenewalCoverage::of(Some(r#"["hook:claude","mcp"]"#), true),
+            RenewalCoverage::ToolCalls
+        );
+        assert_eq!(
+            RenewalCoverage::of(Some(r#"["hook:codex"]"#), false),
+            RenewalCoverage::Edits
+        );
+        assert_eq!(
+            RenewalCoverage::of(Some(r#"["mcp"]"#), false),
+            RenewalCoverage::McpOnly
+        );
+        assert_eq!(RenewalCoverage::of(None, false), RenewalCoverage::Unknown);
+        let item = item(WorkState::Active);
+        let mut input = facts(&item, Some(ReservationBasis::Admitted));
+        input.lease = Some(Lease {
+            renewed_at: 90,
+            expires_at: 200,
+        });
+        input.coverage = RenewalCoverage::McpOnly;
+        let view = work_operational(&input);
+        assert_eq!(view.activity.coverage, RenewalCoverage::McpOnly);
+        assert!(view.activity.reason.contains("only on named MCP calls"));
+        assert!(
+            view.completeness
+                .unknown
+                .contains(&"activity_coverage".to_owned())
+        );
+        input.coverage = RenewalCoverage::ToolCalls;
+        assert!(
+            !work_operational(&input)
+                .completeness
+                .unknown
+                .contains(&"activity_coverage".to_owned())
+        );
     }
 
     #[test]

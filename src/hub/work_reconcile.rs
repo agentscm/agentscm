@@ -673,8 +673,8 @@ pub fn read(
 mod tests {
     use super::super::work::{Checkpoint, ClaimStatus, WorkSource, WorkState};
     use super::super::work_lifecycle::{
-        MergeStatus, OperationalFacts, OutcomeFact, OutcomeProvenance, ReservationBasis,
-        TerminalOutcome, work_operational,
+        MergeStatus, OperationalFacts, OutcomeFact, OutcomeProvenance, RenewalCoverage,
+        ReservationBasis, TerminalOutcome, work_operational,
     };
     use super::super::work_links::WorkPrLinkTarget;
     use super::*;
@@ -761,6 +761,7 @@ mod tests {
             hidden_by_merged_pr: false,
             merge: MergeStatus::Unknown,
             lease: None,
+            coverage: RenewalCoverage::Unknown,
             now: 0,
         });
         ReconcileFacts {

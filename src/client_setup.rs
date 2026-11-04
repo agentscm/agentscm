@@ -211,22 +211,19 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
         json!({"hooks":[hook]})
     };
     Ok(match agent {
-        Agent::Claude => {
-            let mut pre = nested(5, None);
-            pre["matcher"] = json!("^(Edit|Write|MultiEdit|NotebookEdit)$");
-            vec![
-                ("SessionStart", vec![nested(5, None)]),
-                ("PreToolUse", vec![pre]),
-                ("SessionEnd", vec![nested(3, None)]),
-            ]
-        }
+        // Every tool call keeps the session's hold live, so the tool hooks match every tool; the
+        // Hub checks only the edits.
+        Agent::Claude => vec![
+            ("SessionStart", vec![nested(5, None)]),
+            ("PreToolUse", vec![nested(5, None)]),
+            ("PostToolUse", vec![nested(3, None)]),
+            ("SessionEnd", vec![nested(3, None)]),
+        ],
         Agent::Cursor => {
             let hook = |timeout| json!({"command":command,"timeout":timeout});
-            let mut edit = hook(5);
-            edit["matcher"] = json!("Write");
             vec![
                 ("sessionStart", vec![hook(5)]),
-                ("postToolUse", vec![edit]),
+                ("postToolUse", vec![hook(5)]),
                 ("sessionEnd", vec![hook(3)]),
             ]
         }
@@ -235,18 +232,21 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
             vec![
                 ("sessionStart", vec![hook(5)]),
                 ("preToolUse", vec![hook(5)]),
+                ("postToolUse", vec![hook(3)]),
                 ("sessionEnd", vec![hook(3)]),
             ]
         }
         Agent::Gemini => {
-            let mut pre = nested(5000, Some("AgentSCM edit coordination"));
-            pre["matcher"] = json!("^(write_file|replace)$");
             vec![
                 (
                     "SessionStart",
                     vec![nested(5000, Some("AgentSCM session start"))],
                 ),
-                ("BeforeTool", vec![pre]),
+                (
+                    "BeforeTool",
+                    vec![nested(5000, Some("AgentSCM edit coordination"))],
+                ),
+                ("AfterTool", vec![nested(3000, Some("AgentSCM activity"))]),
                 (
                     "SessionEnd",
                     vec![nested(3000, Some("AgentSCM session end"))],

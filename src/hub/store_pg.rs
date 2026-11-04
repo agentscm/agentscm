@@ -112,8 +112,9 @@ use super::work::{
     work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_lifecycle::{
-    LEASE_SECONDS, Lease, OperationalRow, OutcomeFact, RENEW_INTERVAL_SECONDS, lease_seconds,
-    operational_page,
+    CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, MAX_OTHER_OWNER_PARTICIPANTS,
+    OperationalRow, OutcomeFact, RENEW_INTERVAL_SECONDS, RenewalCoverage, lapsed_refusal_text,
+    lease_seconds, operational_page,
 };
 use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
@@ -1759,7 +1760,15 @@ fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i
         item.claim_status = ClaimStatus::Unknown;
         return Ok(());
     }
-    let active = tx
+    let active = lead_token_active(tx, &item.lead_token, now)?;
+    item.claim_status = claim_status(item.last_checkin_at, active, now);
+    Ok(())
+}
+
+/// Whether the token can still act for its Work: not revoked, not expired, its owner not disabled
+/// and its repository not renamed under it.
+fn lead_token_active(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<bool> {
+    Ok(tx
         .query_opt(
             "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
              WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled AND NOT EXISTS (
@@ -1767,11 +1776,9 @@ fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i
                  WHERE c.provider = u.provider AND r.host = u.host
                    AND r.repository_id = t.repository_id AND r.full_name <> t.repository
              )",
-            &[&item.lead_token, &now],
+            &[&token, &now],
         )?
-        .is_some();
-    item.claim_status = claim_status(item.last_checkin_at, active, now);
-    Ok(())
+        .is_some())
 }
 
 /// `project_claim` for many items with one token lookup.
@@ -2034,6 +2041,113 @@ fn renew_leases(
         ],
     )?;
     Ok(())
+}
+
+/// Records a tool call the session's hook reported: when tool activity was last seen and, for a
+/// shell call, how many are still running. While one runs, the session's live leases last up to
+/// `IN_FLIGHT_CAP_SECONDS`; when the last one ends they fall back to the idle lease. A count older
+/// than the cap is stale, its end lost, so a call that crashed holds at most the cap. Callers hold
+/// the repository's Work lock in shared mode, as a touch does.
+fn session_tool_call(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    session: &str,
+    phase: CallPhase,
+    now: i64,
+) -> Result<()> {
+    let stale = now - IN_FLIGHT_CAP_SECONDS;
+    match phase {
+        CallPhase::Tick => {
+            tx.execute(
+                "UPDATE hub_sessions SET tool_activity_at = $3 WHERE token = $1 AND session = $2",
+                &[&token, &session, &now],
+            )?;
+        }
+        CallPhase::Start => {
+            tx.execute(
+                "UPDATE hub_sessions SET tool_activity_at = $3, open_call_at = $3,
+                     open_calls = CASE WHEN open_call_at IS NULL OR open_call_at < $4 THEN 1
+                                       ELSE open_calls + 1 END
+                 WHERE token = $1 AND session = $2",
+                &[&token, &session, &now, &stale],
+            )?;
+            tx.execute(
+                "UPDATE hub_work_items SET reservation_renewed_at = $3,
+                     reservation_expires_at = GREATEST(reservation_expires_at, $3::bigint + $4::bigint)
+                 WHERE lead_token = $1 AND lead_session = $2
+                   AND state <> 'finished' AND state IN ('active', 'blocked')
+                   AND reservation_basis IS NOT NULL AND reservation_expires_at > $3",
+                &[&token, &session, &now, &IN_FLIGHT_CAP_SECONDS],
+            )?;
+        }
+        CallPhase::End => {
+            let open: Option<i32> = tx
+                .query_opt(
+                    "UPDATE hub_sessions SET tool_activity_at = $3,
+                         open_calls = CASE WHEN open_call_at IS NULL OR open_call_at < $4 THEN 0
+                                           ELSE GREATEST(open_calls - 1, 0) END
+                     WHERE token = $1 AND session = $2 RETURNING open_calls",
+                    &[&token, &session, &now, &stale],
+                )?
+                .map(|row| row.get(0));
+            if open.unwrap_or(0) == 0 {
+                // Back to the idle lease. A retain keeps its own longer expiry.
+                tx.execute(
+                    "UPDATE hub_work_items SET reservation_expires_at = $3::bigint + $4::bigint
+                     WHERE lead_token = $1 AND lead_session = $2
+                       AND state <> 'finished' AND state IN ('active', 'blocked')
+                       AND reservation_basis IS NOT NULL AND reservation_basis <> 'retained'
+                       AND reservation_expires_at > $3::bigint + $4::bigint",
+                    &[&token, &session, &now, &LEASE_SECONDS],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The refusal of an edit by a lead session whose hold lapsed, when its latest Work change is that
+/// lapse: when it lapsed, who holds the scope now and how to resume. None otherwise.
+fn lapsed_hold_refusal(
+    tx: &mut postgres::Transaction<'_>,
+    work: &WorkWho,
+    session: &str,
+) -> Result<Option<String>> {
+    let Some(row) = tx.query_opt(
+        "SELECT w.id, w.generation, e.data FROM hub_work_items w
+         JOIN hub_events e ON e.seq = w.updated_seq AND e.kind = 'reservation_lapsed'
+         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+           AND w.repository_id IS NOT DISTINCT FROM $4
+           AND w.lead_token = $5 AND w.lead_session = $6
+         ORDER BY e.seq DESC LIMIT 1",
+        &[
+            &work.owner.identity.provider,
+            &work.owner.identity.host,
+            &work.repository,
+            &work.repository_id,
+            &work.token,
+            &session,
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let (id, generation, data): (String, i64, String) = (row.get(0), row.get(1), row.get(2));
+    let data: serde_json::Value = json_value(&data)?;
+    let holder = data["admitted_by"].as_str().unwrap_or_default().to_owned();
+    let agent: Option<String> = tx
+        .query_opt(
+            "SELECT lead_agent FROM hub_work_items WHERE id = $1",
+            &[&holder],
+        )?
+        .map(|row| row.get(0));
+    Ok(Some(lapsed_refusal_text(
+        &id,
+        generation,
+        &data,
+        &holder,
+        agent.as_deref(),
+    )))
 }
 
 /// Whether this Work's reservation lease has lapsed. A stale clock knows of no lapse.
@@ -3769,6 +3883,17 @@ fn start_in(
                 return Err(HubError::Invalid(
                     "work has the maximum of 100 participants".into(),
                 ));
+            } else if who.owner.id != item.owner
+                && item
+                    .participants
+                    .iter()
+                    .filter(|p| p.owner != item.owner)
+                    .count()
+                    >= MAX_OTHER_OWNER_PARTICIPANTS
+            {
+                return Err(HubError::Invalid(format!(
+                    "work has the maximum of {MAX_OTHER_OWNER_PARTICIPANTS} participants from other owners"
+                )));
             }
             item.participants.push(WorkParticipant {
                 owner: who.owner.id.clone(),
@@ -3892,10 +4017,20 @@ fn start_in(
                 preflight: None,
             });
         }
+        let held = work_holds_reservation(tx, &item.id)?;
+        // A held reservation is open to takeover once its lease lapsed, or for its own owner once
+        // the lead token can no longer act; a stale progress report alone never opens it. Work
+        // that holds nothing keeps the claim-age rule.
+        let open = if held {
+            lease_lapsed(tx, &item.id, now)?
+                || (item.owner == who.owner.id && !lead_token_active(tx, &item.lead_token, now)?)
+        } else {
+            item.claim_status == ClaimStatus::Stale
+        };
         if start.takeover_generation != Some(item.generation) {
             let kind = if start.takeover_generation.is_some() {
                 WorkConflictKind::GenerationChanged
-            } else if item.claim_status == ClaimStatus::Stale {
+            } else if open {
                 WorkConflictKind::StaleTakeoverRequired
             } else {
                 WorkConflictKind::ClaimHeld
@@ -3918,16 +4053,12 @@ fn start_in(
         }
         // Work that released its reservation can be resumed by any token of its owner, whatever
         // the state or claim age; the admission check below decides whether it may hold again.
-        let released_by_owner =
-            item.owner == who.owner.id && !work_holds_reservation(tx, &item.id)?;
+        let released_by_owner = item.owner == who.owner.id && !held;
         let resuming_own_paused = (item.lead_token == who.token
             && item.state == WorkState::Paused
             && start.takeover_generation == Some(item.generation))
             || released_by_owner;
-        if !resuming_own_paused
-            && item.claim_status != ClaimStatus::Stale
-            && item.state != WorkState::Handover
-        {
+        if !resuming_own_paused && !open && item.state != WorkState::Handover {
             return Ok(WorkStartResult {
                 conflict: Some(WorkStartConflict {
                     kind: WorkConflictKind::ClaimHeld,
@@ -5198,6 +5329,9 @@ fn guard_managed_touch(
         eligible.push(json_value::<WorkItem>(&row.get::<_, String>(0))?);
     }
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
+        if let Some(refusal) = lapsed_hold_refusal(tx, who, name)? {
+            return Err(HubError::Invalid(refusal));
+        }
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
     Ok(())
@@ -7130,6 +7264,24 @@ impl Store for PgStore {
             let touched = touch_in(&mut tx, &who, &call, now)?;
             tx.commit()?;
             Ok(touched)
+        })
+    }
+
+    fn session_activity(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        phase: CallPhase,
+        now: i64,
+    ) -> Result<()> {
+        let call = check(call)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = active_token(&mut tx, token, now)?;
+            let touched = touch_in(&mut tx, &who, &call, now)?;
+            session_tool_call(&mut tx, token, &touched.session, phase, now)?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -9765,8 +9917,11 @@ impl Store for PgStore {
             };
             let sql = format!(
                 "SELECT w.snapshot, w.terminal_outcome, w.reservation_basis, {settled},
-                        w.reservation_renewed_at, w.reservation_expires_at
+                        w.reservation_renewed_at, w.reservation_expires_at,
+                        s.via, s.tool_activity_at IS NOT NULL
                  FROM hub_work_items w
+                 LEFT JOIN hub_sessions s
+                   ON s.token = w.lead_token AND s.session = w.lead_session
                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                    AND w.repository_id IS NOT DISTINCT FROM $4 AND {filter}
                  ORDER BY w.id LIMIT 101"
@@ -9820,6 +9975,10 @@ impl Store for PgStore {
                             renewed_at,
                             expires_at,
                         }),
+                    coverage: RenewalCoverage::of(
+                        row.get::<_, Option<String>>(6).as_deref(),
+                        row.get::<_, Option<bool>>(7).unwrap_or(false),
+                    ),
                 });
             }
             let forge_window = tx.query_opt(
