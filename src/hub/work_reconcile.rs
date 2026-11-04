@@ -395,17 +395,18 @@ fn read_coverage(store: &dyn Store, token: &str, now: i64) -> CatchupCoverageSta
 }
 
 /// Reconcile one Work from separate read-only Store calls. The reads are not one snapshot; the
-/// result says so, and says when the Work changed between the first and last read.
+/// result says so, and says when the Work changed between the first and last read. `None` means
+/// the Work is unknown to the token, which is the same answer for a Work in another repository.
 pub fn read(
     store: &dyn Store,
     principal: &Principal,
     work_id: &str,
     now: i64,
-) -> Result<WorkReconciliationV1> {
+) -> Result<Option<WorkReconciliationV1>> {
     let token = principal.token_id.as_str();
-    let item = store
-        .work_get(token, work_id, now)?
-        .ok_or_else(|| HubError::Invalid("unknown work in repository".into()))?;
+    let Some(item) = store.work_get(token, work_id, now)? else {
+        return Ok(None);
+    };
     let mut limits: BTreeSet<&'static str> = BTreeSet::new();
     let all: BTreeSet<&str> = item.depends_on.iter().map(String::as_str).collect();
     if all.len() > MAX_PREREQUISITES_READ {
@@ -465,7 +466,7 @@ pub fn read(
         limits.insert("work_changed_during_read");
     }
     let read_limits: Vec<&'static str> = limits.into_iter().collect();
-    Ok(reconcile(&ReconcileFacts {
+    Ok(Some(reconcile(&ReconcileFacts {
         item: &item,
         outcome: this.outcome.clone(),
         reservation: this.reservation.clone(),
@@ -473,7 +474,7 @@ pub fn read(
         coverage,
         prerequisites: &prerequisites,
         read_limits: &read_limits,
-    }))
+    })))
 }
 
 #[cfg(test)]

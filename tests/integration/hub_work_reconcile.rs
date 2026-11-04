@@ -16,8 +16,8 @@ use agentscm::hub::store::{
 use agentscm::hub::work::{CheckpointKind, WorkCheckpoint, WorkItem, WorkRole, WorkStart};
 use agentscm::hub::work_lifecycle::{OutcomeValue, ReservationStatus};
 use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
+use agentscm::hub::work_reconcile::WorkReconciliationV1;
 use agentscm::hub::work_reconcile::{self, HeadRelation, PrerequisiteState, ProviderStatus};
-use agentscm::hub::{HubError, work_reconcile::WorkReconciliationV1};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -57,6 +57,7 @@ impl StoreFixture {
 struct Ctx {
     store: Arc<dyn Store>,
     principal: Principal,
+    secret: String,
     repo: ConnectedRepository,
     /// Strictly increasing forge read times in milliseconds.
     clock: i64,
@@ -151,6 +152,7 @@ fn setup(fixture: &StoreFixture) -> Ctx {
     Ctx {
         store,
         principal,
+        secret: secret.expose().to_owned(),
         repo,
         clock: 1_000,
     }
@@ -278,7 +280,9 @@ impl Ctx {
     }
 
     fn read(&self, work: &WorkItem) -> WorkReconciliationV1 {
-        work_reconcile::read(&*self.store, &self.principal, &work.id, unix_now()).unwrap()
+        work_reconcile::read(&*self.store, &self.principal, &work.id, unix_now())
+            .unwrap()
+            .unwrap()
     }
 }
 
@@ -421,7 +425,9 @@ fn other_repository_and_unbound(fixture: &StoreFixture) {
             .unwrap();
     let other = principal(&*ctx.store, secret.expose());
     let result = work_reconcile::read(&*ctx.store, &other, &work.id, unix_now());
-    assert!(matches!(result, Err(HubError::Invalid(_))), "{result:?}");
+    assert!(matches!(result, Ok(None)), "{result:?}");
+    let unknown = work_reconcile::read(&*ctx.store, &ctx.principal, "wrk_missing", unix_now());
+    assert!(matches!(unknown, Ok(None)), "{unknown:?}");
 
     // An unbound repository has no readable link, which is not an error.
     let (_, secret) = mint_agent_token(&*ctx.store, &owner, "legacy", "legacy/repo", 3600).unwrap();
@@ -431,10 +437,80 @@ fn other_repository_and_unbound(fixture: &StoreFixture) {
         .work_start(&legacy.token_id, &start("legacy", "src/l", &[]), unix_now())
         .unwrap()
         .item;
-    let out = work_reconcile::read(&*ctx.store, &legacy, &item.id, unix_now()).unwrap();
+    let out = work_reconcile::read(&*ctx.store, &legacy, &item.id, unix_now())
+        .unwrap()
+        .unwrap();
     assert!(has(&out, "pr_link_unavailable") && !has(&out, "no_pr_link"));
     assert_eq!(out.provider.status, ProviderStatus::Unknown);
     assert!(out.link.is_none());
+}
+
+/// The route, over HTTP, for one store: success, unknown Work and another repository answer.
+fn http_route(fixture: &StoreFixture) {
+    let mut ctx = setup(fixture);
+    let work = ctx.start("a", "src/a", &[]);
+    ctx.link(&work, 7, HEAD_A);
+    ctx.observe_pull(7, "closed", HEAD_A);
+    ctx.merge(7);
+    let link_token = ctx
+        .store
+        .work_pr_link_get(ctx.token(), &work.id, &Default::default(), unix_now())
+        .unwrap()
+        .unwrap()
+        .link
+        .unwrap()
+        .token;
+    let owner = user(&*ctx.store, 62, "stranger");
+    let (_, other, _) =
+        mint_bound_agent_token(&*ctx.store, &owner, "other", "other/repo", 202, 3600, false)
+            .unwrap();
+    let other = other.expose().to_owned();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    let objects = agentscm::backend::LocalBackend::open(dir.path().join("objects")).unwrap();
+    let app = agentscm::hub::router(agentscm::hub::HubState::new(
+        ctx.store.clone(),
+        Arc::new(objects),
+    ));
+    let base = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        base
+    });
+    let get = |id: &str, secret: &str| {
+        runtime.block_on(async {
+            let response = reqwest::Client::new()
+                .get(format!("{base}/v1/hub/standup/work/{id}/reconciliation"))
+                .bearer_auth(secret)
+                .send()
+                .await
+                .unwrap();
+            (response.status().as_u16(), response.text().await.unwrap())
+        })
+    };
+
+    let (status, body) = get(&work.id, &ctx.secret);
+    assert_eq!(status, 200, "{body}");
+    let report: WorkReconciliationV1 = serde_json::from_str(&body).unwrap();
+    assert_eq!(report.work_id, work.id);
+    assert_eq!(report.provider.status, ProviderStatus::Merged);
+    assert!(!report.atomic_snapshot);
+    assert!(!link_token.is_empty() && !body.contains(&link_token));
+
+    let unknown = get("wrk_00000000000000000000000000000001", &ctx.secret);
+    let foreign = get(&work.id, &other);
+    assert_eq!(unknown.0, 404, "{}", unknown.1);
+    assert_eq!(
+        foreign, unknown,
+        "another repository must look like unknown Work"
+    );
+    assert_eq!(get(&work.id, "agt_not-a-token").0, 401);
 }
 
 fn run_both(case: fn(&StoreFixture)) {
@@ -462,4 +538,9 @@ fn work_reconcile_prerequisite_cap() {
 #[test]
 fn work_reconcile_other_repository_and_unbound() {
     run_both(other_repository_and_unbound);
+}
+
+#[test]
+fn work_reconcile_http_route() {
+    run_both(http_route);
 }

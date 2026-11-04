@@ -75,6 +75,8 @@ pub enum WorkCommand {
         #[arg(long)]
         expected_head: Option<String>,
     },
+    /// Read the read-only PR evidence and prerequisite report for a Work item.
+    Reconcile { id: String },
     /// Explicitly set or remove a PR relationship as the current Work lead.
     PrLinkSet {
         /// Strict WorkPrLinkUpdate JSON; link:null removes. Use - for standard input.
@@ -263,6 +265,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Catchup { .. }
         | WorkCommand::Preflight { .. }
         | WorkCommand::PrLink { .. }
+        | WorkCommand::Reconcile { .. }
         | WorkCommand::Insight { .. }
         | WorkCommand::Insights { .. } => false,
         WorkCommand::Compact { apply, .. }
@@ -404,6 +407,19 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 json!({"expected_updated_seq":expected_updated_seq,"expected_head":expected_head}),
             )?;
             (hub.call(Method::GET, &path, None).await?, false)
+        }
+        WorkCommand::Reconcile { id } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
+                .map_err(|_| invalid("cannot construct reconciliation URL"))?;
+            url.path_segments_mut()
+                .map_err(|_| invalid("cannot construct reconciliation URL"))?
+                .push(&id)
+                .push("reconciliation");
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct reconciliation URL"))?;
+            (hub.call(Method::GET, path, None).await?, false)
         }
         WorkCommand::PrLinkSet { request } => {
             let request: WorkPrLinkUpdate = read_request(&request)?;

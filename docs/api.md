@@ -70,6 +70,7 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | --- | --- |
 | `GET /v1/hub/standup/work/{id}/pr-link` | Repository-scoped reader; optional `expected_updated_seq` and `expected_head` comparisons |
 | `POST /v1/hub/standup/pr-link` | Current Work lead with generation/session/sequence fencing; explicit set or `link:null` removal, idempotent operation ID |
+| `GET /v1/hub/standup/work/{id}/reconciliation` | Repository-scoped reader, read-only tokens allowed; read-only PR evidence and prerequisite report for one Work item, `404` for Work the token cannot read; see [design](design/work-reconciliation.md) |
 
 MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the same
 Work store. The relationship records caller-reported identity, not provider approval.

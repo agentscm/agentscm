@@ -42,6 +42,7 @@ observed actions and source; they are not independent verification or human appr
 - [Work outcomes and scope reservations](design/work-lifecycle.md): design for separating why Work ended from whether it still holds its scope.
 - [Supported skills](design/supported-skills.md): experimental `pr-gate` v1 and its self-reported evidence.
 - [All repositories](design/all-repositories.md): experimental cross-repository home page for a web sign-in.
+- [Work reconciliation](design/work-reconciliation.md): read-only report joining a Work item's explicit PR link, provider merge evidence, outcome and reservation; partial.
 - [Local workflow library](advanced/workflow-library.md): versioned authoring, pinned imports, simulation and explicit export.
 - [Immutable local CI plans](advanced/local-ci-plans.md): experimental command-first requirements, exact source bindings and independent coverage checks; execution adapters remain separate.
 - [Trusted local CI devices](advanced/local-ci-devices.md): experimental administrator enrollment of device keys and the current-authorization check; no result submission or execution.
