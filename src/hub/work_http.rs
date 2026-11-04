@@ -112,9 +112,9 @@ async fn preflight(
 }
 
 /// `?operational=1` asks for the operational projection beside a result. Without it the
-/// response has no `operational` key, so a strict older client decodes it unchanged.
+/// response has no `operational` key, so a strict older client decodes it unchanged. Other query
+/// parameters are ignored, as they were on these routes before this flag existed.
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct OperationalFlag {
     operational: Option<u8>,
 }

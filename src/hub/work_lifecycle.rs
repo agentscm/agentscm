@@ -391,6 +391,12 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
     }
     if outcome.value == OutcomeValue::Unstated {
         unknown.insert("outcome".to_owned());
+    } else if finished && outcome.provenance == OutcomeProvenance::Unknown {
+        // The outcome is stored but the event that stated it is gone, so nobody can say who did.
+        unknown.insert("outcome_provenance".to_owned());
+    }
+    if item.claim_status == ClaimStatus::Unknown {
+        unknown.insert("freshness".to_owned());
     }
     let unknown: Vec<String> = unknown.into_iter().collect();
     WorkOperationalV1 {
@@ -435,16 +441,24 @@ fn actionable(state: WorkState, held: bool, hidden_by_merged_pr: bool) -> Action
     let (recipient, reason) = if state == WorkState::Finished {
         (Recipient::None, "Work is finished.")
     } else if !held {
-        (Recipient::None, "No reservation is held.")
+        (
+            Recipient::None,
+            "No reservation is held, so this Work blocks nobody.",
+        )
     } else if hidden_by_merged_pr {
         (
             Recipient::Owner,
             "A merged pull request was observed; the owner decides whether to release or finish.",
         )
+    } else if matches!(state, WorkState::Paused | WorkState::Handover) {
+        (
+            Recipient::Owner,
+            "The lead paused or handed over the Work but its reservation is still held; the owner decides whether to retain, release or finish it.",
+        )
     } else {
         (
-            Recipient::None,
-            "The lead holds the reservation; freshness says whether its claim is current.",
+            Recipient::Lead,
+            "The lead is working and holds the reservation; freshness says whether its claim is current.",
         )
     };
     ActionableV1 {
@@ -523,16 +537,38 @@ pub(super) fn operational_page(
     operational_overview(work, more)
 }
 
+/// Room kept for the JSON around the projection.
+const OPERATIONAL_ENVELOPE_BYTES: usize = 1024;
+
+/// The projection with trailing entries shed until the `work` array fits `budget` bytes.
+fn fit_operational(operational: &OperationalOverviewV1, budget: usize) -> OperationalOverviewV1 {
+    let mut fitted = operational.clone();
+    match super::work::fit_json_budget(&mut fitted.work, budget) {
+        Ok(false) => {}
+        Ok(true) => fitted.complete = false,
+        Err(_) => {
+            fitted.work.clear();
+            fitted.complete = false;
+        }
+    }
+    fitted
+}
+
 /// A `WorkOverview` with the operational projection beside it, as the HTTP and MCP surfaces
 /// emit it when asked. The projection stays out of `WorkOverview` itself, which older clients
-/// decode strictly.
+/// decode strictly. It gets what the overview left of `MAX_BRIEFING_BYTES`; entries that do not
+/// fit are shed and `complete` turns false, so the response never grows past the briefing bound.
 pub(super) fn overview_with_operational(
     overview: &super::work::WorkOverview,
     operational: &OperationalOverviewV1,
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(overview).unwrap_or(serde_json::Value::Null);
-    if let (Some(object), Ok(operational)) =
-        (value.as_object_mut(), serde_json::to_value(operational))
+    let used = value.to_string().len();
+    let budget = super::work::MAX_BRIEFING_BYTES
+        .saturating_sub(used)
+        .saturating_sub(OPERATIONAL_ENVELOPE_BYTES);
+    let fitted = fit_operational(operational, budget);
+    if let (Some(object), Ok(operational)) = (value.as_object_mut(), serde_json::to_value(&fitted))
     {
         object.insert("operational".to_owned(), operational);
     }
@@ -922,5 +958,80 @@ mod tests {
         let mut extra = json;
         extra["extra"] = 1.into();
         assert!(serde_json::from_value::<OperationalOverviewV1>(extra).is_err());
+    }
+
+    #[test]
+    fn actionable_follows_state_reservation_and_merge_only() {
+        let recipient = |state, basis, hidden| {
+            let item = item(state);
+            let mut input = facts(&item, basis);
+            input.hidden_by_merged_pr = hidden;
+            work_operational(&input).actionable
+        };
+        let held = Some(ReservationBasis::Admitted);
+        for state in STATES {
+            for hidden in [false, true] {
+                let none = recipient(state, None, hidden);
+                assert_eq!(none.recipient, Recipient::None, "{state:?} unheld");
+                assert!(!none.reason.is_empty());
+            }
+        }
+        assert_eq!(
+            recipient(WorkState::Finished, held, true).recipient,
+            Recipient::None
+        );
+        for state in [WorkState::Active, WorkState::Blocked] {
+            assert_eq!(recipient(state, held, false).recipient, Recipient::Lead);
+            assert_eq!(recipient(state, held, true).recipient, Recipient::Owner);
+        }
+        for state in [WorkState::Paused, WorkState::Handover] {
+            assert_eq!(recipient(state, held, false).recipient, Recipient::Owner);
+            assert_eq!(recipient(state, held, true).recipient, Recipient::Owner);
+        }
+    }
+
+    #[test]
+    fn unknown_freshness_and_provenance_are_listed() {
+        let mut active = item(WorkState::Active);
+        active.claim_status = ClaimStatus::Unknown;
+        let view = work_operational(&facts(&active, Some(ReservationBasis::Admitted)));
+        assert_eq!(view.completeness.unknown, ["activity", "freshness"]);
+
+        let finished = item(WorkState::Finished);
+        let mut input = facts(&finished, None);
+        input.outcome = Some(OutcomeFact {
+            outcome: TerminalOutcome::Completed,
+            provenance: OutcomeProvenance::Unknown,
+        });
+        let view = work_operational(&input);
+        assert_eq!(view.outcome.value, OutcomeValue::Completed);
+        assert_eq!(
+            view.completeness.unknown,
+            ["activity", "outcome_provenance"]
+        );
+        input.outcome = Some(OutcomeFact {
+            outcome: TerminalOutcome::Completed,
+            provenance: OutcomeProvenance::AgentReport,
+        });
+        assert_eq!(work_operational(&input).completeness.unknown, ["activity"]);
+    }
+
+    #[test]
+    fn the_operational_overview_sheds_entries_to_fit_a_budget() {
+        let make = |n: usize| {
+            let mut item = item(WorkState::Active);
+            item.id = format!("w{n:04}");
+            work_operational(&facts(&item, Some(ReservationBasis::Admitted)))
+        };
+        let all = operational_overview((0..10).map(make).collect(), false);
+        assert!(fit_operational(&all, usize::MAX).complete);
+        assert_eq!(fit_operational(&all, usize::MAX).work.len(), 10);
+        let one = serde_json::to_string(&all.work[0]).unwrap().len();
+        let fitted = fit_operational(&all, 2 * one + 3);
+        assert_eq!(fitted.work.len(), 2);
+        assert_eq!(fitted.work[0].work_id, "w0000");
+        assert!(!fitted.complete);
+        let none = fit_operational(&all, 0);
+        assert!(none.work.is_empty() && !none.complete);
     }
 }

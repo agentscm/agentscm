@@ -724,6 +724,27 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
     let (status, rich) = preflight("/v1/hub/standup/preflight?operational=1").await;
     assert_eq!(status, 200, "{rich}");
     assert_eq!(rich["operational"][0]["work_id"], id.as_str());
+    // Start and preflight ignored unknown query parameters before the flag existed, and still do.
+    let (status, ignored) = preflight("/v1/hub/standup/preflight?unknown=1").await;
+    assert_eq!(status, 200, "{ignored}");
+    assert!(ignored.get("operational").is_none(), "{ignored}");
+    let (status, ignored) = preflight("/v1/hub/standup/preflight?unknown=1&operational=1").await;
+    assert_eq!(status, 200, "{ignored}");
+    assert_eq!(ignored["operational"][0]["work_id"], id.as_str());
+    let (status, ignored) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start?unknown=1",
+            &other,
+            Some(billing("rival", "s-b")),
+        )
+        .await;
+    assert_eq!(status, 200, "{ignored}");
+    assert_eq!(ignored["conflict"]["kind"], "scope_overlap");
+    assert!(
+        ignored["conflict"].get("operational").is_none(),
+        "{ignored}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
