@@ -420,6 +420,9 @@ impl Hub {
             401 => Err(invalid(
                 "the agent token was rejected (expired or revoked; mint a new one)",
             )),
+            503 if reply["error"] == "work_overlap_incomplete" => Err(invalid(
+                "hub refused the announce: this token has more than 100 unfinished Work items with a declared scope (work_overlap_incomplete)",
+            )),
             429 | 503 => Err(invalid("hub busy")),
             _ => Ok((status, reply)),
         }
@@ -841,6 +844,15 @@ async fn ready(hub: &Hub, state: &mut State, root: &Path) -> Result<bool> {
     Ok(state.remote_ok == Some(true))
 }
 
+/// The error with the refusal notes already collected, so a failed retry does not lose why
+/// paths were dropped.
+fn keep_notes(notes: &[String], error: Error) -> Error {
+    match block(notes) {
+        Some(notes) => Error::Invalid(format!("{} (earlier refusal: {notes})", reason(&error))),
+        None => error,
+    }
+}
+
 /// Announce the session's paths plus `new`, then collect overlap and notice warnings.
 async fn track(
     hub: &Hub,
@@ -877,7 +889,10 @@ async fn track(
         let body = json!({"intent_id": state.intent_id, "task": state.task,
             "branch": state.branch, "machine": machine(), "paths": state.paths,
             "ttl_s": TTL_SECONDS});
-        let (status, reply) = hub.call_status(Method::POST, &url, Some(body)).await?;
+        let (status, reply) = hub
+            .call_status(Method::POST, &url, Some(body))
+            .await
+            .map_err(|error| keep_notes(&notes, error))?;
         if (200..=299).contains(&status) {
             break reply;
         }
@@ -907,10 +922,13 @@ async fn track(
             continue;
         }
         save(path, state)?;
-        return Err(Error::Invalid(match reply["message"].as_str() {
-            Some(message) => format!("hub error {status}: {}", bound_message(message)),
-            None => format!("hub error {status}"),
-        }));
+        return Err(keep_notes(
+            &notes,
+            Error::Invalid(match reply["message"].as_str() {
+                Some(message) => format!("hub error {status}: {}", bound_message(message)),
+                None => format!("hub error {status}"),
+            }),
+        ));
     };
     let mut lines = notes;
     lines.extend(announce_warnings(&reply, &state.pending, unix_now()));

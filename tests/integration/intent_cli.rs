@@ -616,3 +616,112 @@ fn a_fenced_path_is_dropped_and_the_other_paths_are_still_announced() {
     assert!(text.contains(&id), "{text}");
     assert!(!hub.live().iter().flatten().any(|p| p.starts_with("src/")));
 }
+
+/// A hub stub that answers whoami and notices, and answers each `POST .../intents` with the next
+/// of `announces` (a status and a JSON body), repeating the last one.
+fn stub_hub(announces: Vec<(u16, Value)>) -> String {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut served = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // The request head, then as much body as it declares.
+            let head = loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                buffer.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&buffer).into_owned();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let head = text[..end].to_owned();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buffer.len() >= end + 4 + length {
+                        break head;
+                    }
+                }
+                if read == 0 {
+                    break text;
+                }
+            };
+            let line = head.lines().next().unwrap_or_default().to_owned();
+            let (status, body) = if line.contains("/whoami") {
+                (200, json!({"token": {"repository": REPO}}))
+            } else if line.starts_with("POST") && line.contains("/intents") {
+                let reply = announces[served.min(announces.len() - 1)].clone();
+                served += 1;
+                reply
+            } else {
+                (200, json!({"cursor": 0, "notices": []}))
+            };
+            let body = body.to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    url
+}
+
+fn stubbed_client(hub: &Hub, agent: &Agent, url: String) -> Client {
+    let mut client = Client::new(hub, agent, "laptop-a");
+    client.url = url;
+    client
+}
+
+#[test]
+fn a_failed_retry_after_a_refusal_keeps_the_refusal_note() {
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let work = repo();
+    let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+    let url = stub_hub(vec![
+        (200, json!({"intent": "x", "overlaps": []})),
+        (
+            400,
+            json!({"error": "invalid_request", "message": "Work w holds src/a.rs. Resume it.",
+                "refused_paths": ["src/a.rs"]}),
+        ),
+        (
+            500,
+            json!({"error": "internal", "message": "synthetic failure"}),
+        ),
+    ]);
+    let client = stubbed_client(&hub, &alice, url);
+    silent(&client.edit("s", "Edit", work.path(), &path("src/a.rs")));
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("lib/x.rs")),
+        "PreToolUse",
+    );
+    assert!(text.contains("hub error 500"), "{text}");
+    assert!(text.contains("Resume it."), "{text}");
+}
+
+#[test]
+fn an_incomplete_overlap_scan_is_reported_as_such_and_not_as_a_busy_hub() {
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let work = repo();
+    let url = stub_hub(vec![(503, json!({"error": "work_overlap_incomplete"}))]);
+    let client = stubbed_client(&hub, &alice, url);
+    let file = work.path().join("src/a.rs");
+    let text = context(
+        &client.edit("s", "Edit", work.path(), file.to_str().unwrap()),
+        "PreToolUse",
+    );
+    assert!(text.contains("work_overlap_incomplete"), "{text}");
+    assert!(text.contains("more than 100"), "{text}");
+    assert!(!text.contains("hub busy"), "{text}");
+}
