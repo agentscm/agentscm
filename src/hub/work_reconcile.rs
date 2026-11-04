@@ -18,7 +18,9 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::catchup::{CatchupCoverageState, CatchupPreviewQuery, CatchupRepositoryScope};
+use super::catchup::{
+    CatchupCoverageState, CatchupMergeObservation, CatchupPreviewQuery, CatchupRepositoryScope,
+};
 use super::store::{Principal, Store};
 use super::value_metrics::identity;
 use super::work::{CheckpointKind, WorkItem};
@@ -50,6 +52,9 @@ pub(super) struct PrFacts<'a> {
     /// Exact PR-number merge lookup: `Some(true)` merged, `Some(false)` no merge row, `None`
     /// lookup unavailable.
     pub(super) merged: Option<bool>,
+    pub(super) merge_head: Option<&'a str>,
+    pub(super) merge_evidence: &'a [CatchupMergeObservation],
+    pub(super) closed_unmerged: bool,
     /// Current head of an open-PR observation, when one exists.
     pub(super) open_head: Option<&'a str>,
     /// Milliseconds when the forge read behind `open_head` started.
@@ -209,8 +214,28 @@ fn provider_status(
         if pr.open_head.is_some() {
             limits.insert("merge_and_open_observed".to_owned());
         }
-        limits.insert("merge_head_not_compared".to_owned());
-        return (ProviderStatus::Merged, HeadRelation::Unknown);
+        let relation = match pr.merge_head {
+            Some(head) if head.eq_ignore_ascii_case(&link.target.head_sha) => HeadRelation::Same,
+            Some(_) => {
+                limits.insert("merge_head_changed".to_owned());
+                HeadRelation::Changed
+            }
+            None => {
+                limits.insert("merge_head_not_compared".to_owned());
+                HeadRelation::Unknown
+            }
+        };
+        if pr
+            .merge_evidence
+            .iter()
+            .any(|merge| merge.occurred_at.is_none())
+        {
+            limits.insert("merge_time_unknown".to_owned());
+        }
+        if pr.merge_evidence.len() > 1 {
+            limits.insert("multiple_merge_observations".to_owned());
+        }
+        return (ProviderStatus::Merged, relation);
     }
     // An open observation is a real fact, but without a merge answer it cannot be the whole
     // story: a merge row may exist that the lookup could not see.
@@ -223,6 +248,10 @@ fn provider_status(
         } else {
             (ProviderStatus::OpenHeadChanged, HeadRelation::Changed)
         };
+    }
+    if pr.merged == Some(false) && pr.closed_unmerged {
+        limits.insert("closed_unmerged_observed".to_owned());
+        return (ProviderStatus::Unknown, HeadRelation::Unknown);
     }
     if pr.merged == Some(false) && pr.observation_limit.is_none() {
         limits.insert("closed_state_not_readable".to_owned());
@@ -240,15 +269,17 @@ fn prerequisite(
 ) -> PrerequisiteV1 {
     let mut limits = BTreeSet::new();
     let pr = facts.and_then(|f| f.pr.as_ref());
-    let provider = match pr {
-        Some(pr) => provider_status(pr, &mut limits).0,
+    let (provider, head_relation) = match pr {
+        Some(pr) => provider_status(pr, &mut limits),
         None => {
             limits.insert(facts.map_or(UNREAD_CAP, |f| f.unread).to_owned());
-            ProviderStatus::Unknown
+            (ProviderStatus::Unknown, HeadRelation::Unknown)
         }
     };
     let state = match provider {
-        ProviderStatus::Merged => PrerequisiteState::Satisfied,
+        ProviderStatus::Merged if head_relation == HeadRelation::Same => {
+            PrerequisiteState::Satisfied
+        }
         ProviderStatus::OpenSameHead | ProviderStatus::OpenHeadChanged
             if coverage == CatchupCoverageState::ObservedOnly
                 && pr.is_some_and(|p| p.merged == Some(false)) =>
@@ -339,6 +370,8 @@ struct PrRead {
     link: Option<WorkPrLink>,
     link_unavailable: bool,
     merged: Option<bool>,
+    merges: Vec<CatchupMergeObservation>,
+    closed_unmerged: bool,
     open: Option<(String, i64)>,
     observation_limit: Option<&'static str>,
     merge_gap: bool,
@@ -350,6 +383,13 @@ impl PrRead {
             link: self.link.as_ref(),
             link_unavailable: self.link_unavailable,
             merged: self.merged,
+            merge_head: if self.merges.len() == 1 {
+                Some(self.merges[0].head_commit.as_str())
+            } else {
+                None
+            },
+            merge_evidence: &self.merges,
+            closed_unmerged: self.closed_unmerged,
             open_head: self.open.as_ref().map(|(head, _)| head.as_str()),
             open_observed_at: self.open.as_ref().map(|(_, at)| *at),
             observation_limit: self.observation_limit,
@@ -393,22 +433,34 @@ fn read_pr(
         return Ok(Some(read));
     };
     let number = link.target.number;
-    read.merged = store.catchup_merge_known(scope, number, None).ok();
-    match open_head(store, principal, number) {
-        Ok(open) => read.open = open,
+    if let Ok(merges) = store.catchup_merges_for_pull(scope, number) {
+        read.merged = Some(!merges.is_empty());
+        read.merges = merges;
+    }
+    match read_pull_observation(store, principal, number) {
+        Ok(observation) => {
+            read.open = observation.open;
+            read.closed_unmerged = observation.closed_unmerged;
+        }
         Err(limit) => read.observation_limit = Some(limit),
     }
     read.link = Some(link);
     Ok(Some(read))
 }
 
-/// The head and read time of an open observation. Ingestion tombstones a closed pull request,
-/// so it has no observation; a malformed one gives no head and a limit.
-fn open_head(
+#[derive(Default)]
+struct PullObservation {
+    open: Option<(String, i64)>,
+    closed_unmerged: bool,
+}
+
+/// Read the open head or an explicit closed-unmerged fact, including retained tombstones.
+/// Absent, ambiguous and generic forgotten observations never establish closure.
+fn read_pull_observation(
     store: &dyn Store,
     principal: &Principal,
     number: i64,
-) -> std::result::Result<Option<(String, i64)>, &'static str> {
+) -> std::result::Result<PullObservation, &'static str> {
     let Ok(repository) = super::sync::find_repository(
         store,
         &principal.owner.identity.host,
@@ -422,20 +474,32 @@ fn open_head(
         return Err("observation_unavailable");
     };
     let observation = store
-        .observation(&repository.id, "pull_request", &number.to_string())
+        .observation_retained(&repository.id, "pull_request", &number.to_string())
         .map_err(|_| "observation_unavailable")?;
-    let Some(observation) = observation else {
-        return Ok(None);
+    let Some((observation, deleted)) = observation else {
+        return Ok(PullObservation::default());
     };
     let value: serde_json::Value =
         serde_json::from_str(&observation.data).map_err(|_| "observation_malformed")?;
-    if value["state"] != "open" {
-        return Ok(None);
+    if value["observation_conflict"] == true {
+        return Err("observation_order_ambiguous");
+    }
+    if value["state"] == "closed" && value["merged"] == false {
+        return Ok(PullObservation {
+            open: None,
+            closed_unmerged: true,
+        });
+    }
+    if deleted || value["state"] != "open" {
+        return Ok(PullObservation::default());
     }
     value["head_sha"]
         .as_str()
         .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map(|sha| Some((sha.to_owned(), observation.observed_at)))
+        .map(|sha| PullObservation {
+            open: Some((sha.to_owned(), observation.observed_at)),
+            closed_unmerged: false,
+        })
         .ok_or("observation_malformed")
 }
 
@@ -908,10 +972,7 @@ mod tests {
             assert_eq!(out.prerequisites[1].state, PrerequisiteState::Satisfied);
             assert!(out.reassess.needed);
         }
-        assert_eq!(
-            ok.prerequisites[1].limits,
-            ["merge_and_open_observed", "merge_head_not_compared"]
-        );
+        assert_eq!(ok.prerequisites[1].limits, ["merge_and_open_observed"]);
         // The unreadable one carries its own limit and no data.
         let c = &ok.prerequisites[2];
         assert_eq!(c.work_id, "dep-c");
@@ -1003,6 +1064,11 @@ mod tests {
             pr: Some(PrFacts {
                 link,
                 merged,
+                merge_head: if merged == Some(true) {
+                    link.map(|l| l.target.head_sha.as_str())
+                } else {
+                    None
+                },
                 open_head: open,
                 ..PrFacts::default()
             }),

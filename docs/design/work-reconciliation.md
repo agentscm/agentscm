@@ -20,7 +20,7 @@ including Work of another repository, gets the same `404` as an unknown id.
 |---|---|
 | `link` | The PR number and head the Work's lead reported with `pr-link-set` (`basis: caller_reported`). Provider approval is not implied. The link token is never returned. |
 | `provider.status` | `merged` from a recorded provider merge row for the link's PR number in this repository (by repository id); a merge row wins over any open observation. `open_same_head` or `open_head_changed` from a retained open-PR observation, only when a merge row is known to be absent (heads compare case-insensitively). If the merge lookup itself failed, the Work still reports `open_*` with `open_observed_at_ms`, because the observation is a real fact, but it carries `merge_lookup_unavailable`: a merge row may exist that the lookup could not see. `not_linked` when no link exists. Otherwise `unknown`. |
-| `provider.head_relation` | `same` or `changed` against the open observation's head. `unknown` for a merge. |
+| `provider.head_relation` | `same` or `changed` against the open observation's head. `same` or `changed` for a single retained merge, and `unknown` when exact merge-head evidence is unavailable or ambiguous. |
 | `provider.open_observed_at_ms` | Unix milliseconds when the forge read behind an `open_*` status started; that status is as old as this. Absent otherwise. Outside the digest. |
 | `provider.coverage` | The weakest merge-source state from the catch-up preview: `observed_only`, `incomplete` or `unavailable`. |
 | `outcome` | The Work's reported outcome, as the operational projection holds it. A self-report. |
@@ -33,7 +33,7 @@ including Work of another repository, gets the same `404` as an unknown id.
 | `digest` | Over every field except clock fields (`blocker_at`, `open_observed_at_ms`). It covers coverage, so it can change during a poll with no PR change. |
 
 Work-level limits include `single_pr_link_only`, `no_pr_link`, `pr_link_unavailable`,
-`merge_lookup_unavailable`, `merge_head_not_compared`, `merge_and_open_observed` (a merge row
+`merge_lookup_unavailable`, `merge_head_not_compared` (exact head unavailable), `merge_head_changed`, `multiple_merge_observations`, `merge_time_unknown`, `merge_and_open_observed` (a merge row
 with a stale open observation), `merge_retention_gap` (the catch-up preview reports merge history
 older than retention and there is no merge row). The gap is repository-wide and persists after the first prune, so it does not say this PR's merge was pruned; a per-PR answer needs a store read, which is out of scope here, `closed_state_not_readable` (the observation read
 succeeded and found nothing open), `observation_malformed`, `observation_unavailable`,
@@ -42,12 +42,12 @@ succeeded and found nothing open), `observation_malformed`, `observation_unavail
 failed). The provider limits apply to the row they describe: a prerequisite's own observation
 limits are on its row, not the Work's.
 
-A merge never proves that the task succeeded, and never changes `outcome` or `reservation`.
+A merge never proves that the task succeeded, and never changes `outcome` or `reservation`. Exact merge reads use provider, host, stable repository identity and PR number, ordered by merge commit and bounded to 17 rows; multiple rows cannot establish one exact prerequisite head. Missing occurrence timestamps stay unknown (`merge_time_unknown`). The strict V1 response retains its existing fields and enum values; exact retained merge records are available to the internal store reader for later versioned reconciliation.
 
 ## Prerequisites
 
-A prerequisite is `satisfied` only from an explicit link on that prerequisite plus a provider
-merge; retained merge evidence stays `satisfied` during an outage. An open PR is `not_satisfied`
+A prerequisite is `satisfied` only from an explicit link on that prerequisite plus one provider
+merge whose head matches the link; retained merge evidence stays `satisfied` during an outage. An open PR is `not_satisfied`
 only when coverage is `observed_only` and the absence of a merge row is known; under `incomplete`
 or `unavailable` coverage, or when the merge lookup failed (`merge_lookup_unavailable` on its
 row), the open status may be stale, so it is `unknown`. Everything else is `unknown`, including a prerequisite whose
@@ -70,9 +70,7 @@ sorted `limits`.
   reads as not found, until `agentscm work repair-repository` moves it to the new name.
 - **Legacy unlinked items.** `not_linked` with the `no_pr_link` limit. An unbound repository that
   cannot read links reports `unknown` with `pr_link_unavailable`.
-- **Close without merge.** Only `unknown`, with `closed_state_not_readable`. A closed state is not
-  readable through the Store (ingestion tombstones the observation), so "closed unmerged" cannot
-  be told from "not yet synced".
+- **Close without merge.** The V1 status stays `unknown` for compatibility. An exact retained observation with `state: closed` and `merged: false` adds `closed_unmerged_observed`. A generic tombstone or absent observation never proves closure. A strictly newer open observation supersedes the tombstone; older observations cannot resurrect it. Conflicting pull-request observations with the same read timestamp are retained as unknown (`observation_order_ambiguous`) until a strictly newer read; exact duplicate observations create no new event. This conflict rule does not apply to branch observations.
 - **Merge row with an open observation.** Merged PRs cannot be reopened and only a re-read
   tombstones the observation, so the observation is stale. The report says `merged` with
   `merge_and_open_observed`, and a Work still holding its reservation is
@@ -87,8 +85,7 @@ sorted `limits`.
 
 ## Known limits
 
-- The merge's head is not compared with the link's head (`merge_head_not_compared`); a later
-  store read adds this.
+- The merge head is compared with the explicit linked head. A different head has `merge_head_changed`; multiple retained merge observations have `multiple_merge_observations` and leave the head comparison unknown. Only one exact matching retained merge satisfies a prerequisite.
 - A checkpoint that omits `depends_on` replaces the Work's dependencies with an empty list on
   both stores (`replace_relations`, and `item.depends_on = checkpoint.depends_on` in the
   checkpoint path). The session-end pause carries them forward; a caller that omits them does

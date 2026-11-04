@@ -7468,6 +7468,13 @@ impl Store for SqliteStore {
             .optional()?;
         let previous = match existing {
             Some((_, at, _)) if at > observed_at => return Ok(Observed::Stale),
+            Some((old, at, deleted))
+                if kind == "pull_request" && at == observed_at && (deleted || old != data) =>
+            {
+                tx.execute("UPDATE hub_observations SET data = '{\"state\":\"unknown\",\"observation_conflict\":true}', deleted = 1 WHERE repository = ?1 AND kind = ?2 AND key = ?3", params![repo, kind, key])?;
+                tx.commit()?;
+                return Ok(Observed::Stale);
+            }
             Some((old, _, false)) if old == data => {
                 tx.execute(
                     "UPDATE hub_observations SET observed_at = ?4
@@ -7511,15 +7518,28 @@ impl Store for SqliteStore {
         let repository = repository_by_rep(&tx, repo)?;
         let existing = tx
             .query_row(
-                "SELECT observed_at, deleted FROM hub_observations
+                "SELECT observed_at, deleted, data FROM hub_observations
                  WHERE repository = ?1 AND kind = ?2 AND key = ?3",
                 params![repo, kind, key],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
         let gone = match existing {
-            Some((at, _)) if at > observed_at => return Ok(false),
-            Some((_, deleted)) => deleted,
+            Some((at, _, _)) if at > observed_at => return Ok(false),
+            Some((at, deleted, old))
+                if kind == "pull_request" && at == observed_at && (!deleted || old != data) =>
+            {
+                tx.execute("UPDATE hub_observations SET data = '{\"state\":\"unknown\",\"observation_conflict\":true}', deleted = 1 WHERE repository = ?1 AND kind = ?2 AND key = ?3", params![repo, kind, key])?;
+                tx.commit()?;
+                return Ok(false);
+            }
+            Some((_, deleted, _)) => deleted,
             // Never seen: leave a marker so an older read cannot add it later.
             None => true,
         };
@@ -7543,6 +7563,19 @@ impl Store for SqliteStore {
         Ok(self.conn().query_row(
             "SELECT kind,key,data,observed_at FROM hub_observations WHERE repository=?1 AND kind=?2 AND key=?3 AND deleted=0",
             params![repo,kind,key], |row| Ok(Observation {kind:row.get(0)?,key:row.get(1)?,data:row.get(2)?,observed_at:row.get(3)?})
+        ).optional()?)
+    }
+
+    fn observation_retained(
+        &self,
+        repo: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<(Observation, bool)>> {
+        observation_kinds(kind)?;
+        Ok(self.conn().query_row(
+            "SELECT kind,key,data,observed_at,deleted FROM hub_observations WHERE repository=?1 AND kind=?2 AND key=?3",
+            params![repo,kind,key], |row| Ok((Observation {kind:row.get(0)?,key:row.get(1)?,data:row.get(2)?,observed_at:row.get(3)?}, row.get(4)?))
         ).optional()?)
     }
 
@@ -8573,6 +8606,34 @@ impl Store for SqliteStore {
             ],
             |row| row.get(0),
         )?)
+    }
+
+    fn catchup_merges_for_pull(
+        &self,
+        scope: &CatchupRepositoryScope,
+        pull_number: i64,
+    ) -> Result<Vec<CatchupMergeObservation>> {
+        scope.validate()?;
+        if pull_number < 1 {
+            return Err(HubError::Invalid("pull number must be positive".into()));
+        }
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
+            WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 AND pull_number=?5
+            ORDER BY merge_commit COLLATE BINARY LIMIT 17"
+        ))?;
+        let rows = statement.query_map(
+            params![
+                scope.provider,
+                scope.host,
+                repository_namespace(&scope.repository, scope.repository_id),
+                catchup_repository_key(scope.repository_id),
+                pull_number
+            ],
+            sqlite_catchup_merge_row,
+        )?;
+        rows.map(|row| sqlite_catchup_merge(row?)).collect()
     }
 
     fn record_catchup_source_status(

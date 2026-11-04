@@ -379,6 +379,7 @@ fn provider_states(fixture: &StoreFixture) {
     // Closed unmerged, then genuinely reopened: no merge row, so the open status applies.
     ctx.close_pull(7);
     assert_eq!(ctx.read(&work).provider.status, ProviderStatus::Unknown);
+    assert!(has(&ctx.read(&work), "closed_unmerged_observed"));
     ctx.observe_pull(7, "open", HEAD_A);
     let out = ctx.read(&work);
     assert_eq!(out.provider.status, ProviderStatus::OpenSameHead);
@@ -389,7 +390,7 @@ fn provider_states(fixture: &StoreFixture) {
     ctx.merge(7);
     let out = ctx.read(&work);
     assert_eq!(out.provider.status, ProviderStatus::Merged);
-    assert_eq!(out.provider.head_relation, HeadRelation::Unknown);
+    assert_eq!(out.provider.head_relation, HeadRelation::Same);
     assert_eq!(out.outcome.value, OutcomeValue::None);
     assert_eq!(out.reservation.status, ReservationStatus::Held);
     assert!(out.merged_holding_reservation);
@@ -404,8 +405,8 @@ fn provider_states(fixture: &StoreFixture) {
     ctx.observe_pull(7, "open", HEAD_A);
     let out = ctx.read(&work);
     assert_eq!(out.provider.status, ProviderStatus::Merged);
-    assert_eq!(out.provider.head_relation, HeadRelation::Unknown);
-    assert!(has(&out, "merge_and_open_observed") && has(&out, "merge_head_not_compared"));
+    assert_eq!(out.provider.head_relation, HeadRelation::Same);
+    assert!(has(&out, "merge_and_open_observed") && !has(&out, "merge_head_not_compared"));
     assert_eq!(out.provider.open_observed_at_ms, None);
     assert!(out.merged_holding_reservation);
 
@@ -452,7 +453,7 @@ fn prerequisites(fixture: &StoreFixture) {
     assert!(
         by_id(&reported.id)
             .limits
-            .contains(&"closed_state_not_readable".to_owned())
+            .contains(&"closed_unmerged_observed".to_owned())
     );
     let text = serde_json::to_string(&out).unwrap();
     assert!(!text.contains("Synthetic merged") && !text.contains("synthetic checkpoint"));
@@ -706,4 +707,156 @@ fn work_reconcile_other_repository_and_unbound() {
 #[test]
 fn work_reconcile_http_route() {
     run_both(http_route);
+}
+
+// Exact merged head binding, provider namespaces, and replay/out-of-order observation behavior.
+fn exact_evidence(fixture: &StoreFixture) {
+    let mut ctx = setup(fixture);
+    let stale = ctx.start("stale-merged-head", "src/stale-head", &[]);
+    ctx.link(&stale, 41, HEAD_B);
+    ctx.merge(41); // Provider merged A, while the caller linked B.
+    let dependent = ctx.start("wait-stale", "src/wait-stale", &[&stale]);
+    let report = ctx.read(&stale);
+    assert_eq!(report.provider.status, ProviderStatus::Merged);
+    assert_eq!(report.provider.head_relation, HeadRelation::Changed);
+    assert!(has(&report, "merge_head_changed"));
+    assert_eq!(
+        ctx.read(&dependent).prerequisites[0].state,
+        PrerequisiteState::Unknown
+    );
+    let merges = ctx.store.catchup_merges_for_pull(&scope(), 41).unwrap();
+    assert_eq!(merges.len(), 1);
+    assert_eq!(merges[0].head_commit, HEAD_A);
+    assert_eq!(merges[0].occurred_at, Some(9));
+    assert_eq!(merges[0].observed_at, 10);
+    ctx.merge(41);
+    assert_eq!(
+        ctx.store.catchup_merges_for_pull(&scope(), 41).unwrap(),
+        merges
+    );
+    let mut other = scope();
+    other.host = "other.example".into();
+    assert!(
+        ctx.store
+            .catchup_merges_for_pull(&other, 41)
+            .unwrap()
+            .is_empty()
+    );
+    other = scope();
+    other.repository_id = Some(REPOSITORY_ID + 1);
+    assert!(
+        ctx.store
+            .catchup_merges_for_pull(&other, 41)
+            .unwrap()
+            .is_empty()
+    );
+    other = scope();
+    other.repository = "acme/renamed".into();
+    assert_eq!(
+        ctx.store.catchup_merges_for_pull(&other, 41).unwrap(),
+        merges
+    );
+
+    let unknown_time = ctx.start("unknown-time", "src/time", &[]);
+    ctx.link(&unknown_time, 43, HEAD_A);
+    let mut fact = NewCatchupMerge {
+        source: CatchupMergeSource::ForgePull,
+        source_id: "pr-43".into(),
+        occurred_at: None,
+        title: None,
+        branch: "feature/time".into(),
+        base: "main".into(),
+        head_commit: HEAD_A.into(),
+        merge_commit: "cccccccccccccccccccccccccccccccccccccccc".into(),
+        pull_number: 43,
+        paths: Vec::new(),
+        paths_complete: false,
+        same_repository_head: false,
+    };
+    ctx.store.record_catchup_merge(&scope(), &fact, 10).unwrap();
+    assert!(has(&ctx.read(&unknown_time), "merge_time_unknown"));
+    assert_eq!(
+        ctx.read(&unknown_time).provider.head_relation,
+        HeadRelation::Same
+    );
+    // Conflicting retained merge identities cannot prove one linked head.
+    fact.merge_commit = "dddddddddddddddddddddddddddddddddddddddd".into();
+    fact.head_commit = HEAD_B.into();
+    ctx.store.record_catchup_merge(&scope(), &fact, 11).unwrap();
+    let ambiguous = ctx.read(&unknown_time);
+    assert_eq!(ambiguous.provider.head_relation, HeadRelation::Unknown);
+    assert!(has(&ambiguous, "multiple_merge_observations"));
+    assert_eq!(
+        ctx.store.catchup_merges_for_pull(&scope(), 43).unwrap()[0].merge_commit,
+        "cccccccccccccccccccccccccccccccccccccccc"
+    );
+
+    let open = ctx.start("observation-order", "src/order", &[]);
+    ctx.link(&open, 42, HEAD_A);
+    ctx.observe_pull(42, "open", HEAD_A);
+    let time = ctx.clock;
+    let open_data = json!({"number":42,"state":"open","head_sha":HEAD_A}).to_string();
+    let closed_data = json!({"number":42,"state":"closed","merged":false}).to_string();
+    let event_count = ctx.store.latest_event_seq().unwrap();
+    ctx.store
+        .observe(&ctx.repo.id, "pull_request", "42", &open_data, time)
+        .unwrap();
+    assert_eq!(ctx.store.latest_event_seq().unwrap(), event_count);
+    ctx.store
+        .forget(
+            &ctx.repo.id,
+            "pull_request",
+            "42",
+            time - 1,
+            &closed_data,
+            "pull_request_closed",
+        )
+        .unwrap();
+    assert_eq!(
+        ctx.read(&open).provider.status,
+        ProviderStatus::OpenSameHead
+    );
+    // A conflicting equal read stamp cannot choose an open/closed answer by arrival order.
+    ctx.store
+        .forget(
+            &ctx.repo.id,
+            "pull_request",
+            "42",
+            time,
+            &closed_data,
+            "pull_request_closed",
+        )
+        .unwrap();
+    assert!(has(&ctx.read(&open), "observation_order_ambiguous"));
+    assert!(
+        ctx.store
+            .observation(&ctx.repo.id, "pull_request", "42")
+            .unwrap()
+            .is_none()
+    );
+    ctx.store
+        .observe(&ctx.repo.id, "pull_request", "42", &open_data, time)
+        .unwrap();
+    assert!(has(&ctx.read(&open), "observation_order_ambiguous"));
+    ctx.observe_pull(42, "open", HEAD_A); // A strictly newer read resolves uncertainty.
+    assert_eq!(
+        ctx.read(&open).provider.status,
+        ProviderStatus::OpenSameHead
+    );
+    ctx.close_pull(42);
+    assert!(has(&ctx.read(&open), "closed_unmerged_observed"));
+    ctx.store
+        .observe(&ctx.repo.id, "pull_request", "42", &open_data, ctx.clock)
+        .unwrap();
+    assert!(has(&ctx.read(&open), "observation_order_ambiguous"));
+    ctx.observe_pull(42, "open", HEAD_A);
+    assert_eq!(
+        ctx.read(&open).provider.status,
+        ProviderStatus::OpenSameHead
+    );
+}
+
+#[test]
+fn work_reconcile_exact_evidence_and_order() {
+    run_both(exact_evidence);
 }
