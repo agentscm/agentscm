@@ -47,8 +47,8 @@ use super::work::{
 use super::work_links::{WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView};
 use super::work_preflight::WorkPreflightResult;
 use super::work_transition::{
-    OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkLifecycleView,
-    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
+    OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkTransitionActor,
+    WorkTransitionRequest, WorkTransitionResult,
 };
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
@@ -739,13 +739,6 @@ pub trait Store: Send + Sync {
         request: &WorkTransitionRequest,
         now: i64,
     ) -> Result<WorkTransitionResult>;
-    /// The stored outcome, its provenance and the reservation basis of one Work item.
-    fn work_lifecycle(
-        &self,
-        reader: &WorkLifecycleReader<'_>,
-        id: &str,
-        now: i64,
-    ) -> Result<Option<WorkLifecycleView>>;
     /// The `WorkOperationalV1` projection of the selected Work, ordered by id and bounded to
     /// 100, in one snapshot. Never writes.
     fn work_operational(

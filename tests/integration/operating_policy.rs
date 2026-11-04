@@ -2119,6 +2119,65 @@ fn definite_draft_preflight_errors_do_not_reserve_requests() {
     assert_eq!(count, 0);
 }
 
+/// Points the local binding at the reopened Work. A reopen raises the generation, which the
+/// journal treats as a change of responsibility and refuses to bind, so the staging writes the
+/// binding row directly.
+fn rebind_after_reopen(
+    f: &Fixture,
+    dispatch: &str,
+    binding: &OperatingWork,
+    reopened: &agentscm::hub::work::WorkItem,
+) -> OperatingWork {
+    let mut rebound = binding.clone();
+    rebound.work = reopened.clone();
+    let db = rusqlite::Connection::open(f.data.join("pipeline-rules/state.sqlite")).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE operating_reservations SET work = ?1 WHERE dispatch_id = ?2",
+            rusqlite::params![serde_json::to_string(&rebound).unwrap(), dispatch],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    rebound
+}
+
+/// Reopens finished Work as its lead session and returns the reopened item.
+fn reopen_as_lead(
+    hub: &LocalHub,
+    work: &agentscm::hub::work::WorkItem,
+    operation_id: &str,
+) -> agentscm::hub::work::WorkItem {
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let current = hub
+        .store
+        .work_get(&hub.token_id, &work.id, agentscm::hub::store::unix_now())
+        .unwrap()
+        .unwrap();
+    let result = hub
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent {
+                token: &hub.token_id,
+            },
+            &WorkTransitionRequest {
+                work_id: current.id.clone(),
+                operation_id: operation_id.into(),
+                generation: current.generation,
+                expected_updated_seq: current.updated_seq,
+                session: Some(work.lead_session.clone()),
+                transition: WorkTransitionKind::Reopen,
+                reason: "stage a lost recovery response".into(),
+                superseded_by: None,
+            },
+            agentscm::hub::store::unix_now(),
+        )
+        .unwrap();
+    assert!(result.conflict.is_none());
+    result.item
+}
+
 #[test]
 fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unbound_legacy_refusal()
  {
@@ -2168,10 +2227,21 @@ fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unb
         branch: None,
         worktree: None,
         resolve_blocker: true,
-        source_refs: vec![],
+        // Recovery requests carry the accepted commit, as the production request does.
+        source_refs: vec![agentscm::hub::work::SourceRef::Commit {
+            oid: dispatch.event.accepted_commit.clone(),
+            path: None,
+        }],
         depends_on: vec![],
         related_work: vec![],
     };
+    // The run already finished the Work, and finished Work accepts no new checkpoint. Reopen it
+    // as its lead so the recovery checkpoint below is a first commit whose response is lost.
+    let reopened = reopen_as_lead(&hub, &binding.work, "stage-reopen-1");
+    let binding = rebind_after_reopen(&f, &dispatch.dispatch_id, &binding, &reopened);
+    let mut request = request;
+    request.generation = reopened.generation;
+    request.expected_updated_seq = Some(reopened.updated_seq);
     let mut reserved = binding.clone();
     reserved.recovery = Some(OperatingRecovery {
         dispatch_generation: retained.claim_generation,
@@ -2205,9 +2275,14 @@ fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unb
     );
     let successful_workflow = skill_workflow::runtime::status(&f.data, &dispatch.run_id).unwrap();
     let before_compaction = j.operating_work(&dispatch.dispatch_id).unwrap().unwrap();
+    // Finished again by the recovery above; reopen once more to stage the compacted finish.
+    let reopened = reopen_as_lead(&hub, &before_compaction.work, "stage-reopen-2");
+    let before_compaction =
+        rebind_after_reopen(&f, &dispatch.dispatch_id, &before_compaction, &reopened);
     let mut old_finish = request.clone();
     old_finish.operation_id = "compacted-finish-recovery".into();
-    old_finish.expected_updated_seq = Some(before_compaction.work.updated_seq);
+    old_finish.generation = reopened.generation;
+    old_finish.expected_updated_seq = Some(reopened.updated_seq);
     let mut uncertain = before_compaction.clone();
     uncertain.recovery = Some(OperatingRecovery {
         dispatch_generation: retained.claim_generation,

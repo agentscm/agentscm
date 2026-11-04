@@ -115,19 +115,6 @@ pub struct WorkTransitionResult {
     pub conflict: Option<WorkStartConflict>,
 }
 
-/// What the projection needs about one Work item beyond its snapshot.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkLifecycleView {
-    pub work_id: String,
-    /// None for unfinished Work and for Work finished before outcomes were recorded.
-    pub outcome: Option<TerminalOutcome>,
-    /// Who stated the outcome, read from the latest terminal event; Unknown if that event was
-    /// compacted. None whenever there is no outcome.
-    pub provenance: Option<OutcomeProvenance>,
-    pub basis: Option<ReservationBasis>,
-}
-
 impl WorkTransitionRequest {
     pub(super) fn validate(&self) -> Result<()> {
         validate_id("work", &self.work_id, "wrk")?;
@@ -290,8 +277,16 @@ pub(super) struct Prior {
     pub basis: Option<ReservationBasis>,
     pub outcome: Option<TerminalOutcome>,
     pub generation: i64,
+    pub lead_token: String,
     pub lead_agent: String,
     pub lead_session: String,
+}
+
+impl Prior {
+    /// Whether the item now has another lead session than before the transition.
+    pub(super) fn lead_changed(&self, item: &WorkItem) -> bool {
+        self.lead_token != item.lead_token || self.lead_session != item.lead_session
+    }
 }
 
 /// The reservation columns after the transition.
@@ -431,22 +426,86 @@ pub(super) fn event(
     Ok(event)
 }
 
+/// Why Work stopped holding its scope: what the audit event of an affected request records.
+pub(super) struct ReleaseCause {
+    transition: &'static str,
+    actor: serde_json::Value,
+}
+
+impl ReleaseCause {
+    pub(super) fn transition(request: &WorkTransitionRequest, acting: &Acting) -> Self {
+        Self {
+            transition: request.transition.as_str(),
+            actor: json!({"kind": acting.kind, "id": acting.user_id, "via": acting.via}),
+        }
+    }
+
+    /// A `finish` checkpoint by the lead session of an agent token owned by `owner`.
+    pub(super) fn finish_checkpoint(owner: &str) -> Self {
+        Self {
+            transition: "finish",
+            actor: json!({"kind": WorkActorKind::Lead, "id": owner, "via": ActorVia::Agent}),
+        }
+    }
+}
+
 /// The `coordination_target_released` event for one open request. The request keeps its status.
 pub(super) fn released_target_event(
     request_id: &str,
     item: &WorkItem,
-    request: &WorkTransitionRequest,
-    acting: &Acting,
+    cause: &ReleaseCause,
 ) -> Result<Event> {
     let mut event = Event::new(
         "coordination_target_released",
         request_id,
-        json!({"work_id": item.id, "transition": request.transition,
-            "actor": {"kind": acting.kind, "id": acting.user_id, "via": acting.via},
-            "generation": item.generation}),
+        json!({"work_id": item.id, "transition": cause.transition,
+            "actor": cause.actor, "generation": item.generation}),
     )?;
     event.at = item.updated_at;
     Ok(event)
+}
+
+/// The basis a pause or handover checkpoint leaves behind. Only a basis that was never an
+/// explicit decision becomes implicit; a retained reservation and an implicit one stay as they are.
+pub(super) fn basis_after_pause(prior: Option<ReservationBasis>) -> Option<ReservationBasis> {
+    match prior {
+        Some(ReservationBasis::Admitted) => Some(ReservationBasis::LegacyImplicit),
+        other => other,
+    }
+}
+
+/// The refusal for a checkpoint that reports work on Work that holds nothing.
+pub(super) fn needs_resume(kind: super::work::CheckpointKind) -> Result<()> {
+    use super::work::CheckpointKind::{Blocker, Decision, Progress};
+    if matches!(kind, Progress | Decision | Blocker) {
+        return Err(invalid(
+            "this work holds no reservation; resume it with a takeover start before reporting progress, a decision or a blocker",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a no-session intent announce may proceed for a token, given the scopes of the Work its
+/// sessions are currently eligible on and whether any session was ever linked to Work here.
+/// A token never linked to Work keeps the legacy advice.
+pub(super) fn check_announce(
+    linked: bool,
+    eligible_scopes: &[Vec<String>],
+    keys: &[String],
+) -> Result<()> {
+    if !linked {
+        return Ok(());
+    }
+    let mut uncovered = keys.to_vec();
+    for scope in eligible_scopes {
+        uncovered = super::work::uncovered_scope(scope, &uncovered);
+    }
+    if eligible_scopes.is_empty() || !uncovered.is_empty() {
+        return Err(invalid(
+            "These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the transition frees the lead's and participants' file claims and open requests.

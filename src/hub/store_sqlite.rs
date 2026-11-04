@@ -113,8 +113,8 @@ use super::work_links::{
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::work_transition::{
-    self, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkLifecycleView,
-    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
+    self, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkTransitionActor,
+    WorkTransitionRequest, WorkTransitionResult,
 };
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
@@ -1911,6 +1911,21 @@ fn work_holds_reservation(tx: &Transaction<'_>, id: &str) -> Result<bool> {
     )?)
 }
 
+/// The stored reservation basis, None when the Work holds nothing.
+fn work_reservation_basis(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> Result<Option<work_transition::ReservationBasis>> {
+    let basis: Option<String> = tx.query_row(
+        "SELECT reservation_basis FROM hub_work_items WHERE id = ?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    Ok(basis
+        .as_deref()
+        .and_then(work_transition::ReservationBasis::from_column))
+}
+
 /// Overwrites the reservation columns, which the Work snapshot does not carry.
 fn set_work_reservation(
     tx: &Transaction<'_>,
@@ -3511,9 +3526,14 @@ fn start_in(
                 preflight: None,
             });
         }
-        let resuming_own_paused = item.lead_token == who.token
+        // Work that released its reservation can be resumed by any token of its owner, whatever
+        // the state or claim age; the admission check below decides whether it may hold again.
+        let released_by_owner =
+            item.owner == who.owner.id && !work_holds_reservation(tx, &item.id)?;
+        let resuming_own_paused = (item.lead_token == who.token
             && item.state == WorkState::Paused
-            && start.takeover_generation == Some(item.generation);
+            && start.takeover_generation == Some(item.generation))
+            || released_by_owner;
         if !resuming_own_paused
             && item.claim_status != ClaimStatus::Stale
             && item.state != WorkState::Handover
@@ -4417,6 +4437,100 @@ fn release_session_intent(
         .map(Option::unwrap_or_default)
 }
 
+/// Releases the token's live intents that no session holds and that cover part of `scope`.
+/// A plain intent announce has no session, so only the path overlap ties it to the Work.
+fn release_sessionless_intents(
+    tx: &Transaction<'_>,
+    token: &str,
+    scope: &[String],
+    now: i64,
+) -> Result<()> {
+    let intents = {
+        let mut statement = tx.prepare(
+            "SELECT i.id FROM hub_intents i
+             WHERE i.token = ?1 AND i.released_at IS NULL AND i.expires_at > ?2
+               AND NOT EXISTS (SELECT 1 FROM hub_sessions s WHERE s.intent = i.id)
+             ORDER BY i.id",
+        )?;
+        statement
+            .query_map(params![token, now], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for intent in intents {
+        let keys = {
+            let mut statement =
+                tx.prepare("SELECT key FROM hub_intent_paths WHERE intent = ?1 ORDER BY key")?;
+            statement
+                .query_map([&intent], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !scope_overlap_reasons(scope, &keys).is_empty() {
+            release_in(tx, token, &intent, now)?;
+        }
+    }
+    Ok(())
+}
+
+/// Frees what Work that was released or ended held: the live intent of every participant
+/// session, the session-less intents of those tokens that cover its scope, and the targeting of
+/// open coordination requests, which keep their status. Works with revoked tokens. Returns the
+/// payload bytes the request events add; the caller records them without a quota check.
+fn release_work_holds(
+    tx: &Transaction<'_>,
+    item: &WorkItem,
+    cause: &work_transition::ReleaseCause,
+    now: i64,
+) -> Result<i64> {
+    let sessions = work_transition::claim_sessions(item);
+    for (token, session) in &sessions {
+        release_session_intent(tx, token, session, now)?;
+    }
+    let mut tokens: Vec<&str> = sessions.iter().map(|(token, _)| token.as_str()).collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    for token in tokens {
+        release_sessionless_intents(tx, token, &item.scope, now)?;
+    }
+    // Requests that target the Work or propose it stay open: a response stays a response and
+    // nothing resolves.
+    let open = {
+        let mut statement = tx.prepare(
+            "SELECT r.id, r.status, r.proposed_work FROM hub_coordination_requests r
+             WHERE r.status IN ('pending', 'responded')
+               AND (r.proposed_work = ?1
+                    OR EXISTS (SELECT 1 FROM hub_coordination_targets t
+                               WHERE t.request = r.id AND t.work = ?1))
+             ORDER BY r.id",
+        )?;
+        statement
+            .query_map([&item.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut delta = 0i64;
+    for (id, status, proposed_work) in open {
+        let released = work_transition::released_target_event(&id, item, cause)?;
+        let released_seq = append(tx, &released)?;
+        save_coordination_version(
+            tx,
+            &id,
+            parse_status(&status)?,
+            proposed_work.as_deref(),
+            now,
+            released_seq,
+        )?;
+        delta = delta
+            .checked_add(coordination_payload_bytes(&[""], &released)?)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    }
+    Ok(delta)
+}
+
 /// The named session, else the token's only recent hook-connected one, else the default.
 fn session_name(
     tx: &Transaction<'_>,
@@ -4606,6 +4720,59 @@ fn guard_managed_touch(
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
     Ok(())
+}
+
+/// The guard for a plain intent announce, which names no session. A token that has any session
+/// linked to Work in its repository may announce only paths covered by Work on which one of its
+/// sessions is currently eligible (held reservation, active or blocked, current generation); a
+/// token never linked to Work keeps the legacy advice. It looks the token up by its stored
+/// repository id, as the announce always has, so a renamed repository does not refuse it.
+fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let repository_id: Option<i64> = tx.query_row(
+        "SELECT repository_id FROM hub_agent_tokens WHERE id = ?1",
+        [&who.token],
+        |row| row.get(0),
+    )?;
+    let scope = params![
+        who.owner.identity.provider,
+        who.owner.identity.host,
+        who.repository,
+        repository_id,
+        who.token
+    ];
+    let linked: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hub_work_items w
+         JOIN hub_work_participants p ON p.work=w.id
+         WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
+           AND w.repository_id IS ?4 AND p.token=?5)",
+        scope,
+        |row| row.get(0),
+    )?;
+    if !linked {
+        return Ok(());
+    }
+    let eligible = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT w.snapshot FROM hub_work_items w
+             JOIN hub_work_participants p ON p.work=w.id
+             WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
+               AND w.repository_id IS ?4 AND w.state IN ('active','blocked')
+               AND w.reservation_basis IS NOT NULL
+               AND p.token=?5 AND p.generation=w.generation
+             ORDER BY w.id",
+        )?;
+        statement
+            .query_map(scope, |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let scopes = eligible
+        .iter()
+        .map(|snapshot| json_value::<WorkItem>(snapshot).map(|item| item.scope))
+        .collect::<Result<Vec<_>>>()?;
+    work_transition::check_announce(true, &scopes, keys)
 }
 
 /// the session's behalf, or answered without text) tells and consumes nothing.
@@ -5552,8 +5719,10 @@ impl SqliteStore {
                  JOIN hub_events e ON e.seq = v.event_seq
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at >= ?5 AND e.at <= ?6
-                   AND e.kind = 'work_checkpoint'
-                   AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish')
+                   AND ((e.kind = 'work_checkpoint'
+                         AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish'))
+                        OR (e.kind = 'work_transition'
+                            AND json_extract(e.data, '$.outcome') = 'completed'))
                  ORDER BY v.event_seq DESC LIMIT ?7",
             )?;
             statement
@@ -6393,8 +6562,7 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
-        let name = session_name(&tx, token, None, now)?;
-        guard_managed_touch(&tx, &who, &name, &keys, now)?;
+        guard_announce(&tx, &who, &keys)?;
         let announced = announce_in(&tx, &who, intent, &keys, &[], now)?;
         tx.commit()?;
         Ok(announced)
@@ -8474,6 +8642,12 @@ impl Store for SqliteStore {
                 "only the current lead session may checkpoint work".into(),
             ));
         }
+        let prior_basis = work_reservation_basis(&tx, &item.id)?;
+        let held = prior_basis.is_some();
+        if !held {
+            // Reporting work on Work that holds nothing would flip it to active with nothing held.
+            work_transition::needs_resume(checkpoint.kind)?;
+        }
         let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
             HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
         })?;
@@ -8535,7 +8709,6 @@ impl Store for SqliteStore {
                 }
             }
         }
-        let held = work_holds_reservation(&tx, &item.id)?;
         if let Some(scope) = checkpoint.normalized_scope()? {
             // Work without a reservation claims nothing, so its scope change has nothing to check.
             let overlaps = if held {
@@ -8630,8 +8803,10 @@ impl Store for SqliteStore {
             super::work::CheckpointKind::Finish => {
                 set_work_reservation(&tx, &item.id, Some("completed"), None)?;
             }
-            super::work::CheckpointKind::Pause | super::work::CheckpointKind::Handover if held => {
-                set_work_reservation(&tx, &item.id, None, Some("legacy_implicit"))?;
+            super::work::CheckpointKind::Pause | super::work::CheckpointKind::Handover => {
+                if let Some(basis) = work_transition::basis_after_pause(prior_basis) {
+                    set_work_reservation(&tx, &item.id, None, Some(basis.column()))?;
+                }
             }
             _ => {}
         }
@@ -8648,7 +8823,11 @@ impl Store for SqliteStore {
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
         if checkpoint.kind == super::work::CheckpointKind::Finish {
-            release_session_intent(&tx, token, &checkpoint.session, now)?;
+            // The same cleanup as a terminal transition. It follows the quota check above and
+            // records its own size without one, so a finish is never refused for the cleanup.
+            let cause = work_transition::ReleaseCause::finish_checkpoint(&who.owner.id);
+            let cleanup = release_work_holds(&tx, &item, &cause, now)?;
+            record_work_payload_delta(&tx, &who, cleanup, now)?;
         }
         tx.commit()?;
         Ok(WorkCheckpointResult {
@@ -8686,15 +8865,17 @@ impl Store for SqliteStore {
                 work_transition::person_who(user, repository, *repository_id)
             }
         };
-        let mut item = scoped_work(&tx, &who, &request.work_id, now)?
-            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        // Read-only is refused before the id is looked up, as in the PostgreSQL store, so a
+        // read-only caller learns nothing about which ids exist.
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
         let via = match actor {
             WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
             WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
         };
-        if who.read_only {
-            return Err(HubError::Unauthorized);
-        }
+        let mut item = scoped_work(&tx, &who, &request.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
         let envelope = request.envelope(via, &who.owner.id)?;
         if let Some((previous, event_seq, generation)) = tx
             .query_row(
@@ -8769,10 +8950,10 @@ impl Store for SqliteStore {
                 .as_deref()
                 .and_then(work_transition::TerminalOutcome::from_column),
             generation: item.generation,
+            lead_token: item.lead_token.clone(),
             lead_agent: item.lead_agent.clone(),
             lead_session: item.lead_session.clone(),
         };
-        let claim_sessions = work_transition::claim_sessions(&item);
         let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
         let columns = work_transition::apply(&mut item, request, &acting, now)?;
         let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
@@ -8814,6 +8995,19 @@ impl Store for SqliteStore {
                 ],
             )?;
         }
+        if request.transition == work_transition::WorkTransitionKind::Reopen
+            && prior.lead_changed(&item)
+        {
+            // Open requests followed the old lead; they go back to waiting for the new one.
+            retarget_coordination_requests(
+                &tx,
+                &who,
+                &item.id,
+                item.generation,
+                &item.lead_session,
+                now,
+            )?;
+        }
         tx.execute(
             "INSERT INTO hub_work_checkpoint_ops (work, operation_id, request, event_seq)
              VALUES (?1, ?2, ?3, ?4)",
@@ -8823,45 +9017,11 @@ impl Store for SqliteStore {
             .checked_sub(previous_item_bytes)
             .and_then(|bytes| bytes.checked_add(work_payload_row_bytes(envelope.len()).ok()?))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
-        let releases = work_transition::releases_claims(request.transition);
-        if releases {
-            for (token, session) in &claim_sessions {
-                release_session_intent(&tx, token, session, now)?;
-            }
-            // Open requests keep their status: a response stays a response, and nothing resolves.
-            let open = {
-                let mut statement = tx.prepare(
-                    "SELECT r.id, r.status, r.proposed_work FROM hub_coordination_requests r
-                     JOIN hub_coordination_targets t ON t.request = r.id
-                     WHERE t.work = ?1 AND r.status IN ('pending', 'responded')
-                     ORDER BY r.id",
-                )?;
-                statement
-                    .query_map([&item.id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            for (id, status, proposed_work) in open {
-                let released =
-                    work_transition::released_target_event(&id, &item, request, &acting)?;
-                let released_seq = append(&tx, &released)?;
-                save_coordination_version(
-                    &tx,
-                    &id,
-                    parse_status(&status)?,
-                    proposed_work.as_deref(),
-                    now,
-                    released_seq,
-                )?;
-                delta = delta
-                    .checked_add(coordination_payload_bytes(&[""], &released)?)
-                    .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
-            }
+        if work_transition::releases_claims(request.transition) {
+            let cause = work_transition::ReleaseCause::transition(request, &acting);
+            delta = delta
+                .checked_add(release_work_holds(&tx, &item, &cause, now)?)
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
             record_work_payload_delta(&tx, &who, delta, now)?;
         } else {
             adjust_work_payload_capacity(&tx, &who, delta, now)?;
@@ -8878,50 +9038,6 @@ impl Store for SqliteStore {
             item,
             conflict: None,
         })
-    }
-
-    fn work_lifecycle(
-        &self,
-        reader: &WorkLifecycleReader<'_>,
-        id: &str,
-        now: i64,
-    ) -> Result<Option<WorkLifecycleView>> {
-        super::work::validate_id("work", id, "wrk")?;
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let who = match reader {
-            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
-            WorkLifecycleReader::Person {
-                owner,
-                repository,
-                repository_id,
-            } => work_transition::person_who(owner, repository, *repository_id),
-        };
-        let Some(item) = scoped_work(&tx, &who, id, now)? else {
-            return Ok(None);
-        };
-        let (outcome, basis): (Option<String>, Option<String>) = tx.query_row(
-            "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = ?1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let outcome = outcome
-            .as_deref()
-            .and_then(work_transition::TerminalOutcome::from_column);
-        let provenance = if outcome.is_some() && item.state == WorkState::Finished {
-            Some(terminal_provenance(&tx, id)?)
-        } else {
-            None
-        };
-        tx.commit()?;
-        Ok(Some(WorkLifecycleView {
-            work_id: id.to_owned(),
-            outcome,
-            provenance,
-            basis: basis
-                .as_deref()
-                .and_then(work_transition::ReservationBasis::from_column),
-        }))
     }
 
     fn work_operational(

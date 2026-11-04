@@ -712,6 +712,30 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
                     json!({"dispatch":retained,"work":journal.operating_work(&dispatch)?,"reconciled":true}),
                 );
             }
+            if reconcile_operation.is_some() && completed && current.state == WorkState::Finished {
+                // Finished Work accepts no second finish, so a reconciliation cannot append the
+                // result checkpoint. The Hub already holds the finish whose outcome was unknown;
+                // it must carry this dispatch's accepted commit, and the reconciliation entry
+                // records the observation.
+                let matching = current.current.as_ref().is_some_and(|c| c.kind == CheckpointKind::Finish
+                    && c.source_refs.iter().any(|s| matches!(s, SourceRef::Commit {oid,path:None} if oid == &retained.dispatch.event.accepted_commit)));
+                if !matching {
+                    return Err(Error::Conflict("finished Work lacks the matching result checkpoint; inspect before reconciliation".into()));
+                }
+                journal.bind_operating_work(
+                    &dispatch,
+                    Some(&binding),
+                    &OperatingWork {
+                        identity_commitment: binding.identity_commitment.clone(),
+                        work: current,
+                        recovery: None,
+                        recovery_reconciliations,
+                    },
+                )?;
+                return Ok(
+                    json!({"dispatch":retained,"work":journal.operating_work(&dispatch)?,"reconciled":true}),
+                );
+            }
             let request = replay.map(|r| r.request.clone()).unwrap_or_else(|| WorkCheckpoint {
                 work_id: current.id.clone(), operation_id: format!("operating-recovery-{dispatch}-{expected_generation}-s{}",current.updated_seq),
                 generation: current.generation, session: current.lead_session.clone(), expected_updated_seq: Some(current.updated_seq),
