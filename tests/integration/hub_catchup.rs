@@ -3507,7 +3507,7 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
     assert_eq!(settled, 1);
 
     let holders = operational_read(fixture, &reader, &OperationalSelect::Holders, t0 + 120);
-    assert_eq!((holders.schema_version, holders.complete), (1, true));
+    assert_eq!((holders.schema_version, holders.complete), (2, true));
     let mut expected = vec![hidden.id.clone(), plain.id.clone()];
     expected.sort();
     let listed_ids: Vec<_> = holders.work.iter().map(|w| w.work_id.clone()).collect();
@@ -3555,7 +3555,8 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
         Err(HubError::Invalid(_))
     ));
 
-    // No token identifier appears, and only `freshness` depends on the request time.
+    // No token identifier appears, and only `freshness` and the lease `activity` depend on the
+    // request time.
     let early = serde_json::to_value(&holders).unwrap();
     let text = early.to_string();
     assert!(!text.contains(&token) && !text.contains(&reader), "{text}");
@@ -3566,7 +3567,9 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
     assert_ne!(early, later, "a revoked lead changes freshness");
     for value in [&mut early, &mut later] {
         for work in value["work"].as_array_mut().unwrap() {
-            work.as_object_mut().unwrap().remove("freshness");
+            let work = work.as_object_mut().unwrap();
+            work.remove("freshness");
+            work.remove("activity");
         }
     }
     assert_eq!(early, later);

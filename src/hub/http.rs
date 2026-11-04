@@ -67,6 +67,20 @@ pub async fn blocking<T: Send + 'static>(
     .map_err(|_| HubError::Unavailable("blocking task failed".into()))?
 }
 
+/// Observes the Hub's clock once a minute, first at startup, so a restart or clock jump longer
+/// than a lease grants grace instead of lapsing every reservation, and a quiet Hub does not.
+async fn lease_clock_loop(state: HubState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let store = state.store.clone();
+        if let Err(error) = blocking(&state, move || store.observe_lease_clock(unix_now())).await {
+            eprintln!("hub: lease clock observation failed: {error}");
+        }
+    }
+}
+
 pub async fn serve(config: HubConfig) -> Result<()> {
     if !config.bind.ip().is_loopback() && !config.public {
         return Err(HubError::Invalid(
@@ -181,6 +195,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     tokio::spawn(sync::poll_loop(state.clone(), config.poll_seconds));
     tokio::spawn(super::change_record_http::sweep_loop(state.clone()));
     tokio::spawn(super::work_compaction_loop(state.clone()));
+    tokio::spawn(lease_clock_loop(state.clone()));
     #[cfg(unix)]
     let execution_worker = state
         .workspace_execution

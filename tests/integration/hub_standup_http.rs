@@ -620,7 +620,7 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
     let listed = &rich["operational"];
     assert_eq!(
         (&listed["schema_version"], &listed["complete"]),
-        (&json!(1), &json!(true))
+        (&json!(2), &json!(true))
     );
     let entry = &listed["work"][0];
     assert_eq!(entry["work_id"], id.as_str());
@@ -679,7 +679,7 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
         )
         .await;
     assert_eq!(status, 200, "{one}");
-    assert_eq!(one["schema_version"], 1);
+    assert_eq!(one["schema_version"], 2);
     for body in [
         one.to_string(),
         rich["conflict"]["operational"].to_string(),

@@ -9,7 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use super::work::{CheckpointKind, ClaimStatus, WorkItem, WorkState};
 
-pub(super) const SCHEMA_VERSION_V1: u16 = 1;
+/// 2 adds the reservation lease to `activity`.
+pub(super) const SCHEMA_VERSION: u16 = 2;
+/// A reservation lapses this long after its lead session last renewed it.
+pub const LEASE_SECONDS: i64 = 1200;
+/// A `retain` keeps the reservation at most this long without lead activity.
+pub const RETAIN_CAP_SECONDS: i64 = 7200;
+/// The lead session renews its lease at most this often.
+pub(super) const RENEW_INTERVAL_SECONDS: i64 = 60;
 /// Largest number of reservation-holding Work in one operational overview.
 pub(super) const MAX_OPERATIONAL_WORK: usize = 100;
 
@@ -51,6 +58,23 @@ pub enum ReservationBasis {
     LegacyImplicit,
     Admitted,
     Retained,
+}
+
+/// How long a reservation with the `reservation_basis` column value `basis` lasts from the
+/// admission, decision or renewal that set it.
+pub(super) fn lease_seconds(basis: &str) -> i64 {
+    if basis == ReservationBasis::Retained.column() {
+        RETAIN_CAP_SECONDS
+    } else {
+        LEASE_SECONDS
+    }
+}
+
+/// A held reservation's last renewal and its expiry, in server Unix seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Lease {
+    pub(super) renewed_at: i64,
+    pub(super) expires_at: i64,
 }
 
 impl ReservationBasis {
@@ -254,6 +278,10 @@ pub struct ReportV1 {
 #[serde(rename_all = "snake_case")]
 pub enum ActivityStatus {
     Unknown,
+    /// The lead session renewed the reservation's lease and it has not expired.
+    Live,
+    /// The lease expired: the reservation blocks nobody and the next admission over it clears it.
+    Lapsed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -261,6 +289,10 @@ pub enum ActivityStatus {
 pub struct ActivityV1 {
     pub status: ActivityStatus,
     pub reason: String,
+    /// The lead session's last renewal of the lease, None while no lease is known.
+    pub lease_renewed_at: Option<i64>,
+    /// When the lease lapses without another renewal, None while no lease is known.
+    pub lease_expires_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -345,10 +377,15 @@ pub(super) struct OperationalFacts<'a> {
     pub(super) basis: Option<ReservationBasis>,
     pub(super) hidden_by_merged_pr: bool,
     pub(super) merge: MergeStatus,
+    pub(super) lease: Option<Lease>,
+    /// The request time that decides whether the lease is live, like `freshness`.
+    pub(super) now: i64,
 }
 
-const ACTIVITY_UNKNOWN_REASON: &str =
-    "Activity is not observed; no lease or activity report exists yet.";
+const ACTIVITY_UNKNOWN_REASON: &str = "Activity is not observed; the Work holds no lease.";
+const ACTIVITY_LIVE_REASON: &str =
+    "The lead session renewed the lease; it lapses at lease_expires_at unless renewed again.";
+const ACTIVITY_LAPSED_REASON: &str = "The lead session did not renew the lease in time; the reservation blocks nobody and the next admission over its scope clears it.";
 
 pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV1 {
     let item = facts.item;
@@ -385,7 +422,33 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
         holder_agent: held.then(|| item.lead_agent.clone()),
         holder_session: held.then(|| item.lead_session.clone()),
     };
-    let mut unknown = BTreeSet::from(["activity".to_owned()]);
+    let activity = match facts.lease.filter(|_| held) {
+        Some(lease) => ActivityV1 {
+            status: if lease.expires_at > facts.now {
+                ActivityStatus::Live
+            } else {
+                ActivityStatus::Lapsed
+            },
+            reason: if lease.expires_at > facts.now {
+                ACTIVITY_LIVE_REASON
+            } else {
+                ACTIVITY_LAPSED_REASON
+            }
+            .to_owned(),
+            lease_renewed_at: Some(lease.renewed_at),
+            lease_expires_at: Some(lease.expires_at),
+        },
+        None => ActivityV1 {
+            status: ActivityStatus::Unknown,
+            reason: ACTIVITY_UNKNOWN_REASON.to_owned(),
+            lease_renewed_at: None,
+            lease_expires_at: None,
+        },
+    };
+    let mut unknown = BTreeSet::new();
+    if activity.status == ActivityStatus::Unknown {
+        unknown.insert("activity".to_owned());
+    }
     if facts.merge == MergeStatus::Unknown {
         unknown.insert("merge".to_owned());
     }
@@ -400,7 +463,7 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
     }
     let unknown: Vec<String> = unknown.into_iter().collect();
     WorkOperationalV1 {
-        schema_version: SCHEMA_VERSION_V1,
+        schema_version: SCHEMA_VERSION,
         work_id: item.id.clone(),
         state: item.state,
         generation: item.generation,
@@ -412,10 +475,7 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
             kind: checkpoint.kind,
         }),
         freshness: item.claim_status,
-        activity: ActivityV1 {
-            status: ActivityStatus::Unknown,
-            reason: ACTIVITY_UNKNOWN_REASON.to_owned(),
-        },
+        activity,
         merge: MergeV1 {
             hidden_by_merged_pr: facts.hidden_by_merged_pr,
             status: facts.merge,
@@ -476,7 +536,7 @@ pub(super) fn operational_overview(
     let truncated = work.len() > MAX_OPERATIONAL_WORK;
     work.truncate(MAX_OPERATIONAL_WORK);
     OperationalOverviewV1 {
-        schema_version: SCHEMA_VERSION_V1,
+        schema_version: SCHEMA_VERSION,
         work,
         complete: !more && !truncated,
     }
@@ -489,6 +549,7 @@ pub(super) struct OperationalRow {
     pub(super) basis: Option<ReservationBasis>,
     /// Computed by the stores' shared settled rule, never by this module.
     pub(super) hidden_by_merged_pr: bool,
+    pub(super) lease: Option<Lease>,
 }
 
 /// What a merge observation says about one Work item.
@@ -521,6 +582,7 @@ pub(super) fn operational_page(
     rows: Vec<OperationalRow>,
     forge_window_from: Option<i64>,
     more: bool,
+    now: i64,
 ) -> OperationalOverviewV1 {
     let work = rows
         .iter()
@@ -531,6 +593,8 @@ pub(super) fn operational_page(
                 basis: row.basis,
                 hidden_by_merged_pr: row.hidden_by_merged_pr,
                 merge: merge_status(&row.item, row.hidden_by_merged_pr, forge_window_from),
+                lease: row.lease,
+                now,
             })
         })
         .collect();
@@ -817,7 +881,35 @@ mod tests {
             basis,
             hidden_by_merged_pr: false,
             merge: MergeStatus::None,
+            lease: None,
+            now: 100,
         }
+    }
+
+    #[test]
+    fn a_held_lease_is_live_until_it_expires_then_lapsed() {
+        let item = item(WorkState::Active);
+        let mut input = facts(&item, Some(ReservationBasis::Admitted));
+        input.lease = Some(Lease {
+            renewed_at: 40,
+            expires_at: 100 + 1,
+        });
+        let live = work_operational(&input);
+        assert_eq!(live.activity.status, ActivityStatus::Live);
+        assert_eq!(live.activity.lease_expires_at, Some(101));
+        assert!(!live.completeness.unknown.contains(&"activity".to_owned()));
+        input.now = 101;
+        let lapsed = work_operational(&input);
+        assert_eq!(lapsed.activity.status, ActivityStatus::Lapsed);
+        assert_eq!(lapsed.activity.lease_renewed_at, Some(40));
+        // A lease without a reservation is never reported.
+        input.basis = None;
+        assert_eq!(
+            work_operational(&input).activity.status,
+            ActivityStatus::Unknown
+        );
+        assert_eq!(lease_seconds("retained"), RETAIN_CAP_SECONDS);
+        assert_eq!(lease_seconds("legacy_implicit"), LEASE_SECONDS);
     }
 
     #[test]
@@ -921,7 +1013,7 @@ mod tests {
         let item = item(WorkState::Active);
         let view = work_operational(&facts(&item, Some(ReservationBasis::Admitted)));
         let json = serde_json::to_value(&view).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["reservation"]["basis"], "admitted");
         assert_eq!(json["activity"]["status"], "unknown");
         let back: WorkOperationalV1 = serde_json::from_value(json.clone()).unwrap();

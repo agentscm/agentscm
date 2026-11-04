@@ -950,6 +950,9 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
+    /// Records that the Hub's clock reads `now`. After a gap longer than a lease since the last
+    /// observation, every reservation that was live then gets one lease of grace.
+    fn observe_lease_clock(&self, now: i64) -> Result<()>;
     fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing>;
     /// Side-effect-free current page for hooks and implicit contexts; never ackable, with an
     /// isolated explicit subscriber/session cursor.

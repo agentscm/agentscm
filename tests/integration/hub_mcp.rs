@@ -1298,7 +1298,7 @@ async fn work_transition_releases_replays_and_fences_the_old_session() {
         .tool_result(&alice, "agentscm_work_overview", json!({}))
         .await;
     let held = &overview["structuredContent"]["operational"];
-    assert_eq!(held["schema_version"], 1);
+    assert_eq!(held["schema_version"], 2);
     assert_eq!(held["work"][0]["work_id"], work_id.as_str());
     assert_eq!(held["work"][0]["reservation"]["status"], "held");
     let rival = hub

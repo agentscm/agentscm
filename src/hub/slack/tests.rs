@@ -780,12 +780,13 @@ async fn a_request_to_an_idle_lead_messages_its_person_once() {
     let now = unix_now();
     let requests = tokio::task::block_in_place(|| {
         let store = f.store();
-        // Alice's agent stopped checking in an hour ago on one task and is still on the other.
+        // Alice's agent stopped checking in on one task long enough for its claim to go stale,
+        // though its reservation's lease has not lapsed, and is still on the other.
         let idle = store
             .work_start_auto(
                 &f.alice,
                 &start("readable catch up", "a1", "ui/catchup.tsx"),
-                now - 3600,
+                now - 1000,
             )
             .unwrap();
         store

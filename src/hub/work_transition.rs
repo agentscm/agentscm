@@ -440,6 +440,14 @@ impl ReleaseCause {
         }
     }
 
+    /// A lease that expired, cleared by the Hub at another Work's admission over its scope.
+    pub(super) fn lapse() -> Self {
+        Self {
+            transition: "lapse",
+            actor: json!({"kind": "lease"}),
+        }
+    }
+
     /// A `finish` checkpoint by the lead session of an agent token owned by `owner`.
     pub(super) fn finish_checkpoint(owner: &str) -> Self {
         Self {
