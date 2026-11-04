@@ -349,7 +349,11 @@ fn reason(error: HubError) -> &'static str {
             "checkpoint sequence changed; inspect current Work"
         }
         HubError::Unauthorized => DENIED,
-        HubError::Invalid(_) => "invalid hook payload",
+        HubError::Invalid(detail) => {
+            // Debug-quoted so each message stays on one log line.
+            eprintln!("hub: hook rejected as invalid: {detail:?}");
+            "invalid hook payload"
+        }
         HubError::Unavailable(detail) => {
             eprintln!("hub error: {detail}");
             "hub unavailable"
@@ -532,7 +536,8 @@ impl Call {
                         *delivered = Some((principal.clone(), session, page));
                         advice
                     }
-                    Err(HubError::Invalid(_)) => {
+                    Err(HubError::Invalid(detail)) => {
+                        eprintln!("hub: edit hook not linked to work: {detail:?}");
                         let text = "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned();
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
