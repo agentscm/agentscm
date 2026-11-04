@@ -190,10 +190,33 @@ pub fn project_work(
     if let Some(r) = current {
         limits.extend(r.limits.iter().cloned());
     }
-    // V2 does not expose newly read evidence when no retained result is current. A digest of
-    // this view must not be advertised as an exact provider-evidence version in that case.
-    if current.is_none() {
+    // Older V2 responses may lack the fresh evidence identity. Never infer it from history.
+    if reconciliation
+        .as_ref()
+        .is_none_or(|r| r.current_evidence_digest.is_none())
+    {
         limits.insert("current_provider_evidence_not_exposed".to_owned());
+    }
+    if let Some(r) = &reconciliation {
+        for source in ["forge_pull", "tracked_publication"] {
+            match r
+                .current_source_coverage
+                .iter()
+                .find(|s| s.source == source)
+                .map(|s| s.state.as_str())
+            {
+                Some("observed_only") => {}
+                Some("unavailable") => {
+                    limits.insert("provider_coverage_unavailable".into());
+                }
+                Some("incomplete") => {
+                    limits.insert("provider_coverage_incomplete".into());
+                }
+                _ => {
+                    limits.insert("provider_coverage_unknown".into());
+                }
+            }
+        }
     }
     let (state, recipient, action) = if !consistent {
         (
@@ -627,6 +650,8 @@ mod tests {
             generation: item.generation,
             updated_seq: item.updated_seq,
             declaration_seq: 1,
+            current_evidence_digest: Some("synthetic-evidence".into()),
+            current_source_coverage: vec![],
             retained: None,
             current: Some(DurableReconciliation {
                 work_id: item.id.clone(),
@@ -678,6 +703,69 @@ mod tests {
         assert!(!row.needs_you);
         assert!(row.limits.contains(&"reconciliation_work_changed".into()));
     }
+    #[test]
+    fn fresh_evidence_identity_is_exposed_without_promoting_stale_evaluation() {
+        use crate::hub::work_reconciliation::{
+            WorkDeclarations, WorkDeclarationsView, reconciliation_view,
+        };
+        let item = item(WorkState::Blocked);
+        let declarations = WorkDeclarationsView {
+            schema_version: 2,
+            work_id: item.id.clone(),
+            generation: item.generation,
+            updated_seq: item.updated_seq,
+            declaration_seq: 1,
+            compatibility_link: None,
+            declarations: WorkDeclarations::default(),
+        };
+        let mut evidence: ReconciliationEvidence = serde_json::from_value(json!({
+            "provider":"github", "host":"github.com", "repository_id":1,
+            "merge_through":0,"merge_floor":0,"sources":[],"pulls":[],"prerequisites":[]
+        }))
+        .unwrap();
+        let never = reconciliation_view(&item, &declarations, &evidence, None);
+        assert!(never.current.is_none());
+        assert!(never.current_evidence_digest.is_some());
+        let old_digest = never.current_evidence_digest.clone();
+        evidence.sources = ["forge_pull", "tracked_publication"]
+            .into_iter()
+            .map(|source| crate::hub::work_reconciliation::SourceEvidence {
+                source: source.into(),
+                state: "observed_only".into(),
+                checked_at_seconds: 1,
+                unread_pages: 0,
+                deferred: 0,
+            })
+            .collect();
+        let observed = reconciliation_view(&item, &declarations, &evidence, None);
+        assert!(observed.current.is_none());
+        let row = project_work(&item, op(&item, true, false), Some(observed), "usr_lead");
+        assert!(
+            !row.limits
+                .iter()
+                .any(|l| l.starts_with("provider_coverage_"))
+        );
+        evidence.sources[0].state = "unavailable".into();
+        let unavailable = reconciliation_view(&item, &declarations, &evidence, None);
+        assert_eq!(unavailable.current_source_coverage[0].state, "unavailable");
+        assert!(unavailable.current.is_none());
+        let row = project_work(&item, op(&item, true, false), Some(unavailable), "usr_lead");
+        assert!(row.limits.contains(&"provider_coverage_unavailable".into()));
+
+        let retained = reassessment(&item).current;
+        evidence.merge_through += 1;
+        let stale = reconciliation_view(&item, &declarations, &evidence, retained);
+        assert!(stale.current.is_none());
+        assert!(stale.retained.is_some());
+        assert_ne!(stale.current_evidence_digest, old_digest);
+        let row = project_work(&item, op(&item, true, false), Some(stale), "usr_lead");
+        assert_eq!(row.state, StatusState::Blocked);
+        assert!(
+            !row.limits
+                .contains(&"current_provider_evidence_not_exposed".into())
+        );
+    }
+
     #[test]
     fn mismatched_work_version_suppresses_actionable_instruction() {
         let item = item(WorkState::Blocked);

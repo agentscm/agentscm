@@ -454,3 +454,155 @@ async fn finish_offers_a_fresh_general_briefing_before_the_agent_leaves() {
             .any(|q| q["subscriber"] == "human" && q["task"].is_null())
     );
 }
+
+/// A provider poll can change evidence without a Work event or any changed rendered report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_evidence_versions_invalidate_ready_and_inflight_briefings() {
+    use agentscm::hub::catchup::{
+        CatchupCoverageState, CatchupMergeSource, CatchupRepositoryScope, CatchupSourceStatus,
+    };
+    let hub = Hub::start().await;
+    let (token, secret) = hub.token(41, "writer", REPOSITORY);
+    let item = hub.store.work_start(&token, &serde_json::from_value(json!({
+        "request_key":"provider-evidence", "title":"Synthetic evidence task", "session":"evidence-agent", "scope":["src/evidence.rs"]
+    })).unwrap(), unix_now()).unwrap().item;
+    let scope = CatchupRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: None,
+    };
+    let observed = |at| CatchupSourceStatus {
+        source: CatchupMergeSource::ForgePull,
+        state: CatchupCoverageState::ObservedOnly,
+        checked_at: at,
+        unread_pages: 0,
+        deferred: 0,
+        window_from: None,
+    };
+    let now = unix_now();
+    hub.store
+        .record_catchup_source_status(&scope, &observed(now))
+        .unwrap();
+    let prepared = hub
+        .mcp(&secret, "agentscm_briefing_prepare", json!({}))
+        .await;
+    assert_ne!(prepared["isError"], true, "{prepared}");
+    let claim = &prepared["structuredContent"];
+    assert!(claim["context"]["facts"]["actionable_status"]["digest"].is_string());
+    let submission = |claim: &Value| {
+        let reference = claim["view"]["sources"][0]["id"].as_str().unwrap();
+        json!({"id":claim["view"]["id"],"digest":claim["view"]["digest"],"lease":claim["lease"],
+            "output":{"headline":"Work is reported active.","headline_references":[reference],"facts":[{"text":"Activity coverage remains unknown.","references":[reference]}],"implications":[]}})
+    };
+    let ready = hub
+        .mcp(&secret, "agentscm_briefing_submit", submission(claim))
+        .await;
+    assert_ne!(ready["isError"], true, "{ready}");
+    assert_eq!(ready["structuredContent"]["status"], "ready");
+    // Poll timestamps are excluded from the older catch-up digest. The new exact current
+    // reconciliation evidence must still supersede cached instructions after this read.
+    hub.store
+        .record_catchup_source_status(&scope, &observed(now + 1))
+        .unwrap();
+    assert_eq!(
+        hub.store
+            .work_get(&token, &item.id, unix_now())
+            .unwrap()
+            .unwrap()
+            .updated_seq,
+        item.updated_seq
+    );
+    let (_, changed) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/narrative",
+            Some(&secret),
+            None,
+        )
+        .await;
+    assert_eq!(changed["status"], "pending", "{changed}");
+    assert!(changed["output"].is_null());
+    assert_ne!(changed["digest"], ready["structuredContent"]["digest"]);
+    let inflight = hub
+        .mcp(&secret, "agentscm_briefing_prepare", json!({}))
+        .await;
+    hub.store
+        .record_catchup_source_status(&scope, &observed(now + 2))
+        .unwrap();
+    let rejected = hub
+        .mcp(
+            &secret,
+            "agentscm_briefing_submit",
+            submission(&inflight["structuredContent"]),
+        )
+        .await;
+    assert_eq!(rejected["isError"], true, "{rejected}");
+    let (code, status) = hub
+        .call(Method::GET, "/v1/hub/standup/status", Some(&secret), None)
+        .await;
+    assert_eq!(code, 200);
+    assert_eq!(status["work"][0]["state"], "active");
+    assert!(status["work"][0]["reconciliation"]["current"].is_null());
+    assert!(status["work"][0]["reconciliation"]["current_evidence_digest"].is_string());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_briefing_keeps_full_status_binding_after_omitting_details() {
+    use agentscm::hub::catchup::{
+        CatchupCoverageState, CatchupMergeSource, CatchupRepositoryScope, CatchupSourceStatus,
+    };
+    let hub = Hub::start().await;
+    let (token, secret) = hub.token(42, "writer", REPOSITORY);
+    for n in 0..90 {
+        hub.store.work_start(&token, &serde_json::from_value(json!({
+            "request_key":format!("bounded-{n}"), "title":"Synthetic task ".repeat(30),
+            "session":format!("bounded-agent-{n}"), "next_action":"Synthetic reported next action. ".repeat(15)
+        })).unwrap(), unix_now()).unwrap();
+    }
+    let prepared = hub
+        .mcp(&secret, "agentscm_briefing_prepare", json!({}))
+        .await;
+    assert_ne!(prepared["isError"], true, "{prepared}");
+    let claim = &prepared["structuredContent"];
+    let context = &claim["context"];
+    assert!(serde_json::to_vec(context).unwrap().len() <= 64 * 1024);
+    assert!(context["facts"]["attention"].as_array().unwrap().len() < 90);
+    let binding = context["facts"]["actionable_status"]["digest"].clone();
+    assert!(binding.is_string());
+    // This fact is outside the rendered Work report and changes no Work version.
+    hub.store
+        .record_catchup_source_status(
+            &CatchupRepositoryScope {
+                provider: "github".into(),
+                host: "github.com".into(),
+                repository: REPOSITORY.into(),
+                repository_id: None,
+            },
+            &CatchupSourceStatus {
+                source: CatchupMergeSource::ForgePull,
+                state: CatchupCoverageState::Unavailable,
+                checked_at: unix_now(),
+                unread_pages: 1,
+                deferred: 0,
+                window_from: None,
+            },
+        )
+        .unwrap();
+    let (_, changed) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/narrative",
+            Some(&secret),
+            None,
+        )
+        .await;
+    assert_ne!(changed["digest"], claim["view"]["digest"]);
+    assert!(changed["output"].is_null());
+    let (code, deterministic) = hub
+        .call(Method::GET, "/v1/hub/standup/status", Some(&secret), None)
+        .await;
+    assert_eq!(code, 200);
+    assert_eq!(deterministic["counts"]["active"], 90);
+    assert_ne!(deterministic["digest"], binding);
+}
