@@ -22,7 +22,7 @@ use tokio::time::{Instant, timeout_at};
 use super::advice::unknown;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
-use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
+use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
@@ -112,6 +112,8 @@ impl Agent {
 enum Kind {
     Ignore,
     Start,
+    /// The person typed a prompt in this session: delivers pending requests, writes nothing.
+    Prompt,
     Check,
     Done,
     Fail(&'static str),
@@ -149,6 +151,8 @@ struct Call {
     paths: Vec<String>,
     /// Runs before the edit, in an agent whose hook can refuse it.
     deny: bool,
+    /// Made by a subagent (Claude Code sends `agent_id`), whose context ends when it returns.
+    child: bool,
 }
 
 struct Outcome {
@@ -235,7 +239,7 @@ async fn hook(
         Ok(Err(reason)) => Outcome::unknown(reason),
         Err(_) => Outcome::unknown("hub timed out"),
     };
-    if matches!(call.kind, Kind::Start | Kind::Check)
+    if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
         && let Some(token) = token
     {
         let delivery = async {
@@ -266,36 +270,56 @@ async fn hook(
         };
         match timeout_at(deadline, delivery).await {
             Ok(Ok((principal, session, page))) => {
-                for request in page.requests.iter().take(5) {
-                    if matches!(
+                let open = |request: &&CoordinationRequest| {
+                    !matches!(
                         request.status,
                         CoordinationStatus::Resolved | CoordinationStatus::Withdrawn
-                    ) {
-                        continue;
+                    )
+                };
+                // A subagent's context ends when it returns, so a request shown there is lost
+                // with it: point it at its lead instead, and never hold its edits for a reply.
+                if call.child {
+                    let waiting = page.requests.iter().filter(open).count();
+                    if waiting > 0 {
+                        outcome.text.push_str(&format!("\nAgentSCM: {waiting} coordination request(s) wait for your lead session. Do not answer them here; finish your task and mention them in your report."));
+                        if outcome.status == "clean" {
+                            outcome.status = "fyi";
+                        }
                     }
-                    outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
-                    let reply_needed = request.targets.iter().any(|target| {
-                        target.lead.token == principal.token_id
-                            && target.lead.session == session
-                            && !request.responses.iter().any(|reply| {
-                                reply.target_work_id == target.work_id
-                                    && reply.target_generation == target.generation
-                                    && reply.responder.token == principal.token_id
-                                    && reply.responder.session == session
-                            })
-                    });
-                    if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
-                        outcome.deny = Some(format!(
-                            "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline.",
-                            request.id
-                        ));
-                        outcome.status = "stop";
-                    } else if outcome.status == "clean" {
-                        outcome.status = "fyi";
+                } else {
+                    let mut shown = 0;
+                    for request in page.requests.iter().filter(open).take(5) {
+                        let reply_needed = request.targets.iter().any(|target| {
+                            target.lead.token == principal.token_id
+                                && target.lead.session == session
+                                && !request.responses.iter().any(|reply| {
+                                    reply.target_work_id == target.work_id
+                                        && reply.target_generation == target.generation
+                                        && reply.responder.token == principal.token_id
+                                        && reply.responder.session == session
+                                })
+                        });
+                        // A prompt repeats every turn, so it carries only what this session must answer.
+                        if call.kind == Kind::Prompt && !reply_needed {
+                            continue;
+                        }
+                        shown += 1;
+                        outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
+                            outcome.deny = Some(format!(
+                                "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline.",
+                                request.id
+                            ));
+                            outcome.status = "stop";
+                        } else if outcome.status == "clean" {
+                            outcome.status = "fyi";
+                        }
                     }
-                }
-                if !page.complete || page.requests.len() > 5 {
-                    outcome.text.push_str("\nCoordination inbox is partial in this hook. Page agentscm_coordination_inbox before relying on coverage.");
+                    if (!page.complete || page.requests.len() > 5)
+                        && (call.kind != Kind::Prompt || shown > 0)
+                    {
+                        outcome.text.push_str("\nCoordination inbox is partial in this hook. Page agentscm_coordination_inbox before relying on coverage.");
+                    }
                 }
             }
             _ if outcome.status != "unknown" => {
@@ -408,6 +432,7 @@ impl Call {
             task: None,
             paths: Vec::new(),
             deny: false,
+            child: false,
         }
     }
 
@@ -424,6 +449,11 @@ impl Call {
     /// The call may be refused: the agent has not run the edit yet and its hook can stop it.
     fn deny(mut self) -> Self {
         self.deny = true;
+        self
+    }
+
+    fn child(mut self, child: bool) -> Self {
+        self.child = child;
         self
     }
 
@@ -501,7 +531,8 @@ impl Call {
         };
         match self.kind {
             Kind::Fail(reason) => Err(reason),
-            Kind::Ignore => Ok(Outcome::clean()),
+            // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
+            Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
@@ -988,11 +1019,18 @@ fn patch_paths(patch: &str) -> Vec<&str> {
 
 /// Claude Code, Codex and the PascalCase form of Copilot (VS Code, `.github/hooks`).
 fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
-    let call = |kind, shape| Call::new(agent, kind, shape).session(str_at(v, "session_id"));
+    let call = |kind, shape| {
+        Call::new(agent, kind, shape)
+            .session(str_at(v, "session_id"))
+            .child(v.get("agent_id").is_some())
+    };
     let tool = str_at(v, "tool_name").unwrap_or_default();
     match str_at(v, "hook_event_name") {
         // The start prompt is never read: it would become a team-visible task.
         Some("SessionStart") => call(Kind::Start, Shape::Hook("SessionStart")),
+        // Fires only where a person types, so it reaches the session they are talking to. The
+        // prompt itself is never read; the client does not forward it.
+        Some("UserPromptSubmit") => call(Kind::Prompt, Shape::Hook("UserPromptSubmit")),
         Some("PreToolUse") if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Hook("PreToolUse"))
