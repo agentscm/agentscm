@@ -1,7 +1,10 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import statusFixture from '../../../src/hub/fixtures/actionable-status.json'
+import type { ActionableStatus } from '../../src/actionableStatus.ts'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+// Load shared evidence only at test runtime; the UI Docker build copies only ui/.
+const statusFixture = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/actionable-status.json'), 'utf8')) as ActionableStatus
 
 const read = (name: string) => readFileSync(resolve(process.cwd(), `../src/hub/mcp_views/${name}`), 'utf8')
 const now = Math.floor(Date.now() / 1000)

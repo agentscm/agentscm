@@ -1,9 +1,14 @@
+import { resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DeviceAuth } from '../../src/devices.ts'
-import statusFixture from '../../../src/hub/fixtures/actionable-status.json'
+import type { ActionableStatus } from '../../src/actionableStatus.ts'
 import { RepositoriesPage } from '../../src/pages/Repositories.tsx'
 import type { WorkItem, WorkOverview } from '../../src/standup.ts'
+
+// Load shared evidence only at test runtime; the UI Docker build copies only ui/.
+const statusFixture = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/actionable-status.json'), 'utf8')) as ActionableStatus
 
 const AUTH = { kind: 'ready', value: { kind: 'browser', session: { login: 'example-user', provider: 'github', admin: false, csrf: 'csrf-token-0123456789' } } } as const satisfies { kind: 'ready'; value: DeviceAuth }
 const ROW = (repository: string, extra: Record<string, unknown> = {}) => {

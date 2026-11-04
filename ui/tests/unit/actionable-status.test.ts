@@ -1,13 +1,18 @@
+import { resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { createElement } from 'react'
-import fixture from '../../../src/hub/fixtures/actionable-status.json'
+import type { ActionableStatus } from '../../src/actionableStatus.ts'
 import { needsYou, needHideKey } from '../../src/needs.ts'
 import { decodeStatus, recipientLabel, statusLabel, statusProvenance } from '../../src/actionableStatus.ts'
 import { DashboardPage, dashboardStatus, SharedAnswer, SharedNeeds } from '../../src/pages/Dashboard.tsx'
 import type { WorkOverview } from '../../src/standup.ts'
 import type { Derived } from '../../src/derive.ts'
 import type { HubData } from '../../src/useHub.ts'
+
+// Load shared evidence only at test runtime; the UI Docker build copies only ui/.
+const fixture = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/actionable-status.json'), 'utf8')) as ActionableStatus
 
 describe('shared actionable status', () => {
   it('uses frozen counts and named recipients without reinterpreting reports', () => {
