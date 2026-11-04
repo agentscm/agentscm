@@ -30,7 +30,7 @@ const WORK_LABEL: Record<string, string> = {
   work_joined: 'Agent joined',
   work_takeover: 'Work taken over',
   work_checkpoint: 'Checkpoint reported',
-  work_pr_link: 'Relationship changed',
+  work_pr_link: 'PR evidence or prerequisites changed',
   work_transition: 'Outcome or reservation changed',
 }
 

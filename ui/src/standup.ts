@@ -145,7 +145,7 @@ export interface WorkOverview {
   recent_complete: boolean
   overlaps_complete: boolean
   history_retention_gap: boolean
-  /** Unfinished Work hidden because its branch has a merged pull request. Not finished. */
+  /** Unfinished Work without a held reservation hidden by a legacy branch merge observation. Not finished. */
   settled_count: number
 }
 

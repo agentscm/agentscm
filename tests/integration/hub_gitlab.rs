@@ -1348,6 +1348,15 @@ async fn hooks_for_closed_merge_requests_unconnected_projects_and_github_connect
     })
     .await;
     assert_eq!(env.events("pull_request_closed").len(), 1);
+    let (retained, deleted) = env
+        .store
+        .observation_retained(&env.repo().id, "pull_request", "5")
+        .unwrap()
+        .unwrap();
+    assert!(deleted);
+    let retained: Value = serde_json::from_str(&retained.data).unwrap();
+    assert_eq!(retained["provider_number"], 5);
+    assert_eq!(retained["provider_base_repository_id"], REPO_ID);
     // A project that is not connected does nothing at all.
     let before = (env.event_count(), env.requests());
     let status = fake_gitlab::deliver(

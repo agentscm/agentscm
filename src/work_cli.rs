@@ -14,6 +14,7 @@ use agentscm::hub::work::{
     BriefingAck, WorkCheckpoint, WorkRepositoryScope, WorkStart, WorkStartResult,
 };
 use agentscm::hub::work_links::WorkPrLinkUpdate;
+use agentscm::hub::work_reconciliation::WorkDeclarationsUpdate;
 use agentscm::{Error, Result};
 use clap::Subcommand;
 use reqwest::Method;
@@ -75,8 +76,22 @@ pub enum WorkCommand {
         #[arg(long)]
         expected_head: Option<String>,
     },
+    /// Read durable caller-declared PR links and prerequisite conditions.
+    Declarations { id: String },
+    /// Replace durable declarations as the fenced Work lead.
+    DeclarationsSet {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
     /// Read the read-only PR evidence and prerequisite report for a Work item.
     Reconcile { id: String },
+    /// Read the retained durable evaluation, separating current from stale history.
+    Reconciliation { id: String },
+    /// Persist a server-evaluated reconciliation with Work and declaration fences.
+    ReconcileApply {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
     /// Explicitly set or remove a PR relationship as the current Work lead.
     PrLinkSet {
         /// Strict WorkPrLinkUpdate JSON; link:null removes. Use - for standard input.
@@ -266,6 +281,8 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Preflight { .. }
         | WorkCommand::PrLink { .. }
         | WorkCommand::Reconcile { .. }
+        | WorkCommand::Reconciliation { .. }
+        | WorkCommand::Declarations { .. }
         | WorkCommand::Insight { .. }
         | WorkCommand::Insights { .. } => false,
         WorkCommand::Compact { apply, .. }
@@ -278,6 +295,8 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Start { .. }
         | WorkCommand::Usage { .. }
         | WorkCommand::PrLinkSet { .. }
+        | WorkCommand::DeclarationsSet { .. }
+        | WorkCommand::ReconcileApply { .. }
         | WorkCommand::Checkpoint { .. }
         | WorkCommand::Ack { .. } => true,
         WorkCommand::CatchupAck { .. } => true,
@@ -407,6 +426,57 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 json!({"expected_updated_seq":expected_updated_seq,"expected_head":expected_head}),
             )?;
             (hub.call(Method::GET, &path, None).await?, false)
+        }
+        WorkCommand::Declarations { id } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
+                .map_err(|_| invalid("cannot construct declaration URL"))?;
+            url.path_segments_mut()
+                .map_err(|_| invalid("cannot construct declaration URL"))?
+                .push(&id)
+                .push("declarations");
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct declaration URL"))?;
+            (hub.call(Method::GET, path, None).await?, false)
+        }
+        WorkCommand::DeclarationsSet { request } => {
+            let request: WorkDeclarationsUpdate = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/declarations",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::Reconciliation { id } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
+                .map_err(|_| invalid("cannot construct reconciliation URL"))?;
+            url.path_segments_mut()
+                .map_err(|_| invalid("cannot construct reconciliation URL"))?
+                .push(&id)
+                .push("reconciliation-v2");
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct reconciliation URL"))?;
+            (hub.call(Method::GET, path, None).await?, false)
+        }
+        WorkCommand::ReconcileApply { request } => {
+            let request: agentscm::hub::work_reconciliation::ReconciliationApply =
+                read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/reconciliation",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
         }
         WorkCommand::Reconcile { id } => {
             let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")

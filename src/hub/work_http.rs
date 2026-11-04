@@ -53,8 +53,69 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
         .route("/v1/hub/standup/work/{id}/pr-link", get(pr_link))
         .route("/v1/hub/standup/pr-link", post(set_pr_link))
+        .route("/v1/hub/standup/work/{id}/declarations", get(declarations))
+        .route("/v1/hub/standup/declarations", post(set_declarations))
+        .route(
+            "/v1/hub/standup/work/{id}/reconciliation-v2",
+            get(reconciliation_v2),
+        )
+        .route("/v1/hub/standup/reconciliation", post(apply_reconciliation))
         .route("/v1/hub/standup/work/{id}", get(work))
         .route("/v1/hub/standup/work", get(work_search))
+}
+
+async fn reconciliation_v2(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(id): Path<String>,
+) -> Result<Json<super::work_reconciliation::ReconciliationView>, ApiError> {
+    let store = state.store.clone();
+    blocking(&state, move || {
+        store.work_reconciliation_get(&principal.token_id, &id, unix_now())
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(ApiError::not_found)
+}
+async fn apply_reconciliation(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_reconciliation::ReconciliationApply>,
+) -> Result<Json<super::work_reconciliation::ReconciliationResult>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.work_reconciliation_apply(&principal.token_id, &request, unix_now())
+        })
+        .await?,
+    ))
+}
+
+async fn declarations(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(id): Path<String>,
+) -> Result<Json<super::work_reconciliation::WorkDeclarationsView>, ApiError> {
+    let store = state.store.clone();
+    blocking(&state, move || {
+        store.work_declarations_get(&principal.token_id, &id, unix_now())
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(ApiError::not_found)
+}
+async fn set_declarations(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_reconciliation::WorkDeclarationsUpdate>,
+) -> Result<Json<super::work_reconciliation::WorkDeclarationsResult>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.work_declarations_set(&principal.token_id, &request, unix_now())
+        })
+        .await?,
+    ))
 }
 
 async fn pr_link(

@@ -52,6 +52,7 @@ pub mod work_lifecycle;
 pub mod work_links;
 pub mod work_preflight;
 pub mod work_reconcile;
+pub mod work_reconciliation;
 pub mod work_transition;
 pub mod workspace;
 #[cfg(unix)]

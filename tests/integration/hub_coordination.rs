@@ -714,6 +714,29 @@ fn generation_upgrade_preserves_only_current_lead(db: &Db) {
     );
 
     drop(db.open());
+    let declaration_version: (i64, Option<i64>) = if db._pg.is_some() {
+        let row = postgres::Client::connect(&db.url, postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT d.event_seq,w.updated_seq FROM hub_work_declarations d
+                 JOIN hub_work_items w ON w.id=d.work WHERE w.id='wrk_upgrade'",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    } else {
+        rusqlite::Connection::open(db.url.strip_prefix("sqlite://").unwrap())
+            .unwrap()
+            .query_row(
+                "SELECT d.event_seq,w.updated_seq FROM hub_work_declarations d
+                 JOIN hub_work_items w ON w.id=d.work WHERE w.id='wrk_upgrade'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    // Upgrade succeeds without inventing a Work or declaration version for the legacy row.
+    assert_eq!(declaration_version, (0, None));
     assert_eq!(
         db.participant_generations(),
         vec![

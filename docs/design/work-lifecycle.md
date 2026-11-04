@@ -6,7 +6,7 @@ title: "Design: Work outcomes and scope reservations"
 
 > **Status: design for issue #310; the rules, store operations, routes and MCP tool are in the
 > tree.** Nothing here is a released capability until the change has merged. Not part of this
-> change: lease expiry and activity observation (#311), forge reconciliation (#312), a harness
+> change: lease expiry and activity observation (#311), a harness
 > preview and apply flow (#313), status relabeling (#315) and claim repair (#316). Until #311
 > exists, the `activity` field of the projection is always `unknown`.
 
@@ -181,7 +181,7 @@ the list of `unknown` field names).
 
 `actionable` is derived from stored facts only (state, reservation, merge observation), so the only
 field that follows the request clock is `freshness`. Finished Work and Work with no reservation name
-no recipient. A held reservation hidden by a merged pull request, or held by paused or handed-over
+no recipient. A held reservation with a legacy merged-branch observation, or held by paused or handed-over
 Work, names the owner. A held reservation on active or blocked Work names the lead. The reason says
 which in plain words. `completeness.unknown` also lists `freshness` when the claim status is unknown
 and `outcome_provenance` when a stated outcome has no surviving event that says who stated it.
@@ -201,7 +201,7 @@ operational projection (outcome and provenance). The Hub records no completion o
 
 Delivery without breaking strict older decoders: `GET /v1/hub/standup/work/{id}/operational`;
 `GET /v1/hub/standup/operational` for every reservation-holding Work in the repository including
-Work hidden by a merged pull request, ordered by id, at most 100, with a `complete` flag. `WorkOverview`
+merged Work that still holds scope, ordered by id, at most 100, with a `complete` flag. `WorkOverview`
 itself is unchanged; the HTTP and MCP surfaces add an `operational` key to its JSON (the projection of every
 reservation-holding Work). `WorkStartConflict` and `WorkPreflightResult` gain an `operational` list of the
 overlapping Work, skipped when empty. Over HTTP all of these are filled only when the request carries
@@ -226,3 +226,7 @@ user-facing recovery. The UI only renders the new event kind in history.
   so rolling the server back requires restoring a backup taken before the migration.
 - Older CLIs that send a start or checkpoint keep working. Taking over finished Work is now refused
   for every client, and the error names reopen.
+
+## Reconciliation visibility
+
+Issue #312 keeps every held reservation visible in overview and briefing pages. The legacy `hidden_by_merged_pr` operational field retains the old heuristic observation for strict compatibility; it does not mean a held reservation is now hidden. Durable reconciliation uses explicit stable-repository PR/head conditions, retains owner-controlled reservation disposition and existing authorized remedies, and never changes outcome or reservation from a merge alone. See [Work reconciliation](work-reconciliation.md).
