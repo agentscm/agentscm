@@ -50,15 +50,16 @@ Present a compact table with source, file and line when available, summary, deci
 
 Make focused changes and add or update deterministic synthetic tests when appropriate. Before each push, run:
 
+Always run `git diff --check`. For Rust, manifest, toolchain, or build-related changes, also run:
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-git diff --check
 ```
 
-and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite for a fix round when this machine has a signing key; attestation is the one full run.
+and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite before pushing; step 11 of `.agents/commands/pr.md` handles attestation, including when there is no signing key.
 
-When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `.github/hub-e2e.sh default` only when `compose.hub.yaml`, `.github/compose.e2e.yaml` or `.github/hub-e2e.sh` change. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore`, root `compose.yaml` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `.github/hub-e2e.sh default` only when `compose.hub.yaml`, `.github/compose.e2e.yaml` or `.github/hub-e2e.sh` change; the `postgres` profile runs only in the hosted `Hub end-to-end` workflow. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
 
 All applicable checks must pass before committing. Report missing prerequisites and failures explicitly; do not describe an incomplete check as successful verification. Applicable reviews remain required.
 
@@ -71,7 +72,7 @@ git rev-parse HEAD
 gh pr view --json headRefOid --jq .headRefOid
 ```
 
-A new head has no valid attestation, so it is not ready to merge until it is attested. Do not attest each intermediate push. Once the review feedback is settled, run `tools/attest-pr.sh <PR#>` as in step 11 of `.agents/commands/pr.md` on the final head of the last fix round and report the result. Until then, report the head as not ready, with no attestation.
+A new head has no valid attestation, so it is not ready to merge until it is attested. Do not attest each intermediate push. Once the review feedback is settled, run `tools/attest-pr.sh <PR#>` as in step 11 of `.agents/commands/pr.md` on the final head of the last fix round and report the result. Until then, report the head as not ready, with no attestation. If the recipe fails because of the branch, treat the failure as a new item to fix in this step and attest the new head again; a failure shown to be unrelated to the change may be attested again on the same head without a push, under the evidence rule in that step.
 
 If nothing changed, do not create an empty commit.
 
