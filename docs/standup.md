@@ -20,7 +20,11 @@ Every work item has a stable `wrk_…` identifier. New work can use a caller-sup
 
 A work item has one lead by default. Other agents can join as helpers or reviewers. A claim records the human owner, agent, session, declared repository paths, branch, worktree label and next action. Dependencies and related work use explicit `wrk_…` identifiers; AgentSCM does not merge similar free-text tasks automatically.
 
-The claim is coordination state. It does not create a Git checkout, lock a file, stop an old agent process or replace source-control conflict checks. A disconnected or expired lead becomes `stale`; a projection failure becomes `unknown`. Both remain claimed. Takeover is an explicit generation-checked operation, so agents must not interpret either status as available work.
+The claim is coordination state. It does not create a Git checkout, lock a file, stop an old agent process or replace source-control conflict checks. A disconnected or expired lead becomes `stale`; a projection failure becomes `unknown`. Both are freshness labels only. Neither changes who is responsible for the Work or whether its scope is reserved, and neither releases anything. Takeover is an explicit generation-checked operation, so agents must not interpret either status as available work.
+
+Three things are kept apart. The owner and lead are the durable responsibility for the Work. The declared scope is the intended paths. The reservation is whether that scope is currently held against other Work, recorded as a basis: `admitted` (fresh admission by a start, takeover, resume of released Work or reopen), `retained` (kept on purpose through the `retain` transition) or `implicit` (left by a pause or handover, or backfilled for Work that existed before this version). Unfinished Work with no reservation is still unfinished Work, but other Work may declare overlapping scope without a conflict. Every overlap check, preflight and request resolution counts only held reservations. A stale or unknown claim that holds a reservation keeps holding it until someone releases it, finishes it or another writer takes it over; there is no lease expiry yet.
+
+A finish checkpoint sets the outcome `completed`, attributed to an agent report, and clears the reservation. Finished Work holds nothing under any outcome. A checkpoint on finished Work is refused, and so is a start with `takeover_generation` on finished Work, even when the claim is stale; the error names reopen. Reopen is the explicit way back: it runs a fresh overlap check, and on success the Work is active with an `admitted` reservation and the caller as lead.
 
 To resume a paused task as the same agent token, start the explicit work ID with the observed `takeover_generation`. The new generation binds the session and fences the previous session. An ordinary retry does not silently change paused work back to active. Existing blockers remain reported until explicitly resolved. After a lead changes, helpers from an older generation must explicitly rejoin before their managed edit checks pass. A finish releases the linked live file intent in the same transaction; a linked finished or fenced session cannot regain paths by falling back to legacy intent advice.
 
@@ -46,6 +50,29 @@ References do not accept arbitrary URLs. Forge links shown by the Hub are constr
 Use a fresh operation identifier for a new checkpoint. Retry the same operation identifier only with the exact same fields after an uncertain transport result. The response separates the committed operation receipt from the current work item. An exact retry can confirm an earlier checkpoint after takeover, while the returned item shows the current lead and generation. This receipt grants no ownership; new checkpoints from the old generation are rejected.
 
 Every new checkpoint includes `expected_updated_seq` from the work item the caller inspected. If another checkpoint changed that item in the meantime, the new operation is rejected instead of overwriting newer progress, blockers or completion. Automatic session-end pauses use this same guard. Retained exact retries are resolved before this version check.
+
+A pause or handover checkpoint, including the automatic session-end pause, keeps the scope held: it converts an `admitted` or `retained` reservation to `implicit`. Work that is paused or handed over therefore keeps blocking overlapping scope unless a transition releases it or explicitly retains it. An implicit reservation has no expiry yet; lease expiry is issue #311. Resuming released Work needs a start with `takeover_generation`, which runs fresh admission.
+
+### Work transitions
+
+A transition changes the outcome or the reservation without a checkpoint written in the agent's name. The kinds are `release`, `retain`, `complete`, `abandon`, `supersede` and `reopen`. The request carries `operation_id`, `generation`, `expected_updated_seq` and a required reason (at most 500 bytes); `supersede` also names another Work in the repository. A different request with a used `operation_id` is refused and an exact retry returns the stored receipt and acquires nothing.
+
+| Transition | Allowed from | Who may request it | Effect |
+| --- | --- | --- | --- |
+| `release` | Unfinished, reservation held | Lead, owner, administrator | Clears the reservation and bumps the generation; `active` becomes `paused`. |
+| `retain` | Unfinished, reservation held | Lead, owner | Basis becomes `retained`. |
+| `complete` | Unfinished | Lead, owner | Finished with outcome `completed`; clears the reservation. |
+| `abandon` | Unfinished | Lead, owner, administrator | Finished with outcome `abandoned`; clears the reservation. |
+| `supersede` | Unfinished | Lead, owner, administrator | Finished with outcome `superseded`; clears the reservation. |
+| `reopen` | Finished | Lead session, or the owner's agent token | Fresh admission; see above. |
+
+The lead is the agent token and session that lead the Work. The owner is the person who owns it, acting through a web sign-in, or an agent token of that owner with a named session. An administrator is a web person with the administrator role. A read-only token is refused, and a revoked or expired lead does not stop the owner or an administrator. An owner or administrator acts as itself: the actor is recorded as that person and never as the lead. A person cannot reopen because reopen needs an agent session. The terminal transitions by anyone other than the lead session bump the generation, which fences the older session.
+
+Release alone asserts nothing about completion. It only drops the hold; the Work, its history, its blocker and its outcome are unchanged. Use `complete`, `abandon` or `supersede` to say why Work ended.
+
+In the same transaction a transition records a `work_transition` audit event with the actor, reason and prior state, basis and outcome, and saves a Work version. A release or terminal transition also releases the live file intent of every participant session and the lead, and adds a `coordination_target_released` event to each open coordination request that targets the Work. The request status is unchanged and nothing is resolved automatically. Release and terminal transitions succeed at the payload quota; reopen and retain use the normal capacity check.
+
+The projection `WorkOperationalV1` shows outcome, reservation, freshness, merge observation, who should act and the remedies the state allows. `actionable` uses stored facts only and `activity` is always `unknown`. See [Work outcomes and scope reservations](design/work-lifecycle.md).
 
 ## Briefings and acknowledgement
 
@@ -80,7 +107,7 @@ Limits:
 - A merge observed while a briefing is being delivered changes later pages of the current-item list of a durable delivery only. Exact retries return the cached page, the events list is not filtered, read-only briefings are not cached, and an item behind the cursor stays missing until the next delivery. Pages already delivered, and the fixed watermark of the delivery, are not rewritten.
 - The Hub needs merge observations. With none, nothing is hidden, and a repository whose merges are not synced keeps every item visible.
 - Merges observed before this rule existed carry no head-repository information. They hide matching items, including a fork's same-named branch, until the next check-in.
-- Hiding does not release anything. Scope admission, conflict checks, coordination requests, held files and preflight still treat a hidden item as unfinished, so a start can conflict with an item the overview no longer lists. Use `agentscm_work_search` to find it.
+- Hiding does not release anything, and a merge does not change the outcome or the reservation. Scope admission, conflict checks, coordination requests, held files and preflight still treat a hidden item that holds a reservation as blocking, so a start can conflict with an item the overview no longer lists. Find the blocking reservation through `GET /v1/hub/standup/operational`, through the overview and conflict responses with `operational=1`, or through MCP, which always includes the projection. Its `merge` field reports `hidden_by_merged_pr`. `agentscm_work_search` still finds the Work by text.
 
 ### Since you last checked
 
@@ -397,7 +424,7 @@ All scope comes from the bearer token. There is no repository selector in these 
 | `GET /v1/hub/standup/operational` | Read-only or writable | The projection of every reservation-holding work item, including work hidden by a merged pull request, ordered by id, at most 100, with a `complete` flag. |
 | `POST /v1/hub/session/work/transition` | Web sign-in with CSRF | The same transitions for a person: the owner may release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or supersede. No agent token is needed. |
 
-`overview`, `start` and `preflight` add the operational projection only when the request carries `operational=1`; without it the response has no new key. MCP results always include it, and `agentscm_work_transition` is the MCP form of the transition route. See [Work outcomes and scope reservations](design/work-lifecycle.md).
+`overview`, `start` and `preflight` add the operational projection only when the request carries `operational=1`; without it the response has no new key. MCP fills it without the flag (for `start` and `preflight`, whenever there are overlapping items), and `agentscm_work_transition` is the MCP form of the transition route. See [Work outcomes and scope reservations](design/work-lifecycle.md).
 
 Pages contain at most 100 current items and 100 events. Titles and checkpoint summaries are bounded to 500 bytes; identifiers and labels are bounded to 255 bytes. Scope, participants, relations and source references also have fixed entry limits. Malformed cursors and out-of-scope identifiers are rejected instead of silently widening access.
 
@@ -417,6 +444,19 @@ and usage remain explicit rather than being counted as zero.
 | Native hooks | A supported session-start event can read and render a bounded briefing. A safely linked end event can pause active work if its observed checkpoint is still current. Hooks do not create a goal, acknowledge a briefing, infer decisions or meaningful progress, or claim accepted/landed completion. Existing edit events continue to announce file intent and warn about overlaps. |
 | Forge links | A work item can refer to an issue in its configured GitHub or GitLab repository. No automatic issue creation, update, comment or two-way mirror is performed. |
 | Native workflows | Work references can describe coordination around a workflow, but checkpoints do not become workflow evidence or landing authority. |
-| Qualification | Protocol and local storage behavior are tested. Real-client, live two-machine, live-forge and PostgreSQL deployment qualification are still separate work. |
+| Qualification | Protocol and local storage behavior are tested with synthetic fixtures on SQLite and PostgreSQL only. Real-client, live two-machine, live-forge and PostgreSQL deployment qualification are still separate work. |
+
+Limits of the outcome and reservation model:
+
+- It has not been run with real harness sessions, against a live forge, on a hosted Hub or in a real two-machine lifecycle.
+- `activity` is always `unknown` until #311, and `completeness.complete` is therefore false for every item.
+- There is no Hub UI action or CLI command for transitions. They are available through HTTP, the person session route and MCP; #313 owns user-facing recovery.
+- Existing unfinished Work keeps an `implicit` reservation and blocks until someone releases it. Repair of old claims is owned by #316.
+- Older clients show `abandoned` and `superseded` Work as `finished`. Finished Work reported before this version has no stated outcome and reads as `unstated`.
+- `agentscm_done` and the hook session end release the file intent and pause the Work in two transactions. A crash between them leaves active Work with a reservation and no intent; a release clears it.
+- The plain intent announce route has no session field, so its managed-work guard applies to the token's default session only. Intents announced that way are not tied to a session and a transition does not release them.
+- Stale takeover by any writer on the repository is unchanged; tightening it belongs to #311.
+- The `merge` status is `none` only when the Hub knows its forge pull-request read reached back to the Work's creation and the merge rule applies to the Work; otherwise it is `unknown`. Merge-based discovery follows the merge-observation limits above.
+- The schema migration blocks server rollback: after it applies, an older server binary is refused, and a rollback needs a backup taken before the migration.
 
 The Hub only knows about agents and checkpoints that reach it. Offline edits, skipped MCP calls, missing end hooks and disconnected agents can leave incomplete or stale records. Preserve source work and inspect current repository state before any takeover or resume.

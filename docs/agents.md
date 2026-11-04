@@ -127,7 +127,7 @@ The cost is that failures are quiet. If warnings never appear, run `agentscm int
 - Where the edited file path sits in Cursor, Copilot and Codex payloads is only partly documented; the hub reads the fields that vendor documents and ignores the rest.
 - The hub is trusted. Its replies go into each agent's context, and the URL that decides which hub that is sits in hook and MCP config: a hook's `--hub-url` and the MCP server URL. Whoever controls that URL controls the text the agents using the config see, and receives their token and hook payloads. Review changes to those files, and treat the hub as trusted.
 - Coverage depends on every agent on the team being wired. An unwired agent is invisible. A pull-request check as a backstop is planned, not built.
-- Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim remains claimed; inspect the work and use the explicit takeover flow instead of assuming it is available.
+- Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim is a freshness label, not a release: a reservation held by paused, handed-over or stale Work keeps blocking overlapping scope until it is released, retained or finished through a work transition, and lease expiry does not exist yet. Inspect the work and use the explicit takeover or reopen flow instead of assuming it is available.
 
 ## Recipes for other agents
 

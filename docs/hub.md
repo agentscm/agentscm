@@ -256,6 +256,12 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   responses and `asked_via_hub` / `answered_via_hub` to handoffs, and the named migration
   `handoff_answered_via_slack` adds `answered_via_slack`; rows and events from an agent's
   own call keep their old shape.
+  - `POST /v1/hub/session/work/transition` (`repository`, `work_id`, `operation_id`, `generation`,
+    `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
+    token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may
+    release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or
+    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. There is no Hub page
+    action for it yet. See [stand-up](standup.md#work-transitions).
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
   on the person's forge host that they can read now, for the web pages' All repositories list.
   Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,

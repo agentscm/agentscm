@@ -125,7 +125,9 @@ In the same transaction, in both stores:
 
 The legacy fallback is closed in the same change: `announce_intent` calls `guard_managed_touch` in
 its transaction, and the guard refuses sessions linked to Work that is finished, fenced by generation
-or has no reservation. A session never linked to Work keeps the legacy advice.
+or has no reservation. A session never linked to Work keeps the legacy advice. The plain intent announce route has no
+session field, so its guard applies to the token's default session only, and intents announced that
+way are not tied to a session and are not released by a transition.
 
 The `agentscm_done` and hook flow that releases the intent and then pauses the Work stays two
 separate steps. A crash between them leaves active Work with a reservation and no intent. The
@@ -155,9 +157,11 @@ request-time value enters any digest; no digest is added here.
 
 Delivery without breaking strict older decoders: `GET /v1/hub/standup/work/{id}/operational`;
 `GET /v1/hub/standup/operational` for every reservation-holding Work in the repository including
-Work hidden by a merged pull request, ordered by id, at most 100, with a `complete` flag. The
-optional `operational` fields on `WorkOverview` and `WorkStartConflict` are emitted over HTTP only
-when the request carries `operational=1` and are always present in MCP results. The agent route is
+Work hidden by a merged pull request, ordered by id, at most 100, with a `complete` flag. `WorkOverview`
+itself is unchanged; the HTTP and MCP surfaces add an `operational` key to its JSON (the projection of every
+reservation-holding Work). `WorkStartConflict` and `WorkPreflightResult` gain an `operational` list of the
+overlapping Work, skipped when empty. Over HTTP all of these are filled only when the request carries
+`operational=1`; MCP always fills them, so they appear whenever there is something to report. The agent route is
 `POST /v1/hub/standup/work-transition`, the person route is
 `POST /v1/hub/session/work/transition` with a web sign-in and CSRF check, and the MCP tool is
 `agentscm_work_transition`. There is no UI action or CLI command in this change; #313 owns
