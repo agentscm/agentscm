@@ -191,10 +191,13 @@ marked `requires_authorization`. They are not filtered by caller. Activity is al
 unknown, so `complete` is false for every item in this change. Ordering is by work id and no
 request-time value enters any digest; no digest is added here.
 
-Recent outcomes list a Work item as a completion when its last version is a `finish` checkpoint or
-a `complete` transition (a `work_transition` version whose outcome is `completed`), newest first.
-Abandoned, superseded, release, retain and reopen versions do not appear. The Hub records no
-completion observation for a `complete` transition; completion observations stay checkpoint-only.
+Recent outcomes list a Work item as a completion only when its last version is a `finish`
+checkpoint, newest first. Abandoned, superseded, released, retained and reopened Work do not
+appear, and neither does Work ended by a `complete` transition: a transition leaves the Work's
+current summary unchanged and records no author for one, so listing it would show a stale summary
+under the lead's name. A `complete` transition is visible through the Work's history and the
+operational projection (outcome and provenance). The Hub records no completion observation for a
+`complete` transition; completion observations stay checkpoint-only.
 
 Delivery without breaking strict older decoders: `GET /v1/hub/standup/work/{id}/operational`;
 `GET /v1/hub/standup/operational` for every reservation-holding Work in the repository including
