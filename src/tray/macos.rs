@@ -2525,7 +2525,7 @@ fn companion_rows(
                             agent: item.agent.clone(),
                             title: item.title.clone(),
                             detail: companion_work_detail(item),
-                            needs_you: item.state == "blocked",
+                            needs_you: item.needs_you,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2622,7 +2622,7 @@ fn companion_rows(
                         agent: item.agent.clone(),
                         title: item.title.clone(),
                         detail: companion_work_detail(item),
-                        needs_you: item.state == "blocked",
+                        needs_you: item.needs_you,
                     })
                     .chain(row.live.iter().map(companion_live_row))
                     .collect(),
@@ -2687,12 +2687,17 @@ fn retain_unverified_baselines(
 }
 
 fn companion_work_detail(item: &companion_hub::Work) -> String {
-    let status = match (item.state.as_str(), item.claim_status.as_str()) {
-        ("blocked", _) => "Needs your attention",
-        ("handover", _) => "Ready for handoff",
-        (_, "active") => "Working",
-        (_, "stale") => "Agent may need attention",
-        _ => "Check in Hub",
+    let status = if item.needs_you {
+        "Needs your attention"
+    } else {
+        match item.state.as_str() {
+            "blocked" => "Blocked; assigned elsewhere",
+            "handover" | "awaiting_party" => "Awaiting a named party",
+            "reassessment_needed" => "Reassessment needed",
+            "retired" => "Retired",
+            "active" => "Reported active",
+            _ => "Check in Hub",
+        }
     };
     format!("{status} · Next: {}", item.next_action)
 }
@@ -3850,6 +3855,7 @@ mod tests {
                         state: "blocked".into(),
                         next_action: "Ask for review".into(),
                         claim_status: "active".into(),
+                        needs_you: true,
                     }],
                     live: vec![],
                 },

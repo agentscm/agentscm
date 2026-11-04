@@ -29,6 +29,12 @@ const REQUEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
+    /// Read shared deterministic status, recipients and next actions.
+    Status {
+        /// Print the versioned shared JSON response.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect exact Work subjects, scope overlaps and the merge watermark without claiming work.
     Preflight {
         /// Strict WorkStart JSON, including any source revision and checked merge identities.
@@ -274,7 +280,8 @@ pub enum WorkCommand {
 
 pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
     match command {
-        WorkCommand::Inbox { .. }
+        WorkCommand::Status { .. }
+        | WorkCommand::Inbox { .. }
         | WorkCommand::Overview { .. }
         | WorkCommand::Briefing { .. }
         | WorkCommand::Catchup { .. }
@@ -394,6 +401,22 @@ pub async fn run(command: WorkCommand) -> Result<()> {
     };
     let hub = Hub::connect(timeout)?;
     let (reply, claim_conflict) = match command {
+        WorkCommand::Status { json } => {
+            let reply = hub
+                .call(Method::GET, "/v1/hub/standup/status", None)
+                .await?;
+            let status: agentscm::hub::work_http::actionable_status::ActionableStatus =
+                serde_json::from_value(reply.clone())?;
+            if json {
+                println!("{reply}");
+            } else {
+                println!(
+                    "{}",
+                    agentscm::hub::work_http::actionable_status::render_text(&status)
+                );
+            }
+            return Ok(());
+        }
         WorkCommand::Usage { request } => {
             let request: UsageRecord = read_request(&request)?;
             (

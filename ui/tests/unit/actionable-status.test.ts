@@ -1,0 +1,53 @@
+import { describe, expect, it } from 'vitest'
+import { render, screen } from '@testing-library/react'
+import { createElement } from 'react'
+import fixture from '../../../src/hub/fixtures/actionable-status.json'
+import { needsYou } from '../../src/needs.ts'
+import { decodeStatus, recipientLabel, statusLabel } from '../../src/actionableStatus.ts'
+import { DashboardPage, dashboardStatus, SharedAnswer, SharedNeeds } from '../../src/pages/Dashboard.tsx'
+import type { WorkOverview } from '../../src/standup.ts'
+import type { Derived } from '../../src/derive.ts'
+import type { HubData } from '../../src/useHub.ts'
+
+describe('shared actionable status', () => {
+  it('uses frozen counts and named recipients without reinterpreting reports', () => {
+    const status = decodeStatus(fixture)
+    expect(status.counts.needs_you).toBe(3)
+    expect(status.work.filter((w) => w.needs_you)).toHaveLength(2)
+    expect(status.work[1]!.needs_you).toBe(false)
+    expect(needsYou(null, null, undefined, status)).toHaveLength(3)
+    expect(needsYou(null, null).filter((n) => n.who === 'you')).toHaveLength(0)
+    expect(recipientLabel(status.work[2]!.recipient)).toBe('viewer')
+    expect(statusLabel(status.work[2]!.state)).toBe('Awaiting a named party')
+    expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs).toHaveLength(3)
+  })
+  it('rejects malformed flags and inconsistent counts', () => {
+    expect(() => decodeStatus({ ...fixture, counts: { ...fixture.counts, needs_you: 4 } })).toThrow()
+    expect(() => decodeStatus({ ...fixture, complete: 'yes' })).toThrow()
+    expect(() => decodeStatus({ ...fixture, work: Array(101).fill(fixture.work[0]) })).toThrow()
+  })
+  it('does not claim clear when shared status is missing or partial', () => {
+    expect(dashboardStatus(null, null, null, null, new Set(), undefined, null).home?.text).toBe('Shared status unavailable')
+    const empty = decodeStatus({ ...fixture, work: [], actions: [], counts: { ...fixture.counts, needs_you: 0 } })
+    expect(dashboardStatus(null, null, null, null, new Set(), undefined, empty).home?.text).toContain('partial')
+  })
+  it('shows deterministic status and handover recipient without generated prose', () => {
+    const overview = { current: [], recent: [], overlaps: [], current_complete: true, recent_complete: true, overlaps_complete: true } as unknown as WorkOverview
+    const d = { agents: [], groups: [], contested: [], prOverlaps: [] } as unknown as Derived
+    render(createElement(DashboardPage, { section: 'home', question: 'Status', token: 'synthetic', repo: 'acme/widgets', data: { whoami: null, failing: false } as unknown as HubData, d, overview: { kind: 'ready', value: overview, fetchedAt: 0, refreshError: null, retry: () => undefined }, status: { kind: 'ready', value: decodeStatus(fixture), fetchedAt: 0, refreshError: null, retry: () => undefined } }))
+    expect(screen.getAllByText('Review handover')).toHaveLength(2)
+    expect(screen.getByText('Awaiting a named party · viewer')).toBeTruthy()
+    expect(screen.queryByText(/waiting for another agent/i)).toBeNull()
+    expect(screen.getByText(/Coverage is incomplete/)).toBeTruthy()
+  })
+  it('labels provider failure and retained refresh results separately from clear status', () => {
+    const status = decodeStatus(fixture)
+    status.work[0]!.limits = ['provider_coverage_unavailable']
+    const poll = { kind: 'ready' as const, value: status, fetchedAt: 0, refreshError: 'Synthetic refresh failure', retry: () => undefined }
+    render(createElement('div', null, createElement(SharedAnswer, { question: 'Status', status: poll }), createElement(SharedNeeds, { status: poll })))
+    expect(document.querySelector('.answer-text')!.textContent).toContain('Last known:')
+    expect(screen.getByText('Provider evidence is unavailable')).toBeTruthy()
+    expect(screen.queryByText('All clear')).toBeNull()
+  })
+
+})

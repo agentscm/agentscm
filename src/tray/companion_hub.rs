@@ -1,6 +1,5 @@
-//! Read-only, bounded Hub signals for the tray. This uses the Hub's work overview and
-//! coordination list, the same sources as the Dashboard and Inbox. Live intent and PR
-//! crossings need the Hub page; a partial read is never presented as an all-clear.
+//! Read-only bounded shared Hub status. Personal counts and recipients come from the same
+//! projection as the Dashboard; a partial read never becomes an all-clear.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -70,6 +69,7 @@ pub(super) struct Work {
     pub state: String,
     pub next_action: String,
     pub claim_status: String,
+    pub needs_you: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -251,6 +251,7 @@ async fn read_catalog(
                                 "No next action reported",
                             ),
                             claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
+                            needs_you: item["needs_you"].as_bool().unwrap_or(false),
                         })
                         .collect()
                 })
@@ -466,28 +467,17 @@ async fn read_one(
     let Some(saved) = cache.get(&connection.root) else {
         return unavailable();
     };
-    let overview_url = format!("{hub}/v1/hub/standup/overview?limit=100");
-    let coordination_url = format!("{hub}/v1/hub/standup/coordination?active_only=true&limit=100");
-    let (overview_reply, coordination_reply) = tokio::join!(
-        crate::hub_cli::call(
-            client,
-            Method::GET,
-            &overview_url,
-            Some(&saved.token.secret),
-            None
-        ),
-        crate::hub_cli::call(
-            client,
-            Method::GET,
-            &coordination_url,
-            Some(&saved.token.secret),
-            None
-        ),
-    );
-    let unauthorized = matches!(&overview_reply, Ok((401 | 403, _)))
-        || matches!(&coordination_reply, Ok((401 | 403, _)));
-    let (Ok((200, overview)), Ok((200, coordination))) = (overview_reply, coordination_reply)
-    else {
+    let status_url = format!("{hub}/v1/hub/standup/status");
+    let reply = crate::hub_cli::call(
+        client,
+        Method::GET,
+        &status_url,
+        Some(&saved.token.secret),
+        None,
+    )
+    .await;
+    let unauthorized = matches!(&reply, Ok((401 | 403, _)));
+    let Ok((200, status)) = reply else {
         if unauthorized && let Some(saved) = cache.remove(&connection.root) {
             revoke_token(
                 client,
@@ -500,110 +490,96 @@ async fn read_one(
         }
         return unavailable();
     };
-    summarize(
-        &connection.root,
-        &connection.repository,
-        &overview,
-        &coordination,
-    )
+    summarize(&connection.root, &connection.repository, &status)
 }
 
-fn summarize(
-    root: &std::path::Path,
-    repository: &str,
-    overview: &Value,
-    coordination: &Value,
-) -> Signal {
-    let current = overview["current"].as_array();
-    let overlaps = overview["overlaps"].as_array();
-    let requests = coordination["requests"].as_array();
-    let Some((current, overlaps, requests)) = current
-        .zip(overlaps)
-        .zip(requests)
-        .map(|((a, b), c)| (a, b, c))
-    else {
-        return Signal {
-            root: root.to_path_buf(),
-            repository: repository.to_owned(),
-            text: "Hub attention unavailable. Open Hub to check.".into(),
-            keys: Vec::new(),
-            available: false,
-            complete: false,
-            count: 0,
-            work: Vec::new(),
-        };
+fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal {
+    let unavailable = || Signal {
+        root: root.to_path_buf(),
+        repository: repository.into(),
+        text: "Hub attention unavailable. Open Hub to check.".into(),
+        keys: vec![],
+        available: false,
+        complete: false,
+        count: 0,
+        work: vec![],
     };
-    let mut blocked = 0;
-    let mut keys = Vec::new();
-    let mut work = Vec::new();
-    for item in current {
-        let id = item["id"].as_str().unwrap_or("");
-        if item["state"].as_str() == Some("blocked") {
-            blocked += 1;
-            keys.push(format!("work:{id}"));
-        }
-        work.push(Work {
-            agent: bounded_text(&item["lead_agent"], 64, "Unknown agent"),
-            title: bounded_text(&item["title"], 160, "Untitled work"),
-            state: bounded_text(&item["state"], 32, "unknown"),
-            next_action: bounded_text(&item["next_action"], 160, "No next action reported"),
-            claim_status: bounded_text(&item["claim_status"], 32, "unknown"),
-        });
-    }
-    let open_requests: Vec<_> = requests
-        .iter()
-        .filter(|r| !matches!(r["status"].as_str(), Some("resolved" | "withdrawn")))
-        .collect();
-    for request in &open_requests {
-        keys.push(format!("request:{}", request["id"].as_str().unwrap_or("")));
-    }
-    // An overlap needs a person only while both tasks are active or blocked on an active claim.
-    let live = |side: &Value| {
-        side["claim_status"].as_str() == Some("active")
-            && matches!(side["state"].as_str(), Some("active" | "blocked"))
+    let Ok(status) = serde_json::from_value::<
+        agentscm::hub::work_http::actionable_status::ActionableStatus,
+    >(value.clone()) else {
+        return unavailable();
     };
-    let overlaps: Vec<_> = overlaps
-        .iter()
-        .filter(|o| live(&o["left"]) && live(&o["right"]))
-        .collect();
-    for overlap in &overlaps {
-        keys.push(format!(
-            "overlap:{}:{}",
-            overlap["left"]["id"].as_str().unwrap_or(""),
-            overlap["right"]["id"].as_str().unwrap_or("")
-        ));
+    if status.repository != repository || status.work.len() > 100 || status.actions.len() > 1000 {
+        return unavailable();
     }
+    let count = status.work.iter().filter(|w| w.needs_you).count()
+        + status.actions.iter().filter(|a| a.needs_you).count();
+    if count != status.counts.needs_you {
+        return unavailable();
+    }
+    let mut keys = status
+        .work
+        .iter()
+        .filter(|w| w.needs_you)
+        .map(|w| format!("work:{}", w.work_id))
+        .chain(
+            status
+                .actions
+                .iter()
+                .filter(|a| a.needs_you)
+                .map(|a| a.id.clone()),
+        )
+        .collect::<Vec<_>>();
     keys.sort();
-    let count = blocked + open_requests.len() + overlaps.len();
-    let complete = overview["current_complete"] == true
-        && overview["overlaps_complete"] == true
-        && coordination["complete"] == true;
-    let mut parts = Vec::new();
-    if blocked > 0 {
-        parts.push(format!("{blocked} blocked"));
-    }
-    if !overlaps.is_empty() {
-        parts.push(format!("{} overlap", overlaps.len()));
-    }
-    if !open_requests.is_empty() {
-        parts.push(format!("{} Inbox request", open_requests.len()));
-    }
-    let text = if parts.is_empty() && complete {
-        "No Work or Inbox signals. Open Hub for live file and PR crossings.".into()
-    } else if parts.is_empty() {
-        "No signal in this partial Hub snapshot. Open Hub to check.".into()
-    } else if complete {
-        format!("{} · {}", repository, parts.join(" · "))
+    let work = status
+        .work
+        .iter()
+        .map(|row| Work {
+            agent: row
+                .recipient
+                .agent
+                .clone()
+                .or_else(|| row.operational.reservation.holder_agent.clone())
+                .unwrap_or_else(|| "Unknown agent".into()),
+            title: row
+                .title
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(160)
+                .collect(),
+            state: serde_json::to_value(row.state)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".into()),
+            next_action: row
+                .action
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(160)
+                .collect(),
+            claim_status: format!("{:?}", row.freshness).to_ascii_lowercase(),
+            needs_you: row.needs_you,
+        })
+        .collect();
+    let text = if count == 0 {
+        if status.complete {
+            "No personal action observed.".into()
+        } else {
+            "No personal action observed in partial Hub coverage. Open Hub to check.".into()
+        }
     } else {
-        format!("{} · {} (partial)", repository, parts.join(" · "))
+        format!(
+            "{repository} · {count} actions need you{}",
+            if status.complete { "" } else { " (partial)" }
+        )
     };
     Signal {
         root: root.to_path_buf(),
-        repository: repository.to_owned(),
+        repository: repository.into(),
         text,
         keys,
         available: true,
-        complete,
+        complete: status.complete,
         count,
         work,
     }
@@ -625,59 +601,24 @@ fn bounded_text(value: &Value, max_chars: usize, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
     #[test]
-    fn hub_signals_match_work_and_inbox_categories() {
-        let overview = json!({
-            "current": [
-                {"id":"wrk_blocked","state":"blocked","claim_status":"active","updated_at":4},
-                {"id":"wrk_quiet","state":"active","claim_status":"stale","updated_at":5},
-                {"id":"wrk_handover","state":"handover","claim_status":"active","updated_at":6}
-            ],
-            "overlaps": [
-                {"left":{"id":"wrk_a","state":"active","claim_status":"active"},
-                 "right":{"id":"wrk_b","state":"blocked","claim_status":"active"}},
-                {"left":{"id":"wrk_c","state":"active","claim_status":"stale"},
-                 "right":{"id":"wrk_d","state":"active","claim_status":"active"}},
-                {"left":{"id":"wrk_e","state":"paused","claim_status":"active"},
-                 "right":{"id":"wrk_f","state":"active","claim_status":"active"}}
-            ],
-            "current_complete": true, "overlaps_complete": true
-        });
-        let coordination = json!({"requests": [
-            {"id":"crq_open","status":"responded","updated_at":7},
-            {"id":"crq_done","status":"resolved","updated_at":8}
-        ], "complete": true});
-        let result = summarize(
-            std::path::Path::new("/demo"),
-            "example/repo",
-            &overview,
-            &coordination,
-        );
-        // Quiet, paused and handed-over work, and overlaps with a stale or paused side, are not counted.
+    fn shared_fixture_drives_counts_and_recipients() {
+        let value =
+            serde_json::from_str(include_str!("../hub/fixtures/actionable-status.json")).unwrap();
+        let result = summarize(std::path::Path::new("/synthetic"), "acme/widgets", &value);
+        assert!(result.available);
         assert_eq!(result.count, 3);
-        assert!(result.text.contains("1 blocked"));
-        assert!(!result.text.contains("quiet"));
-        assert!(!result.text.contains("handover"));
-        assert!(result.text.contains("1 overlap"));
-        assert!(result.text.contains("1 Inbox request"));
-        assert_eq!(result.keys.len(), 3);
-        assert_eq!(result.work.len(), 3);
-    }
-
-    #[test]
-    fn incomplete_read_is_not_an_all_clear() {
-        let overview =
-            json!({"current":[],"overlaps":[],"current_complete":false,"overlaps_complete":true});
-        let coordination = json!({"requests":[],"complete":true});
-        let result = summarize(
-            std::path::Path::new("/demo"),
-            "example/repo",
-            &overview,
-            &coordination,
-        );
+        assert_eq!(result.work.iter().filter(|w| w.needs_you).count(), 2);
         assert!(result.text.contains("partial"));
-        assert_eq!(result.count, 0);
+    }
+    #[test]
+    fn older_hub_response_stays_unavailable() {
+        let result = summarize(
+            std::path::Path::new("/synthetic"),
+            "acme/widgets",
+            &serde_json::json!({"current":[]}),
+        );
+        assert!(!result.available);
+        assert!(!result.complete);
     }
 }

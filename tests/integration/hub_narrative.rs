@@ -543,7 +543,7 @@ async fn provider_evidence_versions_invalidate_ready_and_inflight_briefings() {
         .await;
     assert_eq!(code, 200);
     assert_eq!(status["work"][0]["state"], "active");
-    assert!(status["work"][0]["reconciliation"]["current"].is_null());
+    assert_eq!(status["work"][0]["reconciliation"]["current"], false);
     assert!(status["work"][0]["reconciliation"]["current_evidence_digest"].is_string());
 }
 

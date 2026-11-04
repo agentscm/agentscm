@@ -729,3 +729,46 @@ fn reconcile_cli_prints_the_report_and_fails_for_unknown_work() {
     let error = cli_error(&missing);
     assert_eq!(error["error"], "invalid: hub error 404", "{error}");
 }
+
+#[test]
+fn shared_status_cli_has_text_and_json_without_generated_prose() {
+    let hub = Hub::start();
+    let client = hub.bound_client(901, "synthetic-status-owner", 101);
+    let started = client.start(r#"{"request_key":"status-cli","title":"Synthetic status task","session":"status-cli","scope":["src/status.rs"]}"#);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let run = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command.args(["work", "status"]);
+        if json {
+            command.arg("--json");
+        }
+        command
+            .env_clear()
+            .env("HOME", client.config.path())
+            .env("XDG_CONFIG_HOME", client.config.path())
+            .env("AGENTSCM_HUB_URL", &client.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+            .output()
+            .unwrap()
+    };
+    let text = run(false);
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("1 active"));
+    assert!(text.contains("Synthetic status task"));
+    assert!(text.contains("Coverage incomplete"));
+    let json = run(true);
+    assert!(json.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(status["schema_version"], 1);
+    assert_eq!(status["counts"]["active"], 1);
+    assert_eq!(status["work"][0]["state"], "active");
+}

@@ -15,6 +15,9 @@ use crate::hub::work_reconciliation::ReconciliationView;
 use crate::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use crate::hub::{HubError, Result};
 
+#[path = "actionable_conflicts.rs"]
+mod conflicts;
+
 pub const MAX_STATUS_WORK: usize = 100;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -59,6 +62,35 @@ impl StatusRecipient {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct StatusOperational {
+    pub outcome: crate::hub::work_lifecycle::OutcomeV1,
+    pub report: Option<crate::hub::work_lifecycle::ReportV1>,
+    pub reservation: StatusReservation,
+    pub merge: crate::hub::work_lifecycle::MergeV1,
+    /// Identity of the complete operational facts, including omitted scope paths.
+    pub digest: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatusReservation {
+    pub status: ReservationStatus,
+    pub basis: Option<crate::hub::work_lifecycle::ReservationBasis>,
+    pub holder_agent: Option<String>,
+    pub scope_count: usize,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatusReconciliation {
+    pub current: bool,
+    pub declaration_seq: i64,
+    pub current_evidence_digest: Option<String>,
+    pub current_source_coverage: Vec<crate::hub::work_reconciliation::SourceEvidence>,
+    pub stale_reasons: Vec<String>,
+    /// Identity of the full view; snapshots remain on the Work detail endpoint.
+    pub digest: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StatusWork {
     pub work_id: String,
     pub title: String,
@@ -71,9 +103,9 @@ pub struct StatusWork {
     pub action: String,
     pub reported_next_action: Option<String>,
     pub freshness: ClaimStatus,
-    pub operational: WorkOperationalV1,
+    pub operational: StatusOperational,
     /// Historical retained results are never promoted to current by this projection.
-    pub reconciliation: Option<ReconciliationView>,
+    pub reconciliation: Option<StatusReconciliation>,
     pub limits: Vec<String>,
 }
 
@@ -289,8 +321,28 @@ pub fn project_work(
         action: action.into(),
         reported_next_action: item.next_action.clone(),
         freshness: item.claim_status,
-        operational,
-        reconciliation,
+        operational: StatusOperational {
+            digest: identity(&[
+                &serde_json::to_string(&operational).expect("operational serializes")
+            ]),
+            outcome: operational.outcome,
+            report: operational.report,
+            merge: operational.merge,
+            reservation: StatusReservation {
+                status: operational.reservation.status,
+                basis: operational.reservation.basis,
+                holder_agent: operational.reservation.holder_agent,
+                scope_count: operational.reservation.scope.len(),
+            },
+        },
+        reconciliation: reconciliation.map(|r| StatusReconciliation {
+            digest: identity(&[&serde_json::to_string(&r).expect("reconciliation serializes")]),
+            current: r.current.is_some(),
+            declaration_seq: r.declaration_seq,
+            current_evidence_digest: r.current_evidence_digest,
+            current_source_coverage: r.current_source_coverage,
+            stale_reasons: r.stale_reasons,
+        }),
         limits: limits.into_iter().collect(),
     }
 }
@@ -339,7 +391,7 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
     // These producers remain separate issue slices, never inferred from Work checkpoint prose.
     limits.insert("failed_check_attention_not_integrated".to_owned());
     limits.insert("capacity_attention_not_integrated".to_owned());
-    limits.insert("file_and_pr_conflicts_not_integrated".to_owned());
+
     let mut selected: BTreeMap<String, Option<WorkItem>> = holders
         .work
         .iter()
@@ -455,9 +507,29 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
         limits.insert("requests_changed_during_read".into());
         actions.retain(|a| a.kind != "directed_request");
     }
+    let (conflicts, conflict_limits, conflict_evidence_digest) =
+        conflicts::read(store, principal, now)?;
+    actions.extend(conflicts);
+    limits.extend(conflict_limits);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
+    let complete_action_digest =
+        identity(&[&serde_json::to_string(&actions).expect("actions serialize")]);
     actions.dedup_by(|a, b| a.id == b.id);
+    if actions.len() > 200 {
+        limits.insert("status_actions_truncated".into());
+        actions.truncate(200);
+    }
+    for action in &mut actions {
+        if action.recipients.len() > 8 {
+            action
+                .recipients
+                .sort_by_key(|r| r.owner.as_deref() != Some(&principal.owner.id));
+            action.recipients.truncate(8);
+            action.limits.push("recipients_truncated".into());
+            limits.insert("recipients_truncated".into());
+        }
+    }
     let mut counts = StatusCounts::default();
     for row in &work {
         match row.state {
@@ -489,13 +561,92 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
         limits: limits.into_iter().collect(),
         digest: String::new(),
     };
+    // The existing agent CLI accepts at most 1 MiB. Preserve every selected Work/reservation
+    // row and bound displayed actions below that transport limit. Their full identity remains
+    // in complete_action_digest, so omission never makes changed captured facts look current.
+    let mut response_bytes = serde_json::to_vec(&result)
+        .expect("status serializes")
+        .len();
+    if response_bytes > 768 * 1024 {
+        while response_bytes > 767 * 1024 {
+            let Some(action) = result.actions.pop() else {
+                return Err(HubError::Unavailable(
+                    "shared status exceeds its response budget".into(),
+                ));
+            };
+            response_bytes = response_bytes.saturating_sub(
+                serde_json::to_vec(&action)
+                    .expect("action serializes")
+                    .len(),
+            );
+            result.counts.needs_you = result
+                .counts
+                .needs_you
+                .saturating_sub(usize::from(action.needs_you));
+        }
+        result.complete = false;
+        result
+            .limits
+            .push("status_response_budget_truncated".into());
+        result.limits.sort();
+    }
     // Include complete request versions, even omitted/no-longer-actionable request bodies, so a
     // changed recipient/response invalidates the captured evidence. No credential is included.
     let mut hashed = result.clone();
     hashed.observed_at = 0;
-    result.digest =
-        identity(&[&serde_json::to_string(&(hashed, requests)).expect("status serializes")]);
+    result.digest = identity(&[&serde_json::to_string(&(
+        hashed,
+        requests,
+        complete_action_digest,
+        conflict_evidence_digest,
+    ))
+    .expect("status serializes")]);
     Ok(result)
+}
+
+/// Deterministic text used by agent-facing clients; generated prose is optional.
+pub fn render_text(status: &ActionableStatus) -> String {
+    let c = &status.counts;
+    let mut lines = vec![format!(
+        "{}: {} active, {} awaiting a named party, {} blocked, {} reassessment needed; {} actions need you.",
+        status.repository,
+        c.active,
+        c.awaiting_party,
+        c.blocked,
+        c.reassessment_needed,
+        c.needs_you
+    )];
+    for row in &status.work {
+        let state = match row.state {
+            StatusState::Active => "active",
+            StatusState::AwaitingParty => "awaiting a named party",
+            StatusState::Blocked => "blocked",
+            StatusState::ReassessmentNeeded => "reassessment needed",
+            StatusState::Retired => "retired",
+        };
+        let recipient = row
+            .recipient
+            .login
+            .as_deref()
+            .unwrap_or("recipient unknown");
+        lines.push(format!(
+            "{} [{}; {}; reservation {:?}]: {}",
+            row.title, state, recipient, row.operational.reservation.status, row.action
+        ));
+    }
+    for action in &status.actions {
+        if action.needs_you {
+            lines.push(action.action.clone());
+        }
+    }
+    if !status.complete {
+        lines.push("Coverage incomplete; missing signals remain unknown.".into());
+    }
+    lines.push(format!(
+        "Evidence revision {} (read {}; non-atomic).",
+        status.digest, status.observed_at
+    ));
+    lines.join("\n")
 }
 
 fn request_actions(
@@ -839,7 +990,7 @@ mod tests {
             !a.complete,
             "unsupported producers cannot be presented as clear"
         );
-        assert!(a.work[0].reconciliation.as_ref().unwrap().current.is_none());
+        assert!(!a.work[0].reconciliation.as_ref().unwrap().current);
         assert_eq!(
             a.work[0].reported_next_action.as_deref(),
             Some("Reported next step")
@@ -1081,5 +1232,131 @@ mod tests {
                 .windows(2)
                 .all(|rows| rows[0].work_id < rows[1].work_id)
         );
+    }
+    #[test]
+    fn frozen_surface_fixture_matches_work_projection_and_text() {
+        let fixture: ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        assert_eq!(fixture.counts.needs_you, 3);
+        for expected in &fixture.work {
+            let mut source = item(match expected.state {
+                StatusState::Blocked => WorkState::Blocked,
+                StatusState::AwaitingParty => WorkState::Handover,
+                _ => WorkState::Active,
+            });
+            source.id = expected.work_id.clone();
+            source.title = expected.title.clone();
+            let recipient = &expected.recipient;
+            source.owner = recipient.owner.clone().unwrap();
+            source.owner_login = recipient.login.clone().unwrap();
+            source.participants[0].owner = source.owner.clone();
+            source.participants[0].login = source.owner_login.clone();
+            source.participants[0].agent = "codex".into();
+            source.lead_agent = "codex".into();
+            let actual = project_work(
+                &source,
+                op(&source, true, false),
+                None,
+                &fixture.viewer_owner,
+            );
+            assert_eq!(actual.state, expected.state);
+            assert_eq!(actual.recipient, expected.recipient);
+            assert_eq!(actual.needs_you, expected.needs_you);
+        }
+        let text = render_text(&fixture);
+        assert!(text.contains("3 actions need you"));
+        assert!(text.contains("awaiting a named party"));
+        assert!(text.contains("Coverage incomplete"));
+    }
+    #[test]
+    fn compact_status_keeps_full_scope_identity_without_serializing_paths() {
+        let mut source = item(WorkState::Active);
+        source.scope = (0..256)
+            .map(|n| format!("src/{n}-{}", "a".repeat(900)))
+            .collect();
+        let row = project_work(&source, op(&source, true, false), None, "usr_owner");
+        assert_eq!(row.operational.reservation.scope_count, 256);
+        assert!(serde_json::to_vec(&row).unwrap().len() < 4096);
+        let digest = row.operational.digest;
+        source.scope[0].push('x');
+        assert_ne!(
+            project_work(&source, op(&source, true, false), None, "usr_owner")
+                .operational
+                .digest,
+            digest
+        );
+    }
+    #[test]
+    fn conflict_reader_scopes_personal_recipients_and_hashes_quiet_paths() {
+        use crate::hub::intent::NewIntent;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let now = crate::hub::store::unix_now();
+        let principal = |provider: &str, host: &str, id: i64| {
+            let user = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: provider.into(),
+                        host: host.into(),
+                        user_id: id,
+                    },
+                    &format!("synthetic-{id}"),
+                )
+                .unwrap();
+            let (_, secret, _) = mint_bound_agent_token(
+                &*store,
+                &user.id,
+                "synthetic",
+                "acme/widgets",
+                101,
+                3600,
+                false,
+            )
+            .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let owner = principal("github", "github.com", 901);
+        let other = principal("github", "github.com", 902);
+        let outsider = principal("github", "github.com", 903);
+        let foreign = principal("gitlab", "gitlab.example", 901);
+        let request = |id: char, path: &str| NewIntent {
+            id: format!("int_{}", id.to_string().repeat(32)),
+            task: "Synthetic task".into(),
+            branch: None,
+            base: None,
+            machine: None,
+            paths: vec![path.into()],
+            ttl_seconds: 3600,
+        };
+        store
+            .announce_intent(&owner.token_id, &request('a', "src/a.rs"), now)
+            .unwrap();
+        store
+            .announce_intent(&other.token_id, &request('b', "src/a.rs"), now)
+            .unwrap();
+        let own = read(&*store, &owner, now).unwrap();
+        assert_eq!(
+            own.actions
+                .iter()
+                .filter(|a| a.kind == "file_conflict" && a.needs_you)
+                .count(),
+            1
+        );
+        assert_eq!(read(&*store, &outsider, now).unwrap().counts.needs_you, 0);
+        assert!(read(&*store, &foreign, now).unwrap().actions.is_empty());
+        let before = read(&*store, &outsider, now).unwrap().digest;
+        store
+            .announce_intent(&owner.token_id, &request('c', "docs/quiet.md"), now)
+            .unwrap();
+        let after = read(&*store, &outsider, now).unwrap();
+        assert_eq!(after.counts.needs_you, 0);
+        assert_ne!(before, after.digest);
     }
 }
