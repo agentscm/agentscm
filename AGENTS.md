@@ -16,13 +16,15 @@ cargo test --locked --doc
 docker build -t agentscm . && .github/docker-smoke.sh agentscm
 ```
 
-The two test commands are the preferred equivalent full test gate; doctests run separately because nextest does not run them. For focused iteration, select the actual affected tests, callers and failure paths with a nextest filter such as `cargo nextest run --locked -E 'test(/^git_collisions::/)'`. Follow [contributor testing](docs/contributor-testing.md) for installing the pinned runner, measuring or auditing the suite, reusing unchanged evidence, and applying the final whole-branch gate. The toolchain is pinned in `rust-toolchain.toml`. Tests needing PostgreSQL or S3 skip locally unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set. `tools/portable-verifier` is a separate crate with its own `Cargo.toml`.
+The two test commands are the preferred equivalent full test gate; doctests run separately because nextest does not run them. For focused iteration, select the actual affected tests, callers and failure paths with a nextest filter such as `cargo nextest run --locked -E 'test(/^git_collisions::/)'`. Follow [contributor testing](docs/contributor-testing.md) for installing the pinned runner, measuring or auditing the suite, reusing unchanged evidence, and applying the final whole-branch gate. The toolchain is pinned in `rust-toolchain.toml`. Tests needing PostgreSQL or S3 skip locally unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set. `tools/portable-verifier` is a separate crate with its own `Cargo.toml`. Run a full suite as `tools/attest-pr.sh --with-lock cargo nextest run --locked` so it never overlaps an attestation or another full suite on the same machine.
 
 Workflow commands live in `.agents/commands/`: `implement` (issue to reviewed PR), `commit`, `review`, `pr`, `fix-pr` and `handoff`. `.claude/commands` is a symlink to that directory and `CLAUDE.md` is a symlink to this file, so Claude Code and other agents read the same instructions. Follow the matching file when asked to run one of these workflows.
 
 ## Rules
 
-- Work on a feature branch; never commit or push to `main`. Do not merge, enable auto-merge, force-push, bypass hooks or weaken CI, signing or branch protections.
+- Work on a feature branch; never commit or push to `main`. Do not enable auto-merge, force-push, bypass hooks or weaken CI, signing or branch protections. Merge only as the next rule allows.
+- Interim merge rule: an agent may merge only a non-draft PR opened by its own owner, only when GitHub reports it clean (`gh pr view <PR#> --json mergeStateStatus` is `CLEAN`), and never with `--admin` or any other bypass. Never merge while another owner's open PR touches any of the same files: first run `gh pr diff <PR#> --name-only` on each other open PR and compare.
+- A 500 or a timeout on a push or a merge means the outcome is unknown. Re-read the remote ref (`git ls-remote origin <branch>`) or the PR (`gh pr view <PR#>`) before retrying, and never force-push to recover.
 - Do not edit `.github/workflows/`, release or packaging files, `AGENTS.md`, `CLAUDE.md` or `.agents/` unless the task is about them and a maintainer has agreed.
 - Keep changes focused. Preserve other contributors' work and check `git status` before writing. Run only the checks that fit the change, and report exactly what ran and what did not. Never present an incomplete check as passing.
 - Use synthetic fixtures. Never commit credentials, personal data, machine-specific paths, transcripts, session links or raw review evidence.

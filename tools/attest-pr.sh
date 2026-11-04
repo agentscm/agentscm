@@ -3,11 +3,19 @@
 # turns `agentscm/local-validation` green. See docs/advanced/local-validation.md.
 #
 # Usage: tools/attest-pr.sh [PR_NUMBER]    (default: the pull request for the current branch)
+#        tools/attest-pr.sh --with-lock COMMAND [ARG...]    (run COMMAND under the same lock)
 # Env:   AGENTSCM_LV_DIR     key and state root (default ~/.config/agentscm/local-validation)
 #        AGENTSCM_LV_ISSUER  registry issuer and key name (default: the signed-in GitHub login)
+#        AGENTSCM_LV_KEY     signing key file (default: $AGENTSCM_LV_DIR/$ISSUER.ed25519, else
+#                            $AGENTSCM_LV_DIR/$ISSUER.key)
+#
+# One attestation or --with-lock command runs per machine at a time, across worktrees; concurrent
+# full suites fail timing-sensitive tests. The lock is ~/.agentscm/attest-pr.lock, and a lock whose
+# holder has died is reclaimed.
 #
 # Exits 0 without posting when this machine has no signing key; say so in the PR. Any other
-# failure, including a recipe that does not pass, exits nonzero and posts nothing.
+# failure, including a recipe that does not pass, exits nonzero and posts nothing. A recipe that
+# does not pass prints where its signed failure record and command output are kept.
 #
 # PostgreSQL and S3 come from the AGENTSCM_TEST_* variables when set; otherwise disposable containers
 # start from the images pinned in .github/workflows/ci.yml. Tools the recipe selects for this change
@@ -21,13 +29,65 @@ die() {
   exit 1
 }
 
+# macOS has no flock(1): mkdir is the atomic step, and the pid file says who holds the lock.
+lock="$HOME/.agentscm/attest-pr.lock"
+take_lock() {
+  local holder waiting_for=
+  mkdir -p "${lock%/*}"
+  until mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    # One reclaimer at a time, and only if the dead holder still owns the lock, so a waiter that
+    # read a stale pid cannot remove a lock another waiter has just taken.
+    # shortcut: a process killed between mkdir and writing its pid, or inside this reclaim step,
+    # leaves a lock nobody reclaims; remove $lock and $lock.reclaim by hand if a wait never ends.
+    if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null && mkdir "$lock.reclaim" 2>/dev/null; then
+      if [[ "$(cat "$lock/pid" 2>/dev/null || true)" == "$holder" ]]; then
+        echo "attest-pr: reclaiming the lock from $holder, which is no longer running" >&2
+        rm -rf "$lock"
+      fi
+      rmdir "$lock.reclaim"
+      continue
+    fi
+    if [[ "$holder" != "$waiting_for" ]]; then
+      if [[ -n "$holder" ]]; then
+        echo "attest-pr: waiting for $holder ($(ps -o command= -p "$holder" 2>/dev/null | cut -c1-120)) to release $lock" >&2
+      else
+        echo "attest-pr: waiting for a starting run to release $lock" >&2
+      fi
+      waiting_for=$holder
+    fi
+    sleep 2
+  done
+  echo $$ >"$lock/pid"
+}
+release_lock() {
+  if [[ "$(cat "$lock/pid" 2>/dev/null || true)" == "$$" ]]; then rm -rf "$lock"; fi
+}
+
+if [[ "${1:-}" == --with-lock ]]; then
+  shift
+  (($#)) || die "usage: tools/attest-pr.sh --with-lock COMMAND [ARG...]"
+  trap release_lock EXIT
+  take_lock
+  "$@"
+  exit
+fi
+
 lv_dir=${AGENTSCM_LV_DIR:-$HOME/.config/agentscm/local-validation}
 issuer=${AGENTSCM_LV_ISSUER:-$(gh api user --jq .login)}
-key="$lv_dir/$issuer.ed25519"
 state="$lv_dir/agentscm-attestations"
-if [[ ! -f "$key" ]]; then
-  echo "attest-pr: no signing key at $key; nothing signed or posted" >&2
-  exit 0
+# The binary refuses linked keys and keys in a folder that is not owner-private, so name the
+# file rather than linking or copying it.
+if [[ -n "${AGENTSCM_LV_KEY:-}" ]]; then
+  key=$AGENTSCM_LV_KEY
+  [[ -f "$key" ]] || die "AGENTSCM_LV_KEY is not a file: $key"
+else
+  key="$lv_dir/$issuer.ed25519"
+  [[ -f "$key" ]] || key="$lv_dir/$issuer.key"
+  if [[ ! -f "$key" ]]; then
+    echo "attest-pr: no signing key at $lv_dir/$issuer.ed25519 or $key; nothing signed or posted" >&2
+    exit 0
+  fi
 fi
 
 pr=${1:-$(gh pr view --json number --jq .number)}
@@ -43,8 +103,10 @@ started=()
 cleanup() {
   if ((${#started[@]})); then docker rm -f "${started[@]}" >/dev/null 2>&1 || true; fi
   rm -rf "$tmp"
+  release_lock
 }
 trap cleanup EXIT
+take_lock
 
 # The producer runs the release the verifier workflow pins.
 version=$(sed -n 's/^ *release-version: *//p' .github/workflows/local-validation.yml)
@@ -107,16 +169,32 @@ mkdir "$tmp/home"
 printf '[core]\n\tautocrlf = false\n' >"$tmp/home/.gitconfig"
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+# A failing recipe exits 1 after signing and retaining its record, so read the result either way.
+status=0
 HOME="$tmp/home" CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" \
   "$bin" local-validation run --repo . \
   --config-dir .github/local-validation \
   --verifier-workflow .github/workflows/local-validation.yml \
   --recipe "$tmp/recipe.json" --policy "$tmp/policy.json" --registry "$tmp/registry.json" \
   --key-file "$key" --issuer-id "$issuer" --state-dir "$state" \
-  --base-ref main --base-rev "$base" >"$tmp/result.json"
+  --base-ref main --base-rev "$base" >"$tmp/result.json" || status=$?
+outcome=$(jq -r '.outcome // empty' "$tmp/result.json" 2>/dev/null || true)
+[[ -n "$outcome" ]] || die "local-validation run exited $status without a result; not posting"
 jq -c '{outcome, envelope_sha256}' "$tmp/result.json"
-[[ "$(jq -r .outcome "$tmp/result.json")" == pass ]] || die "recipe did not pass; not posting"
 envelope=$(jq -r .envelope_sha256 "$tmp/result.json")
+if [[ "$outcome" != pass ]]; then
+  {
+    echo "attest-pr: recipe did not pass; not posting. The signed failure record is kept in $state:"
+    echo "  record:   $state/$envelope.record.json"
+    echo "  envelope: $state/$envelope.envelope.json"
+    jq -r --arg out "$state/$envelope" '.results | to_entries[]
+      | select(.value.stop != "exited" or .value.exit_code != 0)
+      | "  failed:   \(.value.id) (\(.value.stop), exit \(.value.exit_code // "none")); output in \($out).cmd\(.key + 1).stdout and .stderr"' \
+      "$state/$envelope.record.json" || true
+    echo "  summary:  $bin local-validation show --state-dir $state --attestation $envelope"
+  } >&2
+  exit 1
+fi
 
 git fetch -q origin main
 git diff --quiet "$base" origin/main -- .github/local-validation \
