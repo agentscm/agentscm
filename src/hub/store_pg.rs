@@ -91,9 +91,11 @@ use super::session::{
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
-    HubEvent, LIST_LIMIT, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal,
-    PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit,
-    like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
+    HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
+    LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
+    NewAgentToken, Principal, PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store,
+    TokenDigest, User, event_limit, like_pattern, local_ci_label, lower_hex_of, new_id, pending,
+    plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
     validate_display_name, validate_login,
 };
 use super::work::{
@@ -112,6 +114,7 @@ use super::work_links::{
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::{HubError, Result};
+use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
 mod repository_rename;
@@ -405,6 +408,93 @@ fn revoke_device_in(
         append(tx, &Event::token_revoked(&token, Some(by))?)?;
     }
     Ok(true)
+}
+
+fn local_ci_row(row: &postgres::Row) -> LocalCiRow {
+    LocalCiRow {
+        device_id: row.get(0),
+        repository: row.get(1),
+        owner: row.get(2),
+        generation: row.get(3),
+        document: row.get(4),
+        digest: row.get(5),
+        created_at: row.get(6),
+        updated_at: row.get(7),
+    }
+}
+
+fn local_ci_load(
+    client: &mut impl postgres::GenericClient,
+    device_id: &str,
+) -> Result<Option<LocalCiDevice>> {
+    client
+        .query_opt(
+            &format!("{LOCAL_CI_SELECT} WHERE device_id = $1"),
+            &[&device_id],
+        )?
+        .map(|row| local_ci_row(&row).verify())
+        .transpose()
+}
+
+fn local_ci_seen(
+    client: &mut impl postgres::GenericClient,
+    request_id: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(client
+        .query_opt(
+            "SELECT device_id, fingerprint FROM local_ci_device_requests WHERE request_id = $1",
+            &[&request_id],
+        )?
+        .map(|row| (row.get(0), row.get(1))))
+}
+
+/// A recorded request: the same fingerprint replays, any other use of the id conflicts.
+fn local_ci_replay(
+    tx: &mut postgres::Transaction<'_>,
+    request: &LocalCiRequest,
+    device_id: &str,
+) -> Result<Option<LocalCiDeviceWrite>> {
+    let Some((seen_device, fingerprint)) = local_ci_seen(tx, &request.request_id)? else {
+        return Ok(None);
+    };
+    if seen_device != device_id || fingerprint != request.fingerprint {
+        return Ok(Some(LocalCiDeviceWrite::Refused(
+            LocalCiRefusal::RequestConflict,
+        )));
+    }
+    let device = local_ci_load(tx, device_id)?
+        .ok_or_else(|| HubError::Unavailable("stored local CI device record is missing".into()))?;
+    Ok(Some(LocalCiDeviceWrite::Replayed(device)))
+}
+
+/// Records the new keys, the request and the event, then commits. A key already enrolled anywhere
+/// refuses, and the dropped transaction rolls back the document write.
+fn local_ci_finish(
+    mut tx: postgres::Transaction<'_>,
+    device_id: &str,
+    request: &LocalCiRequest,
+    plan: &LocalCiPlan,
+) -> Result<LocalCiDeviceWrite> {
+    for key in &plan.new_keys {
+        let inserted = tx.execute(
+            "INSERT INTO local_ci_device_keys (key_id, device_id) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+            &[key, &device_id],
+        )?;
+        if inserted == 0 {
+            return Ok(LocalCiDeviceWrite::Refused(LocalCiRefusal::DuplicateKey));
+        }
+    }
+    tx.execute(
+        "INSERT INTO local_ci_device_requests (request_id, device_id, fingerprint)
+         VALUES ($1, $2, $3)",
+        &[&request.request_id, &device_id, &request.fingerprint],
+    )?;
+    append(&mut tx, &plan.event)?;
+    let device = local_ci_load(&mut tx, device_id)?
+        .ok_or_else(|| HubError::Unavailable("stored local CI device record is missing".into()))?;
+    tx.commit()?;
+    Ok(LocalCiDeviceWrite::Applied(device))
 }
 
 fn append(tx: &mut postgres::Transaction<'_>, event: &Event) -> Result<i64> {
@@ -5528,6 +5618,176 @@ impl Store for PgStore {
             append(&mut tx, &Event::device_created(&id, owner, name)?)?;
             tx.commit()?;
             Ok(id.clone())
+        })
+    }
+
+    fn enroll_local_ci_device(
+        &self,
+        repository: &str,
+        owner: &str,
+        by: &str,
+        authorization: &DeviceAuthorization,
+        request: &LocalCiRequest,
+        now: i64,
+    ) -> Result<LocalCiDeviceWrite> {
+        let plan = plan_local_ci_enroll(repository, by, authorization, request)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            // The inserts below take FOR KEY SHARE on these rows through their foreign keys, while
+            // other writers lock a row FOR UPDATE and then take the event lock. Taking the row
+            // locks first keeps one lock order: row locks, then the event lock. FOR KEY SHARE
+            // does not conflict with a disable or a rename, so the label and the disabled flag
+            // are read below, after the event lock that those writers hold until they commit.
+            tx.execute(
+                "SELECT 1 FROM hub_repositories WHERE id = $1 FOR KEY SHARE",
+                &[&repository],
+            )?;
+            tx.execute(
+                "SELECT 1 FROM hub_users WHERE id = $1 FOR KEY SHARE",
+                &[&owner],
+            )?;
+            // Serializes device writes.
+            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&EVENT_LOCK])?;
+            if let Some(write) = local_ci_replay(&mut tx, request, &authorization.device_id)? {
+                return Ok(write);
+            }
+            let label = tx
+                .query_opt(
+                    "SELECT host, full_name FROM hub_repositories WHERE id = $1",
+                    &[&repository],
+                )?
+                .map(|row| local_ci_label(&row.get::<_, String>(0), &row.get::<_, String>(1)));
+            let enabled = tx
+                .query_opt("SELECT NOT disabled FROM hub_users WHERE id = $1", &[&owner])?
+                .map(|row| row.get::<_, bool>(0));
+            if label.as_deref() != Some(authorization.repository.as_str()) {
+                return Err(HubError::Invalid("unknown repository for that label".into()));
+            }
+            if enabled != Some(true) {
+                return Err(HubError::Invalid("unknown or disabled owner".into()));
+            }
+            let inserted = tx.execute(
+                "INSERT INTO local_ci_devices
+                     (device_id, repository, owner, generation, document, digest, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $7) ON CONFLICT DO NOTHING",
+                &[
+                    &authorization.device_id,
+                    &repository,
+                    &owner,
+                    &plan.generation,
+                    &plan.document,
+                    &plan.digest,
+                    &now,
+                ],
+            )?;
+            if inserted == 0 {
+                return Ok(LocalCiDeviceWrite::Refused(LocalCiRefusal::DeviceExists));
+            }
+            local_ci_finish(tx, &authorization.device_id, request, &plan)
+        })
+    }
+
+    fn change_local_ci_device(
+        &self,
+        device_id: &str,
+        expected_generation: u64,
+        by: &str,
+        next: &DeviceAuthorization,
+        request: &LocalCiRequest,
+        now: i64,
+    ) -> Result<LocalCiDeviceWrite> {
+        request.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&EVENT_LOCK])?;
+            if let Some(write) = local_ci_replay(&mut tx, request, device_id)? {
+                return Ok(write);
+            }
+            let Some(current) = local_ci_load(&mut tx, device_id)? else {
+                return Ok(LocalCiDeviceWrite::Refused(LocalCiRefusal::UnknownDevice));
+            };
+            if current.authorization.generation != expected_generation {
+                return Ok(LocalCiDeviceWrite::Refused(LocalCiRefusal::StaleGeneration {
+                    current: current.authorization.generation,
+                }));
+            }
+            let plan = plan_local_ci_change(&current, by, next, request)?;
+            let changed = tx.execute(
+                "UPDATE local_ci_devices SET generation = $2, document = $3, digest = $4, updated_at = $5
+                 WHERE device_id = $1 AND generation = $6",
+                &[
+                    &device_id,
+                    &plan.generation,
+                    &plan.document,
+                    &plan.digest,
+                    &now,
+                    &(plan.generation - 1),
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(LocalCiDeviceWrite::Refused(LocalCiRefusal::StaleGeneration {
+                    current: current.authorization.generation,
+                }));
+            }
+            local_ci_finish(tx, device_id, request, &plan)
+        })
+    }
+
+    fn local_ci_device(&self, device_id: &str) -> Result<Option<LocalCiDevice>> {
+        self.run(true, |client| local_ci_load(client, device_id))
+    }
+
+    fn local_ci_devices(
+        &self,
+        repository: &str,
+        owner: Option<&str>,
+    ) -> Result<Vec<LocalCiDevice>> {
+        self.run(true, |client| {
+            client
+                .query(
+                    &format!(
+                        "{LOCAL_CI_SELECT} WHERE repository = $1 AND ($2::TEXT IS NULL OR owner = $2)
+                         ORDER BY device_id LIMIT $3"
+                    ),
+                    &[&repository, &owner, &LIST_LIMIT],
+                )?
+                .iter()
+                .map(|row| local_ci_row(row).verify())
+                .collect()
+        })
+    }
+
+    fn local_ci_request(&self, request_id: &str) -> Result<Option<(String, String)>> {
+        self.run(true, |client| local_ci_seen(client, request_id))
+    }
+
+    fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>> {
+        Ok(self
+            .repository_query("WHERE id = $1", &[&id])?
+            .into_iter()
+            .next())
+    }
+
+    fn local_ci_device_events(&self, device_id: &str) -> Result<Vec<HubEvent>> {
+        self.run(true, |client| {
+            let rows = client.query(
+                "SELECT seq, id, at, kind, subject, data FROM hub_events
+                 WHERE subject = $1 AND kind IN ('local_ci_device_enrolled', 'local_ci_device_rotated',
+                           'local_ci_device_revoked')
+                 ORDER BY seq LIMIT $2",
+                &[&device_id, &LIST_LIMIT],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|row| HubEvent {
+                    seq: row.get(0),
+                    id: row.get(1),
+                    at: row.get(2),
+                    kind: row.get(3),
+                    subject: row.get(4),
+                    data: row.get(5),
+                })
+                .collect())
         })
     }
 

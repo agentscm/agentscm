@@ -29,7 +29,7 @@ use super::store::{
 use super::{HubError, HubState, Result};
 use crate::team::auth::{generate_secret, token_digest};
 
-mod devices;
+pub(super) mod devices;
 
 const SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.session.v1\0";
 const COOKIE: &str = "__Host-agentscm_login";

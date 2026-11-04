@@ -777,7 +777,7 @@ async fn response_json(
     })
 }
 
-fn generate_key(path: &Path) -> Result<Value> {
+pub(crate) fn generate_key(path: &Path) -> Result<Value> {
     if !path.is_absolute() {
         return Err(Error::Invalid(
             "private key output path must be absolute".into(),

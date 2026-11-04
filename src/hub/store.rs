@@ -47,6 +47,7 @@ use super::work::{
 use super::work_links::{WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView};
 use super::work_preflight::WorkPreflightResult;
 use super::{HubError, Result};
+use crate::local_ci::DeviceAuthorization;
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
 
 const AGENT_TOKEN_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.agent-token.v1\0";
@@ -253,6 +254,42 @@ pub trait Store: Send + Sync {
     fn revoke_device(&self, device: &str, owner: Option<&str>, by: &str, now: i64) -> Result<bool>;
     /// True if `owner`'s live computer was renamed.
     fn rename_device(&self, device: &str, owner: &str, name: &str) -> Result<bool>;
+    /// Authorizes a local CI device (generation 1) for the repository row `repository`
+    /// (`hub_repositories.id`) and the enabled Hub user `owner`, and appends an event, in one
+    /// transaction. `by` is the administrator who acted; the event names them, not `owner`.
+    /// A key id is enrolled once ever. A replayed `request` returns the device.
+    fn enroll_local_ci_device(
+        &self,
+        repository: &str,
+        owner: &str,
+        by: &str,
+        authorization: &DeviceAuthorization,
+        request: &LocalCiRequest,
+        now: i64,
+    ) -> Result<LocalCiDeviceWrite>;
+    /// Replaces the authorization with `next` (from `rotate` or `revoke`) if the stored
+    /// generation is `expected_generation`, and appends an event naming `by`, in one transaction.
+    fn change_local_ci_device(
+        &self,
+        device_id: &str,
+        expected_generation: u64,
+        by: &str,
+        next: &DeviceAuthorization,
+        request: &LocalCiRequest,
+        now: i64,
+    ) -> Result<LocalCiDeviceWrite>;
+    /// A corrupt stored record is an error, never a default.
+    fn local_ci_device(&self, device_id: &str) -> Result<Option<LocalCiDevice>>;
+    /// The repository row's devices ordered by device id, at most 1000, only those of the Hub
+    /// user `owner` when given (filtered before the limit).
+    fn local_ci_devices(&self, repository: &str, owner: Option<&str>)
+    -> Result<Vec<LocalCiDevice>>;
+    /// The device and fingerprint recorded for a request id, if it was applied.
+    fn local_ci_request(&self, request_id: &str) -> Result<Option<(String, String)>>;
+    /// The repository row by its stable `rep_` id, under its current host and name.
+    fn repository_row(&self, id: &str) -> Result<Option<ConnectedRepository>>;
+    /// The device's enrolled, rotated and revoked events, oldest first, at most 1000.
+    fn local_ci_device_events(&self, device_id: &str) -> Result<Vec<HubEvent>>;
     /// Like `insert_agent_token`, minted through `device` (which must be live and `token.owner`'s).
     /// `auto` (auto-connect) records an `auto_connected` event.
     fn insert_device_token(
@@ -1414,6 +1451,206 @@ impl Event {
             }),
         )
     }
+}
+
+impl Event {
+    /// Ids, kind and generation only: public keys appear as key ids.
+    fn local_ci_device(
+        kind: &'static str,
+        authorization: &DeviceAuthorization,
+        repository: &str,
+        by: &str,
+        key_ids: &[&str],
+    ) -> Result<Self> {
+        Self::new(
+            kind,
+            &authorization.device_id,
+            json!({"repository": repository, "generation": authorization.generation,
+                "key_ids": key_ids, "by": by}),
+        )
+    }
+}
+
+/// Caller-chosen identity of one enroll or change, for idempotent replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCiRequest {
+    /// 1 to 128 bytes of identifier characters.
+    pub request_id: String,
+    /// Lowercase SHA-256 hex of what the request asked for.
+    pub fingerprint: String,
+}
+
+impl LocalCiRequest {
+    pub(super) fn validate(&self) -> Result<()> {
+        crate::evidence::validate_identifier("request id", &self.request_id)?;
+        crate::evidence::validate_lower_hex("request fingerprint", &self.fingerprint, 32)?;
+        Ok(())
+    }
+}
+
+/// A stored authorization, verified against its row on every read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCiDevice {
+    pub authorization: DeviceAuthorization,
+    pub digest: String,
+    /// The `hub_repositories.id` the device is bound to.
+    pub repository: String,
+    /// The Hub user id of the owner.
+    pub owner: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalCiRefusal {
+    UnknownDevice,
+    DeviceExists,
+    /// The stored generation is not the expected one.
+    StaleGeneration {
+        current: u64,
+    },
+    /// The request id was used for a different request.
+    RequestConflict,
+    /// A key id is, or once was, enrolled on a device.
+    DuplicateKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalCiDeviceWrite {
+    Applied(LocalCiDevice),
+    /// Same request id and fingerprint as an applied write: the device as stored now.
+    Replayed(LocalCiDevice),
+    Refused(LocalCiRefusal),
+}
+
+/// A stored row as read, before verification.
+pub(super) struct LocalCiRow {
+    pub device_id: String,
+    pub repository: String,
+    pub owner: String,
+    pub generation: i64,
+    pub document: String,
+    pub digest: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub(super) const LOCAL_CI_SELECT: &str = "SELECT device_id, repository, owner, generation, document, digest, created_at, updated_at FROM local_ci_devices";
+
+fn corrupt() -> HubError {
+    HubError::Unavailable("stored local CI device record is corrupt".into())
+}
+
+impl LocalCiRow {
+    pub(super) fn verify(self) -> Result<LocalCiDevice> {
+        let authorization =
+            DeviceAuthorization::from_slice(self.document.as_bytes()).map_err(|_| corrupt())?;
+        let digest = authorization.digest().map_err(|_| corrupt())?;
+        if authorization.device_id != self.device_id
+            || i64::try_from(authorization.generation).ok() != Some(self.generation)
+            || digest != self.digest
+        {
+            return Err(corrupt());
+        }
+        Ok(LocalCiDevice {
+            authorization,
+            digest,
+            repository: self.repository,
+            owner: self.owner,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// What a backend writes for an accepted enroll or change.
+pub(super) struct LocalCiPlan {
+    pub document: String,
+    pub digest: String,
+    pub generation: i64,
+    pub event: Event,
+    /// Keys in the new document that the previous one lacked.
+    pub new_keys: Vec<String>,
+}
+
+fn plan_local_ci(
+    kind: &'static str,
+    previous: Option<&DeviceAuthorization>,
+    next: &DeviceAuthorization,
+    repository: &str,
+    by: &str,
+    request: &LocalCiRequest,
+) -> Result<LocalCiPlan> {
+    request.validate()?;
+    let document = String::from_utf8(next.canonical_bytes()?)
+        .map_err(|_| HubError::Invalid("device authorization is not UTF-8".into()))?;
+    let new_keys: Vec<String> = next
+        .keys
+        .iter()
+        .filter(|key| previous.is_none_or(|p| !p.keys.iter().any(|k| k.key_id == key.key_id)))
+        .map(|key| key.key_id.clone())
+        .collect();
+    let key_ids: Vec<&str> = new_keys.iter().map(String::as_str).collect();
+    Ok(LocalCiPlan {
+        digest: next.digest()?,
+        generation: i64::try_from(next.generation)
+            .map_err(|_| HubError::Invalid("generation out of range".into()))?,
+        event: Event::local_ci_device(kind, next, repository, by, &key_ids)?,
+        document,
+        new_keys,
+    })
+}
+
+pub(super) fn plan_local_ci_enroll(
+    repository: &str,
+    by: &str,
+    authorization: &DeviceAuthorization,
+    request: &LocalCiRequest,
+) -> Result<LocalCiPlan> {
+    authorization.validate()?;
+    if authorization.generation != 1 || authorization.revoked_at_ms.is_some() {
+        return Err(HubError::Invalid(
+            "a new device authorization must be generation 1 and not revoked".into(),
+        ));
+    }
+    plan_local_ci(
+        "local_ci_device_enrolled",
+        None,
+        authorization,
+        repository,
+        by,
+        request,
+    )
+}
+
+pub(super) fn plan_local_ci_change(
+    current: &LocalCiDevice,
+    by: &str,
+    next: &DeviceAuthorization,
+    request: &LocalCiRequest,
+) -> Result<LocalCiPlan> {
+    let old = &current.authorization;
+    next.validate()?;
+    if next.device_id != old.device_id
+        || next.repository != old.repository
+        || next.owner != old.owner
+        || next.generation != old.generation.saturating_add(1)
+    {
+        return Err(HubError::Invalid(
+            "next authorization must be the same device one generation later".into(),
+        ));
+    }
+    let kind = if next.revoked_at_ms.is_some() {
+        "local_ci_device_revoked"
+    } else {
+        "local_ci_device_rotated"
+    };
+    plan_local_ci(kind, Some(old), next, &current.repository, by, request)
+}
+
+/// The hub repository's label as `Authorization.repository` spells it.
+pub(super) fn local_ci_label(host: &str, full_name: &str) -> String {
+    format!("{host}/{full_name}")
 }
 
 pub(super) fn event_limit(limit: usize) -> i64 {

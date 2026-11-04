@@ -21,6 +21,7 @@ pub mod hook;
 pub mod http;
 pub mod insights;
 pub mod intent;
+pub mod local_ci_devices;
 pub mod login;
 pub mod mcp;
 pub mod narrative;
@@ -449,6 +450,7 @@ pub fn router(state: HubState) -> Router {
         .merge(intent::routes())
         .merge(hook::routes())
         .merge(login::routes())
+        .merge(local_ci_devices::routes())
         .merge(mcp::routes())
         .merge(publish::routes())
         .merge(sync::routes())
