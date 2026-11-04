@@ -121,7 +121,7 @@ fn no_hub_url_is_needed_but_a_git_repository_is() {
     );
     let rule = std::fs::read_to_string(repo.path().join(".cursor/rules/agentscm.mdc")).unwrap();
     assert!(
-        rule.contains("run `agentscm quickstart` once on this machine"),
+        rule.contains("give the user `agentscm quickstart` to run once on this machine"),
         "{rule}"
     );
     assert!(!repo.path().join(".cursor/mcp.json").exists());
@@ -153,7 +153,7 @@ fn a_bad_saved_hub_url_warns_and_is_left_out() {
     );
     let agents = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
     assert!(
-        agents.contains("run `agentscm quickstart` once on this machine"),
+        agents.contains("give the user `agentscm quickstart` to run once on this machine"),
         "{agents}"
     );
     // An explicit --hub-url goes into the printed command, so a bad one is still an error.
