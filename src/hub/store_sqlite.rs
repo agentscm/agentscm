@@ -113,8 +113,8 @@ use super::work_links::{
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::work_transition::{
-    self, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkTransitionActor,
-    WorkTransitionRequest, WorkTransitionResult,
+    self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
+    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
 };
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
@@ -4441,11 +4441,15 @@ fn other_eligible_scopes(
            AND w.reservation_basis IS NOT NULL
            AND p.token=?2 AND p.generation=w.generation
            AND (?3 IS NULL OR p.session=?3)
-         ORDER BY w.id",
+         ORDER BY w.id LIMIT 101",
     )?;
     let rows = statement
         .query_map(params![work, token, session], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // A partial read could let an intent through, so more than the bound fails closed.
+    if rows.len() > MAX_TOKEN_WORK_SCOPES {
+        return Err(HubError::WorkOverlapIncomplete);
+    }
     rows.iter()
         .map(|snapshot| json_value::<WorkItem>(snapshot).map(|item| item.scope))
         .collect()
@@ -4794,7 +4798,7 @@ fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()
              JOIN hub_work_participants p ON p.work=w.id
              WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
                AND w.repository_id IS ?4 AND w.state <> 'finished' AND p.token=?5
-             GROUP BY w.id ORDER BY w.id",
+             GROUP BY w.id ORDER BY w.id LIMIT 101",
         )?;
         statement
             .query_map(
@@ -4815,6 +4819,9 @@ fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
+    if rows.len() > MAX_TOKEN_WORK_SCOPES {
+        return Err(HubError::WorkOverlapIncomplete);
+    }
     let mut eligible = Vec::new();
     let mut ineligible = Vec::new();
     for (id, snapshot, held) in rows {

@@ -2175,6 +2175,7 @@ conformance!(
     plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover,
     plain_announce_allows_paths_covered_by_eligible_work,
     plain_announce_refuses_a_directory_that_overlaps_fenced_work_either_way,
+    plain_announce_fails_closed_beyond_the_token_work_bound,
     release_frees_session_and_sessionless_intents_of_the_scope,
     finish_checkpoint_cleans_up_like_a_terminal_transition,
     ending_work_spares_a_tokens_live_intents_elsewhere,
@@ -4812,6 +4813,26 @@ fn plain_announce_refuses_a_directory_that_overlaps_fenced_work_either_way(db: &
         Err(HubError::Invalid(message)) => assert!(message.contains(&broad.id), "{message}"),
         other => panic!("expected a refusal naming the Work, got {other:?}"),
     }
+}
+
+/// More unfinished Work for one token than the guard reads fails closed instead of letting a
+/// partial read allow the announce; at the bound it still decides normally.
+fn plain_announce_fails_closed_beyond_the_token_work_bound(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    for index in 0..100 {
+        let key = format!("k{index}");
+        start_in(&*store, &alice, &key, &key, &format!("d{index}/**"), now);
+    }
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "d1/a.rs"), now + 1)
+        .unwrap();
+    start_in(&*store, &alice, "k100", "k100", "d100/**", now);
+    assert!(matches!(
+        store.announce_intent(&alice.token, &plain_intent(2, "d1/a.rs"), now + 2),
+        Err(HubError::WorkOverlapIncomplete)
+    ));
 }
 
 /// A lead, a helper with a session intent, a session-less intent of each of them and of an

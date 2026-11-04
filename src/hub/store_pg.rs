@@ -115,8 +115,8 @@ use super::work_links::{
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::work_transition::{
-    self, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkTransitionActor,
-    WorkTransitionRequest, WorkTransitionResult,
+    self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
+    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
 };
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
@@ -4331,19 +4331,23 @@ fn other_eligible_scopes(
     token: &str,
     session: Option<&str>,
 ) -> Result<Vec<Vec<String>>> {
-    tx.query(
+    let rows = tx.query(
         "SELECT DISTINCT w.id, w.snapshot FROM hub_work_items w
          JOIN hub_work_participants p ON p.work=w.id
          WHERE w.id <> $1 AND w.state IN ('active','blocked')
            AND w.reservation_basis IS NOT NULL
            AND p.token=$2 AND p.generation=w.generation
            AND ($3::text IS NULL OR p.session=$3)
-         ORDER BY w.id",
+         ORDER BY w.id LIMIT 101",
         &[&work, &token, &session],
-    )?
-    .iter()
-    .map(|row| json_value::<WorkItem>(&row.get::<_, String>(1)).map(|item| item.scope))
-    .collect()
+    )?;
+    // A partial read could let an intent through, so more than the bound fails closed.
+    if rows.len() > MAX_TOKEN_WORK_SCOPES {
+        return Err(HubError::WorkOverlapIncomplete);
+    }
+    rows.iter()
+        .map(|row| json_value::<WorkItem>(&row.get::<_, String>(1)).map(|item| item.scope))
+        .collect()
 }
 
 fn release_session_intent(
@@ -4660,9 +4664,12 @@ fn guard_announce(
          JOIN hub_work_participants p ON p.work=w.id
          WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
            AND w.repository_id IS NOT DISTINCT FROM $4 AND w.state <> 'finished' AND p.token=$5
-         GROUP BY w.id, w.snapshot ORDER BY w.id",
+         GROUP BY w.id, w.snapshot ORDER BY w.id LIMIT 101",
         &scope,
     )?;
+    if rows.len() > MAX_TOKEN_WORK_SCOPES {
+        return Err(HubError::WorkOverlapIncomplete);
+    }
     let mut eligible = Vec::new();
     let mut ineligible = Vec::new();
     for row in rows {

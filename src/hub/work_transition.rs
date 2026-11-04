@@ -485,6 +485,9 @@ pub(super) fn needs_resume(kind: super::work::CheckpointKind) -> Result<()> {
     Ok(())
 }
 
+/// The most unfinished Work items of one token a scope read looks at; more fail closed.
+pub(super) const MAX_TOKEN_WORK_SCOPES: usize = 100;
+
 /// Separates the refusal text from the JSON list of refused keys inside `HubError::Invalid`.
 /// Only the announce route reads it; the keys never reach a client as part of the text.
 pub(super) const REFUSED_KEYS_MARK: &str = "\u{1f}refused:";
