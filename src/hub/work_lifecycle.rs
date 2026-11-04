@@ -458,7 +458,7 @@ fn actionable(state: WorkState, held: bool, hidden_by_merged_pr: bool) -> Action
     } else {
         (
             Recipient::Lead,
-            "The lead is working and holds the reservation; freshness says whether its claim is current.",
+            "The lead holds the reservation; freshness says whether its claim is current.",
         )
     };
     ActionableV1 {

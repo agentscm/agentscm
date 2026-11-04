@@ -1420,6 +1420,39 @@ async fn work_transition_releases_replays_and_fences_the_old_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_pauses_retained_work_without_dropping_the_retained_reservation() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let item = started["structuredContent"]["work"]["item"].clone();
+    let retain = json!({"work_id": item["id"], "operation_id": "keep",
+        "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+        "session": item["lead_session"], "transition": "retain",
+        "reason": "keep the scope while I step away"});
+    let retained = hub
+        .tool_result(&alice, "agentscm_work_transition", retain)
+        .await;
+    assert_eq!(retained["isError"], false, "{retained}");
+
+    // The MCP stop releases the intent and pauses the Work through an ordinary pause checkpoint.
+    let (done, _) = hub.tool(&alice, "/mcp", "agentscm_done", json!({})).await;
+    assert!(done.contains("paused"), "{done}");
+    let overview = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    let held = &overview["structuredContent"]["operational"]["work"][0];
+    assert_eq!(held["state"], "paused", "{overview}");
+    assert_eq!(held["reservation"]["status"], "held");
+    assert_eq!(held["reservation"]["basis"], "retained", "{held}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "alice-agent");

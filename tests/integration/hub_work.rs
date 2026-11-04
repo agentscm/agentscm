@@ -2177,11 +2177,14 @@ conformance!(
     release_frees_session_and_sessionless_intents_of_the_scope,
     finish_checkpoint_cleans_up_like_a_terminal_transition,
     ending_work_spares_a_tokens_live_intents_elsewhere,
+    finish_at_payload_quota_succeeds_in_its_cleanup,
+    an_exact_finish_replay_repeats_no_release,
     ending_work_spares_a_session_that_is_eligible_on_other_work,
     ending_work_that_held_nothing_leaves_sessionless_intents,
     released_work_resumes_in_any_state_and_refuses_reports_until_then,
     resuming_released_work_conflicts_on_overlap_without_mutation,
     reopen_by_another_session_retargets_open_requests,
+    resuming_released_work_retargets_requests_only_when_the_lead_changes,
     pause_and_handover_keep_a_retained_reservation,
     requests_that_propose_ended_work_are_marked_released_too,
     read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores,
@@ -3373,12 +3376,19 @@ fn unreserved_work_needs_fresh_admission_to_be_taken_over(db: &Db) {
     let bob = agent(&*store, 2);
     let carol = agent(&*store, 3);
     let now = unix_now();
-    let released = store
+    let started = store
         .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
         .unwrap()
         .item;
-    // No store operation releases a reservation yet; stage the state a later release leaves.
-    db.sql("UPDATE hub_work_items SET reservation_basis = NULL");
+    // A real release leaves the Work unfinished with no reservation.
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&started, "rel", WorkTransitionKind::Release, Some("s-a")),
+            now,
+        )
+        .unwrap()
+        .item;
     let holder = store
         .work_start(&bob.token, &native_start("b", "b", "s-b"), now + 1)
         .unwrap();
@@ -3389,7 +3399,7 @@ fn unreserved_work_needs_fresh_admission_to_be_taken_over(db: &Db) {
     let mut widen = checkpoint(
         &released.id,
         "widen",
-        1,
+        released.generation,
         "s-a",
         CheckpointKind::Pause,
         "widen",
@@ -4995,6 +5005,124 @@ fn finish_checkpoint_cleans_up_like_a_terminal_transition(db: &Db) {
     assert_eq!(data["actor"]["kind"], "lead");
 }
 
+/// An open request that targets Work of alice's, from bob, who declares an overlapping scope.
+fn open_request_on(
+    store: &dyn Store,
+    bob: &Agent,
+    scope: &str,
+    now: i64,
+) -> agentscm::hub::coordination::CoordinationRequest {
+    let mut start = native_start("b", "b", "s-b");
+    start.scope = vec![scope.into()];
+    store
+        .work_start(&bob.token, &start, now)
+        .unwrap()
+        .coordination_request
+        .unwrap()
+}
+
+fn finish_at_payload_quota_succeeds_in_its_cleanup(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    open_request_on(&*store, &bob, "src/**", now + 1);
+    let item = current_item(&*store, &alice, &item.id, now + 2);
+    // Leave just enough room for the finish checkpoint itself; the cleanup then records its
+    // request event past the quota and must not refuse the finish.
+    let mut request = checkpoint(
+        &item.id,
+        "fin",
+        item.generation,
+        "s-a",
+        CheckpointKind::Finish,
+        "step",
+    );
+    request.expected_updated_seq = Some(item.updated_seq);
+    let mut finished = None;
+    for headroom in (25..40_000).step_by(25) {
+        db.sql(&format!(
+            "UPDATE hub_work_usage SET charged_bytes = {}
+             WHERE repository = '{REPO}'",
+            WORK_PAYLOAD_CAPACITY_BYTES - headroom
+        ));
+        match store.work_checkpoint(&alice.token, &request, now + 3) {
+            Ok(result) => {
+                finished = Some(result);
+                break;
+            }
+            Err(HubError::WorkCapacity) => {}
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+    }
+    let finished = finished.expect("a finish fits some headroom");
+    assert_eq!(finished.item.state, WorkState::Finished);
+    let charged: i64 = db.rows(&format!(
+        "SELECT charged_bytes FROM hub_work_usage WHERE repository = '{REPO}'"
+    ))[0][0]
+        .parse()
+        .unwrap();
+    assert!(
+        charged > WORK_PAYLOAD_CAPACITY_BYTES,
+        "cleanup is recorded past the quota, not refused"
+    );
+    assert_eq!(
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "coordination_target_released")
+            .count(),
+        1
+    );
+}
+
+fn an_exact_finish_replay_repeats_no_release(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    open_request_on(&*store, &bob, "src/**", now + 1);
+    let item = current_item(&*store, &alice, &item.id, now + 2);
+    let mut request = checkpoint(
+        &item.id,
+        "fin",
+        item.generation,
+        "s-a",
+        CheckpointKind::Finish,
+        "step",
+    );
+    request.expected_updated_seq = Some(item.updated_seq);
+    let first = store
+        .work_checkpoint(&alice.token, &request, now + 3)
+        .unwrap();
+    assert!(!first.receipt.replayed);
+    let released = |store: &dyn Store| {
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "coordination_target_released")
+            .count()
+    };
+    assert_eq!(released(&*store), 1);
+    // An advisory intent posted after the finish is not taken by a replay of the finish.
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "src/z.rs"), now + 4)
+        .unwrap();
+    let seq = store.latest_event_seq().unwrap();
+    let replay = store
+        .work_checkpoint(&alice.token, &request, now + 5)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, first.receipt.event_seq);
+    assert_eq!(released(&*store), 1);
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+    assert_eq!(live_keys(db), ["src/z.rs"]);
+}
+
 fn released_work_resumes_in_any_state_and_refuses_reports_until_then(db: &Db) {
     use WorkTransitionKind::Release;
     let store = db.open();
@@ -5185,6 +5313,95 @@ fn resuming_released_work_conflicts_on_overlap_without_mutation(db: &Db) {
     assert_eq!(unchanged.generation, released.generation);
     assert_eq!(unchanged.updated_seq, released.updated_seq);
     assert_eq!(db.reservation(&item.id), (None, None));
+}
+
+fn resuming_released_work_retargets_requests_only_when_the_lead_changes(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let request = open_request_on(&*store, &bob, "src/**", now + 1);
+    let acked = store
+        .coordination_ack(
+            &alice.token,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: Some(item.id.clone()),
+                session: "s-a".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 2,
+        )
+        .unwrap();
+    store
+        .coordination_reply(
+            &alice.token,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "reply".into(),
+                target_work_id: item.id.clone(),
+                session: "s-a".into(),
+                expected_updated_seq: acked.updated_seq,
+                kind: CoordinationResponseKind::Join,
+                note: None,
+                via_hub: false,
+            },
+            now + 3,
+        )
+        .unwrap();
+    let status = || {
+        db.rows(&format!(
+            "SELECT status FROM hub_coordination_requests WHERE id = '{}'",
+            request.id
+        ))[0][0]
+            .clone()
+    };
+    let current = current_item(&*store, &alice, &item.id, now + 4);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-a")),
+            now + 4,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(status(), "responded");
+
+    // The same token and session resume: the lead is unchanged, so the answer stands.
+    let resumed = store
+        .work_start(
+            &alice.token,
+            &takeover(&item.id, "s-a", Some(released.generation)),
+            now + 5,
+        )
+        .unwrap();
+    assert!(resumed.took_over);
+    assert_eq!(status(), "responded");
+    assert_eq!(work_event_count(&*store, "coordination_retargeted"), 0);
+
+    // Another token of the owner resumes after a second release: the lead changes and the
+    // request waits for the new lead again.
+    let current = current_item(&*store, &alice, &item.id, now + 6);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel-2", Release, Some("s-a")),
+            now + 6,
+        )
+        .unwrap()
+        .item;
+    store
+        .work_start(
+            &alice_b.token,
+            &takeover(&item.id, "s-b", Some(released.generation)),
+            now + 7,
+        )
+        .unwrap();
+    assert_eq!(status(), "pending");
+    assert_eq!(work_event_count(&*store, "coordination_retargeted"), 1);
 }
 
 fn reopen_by_another_session_retargets_open_requests(db: &Db) {

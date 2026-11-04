@@ -126,7 +126,7 @@ In the same transaction, in both stores:
   event kind `coordination_target_released` and a saved version with their status unchanged, so a
   responded request stays responded. No request is resolved automatically. All of them are
   processed; creation already bounds how many exist. A reopen that changes the lead session
-  retargets the requests that target the Work, as a takeover does, so they wait for the new lead.
+  retargets the requests that target the Work, as a takeover does, so they wait for the new lead. A resume or takeover retargets them only when the lead token or session changes; the same lead resuming leaves their status alone.
 - Release and terminal transitions are cleanup and succeed at the payload quota; the accounting
   records the change without refusing. A `finish` checkpoint keeps the normal capacity check for
   itself and records its cleanup rows without one, so the cleanup never causes a refusal. Reopen

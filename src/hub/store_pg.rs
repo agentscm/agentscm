@@ -3522,7 +3522,17 @@ fn start_in(
         let snapshot = save_work_version(tx, &item, seq)?;
         set_work_reservation(tx, &item.id, None, Some("admitted"))?;
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
-        retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
+        // Requests follow a new lead; the same lead resuming keeps them as they are.
+        if previous_lead_token != who.token || previous_lead_session != start.session {
+            retarget_coordination_requests(
+                tx,
+                who,
+                &item.id,
+                item.generation,
+                &start.session,
+                now,
+            )?;
+        }
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
