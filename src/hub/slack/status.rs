@@ -176,18 +176,43 @@ fn render_status(status: &ActionableStatus) -> String {
     for action in &mut copy.actions {
         action.action = sanitize(&action.action, 180);
     }
-    let mut text = actionable_status::render_text(&copy);
+    let rendered = actionable_status::render_text(&copy);
+    // The shared renderer ends with coverage and evidence. Reserve that footer before
+    // clipping details so the visible Slack block cannot turn partial counts into clear status.
+    let (details, evidence) = rendered
+        .rsplit_once('\n')
+        .expect("status has an evidence footer");
+    let coverage = "Coverage incomplete; missing signals remain unknown.";
+    let details = if status.complete {
+        details
+    } else {
+        details.strip_suffix(coverage).unwrap_or(details).trim_end()
+    };
+    let mut footer = if status.complete {
+        String::new()
+    } else {
+        format!("{coverage}\n")
+    };
+    footer.push_str(evidence);
     if status.work.iter().any(|w| {
         w.limits
             .iter()
             .any(|l| l == "provider_coverage_unavailable")
     }) {
-        text.push_str("\nProvider evidence is unavailable; this is not clear status.");
+        footer.push_str("\nProvider evidence is unavailable; this is not clear status.");
     }
-    if status.work.len() > 4 || status.actions.len() > 4 {
-        text.push_str("\nThis private reply lists at most four tasks and four personal actions; more evidence is available in the Hub.");
+    if status.work.len() > 4
+        || status.actions.len() > 4
+        || details.chars().count() + footer.chars().count() + 1 > 3000
+    {
+        footer.push_str("\nThis private reply shortens details to at most four tasks and four personal actions; more evidence is available in the Hub.");
     }
-    text
+    let room = 3000usize.saturating_sub(footer.chars().count() + 1);
+    let details = plain_lines(details, room);
+    format!(
+        "{}\n{footer}",
+        details["text"].as_str().expect("plain text")
+    )
 }
 
 impl Slack {
@@ -786,6 +811,35 @@ fn confirmed_cleared(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_visible_status_keeps_coverage_evidence_and_omission_notice() {
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("../fixtures/actionable-status.json")).unwrap();
+        let mut work = status.work[0].clone();
+        work.title = "t".repeat(100);
+        work.action = "a".repeat(180);
+        work.limits.push("provider_coverage_unavailable".into());
+        work.reconciliation = Some(serde_json::from_value(json!({
+            "current": false, "declaration_seq": 1, "current_evidence_digest": null,
+            "current_source_coverage": [
+                {"source":"forge_pull", "state":"unavailable", "checked_at_seconds":1234567890, "unread_pages":1, "deferred":1},
+                {"source":"forge_checks", "state":"unavailable", "checked_at_seconds":1234567890, "unread_pages":1, "deferred":1}
+            ], "stale_reasons":[], "digest":"synthetic"
+        })).unwrap());
+        status.work = vec![work; 4];
+        let mut action = status.actions[0].clone();
+        action.needs_you = true;
+        action.action = "x".repeat(180);
+        status.actions = vec![action; 4];
+        let message = body(&render_status(&status));
+        let visible = message["blocks"][0]["text"]["text"].as_str().unwrap();
+        assert!(visible.chars().count() <= 3000);
+        assert!(visible.contains("Coverage incomplete; missing signals remain unknown."));
+        assert!(visible.contains(&format!("Evidence revision {}", status.digest)));
+        assert!(visible.contains("Provider evidence is unavailable"));
+        assert!(visible.contains("shortens details"));
+    }
+
     #[test]
     fn frozen_status_uses_shared_counts_and_names_provider_failure_without_prose() {
         let mut status: ActionableStatus =
