@@ -16,7 +16,7 @@ Commit the intended working-tree changes with a factual message. If `$ARGUMENTS`
    cargo clippy --all-targets --locked -- -D warnings
    ```
 
-   and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite to commit; the one full run of a head that is ready to merge is its attestation, as in `.agents/commands/pr.md`.
+   and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite to commit; when the recipe selects the Rust gate, the one full run of a head that is ready to merge is its attestation, as in `.agents/commands/pr.md`.
 
    When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore`, root `compose.yaml` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `.github/hub-e2e.sh default` only when `compose.hub.yaml`, `.github/compose.e2e.yaml` or `.github/hub-e2e.sh` change; the `postgres` profile runs only in the hosted `Hub end-to-end` workflow. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
 
