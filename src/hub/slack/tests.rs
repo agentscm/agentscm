@@ -1378,6 +1378,60 @@ async fn opt_in_reminders_retry_deduplicate_escalate_and_resolve() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoked_escalation_recipient_does_not_block_later_status_queries() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "revoked-escalation");
+    status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    scan_status(&f, now + 902);
+    tokio::task::block_in_place(|| {
+        let slack = f.slack();
+        let target = slack.principal(&f.state, &slack.bindings[1]).unwrap();
+        assert!(f.state.store.revoke_agent_token(&target.token_id).unwrap());
+    });
+    f.slack()
+        .database()
+        .unwrap()
+        .execute(
+            "UPDATE status_jobs SET due=0,created=0 WHERE kind='escalation'",
+            [],
+        )
+        .unwrap();
+    f.post(
+        status_event("EvAFTERREVOKE", "U1", "status").to_string(),
+        true,
+    )
+    .await;
+    let sent_before = status_text(&f).len();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert_eq!(status_text(&f).len(), sent_before);
+    assert_eq!(
+        f.slack()
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_jobs WHERE kind='escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        "suppressed"
+    );
+    f.slack().deliver(&f.state).await.unwrap();
+    let sent = status_text(&f);
+    assert_eq!(sent.len(), sent_before + 1);
+    assert_eq!(sent.last().unwrap().0, "U1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changed_action_suppresses_reminder_before_delivery_and_quiet_work_is_not_reminded() {
     let f = Fixture::configured(Some(policy()), false).await;
     let work = status_work(&f, &f.alice, "suppressed");

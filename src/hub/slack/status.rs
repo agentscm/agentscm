@@ -584,7 +584,14 @@ impl Slack {
                         self.obsolete_status_job(&id)?;
                         return Ok(None);
                     };
-                    self.principal(state, target)?;
+                    match self.principal(state, target) {
+                        Ok(_) => {}
+                        Err(HubError::Unauthorized) => {
+                            self.obsolete_status_job(&id)?;
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else if user != binding.config.slack_user {
                     return Err(HubError::Unauthorized);
                 }
