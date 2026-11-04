@@ -2174,7 +2174,7 @@ async fn view_settings_are_per_user_over_a_hub_default() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_start_that_reads_like_live_work_says_to_ask_the_user() {
+async fn a_start_that_reads_like_live_work_lists_it_for_the_agent_to_decide() {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "alice-agent");
     let bob = hub.secret(2, "bob-agent");
@@ -2197,7 +2197,9 @@ async fn a_start_that_reads_like_live_work_says_to_ask_the_user() {
     assert!(
         said.contains("this task reads like work already under way")
             && said.contains("\"make db migrations filename based\"")
-            && said.contains("Ask the user whether this is the same work"),
+            && said.contains(&format!("work {}", work_id.as_str().unwrap()))
+            && said.contains("Decide from the titles and your scope whether this is the same work")
+            && !said.contains("Ask the user"),
         "{said}"
     );
     let events = |kind: &str| {
