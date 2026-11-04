@@ -298,7 +298,10 @@ impl ApiError {
 impl From<HubError> for ApiError {
     fn from(error: HubError) -> Self {
         match error {
-            HubError::Invalid(_) => Self::invalid(),
+            HubError::Invalid(detail) => {
+                eprintln!("hub: request rejected as invalid: {detail:?}");
+                Self::invalid()
+            }
             HubError::WorkCheckpointSequenceConflict { current_seq } => Self {
                 status: StatusCode::CONFLICT,
                 code: "work_checkpoint_sequence_conflict",
