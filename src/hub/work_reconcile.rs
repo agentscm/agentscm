@@ -3,7 +3,17 @@
 //! The caller-reported link, provider merge evidence, the open-PR observation, the agent-reported
 //! outcome, the reservation and coverage stay separate. A merge never proves task success, and a
 //! missing fact stays `unknown`. `reconcile` is pure; `read` gathers its facts through the
-//! existing read-only Store calls and changes no state.
+//! existing Store reads. The report changes no Work, reservation or delivery state, but the
+//! catch-up preview it uses for coverage can run the existing publication backfill, which can
+//! write catch-up rows.
+//!
+//! A merge row outranks an open observation: a merged PR cannot be reopened, and only a
+//! re-read tombstones the observation, so the observation is stale. An open observation applies
+//! only when no merge row exists, and it carries its read time (`open_observed_at_ms`).
+//! `reassess.needed` means a blocker exists and a prerequisite is satisfied; relevance to that
+//! blocker is not assessed. `reservation` carries the caller-chosen `holder_agent` and
+//! `holder_session` labels, which are untrusted text, as `/operational` does. The digest covers
+//! coverage, so it can change during a poll with no PR change.
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +46,12 @@ pub(super) struct PrFacts<'a> {
     pub(super) merged: Option<bool>,
     /// Current head of an open-PR observation, when one exists.
     pub(super) open_head: Option<&'a str>,
+    /// Milliseconds when the forge read behind `open_head` started.
+    pub(super) open_observed_at: Option<i64>,
+    /// `observation_malformed` or `observation_unavailable` when the observation read failed.
+    pub(super) observation_limit: Option<&'static str>,
+    /// The catch-up preview reports merge history older than retention.
+    pub(super) merge_gap: bool,
 }
 
 pub(super) struct PrerequisiteFacts<'a> {
@@ -53,7 +69,7 @@ pub(super) struct ReconcileFacts<'a> {
     pub(super) pr: PrFacts<'a>,
     pub(super) coverage: CatchupCoverageState,
     pub(super) prerequisites: &'a [PrerequisiteFacts<'a>],
-    /// Limits found while reading, such as `prerequisites_truncated`.
+    /// Work-level limits found while reading, such as `prerequisites_truncated`.
     pub(super) read_limits: &'a [&'static str],
 }
 
@@ -95,6 +111,9 @@ pub struct ProviderV1 {
     pub status: ProviderStatus,
     pub head_relation: HeadRelation,
     pub coverage: CatchupCoverageState,
+    /// Unix milliseconds when the forge read behind an `open_*` status started; the status is
+    /// as old as this. Absent for any other status. A clock field, outside the digest.
+    pub open_observed_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -113,6 +132,10 @@ pub struct PrerequisiteV1 {
     pub provider: ProviderStatus,
     /// What the prerequisite's agent reported. Never makes the prerequisite satisfied.
     pub reported_outcome: Option<OutcomeValue>,
+    /// The prerequisite's own caller-reported link; no token.
+    pub link: Option<PrLinkV1>,
+    /// Sorted, deduplicated reasons this row's facts are missing or weak.
+    pub limits: Vec<String>,
 }
 
 /// Blocker time and kind only. The blocker's text is untrusted and is never copied.
@@ -146,6 +169,14 @@ pub struct WorkReconciliationV1 {
     pub digest: String,
 }
 
+fn pr_link_v1(link: &WorkPrLink) -> PrLinkV1 {
+    PrLinkV1 {
+        basis: LinkBasis::CallerReported,
+        number: link.target.number,
+        head_sha: link.target.head_sha.clone(),
+    }
+}
+
 fn provider_status(
     pr: &PrFacts<'_>,
     limits: &mut BTreeSet<String>,
@@ -158,51 +189,73 @@ fn provider_status(
         limits.insert("no_pr_link".to_owned());
         return (ProviderStatus::NotLinked, HeadRelation::Unknown);
     };
-    if pr.merged == Some(true) && pr.open_head.is_some() {
-        limits.insert("merge_and_open_observed".to_owned());
+    if let Some(limit) = pr.observation_limit {
+        limits.insert(limit.to_owned());
+    }
+    if pr.merged != Some(true) && pr.merge_gap {
+        limits.insert("merge_retention_gap".to_owned());
+    }
+    // A merge row outranks an open observation. A merged PR cannot be reopened and only a
+    // re-read tombstones the observation, so an observation beside a merge row is stale.
+    if pr.merged == Some(true) {
+        if pr.open_head.is_some() {
+            limits.insert("merge_and_open_observed".to_owned());
+        }
+        limits.insert("merge_head_not_compared".to_owned());
+        return (ProviderStatus::Merged, HeadRelation::Unknown);
     }
     if let Some(head) = pr.open_head {
-        // An open observation outranks a merge row, which a reopened PR may still have.
-        return if head == link.target.head_sha {
+        return if head.eq_ignore_ascii_case(&link.target.head_sha) {
             (ProviderStatus::OpenSameHead, HeadRelation::Same)
         } else {
             (ProviderStatus::OpenHeadChanged, HeadRelation::Changed)
         };
     }
     match pr.merged {
-        Some(true) => {
-            limits.insert("merge_head_not_compared".to_owned());
-            (ProviderStatus::Merged, HeadRelation::Unknown)
-        }
         Some(false) => {
-            limits.insert("closed_state_not_readable".to_owned());
-            (ProviderStatus::Unknown, HeadRelation::Unknown)
+            if pr.observation_limit.is_none() {
+                limits.insert("closed_state_not_readable".to_owned());
+            }
         }
-        None => {
+        _ => {
             limits.insert("merge_lookup_unavailable".to_owned());
-            (ProviderStatus::Unknown, HeadRelation::Unknown)
         }
     }
+    (ProviderStatus::Unknown, HeadRelation::Unknown)
 }
 
-fn prerequisite(facts: Option<&PrerequisiteFacts<'_>>, id: &str) -> PrerequisiteV1 {
-    let provider = facts
-        .and_then(|f| f.pr.as_ref())
-        .map_or(ProviderStatus::Unknown, |pr| {
-            provider_status(pr, &mut BTreeSet::new()).0
-        });
+/// An open prerequisite is `not_satisfied` only on complete observation; during an outage the
+/// open status may be stale, so it is `unknown`. A merge row stays `satisfied` either way.
+fn prerequisite(
+    facts: Option<&PrerequisiteFacts<'_>>,
+    id: &str,
+    coverage: CatchupCoverageState,
+) -> PrerequisiteV1 {
+    let mut limits = BTreeSet::new();
+    let pr = facts.and_then(|f| f.pr.as_ref());
+    let provider = match pr {
+        Some(pr) => provider_status(pr, &mut limits).0,
+        None => {
+            limits.insert("prerequisite_unreadable".to_owned());
+            ProviderStatus::Unknown
+        }
+    };
     let state = match provider {
         ProviderStatus::Merged => PrerequisiteState::Satisfied,
-        ProviderStatus::OpenSameHead | ProviderStatus::OpenHeadChanged => {
+        ProviderStatus::OpenSameHead | ProviderStatus::OpenHeadChanged
+            if coverage == CatchupCoverageState::ObservedOnly =>
+        {
             PrerequisiteState::NotSatisfied
         }
-        ProviderStatus::Unknown | ProviderStatus::NotLinked => PrerequisiteState::Unknown,
+        _ => PrerequisiteState::Unknown,
     };
     PrerequisiteV1 {
         work_id: id.to_owned(),
         state,
         provider,
         reported_outcome: facts.and_then(|f| f.outcome),
+        link: pr.and_then(|pr| pr.link).map(pr_link_v1),
+        limits: limits.into_iter().collect(),
     }
 }
 
@@ -223,7 +276,10 @@ pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
     let ids: BTreeSet<&str> = item.depends_on.iter().map(String::as_str).collect();
     let prerequisites: Vec<PrerequisiteV1> = ids
         .into_iter()
-        .map(|id| prerequisite(facts.prerequisites.iter().find(|f| f.work_id == id), id))
+        .map(|id| {
+            let found = facts.prerequisites.iter().find(|f| f.work_id == id);
+            prerequisite(found, id, facts.coverage)
+        })
         .collect();
     let any_satisfied = prerequisites
         .iter()
@@ -238,15 +294,17 @@ pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
         work_id: item.id.clone(),
         generation: item.generation,
         updated_seq: item.updated_seq,
-        link: facts.pr.link.map(|l| PrLinkV1 {
-            basis: LinkBasis::CallerReported,
-            number: l.target.number,
-            head_sha: l.target.head_sha.clone(),
-        }),
+        link: facts.pr.link.map(pr_link_v1),
         provider: ProviderV1 {
             status,
             head_relation,
             coverage: facts.coverage,
+            open_observed_at_ms: matches!(
+                status,
+                ProviderStatus::OpenSameHead | ProviderStatus::OpenHeadChanged
+            )
+            .then_some(facts.pr.open_observed_at)
+            .flatten(),
         },
         outcome: facts.outcome.clone(),
         merged_holding_reservation: status == ProviderStatus::Merged
@@ -258,9 +316,10 @@ pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
         atomic_snapshot: false,
         digest: String::new(),
     };
-    // The blocker time is a clock field; it stays out of the digest.
+    // The blocker and observation times are clock fields; they stay out of the digest.
     let mut hashed = out.clone();
     hashed.reassess.blocker_at = None;
+    hashed.provider.open_observed_at_ms = None;
     let json = serde_json::to_string(&hashed).expect("reconciliation serializes");
     out.digest = identity(&[&json]);
     out
@@ -272,7 +331,9 @@ struct PrRead {
     link: Option<WorkPrLink>,
     link_unavailable: bool,
     merged: Option<bool>,
-    open_head: Option<String>,
+    open: Option<(String, i64)>,
+    observation_limit: Option<&'static str>,
+    merge_gap: bool,
 }
 
 impl PrRead {
@@ -281,7 +342,10 @@ impl PrRead {
             link: self.link.as_ref(),
             link_unavailable: self.link_unavailable,
             merged: self.merged,
-            open_head: self.open_head.as_deref(),
+            open_head: self.open.as_ref().map(|(head, _)| head.as_str()),
+            open_observed_at: self.open.as_ref().map(|(_, at)| *at),
+            observation_limit: self.observation_limit,
+            merge_gap: self.merge_gap,
         }
     }
 }
@@ -295,7 +359,7 @@ fn read_pr(
     scope: &CatchupRepositoryScope,
     work_id: &str,
     now: i64,
-    limits: &mut BTreeSet<&'static str>,
+    merge_gap: bool,
 ) -> Result<Option<PrRead>> {
     let view = match store.work_pr_link_get(
         &principal.token_id,
@@ -313,29 +377,30 @@ fn read_pr(
         }
         Err(error) => return Err(error),
     };
-    let mut read = PrRead::default();
+    let mut read = PrRead {
+        merge_gap,
+        ..PrRead::default()
+    };
     let Some(link) = view.link else {
         return Ok(Some(read));
     };
     let number = link.target.number;
     read.merged = store.catchup_merge_known(scope, number, None).ok();
     match open_head(store, principal, number) {
-        Ok(head) => read.open_head = head,
-        Err(limit) => {
-            limits.insert(limit);
-        }
+        Ok(open) => read.open = open,
+        Err(limit) => read.observation_limit = Some(limit),
     }
     read.link = Some(link);
     Ok(Some(read))
 }
 
-/// The head of an open observation. Closed pull requests have no observation; a malformed one
-/// gives no head and a limit.
+/// The head and read time of an open observation. Ingestion tombstones a closed pull request,
+/// so it has no observation; a malformed one gives no head and a limit.
 fn open_head(
     store: &dyn Store,
     principal: &Principal,
     number: i64,
-) -> std::result::Result<Option<String>, &'static str> {
+) -> std::result::Result<Option<(String, i64)>, &'static str> {
     let Ok(repository) = super::sync::find_repository(
         store,
         &principal.owner.identity.host,
@@ -361,13 +426,14 @@ fn open_head(
     value["head_sha"]
         .as_str()
         .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map(|sha| Some(sha.to_owned()))
+        .map(|sha| Some((sha.to_owned(), observation.observed_at)))
         .ok_or("observation_malformed")
 }
 
 /// Coverage of the repository's merge sources: the weakest source wins, and no recorded source
-/// is unavailable. Read through the catch-up preview, which creates no delivery.
-fn read_coverage(store: &dyn Store, token: &str, now: i64) -> CatchupCoverageState {
+/// is unavailable, and whether the preview reports a merge retention gap. Read through the
+/// catch-up preview, which creates no delivery but can run the publication backfill.
+fn read_coverage(store: &dyn Store, token: &str, now: i64) -> (CatchupCoverageState, bool) {
     let Ok(preview) = store.work_catchup_preview(
         token,
         &CatchupPreviewQuery {
@@ -375,10 +441,11 @@ fn read_coverage(store: &dyn Store, token: &str, now: i64) -> CatchupCoverageSta
         },
         now,
     ) else {
-        return CatchupCoverageState::Unavailable;
+        return (CatchupCoverageState::Unavailable, false);
     };
+    let merge_gap = preview.retention.merge_gap;
     let states = preview.source_coverage.iter().map(|c| c.state);
-    if states.clone().count() == 0
+    let state = if states.clone().count() == 0
         || states
             .clone()
             .any(|s| s == CatchupCoverageState::Unavailable)
@@ -391,7 +458,8 @@ fn read_coverage(store: &dyn Store, token: &str, now: i64) -> CatchupCoverageSta
         CatchupCoverageState::Incomplete
     } else {
         CatchupCoverageState::ObservedOnly
-    }
+    };
+    (state, merge_gap)
 }
 
 /// Reconcile one Work from separate read-only Store calls. The reads are not one snapshot; the
@@ -436,14 +504,16 @@ pub fn read(
         repository: principal.repository.clone(),
         repository_id: principal.repository_id,
     };
-    let pr = read_pr(store, principal, &scope, &item.id, now, &mut limits)?.unwrap_or_default();
+    // Coverage first, so a backfill during the preview cannot make the PR reads miss a merge.
+    let (coverage, merge_gap) = read_coverage(store, token, now);
+    let pr = read_pr(store, principal, &scope, &item.id, now, merge_gap)?.unwrap_or_default();
     // Only a prerequisite the token can read gets facts; the others stay unknown, unnamed.
     let mut prerequisite_reads = Vec::new();
     for id in &wanted {
         let Some(projection) = operational.iter().find(|w| &w.work_id == id) else {
             continue;
         };
-        let Ok(Some(read)) = read_pr(store, principal, &scope, id, now, &mut limits) else {
+        let Ok(Some(read)) = read_pr(store, principal, &scope, id, now, merge_gap) else {
             continue;
         };
         prerequisite_reads.push((id.as_str(), read, projection.outcome.value));
@@ -456,14 +526,14 @@ pub fn read(
             outcome: Some(*outcome),
         })
         .collect();
-    let coverage = read_coverage(store, token, now);
-    let unchanged = store
-        .work_get(token, work_id, now)
-        .ok()
-        .flatten()
-        .is_some_and(|again| again.updated_seq == item.updated_seq);
-    if !unchanged {
-        limits.insert("work_changed_during_read");
+    match store.work_get(token, work_id, now) {
+        Ok(Some(again)) if again.updated_seq == item.updated_seq => {}
+        Ok(_) => {
+            limits.insert("work_changed_during_read");
+        }
+        Err(_) => {
+            limits.insert("work_recheck_unavailable");
+        }
     }
     let read_limits: Vec<&'static str> = limits.into_iter().collect();
     Ok(Some(reconcile(&ReconcileFacts {
@@ -656,17 +726,17 @@ mod tests {
                 Some(&l),
                 Some(true),
                 Some("aaa"),
-                P::OpenSameHead,
-                Same,
-                &["merge_and_open_observed"],
+                P::Merged,
+                U,
+                &["merge_and_open_observed", "merge_head_not_compared"],
             ),
             (
                 Some(&l),
                 Some(true),
                 Some("bbb"),
-                P::OpenHeadChanged,
-                Changed,
-                &["merge_and_open_observed"],
+                P::Merged,
+                U,
+                &["merge_and_open_observed", "merge_head_not_compared"],
             ),
             (
                 Some(&l),
@@ -691,6 +761,126 @@ mod tests {
             sorted.dedup();
             assert_eq!(out.limits, sorted);
         }
+    }
+
+    #[test]
+    fn open_head_compares_case_insensitively_with_a_time_outside_the_digest() {
+        let l = link(5, "aaaa");
+        let it = item(WorkState::Active, &[], false);
+        let at = |t| {
+            reconcile(&facts(
+                &it,
+                None,
+                None,
+                PrFacts {
+                    link: Some(&l),
+                    open_head: Some("AAAA"),
+                    open_observed_at: Some(t),
+                    ..PrFacts::default()
+                },
+                CatchupCoverageState::ObservedOnly,
+                &[],
+            ))
+        };
+        let (x, y) = (at(100), at(200));
+        assert_eq!(x.provider.status, ProviderStatus::OpenSameHead);
+        assert_eq!(x.provider.open_observed_at_ms, Some(100));
+        assert_eq!(x.digest, y.digest);
+        let merged = run(&it, Some(&l), Some(true), Some("aaaa"), None, &[]);
+        assert_eq!(merged.provider.open_observed_at_ms, None);
+    }
+
+    #[test]
+    fn observation_and_retention_limits_say_what_happened() {
+        let l = link(5, "aaa");
+        let it = item(WorkState::Active, &[], false);
+        let run = |merged, observation_limit, merge_gap| {
+            reconcile(&facts(
+                &it,
+                None,
+                None,
+                PrFacts {
+                    link: Some(&l),
+                    merged,
+                    observation_limit,
+                    merge_gap,
+                    ..PrFacts::default()
+                },
+                CatchupCoverageState::ObservedOnly,
+                &[],
+            ))
+        };
+        let bad = run(Some(false), Some("observation_malformed"), false);
+        assert!(has(&bad, "observation_malformed") && !has(&bad, "closed_state_not_readable"));
+        let gap = run(Some(false), None, true);
+        assert!(has(&gap, "merge_retention_gap") && has(&gap, "closed_state_not_readable"));
+        let merged = run(Some(true), None, true);
+        assert!(!has(&merged, "merge_retention_gap"));
+    }
+
+    fn has(out: &WorkReconciliationV1, limit: &str) -> bool {
+        out.limits.iter().any(|l| l == limit)
+    }
+
+    #[test]
+    fn prerequisite_evidence_and_outage_handling() {
+        let l = link(8, "ccc");
+        let it = item(
+            WorkState::Blocked,
+            &["dep-a", "dep-b", "dep-c", "dep-d"],
+            true,
+        );
+        let prereqs = [
+            prereq("dep-a", Some(&l), Some(false), Some("ccc"), None),
+            prereq("dep-b", Some(&l), Some(true), Some("ccc"), None),
+            PrerequisiteFacts {
+                work_id: "dep-d",
+                pr: Some(PrFacts {
+                    link: Some(&l),
+                    merged: Some(false),
+                    observation_limit: Some("observation_malformed"),
+                    ..PrFacts::default()
+                }),
+                outcome: None,
+            },
+        ];
+        let with = |coverage| {
+            reconcile(&facts(
+                &it,
+                None,
+                None,
+                PrFacts::default(),
+                coverage,
+                &prereqs,
+            ))
+        };
+        let ok = with(CatchupCoverageState::ObservedOnly);
+        assert_eq!(ok.prerequisites[0].state, PrerequisiteState::NotSatisfied);
+        assert_eq!(ok.prerequisites[0].link.as_ref().unwrap().number, 8);
+        for coverage in [
+            CatchupCoverageState::Incomplete,
+            CatchupCoverageState::Unavailable,
+        ] {
+            let out = with(coverage);
+            assert_eq!(out.prerequisites[0].state, PrerequisiteState::Unknown);
+            assert_eq!(out.prerequisites[0].provider, ProviderStatus::OpenSameHead);
+            // Retained merge evidence still counts, even beside a stale open observation.
+            assert_eq!(out.prerequisites[1].state, PrerequisiteState::Satisfied);
+            assert!(out.reassess.needed);
+        }
+        assert_eq!(
+            ok.prerequisites[1].limits,
+            ["merge_and_open_observed", "merge_head_not_compared"]
+        );
+        // The unreadable one carries its own limit and no data.
+        let c = &ok.prerequisites[2];
+        assert_eq!(c.work_id, "dep-c");
+        assert_eq!(c.limits, ["prerequisite_unreadable"]);
+        assert!(c.link.is_none() && c.reported_outcome.is_none());
+        // A malformed observation lands on its row, not the Work's limits.
+        let d = &ok.prerequisites[3];
+        assert!(d.limits.contains(&"observation_malformed".to_owned()));
+        assert!(!has(&ok, "observation_malformed"));
     }
 
     #[test]
@@ -748,10 +938,17 @@ mod tests {
         assert!(held.merged_holding_reservation);
         assert_eq!(held.reservation.status, ReservationStatus::Held);
         assert_eq!(held.reservation.scope, it.scope);
+        for basis in [ReservationBasis::Retained, ReservationBasis::LegacyImplicit] {
+            let out = run(&it, Some(&l), Some(true), None, Some(basis), &[]);
+            assert!(out.merged_holding_reservation, "{basis:?}");
+        }
         let free = run(&it, Some(&l), Some(true), None, None, &[]);
         assert!(!free.merged_holding_reservation);
         let open = run(&it, Some(&l), Some(false), Some("aaa"), basis, &[]);
         assert!(!open.merged_holding_reservation);
+        // A stale open observation beside a merge row does not hide the held reservation.
+        let stale = run(&it, Some(&l), Some(true), Some("aaa"), basis, &[]);
+        assert!(stale.merged_holding_reservation);
     }
 
     fn prereq<'a>(

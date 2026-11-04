@@ -259,6 +259,43 @@ impl Ctx {
             .unwrap();
     }
 
+    /// A closed pull request, as ingestion records it: the observation is tombstoned.
+    fn close_pull(&mut self, number: i64) {
+        self.clock += 1;
+        let data = json!({"number": number, "state": "closed", "merged": false}).to_string();
+        self.store
+            .forget(
+                &self.repo.id,
+                "pull_request",
+                &number.to_string(),
+                self.clock,
+                &data,
+                "pull_request_closed",
+            )
+            .unwrap();
+    }
+
+    fn set_coverage(&self, state: CatchupCoverageState) {
+        for source in [
+            CatchupMergeSource::TrackedPublication,
+            CatchupMergeSource::ForgePull,
+        ] {
+            self.store
+                .record_catchup_source_status(
+                    &scope(),
+                    &CatchupSourceStatus {
+                        source,
+                        state,
+                        checked_at: unix_now(),
+                        unread_pages: 0,
+                        deferred: 0,
+                        window_from: None,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
     fn merge(&self, number: i64) {
         let merge = NewCatchupMerge {
             source: CatchupMergeSource::ForgePull,
@@ -319,14 +356,36 @@ fn provider_states(fixture: &StoreFixture) {
     assert_eq!(out.provider.status, ProviderStatus::OpenHeadChanged);
     assert_eq!(out.provider.head_relation, HeadRelation::Changed);
 
-    // A malformed observation gives no head and says so.
+    // The open status carries its read time, and head comparison ignores case.
+    assert_eq!(out.provider.open_observed_at_ms, Some(ctx.clock));
+    ctx.observe_pull(7, "open", &HEAD_A.to_uppercase());
+    assert_eq!(
+        ctx.read(&work).provider.status,
+        ProviderStatus::OpenSameHead
+    );
+
+    // A malformed observation gives no head and says so, and is not "closed".
     ctx.observe_pull(7, "open", "not-a-sha");
     let out = ctx.read(&work);
     assert_eq!(out.provider.status, ProviderStatus::Unknown);
-    assert!(has(&out, "observation_malformed"));
+    assert!(has(&out, "observation_malformed") && !has(&out, "closed_state_not_readable"));
+
+    // An observation whose state is not open is not treated as open.
+    ctx.observe_pull(7, "closed", HEAD_A);
+    let out = ctx.read(&work);
+    assert_eq!(out.provider.status, ProviderStatus::Unknown);
+    assert!(has(&out, "closed_state_not_readable"));
+
+    // Closed unmerged, then genuinely reopened: no merge row, so the open status applies.
+    ctx.close_pull(7);
+    assert_eq!(ctx.read(&work).provider.status, ProviderStatus::Unknown);
+    ctx.observe_pull(7, "open", HEAD_A);
+    let out = ctx.read(&work);
+    assert_eq!(out.provider.status, ProviderStatus::OpenSameHead);
+    assert!(!has(&out, "merge_and_open_observed"));
 
     // A recorded merge: the outcome is untouched and the reservation is still held.
-    ctx.observe_pull(7, "closed", HEAD_A);
+    ctx.close_pull(7);
     ctx.merge(7);
     let out = ctx.read(&work);
     assert_eq!(out.provider.status, ProviderStatus::Merged);
@@ -341,12 +400,14 @@ fn provider_states(fixture: &StoreFixture) {
     assert_eq!(out.digest, again.digest);
     assert_eq!(out, again);
 
-    // Reopened: the open observation outranks the retained merge row.
+    // A merged PR cannot reopen: a merge row outranks a stale open observation.
     ctx.observe_pull(7, "open", HEAD_A);
     let out = ctx.read(&work);
-    assert_eq!(out.provider.status, ProviderStatus::OpenSameHead);
-    assert!(has(&out, "merge_and_open_observed"));
-    assert!(!out.merged_holding_reservation);
+    assert_eq!(out.provider.status, ProviderStatus::Merged);
+    assert_eq!(out.provider.head_relation, HeadRelation::Unknown);
+    assert!(has(&out, "merge_and_open_observed") && has(&out, "merge_head_not_compared"));
+    assert_eq!(out.provider.open_observed_at_ms, None);
+    assert!(out.merged_holding_reservation);
 
     // The caller-reported link token never reaches the output.
     let link_token = ctx
@@ -365,11 +426,11 @@ fn prerequisites(fixture: &StoreFixture) {
     let mut ctx = setup(fixture);
     let merged = ctx.start("merged", "src/merged", &[]);
     ctx.link(&merged, 8, HEAD_A);
-    ctx.observe_pull(8, "closed", HEAD_A);
+    ctx.close_pull(8);
     ctx.merge(8);
     let reported = ctx.start("reported", "src/reported", &[]);
     ctx.link(&reported, 9, HEAD_A);
-    ctx.observe_pull(9, "closed", HEAD_A);
+    ctx.close_pull(9);
     ctx.checkpoint(&reported, CheckpointKind::Finish);
     let dependent = ctx.start("dependent", "src/dependent", &[&merged, &reported]);
     ctx.checkpoint(&dependent, CheckpointKind::Blocker);
@@ -387,8 +448,68 @@ fn prerequisites(fixture: &StoreFixture) {
     assert_eq!(out.reassess.blocker_kind, Some(CheckpointKind::Blocker));
     assert_eq!(out.outcome.value, OutcomeValue::None);
     assert_eq!(out.provider.status, ProviderStatus::NotLinked);
+    assert_eq!(by_id(&merged.id).link.as_ref().unwrap().number, 8);
+    assert!(
+        by_id(&reported.id)
+            .limits
+            .contains(&"closed_state_not_readable".to_owned())
+    );
     let text = serde_json::to_string(&out).unwrap();
     assert!(!text.contains("Synthetic merged") && !text.contains("synthetic checkpoint"));
+}
+
+fn prerequisite_evidence(fixture: &StoreFixture) {
+    let mut ctx = setup(fixture);
+    let stale = ctx.start("stale", "src/stale", &[]);
+    ctx.link(&stale, 11, HEAD_A);
+    ctx.close_pull(11);
+    ctx.merge(11);
+    ctx.observe_pull(11, "open", HEAD_A);
+    let open = ctx.start("open", "src/open", &[]);
+    ctx.link(&open, 12, HEAD_A);
+    ctx.observe_pull(12, "open", HEAD_A);
+    let bad = ctx.start("bad", "src/bad", &[]);
+    ctx.link(&bad, 13, HEAD_A);
+    ctx.observe_pull(13, "open", "not-a-sha");
+    let dependent = ctx.start("dependent", "src/dependent", &[&stale, &open, &bad]);
+    ctx.checkpoint(&dependent, CheckpointKind::Blocker);
+
+    let find = |out: &WorkReconciliationV1, id: &str| {
+        out.prerequisites
+            .iter()
+            .find(|p| p.work_id == id)
+            .cloned()
+            .unwrap()
+    };
+    let out = ctx.read(&dependent);
+    // Merge evidence outranks the stale open observation and satisfies the prerequisite.
+    let stale_row = find(&out, &stale.id);
+    assert_eq!(stale_row.state, PrerequisiteState::Satisfied);
+    assert_eq!(stale_row.provider, ProviderStatus::Merged);
+    assert!(
+        stale_row
+            .limits
+            .contains(&"merge_and_open_observed".to_owned())
+    );
+    assert!(out.reassess.needed);
+    assert_eq!(find(&out, &open.id).state, PrerequisiteState::NotSatisfied);
+    // A malformed observation lands on its prerequisite row, not the Work's limits.
+    let bad_row = find(&out, &bad.id);
+    assert!(bad_row.limits.contains(&"observation_malformed".to_owned()));
+    assert!(!has(&out, "observation_malformed"));
+
+    // During an outage an open status may be stale; a retained merge still counts.
+    for state in [
+        CatchupCoverageState::Incomplete,
+        CatchupCoverageState::Unavailable,
+    ] {
+        ctx.set_coverage(state);
+        let out = ctx.read(&dependent);
+        assert_eq!(out.provider.coverage, state);
+        assert_eq!(find(&out, &open.id).state, PrerequisiteState::Unknown);
+        assert_eq!(find(&out, &open.id).provider, ProviderStatus::OpenSameHead);
+        assert_eq!(find(&out, &stale.id).state, PrerequisiteState::Satisfied);
+    }
 }
 
 fn prerequisite_cap(fixture: &StoreFixture) {
@@ -450,7 +571,7 @@ fn http_route(fixture: &StoreFixture) {
     let mut ctx = setup(fixture);
     let work = ctx.start("a", "src/a", &[]);
     ctx.link(&work, 7, HEAD_A);
-    ctx.observe_pull(7, "closed", HEAD_A);
+    ctx.close_pull(7);
     ctx.merge(7);
     let link_token = ctx
         .store
@@ -528,6 +649,11 @@ fn work_reconcile_provider_states() {
 #[test]
 fn work_reconcile_prerequisites() {
     run_both(prerequisites);
+}
+
+#[test]
+fn work_reconcile_prerequisite_evidence() {
+    run_both(prerequisite_evidence);
 }
 
 #[test]
