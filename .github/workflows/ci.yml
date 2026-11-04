@@ -3,9 +3,10 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-  push:
-    branches: [main]
   workflow_dispatch:
+  # Replaces the push to main; the release PR also runs this workflow through ci-extended.
+  schedule:
+    - cron: '23 7 * * *'
 
 permissions:
   contents: read
@@ -19,7 +20,7 @@ env:
 
 jobs:
   # Routine checks run locally; this is the explicit hosted fallback. Platform checks below keep
-  # their main-push coverage. Fork code runs only after a maintainer applies ci-extended.
+  # their nightly coverage. Fork code runs only after a maintainer applies ci-extended.
   static:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
     runs-on: ubuntu-latest
@@ -100,7 +101,7 @@ jobs:
   # item deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the
   # pull request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
   # needs the UI build. Same gate as the `windows` job in windows.yml: with the `ci-extended` label, a
-  # fork PR once per labelling, and always on push to main and manual runs.
+  # fork PR once per labelling, and always on scheduled and manual runs.
   release-targets:
     if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')) }}
     strategy:
