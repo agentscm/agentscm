@@ -1283,6 +1283,97 @@ fn postgres_work_declarations_migrates_legacy_once() {
     assert_eq!(charged, 100 + snapshot.len() as i64 + 256);
 }
 
+fn initialize_unversioned_declarations(fixture: &StoreFixture) {
+    use agentscm::hub::work_reconciliation::{WorkDeclarations, WorkDeclarationsUpdate};
+    let ctx = setup(fixture);
+    let work = ctx.start("unversioned-declarations", "src/unversioned", &[]);
+    if let Some(pg) = &fixture._pg {
+        postgres::Client::connect(&pg.url, postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE hub_work_declarations SET event_seq=0 WHERE work=$1",
+                &[&work.id],
+            )
+            .unwrap();
+    } else {
+        rusqlite::Connection::open(
+            fixture
+                ._directory
+                .as_ref()
+                .unwrap()
+                .path()
+                .join("hub.sqlite"),
+        )
+        .unwrap()
+        .execute(
+            "UPDATE hub_work_declarations SET event_seq=0 WHERE work=?1",
+            [&work.id],
+        )
+        .unwrap();
+    }
+    let unversioned = durable_request(&ctx, &work.id, "unversioned-apply");
+    assert_eq!(unversioned.declaration_seq, 0);
+    assert!(
+        ctx.store
+            .work_reconciliation_apply(ctx.token(), &unversioned, unix_now())
+            .is_err()
+    );
+    let request = WorkDeclarationsUpdate {
+        work_id: work.id.clone(),
+        operation_id: "initialize-declarations".into(),
+        generation: work.generation,
+        session: work.lead_session.clone(),
+        expected_updated_seq: work.updated_seq,
+        declarations: WorkDeclarations::default(),
+    };
+    let initialized = ctx
+        .store
+        .work_declarations_set(ctx.token(), &request, unix_now())
+        .unwrap();
+    assert!(initialized.view.declaration_seq > work.updated_seq);
+    assert_eq!(
+        initialized.view.declaration_seq,
+        initialized.receipt.event_seq
+    );
+    assert!(initialized.view.declarations.links.is_empty());
+    assert!(initialized.view.declarations.prerequisites.is_empty());
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &request, unix_now())
+            .unwrap()
+            .receipt
+            .replayed
+    );
+    let mut unchanged = request;
+    unchanged.operation_id = "already-initialized".into();
+    unchanged.expected_updated_seq = initialized.view.updated_seq;
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &unchanged, unix_now())
+            .is_err()
+    );
+    let fresh = durable_request(&ctx, &work.id, "initialized-apply");
+    let applied = ctx
+        .store
+        .work_reconciliation_apply(ctx.token(), &fresh, unix_now())
+        .unwrap();
+    assert!(applied.view.current.is_some());
+    assert_eq!(ctx.read(&work).outcome.value, OutcomeValue::None);
+    assert_eq!(ctx.read(&work).reservation.status, ReservationStatus::Held);
+}
+
+#[test]
+fn unversioned_declarations_sqlite_require_explicit_initialization() {
+    initialize_unversioned_declarations(&StoreFixture::sqlite());
+}
+
+#[test]
+fn postgres_unversioned_declarations_require_explicit_initialization() {
+    if let Some(fixture) = StoreFixture::postgres() {
+        initialize_unversioned_declarations(&fixture);
+    }
+}
+
 fn durable_request(
     ctx: &Ctx,
     id: &str,

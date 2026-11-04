@@ -6,10 +6,11 @@ CREATE TABLE hub_work_declarations (
     event_seq BIGINT NOT NULL
 );
 INSERT INTO hub_work_declarations (work,snapshot,event_seq)
+-- An older unversioned row has no qualifying declaration fence; zero preserves that unknown.
 SELECT w.id, json_object('links',json('[]'),'prerequisites',json(COALESCE((
     SELECT json_group_array(json_object('id','legacy-' || related,'requirement',json_object('kind','legacy_work','work_id',related)))
     FROM (SELECT related FROM hub_work_relations WHERE work=w.id AND kind='depends_on' ORDER BY related)
-), '[]'))),w.updated_seq FROM hub_work_items w;
+), '[]'))),COALESCE(w.updated_seq,0) FROM hub_work_items w;
 UPDATE hub_work_usage SET charged_bytes=charged_bytes+COALESCE((
     SELECT SUM(length(CAST(d.snapshot AS BLOB))+256) FROM hub_work_declarations d
     JOIN hub_work_items w ON w.id=d.work WHERE w.provider=hub_work_usage.provider AND w.host=hub_work_usage.host

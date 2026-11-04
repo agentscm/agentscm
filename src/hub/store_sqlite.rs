@@ -9741,13 +9741,13 @@ impl Store for SqliteStore {
         update.authorize(&who, &item)?;
         update.check_current(&item)?;
         relation_targets(&tx, &who, &canonical.declarations.targets())?;
-        let old: String = tx.query_row(
-            "SELECT snapshot FROM hub_work_declarations WHERE work=?1",
+        let (old, declaration_seq): (String, i64) = tx.query_row(
+            "SELECT snapshot,event_seq FROM hub_work_declarations WHERE work=?1",
             [&item.id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let old_declarations: WorkDeclarations = json_value(&old)?;
-        if old_declarations == canonical.declarations {
+        if declaration_seq > 0 && old_declarations == canonical.declarations {
             return Err(HubError::Invalid("declarations are unchanged".into()));
         }
         let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;

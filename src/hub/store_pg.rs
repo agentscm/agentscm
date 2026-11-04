@@ -9674,14 +9674,14 @@ impl Store for PgStore {
             update.authorize(&who, &item)?;
             update.check_current(&item)?;
             relation_targets(&mut tx, &who, &canonical.declarations.targets())?;
-            let old: String = tx
-                .query_one(
-                    "SELECT snapshot FROM hub_work_declarations WHERE work=$1",
-                    &[&item.id],
-                )?
-                .get(0);
+            let previous = tx.query_one(
+                "SELECT snapshot,event_seq FROM hub_work_declarations WHERE work=$1",
+                &[&item.id],
+            )?;
+            let old: String = previous.get(0);
+            let declaration_seq: i64 = previous.get(1);
             let old_declarations: WorkDeclarations = json_value(&old)?;
-            if old_declarations == canonical.declarations {
+            if declaration_seq > 0 && old_declarations == canonical.declarations {
                 return Err(HubError::Invalid("declarations are unchanged".into()));
             }
             let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
