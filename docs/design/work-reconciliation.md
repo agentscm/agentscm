@@ -1,5 +1,5 @@
 ---
-title: "Design: Work and pull request reconciliation"
+title: "Work and pull request reconciliation"
 ---
 
 # Work and pull request reconciliation
