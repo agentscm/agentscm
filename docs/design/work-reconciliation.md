@@ -99,3 +99,16 @@ sorted `limits`.
 - The overview's overlap list can still omit a hidden reservation holder;
   `/v1/hub/standup/operational` lists holders.
 - PostgreSQL behavior needs `AGENTSCM_TEST_DATABASE_URL`, and no live forge was exercised.
+
+
+## Durable caller declarations
+
+The separate `GET /v1/hub/standup/work/{id}/declarations` response has `schema_version: 2`. It contains a caller-declared set of additional PR links and typed prerequisite conditions. It does not establish provider facts or claim that a Work item completed. Read-only tokens can read it. A foreign repository receives the same not-found response as unknown Work. The compatibility single-link endpoint owns an independent `compatibility_link` slot; setting or clearing that slot cannot erase additional links or conditions.
+
+`POST /v1/hub/standup/declarations` accepts `work_id`, `operation_id`, `generation`, `session`, `expected_updated_seq` and a complete `declarations` replacement. Only the current lead token/session may write. A successful mutation advances the Work sequence without rewriting its progress report, blocker, outcome or reservation. Exact retries return the original receipt and current view; operation ID reuse for a different canonical request is refused. Link and condition order is canonicalized by stable `id`. Explicit empty arrays remove the corresponding declarations.
+
+Each additional link has an `id` and a `target` containing the authorized stable `repository_id`, PR `number` and full lowercase `head_sha`. Each prerequisite has an `id` and a tagged `requirement`: `merged_pull_request` names a readable prerequisite `work_id` and an exact `target`; `legacy_work` names a dependency whose evidence target has not been declared. IDs are bounded visible labels. Explicit updates allow at most 32 additional links and 32 conditions. Imported legacy dependencies may retain up to the existing 100-relation bound; none is silently dropped. All PRs in a partial or multiple-PR Work remain separate declarations; satisfying all declared merge conditions still cannot prove whole-task success.
+
+The named migration copies existing `depends_on` relations once into deterministic `legacy-<work-id>` conditions with `legacy_work` requirements. New Work starts seed the same independent record, including an empty record. These conditions are unbound caller reports and remain unknown until explicitly replaced with evidence-targeted requirements. Legacy checkpoint omission still clears its legacy relation hints, but cannot delete the durable declaration record. The initial `declaration_seq` is the Work sequence at migration or admission; later updates use their committed event sequence. Every Work has a declaration record, so there is no absent-record sequence sentinel. The mutation records the existing `work_pr_link` audit kind with `operation: declarations_set` for history and catch-up compatibility.
+
+CLI equivalents are `agentscm work declarations <work-id>` and `agentscm work declarations-set --request <json-file>`. The v1 read-only reconciliation response remains wire-compatible and still projects legacy `depends_on`; durable evaluation, reassessment and additional surface integration are separate from this declaration operation.

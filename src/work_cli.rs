@@ -14,6 +14,7 @@ use agentscm::hub::work::{
     BriefingAck, WorkCheckpoint, WorkRepositoryScope, WorkStart, WorkStartResult,
 };
 use agentscm::hub::work_links::WorkPrLinkUpdate;
+use agentscm::hub::work_reconciliation::WorkDeclarationsUpdate;
 use agentscm::{Error, Result};
 use clap::Subcommand;
 use reqwest::Method;
@@ -74,6 +75,13 @@ pub enum WorkCommand {
         expected_updated_seq: Option<i64>,
         #[arg(long)]
         expected_head: Option<String>,
+    },
+    /// Read durable caller-declared PR links and prerequisite conditions.
+    Declarations { id: String },
+    /// Replace durable declarations as the fenced Work lead.
+    DeclarationsSet {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
     },
     /// Read the read-only PR evidence and prerequisite report for a Work item.
     Reconcile { id: String },
@@ -266,6 +274,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Preflight { .. }
         | WorkCommand::PrLink { .. }
         | WorkCommand::Reconcile { .. }
+        | WorkCommand::Declarations { .. }
         | WorkCommand::Insight { .. }
         | WorkCommand::Insights { .. } => false,
         WorkCommand::Compact { apply, .. }
@@ -278,6 +287,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Start { .. }
         | WorkCommand::Usage { .. }
         | WorkCommand::PrLinkSet { .. }
+        | WorkCommand::DeclarationsSet { .. }
         | WorkCommand::Checkpoint { .. }
         | WorkCommand::Ack { .. } => true,
         WorkCommand::CatchupAck { .. } => true,
@@ -407,6 +417,31 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 json!({"expected_updated_seq":expected_updated_seq,"expected_head":expected_head}),
             )?;
             (hub.call(Method::GET, &path, None).await?, false)
+        }
+        WorkCommand::Declarations { id } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
+                .map_err(|_| invalid("cannot construct declaration URL"))?;
+            url.path_segments_mut()
+                .map_err(|_| invalid("cannot construct declaration URL"))?
+                .push(&id)
+                .push("declarations");
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct declaration URL"))?;
+            (hub.call(Method::GET, path, None).await?, false)
+        }
+        WorkCommand::DeclarationsSet { request } => {
+            let request: WorkDeclarationsUpdate = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/declarations",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
         }
         WorkCommand::Reconcile { id } => {
             let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")

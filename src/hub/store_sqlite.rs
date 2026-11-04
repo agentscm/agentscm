@@ -113,6 +113,10 @@ use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
+use super::work_reconciliation::{
+    self as declarations, WorkDeclarations, WorkDeclarationsResult, WorkDeclarationsUpdate,
+    WorkDeclarationsView,
+};
 use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
     WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
@@ -2057,6 +2061,11 @@ fn work_payload_bytes(
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
              UNION ALL
+             SELECT length(CAST(d.snapshot AS BLOB)) + 256 FROM hub_work_declarations d
+              JOIN hub_work_items w ON w.id = d.work
+              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
+                AND w.repository_id IS ?4
+             UNION ALL
              SELECT length(CAST(l.snapshot AS BLOB)) + 256 FROM hub_work_pr_links l
               JOIN hub_work_items w ON w.id = l.work
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
@@ -2295,6 +2304,32 @@ fn work_retention_floors(tx: &Transaction<'_>, who: &WorkWho) -> Result<(i64, i6
         )
         .optional()?
         .unwrap_or((0, 0)))
+}
+
+fn declaration_view(tx: &Transaction<'_>, item: &WorkItem) -> Result<WorkDeclarationsView> {
+    let (snapshot, seq): (String, i64) = tx.query_row(
+        "SELECT snapshot,event_seq FROM hub_work_declarations WHERE work=?1",
+        [&item.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let link: Option<String> = tx
+        .query_row(
+            "SELECT snapshot FROM hub_work_pr_links WHERE work=?1",
+            [&item.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let compatibility = link
+        .as_deref()
+        .map(json_value::<WorkPrLink>)
+        .transpose()?
+        .map(|l| l.target);
+    Ok(declarations::view(
+        item,
+        seq,
+        json_value(&snapshot)?,
+        compatibility,
+    ))
 }
 
 fn replace_relations(
@@ -3884,6 +3919,12 @@ fn start_in(
         params![id, who.token, who.owner.id, who.agent, start.session, now],
     )?;
     replace_relations(tx, who, &id, &item.depends_on, &item.related_work)?;
+    let declarations_snapshot = json_string(&WorkDeclarations::legacy(&item))?;
+    tx.execute(
+        "INSERT INTO hub_work_declarations (work,snapshot,event_seq) VALUES (?1,?2,?3)",
+        params![id, declarations_snapshot, seq],
+    )?;
+
     tx.execute(
         "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
          VALUES (?1, ?2, 'active', ?3)",
@@ -3893,7 +3934,8 @@ fn start_in(
     adjust_work_payload_capacity(
         tx,
         who,
-        work_transition_payload_bytes(&snapshot, &event)?,
+        work_transition_payload_bytes(&snapshot, &event)?
+            + work_payload_row_bytes(declarations_snapshot.len())?,
         now,
     )?;
     bind_coordination_request(tx, who, &start.session, &item, now)?;
@@ -9377,6 +9419,104 @@ impl Store for SqliteStore {
         let item = scoped_work(&tx, &who, id, now)?;
         tx.commit()?;
         Ok(item)
+    }
+
+    fn work_declarations_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<WorkDeclarationsView>> {
+        super::work::validate_id("work", id, "wrk")?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let Some(item) = scoped_work(&tx, &who, id, now)? else {
+            return Ok(None);
+        };
+        let view = declaration_view(&tx, &item)?;
+        tx.commit()?;
+        Ok(Some(view))
+    }
+
+    fn work_declarations_set(
+        &self,
+        token: &str,
+        update: &WorkDeclarationsUpdate,
+        now: i64,
+    ) -> Result<WorkDeclarationsResult> {
+        update.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let repository_id = work_links::trusted_repository_id(&who)?;
+        let normalized = update
+            .declarations
+            .normalized(repository_id, &update.work_id)?;
+        let mut canonical = update.clone();
+        canonical.declarations = normalized;
+        let request = json_string(&json!({"operation":"work_declarations", "update":canonical}))?;
+        let mut item = scoped_work(&tx, &who, &update.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        if let Some((previous,snapshot,seq))=tx.query_row(
+            "SELECT o.request,v.snapshot,o.event_seq FROM hub_work_checkpoint_ops o JOIN hub_work_versions v ON v.work=o.work AND v.event_seq=o.event_seq WHERE o.work=?1 AND o.operation_id=?2",
+            params![item.id,update.operation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).optional()? {
+            if previous!=request {return Err(HubError::Invalid("operation_id was already used for another request".into()));}
+            let committed:WorkItem=json_value(&snapshot)?; update.authorize(&who,&committed)?;
+            let view=declaration_view(&tx,&item)?; tx.commit()?;
+            return Ok(WorkDeclarationsResult {view,receipt:CheckpointReceipt{work_id:item.id,operation_id:update.operation_id.clone(),generation:committed.generation,event_seq:seq,replayed:true}});
+        }
+        update.authorize(&who, &item)?;
+        update.check_current(&item)?;
+        relation_targets(&tx, &who, &canonical.declarations.targets())?;
+        let old: String = tx.query_row(
+            "SELECT snapshot FROM hub_work_declarations WHERE work=?1",
+            [&item.id],
+            |r| r.get(0),
+        )?;
+        let old_declarations: WorkDeclarations = json_value(&old)?;
+        if old_declarations == canonical.declarations {
+            return Err(HubError::Invalid("declarations are unchanged".into()));
+        }
+        let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
+        item.updated_at = now;
+        let mut event = Event::new(
+            "work_pr_link",
+            &item.id,
+            json!({"operation":"declarations_set","generation":item.generation,"owner":item.owner,"repository":item.repository,"repository_id":repository_id,"declarations":canonical.declarations,"author":who.owner.id,"agent":who.agent,"session":update.session}),
+        )?;
+        event.at = now;
+        let seq = append(&tx, &event)?;
+        item.updated_seq = seq;
+        let snapshot = save_work_version(&tx, &item, seq)?;
+        let declared = json_string(&canonical.declarations)?;
+        tx.execute(
+            "UPDATE hub_work_declarations SET snapshot=?2,event_seq=?3 WHERE work=?1",
+            params![item.id, declared, seq],
+        )?;
+        tx.execute("INSERT INTO hub_work_checkpoint_ops (work,operation_id,request,event_seq) VALUES (?1,?2,?3,?4)",params![item.id,update.operation_id,request,seq])?;
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
+            .and_then(|v| v.checked_add(work_payload_row_bytes(declared.len()).ok()?))
+            .and_then(|v| v.checked_sub(work_payload_row_bytes(old.len()).ok()?))
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        let view = declaration_view(&tx, &item)?;
+        tx.commit()?;
+        Ok(WorkDeclarationsResult {
+            view,
+            receipt: CheckpointReceipt {
+                work_id: item.id,
+                operation_id: update.operation_id.clone(),
+                generation: update.generation,
+                event_seq: seq,
+                replayed: false,
+            },
+        })
     }
 
     fn work_pr_link_get(

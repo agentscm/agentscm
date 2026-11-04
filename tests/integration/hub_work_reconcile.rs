@@ -860,3 +860,425 @@ fn exact_evidence(fixture: &StoreFixture) {
 fn work_reconcile_exact_evidence_and_order() {
     run_both(exact_evidence);
 }
+
+fn durable_declarations(fixture: &StoreFixture) {
+    use agentscm::hub::work_reconciliation::{
+        DeclaredPrLink, PrerequisiteCondition, PrerequisiteRequirement, WorkDeclarations,
+        WorkDeclarationsUpdate,
+    };
+    let ctx = setup(fixture);
+    let prerequisite = ctx.start("decl-prereq", "src/dependency", &[]);
+    let work = ctx.start("decl-work", "src/consumer", &[&prerequisite]);
+    let initial = ctx
+        .store
+        .work_declarations_get(ctx.token(), &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.schema_version, 2);
+    assert_eq!(initial.declaration_seq, work.updated_seq);
+    assert_eq!(initial.declarations.prerequisites.len(), 1);
+    assert!(
+        matches!(&initial.declarations.prerequisites[0].requirement,PrerequisiteRequirement::LegacyWork{work_id} if work_id==&prerequisite.id)
+    );
+    let target = |number, head: &str| WorkPrLinkTarget {
+        repository_id: REPOSITORY_ID,
+        number,
+        head_sha: head.into(),
+    };
+    let update = WorkDeclarationsUpdate {
+        work_id: work.id.clone(),
+        operation_id: "declare-v2".into(),
+        generation: work.generation,
+        session: work.lead_session.clone(),
+        expected_updated_seq: work.updated_seq,
+        declarations: WorkDeclarations {
+            links: vec![
+                DeclaredPrLink {
+                    id: "second".into(),
+                    target: target(22, HEAD_B),
+                },
+                DeclaredPrLink {
+                    id: "first".into(),
+                    target: target(21, HEAD_A),
+                },
+            ],
+            prerequisites: vec![PrerequisiteCondition {
+                id: "merged-dependency".into(),
+                requirement: PrerequisiteRequirement::MergedPullRequest {
+                    work_id: prerequisite.id.clone(),
+                    target: target(20, HEAD_A),
+                },
+            }],
+        },
+    };
+    let result = ctx
+        .store
+        .work_declarations_set(ctx.token(), &update, unix_now())
+        .unwrap();
+    assert!(!result.receipt.replayed);
+    assert_eq!(result.view.declarations.links[0].id, "first");
+    assert_eq!(result.view.declaration_seq, result.receipt.event_seq);
+    // An ordinary old client that omits depends_on cannot erase the independent declaration.
+    let current = ctx.item(&work.id);
+    let checkpoint = WorkCheckpoint {
+        work_id: work.id.clone(),
+        operation_id: "legacy-progress".into(),
+        generation: current.generation,
+        session: current.lead_session.clone(),
+        expected_updated_seq: Some(current.updated_seq),
+        kind: CheckpointKind::Progress,
+        summary: "still implementing".into(),
+        next_action: None,
+        scope: None,
+        branch: None,
+        worktree: None,
+        resolve_blocker: false,
+        source_refs: vec![],
+        depends_on: vec![],
+        related_work: vec![],
+    };
+    ctx.store
+        .work_checkpoint(ctx.token(), &checkpoint, unix_now())
+        .unwrap();
+    assert!(ctx.item(&work.id).depends_on.is_empty());
+    let after = ctx
+        .store
+        .work_declarations_get(ctx.token(), &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.declarations, result.view.declarations);
+    assert_eq!(after.declaration_seq, result.view.declaration_seq);
+    // Legacy single-link mutation is a separate compatibility slot, not a set replacement.
+    ctx.link(&ctx.item(&work.id), 23, HEAD_B);
+    let after = ctx
+        .store
+        .work_declarations_get(ctx.token(), &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.declarations, result.view.declarations);
+    assert_eq!(after.compatibility_link, Some(target(23, HEAD_B)));
+    let replay = ctx
+        .store
+        .work_declarations_set(ctx.token(), &update, unix_now())
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, result.receipt.event_seq);
+    assert_eq!(replay.view.updated_seq, after.updated_seq);
+    let mut reordered = update.clone();
+    reordered.declarations.links.reverse();
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &reordered, unix_now())
+            .unwrap()
+            .receipt
+            .replayed
+    );
+    let mut mismatch = update.clone();
+    mismatch.declarations.links.clear();
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &mismatch, unix_now())
+            .is_err()
+    );
+    let mut stale = update.clone();
+    stale.operation_id = "new-stale".into();
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &stale, unix_now())
+            .is_err()
+    );
+    let mut clear = update.clone();
+    clear.operation_id = "explicit-clear".into();
+    clear.expected_updated_seq = ctx.item(&work.id).updated_seq;
+    clear.declarations = WorkDeclarations::default();
+    let cleared = ctx
+        .store
+        .work_declarations_set(ctx.token(), &clear, unix_now())
+        .unwrap();
+    assert!(
+        cleared.view.declarations.links.is_empty()
+            && cleared.view.declarations.prerequisites.is_empty()
+    );
+    assert_eq!(cleared.view.compatibility_link, Some(target(23, HEAD_B)));
+    let encoded = serde_json::to_string(&cleared.view).unwrap();
+    assert!(!encoded.contains(ctx.token()) && !encoded.contains(&ctx.secret));
+    // The declarations operation never changes report, outcome or reservation.
+    assert_eq!(
+        ctx.item(&work.id).current.unwrap().summary,
+        "still implementing"
+    );
+    assert_eq!(ctx.read(&work).outcome.value, OutcomeValue::None);
+    assert_eq!(ctx.read(&work).reservation.status, ReservationStatus::Held);
+}
+
+#[test]
+fn work_declarations_sqlite_persistence_and_compatibility() {
+    durable_declarations(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_work_declarations_persistence_and_compatibility() {
+    if let Some(fixture) = StoreFixture::postgres() {
+        durable_declarations(&fixture);
+    }
+}
+
+fn declaration_authorization(fixture: &StoreFixture) {
+    use agentscm::hub::work_reconciliation::{
+        DeclaredPrLink, WorkDeclarations, WorkDeclarationsUpdate,
+    };
+    let ctx = setup(fixture);
+    let work = ctx.start("decl-auth", "src/auth", &[]);
+    let update = WorkDeclarationsUpdate {
+        work_id: work.id.clone(),
+        operation_id: "decl-auth".into(),
+        generation: work.generation,
+        session: work.lead_session.clone(),
+        expected_updated_seq: work.updated_seq,
+        declarations: WorkDeclarations {
+            links: vec![DeclaredPrLink {
+                id: "pr".into(),
+                target: WorkPrLinkTarget {
+                    repository_id: REPOSITORY_ID,
+                    number: 1,
+                    head_sha: HEAD_A.into(),
+                },
+            }],
+            prerequisites: vec![],
+        },
+    };
+    let (_, read_secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &ctx.principal.owner.id,
+        "reader",
+        REPOSITORY,
+        REPOSITORY_ID,
+        3600,
+        true,
+    )
+    .unwrap();
+    let reader = principal(&*ctx.store, read_secret.expose());
+    assert!(
+        ctx.store
+            .work_declarations_get(&reader.token_id, &work.id, unix_now())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        ctx.store
+            .work_declarations_set(&reader.token_id, &update, unix_now())
+            .is_err()
+    );
+    let (_, helper_secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &ctx.principal.owner.id,
+        "helper",
+        REPOSITORY,
+        REPOSITORY_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let helper = principal(&*ctx.store, helper_secret.expose());
+    assert!(
+        ctx.store
+            .work_declarations_set(&helper.token_id, &update, unix_now())
+            .is_err()
+    );
+    let mut wrong = update.clone();
+    wrong.session = "another-session".into();
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &wrong, unix_now())
+            .is_err()
+    );
+    wrong = update.clone();
+    wrong.generation += 1;
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &wrong, unix_now())
+            .is_err()
+    );
+    wrong = update.clone();
+    wrong.declarations.links[0].target.repository_id += 1;
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &wrong, unix_now())
+            .is_err()
+    );
+    wrong = update.clone();
+    wrong
+        .declarations
+        .links
+        .push(wrong.declarations.links[0].clone());
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &wrong, unix_now())
+            .is_err()
+    );
+    wrong = update.clone();
+    wrong.declarations.links = vec![wrong.declarations.links[0].clone(); 33];
+    assert!(
+        ctx.store
+            .work_declarations_set(ctx.token(), &wrong, unix_now())
+            .is_err()
+    );
+    let other_owner = user(&*ctx.store, 999, "outsider");
+    let (_, other_secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &other_owner,
+        "foreign",
+        "acme/other",
+        999,
+        3600,
+        false,
+    )
+    .unwrap();
+    let other = principal(&*ctx.store, other_secret.expose());
+    assert!(
+        ctx.store
+            .work_declarations_get(&other.token_id, &work.id, unix_now())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ctx.store
+            .work_declarations_set(&other.token_id, &update, unix_now())
+            .is_err()
+    );
+    assert_eq!(ctx.item(&work.id).updated_seq, work.updated_seq);
+}
+#[test]
+fn work_declarations_sqlite_authorization() {
+    declaration_authorization(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_work_declarations_authorization() {
+    if let Some(fixture) = StoreFixture::postgres() {
+        declaration_authorization(&fixture);
+    }
+}
+
+fn declarations_concurrent(fixture: &StoreFixture) {
+    use agentscm::hub::work_reconciliation::{
+        DeclaredPrLink, WorkDeclarations, WorkDeclarationsUpdate,
+    };
+    let ctx = setup(fixture);
+    let work = ctx.start("declaration-race", "src/race", &[]);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (1..=2)
+        .map(|number| {
+            let store = ctx.store.clone();
+            let token = ctx.token().to_owned();
+            let barrier = barrier.clone();
+            let request = WorkDeclarationsUpdate {
+                work_id: work.id.clone(),
+                operation_id: format!("race-{number}"),
+                generation: work.generation,
+                session: work.lead_session.clone(),
+                expected_updated_seq: work.updated_seq,
+                declarations: WorkDeclarations {
+                    links: vec![DeclaredPrLink {
+                        id: "pr".into(),
+                        target: WorkPrLinkTarget {
+                            repository_id: REPOSITORY_ID,
+                            number,
+                            head_sha: HEAD_A.into(),
+                        },
+                    }],
+                    prerequisites: vec![],
+                },
+            };
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.work_declarations_set(&token, &request, unix_now())
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    let current = ctx
+        .store
+        .work_declarations_get(ctx.token(), &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, winner.view);
+}
+#[test]
+fn work_declarations_sqlite_concurrent_fence() {
+    declarations_concurrent(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_work_declarations_concurrent_fence() {
+    if let Some(fixture) = StoreFixture::postgres() {
+        declarations_concurrent(&fixture);
+    }
+}
+
+#[test]
+fn work_declarations_sqlite_migrates_legacy_once() {
+    use agentscm::hub::work_reconciliation::{PrerequisiteRequirement, WorkDeclarations};
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE hub_work_items(id TEXT PRIMARY KEY, updated_seq INTEGER, provider TEXT,host TEXT,repository TEXT,repository_id INTEGER); CREATE TABLE hub_work_relations(work TEXT,related TEXT,kind TEXT); CREATE TABLE hub_work_usage(provider TEXT,host TEXT,repository TEXT,repository_id INTEGER,charged_bytes INTEGER); INSERT INTO hub_work_items VALUES ('work',42,'github','github.com','acme/repo',1); INSERT INTO hub_work_relations VALUES ('work','second','depends_on'),('work','first','depends_on'),('work','other','related'); INSERT INTO hub_work_usage VALUES ('github','github.com','acme/repo',1,100);").unwrap();
+    conn.execute_batch(include_str!(
+        "../../src/hub/migrations/named/work_reconciliation.sqlite.sql"
+    ))
+    .unwrap();
+    let (snapshot, seq): (String, i64) = conn
+        .query_row(
+            "SELECT snapshot,event_seq FROM hub_work_declarations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let declared: WorkDeclarations = serde_json::from_str(&snapshot).unwrap();
+    assert_eq!(seq, 42);
+    assert_eq!(declared.prerequisites.len(), 2);
+    assert!(
+        matches!(&declared.prerequisites[0].requirement,PrerequisiteRequirement::LegacyWork{work_id} if work_id=="first")
+    );
+    assert!(declared.links.is_empty());
+    let charged: i64 = conn
+        .query_row("SELECT charged_bytes FROM hub_work_usage", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(charged, 100 + snapshot.len() as i64 + 256);
+    // Later relation changes cannot erase the imported declaration.
+    conn.execute("DELETE FROM hub_work_relations", []).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT snapshot FROM hub_work_declarations", [], |r| r
+            .get::<_, String>(
+            0
+        ))
+        .unwrap(),
+        snapshot
+    );
+}
+
+#[test]
+fn postgres_work_declarations_migrates_legacy_once() {
+    use agentscm::hub::work_reconciliation::WorkDeclarations;
+    let Some(pg) = PgSchema::create() else {
+        return;
+    };
+    let mut client = postgres::Client::connect(&pg.url, postgres::NoTls).unwrap();
+    client.batch_execute("CREATE TABLE hub_work_items(id TEXT PRIMARY KEY,updated_seq BIGINT,provider TEXT,host TEXT,repository TEXT,repository_id BIGINT); CREATE TABLE hub_work_relations(work TEXT,related TEXT,kind TEXT); CREATE TABLE hub_work_usage(provider TEXT,host TEXT,repository TEXT,repository_id BIGINT,charged_bytes BIGINT); INSERT INTO hub_work_items VALUES ('work',42,'github','github.com','acme/repo',1); INSERT INTO hub_work_relations VALUES ('work','second','depends_on'),('work','first','depends_on'),('work','other','related'); INSERT INTO hub_work_usage VALUES ('github','github.com','acme/repo',1,100);").unwrap();
+    client
+        .batch_execute(include_str!(
+            "../../src/hub/migrations/named/work_reconciliation.pg.sql"
+        ))
+        .unwrap();
+    let row = client
+        .query_one("SELECT snapshot,event_seq FROM hub_work_declarations", &[])
+        .unwrap();
+    let snapshot: String = row.get(0);
+    let seq: i64 = row.get(1);
+    let declared: WorkDeclarations = serde_json::from_str(&snapshot).unwrap();
+    assert_eq!(seq, 42);
+    assert_eq!(declared.prerequisites.len(), 2);
+    assert_eq!(declared.prerequisites[0].id, "legacy-first");
+    let charged: i64 = client
+        .query_one("SELECT charged_bytes FROM hub_work_usage", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(charged, 100 + snapshot.len() as i64 + 256);
+}

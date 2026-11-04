@@ -748,6 +748,20 @@ pub trait Store: Send + Sync {
         update: &WorkPrLinkUpdate,
         now: i64,
     ) -> Result<WorkPrLinkResult>;
+    /// Read durable declarations without modifying legacy checkpoint relations.
+    fn work_declarations_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_reconciliation::WorkDeclarationsView>>;
+    /// Replace durable declarations as the fenced lead, with an idempotent receipt.
+    fn work_declarations_set(
+        &self,
+        token: &str,
+        update: &super::work_reconciliation::WorkDeclarationsUpdate,
+        now: i64,
+    ) -> Result<super::work_reconciliation::WorkDeclarationsResult>;
     /// Release, retain, finish or reopen Work as its lead, owner or an administrator. One
     /// transaction, idempotent by `operation_id`, fenced by generation and `updated_seq`.
     fn work_transition(
