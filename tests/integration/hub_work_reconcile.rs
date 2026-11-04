@@ -1721,6 +1721,8 @@ fn publication_head_provenance(fixture: &StoreFixture) {
     let mut ctx = setup(fixture);
     let cases = [
         ("absent", None, false, false),
+        ("legacy-proof", Some((HEAD_A, true)), false, false),
+        ("wrong-repository", Some((HEAD_A, true)), false, false),
         ("actual-b", Some((HEAD_B, true)), false, false),
         ("actual-a", Some((HEAD_A, true)), false, false),
         ("wrong-merge", Some((HEAD_A, false)), false, false),
@@ -1804,8 +1806,18 @@ fn publication_head_provenance(fixture: &StoreFixture) {
         // A normal individual reread leaves the independent provider tombstone needed to qualify it.
         if let Some((head, same_merge)) = observation {
             ctx.clock += 1;
-            let data=json!({"number":if wrong_number {number+1}else{number},"state":"closed","merged":true,
-                "head_sha":head,"merge_commit_sha":if same_merge {merge_sha.clone()}else{"f".repeat(40)}}).to_string();
+            let data = json!({"number":if wrong_number {number+1}else{number},"state":"closed","merged":true,
+                "provider_number":if wrong_number {number+1}else{number},
+                "provider_base_repository_id":if name=="wrong-repository" {REPOSITORY_ID+1}else{REPOSITORY_ID},
+                "head_sha":head,"merge_commit_sha":if same_merge {merge_sha.clone()}else{"f".repeat(40)}});
+            let mut data = data;
+            if name == "legacy-proof" {
+                data.as_object_mut().unwrap().remove("provider_number");
+                data.as_object_mut()
+                    .unwrap()
+                    .remove("provider_base_repository_id");
+            }
+            let data = data.to_string();
             ctx.store
                 .forget(
                     &ctx.repo.id,

@@ -1442,6 +1442,12 @@ async fn reread_pull(
         Some(pull) => json!({"number": number, "node_id": pull["node_id"],
             "state": pull["state"], "merged": pull["merged"].as_bool().unwrap_or(false),
             "merge_commit_sha": pull["merge_commit_sha"], "head_sha": pull["head"]["sha"],
+            "provider_number": pull["number"],
+            "provider_base_repository_id": match conn.provider.as_str() {
+                "github" => &pull["base"]["repo"]["id"],
+                "gitlab" => &pull["target_project_id"],
+                _ => &Value::Null,
+            },
             "head_ref": pull["head"]["ref"], "html_url": pull["html_url"]}),
     }
     .to_string();

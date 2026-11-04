@@ -405,13 +405,18 @@ fn digest(value: &impl Serialize) -> String {
     ])
 }
 /// A retained individual provider read can qualify a publication's otherwise unverified head.
-/// The observation key is already bound to the stable repository and PR; validate its payload too.
+/// The lookup key identifies the requested target, not necessarily the returned provider object.
+/// Require raw provider identities too; legacy tombstones without them cannot qualify a head.
 pub(super) fn merged_observation(
     number: i64,
+    repository_id: i64,
     value: &serde_json::Value,
 ) -> Option<(String, String)> {
-    if value["observation_conflict"] == true
+    if repository_id < 1
+        || value["observation_conflict"] == true
         || value["number"].as_i64() != Some(number)
+        || value["provider_number"].as_i64() != Some(number)
+        || value["provider_base_repository_id"].as_i64() != Some(repository_id)
         || value["state"] != "closed"
         || value["merged"] != true
     {
@@ -454,7 +459,7 @@ pub(super) fn pull_evidence(
     if let Some((data, at, deleted)) = observation {
         out.observed_at_ms = Some(at);
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-            let merged = merged_observation(out.target.number, &v);
+            let merged = merged_observation(out.target.number, out.target.repository_id, &v);
             out.observed_merge_sha = merged.as_ref().map(|(_, commit)| commit.clone());
             out.observed_state = if v["observation_conflict"] == true {
                 "ambiguous"

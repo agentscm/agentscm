@@ -498,7 +498,10 @@ fn read_pull_observation(
     if value["observation_conflict"] == true {
         return Err("observation_order_ambiguous");
     }
-    if let Some(merged) = super::work_reconciliation::merged_observation(number, &value) {
+    if let Some(repository_id) = principal.repository_id
+        && let Some(merged) =
+            super::work_reconciliation::merged_observation(number, repository_id, &value)
+    {
         return Ok(PullObservation {
             merged: Some(merged),
             ..PullObservation::default()
