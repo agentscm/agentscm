@@ -256,6 +256,12 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   responses and `asked_via_hub` / `answered_via_hub` to handoffs, and the named migration
   `handoff_answered_via_slack` adds `answered_via_slack`; rows and events from an agent's
   own call keep their old shape.
+  - `POST /v1/hub/session/work/transition` (`repository`, `work_id`, `operation_id`, `generation`,
+    `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
+    token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may
+    release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or
+    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. There is no Hub page
+    action for it yet. See [stand-up](standup.md#work-transitions).
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
   on the person's forge host that they can read now, for the web pages' All repositories list.
   Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,
@@ -508,7 +514,7 @@ body or query string is a 400 with a fixed body.
   idempotent: it writes no event and sends no notice (only the expiry moves, as
   a renewal, if `ttl_s` gives a different one). A changed announce of the same
   id replaces it and notices only the intents that overlap a path added by the
-  change. An id held by another token, or one that was released, is a 400.
+  change. An id held by another token, or one that was released, is a 400; a released id also carries the `message` "intent was released". An announce is also a 400 with a `message` that names the Work and says to resume it when a path lies in the scope of unfinished Work that the token no longer holds (see [stand-up](standup.md)). When a Work is released, finished or abandoned, the Hub releases the live intents of its participant sessions and, if the Work held a reservation, the token's session-less intents that overlap its scope, except those another Work with an eligible session of the token covers. Work that held no reservation releases no session-less intent, and a session that is eligible on other Work keeps its whole intent, including paths of the ended Work. A refused announce lists the refused paths in `refused_paths` (sorted, at most 32); the `agentscm intent` hook drops them and announces the others once. A token with more than 100 unfinished Work items that declare a scope is refused with `work_overlap_incomplete` (a 503; the `agentscm intent` hook shows that reason). Work with an empty scope does not count, and releasing, finishing or abandoning Work never fails on this bound.
 - `GET /v1/hub/repos/{repo}/intents` returns `{"intents": [I...], "truncated":
   bool}`: the live intents, by id, at most 1000.
 - `POST /v1/hub/repos/{repo}/intents/{id}/renew` with `{ttl_s}` returns

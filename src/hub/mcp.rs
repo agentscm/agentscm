@@ -40,6 +40,9 @@ use super::work::{
     WorkConflictKind, WorkItem, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
 };
 use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult, WorkPreflightStatus};
+use super::work_transition::{
+    OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionRequest,
+};
 #[cfg(not(unix))]
 use super::workspace::PromiseExecution;
 use super::{HubError, HubState, Result};
@@ -898,6 +901,18 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "depends_on": {"type": "array", "items": {"type": "string"}},
              "related_work": {"type": "array", "items": {"type": "string"}}
          }), &["work_id", "operation_id", "generation", "expected_updated_seq", "session", "kind", "summary"])});
+    let transition = json!({"name": "agentscm_work_transition",
+         "description": "Releases, retains, ends or reopens one Work item with one idempotent, generation-checked transition. release frees the reserved scope and pauses active Work; it does not assert completion, and the Work stays unfinished. retain keeps the reservation on purpose. complete, abandon and supersede end the Work and free its scope, each stating a different outcome. reopen takes finished Work back as lead after a scope overlap check. Allowed for the lead session and for another agent of the Work's owner; the reason is recorded and shown. Returns the receipt and the current work item, or a conflict with no change when a reopen overlaps another assignment.",
+         "inputSchema": schema(json!({
+             "work_id": {"type": "string"},
+             "operation_id": {"type": "string", "description": "Stable idempotency key for this exact transition."},
+             "generation": {"type": "integer", "minimum": 1},
+             "expected_updated_seq": {"type": "integer", "minimum": 1, "description": "Required compare-and-set fence from the last observed work item. An exact retained request returns its stored receipt before this fence is compared."},
+             "session": {"type": "string"},
+             "transition": {"type": "string", "enum": ["release", "retain", "complete", "abandon", "supersede", "reopen"]},
+             "reason": {"type": "string", "maxLength": 500, "description": "Why, in one line; recorded with the transition."},
+             "superseded_by": {"type": "string", "description": "The Work that replaces this one; required for supersede and refused otherwise."}
+         }), &["work_id", "operation_id", "generation", "expected_updated_seq", "session", "transition", "reason"])});
     let mut listed = json!([
         {"name": "agentscm_setup_status",
          "description": "Verify onboarding through native MCP using the actual native hook session ID. Reports MCP and native edit-hook evidence separately, with the next setup step. Optional blocker reports describe observed login, trust, quota or unsupported-account errors; never send raw diagnostics or credentials. CLI/config checks do not verify native hooks.",
@@ -978,6 +993,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         workflow_runs,
         usage,
         checkpoint,
+        transition,
         {"name": "agentscm_work_ack",
          "description": "Acknowledges one complete durable briefing after it was deliberately delivered. Never call this for a partial or unseen briefing.",
          "inputSchema": schema(json!({"delivery": {"type": "string"}}), &["delivery"])},
@@ -1581,6 +1597,7 @@ async fn call_inner(
             | "agentscm_coordination_resolve"
             | "agentscm_coordination_withdraw"
             | "agentscm_work_checkpoint"
+            | "agentscm_work_transition"
             | "agentscm_work_ack"
             | "agentscm_workflow_status"
             | "agentscm_work_search"
@@ -1769,7 +1786,16 @@ async fn call_inner(
         let token = principal.token_id.clone();
         return Ok(
             match blocking(state, move || {
-                store.work_overview(&token, &query, unix_now())
+                let now = unix_now();
+                let overview = store.work_overview(&token, &query, now)?;
+                let held = store.work_operational(
+                    &WorkLifecycleReader::Token(&token),
+                    &OperationalSelect::Holders,
+                    now,
+                )?;
+                Ok(super::work_lifecycle::overview_with_operational(
+                    &overview, &held,
+                ))
             })
             .await
             {
@@ -2026,6 +2052,13 @@ async fn call_inner(
             Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(work_checkpoint(state, principal, checkpoint, completion_reporting).await);
+    }
+    if name == "agentscm_work_transition" {
+        let request = match try_args::<WorkTransitionRequest>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        return Ok(work_transition(state, principal, request).await);
     }
     if name == "agentscm_work_ack" {
         let ack = match try_args::<BriefingAck>(arguments) {
@@ -2318,7 +2351,7 @@ async fn work_preflight(
     blocking(state, move || {
         let now = unix_now();
         let session = store.session_name_for(&token, session.as_deref(), now)?;
-        store.work_preflight(
+        let mut result = store.work_preflight(
             &token,
             &WorkStart {
                 work_id,
@@ -2337,7 +2370,14 @@ async fn work_preflight(
                 preflight,
             },
             now,
-        )
+        )?;
+        result.operational = super::work_http::operational_for_overlaps(
+            &*store,
+            &token,
+            &result.scope_overlaps,
+            now,
+        )?;
+        Ok(result)
     })
     .await
 }
@@ -2373,6 +2413,36 @@ async fn work_checkpoint(
     .await
     {
         Ok(item) => structured(&item),
+        Err(error) => work_failure(&error),
+    }
+}
+
+/// `agentscm_work_transition`: release, retain, finish or reopen Work as its lead or its owner's
+/// agent. The same store operation and rules as the HTTP route.
+async fn work_transition(
+    state: &HubState,
+    principal: &Principal,
+    request: WorkTransitionRequest,
+) -> Value {
+    let store = state.store.clone();
+    let token = principal.token_id.clone();
+    match blocking(state, move || {
+        let now = unix_now();
+        let mut result =
+            store.work_transition(&WorkTransitionActor::Agent { token: &token }, &request, now)?;
+        if let Some(conflict) = &mut result.conflict {
+            conflict.operational = super::work_http::operational_for_overlaps(
+                &*store,
+                &token,
+                &conflict.overlaps,
+                now,
+            )?;
+        }
+        Ok(result)
+    })
+    .await
+    {
+        Ok(result) => structured(&result),
         Err(error) => work_failure(&error),
     }
 }
@@ -2828,19 +2898,64 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         } else {
             store.work_start_auto(&token, &start, unix_now())
         }
-        .map(|work| (work, resolved, paths))
+        .and_then(|mut work| {
+            let now = unix_now();
+            if let Some(conflict) = &mut work.conflict {
+                conflict.operational = super::work_http::operational_for_overlaps(
+                    &*store,
+                    &token,
+                    &conflict.overlaps,
+                    now,
+                )?;
+            }
+            if let Some(preflight) = &mut work.preflight {
+                preflight.operational = super::work_http::operational_for_overlaps(
+                    &*store,
+                    &token,
+                    &preflight.scope_overlaps,
+                    now,
+                )?;
+            }
+            // Unfinished Work that holds no reservation (released) is not claimed by a start
+            // that merely names it again as its lead; resuming needs a takeover.
+            let unreserved = work.conflict.is_none()
+                && work.coordination_request.is_none()
+                && !work.created
+                && !work.took_over
+                && !matches!(work.item.state, WorkState::Finished)
+                && store
+                    .work_operational(
+                        &WorkLifecycleReader::Token(&token),
+                        &OperationalSelect::One(&work.item.id),
+                        now,
+                    )?
+                    .work
+                    .first()
+                    .is_some_and(|view| {
+                        view.reservation.status == super::work_lifecycle::ReservationStatus::None
+                    });
+            Ok((work, unreserved))
+        })
+        .map(|(work, unreserved)| (work, unreserved, resolved, paths))
     })
     .await?;
-    let (mut work, resolved, paths) = work;
+    let (mut work, unreserved, resolved, paths) = work;
     work.context = Some(context);
-    if work.conflict.is_some()
+    if unreserved
+        || work.conflict.is_some()
         || work.coordination_request.is_some()
         || matches!(
             work.item.state,
             WorkState::Paused | WorkState::Finished | WorkState::Handover
         )
     {
-        return Ok(start_result(String::new(), briefing, work, catchup));
+        return Ok(start_result(
+            String::new(),
+            briefing,
+            work,
+            catchup,
+            unreserved,
+        ));
     }
 
     let advice = announce_for(
@@ -2886,7 +3001,13 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     {
         parts.push(HOOKED.to_owned());
     }
-    Ok(start_result(parts.join("\n"), briefing, work, catchup))
+    Ok(start_result(
+        parts.join("\n"),
+        briefing,
+        work,
+        catchup,
+        false,
+    ))
 }
 
 fn start_result(
@@ -2894,11 +3015,13 @@ fn start_result(
     briefing: Briefing,
     work: WorkStartResult,
     catchup: Option<CatchupPreview>,
+    unreserved: bool,
 ) -> Value {
-    let paused = matches!(
-        work.item.state,
-        WorkState::Paused | WorkState::Finished | WorkState::Handover
-    );
+    let paused = unreserved
+        || matches!(
+            work.item.state,
+            WorkState::Paused | WorkState::Finished | WorkState::Handover
+        );
     let preflight_ready = work.preflight.as_ref().is_some_and(|preflight| {
         preflight.status == WorkPreflightStatus::ClearWithinCheckedWindow && preflight.complete
     });
@@ -2934,9 +3057,13 @@ fn start_result(
             "Inspect the queued coordination request and await the affected leads' replies.",
             "Make the agreed scope or participation change before continuing.",
         ],
+        None if unreserved => &[
+            "This work holds no reservation, so this start did not claim its scope. If it is your owner's Work, resume it by retrying the work id with takeover_generation set to current_generation; otherwise ask its owner to resume it.",
+            "Use a new stable work identity instead if the work should not be resumed.",
+        ],
         None if paused => &[
             "Paused work needs an explicit generation-checked resume; pass takeover_generation with the observed current generation.",
-            "For finished work, use a new stable work identity. For handover, inspect the current lead and generation before claiming it.",
+            "For finished work, reopen it with agentscm_work_transition or use a new stable work identity. For handover, inspect the current lead and generation before claiming it.",
         ],
         None if !preflight_ready => &[
             "Inspect work.preflight reasons, exact merge identities and completeness before editing.",

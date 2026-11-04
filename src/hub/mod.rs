@@ -48,8 +48,10 @@ pub mod value_metrics;
 pub mod view_settings;
 pub mod work;
 pub mod work_http;
+pub mod work_lifecycle;
 pub mod work_links;
 pub mod work_preflight;
+pub mod work_transition;
 pub mod workspace;
 #[cfg(unix)]
 pub mod workspace_agent_tasks;

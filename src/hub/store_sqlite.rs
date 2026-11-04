@@ -107,10 +107,15 @@ use super::work::{
     claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
     work_overlap_pairs, work_payload_row_bytes,
 };
+use super::work_lifecycle::{OperationalRow, OutcomeFact, operational_page};
 use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
+use super::work_transition::{
+    self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
+    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
+};
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
 
@@ -1768,8 +1773,17 @@ fn sqlite_insight_input(
         publications_complete = false;
     }
     project_claim(tx, &mut item, now)?;
+    let terminal_outcome = tx
+        .query_row(
+            "SELECT terminal_outcome FROM hub_work_items WHERE id = ?1",
+            [&item.id],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .as_deref()
+        .and_then(work_transition::TerminalOutcome::from_column);
     Ok(InsightInput {
         usage: sqlite_usage_summary(tx, &item.id, group_limit)?,
+        terminal_outcome,
         item,
         history,
         history_complete: rows.len() <= MAX_HISTORY && !retention_gap,
@@ -1826,6 +1840,27 @@ fn project_claims(tx: &Transaction<'_>, items: &mut [WorkItem], now: i64) -> Res
     Ok(())
 }
 
+/// Who stated the outcome of finished Work, from its latest terminal event. Unknown when that
+/// event was compacted away.
+fn terminal_provenance(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> Result<work_transition::OutcomeProvenance> {
+    let latest: Option<(String, String)> = tx
+        .query_row(
+            "SELECT kind, data FROM hub_events
+             WHERE subject = ?1 AND kind IN ('work_checkpoint', 'work_transition')
+             ORDER BY seq DESC LIMIT 1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(latest.map_or(
+        work_transition::OutcomeProvenance::Unknown,
+        |(kind, data)| work_transition::provenance_from_event(&kind, &data),
+    ))
+}
+
 fn scoped_work(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -1867,6 +1902,44 @@ fn relation_targets(tx: &Transaction<'_>, who: &WorkWho, ids: &[String]) -> Resu
     Ok(())
 }
 
+/// Whether the Work item currently holds its declared scope against other Work.
+fn work_holds_reservation(tx: &Transaction<'_>, id: &str) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT reservation_basis IS NOT NULL FROM hub_work_items WHERE id = ?1",
+        [id],
+        |row| row.get(0),
+    )?)
+}
+
+/// The stored reservation basis, None when the Work holds nothing.
+fn work_reservation_basis(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> Result<Option<work_transition::ReservationBasis>> {
+    let basis: Option<String> = tx.query_row(
+        "SELECT reservation_basis FROM hub_work_items WHERE id = ?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    Ok(basis
+        .as_deref()
+        .and_then(work_transition::ReservationBasis::from_column))
+}
+
+/// Overwrites the reservation columns, which the Work snapshot does not carry.
+fn set_work_reservation(
+    tx: &Transaction<'_>,
+    id: &str,
+    outcome: Option<&str>,
+    basis: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_work_items SET terminal_outcome = ?2, reservation_basis = ?3 WHERE id = ?1",
+        params![id, outcome, basis],
+    )?;
+    Ok(())
+}
+
 fn work_scope_overlaps(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -1881,7 +1954,7 @@ fn work_scope_overlaps(
     let mut statement = tx.prepare(
         "SELECT id, scope FROM hub_work_items
          WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-           AND state <> 'finished' AND (?5 IS NULL OR id <> ?5)
+           AND reservation_basis IS NOT NULL AND (?5 IS NULL OR id <> ?5)
          ORDER BY id LIMIT 101",
     )?;
     let scopes = statement
@@ -2008,7 +2081,7 @@ fn work_payload_bytes(
                FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
-                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
+                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
              UNION ALL
              SELECT length(CAST(r.proposed_scope AS BLOB))
                     + length(CAST(r.proposed_title AS BLOB)) + 256
@@ -2135,6 +2208,26 @@ fn adjust_work_payload_capacity(
     delta: i64,
     now: i64,
 ) -> Result<()> {
+    charge_work_payload(tx, who, delta, now, true)
+}
+
+/// Cleanup such as a release records its size even at quota, so the accounting stays exact.
+fn record_work_payload_delta(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    delta: i64,
+    now: i64,
+) -> Result<()> {
+    charge_work_payload(tx, who, delta, now, false)
+}
+
+fn charge_work_payload(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    delta: i64,
+    now: i64,
+    enforce: bool,
+) -> Result<()> {
     let used: Option<i64> = tx
         .query_row(
             "SELECT charged_bytes FROM hub_work_usage
@@ -2149,7 +2242,9 @@ fn adjust_work_payload_capacity(
         )
         .optional()?;
     let used = used.unwrap_or(0);
-    check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+    if enforce {
+        check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+    }
     let charged = used
         .checked_add(delta)
         .filter(|charged| *charged >= 0)
@@ -3340,6 +3435,11 @@ fn start_in(
                 preflight: None,
             });
         }
+        if item.state == WorkState::Finished && start.takeover_generation.is_some() {
+            return Err(HubError::Invalid(
+                "finished work cannot be taken over; reopen it instead".into(),
+            ));
+        }
         if item.lead_token == who.token
             && item.lead_session == start.session
             && start.takeover_generation.is_none()
@@ -3357,6 +3457,7 @@ fn start_in(
                         kind: WorkConflictKind::MetadataChanged,
                         current_generation: item.generation,
                         overlaps: Vec::new(),
+                        operational: Vec::new(),
                     }),
                     item,
                     created: false,
@@ -3367,7 +3468,11 @@ fn start_in(
                     preflight: None,
                 });
             }
-            let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            let overlaps = if work_holds_reservation(tx, &item.id)? {
+                work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?
+            } else {
+                Vec::new()
+            };
             let coordination_request = if overlaps.is_empty() {
                 None
             } else {
@@ -3410,6 +3515,7 @@ fn start_in(
                     kind,
                     current_generation: item.generation,
                     overlaps: Vec::new(),
+                    operational: Vec::new(),
                 }),
                 item,
                 created: false,
@@ -3420,9 +3526,14 @@ fn start_in(
                 preflight: None,
             });
         }
-        let resuming_own_paused = item.lead_token == who.token
+        // Work that released its reservation can be resumed by any token of its owner, whatever
+        // the state or claim age; the admission check below decides whether it may hold again.
+        let released_by_owner =
+            item.owner == who.owner.id && !work_holds_reservation(tx, &item.id)?;
+        let resuming_own_paused = (item.lead_token == who.token
             && item.state == WorkState::Paused
-            && start.takeover_generation == Some(item.generation);
+            && start.takeover_generation == Some(item.generation))
+            || released_by_owner;
         if !resuming_own_paused
             && item.claim_status != ClaimStatus::Stale
             && item.state != WorkState::Handover
@@ -3432,6 +3543,7 @@ fn start_in(
                     kind: WorkConflictKind::ClaimHeld,
                     current_generation: item.generation,
                     overlaps: Vec::new(),
+                    operational: Vec::new(),
                 }),
                 item,
                 created: false,
@@ -3441,6 +3553,27 @@ fn start_in(
                 coordination_request: None,
                 preflight: None,
             });
+        }
+        // Work that released its reservation must win the scope again before anyone leads it.
+        if !work_holds_reservation(tx, &item.id)? {
+            let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            if let Some(first) = overlaps.first() {
+                return Ok(WorkStartResult {
+                    conflict: Some(WorkStartConflict {
+                        kind: WorkConflictKind::ScopeOverlap,
+                        current_generation: first.item.generation,
+                        overlaps,
+                        operational: Vec::new(),
+                    }),
+                    item,
+                    created: false,
+                    joined: false,
+                    took_over: false,
+                    context: None,
+                    coordination_request: None,
+                    preflight: None,
+                });
+            }
         }
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
         let previous_lead_token = item.lead_token.clone();
@@ -3504,8 +3637,19 @@ fn start_in(
             ],
         )?;
         let snapshot = save_work_version(tx, &item, seq)?;
+        set_work_reservation(tx, &item.id, None, Some("admitted"))?;
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
-        retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
+        // Requests follow a new lead; the same lead resuming keeps them as they are.
+        if previous_lead_token != who.token || previous_lead_session != start.session {
+            retarget_coordination_requests(
+                tx,
+                who,
+                &item.id,
+                item.generation,
+                &start.session,
+                now,
+            )?;
+        }
         let delta = work_transition_payload_bytes(&snapshot, &event)?
             .checked_sub(previous_item_bytes)
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
@@ -3530,6 +3674,7 @@ fn start_in(
                 kind: WorkConflictKind::SessionGoalChanged,
                 current_generation: item.generation,
                 overlaps: Vec::new(),
+                operational: Vec::new(),
             }),
             item,
             created: false,
@@ -3565,6 +3710,7 @@ fn start_in(
                 kind: WorkConflictKind::ScopeOverlap,
                 current_generation: first.item.generation,
                 overlaps,
+                operational: Vec::new(),
             }),
             context: None,
             coordination_request: Some(coordination_request),
@@ -3648,9 +3794,10 @@ fn start_in(
             (id, provider, host, repository, repository_id, owner, lead_token, lead_agent,
              lead_session, generation, source_provider, source_host, source_repository,
              source_issue, request_key, title, state, scope, branch, worktree, next_action,
-             current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq)
+             current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq,
+             reservation_basis)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?14,
-                 ?15, 'active', ?16, ?17, ?18, ?19, NULL, ?20, ?21, ?21, ?22, ?22)",
+                 ?15, 'active', ?16, ?17, ?18, ?19, NULL, ?20, ?21, ?21, ?22, ?22, 'admitted')",
         params![
             item.id,
             who.owner.identity.provider,
@@ -4279,6 +4426,53 @@ fn release_in(tx: &Transaction<'_>, token: &str, intent: &str, now: i64) -> Resu
     Ok(changed > 0)
 }
 
+/// Whether the token's session is currently eligible on unfinished Work other than `work`: held
+/// reservation, active or blocked, current generation. An exact query, so it has no bound.
+fn session_eligible_elsewhere(
+    tx: &Transaction<'_>,
+    work: &str,
+    token: &str,
+    session: &str,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hub_work_items w
+         JOIN hub_work_participants p ON p.work=w.id
+         WHERE w.id <> ?1 AND w.state IN ('active','blocked')
+           AND w.reservation_basis IS NOT NULL
+           AND p.token=?2 AND p.generation=w.generation AND p.session=?3)",
+        params![work, token, session],
+        |row| row.get(0),
+    )?)
+}
+
+/// The declared scopes of up to `MAX_TOKEN_WORK_SCOPES` other unfinished Work on which one of the
+/// token's sessions is currently eligible (see `session_eligible_elsewhere`). Cleanup must not
+/// fail on a busy token, so a read past the bound is truncated: a covered advisory intent may
+/// then be released, and the next hook announces a new one. Only `guard_announce` fails closed.
+fn other_eligible_scopes(
+    tx: &Transaction<'_>,
+    work: &str,
+    token: &str,
+) -> Result<Vec<Vec<String>>> {
+    let mut statement = tx.prepare(
+        "SELECT DISTINCT w.id, w.snapshot FROM hub_work_items w
+         JOIN hub_work_participants p ON p.work=w.id
+         WHERE w.id <> ?1 AND w.state IN ('active','blocked')
+           AND w.reservation_basis IS NOT NULL
+           AND p.token=?2 AND p.generation=w.generation
+           AND w.scope <> '[]'
+         ORDER BY w.id LIMIT ?3",
+    )?;
+    let rows = statement
+        .query_map(params![work, token, MAX_TOKEN_WORK_SCOPES as i64], |row| {
+            row.get::<_, String>(1)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.iter()
+        .map(|snapshot| json_value::<WorkItem>(snapshot).map(|item| item.scope))
+        .collect()
+}
+
 fn release_session_intent(
     tx: &Transaction<'_>,
     token: &str,
@@ -4298,6 +4492,113 @@ fn release_session_intent(
         .map(|intent| release_in(tx, token, intent, now))
         .transpose()
         .map(Option::unwrap_or_default)
+}
+
+/// Releases the token's live intents that no session holds and that cover part of `scope`.
+/// A plain intent announce has no session, so only the path overlap ties it to the Work.
+fn release_sessionless_intents(
+    tx: &Transaction<'_>,
+    work: &str,
+    token: &str,
+    scope: &[String],
+    now: i64,
+) -> Result<()> {
+    // Paths another Work of the token covers while one of its sessions is eligible there are not
+    // this Work's to free.
+    let elsewhere = other_eligible_scopes(tx, work, token)?;
+    let intents = {
+        let mut statement = tx.prepare(
+            "SELECT i.id FROM hub_intents i
+             WHERE i.token = ?1 AND i.released_at IS NULL AND i.expires_at > ?2
+               AND NOT EXISTS (SELECT 1 FROM hub_sessions s WHERE s.intent = i.id)
+             ORDER BY i.id",
+        )?;
+        statement
+            .query_map(params![token, now], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for intent in intents {
+        let keys = {
+            let mut statement =
+                tx.prepare("SELECT key FROM hub_intent_paths WHERE intent = ?1 ORDER BY key")?;
+            statement
+                .query_map([&intent], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let ours = elsewhere.iter().fold(keys, |keys, other| {
+            super::work::uncovered_scope(other, &keys)
+        });
+        if !scope_overlap_reasons(scope, &ours).is_empty() {
+            release_in(tx, token, &intent, now)?;
+        }
+    }
+    Ok(())
+}
+
+/// Frees what Work that was released or ended held: the live intent of every participant
+/// session, the session-less intents of those tokens that cover its scope, and the targeting of
+/// open coordination requests, which keep their status. Works with revoked tokens. Returns the
+/// payload bytes the request events add; the caller records them without a quota check.
+fn release_work_holds(
+    tx: &Transaction<'_>,
+    item: &WorkItem,
+    cause: &work_transition::ReleaseCause,
+    held: bool,
+    now: i64,
+) -> Result<i64> {
+    let sessions = work_transition::claim_sessions(item);
+    for (token, session) in &sessions {
+        // A session that is currently eligible on other Work keeps the intent it holds there.
+        if !session_eligible_elsewhere(tx, &item.id, token, session)? {
+            release_session_intent(tx, token, session, now)?;
+        }
+    }
+    if held {
+        let mut tokens: Vec<&str> = sessions.iter().map(|(token, _)| token.as_str()).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        for token in tokens {
+            release_sessionless_intents(tx, &item.id, token, &item.scope, now)?;
+        }
+    }
+    // Requests that target the Work or propose it stay open: a response stays a response and
+    // nothing resolves.
+    let open = {
+        let mut statement = tx.prepare(
+            "SELECT r.id, r.status, r.proposed_work FROM hub_coordination_requests r
+             WHERE r.status IN ('pending', 'responded')
+               AND (r.proposed_work = ?1
+                    OR EXISTS (SELECT 1 FROM hub_coordination_targets t
+                               WHERE t.request = r.id AND t.work = ?1))
+             ORDER BY r.id",
+        )?;
+        statement
+            .query_map([&item.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut delta = 0i64;
+    for (id, status, proposed_work) in open {
+        let released = work_transition::released_target_event(&id, item, cause)?;
+        let released_seq = append(tx, &released)?;
+        save_coordination_version(
+            tx,
+            &id,
+            parse_status(&status)?,
+            proposed_work.as_deref(),
+            now,
+            released_seq,
+        )?;
+        delta = delta
+            .checked_add(coordination_payload_bytes(&[""], &released)?)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    }
+    Ok(delta)
 }
 
 /// The named session, else the token's only recent hook-connected one, else the default.
@@ -4443,6 +4744,7 @@ fn guard_managed_touch(
              JOIN hub_work_participants p ON p.work=w.id
              WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
                AND w.repository_id IS ?4 AND w.state IN ('active','blocked')
+               AND w.reservation_basis IS NOT NULL
                AND p.token=?5 AND p.session=?6 AND p.generation=w.generation
              ORDER BY w.id LIMIT 2",
         )?;
@@ -4488,6 +4790,68 @@ fn guard_managed_touch(
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
     Ok(())
+}
+
+/// The guard for a plain intent announce, which names no session and is advisory. It refuses a
+/// path only when the path lies in the scope of unfinished Work the token took part in and none of
+/// the token's sessions is currently eligible on it (held reservation, active or blocked, current
+/// generation), unless Work with an eligible session of the token covers the path. It looks the
+/// token up by its stored repository id, as the announce always has, so a renamed repository does
+/// not refuse it.
+fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let repository_id: Option<i64> = tx.query_row(
+        "SELECT repository_id FROM hub_agent_tokens WHERE id = ?1",
+        [&who.token],
+        |row| row.get(0),
+    )?;
+    let rows = {
+        let mut statement = tx.prepare(
+            "SELECT w.id, w.snapshot,
+                    MAX(w.state IN ('active','blocked') AND w.reservation_basis IS NOT NULL
+                        AND p.generation=w.generation)
+             FROM hub_work_items w
+             JOIN hub_work_participants p ON p.work=w.id
+             WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
+               AND w.repository_id IS ?4 AND w.state <> 'finished' AND p.token=?5
+               AND w.scope <> '[]'
+             GROUP BY w.id ORDER BY w.id LIMIT 101",
+        )?;
+        statement
+            .query_map(
+                params![
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    who.repository,
+                    repository_id,
+                    who.token
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if rows.len() > MAX_TOKEN_WORK_SCOPES {
+        return Err(HubError::WorkOverlapIncomplete);
+    }
+    let mut eligible = Vec::new();
+    let mut ineligible = Vec::new();
+    for (id, snapshot, held) in rows {
+        let scope = json_value::<WorkItem>(&snapshot)?.scope;
+        if held {
+            eligible.push(scope);
+        } else {
+            ineligible.push((id, scope));
+        }
+    }
+    work_transition::check_announce(&eligible, &ineligible, keys)
 }
 
 /// the session's behalf, or answered without text) tells and consumes nothing.
@@ -5372,7 +5736,7 @@ impl SqliteStore {
         let settled = settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 6, 7, 8]);
         let current_rows = {
             let mut statement = tx.prepare(&format!(
-                "SELECT w.snapshot FROM hub_work_items w
+                "SELECT w.snapshot, w.reservation_basis IS NOT NULL FROM hub_work_items w
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
                    AND w.state <> 'finished' AND NOT {settled} ORDER BY w.id LIMIT ?5"
             ))?;
@@ -5388,7 +5752,7 @@ impl SqliteStore {
                         catchup_key,
                         AUTO_PAUSE_SUMMARY
                     ],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -5410,10 +5774,15 @@ impl SqliteStore {
             ],
             |row| row.get(0),
         )?;
-        let mut current = current_rows
-            .into_iter()
-            .map(|snapshot| json_value::<WorkItem>(&snapshot))
-            .collect::<Result<Vec<_>>>()?;
+        let mut current = Vec::new();
+        let mut reserved_ids = std::collections::HashSet::new();
+        for (snapshot, held) in current_rows {
+            let item = json_value::<WorkItem>(&snapshot)?;
+            if held {
+                reserved_ids.insert(item.id.clone());
+            }
+            current.push(item);
+        }
         let mut current_complete = current.len() <= query.limit;
         current.truncate(query.limit);
         project_claims(&tx, &mut current, now)?;
@@ -5478,7 +5847,13 @@ impl SqliteStore {
         if fit_json_budget(&mut recent, overview_part_budget)? {
             recent_complete = false;
         }
-        let mut overlaps = work_overlap_pairs(&current, query.limit + 1);
+        // Only Work that holds its scope can overlap; released Work is listed but claims nothing.
+        let reserved = current
+            .iter()
+            .filter(|item| reserved_ids.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut overlaps = work_overlap_pairs(&reserved, query.limit + 1);
         let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
         overlaps.truncate(query.limit);
         if fit_json_budget(&mut overlaps, overview_part_budget)? {
@@ -6264,6 +6639,7 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
+        guard_announce(&tx, &who, &keys)?;
         let announced = announce_in(&tx, &who, intent, &keys, &[], now)?;
         tx.commit()?;
         Ok(announced)
@@ -8244,6 +8620,7 @@ impl Store for SqliteStore {
                 kind: WorkConflictKind::SessionGoalChanged,
                 current_generation: item.generation,
                 overlaps: Vec::new(),
+                operational: Vec::new(),
             });
             let result = WorkStartResult {
                 item,
@@ -8326,6 +8703,11 @@ impl Store for SqliteStore {
                 },
             });
         }
+        if item.state == WorkState::Finished {
+            return Err(HubError::Invalid(
+                "finished work accepts no checkpoint; reopen it first".into(),
+            ));
+        }
         if item.generation != checkpoint.generation {
             return Err(HubError::Invalid(format!(
                 "checkpoint generation is fenced; current generation is {}",
@@ -8336,6 +8718,12 @@ impl Store for SqliteStore {
             return Err(HubError::Invalid(
                 "only the current lead session may checkpoint work".into(),
             ));
+        }
+        let prior_basis = work_reservation_basis(&tx, &item.id)?;
+        let held = prior_basis.is_some();
+        if !held {
+            // Reporting work on Work that holds nothing would flip it to active with nothing held.
+            work_transition::needs_resume(checkpoint.kind)?;
         }
         let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
             HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
@@ -8399,7 +8787,12 @@ impl Store for SqliteStore {
             }
         }
         if let Some(scope) = checkpoint.normalized_scope()? {
-            let overlaps = work_scope_overlaps(&tx, &who, &scope, Some(&item.id), now)?;
+            // Work without a reservation claims nothing, so its scope change has nothing to check.
+            let overlaps = if held {
+                work_scope_overlaps(&tx, &who, &scope, Some(&item.id), now)?
+            } else {
+                Vec::new()
+            };
             if !overlaps.is_empty() {
                 let request = create_coordination_request(
                     &tx,
@@ -8483,6 +8876,17 @@ impl Store for SqliteStore {
         let seq = append(&tx, &event)?;
         item.updated_seq = seq;
         let snapshot = save_work_version(&tx, &item, seq)?;
+        match checkpoint.kind {
+            super::work::CheckpointKind::Finish => {
+                set_work_reservation(&tx, &item.id, Some("completed"), None)?;
+            }
+            super::work::CheckpointKind::Pause | super::work::CheckpointKind::Handover => {
+                if let Some(basis) = work_transition::basis_after_pause(prior_basis) {
+                    set_work_reservation(&tx, &item.id, None, Some(basis.column()))?;
+                }
+            }
+            _ => {}
+        }
         tx.execute(
             "INSERT INTO hub_work_checkpoint_ops
                 (work, operation_id, request, event_seq)
@@ -8496,7 +8900,11 @@ impl Store for SqliteStore {
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(&tx, &who, delta, now)?;
         if checkpoint.kind == super::work::CheckpointKind::Finish {
-            release_session_intent(&tx, token, &checkpoint.session, now)?;
+            // The same cleanup as a terminal transition. It follows the quota check above and
+            // records its own size without one, so a finish is never refused for the cleanup.
+            let cause = work_transition::ReleaseCause::finish_checkpoint(&who.owner.id);
+            let cleanup = release_work_holds(&tx, &item, &cause, held, now)?;
+            record_work_payload_delta(&tx, &who, cleanup, now)?;
         }
         tx.commit()?;
         Ok(WorkCheckpointResult {
@@ -8509,6 +8917,327 @@ impl Store for SqliteStore {
                 replayed: false,
             },
         })
+    }
+
+    fn work_transition(
+        &self,
+        actor: &WorkTransitionActor<'_>,
+        request: &WorkTransitionRequest,
+        now: i64,
+    ) -> Result<WorkTransitionResult> {
+        request.validate()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = match actor {
+            WorkTransitionActor::Agent { token } => work_who(&tx, token, now)?,
+            WorkTransitionActor::Person {
+                user,
+                repository,
+                repository_id,
+                ..
+            } => {
+                if user.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(user, repository, *repository_id)
+            }
+        };
+        // Read-only is refused before the id is looked up, as in the PostgreSQL store, so a
+        // read-only caller learns nothing about which ids exist.
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let via = match actor {
+            WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
+            WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
+        };
+        let mut item = scoped_work(&tx, &who, &request.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        let envelope = request.envelope(via, &who.owner.id)?;
+        if let Some((previous, event_seq, generation)) = tx
+            .query_row(
+                "SELECT o.request, o.event_seq, json_extract(v.snapshot, '$.generation')
+                 FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
+                 WHERE o.work = ?1 AND o.operation_id = ?2",
+                params![item.id, request.operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if previous != envelope {
+                return Err(HubError::Invalid(
+                    "operation_id was already used for another request".into(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(WorkTransitionResult {
+                item,
+                receipt: Some(CheckpointReceipt {
+                    work_id: request.work_id.clone(),
+                    operation_id: request.operation_id.clone(),
+                    generation,
+                    event_seq,
+                    replayed: true,
+                }),
+                conflict: None,
+            });
+        }
+        let acting = work_transition::classify(&item, &who, actor, request.session.as_deref())?
+            .ok_or(HubError::Unauthorized)?;
+        let (outcome_column, basis_column): (Option<String>, Option<String>) = tx.query_row(
+            "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = ?1",
+            [&item.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let held = basis_column.is_some();
+        work_transition::check(&item, held, &acting, request)?;
+        if let Some(by) = &request.superseded_by {
+            relation_targets(&tx, &who, std::slice::from_ref(by))?;
+        }
+        if request.transition == work_transition::WorkTransitionKind::Reopen {
+            // Reopening is a fresh admission whatever the client checked beforehand.
+            let overlaps = work_scope_overlaps(&tx, &who, &item.scope, Some(&item.id), now)?;
+            if let Some(first) = overlaps.first() {
+                let conflict = WorkStartConflict {
+                    kind: WorkConflictKind::ScopeOverlap,
+                    current_generation: first.item.generation,
+                    overlaps,
+                    operational: Vec::new(),
+                };
+                return Ok(WorkTransitionResult {
+                    item,
+                    receipt: None,
+                    conflict: Some(conflict),
+                });
+            }
+        }
+        let prior = work_transition::Prior {
+            state: item.state,
+            basis: basis_column
+                .as_deref()
+                .and_then(work_transition::ReservationBasis::from_column),
+            outcome: outcome_column
+                .as_deref()
+                .and_then(work_transition::TerminalOutcome::from_column),
+            generation: item.generation,
+            lead_token: item.lead_token.clone(),
+            lead_agent: item.lead_agent.clone(),
+            lead_session: item.lead_session.clone(),
+        };
+        let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
+        let columns = work_transition::apply(&mut item, request, &acting, now)?;
+        let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
+        let seq = append(&tx, &event)?;
+        item.updated_seq = seq;
+        let snapshot = save_work_version(&tx, &item, seq)?;
+        set_work_reservation(
+            &tx,
+            &item.id,
+            columns
+                .outcome
+                .map(work_transition::TerminalOutcome::column),
+            columns.basis.map(work_transition::ReservationBasis::column),
+        )?;
+        if request.superseded_by.is_some() {
+            replace_relations(&tx, &who, &item.id, &item.depends_on, &item.related_work)?;
+        }
+        if request.transition == work_transition::WorkTransitionKind::Reopen {
+            tx.execute(
+                "UPDATE hub_work_participants SET role = 'helper', updated_at = ?2
+                 WHERE work = ?1 AND role = 'lead'",
+                params![item.id, now],
+            )?;
+            tx.execute(
+                "INSERT INTO hub_work_participants
+                    (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'lead', ?6, ?7, ?7)
+                 ON CONFLICT (work, token, session) DO UPDATE SET role = 'lead',
+                    owner = excluded.owner, agent = excluded.agent,
+                    generation = excluded.generation, updated_at = excluded.updated_at",
+                params![
+                    item.id,
+                    item.lead_token,
+                    acting.user_id,
+                    item.lead_agent,
+                    item.lead_session,
+                    item.generation,
+                    now
+                ],
+            )?;
+        }
+        if request.transition == work_transition::WorkTransitionKind::Reopen
+            && prior.lead_changed(&item)
+        {
+            // Open requests followed the old lead; they go back to waiting for the new one.
+            retarget_coordination_requests(
+                &tx,
+                &who,
+                &item.id,
+                item.generation,
+                &item.lead_session,
+                now,
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO hub_work_checkpoint_ops (work, operation_id, request, event_seq)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![item.id, request.operation_id, envelope, seq],
+        )?;
+        let mut delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .and_then(|bytes| bytes.checked_add(work_payload_row_bytes(envelope.len()).ok()?))
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        if work_transition::releases_claims(request.transition) {
+            let cause = work_transition::ReleaseCause::transition(request, &acting);
+            delta = delta
+                .checked_add(release_work_holds(
+                    &tx,
+                    &item,
+                    &cause,
+                    prior.basis.is_some(),
+                    now,
+                )?)
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            record_work_payload_delta(&tx, &who, delta, now)?;
+        } else {
+            adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        }
+        tx.commit()?;
+        Ok(WorkTransitionResult {
+            receipt: Some(CheckpointReceipt {
+                work_id: item.id.clone(),
+                operation_id: request.operation_id.clone(),
+                generation: item.generation,
+                event_seq: seq,
+                replayed: false,
+            }),
+            item,
+            conflict: None,
+        })
+    }
+
+    fn work_operational(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        select: &OperationalSelect<'_>,
+        now: i64,
+    ) -> Result<OperationalOverviewV1> {
+        let ids = select.ids()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => work_transition::person_who(owner, repository, *repository_id),
+        };
+        let catchup_repository = repository_namespace(&who.repository, who.repository_id);
+        let catchup_key = catchup_repository_key(who.repository_id);
+        let settled = settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 5, 6, 7]);
+        let filter = if ids.is_some() {
+            "w.id IN (SELECT value FROM json_each(?8))"
+        } else {
+            "w.reservation_basis IS NOT NULL"
+        };
+        let sql = format!(
+            "SELECT w.snapshot, w.terminal_outcome, w.reservation_basis, {settled}
+             FROM hub_work_items w
+             WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
+               AND {filter} ORDER BY w.id LIMIT 101"
+        );
+        let mut found = Vec::new();
+        {
+            let mut statement = tx.prepare(&sql)?;
+            let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(who.owner.identity.provider.clone()),
+                Box::new(who.owner.identity.host.clone()),
+                Box::new(who.repository.clone()),
+                Box::new(who.repository_id),
+                Box::new(catchup_repository),
+                Box::new(catchup_key),
+                Box::new(AUTO_PAUSE_SUMMARY),
+            ];
+            if let Some(ids) = &ids {
+                values.push(Box::new(json_string(ids)?));
+            }
+            let rows = statement.query_map(
+                rusqlite::params_from_iter(values.iter().map(|value| value.as_ref())),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                found.push(row?);
+            }
+        }
+        let more = found.len() > super::work_lifecycle::MAX_OPERATIONAL_WORK;
+        found.truncate(super::work_lifecycle::MAX_OPERATIONAL_WORK);
+        let mut items = found
+            .iter()
+            .map(|(snapshot, ..)| json_value::<WorkItem>(snapshot))
+            .collect::<Result<Vec<_>>>()?;
+        project_claims(&tx, &mut items, now)?;
+        let mut rows = Vec::new();
+        for (item, (_, outcome, basis, hidden)) in items.into_iter().zip(found) {
+            let outcome = outcome
+                .as_deref()
+                .and_then(work_transition::TerminalOutcome::from_column)
+                .filter(|_| item.state == WorkState::Finished);
+            let outcome = match outcome {
+                Some(outcome) => Some(OutcomeFact {
+                    outcome,
+                    provenance: terminal_provenance(&tx, &item.id)?,
+                }),
+                None => None,
+            };
+            rows.push(OperationalRow {
+                item,
+                outcome,
+                basis: basis
+                    .as_deref()
+                    .and_then(work_transition::ReservationBasis::from_column),
+                hidden_by_merged_pr: hidden,
+            });
+        }
+        let forge_window: Option<(String, Option<i64>)> = tx
+            .query_row(
+                "SELECT state, window_from FROM hub_catchup_sources
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 AND source=?5",
+                params![
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    repository_namespace(&who.repository, who.repository_id),
+                    catchup_key,
+                    source_name(CatchupMergeSource::ForgePull)
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let forge_window_from = match forge_window {
+            Some((state, from))
+                if parse_coverage(&state)?
+                    == super::catchup::CatchupCoverageState::ObservedOnly =>
+            {
+                from
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok(operational_page(rows, forge_window_from, more))
     }
 
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
@@ -11690,19 +12419,19 @@ impl Store for SqliteStore {
                      SELECT MAX(e.seq) FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
                        'coordination_requested','coordination_bound','coordination_retargeted',
                        'coordination_acknowledged','coordination_responded',
-                       'coordination_resolved','coordination_withdrawn'))
+                       'coordination_resolved','coordination_withdrawn','coordination_target_released'))
                  FROM hub_coordination_requests r
                  WHERE r.provider=?1 AND r.host=?2 AND r.repository=?3 AND r.repository_id IS ?4
                    AND r.status IN ('resolved','withdrawn') AND r.updated_at < ?5
                    AND EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
                        'coordination_requested','coordination_bound','coordination_retargeted',
                        'coordination_acknowledged','coordination_responded',
-                       'coordination_resolved','coordination_withdrawn'))
+                       'coordination_resolved','coordination_withdrawn','coordination_target_released'))
                    AND NOT EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id
                        AND e.kind IN ('coordination_requested','coordination_bound',
                          'coordination_retargeted','coordination_acknowledged',
                          'coordination_responded','coordination_resolved',
-                         'coordination_withdrawn') AND e.at >= ?5)",
+                         'coordination_withdrawn','coordination_target_released') AND e.at >= ?5)",
             )?;
             statement
                 .query_map(
@@ -11793,7 +12522,7 @@ impl Store for SqliteStore {
                  JOIN hub_work_items w ON w.id = e.subject
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at < ?5
-                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
+                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
                    AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                    AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                 params![
@@ -11811,7 +12540,7 @@ impl Store for SqliteStore {
                      JOIN hub_work_items w ON w.id = e.subject
                      WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                        AND w.repository_id IS ?4 AND e.at < ?5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)
                  )",
@@ -11889,7 +12618,7 @@ impl Store for SqliteStore {
                     "DELETE FROM hub_events WHERE subject=?1 AND kind IN (
                        'coordination_requested','coordination_bound','coordination_retargeted',
                        'coordination_acknowledged','coordination_responded',
-                       'coordination_resolved','coordination_withdrawn') AND at < ?2",
+                       'coordination_resolved','coordination_withdrawn','coordination_target_released') AND at < ?2",
                     params![request, before],
                 )?;
             }
@@ -12477,7 +13206,7 @@ impl Store for SqliteStore {
         let proposal_scope = if let Some(work) = &request.proposal.work_id {
             let item = scoped_work(&tx, &who, work, now)?
                 .ok_or_else(|| HubError::Unavailable("proposed work item is missing".into()))?;
-            if item.state == WorkState::Finished {
+            if item.state == WorkState::Finished || !work_holds_reservation(&tx, &item.id)? {
                 Vec::new()
             } else if coordination_was_initially_bound(&tx, &request.id)? {
                 if item.scope != request.proposal.scope {

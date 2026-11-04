@@ -557,7 +557,24 @@ async fn announce(
     let announced = blocking(&state, move || {
         store.announce_intent(&principal.token_id, &intent, unix_now())
     })
-    .await?;
+    .await
+    .map_err(|error| match error {
+        // Only the two refusals that tell the client what to do carry their text; every other
+        // validation failure keeps the fixed body.
+        HubError::Invalid(message)
+            if message == "intent was released"
+                || message.starts_with("These files are in the scope of Work ") =>
+        {
+            let (text, refused) = super::work_transition::split_refusal(&message);
+            let error = ApiError::invalid().with_message(text);
+            if refused.is_empty() {
+                error
+            } else {
+                error.with_field("refused_paths", json!(refused))
+            }
+        }
+        other => ApiError::from(other),
+    })?;
     NOTICES.notify_waiters();
     let host = principal.owner.identity.host.clone();
     // The announce is committed; a failed look at pull requests must not fail it.

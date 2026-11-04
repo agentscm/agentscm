@@ -4,7 +4,9 @@ use crate::hub_pg;
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token};
+use agentscm::hub::catchup::{CatchupMergeSource, CatchupRepositoryScope, NewCatchupMerge};
+use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
+use agentscm::hub::work::{WorkOverview, WorkStartResult};
 use agentscm::hub::{HubState, router};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -534,4 +536,393 @@ fn work_search_on_postgres() {
     };
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async { work_search(Hub::start(Some(pg.url.clone())).await).await });
+}
+
+async fn record_merge(hub: &Hub, branch: &str) {
+    let at = unix_now();
+    let (store, branch) = (hub.store.clone(), branch.to_owned());
+    tokio::task::spawn_blocking(move || {
+        store
+            .record_catchup_merge(
+                &CatchupRepositoryScope {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    repository: "acme/widgets".into(),
+                    repository_id: Some(101),
+                },
+                &NewCatchupMerge {
+                    same_repository_head: true,
+                    source: CatchupMergeSource::ForgePull,
+                    source_id: "pull:7".into(),
+                    occurred_at: Some(at),
+                    title: Some("Merge 7".into()),
+                    branch,
+                    base: "main".into(),
+                    head_commit: "7".repeat(40),
+                    merge_commit: "8".repeat(40),
+                    pull_number: 7,
+                    paths: vec!["src/billing.rs".into()],
+                    paths_complete: true,
+                },
+                at,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+fn billing(key: &str, session: &str) -> Value {
+    json!({"request_key": key, "title": "Billing rounding", "session": session,
+        "scope": ["src/billing.rs"], "branch": "feat/billing", "next_action": "Continue"})
+}
+
+/// Work hidden by a merged pull request still holds its scope: it stays out of `current`, is
+/// listed in `operational`, and a conflicting start sees it marked, with nothing altered.
+async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
+    let (lead_id, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, other) = hub.token(2, "acme/widgets", false).await;
+    let (_, reader) = hub.token(3, "acme/widgets", true).await;
+    let (status, started) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &lead,
+            Some(billing("bill", "s-a")),
+        )
+        .await;
+    assert_eq!(status, 200, "{started}");
+    let id = started["item"]["id"].as_str().unwrap().to_owned();
+    record_merge(&hub, "feat/billing").await;
+
+    // Without the flag the overview carries no new key and a strict client decodes it.
+    let (status, plain) = hub
+        .call(Method::GET, "/v1/hub/standup/overview", &reader, None)
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain.get("operational").is_none(), "{plain}");
+    let strict: WorkOverview = serde_json::from_value(plain.clone()).unwrap();
+    assert!(strict.current.is_empty());
+    assert_eq!(strict.settled_count, 1);
+
+    // With it, the hidden Work is listed with its state, outcome and reservation unaltered.
+    let (status, rich) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/overview?operational=1",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{rich}");
+    assert_eq!(rich["current"], plain["current"]);
+    assert_eq!(rich["settled_count"], plain["settled_count"]);
+    let listed = &rich["operational"];
+    assert_eq!(
+        (&listed["schema_version"], &listed["complete"]),
+        (&json!(1), &json!(true))
+    );
+    let entry = &listed["work"][0];
+    assert_eq!(entry["work_id"], id.as_str());
+    assert_eq!(
+        entry["merge"],
+        json!({"hidden_by_merged_pr": true, "status": "observed"})
+    );
+    assert_eq!(entry["state"], "active");
+    assert_eq!(entry["outcome"]["value"], "none");
+    assert_eq!(entry["reservation"]["status"], "held");
+    assert_eq!(entry["reservation"]["holder_session"], "s-a");
+    // Parameters are strict.
+    for bad in ["operational=2", "operational=yes", "operational=1&other=1"] {
+        let path = format!("/v1/hub/standup/overview?{bad}");
+        assert_eq!(
+            hub.call(Method::GET, &path, &reader, None).await.0,
+            400,
+            "{bad}"
+        );
+    }
+
+    // A conflicting start: the conflict names the hidden Work only on request.
+    let (status, bare) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &other,
+            Some(billing("rival", "s-b")),
+        )
+        .await;
+    assert_eq!(status, 200, "{bare}");
+    assert_eq!(bare["conflict"]["kind"], "scope_overlap");
+    assert!(bare["conflict"].get("operational").is_none(), "{bare}");
+    serde_json::from_value::<WorkStartResult>(bare).unwrap();
+    let (status, rich) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start?operational=1",
+            &other,
+            Some(billing("rival", "s-b")),
+        )
+        .await;
+    assert_eq!(status, 200, "{rich}");
+    let marked = &rich["conflict"]["operational"][0];
+    assert_eq!(marked["work_id"], id.as_str());
+    assert_eq!(marked["merge"]["hidden_by_merged_pr"], true);
+    assert_eq!(marked["state"], "active");
+    assert_eq!(marked["outcome"]["value"], "none");
+    // The same facts are readable on their own, and nothing leaks a token.
+    let (status, one) = hub
+        .call(
+            Method::GET,
+            &format!("/v1/hub/standup/work/{id}/operational"),
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(one["schema_version"], 1);
+    for body in [
+        one.to_string(),
+        rich["conflict"]["operational"].to_string(),
+        listed.to_string(),
+    ] {
+        assert!(!body.contains(&lead_id), "{body}");
+    }
+    let (status, _) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/work/wrk_00000000000000000000000000000001/operational",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = hub
+        .call(
+            Method::GET,
+            "/v1/hub/standup/work/not-an-id/operational",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 400);
+    let (status, none) = hub
+        .call(Method::GET, "/v1/hub/standup/operational", &other, None)
+        .await;
+    assert_eq!(status, 200, "{none}");
+    assert_eq!(none["work"].as_array().unwrap().len(), 1, "{none}");
+    // Preflight follows the same rule.
+    let preflight = |path: &'static str| {
+        let (hub, other) = (&hub, other.clone());
+        async move {
+            hub.call(Method::POST, path, &other, Some(billing("rival", "s-b")))
+                .await
+        }
+    };
+    let (status, bare) = preflight("/v1/hub/standup/preflight").await;
+    assert_eq!(status, 200, "{bare}");
+    assert!(bare.get("operational").is_none(), "{bare}");
+    let (status, rich) = preflight("/v1/hub/standup/preflight?operational=1").await;
+    assert_eq!(status, 200, "{rich}");
+    assert_eq!(rich["operational"][0]["work_id"], id.as_str());
+    // Start and preflight ignored unknown query parameters before the flag existed, and still do.
+    let (status, ignored) = preflight("/v1/hub/standup/preflight?unknown=1").await;
+    assert_eq!(status, 200, "{ignored}");
+    assert!(ignored.get("operational").is_none(), "{ignored}");
+    let (status, ignored) = preflight("/v1/hub/standup/preflight?unknown=1&operational=1").await;
+    assert_eq!(status, 200, "{ignored}");
+    assert_eq!(ignored["operational"][0]["work_id"], id.as_str());
+    let (status, ignored) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start?unknown=1",
+            &other,
+            Some(billing("rival", "s-b")),
+        )
+        .await;
+    assert_eq!(status, 200, "{ignored}");
+    assert_eq!(ignored["conflict"]["kind"], "scope_overlap");
+    assert!(
+        ignored["conflict"].get("operational").is_none(),
+        "{ignored}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operational_projection_is_opt_in_over_http() {
+    operational_projection_is_opt_in_and_strictly_compatible(Hub::start(None).await).await;
+}
+
+#[test]
+fn operational_projection_is_opt_in_on_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        operational_projection_is_opt_in_and_strictly_compatible(
+            Hub::start(Some(pg.url.clone())).await,
+        )
+        .await
+    });
+}
+
+fn transition(item: &Value, operation: &str, kind: &str) -> Value {
+    json!({"work_id": item["id"], "operation_id": operation, "generation": item["generation"],
+        "expected_updated_seq": item["updated_seq"], "session": "s-a", "transition": kind,
+        "reason": "synthetic reason"})
+}
+
+async fn agent_transition_route(hub: Hub) {
+    const PATH: &str = "/v1/hub/standup/work-transition";
+    let (_, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, stranger) = hub.token(2, "acme/widgets", false).await;
+    let (_, viewer) = hub.token(3, "acme/widgets", true).await;
+    let (_, started) = {
+        let r = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/start",
+                &lead,
+                Some(billing("bill", "s-a")),
+            )
+            .await;
+        (r.0, r.1)
+    };
+    let item = started["item"].clone();
+    let id = item["id"].as_str().unwrap().to_owned();
+    let release = transition(&item, "rel-1", "release");
+
+    // A read-only token and another owner's token cannot release.
+    let (status, refused) = hub
+        .call(Method::POST, PATH, &viewer, Some(release.clone()))
+        .await;
+    assert_eq!(status, 403, "{refused}");
+    let (status, refused) = hub
+        .call(Method::POST, PATH, &stranger, Some(release.clone()))
+        .await;
+    assert_eq!(status, 401, "{refused}");
+    let mut stray = release.clone();
+    stray["extra"] = json!(1);
+    assert_eq!(
+        hub.call(Method::POST, PATH, &lead, Some(stray)).await.0,
+        400
+    );
+    let (_, still) = hub
+        .call(
+            Method::GET,
+            &format!("/v1/hub/standup/work/{id}"),
+            &lead,
+            None,
+        )
+        .await;
+    assert_eq!(still["state"], "active");
+
+    // The lead releases; an exact retry returns the same receipt.
+    let (status, done) = hub
+        .call(Method::POST, PATH, &lead, Some(release.clone()))
+        .await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["item"]["state"], "paused");
+    let receipt = done["receipt"].clone();
+    assert!(receipt.is_object());
+    let (status, retry) = hub
+        .call(Method::POST, PATH, &lead, Some(release.clone()))
+        .await;
+    assert_eq!(status, 200, "{retry}");
+    assert_eq!(retry["receipt"]["replayed"], true);
+    for field in ["event_seq", "generation", "operation_id", "work_id"] {
+        assert_eq!(retry["receipt"][field], receipt[field], "{field}");
+    }
+    let mut changed = release;
+    changed["reason"] = json!("another reason");
+    assert_eq!(
+        hub.call(Method::POST, PATH, &lead, Some(changed)).await.0,
+        400
+    );
+
+    // The reservation is gone from the holders list but the Work is still readable.
+    let (_, holders) = hub
+        .call(Method::GET, "/v1/hub/standup/operational", &viewer, None)
+        .await;
+    assert!(holders["work"].as_array().unwrap().is_empty(), "{holders}");
+    let (_, one) = hub
+        .call(
+            Method::GET,
+            &format!("/v1/hub/standup/work/{id}/operational"),
+            &viewer,
+            None,
+        )
+        .await;
+    assert_eq!(one["reservation"]["status"], "none");
+    assert_eq!(one["state"], "paused");
+
+    // The released session is fenced: its checkpoint is refused.
+    let (status, _) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/checkpoint",
+            &lead,
+            Some(
+                json!({"work_id": id, "operation_id": "late", "generation": item["generation"],
+                "session": "s-a", "expected_updated_seq": done["item"]["updated_seq"],
+                "kind": "progress", "summary": "late"}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // A reopen that overlaps newer Work is a result with a conflict and no receipt, like a start.
+    let (_, finished) = {
+        let current = done["item"].clone();
+        hub.call(
+            Method::POST,
+            PATH,
+            &lead,
+            Some(transition(&current, "fin-1", "complete")),
+        )
+        .await
+    };
+    assert_eq!(finished["item"]["state"], "finished");
+    let (status, _) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &stranger,
+            Some(billing("rival", "s-b")),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let ended = finished["item"].clone();
+    let reopen = transition(&ended, "reopen-1", "reopen");
+    let (status, blocked) = hub
+        .call(Method::POST, PATH, &lead, Some(reopen.clone()))
+        .await;
+    assert_eq!(status, 200, "{blocked}");
+    assert!(blocked["receipt"].is_null(), "{blocked}");
+    assert_eq!(blocked["conflict"]["kind"], "scope_overlap");
+    assert!(blocked["conflict"].get("operational").is_none());
+    let (_, rich) = hub
+        .call(
+            Method::POST,
+            &format!("{PATH}?operational=1"),
+            &lead,
+            Some(reopen),
+        )
+        .await;
+    assert_eq!(rich["conflict"]["operational"][0]["state"], "active");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_transition_route_authorizes_replays_and_reports_conflicts() {
+    agent_transition_route(Hub::start(None).await).await;
+}
+
+#[test]
+fn work_transition_route_on_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime
+        .block_on(async { agent_transition_route(Hub::start(Some(pg.url.clone())).await).await });
 }

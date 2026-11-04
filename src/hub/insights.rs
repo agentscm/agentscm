@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::work::{ClaimStatus, WorkItem, WorkState};
+use super::work_lifecycle::TerminalOutcome;
 use super::{HubError, Result};
 
 pub const MAX_OBSERVATIONS: usize = 500;
@@ -282,6 +283,9 @@ pub struct PublicationEvidence {
 #[derive(Clone, Debug)]
 pub struct InsightInput {
     pub item: WorkItem,
+    /// Why the Work finished. Abandoned and superseded Work is finished but not a reported
+    /// completion.
+    pub terminal_outcome: Option<TerminalOutcome>,
     pub history: Vec<HistoryPoint>,
     pub history_complete: bool,
     pub retention_gap: bool,
@@ -591,6 +595,7 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
 pub fn project(input: InsightInput) -> WorkInsight {
     let InsightInput {
         item,
+        terminal_outcome,
         history,
         history_complete,
         retention_gap,
@@ -688,7 +693,11 @@ pub fn project(input: InsightInput) -> WorkInsight {
         claim_status: item.claim_status,
         created_at: item.created_at,
         updated_at: item.updated_at,
-        reported_finished: item.state == WorkState::Finished,
+        reported_finished: item.state == WorkState::Finished
+            && !matches!(
+                terminal_outcome,
+                Some(TerminalOutcome::Abandoned | TerminalOutcome::Superseded)
+            ),
         history_complete: complete,
         history_retention_gap: retention_gap,
         scanned_events: history.len(),
@@ -796,6 +805,7 @@ mod tests {
         };
         InsightInput {
             item,
+            terminal_outcome: None,
             history,
             history_complete: true,
             retention_gap: false,
@@ -918,6 +928,22 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("private-token-id"));
         assert!(!json.contains("private-session"));
+    }
+    #[test]
+    fn only_completed_or_unstated_finished_work_is_a_reported_finish() {
+        for (outcome, reported) in [
+            (None, true),
+            (Some(TerminalOutcome::Completed), true),
+            (Some(TerminalOutcome::Abandoned), false),
+            (Some(TerminalOutcome::Superseded), false),
+        ] {
+            let mut finished = input(
+                &[(100, WorkState::Active, 1), (200, WorkState::Finished, 1)],
+                300,
+            );
+            finished.terminal_outcome = outcome;
+            assert_eq!(project(finished).reported_finished, reported, "{outcome:?}");
+        }
     }
     #[test]
     fn missing_or_nonmonotonic_history_never_invents_zero_wait() {

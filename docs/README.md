@@ -39,6 +39,7 @@ observed actions and source; they are not independent verification or human appr
 
 ## Reuse workflows and track commitments
 
+- [Work outcomes and scope reservations](design/work-lifecycle.md): design for separating why Work ended from whether it still holds its scope.
 - [Supported skills](design/supported-skills.md): experimental `pr-gate` v1 and its self-reported evidence.
 - [All repositories](design/all-repositories.md): experimental cross-repository home page for a web sign-in.
 - [Local workflow library](advanced/workflow-library.md): versioned authoring, pinned imports, simulation and explicit export.

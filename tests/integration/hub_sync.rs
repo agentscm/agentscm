@@ -2556,10 +2556,48 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
             "alice",
         )
         .unwrap();
-    let (_, bound, _) =
+    let (bound_id, bound, _) =
         mint_bound_agent_token(&*env.store, &owner.id, "bound", REPO, REPO_ID, 3600, false)
             .unwrap();
     let bound = bound.expose().to_owned();
+    // The token leads Work, so the announce guard has something to look at after the rename.
+    let started = env
+        .store
+        .work_start(
+            &bound_id,
+            &serde_json::from_value(json!({
+                "work_id": null, "source": null, "request_key": "renamed-key",
+                "title": "Rework billing", "session": "default", "role": "lead",
+                "scope": ["lib/**"], "branch": null, "worktree": null, "next_action": null,
+                "depends_on": [], "related_work": [], "takeover_generation": null,
+                "preflight": null
+            }))
+            .unwrap(),
+            unix_now(),
+        )
+        .unwrap()
+        .item;
+    {
+        use agentscm::hub::work_transition::{
+            WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+        };
+        env.store
+            .work_transition(
+                &WorkTransitionActor::Agent { token: &bound_id },
+                &WorkTransitionRequest {
+                    work_id: started.id.clone(),
+                    operation_id: "rel".into(),
+                    generation: started.generation,
+                    expected_updated_seq: started.updated_seq,
+                    session: Some("default".into()),
+                    transition: WorkTransitionKind::Release,
+                    reason: "synthetic reason".into(),
+                    superseded_by: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
     // The repository is renamed and another one takes the old name.
     env.fake.with(|s| {
         s.repos.get_mut(&REPO_ID).unwrap().full_name = "acme/widgets-renamed".into();
@@ -2584,6 +2622,19 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
     assert_eq!(numbers(&env.work(&unbound).await), [9]);
     let reply = env.announce(&bound, 1, &["src/a.rs"], None).await;
     assert_eq!(reply["pull_requests"][0]["number"], 5);
+
+    // The guard still finds the token's released Work by repository id: a path in its scope is
+    // refused for the renamed repository's token, and the response says why.
+    let body = json!({"intent_id": format!("int_{:032x}", 2), "task": "rework billing",
+        "branch": null, "paths": ["lib/b.rs"], "ttl_s": 3600});
+    let (status, refused) = env
+        .post("/v1/hub/repos/acme%2Fwidgets/intents", Some(&bound), body)
+        .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused["message"].as_str().unwrap().contains(&started.id),
+        "{refused}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

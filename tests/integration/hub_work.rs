@@ -7,7 +7,12 @@ use std::thread;
 use std::time::Duration;
 
 use agentscm::hub::HubError;
+use agentscm::hub::User;
 use agentscm::hub::catchup::{CatchupPreviewQuery, CatchupQuery};
+use agentscm::hub::coordination::{
+    CoordinationAck, CoordinationReply, CoordinationResponseKind, CoordinationStatus,
+    CoordinationWithdraw,
+};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
 };
@@ -18,6 +23,10 @@ use agentscm::hub::work::{
 };
 use agentscm::hub::work_links::{
     WorkPrHeadStatus, WorkPrLinkQuery, WorkPrLinkTarget, WorkPrLinkUpdate, WorkPrSnapshotStatus,
+};
+use agentscm::hub::work_transition::{
+    OperationalSelect, OutcomeProvenance, ReservationBasis, TerminalOutcome, WorkLifecycleReader,
+    WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
 };
 use hub_pg::PgSchema;
 use postgres::NoTls;
@@ -69,6 +78,8 @@ impl Db {
             "work_takeover",
             "work_checkpoint",
             "work_pr_link",
+            "work_transition",
+            "coordination_target_released",
         ];
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
@@ -189,7 +200,8 @@ impl Db {
                        WHERE w.provider = 'github' AND w.host = 'github.com'
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                          AND e.kind IN
-                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')";
+                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link',
+                             'work_transition')";
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
             let used: i64 = client
@@ -249,13 +261,90 @@ impl Db {
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
                             AND e.kind IN ('work_started', 'work_joined', 'work_takeover',
-                                           'work_checkpoint', 'work_pr_link')
+                                           'work_checkpoint', 'work_pr_link', 'work_transition')
                      )",
                     rusqlite::params![REPO, REPOSITORY_ID],
                     |row| row.get(0),
                 )
                 .unwrap();
             (used, aggregate)
+        }
+    }
+
+    /// Runs raw SQL, to build or inspect a database state the Store cannot reach.
+    fn sql(&self, sql: &str) {
+        if self._pg.is_some() {
+            postgres::Client::connect(&self.url, NoTls)
+                .unwrap()
+                .batch_execute(sql)
+                .unwrap();
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+    }
+
+    /// The stored `(terminal_outcome, reservation_basis)` of one Work item.
+    fn reservation(&self, id: &str) -> (Option<String>, Option<String>) {
+        let sql = "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = ";
+        if self._pg.is_some() {
+            let row = postgres::Client::connect(&self.url, NoTls)
+                .unwrap()
+                .query_one(&format!("{sql}$1"), &[&id])
+                .unwrap();
+            (row.get(0), row.get(1))
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(&format!("{sql}?1"), [id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+        }
+    }
+
+    /// Runs a query and returns every column as text, with NULL as the empty string.
+    fn rows(&self, sql: &str) -> Vec<Vec<String>> {
+        if self._pg.is_some() {
+            postgres::Client::connect(&self.url, NoTls)
+                .unwrap()
+                .simple_query(sql)
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| match message {
+                    postgres::SimpleQueryMessage::Row(row) => Some(
+                        (0..row.len())
+                            .map(|index| row.get(index).unwrap_or("").to_owned())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            Ok(match row.get::<_, rusqlite::types::Value>(index)? {
+                                rusqlite::types::Value::Null => String::new(),
+                                rusqlite::types::Value::Integer(value) => value.to_string(),
+                                rusqlite::types::Value::Text(value) => value,
+                                other => format!("{other:?}"),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         }
     }
 
@@ -1344,10 +1433,19 @@ fn stale_observed_pause_cannot_overwrite_newer_checkpoint(db: &Db) {
             "automatic session-end pause",
         );
         stale_pause.expected_updated_seq = Some(observed);
-        assert!(matches!(
-            store.work_checkpoint(&lead.token, &stale_pause, now + index as i64 * 10 + 2),
-            Err(HubError::WorkCheckpointSequenceConflict { current_seq }) if current_seq == fresh.updated_seq
-        ));
+        let attempt = store.work_checkpoint(&lead.token, &stale_pause, now + index as i64 * 10 + 2);
+        if kind == CheckpointKind::Finish {
+            // Finished work refuses every new checkpoint before the sequence is compared.
+            assert_invalid(
+                attempt,
+                "finished work accepts no checkpoint; reopen it first",
+            );
+        } else {
+            assert!(matches!(
+                attempt,
+                Err(HubError::WorkCheckpointSequenceConflict { current_seq }) if current_seq == fresh.updated_seq
+            ));
+        }
 
         let retained = store
             .work_get(&lead.token, &started.id, now + index as i64 * 10 + 3)
@@ -2054,6 +2152,47 @@ conformance!(
     postgres_read_briefings_share_the_repository_maintenance_lock,
     concurrent_delivery_reservations_enforce_capacity_and_roll_back,
     briefing_sessions_on_one_token_have_independent_cursors,
+    reservation_migration_backfills_unfinished_work_and_leaves_finished_unstated,
+    finish_frees_scope_for_a_new_start_and_pause_keeps_blocking,
+    finished_work_refuses_checkpoints_but_replays_the_finish_receipt,
+    stale_finished_work_cannot_be_taken_over,
+    announce_intent_refuses_fenced_sessions_but_not_finished_or_unlinked_ones,
+    helper_join_on_finished_work_acquires_nothing,
+    unreserved_work_needs_fresh_admission_to_be_taken_over,
+    transition_matrix_covers_every_actor_and_kind,
+    transition_state_rules_refuse_without_mutation,
+    transition_refuses_foreign_read_only_and_unrelated_callers,
+    owner_and_admin_act_after_the_lead_token_is_revoked,
+    release_alone_leaves_no_outcome_and_frees_the_scope,
+    old_session_after_release_is_fenced_and_not_reacquired,
+    concurrent_release_checkpoint_and_reopen_have_one_winner,
+    transition_retries_replay_after_later_transitions,
+    reopen_conflicts_on_overlap_and_fences_the_old_session,
+    responded_request_stays_responded_after_release,
+    release_succeeds_at_payload_quota_and_retain_refuses,
+    compaction_runs_after_transition_events_exist,
+    abandoned_work_is_not_a_reported_completion,
+    plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover,
+    plain_announce_allows_paths_covered_by_eligible_work,
+    plain_announce_refuses_a_directory_that_overlaps_fenced_work_either_way,
+    plain_announce_fails_closed_beyond_the_token_work_bound,
+    cleanup_succeeds_for_a_token_with_more_work_than_the_announce_bound,
+    a_helper_with_many_work_cannot_block_the_owners_release,
+    plain_announce_ignores_empty_scope_work_in_its_bound,
+    release_frees_session_and_sessionless_intents_of_the_scope,
+    finish_checkpoint_cleans_up_like_a_terminal_transition,
+    ending_work_spares_a_tokens_live_intents_elsewhere,
+    finish_at_payload_quota_succeeds_in_its_cleanup,
+    an_exact_finish_replay_repeats_no_release,
+    ending_work_spares_a_session_that_is_eligible_on_other_work,
+    ending_work_that_held_nothing_leaves_sessionless_intents,
+    released_work_resumes_in_any_state_and_refuses_reports_until_then,
+    resuming_released_work_conflicts_on_overlap_without_mutation,
+    reopen_by_another_session_retargets_open_requests,
+    resuming_released_work_retargets_requests_only_when_the_lead_changes,
+    pause_and_handover_keep_a_retained_reservation,
+    requests_that_propose_ended_work_are_marked_released_too,
+    read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores,
 );
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
@@ -2850,4 +2989,2816 @@ fn checkpoint_rejection_respects_removed_history_without_a_checkpoint_baseline(d
             .updated_seq,
         current.item.updated_seq
     );
+}
+
+fn lead_checkpoint(
+    store: &dyn Store,
+    who: &Agent,
+    item: &agentscm::hub::work::WorkItem,
+    operation_id: &str,
+    session: &str,
+    kind: CheckpointKind,
+    now: i64,
+) -> agentscm::hub::work::WorkCheckpointResult {
+    let mut request = checkpoint(
+        &item.id,
+        operation_id,
+        item.generation,
+        session,
+        kind,
+        "step",
+    );
+    request.expected_updated_seq = Some(item.updated_seq);
+    store.work_checkpoint(&who.token, &request, now).unwrap()
+}
+
+fn assert_scope_overlap(result: &agentscm::hub::work::WorkStartResult) {
+    assert!(!result.created);
+    assert_eq!(
+        result.conflict.as_ref().map(|conflict| conflict.kind),
+        Some(WorkConflictKind::ScopeOverlap)
+    );
+}
+
+fn reservation_migration_backfills_unfinished_work_and_leaves_finished_unstated(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let start = |key: &str, session: &str, scope: &str| {
+        let mut start = native_start(key, key, session);
+        start.scope = vec![scope.into()];
+        start
+    };
+    let active = store
+        .work_start(&alice.token, &start("active", "s-active", "src/**"), now)
+        .unwrap()
+        .item;
+    let paused = store
+        .work_start(&alice.token, &start("paused", "s-paused", "lib/**"), now)
+        .unwrap()
+        .item;
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &paused,
+        "pause",
+        "s-paused",
+        CheckpointKind::Pause,
+        now + 1,
+    );
+    let finished = store
+        .work_start(
+            &alice.token,
+            &start("finished", "s-finished", "docs/**"),
+            now,
+        )
+        .unwrap()
+        .item;
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &finished,
+        "finish",
+        "s-finished",
+        CheckpointKind::Finish,
+        now + 1,
+    );
+    drop(store);
+
+    // Rebuild the schema a binary without this change leaves behind: no columns, no marker.
+    db.sql(
+        "DROP INDEX hub_work_reserved;
+         ALTER TABLE hub_work_items DROP COLUMN reservation_basis;
+         ALTER TABLE hub_work_items DROP COLUMN terminal_outcome;
+         DELETE FROM hub_named_migrations WHERE name = 'work_reservations';",
+    );
+
+    let store = db.open();
+    let implicit = (None, Some("legacy_implicit".to_owned()));
+    assert_eq!(db.reservation(&active.id), implicit);
+    assert_eq!(db.reservation(&paused.id), implicit);
+    assert_eq!(db.reservation(&finished.id), (None, None));
+    // Blocking is unchanged: the backfilled Work still holds its scope, finished Work does not.
+    let blocked = store
+        .work_start(&alice.token, &start("new-src", "s-new", "src/**"), now + 2)
+        .unwrap();
+    assert_scope_overlap(&blocked);
+    let free = store
+        .work_start(
+            &alice.token,
+            &start("new-docs", "s-docs", "docs/**"),
+            now + 2,
+        )
+        .unwrap();
+    assert!(free.created);
+}
+
+fn finish_frees_scope_for_a_new_start_and_pause_keeps_blocking(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let now = unix_now();
+    let first = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    assert_eq!(db.reservation(&first.id), (None, Some("admitted".into())));
+    assert_scope_overlap(
+        &store
+            .work_start(&bob.token, &native_start("b1", "b", "s-b"), now + 1)
+            .unwrap(),
+    );
+
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &first,
+        "finish",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 2,
+    );
+    assert_eq!(finished.item.state, WorkState::Finished);
+    assert_eq!(db.reservation(&first.id), (Some("completed".into()), None));
+
+    let second = store
+        .work_start(&bob.token, &native_start("b2", "b", "s-b2"), now + 3)
+        .unwrap();
+    assert!(second.created);
+    assert_eq!(
+        db.reservation(&second.item.id),
+        (None, Some("admitted".into()))
+    );
+
+    // A pause keeps the scope held, as an implicit reservation.
+    lead_checkpoint(
+        &*store,
+        &bob,
+        &second.item,
+        "pause",
+        "s-b2",
+        CheckpointKind::Pause,
+        now + 4,
+    );
+    assert_eq!(
+        db.reservation(&second.item.id),
+        (None, Some("legacy_implicit".into()))
+    );
+    assert_scope_overlap(
+        &store
+            .work_start(&carol.token, &native_start("c", "c", "s-c"), now + 5)
+            .unwrap(),
+    );
+}
+
+fn finished_work_refuses_checkpoints_but_replays_the_finish_receipt(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    let mut finish = checkpoint(
+        &started.id,
+        "finish",
+        1,
+        "s-a",
+        CheckpointKind::Finish,
+        "done",
+    );
+    finish.expected_updated_seq = Some(started.updated_seq);
+    let first = store
+        .work_checkpoint(&alice.token, &finish, now + 1)
+        .unwrap();
+    assert!(!first.receipt.replayed);
+    let before = store
+        .work_get(&alice.token, &started.id, now + 2)
+        .unwrap()
+        .unwrap();
+    let events = work_event_count(&*store, "work_checkpoint");
+
+    let mut resume = checkpoint(
+        &started.id,
+        "resume",
+        1,
+        "s-a",
+        CheckpointKind::Progress,
+        "again",
+    );
+    resume.expected_updated_seq = Some(before.updated_seq);
+    assert_invalid(
+        store.work_checkpoint(&alice.token, &resume, now + 3),
+        "finished work accepts no checkpoint; reopen it first",
+    );
+    let after = store
+        .work_get(&alice.token, &started.id, now + 4)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    assert_eq!(after.state, WorkState::Finished);
+    assert_eq!(work_event_count(&*store, "work_checkpoint"), events);
+    assert_eq!(
+        db.reservation(&started.id),
+        (Some("completed".into()), None)
+    );
+
+    let replay = store
+        .work_checkpoint(&alice.token, &finish, now + 5)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, first.receipt.event_seq);
+}
+
+fn stale_finished_work_cannot_be_taken_over(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &started,
+        "finish",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 1,
+    )
+    .item;
+    let message = "finished work cannot be taken over; reopen it instead";
+    for at in [now + 2, now + 1 + CLAIM_STALE_SECONDS + 10] {
+        let attempt = takeover(&started.id, "s-b", Some(finished.generation));
+        let result = store.work_start(&bob.token, &attempt, at);
+        assert!(
+            matches!(result, Err(HubError::Invalid(ref actual)) if actual == message && actual.contains("reopen")),
+            "takeover at {at} must name reopen"
+        );
+    }
+    let after = store
+        .work_get(&alice.token, &started.id, now + 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.lead_token, alice.token);
+    assert_eq!(after.generation, finished.generation);
+    assert_eq!(after.updated_seq, finished.updated_seq);
+    assert_eq!(
+        db.reservation(&started.id),
+        (Some("completed".into()), None)
+    );
+}
+
+fn announce_intent_refuses_fenced_sessions_but_not_finished_or_unlinked_ones(db: &Db) {
+    use agentscm::hub::intent::NewIntent;
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let dave = agent(&*store, 4);
+    let now = unix_now();
+    let intent = |n: u128, path: &str| NewIntent {
+        id: format!("int_{n:032x}"),
+        task: "edit".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec![path.into()],
+        ttl_seconds: 600,
+    };
+    // The announce route names no session, so it resolves to the default session.
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "default"), now)
+        .unwrap()
+        .item;
+    store
+        .announce_intent(&alice.token, &intent(1, "src/a.rs"), now + 1)
+        .unwrap();
+
+    // Bob takes over after the claim went stale; alice's session is now fenced.
+    let later = now + CLAIM_STALE_SECONDS + 10;
+    assert!(
+        store
+            .work_start(
+                &bob.token,
+                &takeover(&started.id, "default", Some(1)),
+                later
+            )
+            .unwrap()
+            .took_over
+    );
+    assert!(matches!(
+        store.announce_intent(&alice.token, &intent(2, "src/b.rs"), later + 1),
+        Err(HubError::Invalid(_))
+    ));
+    store
+        .announce_intent(&bob.token, &intent(3, "src/c.rs"), later + 1)
+        .unwrap();
+
+    // A token linked only to finished Work may post advisory intents: the plain route carries no
+    // session, an intent reserves nothing, and finishing acquired no reservation to lose.
+    let mut lib_start = native_start("d", "d", "default");
+    lib_start.scope = vec!["lib/**".into()];
+    let lib = store
+        .work_start(&dave.token, &lib_start, later)
+        .unwrap()
+        .item;
+    store
+        .announce_intent(&dave.token, &intent(4, "lib/a.rs"), later + 1)
+        .unwrap();
+    lead_checkpoint(
+        &*store,
+        &dave,
+        &lib,
+        "finish-lib",
+        "default",
+        CheckpointKind::Finish,
+        later + 2,
+    );
+    store
+        .announce_intent(&dave.token, &intent(5, "lib/b.rs"), later + 3)
+        .unwrap();
+
+    // A session never linked to Work keeps the legacy advisory behavior.
+    store
+        .announce_intent(&carol.token, &intent(6, "src/a.rs"), later + 4)
+        .unwrap();
+}
+
+fn helper_join_on_finished_work_acquires_nothing(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let helper = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &started,
+        "finish",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 1,
+    )
+    .item;
+
+    for (who, session, role) in [
+        (&helper, "s-h", WorkRole::Helper),
+        (&carol, "s-r", WorkRole::Reviewer),
+    ] {
+        let joined = store
+            .work_start(&who.token, &join(&started.id, session, role), now + 2)
+            .unwrap();
+        assert!(joined.joined);
+        assert_eq!(joined.item.state, WorkState::Finished);
+        assert_eq!(joined.item.generation, finished.generation);
+        assert_eq!(joined.item.lead_session, "s-a");
+    }
+    assert_eq!(
+        db.reservation(&started.id),
+        (Some("completed".into()), None)
+    );
+    // Participants of finished Work do not hold its scope against new Work.
+    let fresh = store
+        .work_start(&helper.token, &native_start("h", "h", "s-h2"), now + 3)
+        .unwrap();
+    assert!(fresh.created);
+}
+
+fn unreserved_work_needs_fresh_admission_to_be_taken_over(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    // A real release leaves the Work unfinished with no reservation.
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&started, "rel", WorkTransitionKind::Release, Some("s-a")),
+            now,
+        )
+        .unwrap()
+        .item;
+    let holder = store
+        .work_start(&bob.token, &native_start("b", "b", "s-b"), now + 1)
+        .unwrap();
+    assert!(holder.created, "unreserved Work does not block a new start");
+
+    // Its own scope change checks nothing, so it may overlap the new holder.
+    // A progress report on Work that holds nothing is refused; a pause is allowed.
+    let mut widen = checkpoint(
+        &released.id,
+        "widen",
+        released.generation,
+        "s-a",
+        CheckpointKind::Pause,
+        "widen",
+    );
+    widen.expected_updated_seq = Some(released.updated_seq);
+    widen.scope = Some(vec!["src/**".into(), "lib/**".into()]);
+    let widened = store
+        .work_checkpoint(&alice.token, &widen, now + 2)
+        .unwrap()
+        .item;
+    assert_eq!(db.reservation(&released.id), (None, None));
+
+    // Taking it over must win the scope first; the overlap leaves the Work untouched.
+    let handover = lead_checkpoint(
+        &*store,
+        &alice,
+        &widened,
+        "handover",
+        "s-a",
+        CheckpointKind::Handover,
+        now + 3,
+    )
+    .item;
+    assert_eq!(db.reservation(&released.id), (None, None));
+    let blocked = store
+        .work_start(
+            &carol.token,
+            &takeover(&released.id, "s-c", Some(handover.generation)),
+            now + 4,
+        )
+        .unwrap();
+    assert_scope_overlap(&blocked);
+    assert!(!blocked.took_over);
+    let unchanged = store
+        .work_get(&alice.token, &released.id, now + 5)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.generation, handover.generation);
+    assert_eq!(unchanged.lead_session, "s-a");
+    assert_eq!(db.reservation(&released.id), (None, None));
+
+    // Once the holder finishes, the same takeover is admitted.
+    lead_checkpoint(
+        &*store,
+        &bob,
+        &holder.item,
+        "finish-b",
+        "s-b",
+        CheckpointKind::Finish,
+        now + 6,
+    );
+    let admitted = store
+        .work_start(
+            &carol.token,
+            &takeover(&released.id, "s-c", Some(handover.generation)),
+            now + 7,
+        )
+        .unwrap();
+    assert!(admitted.took_over);
+    assert_eq!(
+        db.reservation(&released.id),
+        (None, Some("admitted".into()))
+    );
+}
+
+// Work transitions: release, retain, finish and reopen.
+
+fn user_of(store: &dyn Store, who: &Agent) -> User {
+    store.user_by_id(&who.owner).unwrap().unwrap()
+}
+
+fn person(user: &User, is_admin: bool) -> WorkTransitionActor<'_> {
+    WorkTransitionActor::Person {
+        user,
+        repository: REPO,
+        repository_id: REPOSITORY_ID,
+        is_admin,
+    }
+}
+
+fn by_agent(who: &Agent) -> WorkTransitionActor<'_> {
+    WorkTransitionActor::Agent { token: &who.token }
+}
+
+fn transition_request(
+    item: &agentscm::hub::work::WorkItem,
+    operation_id: &str,
+    transition: WorkTransitionKind,
+    session: Option<&str>,
+) -> WorkTransitionRequest {
+    WorkTransitionRequest {
+        work_id: item.id.clone(),
+        operation_id: operation_id.into(),
+        generation: item.generation,
+        expected_updated_seq: item.updated_seq,
+        session: session.map(str::to_owned),
+        transition,
+        reason: "synthetic reason".into(),
+        superseded_by: None,
+    }
+}
+
+fn start_in(
+    store: &dyn Store,
+    who: &Agent,
+    key: &str,
+    session: &str,
+    scope: &str,
+    now: i64,
+) -> agentscm::hub::work::WorkItem {
+    let mut start = native_start(key, key, session);
+    start.scope = vec![scope.into()];
+    let result = store.work_start(&who.token, &start, now).unwrap();
+    assert!(result.created, "{key} should be created");
+    result.item
+}
+
+fn current_item(
+    store: &dyn Store,
+    who: &Agent,
+    id: &str,
+    now: i64,
+) -> agentscm::hub::work::WorkItem {
+    store.work_get(&who.token, id, now).unwrap().unwrap()
+}
+
+fn transition_events(store: &dyn Store) -> Vec<serde_json::Value> {
+    store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == "work_transition")
+        .map(|event| serde_json::from_str(&event.data).unwrap())
+        .collect()
+}
+
+/// Holds `path` for the token's named session, the way a hook or MCP session does.
+fn announce(store: &dyn Store, who: &Agent, session: &str, path: &str, now: i64) {
+    store
+        .touch_session(
+            &who.token,
+            &agentscm::hub::session::SessionCall {
+                session: Some(session.into()),
+                via: "mcp".into(),
+                task: Some("edit".into()),
+                paths: vec![path.into()],
+                deny: false,
+                report: false,
+            },
+            now,
+        )
+        .unwrap();
+}
+
+fn transition_matrix_covers_every_actor_and_kind(db: &Db) {
+    use WorkTransitionKind::{Abandon, Complete, Release, Reopen, Retain, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    // Columns: lead, owner agent, owner person, administrator.
+    let table = [
+        (Release, [true, true, true, true]),
+        (Retain, [true, true, true, false]),
+        (Complete, [true, true, true, false]),
+        (Abandon, [true, true, true, true]),
+        (Supersede, [true, true, true, true]),
+        (Reopen, [true, true, false, false]),
+    ];
+    let mut n = 0_i64;
+    for (kind, allowed) in table {
+        for (column, allowed) in allowed.into_iter().enumerate() {
+            n += 1;
+            let lead_session = format!("lead-s{n}");
+            let mut item = start_in(
+                &*store,
+                &alice,
+                &format!("m{n}"),
+                &lead_session,
+                &format!("m{n}/**"),
+                now + n,
+            );
+            let other = start_in(
+                &*store,
+                &alice,
+                &format!("o{n}"),
+                &format!("other-s{n}"),
+                &format!("o{n}/**"),
+                now + n,
+            );
+            if kind == Reopen {
+                item = lead_checkpoint(
+                    &*store,
+                    &alice,
+                    &item,
+                    "fin",
+                    &lead_session,
+                    CheckpointKind::Finish,
+                    now + n,
+                )
+                .item;
+            }
+            let session = [Some(lead_session.as_str()), Some("owner-s"), None, None][column];
+            let mut request = transition_request(&item, "op", kind, session);
+            if kind == Supersede {
+                request.superseded_by = Some(other.id.clone());
+            }
+            let actor = match column {
+                0 => by_agent(&alice),
+                1 => by_agent(&alice_b),
+                2 => person(&owner, false),
+                _ => person(&admin, true),
+            };
+            let before = serde_json::to_value(&item).unwrap();
+            let before_columns = db.reservation(&item.id);
+            let seq = store.latest_event_seq().unwrap();
+            let outcome = store.work_transition(&actor, &request, now + 100 + n);
+            let label = format!("{kind:?} column {column}");
+            if !allowed {
+                assert!(matches!(outcome, Err(HubError::Invalid(_))), "{label}");
+                assert_eq!(
+                    serde_json::to_value(current_item(&*store, &alice, &item.id, now + 200))
+                        .unwrap(),
+                    before,
+                    "{label}"
+                );
+                assert_eq!(db.reservation(&item.id), before_columns, "{label}");
+                assert_eq!(store.latest_event_seq().unwrap(), seq, "{label}");
+                continue;
+            }
+            let result = outcome.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert!(result.conflict.is_none(), "{label}");
+            let receipt = result.receipt.unwrap();
+            assert!(!receipt.replayed, "{label}");
+            let after = result.item;
+            assert_eq!(receipt.generation, after.generation, "{label}");
+            // Reports stay where their author left them.
+            assert_eq!(after.current, item.current, "{label}");
+            assert_eq!(after.blocker, item.blocker, "{label}");
+            let lead = column == 0;
+            match kind {
+                Release => {
+                    assert_eq!(after.state, WorkState::Paused, "{label}");
+                    assert_eq!(after.generation, item.generation + 1, "{label}");
+                    assert_eq!(db.reservation(&item.id), (None, None), "{label}");
+                }
+                Retain => {
+                    assert_eq!(after.state, WorkState::Active, "{label}");
+                    assert_eq!(after.generation, item.generation, "{label}");
+                    assert_eq!(
+                        db.reservation(&item.id),
+                        (None, Some("retained".into())),
+                        "{label}"
+                    );
+                }
+                Complete | Abandon | Supersede => {
+                    assert_eq!(after.state, WorkState::Finished, "{label}");
+                    assert_eq!(
+                        after.generation,
+                        item.generation + i64::from(!lead),
+                        "{label}"
+                    );
+                    let name = match kind {
+                        Complete => "completed",
+                        Abandon => "abandoned",
+                        _ => "superseded",
+                    };
+                    assert_eq!(
+                        db.reservation(&item.id),
+                        (Some(name.into()), None),
+                        "{label}"
+                    );
+                    assert_eq!(
+                        after.related_work.contains(&other.id),
+                        kind == Supersede,
+                        "{label}"
+                    );
+                }
+                Reopen => {
+                    assert_eq!(after.state, WorkState::Active, "{label}");
+                    assert_eq!(after.generation, item.generation + 1, "{label}");
+                    assert_eq!(
+                        db.reservation(&item.id),
+                        (None, Some("admitted".into())),
+                        "{label}"
+                    );
+                    assert_eq!(after.lead_session, session.unwrap(), "{label}");
+                    assert_eq!(
+                        after.lead_token,
+                        if lead { &alice.token } else { &alice_b.token }.as_str(),
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn transition_state_rules_refuse_without_mutation(db: &Db) {
+    use WorkTransitionKind::{Complete, Release, Reopen, Retain, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let other = start_in(&*store, &alice, "b", "s-b", "lib/**", now);
+    let try_it = |item: &agentscm::hub::work::WorkItem,
+                  op: &str,
+                  kind,
+                  edit: &dyn Fn(&mut WorkTransitionRequest)| {
+        let mut request = transition_request(item, op, kind, Some("s-a"));
+        edit(&mut request);
+        store.work_transition(&by_agent(&alice), &request, now + 5)
+    };
+    let invalid =
+        |result: Result<_, HubError>| assert!(matches!(result, Err(HubError::Invalid(_))));
+    // Reopen needs finished Work; a stale generation or sequence is fenced.
+    invalid(try_it(&item, "r0", Reopen, &|_| {}));
+    invalid(try_it(&item, "g", Retain, &|r| r.generation += 1));
+    invalid(try_it(&item, "q", Retain, &|r| r.expected_updated_seq -= 1));
+    // Supersede names an existing, different Work of the repository.
+    invalid(try_it(&item, "s0", Supersede, &|_| {}));
+    invalid(try_it(&item, "s1", Supersede, &|r| {
+        r.superseded_by = Some(item.id.clone())
+    }));
+    invalid(try_it(&item, "s2", Supersede, &|r| {
+        r.superseded_by = Some(format!("wrk_{:032x}", 7))
+    }));
+    invalid(try_it(&item, "s3", Complete, &|r| {
+        r.superseded_by = Some(other.id.clone())
+    }));
+    invalid(try_it(&item, "e", Complete, &|r| r.reason = String::new()));
+    assert_eq!(
+        current_item(&*store, &alice, &item.id, now + 6).updated_seq,
+        item.updated_seq
+    );
+    // Released Work holds nothing to release or retain again.
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 6,
+        )
+        .unwrap()
+        .item;
+    for (op, kind) in [("rel2", Release), ("ret", Retain)] {
+        let request = transition_request(&released, op, kind, Some("s-a"));
+        invalid(store.work_transition(&by_agent(&alice), &request, now + 7));
+    }
+    let missing = WorkTransitionRequest {
+        work_id: format!("wrk_{:032x}", 9),
+        ..transition_request(&released, "missing", Release, Some("s-a"))
+    };
+    assert_invalid(
+        store.work_transition(&by_agent(&alice), &missing, now + 7),
+        "unknown work item",
+    );
+}
+
+fn transition_refuses_foreign_read_only_and_unrelated_callers(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release, Retain};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let read_only = agent_with(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 1,
+            repository: REPO,
+            repository_id: Some(REPOSITORY_ID),
+            read_only: true,
+            ttl: TTL,
+        },
+    );
+    let carol = agent(&*store, 3);
+    let carol_user = user_of(&*store, &carol);
+    let bob_user = user_of(&*store, &bob);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let before = serde_json::to_value(&item).unwrap();
+    let before_columns = db.reservation(&item.id);
+    let seq = store.latest_event_seq().unwrap();
+    for kind in [Release, Retain, Abandon] {
+        let mut request = transition_request(&item, "op", kind, Some("s-a"));
+        let attempts = [
+            store.work_transition(&by_agent(&bob), &request, now + 1),
+            store.work_transition(&by_agent(&read_only), &request, now + 1),
+            store.work_transition(
+                &person(&carol_user, false),
+                &{
+                    request.session = None;
+                    request.clone()
+                },
+                now + 1,
+            ),
+            // A foreign person who claims the flag still holds no standing in an owner check,
+            // but an administrator is allowed to abandon and release.
+        ];
+        for (index, attempt) in attempts.into_iter().enumerate() {
+            assert!(
+                matches!(attempt, Err(HubError::Unauthorized)),
+                "{kind:?} caller {index}"
+            );
+        }
+    }
+    // A cross-owner person without the admin flag is refused even for read access to the repository.
+    let request = transition_request(&item, "op", Abandon, None);
+    assert!(matches!(
+        store.work_transition(&person(&bob_user, false), &request, now + 1),
+        Err(HubError::Unauthorized)
+    ));
+    assert_eq!(
+        serde_json::to_value(current_item(&*store, &alice, &item.id, now + 2)).unwrap(),
+        before
+    );
+    assert_eq!(db.reservation(&item.id), before_columns);
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+}
+
+fn owner_and_admin_act_after_the_lead_token_is_revoked(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let helper = agent(&*store, 2);
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    let first = start_in(&*store, &alice, "a", "default", "src/**", now);
+    let second = start_in(&*store, &alice, "b", "default2", "lib/**", now);
+    assert!(
+        store
+            .work_start(
+                &helper.token,
+                &join(&first.id, "default", WorkRole::Helper),
+                now + 1
+            )
+            .unwrap()
+            .joined
+    );
+    announce(&*store, &alice, "default", "src/a.rs", now + 2);
+    announce(&*store, &helper, "default", "src/b.rs", now + 2);
+    assert_eq!(store.live_intents(REPO, now + 3, 10).unwrap().len(), 2);
+    assert!(store.revoke_agent_token(&alice.token).unwrap());
+
+    let item = current_item(&*store, &helper, &first.id, now + 4);
+    let released = store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&item, "owner-release", Release, None),
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(released.item.state, WorkState::Paused);
+    assert_eq!(released.item.current, item.current);
+    assert_eq!(released.item.blocker, item.blocker);
+    // The lead's and the helper's claims are both gone.
+    let live = store.live_intents(REPO, now + 5, 10).unwrap();
+    assert!(
+        live.is_empty(),
+        "{:?}",
+        live.iter()
+            .map(|i| (i.agent.clone(), i.session.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    let second = current_item(&*store, &helper, &second.id, now + 5);
+    store
+        .work_transition(
+            &person(&admin, true),
+            &transition_request(&second, "admin-abandon", Abandon, None),
+            now + 5,
+        )
+        .unwrap();
+    let events = transition_events(&*store);
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0]["actor"],
+        serde_json::json!({
+            "kind": "owner", "id": owner.id, "login": owner.login, "via": "person"
+        })
+    );
+    assert_eq!(events[0]["lead"]["agent"], "agent1");
+    assert_eq!(events[0]["lead"]["session"], "default");
+    assert_eq!(events[1]["actor"]["kind"], "admin");
+    assert_eq!(events[1]["actor"]["login"], admin.login.as_str());
+    assert_eq!(events[1]["reason"], "synthetic reason");
+    assert_eq!(events[1]["prior_state"], "active");
+    let text = serde_json::to_string(&events).unwrap();
+    assert!(
+        !text.contains(&alice.token),
+        "the audit event must not hold a token id"
+    );
+    let reader = WorkLifecycleReader::Token(&helper.token);
+    let view = lifecycle(&*store, &reader, &second.id, now + 6);
+    assert_eq!(view.0, Some(TerminalOutcome::Abandoned));
+    assert_eq!(view.1, Some(OutcomeProvenance::Admin));
+}
+
+/// The stored outcome, who stated it and the reservation basis of one Work item, read through
+/// the operational projection.
+fn lifecycle(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    id: &str,
+    now: i64,
+) -> (
+    Option<TerminalOutcome>,
+    Option<OutcomeProvenance>,
+    Option<ReservationBasis>,
+) {
+    use agentscm::hub::work_lifecycle::OutcomeValue;
+    let page = store
+        .work_operational(reader, &OperationalSelect::One(id), now)
+        .unwrap();
+    let view = page.work.into_iter().next().unwrap();
+    let outcome = match view.outcome.value {
+        OutcomeValue::Completed => Some(TerminalOutcome::Completed),
+        OutcomeValue::Abandoned => Some(TerminalOutcome::Abandoned),
+        OutcomeValue::Superseded => Some(TerminalOutcome::Superseded),
+        OutcomeValue::Unstated | OutcomeValue::None => None,
+    };
+    let provenance = outcome.map(|_| view.outcome.provenance);
+    (outcome, provenance, view.reservation.basis)
+}
+
+fn release_alone_leaves_no_outcome_and_frees_the_scope(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 1,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(
+        (released.state, released.generation),
+        (WorkState::Paused, 2)
+    );
+    assert_eq!(db.reservation(&item.id), (None, None));
+    // Unfinished and unreserved: another start on the scope succeeds.
+    let taken = start_in(&*store, &bob, "b", "s-b", "src/**", now + 2);
+    assert_ne!(taken.id, item.id);
+    let still = current_item(&*store, &alice, &item.id, now + 3);
+    assert_eq!(still.state, WorkState::Paused);
+    assert_eq!(db.reservation(&item.id), (None, None));
+    // Fresh admission of the released Work is now an overlap with bob.
+    let resume = store
+        .work_start(&alice.token, &takeover(&item.id, "s-a", Some(2)), now + 4)
+        .unwrap();
+    assert_eq!(
+        resume.conflict.map(|conflict| conflict.kind),
+        Some(WorkConflictKind::ScopeOverlap)
+    );
+    assert_eq!(db.reservation(&item.id), (None, None));
+}
+
+fn old_session_after_release_is_fenced_and_not_reacquired(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let item = start_in(&*store, &alice, "a", "default", "src/**", now);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("default")),
+            now + 1,
+        )
+        .unwrap()
+        .item;
+    let mut stale = checkpoint(
+        &item.id,
+        "late",
+        item.generation,
+        "default",
+        CheckpointKind::Progress,
+        "late",
+    );
+    stale.expected_updated_seq = Some(released.updated_seq);
+    assert!(matches!(
+        store.work_checkpoint(&alice.token, &stale, now + 2),
+        Err(HubError::Invalid(_))
+    ));
+    // An ordinary start by the same session returns the Work and takes nothing.
+    let again = store
+        .work_start(
+            &alice.token,
+            &start_with(None, "a", "default", Some(&item.id), WorkRole::Lead),
+            now + 3,
+        )
+        .unwrap();
+    assert!(!again.took_over);
+    assert_eq!(db.reservation(&item.id), (None, None));
+    assert!(matches!(
+        store.announce_intent(
+            &alice.token,
+            &agentscm::hub::intent::NewIntent {
+                id: format!("int_{:032x}", 5),
+                task: "edit".into(),
+                branch: None,
+                base: None,
+                machine: None,
+                paths: vec!["src/a.rs".into()],
+                ttl_seconds: 600
+            },
+            now + 4
+        ),
+        Err(HubError::Invalid(_))
+    ));
+    // An explicit resume at the new generation is a fresh admission.
+    let resumed = store
+        .work_start(
+            &alice.token,
+            &takeover(&item.id, "default", Some(released.generation)),
+            now + 5,
+        )
+        .unwrap();
+    assert!(resumed.took_over);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+}
+
+fn concurrent_release_checkpoint_and_reopen_have_one_winner(db: &Db) {
+    use WorkTransitionKind::{Release, Reopen};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let item = start_in(&*store, &alice, "a", "lead-s", "src/**", now);
+
+    // Release against a checkpoint, both built from the same read.
+    let release = transition_request(&item, "race-release", Release, Some("lead-s"));
+    let mut progress = checkpoint(
+        &item.id,
+        "race-progress",
+        item.generation,
+        "lead-s",
+        CheckpointKind::Progress,
+        "newer report",
+    );
+    progress.expected_updated_seq = Some(item.updated_seq);
+    let barrier = Arc::new(Barrier::new(2));
+    let release_handle = {
+        let (connection, barrier, token) = (db.open(), barrier.clone(), alice.token.clone());
+        thread::spawn(move || {
+            barrier.wait();
+            connection.work_transition(
+                &WorkTransitionActor::Agent { token: &token },
+                &release,
+                now + 1,
+            )
+        })
+    };
+    let progress_handle = {
+        let (connection, barrier, token) = (db.open(), barrier.clone(), alice.token.clone());
+        thread::spawn(move || {
+            barrier.wait();
+            connection.work_checkpoint(&token, &progress, now + 1)
+        })
+    };
+    let (released, progressed) = (
+        release_handle.join().unwrap(),
+        progress_handle.join().unwrap(),
+    );
+    assert_eq!(
+        usize::from(released.is_ok()) + usize::from(progressed.is_ok()),
+        1
+    );
+    let after = current_item(&*store, &alice, &item.id, now + 2);
+    if released.is_ok() {
+        assert_eq!(db.reservation(&item.id), (None, None));
+        assert_eq!(after.generation, 2);
+        assert!(
+            after.current.is_none(),
+            "the refused report must not be written"
+        );
+    } else {
+        assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+        assert_eq!(after.generation, 1);
+        assert_eq!(after.current.unwrap().summary, "newer report");
+    }
+    // Nothing resurrects a reservation afterwards.
+    let before = db.reservation(&item.id);
+    let _ = store.work_checkpoint(
+        &alice.token,
+        &checkpoint(
+            &item.id,
+            "again",
+            1,
+            "lead-s",
+            CheckpointKind::Progress,
+            "x",
+        ),
+        now + 3,
+    );
+    assert_eq!(db.reservation(&item.id).1.is_some(), before.1.is_some());
+
+    // Two reopens of the same finished Work: one lead, one refusal.
+    let other = start_in(&*store, &alice, "b", "lead-b", "lib/**", now + 4);
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &other,
+        "fin",
+        "lead-b",
+        CheckpointKind::Finish,
+        now + 5,
+    )
+    .item;
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [(&alice, "lead-b"), (&alice_b, "owner-b")].map(|(who, session)| {
+        let (connection, barrier, token) = (db.open(), barrier.clone(), who.token.clone());
+        let request = transition_request(&finished, "race-reopen", Reopen, Some(session));
+        let request = WorkTransitionRequest {
+            operation_id: format!("race-reopen-{session}"),
+            ..request
+        };
+        thread::spawn(move || {
+            barrier.wait();
+            connection.work_transition(
+                &WorkTransitionActor::Agent { token: &token },
+                &request,
+                now + 6,
+            )
+        })
+    });
+    let results = handles.map(|handle| handle.join().unwrap());
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    let settled = current_item(&*store, &alice, &other.id, now + 7);
+    assert_eq!(settled.generation, finished.generation + 1);
+    assert_eq!(settled.lead_session, winner.item.lead_session);
+    assert_eq!(db.reservation(&other.id), (None, Some("admitted".into())));
+    assert_eq!(
+        settled
+            .participants
+            .iter()
+            .filter(|p| p.role == WorkRole::Lead)
+            .count(),
+        1
+    );
+}
+
+fn transition_retries_replay_after_later_transitions(db: &Db) {
+    use WorkTransitionKind::{Complete, Release, Reopen, Retain, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let target = start_in(&*store, &alice, "t", "s-t", "lib/**", now);
+    let mut at = now;
+    let mut step = |actor: WorkTransitionActor<'_>,
+                    op: &str,
+                    kind,
+                    session: Option<&str>,
+                    by: Option<&str>| {
+        at += 1;
+        let current = current_item(&*store, &alice_b, &item.id, at);
+        let mut request = transition_request(&current, op, kind, session);
+        request.superseded_by = by.map(str::to_owned);
+        let result = store.work_transition(&actor, &request, at).unwrap();
+        (request, result.receipt.unwrap())
+    };
+    let history = [
+        step(by_agent(&alice), "t-retain", Retain, Some("s-a"), None),
+        step(person(&owner, false), "t-release", Release, None, None),
+        step(
+            by_agent(&alice_b),
+            "t-complete",
+            Complete,
+            Some("owner-s"),
+            None,
+        ),
+        step(by_agent(&alice), "t-reopen", Reopen, Some("s-a"), None),
+        step(
+            person(&admin, true),
+            "t-supersede",
+            Supersede,
+            None,
+            Some(&target.id),
+        ),
+    ];
+    let actors = [
+        by_agent(&alice),
+        person(&owner, false),
+        by_agent(&alice_b),
+        by_agent(&alice),
+        person(&admin, true),
+    ];
+    let state = serde_json::to_value(current_item(&*store, &alice_b, &item.id, at + 1)).unwrap();
+    let columns = db.reservation(&item.id);
+    let seq = store.latest_event_seq().unwrap();
+    let usage = db.work_usage_and_aggregate();
+    for ((request, receipt), actor) in history.iter().zip(actors) {
+        let replay = store.work_transition(&actor, request, at + 2).unwrap();
+        let replayed = replay.receipt.unwrap();
+        assert!(replayed.replayed, "{}", request.operation_id);
+        assert_eq!(replayed.event_seq, receipt.event_seq);
+        assert_eq!(replayed.generation, receipt.generation);
+        assert_eq!(serde_json::to_value(&replay.item).unwrap(), state);
+        // Changed fields under the same operation are refused.
+        let mut changed = request.clone();
+        changed.reason = "different reason".into();
+        assert_invalid(
+            store.work_transition(&actor, &changed, at + 3),
+            "operation_id was already used for another request",
+        );
+    }
+    assert_eq!(db.reservation(&item.id), columns);
+    assert_eq!(columns, (Some("superseded".into()), None));
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+    assert_eq!(db.work_usage_and_aggregate(), usage);
+    assert_eq!(
+        db.work_usage_and_aggregate().0,
+        db.work_usage_and_aggregate().1
+    );
+}
+
+fn reopen_conflicts_on_overlap_and_fences_the_old_session(db: &Db) {
+    use WorkTransitionKind::Reopen;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &item,
+        "fin",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 1,
+    )
+    .item;
+    let blocker = start_in(&*store, &bob, "b", "s-b", "src/**", now + 2);
+
+    let before = serde_json::to_value(&finished).unwrap();
+    let seq = store.latest_event_seq().unwrap();
+    let request = transition_request(&finished, "reopen", Reopen, Some("s-a"));
+    let result = store
+        .work_transition(&by_agent(&alice), &request, now + 3)
+        .unwrap();
+    assert!(result.receipt.is_none());
+    assert_eq!(
+        result.conflict.as_ref().map(|c| c.kind),
+        Some(WorkConflictKind::ScopeOverlap)
+    );
+    assert_eq!(result.conflict.unwrap().overlaps[0].item.id, blocker.id);
+    assert_eq!(serde_json::to_value(&result.item).unwrap(), before);
+    assert_eq!(db.reservation(&item.id), (Some("completed".into()), None));
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+
+    // Once the overlap is gone, the owner's other agent reopens and leads under a new session.
+    lead_checkpoint(
+        &*store,
+        &bob,
+        &blocker,
+        "fin-b",
+        "s-b",
+        CheckpointKind::Finish,
+        now + 4,
+    );
+    let request = transition_request(&finished, "reopen-2", Reopen, Some("s-new"));
+    let reopened = store
+        .work_transition(&by_agent(&alice_b), &request, now + 5)
+        .unwrap();
+    assert!(reopened.conflict.is_none());
+    let item_after = reopened.item;
+    assert_eq!(
+        (item_after.state, item_after.generation),
+        (WorkState::Active, 2)
+    );
+    assert_eq!(item_after.lead_session, "s-new");
+    assert_eq!(item_after.lead_token, alice_b.token);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+    let roles: Vec<_> = item_after
+        .participants
+        .iter()
+        .map(|p| (p.session.as_str(), p.role))
+        .collect();
+    assert!(roles.contains(&("s-new", WorkRole::Lead)));
+    assert!(roles.contains(&("s-a", WorkRole::Helper)));
+    // The previous session is fenced.
+    let mut stale = checkpoint(&item.id, "old", 1, "s-a", CheckpointKind::Progress, "old");
+    stale.expected_updated_seq = Some(item_after.updated_seq);
+    assert!(matches!(
+        store.work_checkpoint(&alice.token, &stale, now + 6),
+        Err(HubError::Invalid(_))
+    ));
+
+    // The reopened Work is ordinary: once stale, another agent takes it over.
+    let later = now + CLAIM_STALE_SECONDS + 10;
+    let taken = store
+        .work_start(&bob.token, &takeover(&item.id, "s-bob", Some(2)), later)
+        .unwrap();
+    assert!(taken.took_over);
+    assert_eq!(taken.item.generation, 3);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+}
+
+fn responded_request_stays_responded_after_release(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let ask = |who: &Agent, key: &str, at: i64| {
+        let mut start = native_start(key, key, &format!("s-{key}"));
+        start.scope = vec!["src/**".into()];
+        store
+            .work_start(&who.token, &start, at)
+            .unwrap()
+            .coordination_request
+            .unwrap()
+    };
+    let first = ask(&bob, "b", now + 1);
+    let second = ask(&carol, "c", now + 2);
+    let ack = CoordinationAck {
+        request_id: first.id.clone(),
+        target_work_id: Some(item.id.clone()),
+        session: "s-a".into(),
+        expected_updated_seq: first.updated_seq,
+    };
+    let acked = store.coordination_ack(&alice.token, &ack, now + 3).unwrap();
+    let responded = store
+        .coordination_reply(
+            &alice.token,
+            &CoordinationReply {
+                request_id: first.id.clone(),
+                operation_id: "reply".into(),
+                target_work_id: item.id.clone(),
+                session: "s-a".into(),
+                expected_updated_seq: acked.updated_seq,
+                kind: CoordinationResponseKind::Join,
+                note: None,
+                via_hub: false,
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(responded.status, CoordinationStatus::Responded);
+
+    let current = current_item(&*store, &alice, &item.id, now + 5);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-a")),
+            now + 5,
+        )
+        .unwrap();
+    let statuses = db.rows(&format!(
+        "SELECT id, status FROM hub_coordination_requests WHERE id IN ('{}', '{}') ORDER BY id",
+        first.id, second.id
+    ));
+    let mut expected = vec![
+        vec![first.id.clone(), "responded".to_owned()],
+        vec![second.id.clone(), "pending".to_owned()],
+    ];
+    expected.sort();
+    assert_eq!(statuses, expected);
+    let released: Vec<_> = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "coordination_target_released")
+        .map(|event| event.subject)
+        .collect();
+    let mut want = vec![first.id.clone(), second.id.clone()];
+    want.sort();
+    let mut got = released;
+    got.sort();
+    assert_eq!(got, want);
+    // The requester can still withdraw its own request afterwards; nothing was closed for it.
+    let refreshed = store
+        .coordination_list(&bob.token, &Default::default(), now + 6)
+        .unwrap();
+    let mine = refreshed
+        .requests
+        .iter()
+        .find(|r| r.id == first.id)
+        .unwrap();
+    store
+        .coordination_withdraw(
+            &bob.token,
+            &CoordinationWithdraw {
+                request_id: first.id.clone(),
+                operation_id: "withdraw".into(),
+                session: "s-b".into(),
+                expected_updated_seq: mine.updated_seq,
+            },
+            now + 7,
+        )
+        .unwrap();
+}
+
+fn release_succeeds_at_payload_quota_and_retain_refuses(db: &Db) {
+    use WorkTransitionKind::{Release, Retain};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    db.sql(&format!(
+        "UPDATE hub_work_usage SET charged_bytes = {WORK_PAYLOAD_CAPACITY_BYTES}
+         WHERE repository = '{REPO}'"
+    ));
+    let seq = store.latest_event_seq().unwrap();
+    assert!(matches!(
+        store.work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "ret", Retain, Some("s-a")),
+            now + 1
+        ),
+        Err(HubError::WorkCapacity)
+    ));
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(released.item.state, WorkState::Paused);
+    assert_eq!(db.reservation(&item.id), (None, None));
+    let charged: i64 = db.rows(&format!(
+        "SELECT charged_bytes FROM hub_work_usage WHERE repository = '{REPO}'"
+    ))[0][0]
+        .parse()
+        .unwrap();
+    assert!(
+        charged > WORK_PAYLOAD_CAPACITY_BYTES,
+        "cleanup is recorded, not refused"
+    );
+}
+
+fn compaction_runs_after_transition_events_exist(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release};
+    let store = db.open();
+    let now = unix_now();
+    let old = now - 3 * 86_400;
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", old);
+    let mut start = native_start("b", "b", "s-b");
+    start.scope = vec!["src/**".into()];
+    let request = store
+        .work_start(&bob.token, &start, old + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let current = current_item(&*store, &alice, &item.id, old + 2);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-a")),
+            old + 2,
+        )
+        .unwrap()
+        .item;
+    let mut abandon = transition_request(&released, "abandon", Abandon, Some("s-a"));
+    abandon.generation = released.generation;
+    store
+        .work_transition(&by_agent(&alice), &abandon, old + 3)
+        .unwrap();
+    let mine = store
+        .coordination_list(&bob.token, &Default::default(), old + 4)
+        .unwrap();
+    let mine = mine.requests.iter().find(|r| r.id == request.id).unwrap();
+    store
+        .coordination_withdraw(
+            &bob.token,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "withdraw".into(),
+                session: "s-b".into(),
+                expected_updated_seq: mine.updated_seq,
+            },
+            old + 5,
+        )
+        .unwrap();
+    assert_eq!(transition_events(&*store).len(), 2);
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let compacted = store.work_compact(&scope, now - 86_400, true, now).unwrap();
+    assert!(compacted.applied);
+    assert!(compacted.deleted_operations >= 1);
+    assert_eq!(compacted.deleted_coordination_requests, 1);
+    assert!(
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "coordination_target_released")
+    );
+}
+
+fn abandoned_work_is_not_a_reported_completion(db: &Db) {
+    use WorkTransitionKind::{Abandon, Complete, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    let reader = WorkLifecycleReader::Token(&alice.token);
+    let make =
+        |key: &str, scope: &str| start_in(&*store, &alice, key, &format!("s-{key}"), scope, now);
+    let finished = make("f", "f/**");
+    let abandoned = make("a", "a/**");
+    let superseded = make("s", "s/**");
+    let completed = make("c", "c/**");
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &finished,
+        "fin",
+        "s-f",
+        CheckpointKind::Finish,
+        now + 1,
+    );
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&abandoned, "x", Abandon, None),
+            now + 1,
+        )
+        .unwrap();
+    let mut request = transition_request(&superseded, "x", Supersede, None);
+    request.superseded_by = Some(completed.id.clone());
+    store
+        .work_transition(&person(&admin, true), &request, now + 1)
+        .unwrap();
+    store
+        .work_transition(
+            &by_agent(&alice_b),
+            &transition_request(&completed, "x", Complete, Some("owner-s")),
+            now + 1,
+        )
+        .unwrap();
+    let expect = [
+        (
+            &finished,
+            Some(TerminalOutcome::Completed),
+            OutcomeProvenance::AgentReport,
+            true,
+        ),
+        (
+            &abandoned,
+            Some(TerminalOutcome::Abandoned),
+            OutcomeProvenance::Person,
+            false,
+        ),
+        (
+            &superseded,
+            Some(TerminalOutcome::Superseded),
+            OutcomeProvenance::Admin,
+            false,
+        ),
+        (
+            &completed,
+            Some(TerminalOutcome::Completed),
+            OutcomeProvenance::AgentReport,
+            true,
+        ),
+    ];
+    for (item, outcome, provenance, reported) in expect {
+        let view = lifecycle(&*store, &reader, &item.id, now + 2);
+        assert_eq!(
+            (view.0, view.1),
+            (outcome, Some(provenance)),
+            "{}",
+            item.title
+        );
+        assert_eq!(view.2, None);
+        let insight = store
+            .work_insight(&alice.token, &item.id, now + 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(insight.state, WorkState::Finished);
+        assert_eq!(insight.reported_finished, reported, "{}", item.title);
+    }
+    // Recent outcomes stay checkpoint-only: a transition leaves `current` unchanged and carries
+    // no actor, so listing it would show a stale summary under the lead's name. Only the finish
+    // checkpoint is listed; abandoned, superseded and transition-completed Work are not (the
+    // latter is visible through history and the operational projection).
+    let overview = store
+        .work_overview(&alice.token, &Default::default(), now + 3)
+        .unwrap();
+    let recent: Vec<_> = overview
+        .recent
+        .iter()
+        .map(|outcome| outcome.item.id.as_str())
+        .collect();
+    assert!(recent.contains(&finished.id.as_str()));
+    assert!(!recent.contains(&abandoned.id.as_str()));
+    assert!(!recent.contains(&superseded.id.as_str()));
+    assert!(!recent.contains(&completed.id.as_str()));
+    // Pre-existing finished Work with no stored outcome reads as unstated.
+    db.sql(&format!(
+        "UPDATE hub_work_items SET terminal_outcome = NULL WHERE id = '{}'",
+        abandoned.id
+    ));
+    let view = lifecycle(&*store, &reader, &abandoned.id, now + 4);
+    assert_eq!((view.0, view.1), (None, None));
+}
+
+// Corrections: plain announces, session-less intents, resume, finish cleanup, reopen retarget.
+
+fn plain_intent(n: u128, path: &str) -> agentscm::hub::intent::NewIntent {
+    agentscm::hub::intent::NewIntent {
+        id: format!("int_{n:032x}"),
+        task: "edit".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec![path.into()],
+        ttl_seconds: 600,
+    }
+}
+
+fn live_intents(db: &Db) -> usize {
+    db.rows("SELECT id FROM hub_intents WHERE released_at IS NULL")
+        .len()
+}
+
+fn plain_intent_of(id: u128, paths: &[&str]) -> agentscm::hub::intent::NewIntent {
+    let mut intent = plain_intent(id, paths[0]);
+    intent.paths = paths.iter().map(|path| (*path).to_owned()).collect();
+    intent
+}
+
+fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let dave = agent(&*store, 4);
+    let erin = agent(&*store, 5);
+    let owner = user_of(&*store, &alice);
+    let announce_plain = |who: &Agent, id: u128, paths: &[&str], at: i64| {
+        store.announce_intent(&who.token, &plain_intent_of(id, paths), at)
+    };
+
+    // One id, the paths accumulated, as the `agentscm intent` hook posts them. A path outside
+    // every linked scope is advisory and never refused.
+    let item = start_in(&*store, &alice, "a", "abc", "src/**", now);
+    announce_plain(&alice, 1, &["src/a.rs", "lib/x.rs"], now + 1).unwrap();
+
+    // After a release the path inside the Work's scope is refused and names the Work; the path
+    // outside it passes in the same token.
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("abc")),
+            now + 2,
+        )
+        .unwrap()
+        .item;
+    let refused = announce_plain(&alice, 2, &["lib/x.rs", "src/b.rs"], now + 3);
+    match refused {
+        Err(HubError::Invalid(message)) => {
+            assert!(message.contains(&item.id), "{message}");
+            assert!(message.contains("Resume"), "{message}");
+        }
+        other => panic!("expected a refusal naming the Work, got {other:?}"),
+    }
+    announce_plain(&alice, 2, &["lib/x.rs"], now + 3).unwrap();
+    // An explicit resume is a fresh admission and the refused path works again.
+    let resumed = store
+        .work_start(
+            &alice.token,
+            &takeover(&item.id, "abc", Some(released.generation)),
+            now + 4,
+        )
+        .unwrap();
+    assert!(resumed.took_over);
+    announce_plain(&alice, 2, &["lib/x.rs", "src/b.rs"], now + 5).unwrap();
+
+    // Abandoned Work is finished: its token may post advisory intents, but a released id stays
+    // released, so the client mints a new one.
+    let current = current_item(&*store, &alice, &item.id, now + 6);
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&current, "ab", Abandon, None),
+            now + 6,
+        )
+        .unwrap();
+    assert!(matches!(
+        announce_plain(&alice, 2, &["src/c.rs"], now + 7),
+        Err(HubError::Invalid(message)) if message == "intent was released"
+    ));
+    announce_plain(&alice, 3, &["src/c.rs"], now + 7).unwrap();
+
+    // A stale takeover fences the previous holder's named session.
+    let other = start_in(&*store, &bob, "b", "abc", "lib/**", now + 8);
+    announce_plain(&bob, 6, &["lib/a.rs"], now + 9).unwrap();
+    let later = now + 8 + CLAIM_STALE_SECONDS + 10;
+    assert!(
+        store
+            .work_start(&carol.token, &takeover(&other.id, "abc", Some(1)), later)
+            .unwrap()
+            .took_over
+    );
+    assert!(matches!(
+        announce_plain(&bob, 6, &["lib/a.rs", "lib/b.rs"], later + 1),
+        Err(HubError::Invalid(_))
+    ));
+    announce_plain(&carol, 8, &["lib/c.rs"], later + 1).unwrap();
+
+    // A token never linked to Work keeps the legacy advice.
+    announce_plain(&dave, 9, &["lib/c.rs"], later + 2).unwrap();
+
+    // Work with an empty scope refuses nothing.
+    let mut empty = native_start("e", "e", "s-e");
+    empty.scope = vec![];
+    store.work_start(&erin.token, &empty, later + 3).unwrap();
+    announce_plain(&erin, 10, &["src/z.rs"], later + 4).unwrap();
+}
+
+/// A path covered by Work on which a session is eligible passes even when other, fenced Work of
+/// the same token also covers it.
+fn plain_announce_allows_paths_covered_by_eligible_work(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let first = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&first, "rel", Release, Some("s-a")),
+            now + 1,
+        )
+        .unwrap();
+    // The released Work holds nothing, so the second may take a part of its scope.
+    let second = start_in(&*store, &alice, "b", "s-b", "src/sub/**", now + 2);
+    // `src/sub/` is still held by the second Work; the rest of `src/` is fenced.
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "src/sub/a.rs"), now + 3)
+        .unwrap();
+    assert!(matches!(
+        store.announce_intent(&alice.token, &plain_intent(2, "src/a.rs"), now + 3),
+        Err(HubError::Invalid(_))
+    ));
+    assert_eq!(second.state, WorkState::Active);
+}
+
+/// A broader directory key against a narrower fenced scope, and the reverse, is refused; an
+/// unrelated directory is not.
+fn plain_announce_refuses_a_directory_that_overlaps_fenced_work_either_way(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let narrow = start_in(&*store, &alice, "a", "s-a", "src/sub/**", now);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&narrow, "rel", Release, Some("s-a")),
+            now + 1,
+        )
+        .unwrap();
+    match store.announce_intent(&alice.token, &plain_intent(1, "src/**"), now + 2) {
+        Err(HubError::Invalid(message)) => assert!(message.contains(&narrow.id), "{message}"),
+        other => panic!("expected a refusal naming the Work, got {other:?}"),
+    }
+    store
+        .announce_intent(&alice.token, &plain_intent(2, "lib/**"), now + 2)
+        .unwrap();
+
+    let bob = agent(&*store, 2);
+    let broad = start_in(&*store, &bob, "b", "s-b", "docs/**", now + 3);
+    store
+        .work_transition(
+            &by_agent(&bob),
+            &transition_request(&broad, "rel-b", Release, Some("s-b")),
+            now + 4,
+        )
+        .unwrap();
+    match store.announce_intent(&bob.token, &plain_intent(3, "docs/deep/**"), now + 5) {
+        Err(HubError::Invalid(message)) => assert!(message.contains(&broad.id), "{message}"),
+        other => panic!("expected a refusal naming the Work, got {other:?}"),
+    }
+}
+
+/// More unfinished Work for one token than the guard reads fails closed instead of letting a
+/// partial read allow the announce; at the bound it still decides normally.
+fn plain_announce_fails_closed_beyond_the_token_work_bound(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    for index in 0..100 {
+        let key = format!("k{index}");
+        start_in(&*store, &alice, &key, &key, &format!("d{index}/**"), now);
+    }
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "d1/a.rs"), now + 1)
+        .unwrap();
+    start_in(&*store, &alice, "k100", "k100", "d100/**", now);
+    assert!(matches!(
+        store.announce_intent(&alice.token, &plain_intent(2, "d1/a.rs"), now + 2),
+        Err(HubError::WorkOverlapIncomplete)
+    ));
+}
+
+/// Cleanup is not bounded by the announce guard: a token with more empty-scope Work than the
+/// guard reads can still release, abandon and finish its Work.
+fn cleanup_succeeds_for_a_token_with_more_work_than_the_announce_bound(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let mut items = Vec::new();
+    for index in 0..102 {
+        let key = format!("k{index}");
+        let mut start = native_start(&key, &key, &key);
+        start.scope = vec![];
+        items.push(store.work_start(&alice.token, &start, now).unwrap().item);
+    }
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&items[0], "rel", Release, Some("k0")),
+            now + 1,
+        )
+        .unwrap();
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&items[1], "ab", Abandon, Some("k1")),
+            now + 2,
+        )
+        .unwrap();
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &items[2],
+        "fin",
+        "k2",
+        CheckpointKind::Finish,
+        now + 3,
+    );
+    assert_eq!(finished.item.state, WorkState::Finished);
+}
+
+/// Another token's pile of empty-scope Work, joined as a helper to the victim's Work, cannot make
+/// the victim's owner's release fail.
+fn a_helper_with_many_work_cannot_block_the_owners_release(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let victim = start_in(&*store, &alice, "v", "s-v", "src/**", now);
+    for index in 0..102 {
+        let key = format!("k{index}");
+        let mut start = native_start(&key, &key, &key);
+        start.scope = vec![];
+        store.work_start(&bob.token, &start, now).unwrap();
+    }
+    let mut helper = join(&victim.id, "s-h", WorkRole::Helper);
+    helper.scope = vec![];
+    store.work_start(&bob.token, &helper, now + 1).unwrap();
+    announce(&*store, &bob, "s-h", "src/h.rs", now + 2);
+    let current = current_item(&*store, &alice, &victim.id, now + 3);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-v")),
+            now + 4,
+        )
+        .unwrap();
+}
+
+/// Empty-scope Work cannot affect an announce, so it does not count toward the guard's bound.
+fn plain_announce_ignores_empty_scope_work_in_its_bound(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    for index in 0..101 {
+        let key = format!("k{index}");
+        let mut start = native_start(&key, &key, &key);
+        start.scope = vec![];
+        store.work_start(&alice.token, &start, now).unwrap();
+    }
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "d1/a.rs"), now + 1)
+        .unwrap();
+}
+
+/// A lead, a helper with a session intent, a session-less intent of each of them and of an
+/// unrelated token, all inside `src/**`.
+fn hold_scope_with_three_kinds_of_intent(
+    db: &Db,
+    store: &dyn Store,
+    now: i64,
+) -> (Agent, agentscm::hub::work::WorkItem) {
+    let alice = agent(store, 1);
+    let bob = agent(store, 2);
+    let carol = agent(store, 3);
+    let item = start_in(store, &alice, "a", "s-a", "src/**", now);
+    store
+        .work_start(
+            &bob.token,
+            &join(&item.id, "s-h", WorkRole::Helper),
+            now + 1,
+        )
+        .unwrap();
+    announce(store, &alice, "s-a", "src/q.rs", now + 2);
+    announce(store, &bob, "s-h", "src/h.rs", now + 2);
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "src/p.rs"), now + 3)
+        .unwrap();
+    store
+        .announce_intent(&bob.token, &plain_intent(2, "src/p2.rs"), now + 3)
+        .unwrap();
+    // An unrelated token is not tied to the Work and is left alone.
+    store
+        .announce_intent(&carol.token, &plain_intent(3, "src/c.rs"), now + 3)
+        .unwrap();
+    assert_eq!(live_intents(db), 5);
+    let item = current_item(store, &alice, &item.id, now + 4);
+    (alice, item)
+}
+
+fn release_frees_session_and_sessionless_intents_of_the_scope(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let (alice, item) = hold_scope_with_three_kinds_of_intent(db, &*store, now);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 5,
+        )
+        .unwrap();
+    // Only the unrelated token's intent is left.
+    assert_eq!(live_intents(db), 1);
+}
+
+fn live_keys(db: &Db) -> Vec<String> {
+    db.rows("SELECT key FROM hub_intent_paths ORDER BY key")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect()
+}
+
+fn ending_work_spares_a_tokens_live_intents_elsewhere(db: &Db) {
+    use WorkTransitionKind::Abandon;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let owner = user_of(&*store, &alice);
+    // Bob helped on A and leads B now. Ending A takes only what belongs to A.
+    let a = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .work_start(&bob.token, &join(&a.id, "s-h", WorkRole::Helper), now + 1)
+        .unwrap();
+    start_in(&*store, &bob, "b", "s-b", "lib/**", now + 2);
+    announce(&*store, &bob, "s-h", "src/h.rs", now + 3);
+    announce(&*store, &bob, "s-b", "lib/b.rs", now + 3);
+    for (id, path) in [(1, "lib/p.rs"), (2, "doc/q.rs"), (3, "src/p.rs")] {
+        store
+            .announce_intent(&bob.token, &plain_intent(id, path), now + 4)
+            .unwrap();
+    }
+    let a = current_item(&*store, &alice, &a.id, now + 5);
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&a, "ab", Abandon, None),
+            now + 5,
+        )
+        .unwrap();
+    // A's helper session intent and the session-less intent inside A's scope are freed; B's
+    // intent and the non-overlapping session-less intents stay.
+    assert_eq!(live_keys(db), ["doc/q.rs", "lib/b.rs", "lib/p.rs"]);
+}
+
+fn ending_work_spares_a_session_that_is_eligible_on_other_work(db: &Db) {
+    use WorkTransitionKind::Abandon;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let owner = user_of(&*store, &alice);
+    let a = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .work_start(&bob.token, &join(&a.id, "s-h", WorkRole::Helper), now + 1)
+        .unwrap();
+    announce(&*store, &bob, "s-h", "src/h.rs", now + 2);
+    // The same session now leads other Work, so it is not ended with A.
+    start_in(&*store, &bob, "b", "s-h", "lib/**", now + 3);
+    let a = current_item(&*store, &alice, &a.id, now + 4);
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&a, "ab", Abandon, None),
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(live_keys(db), ["src/h.rs"]);
+}
+
+fn ending_work_that_held_nothing_leaves_sessionless_intents(db: &Db) {
+    use WorkTransitionKind::Abandon;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let owner = user_of(&*store, &alice);
+    let a = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "src/x.rs"), now + 1)
+        .unwrap();
+    db.sql("UPDATE hub_work_items SET reservation_basis = NULL");
+    let a = current_item(&*store, &alice, &a.id, now + 2);
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&a, "ab", Abandon, None),
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(live_keys(db), ["src/x.rs"]);
+}
+
+fn finish_checkpoint_cleans_up_like_a_terminal_transition(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let (alice, item) = hold_scope_with_three_kinds_of_intent(db, &*store, now);
+    let dave = agent(&*store, 4);
+    let erin = agent(&*store, 5);
+    // One request stays pending; one is answered. Neither may change status.
+    let ask = |who: &Agent, key: &str, at: i64| {
+        let mut start = native_start(key, key, &format!("s-{key}"));
+        start.scope = vec!["src/**".into()];
+        store
+            .work_start(&who.token, &start, at)
+            .unwrap()
+            .coordination_request
+            .unwrap()
+    };
+    let pending = ask(&dave, "d", now + 5);
+    let answered = ask(&erin, "e", now + 6);
+    let acked = store
+        .coordination_ack(
+            &alice.token,
+            &CoordinationAck {
+                request_id: answered.id.clone(),
+                target_work_id: Some(item.id.clone()),
+                session: "s-a".into(),
+                expected_updated_seq: answered.updated_seq,
+            },
+            now + 7,
+        )
+        .unwrap();
+    store
+        .coordination_reply(
+            &alice.token,
+            &CoordinationReply {
+                request_id: answered.id.clone(),
+                operation_id: "reply".into(),
+                target_work_id: item.id.clone(),
+                session: "s-a".into(),
+                expected_updated_seq: acked.updated_seq,
+                kind: CoordinationResponseKind::Join,
+                note: None,
+                via_hub: false,
+            },
+            now + 8,
+        )
+        .unwrap();
+    let current = current_item(&*store, &alice, &item.id, now + 9);
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &current,
+        "fin",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 9,
+    );
+    assert_eq!(finished.item.state, WorkState::Finished);
+    assert_eq!(db.reservation(&item.id).1, None);
+    // The lead's, the helper's and both session-less intents are gone; the stranger's stays.
+    assert_eq!(live_intents(db), 1);
+    let statuses = db.rows(&format!(
+        "SELECT id, status FROM hub_coordination_requests WHERE id IN ('{}', '{}') ORDER BY id",
+        pending.id, answered.id
+    ));
+    let mut expected = vec![
+        vec![pending.id.clone(), "pending".to_owned()],
+        vec![answered.id.clone(), "responded".to_owned()],
+    ];
+    expected.sort();
+    assert_eq!(statuses, expected);
+    let mut released: Vec<_> = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "coordination_target_released")
+        .map(|event| event.subject)
+        .collect();
+    released.sort();
+    let mut want = vec![pending.id, answered.id];
+    want.sort();
+    assert_eq!(released, want);
+    let event = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "coordination_target_released")
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(data["transition"], "finish");
+    assert_eq!(data["actor"]["kind"], "lead");
+}
+
+/// An open request that targets Work of alice's, from bob, who declares an overlapping scope.
+fn open_request_on(
+    store: &dyn Store,
+    bob: &Agent,
+    scope: &str,
+    now: i64,
+) -> agentscm::hub::coordination::CoordinationRequest {
+    let mut start = native_start("b", "b", "s-b");
+    start.scope = vec![scope.into()];
+    store
+        .work_start(&bob.token, &start, now)
+        .unwrap()
+        .coordination_request
+        .unwrap()
+}
+
+fn finish_at_payload_quota_succeeds_in_its_cleanup(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    open_request_on(&*store, &bob, "src/**", now + 1);
+    let item = current_item(&*store, &alice, &item.id, now + 2);
+    // Leave just enough room for the finish checkpoint itself; the cleanup then records its
+    // request event past the quota and must not refuse the finish.
+    let mut request = checkpoint(
+        &item.id,
+        "fin",
+        item.generation,
+        "s-a",
+        CheckpointKind::Finish,
+        "step",
+    );
+    request.expected_updated_seq = Some(item.updated_seq);
+    let mut finished = None;
+    for headroom in (25..40_000).step_by(25) {
+        db.sql(&format!(
+            "UPDATE hub_work_usage SET charged_bytes = {}
+             WHERE repository = '{REPO}'",
+            WORK_PAYLOAD_CAPACITY_BYTES - headroom
+        ));
+        match store.work_checkpoint(&alice.token, &request, now + 3) {
+            Ok(result) => {
+                finished = Some(result);
+                break;
+            }
+            Err(HubError::WorkCapacity) => {}
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+    }
+    let finished = finished.expect("a finish fits some headroom");
+    assert_eq!(finished.item.state, WorkState::Finished);
+    let charged: i64 = db.rows(&format!(
+        "SELECT charged_bytes FROM hub_work_usage WHERE repository = '{REPO}'"
+    ))[0][0]
+        .parse()
+        .unwrap();
+    assert!(
+        charged > WORK_PAYLOAD_CAPACITY_BYTES,
+        "cleanup is recorded past the quota, not refused"
+    );
+    assert_eq!(
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "coordination_target_released")
+            .count(),
+        1
+    );
+}
+
+fn an_exact_finish_replay_repeats_no_release(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    open_request_on(&*store, &bob, "src/**", now + 1);
+    let item = current_item(&*store, &alice, &item.id, now + 2);
+    let mut request = checkpoint(
+        &item.id,
+        "fin",
+        item.generation,
+        "s-a",
+        CheckpointKind::Finish,
+        "step",
+    );
+    request.expected_updated_seq = Some(item.updated_seq);
+    let first = store
+        .work_checkpoint(&alice.token, &request, now + 3)
+        .unwrap();
+    assert!(!first.receipt.replayed);
+    let released = |store: &dyn Store| {
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "coordination_target_released")
+            .count()
+    };
+    assert_eq!(released(&*store), 1);
+    // An advisory intent posted after the finish is not taken by a replay of the finish.
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "src/z.rs"), now + 4)
+        .unwrap();
+    let seq = store.latest_event_seq().unwrap();
+    let replay = store
+        .work_checkpoint(&alice.token, &request, now + 5)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, first.receipt.event_seq);
+    assert_eq!(released(&*store), 1);
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+    assert_eq!(live_keys(db), ["src/z.rs"]);
+}
+
+fn released_work_resumes_in_any_state_and_refuses_reports_until_then(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let bob = agent(&*store, 2);
+    let report =
+        |who: &Agent, item: &agentscm::hub::work::WorkItem, op: &str, session: &str, kind, at| {
+            let mut request = checkpoint(&item.id, op, item.generation, session, kind, "report");
+            request.expected_updated_seq = Some(item.updated_seq);
+            store.work_checkpoint(&who.token, &request, at)
+        };
+
+    // Blocked work, released, resumes by its own lead although its claim is current.
+    let first = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let blocked = lead_checkpoint(
+        &*store,
+        &alice,
+        &first,
+        "blk",
+        "s-a",
+        CheckpointKind::Blocker,
+        now + 1,
+    )
+    .item;
+    assert_eq!(blocked.state, WorkState::Blocked);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&blocked, "rel", Release, Some("s-a")),
+            now + 2,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(released.state, WorkState::Blocked);
+    assert_eq!(db.reservation(&first.id), (None, None));
+    // Progress, a decision and a blocker are refused with nothing held, and change nothing.
+    for (op, kind) in [
+        ("prog", CheckpointKind::Progress),
+        ("dec", CheckpointKind::Decision),
+        ("blk2", CheckpointKind::Blocker),
+    ] {
+        let seq = store.latest_event_seq().unwrap();
+        let refused = report(&alice, &released, op, "s-a", kind, now + 3);
+        assert!(
+            matches!(&refused, Err(HubError::Invalid(message)) if message.contains("resume")),
+            "{op}: {refused:?}"
+        );
+        assert_eq!(store.latest_event_seq().unwrap(), seq);
+    }
+    let resumed = store
+        .work_start(
+            &alice.token,
+            &takeover(&first.id, "s-a", Some(released.generation)),
+            now + 4,
+        )
+        .unwrap();
+    assert!(resumed.took_over, "{:?}", resumed.conflict);
+    assert_eq!(resumed.item.state, WorkState::Active);
+    assert_eq!(db.reservation(&first.id), (None, Some("admitted".into())));
+    report(
+        &alice,
+        &resumed.item,
+        "prog-2",
+        "s-a",
+        CheckpointKind::Progress,
+        now + 5,
+    )
+    .unwrap();
+
+    // Paused work, released: a pause, handover or finish is still accepted, a progress report is not.
+    let second = start_in(&*store, &alice, "b", "s-b", "lib/**", now + 6);
+    let paused = lead_checkpoint(
+        &*store,
+        &alice,
+        &second,
+        "pause",
+        "s-b",
+        CheckpointKind::Pause,
+        now + 7,
+    )
+    .item;
+    let released_paused = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&paused, "rel-b", Release, Some("s-b")),
+            now + 8,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(released_paused.state, WorkState::Paused);
+    assert!(matches!(
+        report(
+            &alice,
+            &released_paused,
+            "late",
+            "s-b",
+            CheckpointKind::Progress,
+            now + 9
+        ),
+        Err(HubError::Invalid(_))
+    ));
+    let handed = report(
+        &alice,
+        &released_paused,
+        "hand",
+        "s-b",
+        CheckpointKind::Handover,
+        now + 9,
+    )
+    .unwrap()
+    .item;
+    assert_eq!(handed.state, WorkState::Handover);
+    assert_eq!(db.reservation(&second.id), (None, None));
+
+    // A rotated token of the same owner resumes it under a new session; another owner may not.
+    let taken_over = store
+        .work_start(
+            &bob.token,
+            &takeover(&second.id, "s-bob", Some(handed.generation)),
+            now + 10,
+        )
+        .unwrap();
+    // Handover work stays open to any agent, as before.
+    assert!(taken_over.took_over);
+    let third = start_in(&*store, &alice, "c", "s-c", "docs/**", now + 11);
+    let released_third = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&third, "rel-c", Release, Some("s-c")),
+            now + 12,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(released_third.state, WorkState::Paused);
+    let refused = store
+        .work_start(
+            &bob.token,
+            &takeover(&third.id, "s-bob2", Some(released_third.generation)),
+            now + 13,
+        )
+        .unwrap();
+    assert_eq!(
+        refused.conflict.map(|conflict| conflict.kind),
+        Some(WorkConflictKind::ClaimHeld)
+    );
+    let rotated = store
+        .work_start(
+            &alice_b.token,
+            &takeover(&third.id, "s-rot", Some(released_third.generation)),
+            now + 14,
+        )
+        .unwrap();
+    assert!(rotated.took_over, "{:?}", rotated.conflict);
+    assert_eq!(rotated.item.lead_session, "s-rot");
+    assert_eq!(db.reservation(&third.id), (None, Some("admitted".into())));
+}
+
+fn resuming_released_work_conflicts_on_overlap_without_mutation(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 1,
+        )
+        .unwrap()
+        .item;
+    start_in(&*store, &bob, "b", "s-b", "src/**", now + 2);
+    let seq = store.latest_event_seq().unwrap();
+    let blocked = store
+        .work_start(
+            &alice.token,
+            &takeover(&item.id, "s-a", Some(released.generation)),
+            now + 3,
+        )
+        .unwrap();
+    assert_scope_overlap(&blocked);
+    assert!(!blocked.took_over);
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+    let unchanged = current_item(&*store, &alice, &item.id, now + 4);
+    assert_eq!(unchanged.generation, released.generation);
+    assert_eq!(unchanged.updated_seq, released.updated_seq);
+    assert_eq!(db.reservation(&item.id), (None, None));
+}
+
+fn resuming_released_work_retargets_requests_only_when_the_lead_changes(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let request = open_request_on(&*store, &bob, "src/**", now + 1);
+    let acked = store
+        .coordination_ack(
+            &alice.token,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: Some(item.id.clone()),
+                session: "s-a".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 2,
+        )
+        .unwrap();
+    store
+        .coordination_reply(
+            &alice.token,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "reply".into(),
+                target_work_id: item.id.clone(),
+                session: "s-a".into(),
+                expected_updated_seq: acked.updated_seq,
+                kind: CoordinationResponseKind::Join,
+                note: None,
+                via_hub: false,
+            },
+            now + 3,
+        )
+        .unwrap();
+    let status = || {
+        db.rows(&format!(
+            "SELECT status FROM hub_coordination_requests WHERE id = '{}'",
+            request.id
+        ))[0][0]
+            .clone()
+    };
+    let current = current_item(&*store, &alice, &item.id, now + 4);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-a")),
+            now + 4,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(status(), "responded");
+
+    // The same token and session resume: the lead is unchanged, so the answer stands.
+    let resumed = store
+        .work_start(
+            &alice.token,
+            &takeover(&item.id, "s-a", Some(released.generation)),
+            now + 5,
+        )
+        .unwrap();
+    assert!(resumed.took_over);
+    assert_eq!(status(), "responded");
+    assert_eq!(work_event_count(&*store, "coordination_retargeted"), 0);
+
+    // Another token of the owner resumes after a second release: the lead changes and the
+    // request waits for the new lead again.
+    let current = current_item(&*store, &alice, &item.id, now + 6);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel-2", Release, Some("s-a")),
+            now + 6,
+        )
+        .unwrap()
+        .item;
+    store
+        .work_start(
+            &alice_b.token,
+            &takeover(&item.id, "s-b", Some(released.generation)),
+            now + 7,
+        )
+        .unwrap();
+    assert_eq!(status(), "pending");
+    assert_eq!(work_event_count(&*store, "coordination_retargeted"), 1);
+}
+
+fn reopen_by_another_session_retargets_open_requests(db: &Db) {
+    use WorkTransitionKind::{Complete, Reopen};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let mut start = native_start("b", "b", "s-b");
+    start.scope = vec!["src/**".into()];
+    let request = store
+        .work_start(&bob.token, &start, now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let acked = store
+        .coordination_ack(
+            &alice.token,
+            &CoordinationAck {
+                request_id: request.id.clone(),
+                target_work_id: Some(item.id.clone()),
+                session: "s-a".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            now + 2,
+        )
+        .unwrap();
+    store
+        .coordination_reply(
+            &alice.token,
+            &CoordinationReply {
+                request_id: request.id.clone(),
+                operation_id: "reply".into(),
+                target_work_id: item.id.clone(),
+                session: "s-a".into(),
+                expected_updated_seq: acked.updated_seq,
+                kind: CoordinationResponseKind::Join,
+                note: None,
+                via_hub: false,
+            },
+            now + 3,
+        )
+        .unwrap();
+    let status = || {
+        db.rows(&format!(
+            "SELECT status FROM hub_coordination_requests WHERE id = '{}'",
+            request.id
+        ))[0][0]
+            .clone()
+    };
+    assert_eq!(status(), "responded");
+    let current = current_item(&*store, &alice, &item.id, now + 4);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "done", Complete, Some("s-a")),
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(status(), "responded", "ending the Work resolves nothing");
+    assert_eq!(work_event_count(&*store, "coordination_retargeted"), 0);
+
+    // The same session reopening keeps the same lead, so nothing is retargeted.
+    let finished = current_item(&*store, &alice, &item.id, now + 5);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&finished, "same", Reopen, Some("s-a")),
+            now + 5,
+        )
+        .unwrap();
+    assert_eq!(status(), "responded");
+    assert_eq!(work_event_count(&*store, "coordination_retargeted"), 0);
+
+    // Another session reopening changes the lead: the answered request waits for it again.
+    let current = current_item(&*store, &alice, &item.id, now + 6);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "done-2", Complete, Some("s-a")),
+            now + 6,
+        )
+        .unwrap();
+    let finished = current_item(&*store, &alice, &item.id, now + 7);
+    let reopened = store
+        .work_transition(
+            &by_agent(&alice_b),
+            &transition_request(&finished, "other", Reopen, Some("s-new")),
+            now + 7,
+        )
+        .unwrap();
+    assert_eq!(reopened.item.lead_session, "s-new");
+    assert_eq!(status(), "pending");
+    assert_eq!(work_event_count(&*store, "coordination_retargeted"), 1);
+}
+
+fn pause_and_handover_keep_a_retained_reservation(db: &Db) {
+    use WorkTransitionKind::Retain;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let retained = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "keep", Retain, Some("s-a")),
+            now + 1,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(db.reservation(&item.id).1, Some("retained".into()));
+    // The automatic pause that ends a session is an ordinary pause checkpoint.
+    let paused = lead_checkpoint(
+        &*store,
+        &alice,
+        &retained,
+        "auto",
+        "s-a",
+        CheckpointKind::Pause,
+        now + 2,
+    )
+    .item;
+    assert_eq!(db.reservation(&item.id).1, Some("retained".into()));
+    let handed = lead_checkpoint(
+        &*store,
+        &alice,
+        &paused,
+        "hand",
+        "s-a",
+        CheckpointKind::Handover,
+        now + 3,
+    )
+    .item;
+    assert_eq!(db.reservation(&item.id).1, Some("retained".into()));
+    // An admitted reservation still becomes implicit, and a takeover admits it again.
+    let other = start_in(&*store, &alice, "b", "s-b", "lib/**", now + 4);
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &other,
+        "pause-b",
+        "s-b",
+        CheckpointKind::Pause,
+        now + 5,
+    );
+    assert_eq!(db.reservation(&other.id).1, Some("legacy_implicit".into()));
+    let taken = store
+        .work_start(
+            &alice.token,
+            &takeover(&item.id, "s-new", Some(handed.generation)),
+            now + 6,
+        )
+        .unwrap();
+    assert!(taken.took_over);
+    assert_eq!(db.reservation(&item.id).1, Some("admitted".into()));
+}
+
+fn requests_that_propose_ended_work_are_marked_released_too(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let first = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let mut start = native_start("b", "b", "s-b");
+    start.scope = vec!["src/**".into()];
+    let request = store
+        .work_start(&bob.token, &start, now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    // Alice's release frees the scope; bob's retried start then creates the Work the request
+    // proposed, and the request is bound to it.
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&first, "rel", Release, Some("s-a")),
+            now + 2,
+        )
+        .unwrap();
+    let mine = store.work_start(&bob.token, &start, now + 3).unwrap();
+    assert!(mine.created, "{:?}", mine.conflict);
+    let bound = db.rows(&format!(
+        "SELECT proposed_work FROM hub_coordination_requests WHERE id = '{}'",
+        request.id
+    ));
+    assert_eq!(bound[0][0], mine.item.id);
+    let released_events = |store: &dyn Store| {
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "coordination_target_released" && e.subject == request.id)
+            .count()
+    };
+    assert_eq!(released_events(&*store), 1);
+    // Ending the proposing Work marks the request again; its status is not touched.
+    lead_checkpoint(
+        &*store,
+        &bob,
+        &mine.item,
+        "fin",
+        "s-b",
+        CheckpointKind::Finish,
+        now + 4,
+    );
+    assert_eq!(released_events(&*store), 2);
+    let status = db.rows(&format!(
+        "SELECT status FROM hub_coordination_requests WHERE id = '{}'",
+        request.id
+    ));
+    assert_eq!(status[0][0], "pending");
+}
+
+fn read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let reader = agent_with(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 7,
+            repository: REPO,
+            repository_id: Some(REPOSITORY_ID),
+            read_only: true,
+            ttl: TTL,
+        },
+    );
+    let request = WorkTransitionRequest {
+        work_id: "wrk_00000000000000000000000000000001".into(),
+        operation_id: "op".into(),
+        generation: 1,
+        expected_updated_seq: 1,
+        session: Some("s".into()),
+        transition: WorkTransitionKind::Release,
+        reason: "synthetic reason".into(),
+        superseded_by: None,
+    };
+    assert!(matches!(
+        store.work_transition(&by_agent(&reader), &request, now),
+        Err(HubError::Unauthorized)
+    ));
+    // A writer sees an unknown id as invalid.
+    let writer = agent(&*store, 8);
+    assert!(matches!(
+        store.work_transition(&by_agent(&writer), &request, now),
+        Err(HubError::Invalid(_))
+    ));
 }

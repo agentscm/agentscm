@@ -1954,6 +1954,187 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
     assert!(responded[0].data.contains("\"via\":\"hub\""));
 }
 
+const TRANSITION: &str = "/v1/hub/session/work/transition";
+
+fn person_transition(item: &agentscm::hub::work::WorkItem, operation: &str, kind: &str) -> Value {
+    json!({"repository": REPO, "work_id": item.id, "operation_id": operation,
+        "generation": item.generation, "expected_updated_seq": item.updated_seq,
+        "transition": kind, "reason": "synthetic reason"})
+}
+
+#[tokio::test]
+async fn a_web_session_releases_or_ends_work_without_any_agent_token() {
+    let env = Env::start("github").await;
+    let (alice, bob, admin) = (
+        page(&env, ALICE).await,
+        page(&env, BOB).await,
+        page(&env, ADMIN).await,
+    );
+    let now = unix_now();
+    let start = |token: &str, key: &str, path: &str, at: i64| {
+        let mut start = work(key, &format!("{key}-session"));
+        start.scope = vec![path.into()];
+        env.store.work_start(token, &start, at).unwrap().item
+    };
+    let (lead, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let first = start(&lead, "first", "src/first.rs", now);
+    // The lead's token is gone; the owner still acts.
+    env.store.revoke_agent_token(&lead).unwrap();
+
+    // Signed out, without the page's CSRF token, and a computer's bearer session are refused.
+    let release = person_transition(&first, "rel-1", "release");
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            TRANSITION,
+            None,
+            Some(release.clone()),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, refused) = page_post(&env, &alice, false, TRANSITION, release.clone()).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (session, _, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            TRANSITION,
+            Some(&session),
+            Some(release.clone()),
+        )
+        .await;
+    assert_eq!(status, 403);
+    // Another person, even one who can read the repository, cannot touch Alice's Work.
+    let (status, refused) = page_post(&env, &bob, true, TRANSITION, release.clone()).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_work"))
+    );
+
+    // Unknown fields and an unconnected repository are refused.
+    let mut stray = release.clone();
+    stray["session"] = json!("someone");
+    assert_eq!(
+        page_post(&env, &alice, true, TRANSITION, stray).await.0,
+        400
+    );
+    let mut elsewhere = release.clone();
+    elsewhere["repository"] = json!("acme/elsewhere");
+    assert_eq!(
+        page_post(&env, &alice, true, TRANSITION, elsewhere).await.0,
+        403
+    );
+
+    // The owner releases without a token, and an exact retry returns the same receipt.
+    let (status, done) = page_post(&env, &alice, true, TRANSITION, release.clone()).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["item"]["state"], "paused");
+    assert!(done["conflict"].is_null());
+    let (status, retry) = page_post(&env, &alice, true, TRANSITION, release).await;
+    assert_eq!(status, 200, "{retry}");
+    assert_eq!(retry["receipt"]["event_seq"], done["receipt"]["event_seq"]);
+    assert_eq!(retry["receipt"]["replayed"], true);
+    let events = env.store.events_after(0, 1000).unwrap();
+    let recorded: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "work_transition")
+        .collect();
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].data.contains("\"kind\":\"owner\""));
+    assert!(recorded[0].data.contains("\"via\":\"person\""));
+    assert!(!recorded[0].data.contains(&lead));
+
+    // An administrator who is not the owner may release or abandon, never complete.
+    let (second_lead, _) = agent_for(&env, &alice.id, "codex", false);
+    let second = start(&second_lead, "second", "src/second.rs", now + 1);
+    let (status, refused) = page_post(
+        &env,
+        &admin,
+        true,
+        TRANSITION,
+        person_transition(&second, "adm-complete", "complete"),
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    let (status, released) = page_post(
+        &env,
+        &admin,
+        true,
+        TRANSITION,
+        person_transition(&second, "adm-release", "release"),
+    )
+    .await;
+    assert_eq!(status, 200, "{released}");
+    assert_eq!(released["item"]["state"], "paused");
+    // A person cannot reopen: a lead needs an agent session.
+    let third = start(&second_lead, "third", "src/third.rs", now + 2);
+    let (_, ended) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&third, "end-third", "abandon"),
+    )
+    .await;
+    assert_eq!(ended["item"]["state"], "finished");
+    let finished = env
+        .store
+        .work_get(&second_lead, &third.id, now + 3)
+        .unwrap()
+        .unwrap();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&finished, "reopen-third", "reopen"),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    // Repository access is checked on every call: no role, or read on a public repository.
+    let fourth = start(&second_lead, "fourth", "src/fourth.rs", now + 4);
+    env.drop_role(ALICE);
+    let (status, refused) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&fourth, "no-role", "release"),
+    )
+    .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+    env.set_repo(REPO, REPO_ID, "public");
+    env.role(ALICE, "read", "read", 20);
+    let (status, refused) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&fourth, "read-only", "release"),
+    )
+    .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+    env.role(ALICE, "write", "write", 30);
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&fourth, "role-back", "release"),
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
 #[tokio::test]
 async fn a_web_session_asks_and_answers_file_handoffs_only_for_its_own_agents() {
     let env = Env::start("github").await;

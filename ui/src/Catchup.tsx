@@ -31,6 +31,7 @@ const WORK_LABEL: Record<string, string> = {
   work_takeover: 'Work taken over',
   work_checkpoint: 'Checkpoint reported',
   work_pr_link: 'Relationship changed',
+  work_transition: 'Outcome or reservation changed',
 }
 
 const COORDINATION_LABEL: Record<string, string> = {
@@ -42,10 +43,11 @@ const COORDINATION_LABEL: Record<string, string> = {
 
 export function WorkUpdate({ event }: { event: CatchupWorkEvent }) {
   const relationshipChanged = event.kind === 'work_pr_link'
-  const summary = relationshipChanged ? 'Explicit PR relationship updated; inspect Work for the current link.' : event.item.current?.summary
+  const transitioned = event.kind === 'work_transition'
+  const summary = relationshipChanged ? 'Explicit PR relationship updated; inspect Work for the current link.' : transitioned ? 'Outcome or reservation changed; inspect Work for the reason and current state.' : event.item.current?.summary
   return (
-    <li className={!relationshipChanged && event.item.state === 'finished' ? 'tone-ok' : undefined}>
-      <Icon name={relationshipChanged ? 'git' : event.item.state === 'finished' ? 'check2-circle' : 'chat-square-text'} />
+    <li className={!relationshipChanged && !transitioned && event.item.state === 'finished' ? 'tone-ok' : undefined}>
+      <Icon name={relationshipChanged ? 'git' : event.item.state === 'finished' && !transitioned ? 'check2-circle' : 'chat-square-text'} />
       <div><strong>{WORK_LABEL[event.kind] ?? 'Work updated'}</strong> · <a href={`#work/${encodeURIComponent(event.work_id)}`}>{event.item.title}</a></div>
       <div className="small muted">{event.item.lead_agent} · {summary ?? <span className="muted">No summary reported</span>} · <Ago at={event.at} /></div>
       <details className="disclosure">

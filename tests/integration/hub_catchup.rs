@@ -19,8 +19,15 @@ use agentscm::hub::work::{
     BriefingQuery, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverviewQuery,
     WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
+use agentscm::hub::work_lifecycle::{
+    MergeStatus, OperationalOverviewV1, OutcomeValue, ReservationStatus,
+};
 use agentscm::hub::work_preflight::{
     WorkPreflightReason, WorkPreflightRequest, WorkPreflightStatus,
+};
+use agentscm::hub::work_transition::{
+    OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionKind,
+    WorkTransitionRequest,
 };
 use hub_pg::PgSchema;
 use postgres::{Client, NoTls};
@@ -3457,6 +3464,176 @@ fn a_check_in_after_the_merge_survives_the_automatic_pause(fixture: &Fixture) {
     assert_eq!(real.reported_at, None);
 }
 
+fn operational_read(
+    fixture: &Fixture,
+    token: &str,
+    select: &OperationalSelect<'_>,
+    now: i64,
+) -> OperationalOverviewV1 {
+    fixture
+        .store
+        .work_operational(&WorkLifecycleReader::Token(token), select, now)
+        .unwrap()
+}
+
+fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let now = t0 + 5_000;
+    let hidden = begin(fixture, &token, "oph", Some("feat/oph"), "src/oph.rs", t0);
+    let plain = begin(fixture, &token, "opp", Some("feat/opp"), "src/opp.rs", t0);
+    let freed = begin(fixture, &token, "opf", None, "src/opf.rs", t0);
+    fixture
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token },
+            &WorkTransitionRequest {
+                work_id: freed.id.clone(),
+                operation_id: "release-opf".into(),
+                generation: freed.generation,
+                expected_updated_seq: freed.updated_seq,
+                session: Some("session-opf".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic release".into(),
+                superseded_by: None,
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    merged(fixture, 60, "feat/oph", "main", true, t0 + 100);
+
+    // The merged item is hidden from `current` and counted as settled.
+    let (ids, settled, _) = listed(fixture, &reader, 100, now);
+    assert!(!ids.contains(&hidden.id), "{ids:?}");
+    assert_eq!(settled, 1);
+
+    let holders = operational_read(fixture, &reader, &OperationalSelect::Holders, t0 + 120);
+    assert_eq!((holders.schema_version, holders.complete), (1, true));
+    let mut expected = vec![hidden.id.clone(), plain.id.clone()];
+    expected.sort();
+    let listed_ids: Vec<_> = holders.work.iter().map(|w| w.work_id.clone()).collect();
+    assert_eq!(listed_ids, expected, "ordered by id, freed work absent");
+    let entry = holders
+        .work
+        .iter()
+        .find(|w| w.work_id == hidden.id)
+        .unwrap();
+    assert!(entry.merge.hidden_by_merged_pr);
+    assert_eq!(entry.merge.status, MergeStatus::Observed);
+    // A merge changes neither the state, the outcome nor the reservation.
+    assert_eq!(entry.state, WorkState::Active);
+    assert_eq!(entry.outcome.value, OutcomeValue::None);
+    assert_eq!(entry.reservation.status, ReservationStatus::Held);
+    assert_eq!(entry.reservation.scope, vec!["src/oph.rs".to_owned()]);
+    assert_eq!(entry.generation, hidden.generation);
+    let other = holders.work.iter().find(|w| w.work_id == plain.id).unwrap();
+    assert!(!other.merge.hidden_by_merged_pr);
+    assert_eq!(
+        other.merge.status,
+        MergeStatus::Unknown,
+        "no coverage known"
+    );
+
+    // Unfinished and released: readable by id with no reservation, never a holder.
+    let one = operational_read(fixture, &reader, &OperationalSelect::One(&freed.id), now);
+    let one = &one.work[0];
+    assert_eq!(one.reservation.status, ReservationStatus::None);
+    assert!(one.reservation.scope.is_empty() && one.reservation.basis.is_none());
+    assert_eq!(one.state, WorkState::Paused);
+    // Unknown and foreign ids read as empty.
+    let missing = format!("wrk_{}", "0".repeat(32));
+    assert!(
+        operational_read(fixture, &reader, &OperationalSelect::One(&missing), now)
+            .work
+            .is_empty()
+    );
+    assert!(matches!(
+        fixture.store.work_operational(
+            &WorkLifecycleReader::Token(&reader),
+            &OperationalSelect::One("not-an-id"),
+            now
+        ),
+        Err(HubError::Invalid(_))
+    ));
+
+    // No token identifier appears, and only `freshness` depends on the request time.
+    let early = serde_json::to_value(&holders).unwrap();
+    let text = early.to_string();
+    assert!(!text.contains(&token) && !text.contains(&reader), "{text}");
+    fixture.store.revoke_agent_token(&token).unwrap();
+    let later = operational_read(fixture, &reader, &OperationalSelect::Holders, now + 600);
+    let mut later = serde_json::to_value(&later).unwrap();
+    let mut early = early;
+    assert_ne!(early, later, "a revoked lead changes freshness");
+    for value in [&mut early, &mut later] {
+        for work in value["work"].as_array_mut().unwrap() {
+            work.as_object_mut().unwrap().remove("freshness");
+        }
+    }
+    assert_eq!(early, later);
+}
+
+fn merge_status_is_none_only_when_forge_coverage_is_known(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let now = t0 + 5_000;
+    let branch = begin(fixture, &token, "mnb", Some("feat/mnb"), "src/mnb.rs", t0);
+    let loose = begin(fixture, &token, "mnl", None, "src/mnl.rs", t0);
+    let status_of = |id: &str| {
+        operational_read(fixture, &reader, &OperationalSelect::One(id), now).work[0]
+            .merge
+            .status
+    };
+    assert_eq!(status_of(&branch.id), MergeStatus::Unknown);
+    let record = |state, window_from| {
+        fixture
+            .store
+            .record_catchup_source_status(
+                &scope(SETTLED_RID),
+                &CatchupSourceStatus {
+                    source: CatchupMergeSource::ForgePull,
+                    state,
+                    checked_at: t0 + 1_000,
+                    unread_pages: 0,
+                    deferred: 0,
+                    window_from,
+                },
+            )
+            .unwrap();
+    };
+    // A read that does not reach the item's creation, or an incomplete one, proves nothing.
+    record(CatchupCoverageState::ObservedOnly, Some(t0 + 500));
+    assert_eq!(status_of(&branch.id), MergeStatus::Unknown);
+    record(CatchupCoverageState::Incomplete, Some(t0 - 100));
+    assert_eq!(status_of(&branch.id), MergeStatus::Unknown);
+    record(CatchupCoverageState::ObservedOnly, Some(t0 - 100));
+    assert_eq!(status_of(&branch.id), MergeStatus::None);
+    // Work with no branch is never judged by the merge rule.
+    assert_eq!(status_of(&loose.id), MergeStatus::Unknown);
+    merged(fixture, 61, "feat/mnb", "main", true, t0 + 100);
+    let after = operational_read(fixture, &reader, &OperationalSelect::One(&branch.id), now);
+    assert_eq!(after.work[0].merge.status, MergeStatus::Observed);
+    assert!(after.work[0].merge.hidden_by_merged_pr);
+}
+
+fn more_than_a_hundred_holders_are_bounded_and_flagged(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    for index in 0..101 {
+        begin(
+            fixture,
+            &token,
+            &format!("many{index}"),
+            None,
+            &format!("src/many{index}.rs"),
+            t0,
+        );
+    }
+    let page = operational_read(fixture, &reader, &OperationalSelect::Holders, t0 + 10);
+    assert_eq!((page.work.len(), page.complete), (100, false));
+    let ids: Vec<_> = page.work.iter().map(|w| w.work_id.clone()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
+}
+
 macro_rules! settled_cases {
     ($($case:ident),* $(,)?) => {
         mod settled {
@@ -3498,4 +3675,7 @@ settled_cases!(
     a_branch_that_is_also_a_base_stays_listed_in_either_order,
     settling_works_in_an_unbound_repository,
     a_check_in_after_the_merge_survives_the_automatic_pause,
+    operational_covers_reserving_work_hidden_by_a_merged_pr,
+    merge_status_is_none_only_when_forge_coverage_is_known,
+    more_than_a_hundred_holders_are_bounded_and_flagged,
 );

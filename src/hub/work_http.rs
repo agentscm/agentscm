@@ -14,10 +14,15 @@ use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, Work
 use super::store::{search_text, unix_now};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, DEFAULT_WORK_SEARCH, MAX_WORK_SEARCH,
-    WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkOverview, WorkOverviewQuery,
+    WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkOverviewQuery, WorkScopeOverlap,
     WorkSearchPage, WorkStart, WorkState,
 };
+use super::work_lifecycle::overview_with_operational;
 use super::work_preflight::WorkPreflightResult;
+use super::work_transition::{
+    OperationalOverviewV1, OperationalSelect, WorkLifecycleReader, WorkOperationalV1,
+    WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
+};
 use super::{HubError, HubState};
 
 pub fn routes() -> Router<HubState> {
@@ -31,6 +36,12 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/preflight", post(preflight))
         .route("/v1/hub/standup/start", post(start))
         .route("/v1/hub/standup/checkpoint", post(checkpoint))
+        .route("/v1/hub/standup/work-transition", post(work_transition))
+        .route("/v1/hub/standup/operational", get(operational_overview))
+        .route(
+            "/v1/hub/standup/work/{id}/operational",
+            get(operational_one),
+        )
         .route("/v1/hub/standup/ack", post(acknowledge))
         .route("/v1/hub/standup/usage", post(usage))
         .route("/v1/hub/standup/insights", get(insights))
@@ -77,15 +88,134 @@ async fn set_pr_link(
 async fn preflight(
     State(state): State<HubState>,
     Reader(principal): Reader,
+    flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkStart>,
 ) -> Result<Json<WorkPreflightResult>, ApiError> {
+    let operational = flag.map_err(|_| ApiError::invalid())?.0.requested()?;
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            store.work_preflight(&principal.token_id, &request, unix_now())
+            let now = unix_now();
+            let mut result = store.work_preflight(&principal.token_id, &request, now)?;
+            if operational {
+                result.operational = operational_for_overlaps(
+                    &*store,
+                    &principal.token_id,
+                    &result.scope_overlaps,
+                    now,
+                )?;
+            }
+            Ok(result)
         })
         .await?,
     ))
+}
+
+/// `?operational=1` asks for the operational projection beside a result. Without it the
+/// response has no `operational` key, so a strict older client decodes it unchanged. Other query
+/// parameters are ignored, as they were on these routes before this flag existed.
+#[derive(serde::Deserialize)]
+struct OperationalFlag {
+    operational: Option<u8>,
+}
+
+impl OperationalFlag {
+    fn requested(&self) -> Result<bool, ApiError> {
+        match self.operational {
+            None | Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(_) => Err(ApiError::invalid()),
+        }
+    }
+}
+
+/// The operational projection of the Work that overlaps, for a conflict or a preflight.
+pub(super) fn operational_for_overlaps(
+    store: &dyn super::Store,
+    token: &str,
+    overlaps: &[WorkScopeOverlap],
+    now: i64,
+) -> super::Result<Vec<WorkOperationalV1>> {
+    if overlaps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = overlaps.iter().map(|o| o.item.id.clone()).collect();
+    Ok(store
+        .work_operational(
+            &WorkLifecycleReader::Token(token),
+            &OperationalSelect::Many(&ids),
+            now,
+        )?
+        .work)
+}
+
+async fn operational_one(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(id): Path<String>,
+) -> Result<Json<WorkOperationalV1>, ApiError> {
+    let store = state.store.clone();
+    let page = blocking(&state, move || {
+        store.work_operational(
+            &WorkLifecycleReader::Token(&principal.token_id),
+            &OperationalSelect::One(&id),
+            unix_now(),
+        )
+    })
+    .await?;
+    page.work
+        .into_iter()
+        .next()
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+async fn operational_overview(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+) -> Result<Json<OperationalOverviewV1>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.work_operational(
+                &WorkLifecycleReader::Token(&principal.token_id),
+                &OperationalSelect::Holders,
+                unix_now(),
+            )
+        })
+        .await?,
+    ))
+}
+
+/// Release, retain, finish or reopen Work as its lead, its owner's agent or, for a reopen,
+/// a session that takes it. A scope overlap on reopen is a result with a conflict and no
+/// receipt, like a start.
+async fn work_transition(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
+    JsonBody(request): JsonBody<WorkTransitionRequest>,
+) -> Result<Json<WorkTransitionResult>, ApiError> {
+    let operational = flag.map_err(|_| ApiError::invalid())?.0.requested()?;
+    let store = state.store.clone();
+    let result = blocking(&state, move || {
+        let now = unix_now();
+        let mut result = store.work_transition(
+            &WorkTransitionActor::Agent {
+                token: &principal.token_id,
+            },
+            &request,
+            now,
+        )?;
+        if operational && let Some(conflict) = &mut result.conflict {
+            conflict.operational =
+                operational_for_overlaps(&*store, &principal.token_id, &conflict.overlaps, now)?;
+        }
+        Ok(result)
+    })
+    .await?;
+    super::coordination_http::CHANGED.notify_waiters();
+    Ok(Json(result))
 }
 
 /// A cached agent synthesis of the bounded source window; never acknowledges review.
@@ -232,17 +362,47 @@ async fn insights(
 async fn overview(
     State(state): State<HubState>,
     Reader(principal): Reader,
-    query: std::result::Result<Query<WorkOverviewQuery>, QueryRejection>,
-) -> Result<Json<WorkOverview>, ApiError> {
-    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    query: std::result::Result<Query<OverviewParams>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(params) = query.map_err(|_| ApiError::invalid())?;
+    let operational = OperationalFlag {
+        operational: params.operational,
+    }
+    .requested()?;
+    let query = WorkOverviewQuery {
+        recent_since: params.recent_since,
+        limit: params
+            .limit
+            .unwrap_or_else(|| WorkOverviewQuery::default().limit),
+    };
     let store = state.store.clone();
     let token = principal.token_id.clone();
     Ok(Json(
         blocking(&state, move || {
-            store.work_overview(&token, &query, unix_now())
+            let now = unix_now();
+            let overview = store.work_overview(&token, &query, now)?;
+            if !operational {
+                return Ok(serde_json::to_value(&overview).unwrap_or(Value::Null));
+            }
+            let held = store.work_operational(
+                &WorkLifecycleReader::Token(&token),
+                &OperationalSelect::Holders,
+                now,
+            )?;
+            Ok(overview_with_operational(&overview, &held))
         })
         .await?,
     ))
+}
+
+/// The overview query plus `operational`, which `WorkOverviewQuery` does not carry because the
+/// stores, hooks and MCP share it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverviewParams {
+    recent_since: Option<i64>,
+    limit: Option<usize>,
+    operational: Option<u8>,
 }
 
 async fn briefing(
@@ -277,8 +437,16 @@ async fn work(
 async fn start(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
+    flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkStart>,
 ) -> Response {
+    let operational = match flag
+        .map_err(|_| ApiError::invalid())
+        .and_then(|f| f.0.requested())
+    {
+        Ok(operational) => operational,
+        Err(error) => return error.into_response(),
+    };
     let store = state.store.clone();
     match blocking(&state, move || {
             let now = unix_now();
@@ -287,6 +455,14 @@ async fn start(
             let mut result = store.work_start(&principal.token_id, &request, now)?;
             super::coordination_http::CHANGED.notify_waiters();
             result.context = Some(context);
+            if operational && let Some(conflict) = &mut result.conflict {
+                conflict.operational = operational_for_overlaps(
+                    &*store,
+                    &principal.token_id,
+                    &conflict.overlaps,
+                    now,
+                )?;
+            }
             Ok(result)
         })
         .await

@@ -567,6 +567,7 @@ async fn protocol_basics() {
             "agentscm_workflow_runs_list",
             "agentscm_work_usage",
             "agentscm_work_checkpoint",
+            "agentscm_work_transition",
             "agentscm_work_ack",
             "agentscm_workflow_status",
             "agentscm_skill_list",
@@ -1275,6 +1276,180 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     );
     let (status, _) = call(&bob, "agentscm_status", json!({})).await;
     assert!(!status.contains("keeps src/c.rs"), "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_transition_releases_replays_and_fences_the_old_session() {
+    let hub = Hub::start().await;
+    let (lead_id, alice) = hub.secret_with_id(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "session": "session-a", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let item = started["structuredContent"]["work"]["item"].clone();
+    let work_id = item["id"].as_str().unwrap().to_owned();
+
+    // The overview and a conflicting start carry the operational projection.
+    let overview = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    let held = &overview["structuredContent"]["operational"];
+    assert_eq!(held["schema_version"], 1);
+    assert_eq!(held["work"][0]["work_id"], work_id.as_str());
+    assert_eq!(held["work"][0]["reservation"]["status"], "held");
+    let rival = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "rival", "session": "session-b", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let marked = &rival["structuredContent"]["work"]["conflict"]["operational"][0];
+    assert_eq!(marked["work_id"], work_id.as_str());
+    assert_eq!(marked["merge"]["hidden_by_merged_pr"], false);
+    let preflight = hub
+        .tool_result(
+            &bob,
+            "agentscm_work_preflight",
+            json!({"task": "rival", "session": "session-b", "request_key": "rival-key",
+                "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        preflight["structuredContent"]["operational"][0]["work_id"],
+        work_id.as_str(),
+        "{preflight}"
+    );
+
+    // Another agent's owner cannot release it; the schema documents that release is not a finish.
+    let release = json!({"work_id": work_id, "operation_id": "rel-1",
+        "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+        "session": "session-a", "transition": "release", "reason": "handing the scope back"});
+    let refused = hub
+        .tool_result(&bob, "agentscm_work_transition", release.clone())
+        .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let tools = hub
+        .rpc(
+            &alice,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await
+        .json();
+    let description = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "agentscm_work_transition")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        description.contains("does not assert completion"),
+        "{description}"
+    );
+
+    // The lead releases; the exact retry returns the stored receipt.
+    let done = hub
+        .tool_result(&alice, "agentscm_work_transition", release.clone())
+        .await;
+    assert_eq!(done["isError"], false, "{done}");
+    let result = &done["structuredContent"];
+    assert_eq!(result["item"]["state"], "paused");
+    assert_eq!(result["receipt"]["replayed"], false);
+    let retry = hub
+        .tool_result(&alice, "agentscm_work_transition", release.clone())
+        .await;
+    assert_eq!(retry["isError"], false, "{retry}");
+    assert_eq!(retry["structuredContent"]["receipt"]["replayed"], true);
+    assert_eq!(
+        retry["structuredContent"]["receipt"]["event_seq"],
+        result["receipt"]["event_seq"]
+    );
+    let mut changed = release;
+    changed["reason"] = json!("a different reason");
+    let altered = hub
+        .tool_result(&alice, "agentscm_work_transition", changed)
+        .await;
+    assert_eq!(altered["isError"], true);
+
+    // The old session is fenced, and the freed scope no longer blocks the rival.
+    let late = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({"work_id": work_id, "operation_id": "late",
+                "generation": item["generation"],
+                "expected_updated_seq": result["item"]["updated_seq"],
+                "session": "session-a", "kind": "progress", "summary": "late"}),
+        )
+        .await;
+    assert_eq!(late["isError"], true, "{late}");
+    let after = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    assert!(
+        after["structuredContent"]["operational"]["work"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{after}"
+    );
+    let taken = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "rival", "session": "session-b", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        taken["structuredContent"]["work"]["created"], true,
+        "{taken}"
+    );
+    // No token identifier is part of the projection.
+    assert!(
+        !after["structuredContent"]["operational"]
+            .to_string()
+            .contains(&lead_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_pauses_retained_work_without_dropping_the_retained_reservation() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let item = started["structuredContent"]["work"]["item"].clone();
+    let retain = json!({"work_id": item["id"], "operation_id": "keep",
+        "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+        "session": item["lead_session"], "transition": "retain",
+        "reason": "keep the scope while I step away"});
+    let retained = hub
+        .tool_result(&alice, "agentscm_work_transition", retain)
+        .await;
+    assert_eq!(retained["isError"], false, "{retained}");
+
+    // The MCP stop releases the intent and pauses the Work through an ordinary pause checkpoint.
+    let (done, _) = hub.tool(&alice, "/mcp", "agentscm_done", json!({})).await;
+    assert!(done.contains("paused"), "{done}");
+    let overview = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .await;
+    let held = &overview["structuredContent"]["operational"]["work"][0];
+    assert_eq!(held["state"], "paused", "{overview}");
+    assert_eq!(held["reservation"]["status"], "held");
+    assert_eq!(held["reservation"]["basis"], "retained", "{held}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2321,7 +2496,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (39, 42, 47));
+    assert_eq!((before.len(), listed.len(), all.len()), (40, 43, 48));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
@@ -2711,4 +2886,126 @@ async fn value_metrics_and_receipts_are_scoped_and_automatic_delivery_is_idempot
         )
         .await;
     assert_eq!(invalid_session["isError"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_lead_start_on_released_work_is_not_ready_for_work() {
+    use agentscm::hub::catchup::{
+        CatchupCoverageState, CatchupMergeSource, CatchupRepositoryScope, CatchupSourceStatus,
+    };
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let hub = Hub::start().await;
+    let user = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 77,
+            },
+            "synthetic-lead",
+        )
+        .unwrap();
+    let (id, secret, _) =
+        mint_bound_agent_token(&*hub.store, &user.id, "lead", REPO, 100, 3600, false).unwrap();
+    let secret = secret.expose().to_owned();
+    let now = unix_now();
+    for source in [
+        CatchupMergeSource::TrackedPublication,
+        CatchupMergeSource::ForgePull,
+    ] {
+        hub.store
+            .record_catchup_source_status(
+                &CatchupRepositoryScope {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    repository: REPO.into(),
+                    repository_id: Some(100),
+                },
+                &CatchupSourceStatus {
+                    source,
+                    state: CatchupCoverageState::ObservedOnly,
+                    checked_at: now,
+                    unread_pages: 0,
+                    deferred: 0,
+                    window_from: None,
+                },
+            )
+            .unwrap();
+    }
+    let preflight = json!({"source_revision": "a".repeat(40), "merge_after": 0,
+        "merge_through": 0, "source_relation_checked": true, "checked_merges": []});
+    let arguments = |work_id: Option<&str>| {
+        let mut arguments = json!({"task": "continue released work", "session": "lead-session",
+            "paths": ["src/released.rs"], "preflight": preflight});
+        match work_id {
+            Some(id) => arguments["work_id"] = json!(id),
+            None => arguments["request_key"] = json!("released-ready"),
+        }
+        arguments
+    };
+    let first = hub
+        .tool_result(&secret, "agentscm_start", arguments(None))
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(
+        first["structuredContent"]["ready_for_work"], true,
+        "{first}"
+    );
+    let started = &first["structuredContent"]["work"]["item"];
+    let work_id = started["id"].as_str().unwrap().to_owned();
+    // A release keeps Blocked work Blocked, so it stays unfinished without holding a reservation.
+    let blocked = hub
+        .tool_result(
+            &secret,
+            "agentscm_work_checkpoint",
+            json!({"work_id": work_id, "operation_id": "block-1",
+                "generation": started["generation"],
+                "expected_updated_seq": started["updated_seq"], "session": "lead-session",
+                "kind": "blocker", "summary": "waiting for a decision"}),
+        )
+        .await;
+    assert_eq!(blocked["isError"], false, "{blocked}");
+    let item = blocked["structuredContent"]["item"].clone();
+    assert_eq!(item["state"], "blocked", "{item}");
+
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &id },
+            &WorkTransitionRequest {
+                work_id: work_id.clone(),
+                operation_id: "release-1".into(),
+                generation: item["generation"].as_i64().unwrap(),
+                expected_updated_seq: item["updated_seq"].as_i64().unwrap(),
+                session: Some("lead-session".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+
+    // The same lead naming the Work again, with no takeover, holds nothing and is told to resume.
+    let again = hub
+        .tool_result(&secret, "agentscm_start", arguments(Some(&work_id)))
+        .await;
+    // Like a paused or refused start, it reports that no claim was acquired.
+    assert_eq!(again["isError"], true, "{again}");
+    let content = &again["structuredContent"];
+    assert_eq!(content["ready_for_work"], false, "{again}");
+    assert_eq!(content["claim_acquired"], false, "{again}");
+    assert!(
+        content["alternatives"][0]
+            .as_str()
+            .unwrap()
+            .contains("takeover_generation"),
+        "{again}"
+    );
+    // Resuming is conditional on the Work being the caller's owner's; otherwise ask its owner.
+    let step = content["alternatives"][0].as_str().unwrap();
+    assert!(step.contains("If it is your owner's Work"), "{step}");
+    assert!(step.contains("otherwise ask its owner"), "{step}");
 }
