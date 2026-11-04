@@ -537,3 +537,82 @@ fn a_released_intent_id_is_replaced_and_a_refusal_is_shown() {
     assert!(text.contains("Resume"), "{text}");
     assert!(!hub.live().iter().flatten().any(|p| p == "lib/c.rs"));
 }
+
+/// Starts Work with `scope` for `agent` and releases it, so its scope is fenced for the token.
+fn start_and_release(hub: &Hub, agent: &Agent, session: &str, scope: &[&str]) -> String {
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let started = hub
+        .store
+        .work_start(&agent.id, &work_start(session, scope), unix_now())
+        .unwrap()
+        .item;
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &agent.id },
+            &WorkTransitionRequest {
+                work_id: started.id.clone(),
+                operation_id: format!("rel-{session}"),
+                generation: started.generation,
+                expected_updated_seq: started.updated_seq,
+                session: Some(session.into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    started.id
+}
+
+#[test]
+fn a_fenced_path_is_dropped_and_the_other_paths_are_still_announced() {
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let bob = hub.agent(2, "bob", "claude-2");
+    let client = Client::new(&hub, &alice, "laptop-a");
+    let work = repo();
+    let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+
+    // A path accumulated before the release, then the Work is released.
+    silent(&client.edit("s", "Edit", work.path(), &path("src/a.rs")));
+    let id = start_and_release(&hub, &alice, "w", &["src/**"]);
+    hub.hold(&bob, 9, &["lib/x.rs"], "laptop-b", 0);
+
+    // One invocation meets the released intent id and then the fenced path: it mints a new id,
+    // drops `src/a.rs`, announces `lib/x.rs` and shows both the Hub's reason and the overlap.
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("lib/x.rs")),
+        "PreToolUse",
+    );
+    assert!(text.contains(&id), "{text}");
+    assert!(text.contains("Resume"), "{text}");
+    assert!(text.contains("lib/x.rs"), "{text}");
+    let mine: Vec<Vec<String>> = hub
+        .store
+        .live_intents(REPO, unix_now(), 10)
+        .unwrap()
+        .into_iter()
+        .filter(|i| {
+            i.paths.iter().any(|p| p == "lib/x.rs") && i.machine.as_deref() != Some("laptop-b")
+        })
+        .map(|i| i.paths)
+        .collect();
+    assert_eq!(mine, vec![vec!["lib/x.rs".to_owned()]]);
+
+    // The refused path is not sent again with the next unrelated edit.
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("lib/x.rs")),
+        "PreToolUse",
+    );
+    assert!(!text.contains(&id), "{text}");
+    // Editing the fenced path again is refused with the reason and nothing else is lost.
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("src/b.rs")),
+        "PreToolUse",
+    );
+    assert!(text.contains(&id), "{text}");
+    assert!(!hub.live().iter().flatten().any(|p| p.starts_with("src/")));
+}

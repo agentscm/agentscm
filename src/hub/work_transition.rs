@@ -485,12 +485,20 @@ pub(super) fn needs_resume(kind: super::work::CheckpointKind) -> Result<()> {
     Ok(())
 }
 
+/// Separates the refusal text from the JSON list of refused keys inside `HubError::Invalid`.
+/// Only the announce route reads it; the keys never reach a client as part of the text.
+pub(super) const REFUSED_KEYS_MARK: &str = "\u{1f}refused:";
+
+/// The most refused keys one refusal names; a client that has more left is refused again.
+const MAX_REFUSED_KEYS: usize = 32;
+
 /// Whether a no-session intent announce may proceed for a token. The plain route names no
-/// session and an intent is advisory, so it is refused only for a path that lies in the declared
+/// session and an intent is advisory, so it is refused only for a path that overlaps the declared
 /// scope of unfinished Work the token took part in but on which none of its sessions is currently
-/// eligible, and that no Work with an eligible session of the token covers. Every other path keeps
-/// the legacy advice: a token never linked to Work, one linked only to finished Work, Work with an
-/// empty scope, and paths outside every linked scope.
+/// eligible, after the paths covered by Work with an eligible session of the token are set aside.
+/// Every other path keeps the legacy advice: a token never linked to Work, one linked only to
+/// finished Work, Work with an empty scope, and paths outside every linked scope. The refusal
+/// carries the refused keys (sorted, bounded) so a client can drop them and announce the rest.
 pub(super) fn check_announce(
     eligible_scopes: &[Vec<String>],
     ineligible: &[(String, Vec<String>)],
@@ -500,15 +508,34 @@ pub(super) fn check_announce(
     for scope in eligible_scopes {
         open = super::work::uncovered_scope(scope, &open);
     }
-    for (id, scope) in ineligible {
-        let outside = super::work::uncovered_scope(scope, &open);
-        if outside.len() < open.len() {
-            return Err(invalid(&format!(
-                "These files are in the scope of Work {id}, which this agent no longer holds. Resume it with agentscm_start for that Work before editing."
-            )));
+    let mut refused: Vec<&String> = Vec::new();
+    let mut first: Option<&str> = None;
+    for key in &open {
+        let hit = ineligible.iter().find(|(_, scope)| {
+            !super::work::scope_overlap_reasons(scope, std::slice::from_ref(key)).is_empty()
+        });
+        if let Some((id, _)) = hit {
+            first.get_or_insert(id);
+            refused.push(key);
         }
     }
-    Ok(())
+    let Some(id) = first else {
+        return Ok(());
+    };
+    refused.sort();
+    refused.truncate(MAX_REFUSED_KEYS);
+    let keys = serde_json::to_string(&refused).unwrap_or_default();
+    Err(invalid(&format!(
+        "These files are in the scope of Work {id}, which this agent no longer holds. Resume it with agentscm_start for that Work before editing.{REFUSED_KEYS_MARK}{keys}"
+    )))
+}
+
+/// Splits a refusal from [`check_announce`] into its text and refused keys.
+pub(super) fn split_refusal(message: &str) -> (&str, Vec<String>) {
+    match message.split_once(REFUSED_KEYS_MARK) {
+        Some((text, keys)) => (text, serde_json::from_str(keys).unwrap_or_default()),
+        None => (message, Vec::new()),
+    }
 }
 
 /// Whether the transition frees the lead's and participants' file claims and open requests.

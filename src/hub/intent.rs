@@ -565,7 +565,13 @@ async fn announce(
             if message == "intent was released"
                 || message.starts_with("These files are in the scope of Work ") =>
         {
-            ApiError::invalid().with_message(message)
+            let (text, refused) = super::work_transition::split_refusal(&message);
+            let error = ApiError::invalid().with_message(text);
+            if refused.is_empty() {
+                error
+            } else {
+                error.with_field("refused_paths", json!(refused))
+            }
         }
         other => ApiError::from(other),
     })?;

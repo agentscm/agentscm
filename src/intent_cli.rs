@@ -385,6 +385,23 @@ impl Hub {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value> {
+        let (status, reply) = self.call_status(method, path, body).await?;
+        match status {
+            200..=299 => Ok(reply),
+            _ => Err(Error::Invalid(match reply["message"].as_str() {
+                Some(message) => format!("hub error {status}: {}", bound_message(message)),
+                None => format!("hub error {status}"),
+            })),
+        }
+    }
+
+    /// Like `call`, but a reply the hub answered with another status is returned with it.
+    async fn call_status(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value)> {
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base))
@@ -400,15 +417,11 @@ impl Hub {
             .await
             .map_err(|_| invalid("hub unreachable"))?;
         match status {
-            200..=299 => Ok(reply),
             401 => Err(invalid(
                 "the agent token was rejected (expired or revoked; mint a new one)",
             )),
             429 | 503 => Err(invalid("hub busy")),
-            _ => Err(Error::Invalid(match reply["message"].as_str() {
-                Some(message) => format!("hub error {status}: {}", bound_message(message)),
-                None => format!("hub error {status}"),
-            })),
+            _ => Ok((status, reply)),
         }
     }
 
@@ -850,23 +863,57 @@ async fn track(
     if !ready? {
         return Ok(None);
     }
-    let body = json!({"intent_id": state.intent_id, "task": state.task, "branch": state.branch,
-        "machine": machine(), "paths": state.paths, "ttl_s": TTL_SECONDS});
     let url = format!("{}/intents", Hub::repo_path(&state.repo));
-    let reply = match hub.call(Method::POST, &url, Some(body)).await {
-        // The stored id was released (its Work finished or was released). A resumed agent must
-        // not stay stuck on a dead id: keep the paths, mint a new id and retry once.
-        Err(Error::Invalid(message)) if message.ends_with(RELEASED) => {
+    // At most one fresh id (the stored one was released: its Work finished or was released) and
+    // one drop of refused paths, so a hub that keeps refusing cannot loop this.
+    let mut minted = false;
+    let mut dropped = false;
+    let mut notes: Vec<String> = Vec::new();
+    let reply = loop {
+        if state.paths.is_empty() {
+            save(path, state)?;
+            return Ok(block(&notes));
+        }
+        let body = json!({"intent_id": state.intent_id, "task": state.task,
+            "branch": state.branch, "machine": machine(), "paths": state.paths,
+            "ttl_s": TTL_SECONDS});
+        let (status, reply) = hub.call_status(Method::POST, &url, Some(body)).await?;
+        if (200..=299).contains(&status) {
+            break reply;
+        }
+        let message = reply["message"].as_str().unwrap_or_default();
+        if !minted && status == 400 && message.ends_with(RELEASED) {
+            // A resumed agent must not stay stuck on a dead id: keep the paths and mint anew.
+            minted = true;
             state.intent_id = new_intent_id()?;
             save(path, state)?;
-            let body = json!({"intent_id": state.intent_id, "task": state.task,
-                "branch": state.branch, "machine": machine(), "paths": state.paths,
-                "ttl_s": TTL_SECONDS});
-            hub.call(Method::POST, &url, Some(body)).await?
+            continue;
         }
-        other => other?,
+        let refused: Vec<&str> = reply["refused_paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let before = state.paths.len();
+        let State { paths, pending, .. } = &mut *state;
+        paths.retain(|p| !refused.contains(&p.as_str()));
+        pending.retain(|p| !refused.contains(&p.as_str()));
+        if !dropped && status == 400 && state.paths.len() < before {
+            // The hub refused these paths only; announce the others and show why.
+            dropped = true;
+            notes.extend(bound(message, 300));
+            save(path, state)?;
+            continue;
+        }
+        save(path, state)?;
+        return Err(Error::Invalid(match reply["message"].as_str() {
+            Some(message) => format!("hub error {status}: {}", bound_message(message)),
+            None => format!("hub error {status}"),
+        }));
     };
-    let mut lines = announce_warnings(&reply, &state.pending, unix_now());
+    let mut lines = notes;
+    lines.extend(announce_warnings(&reply, &state.pending, unix_now()));
     state.pending.clear();
     // The announce already succeeded; a notice failure only defers them to the next call.
     lines.extend(notices(hub, state, 0, true).await.unwrap_or_default());
