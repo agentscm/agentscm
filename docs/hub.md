@@ -595,8 +595,12 @@ the intent lives 20 minutes from the session's last call, and never more than
 30 minutes from when it was first taken, whatever the heartbeats. A session that ends
 without saying so expires on its own, and a call after that starts a fresh
 intent holding only its own files (so it is warned about overlaps again). When
-a call omits `session`, it joins the token's hook-connected session from the
-last 20 minutes if there is exactly one, else one `default` session per token.
+a call omits `session`, it joins the token's hook-connected session if that is
+the only one the hub keeps and it was used in the last 20 minutes. A token with
+no hook session uses one `default` session. Any other omission is ambiguous: the
+call is refused and told to pass `session` with the agent's own native session
+ID, which the AgentSCM SessionStart context shows, so a call never lands on a
+guessed session.
 A hook that opens a new session first takes over the token's `default` session
 if that was created by MCP alone in the last 20 minutes, so calling
 `agentscm_start` before the first hook does not make the agent warn itself.

@@ -83,8 +83,9 @@ use super::publish::{
     SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
-    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
-    SessionCall, Touched, check, check_name, expiry_cause, guard, held, plan as plan_touch,
+    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_REQUIRED, SESSION_TTL_SECONDS,
+    STALE_SESSION_SECONDS, SessionCall, Touched, check, check_name, expiry_cause, guard, held,
+    plan as plan_touch,
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
@@ -2320,6 +2321,8 @@ fn replace_relations(
     Ok(())
 }
 
+/// The active or blocked Work this session leads. Paused, handed-over and finished Work leave the
+/// session free to lead another goal.
 fn unfinished_for_session(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -2329,7 +2332,7 @@ fn unfinished_for_session(
     let mut statement = tx.prepare(
         "SELECT snapshot FROM hub_work_items
          WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-           AND lead_token = ?5 AND lead_session = ?6 AND state <> 'finished'
+           AND lead_token = ?5 AND lead_session = ?6 AND state IN ('active', 'blocked')
          ORDER BY id LIMIT 2",
     )?;
     let snapshots = statement
@@ -2347,7 +2350,7 @@ fn unfinished_for_session(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if snapshots.len() > 1 {
         return Err(HubError::Invalid(
-            "session is lead for more than one unfinished work item".into(),
+            "session is lead for more than one active or blocked work item".into(),
         ));
     }
     snapshots
@@ -2359,6 +2362,37 @@ fn unfinished_for_session(
             Ok(item)
         })
         .transpose()
+}
+
+/// The paused Work this session leads that was updated last.
+fn paused_for_session(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    tx.query_row(
+        "SELECT snapshot FROM hub_work_items
+         WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
+           AND lead_token = ?5 AND lead_session = ?6 AND state = 'paused'
+         ORDER BY updated_at DESC, id LIMIT 1",
+        params![
+            who.owner.identity.provider,
+            who.owner.identity.host,
+            who.repository,
+            who.repository_id,
+            who.token,
+            session
+        ],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|snapshot| {
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        Ok(item)
+    })
+    .transpose()
 }
 
 fn current_capture_work_for_session(
@@ -3575,6 +3609,26 @@ fn start_in(
                 });
             }
         }
+        // A session leads one active or blocked goal, so it pauses or ends that one first.
+        if let Some(current) = unfinished_for_session(tx, who, &start.session, now)?
+            && current.id != item.id
+        {
+            return Ok(WorkStartResult {
+                conflict: Some(WorkStartConflict {
+                    kind: WorkConflictKind::SessionGoalChanged,
+                    current_generation: current.generation,
+                    overlaps: Vec::new(),
+                    operational: Vec::new(),
+                }),
+                item: current,
+                created: false,
+                joined: false,
+                took_over: false,
+                context: None,
+                coordination_request: None,
+                preflight: None,
+            });
+        }
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
         let previous_lead_token = item.lead_token.clone();
         let previous_lead_session = item.lead_session.clone();
@@ -4601,7 +4655,9 @@ fn release_work_holds(
     Ok(delta)
 }
 
-/// The named session, else the token's only recent hook-connected one, else the default.
+/// The named session; else the token's only kept hook session when it is recent; else the default
+/// when the token keeps no hook session. Any other omission is ambiguous and refused, so a call
+/// never lands on a guessed session.
 fn session_name(
     tx: &Transaction<'_>,
     token: &str,
@@ -4626,16 +4682,24 @@ fn session_name(
         return Ok(name.to_owned());
     }
     let mut statement = tx.prepare(
-        "SELECT session FROM hub_sessions
-         WHERE token = ?1 AND updated_at > ?2 AND via LIKE '%\"hook:%' LIMIT 2",
+        "SELECT session, updated_at > ?2 FROM hub_sessions
+         WHERE token = ?1 AND updated_at >= ?3 AND via LIKE '%\"hook:%' LIMIT 2",
     )?;
-    let mut recent = statement
-        .query_map(params![token, now - SESSION_TTL_SECONDS], |row| row.get(0))?
-        .collect::<std::result::Result<Vec<String>, _>>()?;
-    Ok(match recent.len() {
-        1 => recent.remove(0),
-        _ => DEFAULT_SESSION.to_owned(),
-    })
+    let kept = statement
+        .query_map(
+            params![
+                token,
+                now - SESSION_TTL_SECONDS,
+                now - STALE_SESSION_SECONDS
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    match kept.as_slice() {
+        [] => Ok(DEFAULT_SESSION.to_owned()),
+        [(only, true)] => Ok(only.clone()),
+        _ => Err(HubError::Invalid(SESSION_REQUIRED.into())),
+    }
 }
 
 fn alias_hook_session(
@@ -8603,7 +8667,12 @@ impl Store for SqliteStore {
         let mut planned = start.clone();
         planned.request_key = Some("automatic-session-start".into());
         let planned_scope = planned.validate(&who)?;
-        if let Some(item) = unfinished_for_session(&tx, &who, &start.session, now)? {
+        // A task-only start's identity is its session, so it finds a paused goal too.
+        let current = match unfinished_for_session(&tx, &who, &start.session, now)? {
+            Some(item) => Some(item),
+            None => paused_for_session(&tx, &who, &start.session, now)?,
+        };
+        if let Some(item) = current {
             let mut inspected = planned.clone();
             inspected.work_id = Some(item.id.clone());
             inspected.request_key = None;

@@ -22,6 +22,8 @@ use super::{HubError, HubState, Result};
 
 pub const SESSION_TTL_SECONDS: i64 = 1200;
 pub const DEFAULT_SESSION: &str = "default";
+/// The refusal of an omitted session that the Hub cannot match to exactly one hook session.
+pub const SESSION_REQUIRED: &str = "session is required: this agent token has more than one hook session, or its only one is idle, so an omitted session is ambiguous. Pass session with your own native session ID (the AgentSCM SessionStart context shows it) on every AgentSCM call; a client without hooks can pass any stable name of its own.";
 const MAX_SESSION_BYTES: usize = 128;
 /// Session rows untouched this long are pruned; their intents expired long before.
 pub(super) const STALE_SESSION_SECONDS: i64 = 7 * 86_400;
@@ -40,9 +42,10 @@ pub(super) const NOTICES_PER_TOUCH: usize = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionCall {
-    /// None: the token's default session, which is its most recently updated session whose `via`
-    /// contains a `hook:` mode and was updated within `SESSION_TTL_SECONDS` (so an MCP call joins
-    /// the hook-connected session of the same agent); if none, `DEFAULT_SESSION`.
+    /// None: the token's only kept hook session when it was updated within
+    /// `SESSION_TTL_SECONDS` (so an MCP call joins the hook-connected session of the same agent);
+    /// `DEFAULT_SESSION` when the token keeps no hook session; otherwise refused with
+    /// `SESSION_REQUIRED`.
     pub session: Option<String>,
     /// `mcp` or `hook:<agent>`, the latter with 1-32 of [a-z0-9-].
     pub via: String,

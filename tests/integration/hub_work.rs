@@ -2193,6 +2193,7 @@ conformance!(
     pause_and_handover_keep_a_retained_reservation,
     requests_that_propose_ended_work_are_marked_released_too,
     read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores,
+    a_paused_item_frees_its_session_for_another_goal,
 );
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
@@ -5801,4 +5802,90 @@ fn read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores(db: &Db)
         store.work_transition(&by_agent(&writer), &request, now),
         Err(HubError::Invalid(_))
     ));
+}
+
+fn a_paused_item_frees_its_session_for_another_goal(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let mut first_start = automatic_start("first goal", "s-1");
+    first_start.scope = vec!["first/**".into()];
+    let first = store
+        .work_start_auto(&alice.token, &first_start, now)
+        .unwrap()
+        .item;
+    let paused = lead_checkpoint(
+        &*store,
+        &alice,
+        &first,
+        "pause",
+        "s-1",
+        CheckpointKind::Pause,
+        now + 1,
+    )
+    .item;
+    assert_eq!(paused.state, WorkState::Paused);
+    // A task-only start is identified by its session, so a repeat finds the paused goal.
+    let repeat = store
+        .work_start_auto(&alice.token, &first_start, now + 2)
+        .unwrap();
+    assert_eq!(repeat.item.id, first.id);
+    assert!(!repeat.created);
+
+    // A different explicit goal in the same session starts, where it used to be refused.
+    let second = store
+        .work_start(
+            &alice.token,
+            &{
+                let mut start = native_start("second", "second goal", "s-1");
+                start.scope = vec!["second/**".into()];
+                start
+            },
+            now + 3,
+        )
+        .unwrap();
+    assert!(second.created && second.conflict.is_none());
+    assert_eq!(
+        store
+            .work_for_session(&alice.token, "s-1", now + 3)
+            .unwrap()
+            .unwrap()
+            .id,
+        second.item.id
+    );
+
+    // Resuming the paused goal while the session leads another is refused without mutation.
+    let refused = store
+        .work_start(
+            &alice.token,
+            &takeover(&first.id, "s-1", Some(paused.generation)),
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        refused.conflict.map(|conflict| conflict.kind),
+        Some(WorkConflictKind::SessionGoalChanged)
+    );
+    assert_eq!(refused.item.id, second.item.id);
+    assert_eq!(work_event_count(&*store, "work_takeover"), 0);
+
+    // Once the second goal is paused too, the first resumes.
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &second.item,
+        "pause-second",
+        "s-1",
+        CheckpointKind::Pause,
+        now + 5,
+    );
+    let resumed = store
+        .work_start(
+            &alice.token,
+            &takeover(&first.id, "s-1", Some(paused.generation)),
+            now + 6,
+        )
+        .unwrap();
+    assert!(resumed.took_over && resumed.conflict.is_none());
+    assert_eq!(resumed.item.state, WorkState::Active);
 }

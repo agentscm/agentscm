@@ -31,7 +31,9 @@ use super::promise::{
     DEFAULT_PROMISE_PAGE, MAX_PROMISE_PAGE, PromiseConstraintV1, PromiseCriterionV1,
     PromiseInputV1, PromiseViewV1, current_admission,
 };
-use super::session::{SessionCall, announce_for, done_for, duplicates_for, others_for, status_for};
+use super::session::{
+    SESSION_REQUIRED, SessionCall, announce_for, done_for, duplicates_for, others_for, status_for,
+};
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
 use super::view_settings::{ViewOverride, ViewSettings};
@@ -542,7 +544,7 @@ pub fn agent_tools() -> Value {
 }
 
 fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> Value {
-    let session = json!({"type": "string", "description": "Session id; omit to use this agent's current session."});
+    let session = json!({"type": "string", "description": "Your native session ID (the AgentSCM SessionStart context shows it). Pass it on every call; omitting it is refused while this agent token has more than one hook session or only an idle one."});
     let paths = |description: &str| json!({"type": "array", "items": {"type": "string"}, "description": description});
     let schema = |properties: Value, required: &[&str]| {
         json!({"type": "object", "properties": properties, "required": required,
@@ -1127,6 +1129,7 @@ pub(super) fn hub_failure(error: &HubError) -> Value {
             "checkpoint sequence changed; inspect current Work before retry"
         }
         HubError::Unavailable(_) => "hub unavailable",
+        HubError::Invalid(message) if message == SESSION_REQUIRED => SESSION_REQUIRED,
         HubError::Invalid(_) => "invalid request",
         HubError::Unauthorized => "token not accepted",
     })
@@ -3041,7 +3044,7 @@ fn start_result(
             "Retry against current_generation only if the same takeover is still intended.",
         ],
         Some(WorkConflictKind::SessionGoalChanged) => &[
-            "Keep the current session bound to its existing unfinished goal.",
+            "Keep the current session bound to its active or blocked goal, or pause it with agentscm_work_checkpoint before starting another.",
             "Use an explicit stable work identity in another session for distinct work.",
         ],
         Some(WorkConflictKind::MetadataChanged) => &[
