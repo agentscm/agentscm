@@ -350,22 +350,67 @@ pub fn project_work(
 /// Read through the caller's authenticated repository scope. Counts are lower bounds when any
 /// collection is truncated. Reservation holders are selected first, including legacy-hidden Work.
 pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<ActionableStatus> {
-    let token = &principal.token_id;
-    let overview = store.work_overview(
-        token,
-        &WorkOverviewQuery {
-            recent_since: None,
-            limit: MAX_STATUS_WORK,
+    read_scoped(
+        store,
+        principal,
+        &WorkLifecycleReader::Token(&principal.token_id),
+        now,
+    )
+}
+
+/// Internal role-checked person read. Never infer person authority from an empty token.
+pub(crate) fn read_person(
+    store: &dyn Store,
+    owner: &crate::hub::store::User,
+    repository: &str,
+    repository_id: i64,
+    now: i64,
+) -> Result<ActionableStatus> {
+    if owner.disabled {
+        return Err(HubError::Unauthorized);
+    }
+    let principal = Principal {
+        token_id: String::new(),
+        name: String::new(),
+        repository: repository.into(),
+        repository_id: Some(repository_id),
+        expires_at: now,
+        read_only: true,
+        owner: owner.clone(),
+    };
+    read_scoped(
+        store,
+        &principal,
+        &WorkLifecycleReader::Person {
+            owner,
+            repository,
+            repository_id,
         },
         now,
-    )?;
-    let holders = store.work_operational(
-        &WorkLifecycleReader::Token(token),
-        &OperationalSelect::Holders,
-        now,
-    )?;
-    let requests = store.coordination_list(
-        token,
+    )
+}
+
+fn read_scoped(
+    store: &dyn Store,
+    principal: &Principal,
+    reader: &WorkLifecycleReader<'_>,
+    now: i64,
+) -> Result<ActionableStatus> {
+    let query = WorkOverviewQuery {
+        recent_since: None,
+        limit: MAX_STATUS_WORK,
+    };
+    let overview = match reader {
+        WorkLifecycleReader::Token(token) => store.work_overview(token, &query, now)?,
+        WorkLifecycleReader::Person {
+            owner,
+            repository,
+            repository_id,
+        } => store.repository_work_overview(owner, repository, *repository_id, &query, now)?,
+    };
+    let holders = store.work_operational(reader, &OperationalSelect::Holders, now)?;
+    let requests = store.coordination_list_scoped(
+        reader,
         &CoordinationListQuery {
             active_only: true,
             ..Default::default()
@@ -405,17 +450,13 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
         }
     }
     let ids = selected.keys().cloned().collect::<Vec<_>>();
-    let operational = store.work_operational(
-        &WorkLifecycleReader::Token(token),
-        &OperationalSelect::Many(&ids),
-        now,
-    )?;
+    let operational = store.work_operational(reader, &OperationalSelect::Many(&ids), now)?;
     let mut work = Vec::new();
     let mut items = BTreeMap::new();
     for (id, item) in selected {
         let item = match item {
             Some(i) => Some(i),
-            None => store.work_get(token, &id, now)?,
+            None => store.work_get_scoped(reader, &id, now)?,
         };
         let Some(item) = item else {
             limits.insert("work_changed_during_read".into());
@@ -425,7 +466,7 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
             limits.insert("work_changed_during_read".into());
             continue;
         };
-        let reconciliation = match store.work_reconciliation_get(token, &id, now) {
+        let reconciliation = match store.work_reconciliation_get_scoped(reader, &id, now) {
             Ok(r) => r,
             Err(HubError::Unauthorized) => return Err(HubError::Unauthorized),
             Err(_) => {
@@ -436,7 +477,7 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
         let mut row = project_work(&item, op.clone(), reconciliation, &principal.owner.id);
         // Fence the row with the final Work version. This does not claim an atomic snapshot.
         if store
-            .work_get(token, &id, now)?
+            .work_get_scoped(reader, &id, now)?
             .is_none_or(|i| i.updated_seq != item.updated_seq || i.generation != item.generation)
         {
             row.limits.push("work_changed_during_read".into());
@@ -495,8 +536,8 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
             limits: vec![],
         });
     }
-    let requests_after = store.coordination_list(
-        token,
+    let requests_after = store.coordination_list_scoped(
+        reader,
         &CoordinationListQuery {
             active_only: true,
             ..Default::default()
@@ -605,6 +646,32 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
 }
 
 /// Deterministic text used by agent-facing clients; generated prose is optional.
+pub fn recipient_label(recipient: &StatusRecipient) -> String {
+    match (&recipient.login, recipient.kind) {
+        (Some(login), RecipientKind::Person) => login.clone(),
+        (Some(login), RecipientKind::LeadAgent) => format!(
+            "{login}’s {}",
+            recipient.agent.as_deref().unwrap_or("agent")
+        ),
+        (_, RecipientKind::None) => "No action assigned".into(),
+        _ => "Recipient unknown".into(),
+    }
+}
+
+/// Short startup/query copy; the structured facts retain full captured counts and evidence.
+pub fn render_compact_text(status: &ActionableStatus) -> String {
+    let mut bounded = status.clone();
+    bounded.work.sort_by_key(|w| !w.needs_you);
+    bounded.work.truncate(6);
+    bounded.actions.retain(|a| a.needs_you);
+    bounded.actions.truncate(6);
+    let mut text = render_text(&bounded);
+    if status.work.len() > 6 || status.actions.iter().filter(|a| a.needs_you).count() > 6 {
+        text.push_str("\nShowing at most six tasks and six personal actions; full captured facts and coverage remain in the structured status read.");
+    }
+    text
+}
+
 pub fn render_text(status: &ActionableStatus) -> String {
     let c = &status.counts;
     let mut lines = vec![format!(
@@ -624,15 +691,41 @@ pub fn render_text(status: &ActionableStatus) -> String {
             StatusState::ReassessmentNeeded => "reassessment needed",
             StatusState::Retired => "retired",
         };
-        let recipient = row
-            .recipient
-            .login
-            .as_deref()
-            .unwrap_or("recipient unknown");
+        let recipient = recipient_label(&row.recipient);
         lines.push(format!(
             "{} [{}; {}; reservation {:?}]: {}",
             row.title, state, recipient, row.operational.reservation.status, row.action
         ));
+        lines.push(format!(
+            "  Claim {:?}; outcome {:?} ({:?}). {}",
+            row.freshness,
+            row.operational.outcome.value,
+            row.operational.outcome.provenance,
+            row.operational
+                .report
+                .as_ref()
+                .map(|r| format!("Agent report {:?} at {}.", r.kind, r.at))
+                .unwrap_or_else(|| "No retained agent report.".into())
+        ));
+        if let Some(r) = &row.reconciliation {
+            for source in &r.current_source_coverage {
+                lines.push(format!(
+                    "  Provider source {}: {}; checked {} ({} unread pages, {} deferred).",
+                    source.source,
+                    source.state,
+                    source.checked_at_seconds,
+                    source.unread_pages,
+                    source.deferred
+                ));
+            }
+            if !r.current {
+                lines.push(
+                    "  No current reconciliation synthesis; retained reports are history.".into(),
+                );
+            }
+        } else {
+            lines.push("  Provider coverage unavailable.".into());
+        }
     }
     for action in &status.actions {
         if action.needs_you {
@@ -643,7 +736,7 @@ pub fn render_text(status: &ActionableStatus) -> String {
         lines.push("Coverage incomplete; missing signals remain unknown.".into());
     }
     lines.push(format!(
-        "Evidence revision {} (read {}; non-atomic).",
+        "Evidence revision {} (read as of {}; non-atomic; provider times shown separately).",
         status.digest, status.observed_at
     ));
     lines.join("\n")
@@ -982,6 +1075,30 @@ mod tests {
         let a = read(store, &principal, now).unwrap();
         let b = read(store, &principal, now + 1).unwrap();
         assert_eq!(a.digest, b.digest, "read time is outside evidence version");
+        let person = read_person(
+            store,
+            &principal.owner,
+            &principal.repository,
+            principal.repository_id.unwrap(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            person, a,
+            "role-checked person and token read the same facts without minting a token"
+        );
+        let mut disabled = principal.owner.clone();
+        disabled.disabled = true;
+        assert!(matches!(
+            read_person(
+                store,
+                &disabled,
+                &principal.repository,
+                principal.repository_id.unwrap(),
+                now
+            ),
+            Err(HubError::Unauthorized)
+        ));
         assert_eq!(a.counts.blocked, 1);
         assert_eq!(a.counts.needs_you, 1);
         assert_eq!(a.counts.held_reservations, 1);
@@ -1038,6 +1155,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(read(store, &foreign, now).unwrap().work.is_empty());
+        assert!(
+            read_person(
+                store,
+                &foreign.owner,
+                &foreign.repository,
+                foreign.repository_id.unwrap(),
+                now
+            )
+            .unwrap()
+            .work
+            .is_empty()
+        );
+        store.revoke_agent_token(&reader.token_id).unwrap();
+        assert!(matches!(
+            read(store, &reader, now),
+            Err(HubError::Unauthorized)
+        ));
+        assert!(
+            read_person(
+                store,
+                &reader.owner,
+                &reader.repository,
+                reader.repository_id.unwrap(),
+                now
+            )
+            .is_ok(),
+            "person authority is independent of the revoked agent credential"
+        );
+        let mut empty_token = principal.clone();
+        empty_token.token_id.clear();
+        assert!(
+            matches!(read(store, &empty_token, now), Err(HubError::Unauthorized)),
+            "an arbitrary empty credential never confers person authority"
+        );
     }
     #[test]
     fn sqlite_status_reader_is_scoped_deterministic_and_reports_limits() {

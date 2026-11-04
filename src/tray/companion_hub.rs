@@ -535,12 +535,7 @@ fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal 
         .work
         .iter()
         .map(|row| Work {
-            agent: row
-                .recipient
-                .agent
-                .clone()
-                .or_else(|| row.operational.reservation.holder_agent.clone())
-                .unwrap_or_else(|| "Unknown agent".into()),
+            agent: agentscm::hub::work_http::actionable_status::recipient_label(&row.recipient),
             title: row
                 .title
                 .chars()
@@ -560,6 +555,31 @@ fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal 
             claim_status: format!("{:?}", row.freshness).to_ascii_lowercase(),
             needs_you: row.needs_you,
         })
+        .chain(status.actions.iter().map(|action| {
+            Work {
+                agent: action
+                    .recipients
+                    .iter()
+                    .map(agentscm::hub::work_http::actionable_status::recipient_label)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                title: action
+                    .action
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(160)
+                    .collect(),
+                state: "action".into(),
+                next_action: action
+                    .action
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(160)
+                    .collect(),
+                claim_status: "unknown".into(),
+                needs_you: action.needs_you,
+            }
+        }))
         .collect();
     let text = if count == 0 {
         if status.complete {
@@ -608,7 +628,7 @@ mod tests {
         let result = summarize(std::path::Path::new("/synthetic"), "acme/widgets", &value);
         assert!(result.available);
         assert_eq!(result.count, 3);
-        assert_eq!(result.work.iter().filter(|w| w.needs_you).count(), 2);
+        assert_eq!(result.work.iter().filter(|w| w.needs_you).count(), 3);
         assert!(result.text.contains("partial"));
     }
     #[test]

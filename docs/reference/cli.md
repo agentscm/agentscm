@@ -390,7 +390,7 @@ changed checkout bindings and failed Hub requests produce a visible error.
 
 ## Shared actionable status
 
-`agentscm work status` reads the Hub’s shared deterministic projection and prints states, named recipients, next actions, reservation visibility, an evidence revision and incomplete-coverage warnings. `agentscm work status --json` prints the versioned response. It uses the configured repository credential and needs no generated briefing. Reports, provider observations and unknown activity remain separate; a merge or a quiet claim never proves task completion.
+`agentscm work status` reads the Hub’s shared deterministic projection and prints states, named recipients, next actions, reservation visibility, an evidence revision and incomplete-coverage warnings. Row evidence includes claim freshness, agent report kind/time and provider source coverage/check times; the overall read time is separate. `agentscm work status --json` prints the versioned response. It uses the configured repository credential and needs no generated briefing. Reports, provider observations and unknown activity remain separate; a merge or a quiet claim never proves task completion.
 
 ## Usage telemetry
 

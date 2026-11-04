@@ -81,6 +81,8 @@ MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the 
 Work store. The relationship records caller-reported identity, not provider approval.
 
 
+The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`.
+
 ## Hub change-record routes
 
 These routes belong to `agentscm hub serve`, not the unauthenticated local `serve` API above. They

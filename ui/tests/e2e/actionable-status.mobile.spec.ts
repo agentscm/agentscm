@@ -41,3 +41,21 @@ test('shared status stays readable on desktop, phone and 200 percent zoom', asyn
     }
   }
 })
+
+test('repository list keeps shared states readable on phone and desktop', async ({ page }) => {
+  const status = JSON.parse(JSON.stringify(fixture))
+  await page.route('**/v1/hub/session/repositories', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ repositories: [{ repository: 'acme/widgets', repository_id: 1, provider: 'github', unfinished: { total: 3, moving: 0, stuck: 2 }, needs_you: status.counts.needs_you, status_counts: status.counts, coverage: status.limits, status_digest: status.digest, agents: 2, last_activity_at: null, complete: false }], unchecked: 0, complete: true }) }))
+  await page.goto('/#repositories')
+  for (const width of [1360, 390]) {
+    await page.setViewportSize({ width, height: 900 })
+    await expect(page.locator('.rp-focus')).toContainText('2 blocked')
+    await expect(page.locator('.rp-focus')).toContainText('1 awaiting a named party')
+    await expect(page.locator('.rp-checked')).toContainText('Counts are partial')
+    for (const zoom of ['1', '2']) {
+      await page.evaluate((zoom) => { document.documentElement.style.zoom = zoom }, zoom)
+      const viewport = await page.evaluate(() => ({ width: window.innerWidth, scroll: document.documentElement.scrollWidth }))
+      expect(viewport.scroll, `${width}px zoom ${zoom}`).toBeLessThanOrEqual(viewport.width + 1)
+    }
+    await page.evaluate(() => { document.documentElement.style.zoom = '1' })
+  }
+})

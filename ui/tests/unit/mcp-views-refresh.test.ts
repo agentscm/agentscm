@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import statusFixture from '../../../src/hub/fixtures/actionable-status.json'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const read = (name: string) => readFileSync(resolve(process.cwd(), `../src/hub/mcp_views/${name}`), 'utf8')
@@ -76,7 +77,7 @@ function mount(file: string, tool: string) {
 }
 
 const item = (over: Data) => ({ id: 'wrk_a', title: 'Task', state: 'active', claim_status: 'active', last_checkin_at: now - 60, lead_agent: 'claude-code', owner_login: 'maria', repository: 'acme/widgets', ...over })
-const overview = (current: Data[]) => ({ current, recent: [], overlaps: [], current_complete: true, overlaps_complete: true, recent_complete: true, history_retention_gap: false })
+const overview = (current: Data[]) => ({ actionable_status: { ...statusFixture, counts: { ...statusFixture.counts, active: current.filter((w) => w.state === 'active').length, needs_you: current.filter((w) => w.state === 'blocked').length }, actions: [], work: current.map((w) => ({ ...statusFixture.work[0], title: w.title, state: w.state, needs_you: w.state === 'blocked' })) } })
 const request = (id: string, status: string) => ({
   id, status, updated_at: now - 120, proposal: { title: id }, requester: { agent: 'a' },
   targets: [{ lead: { agent: 'b' }, reasons: [{ your_path: 'p1' }], reasons_complete: true }],
@@ -90,7 +91,7 @@ const views = [
     name: 'work overview', file: 'work-overview.html', tool: 'agentscm_work_overview', fold: 'All work',
     before: overview([item({})]),
     after: overview([item({}), item({ id: 'wrk_b', title: 'Stuck', state: 'blocked', blocker: { summary: 'needs api' } })]),
-    said: '1 thing needs a person',
+    said: '1 action needs you',
   },
   {
     name: 'coordination inbox', file: 'coordination-inbox.html', tool: 'agentscm_coordination_inbox', fold: 'Receipts',

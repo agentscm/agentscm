@@ -5,6 +5,7 @@ export type StatusState = 'active' | 'awaiting_party' | 'blocked' | 'reassessmen
 export interface StatusRecipient { kind: 'person' | 'lead_agent' | 'unknown' | 'none'; owner: string | null; login: string | null; agent: string | null }
 export interface StatusWork {
   work_id: string; title: string; generation: number; updated_seq: number; state: StatusState; recipient: StatusRecipient; needs_you: boolean; action: string; reported_next_action: string | null; freshness: 'active' | 'stale' | 'unknown'; limits: string[]
+  reconciliation: { current: boolean; declaration_seq: number; current_evidence_digest: string | null; current_source_coverage: { source: string; state: string; checked_at_seconds: number; unread_pages: number; deferred: number }[]; stale_reasons: string[]; digest: string } | null
   operational: { reservation: { status: 'held' | 'none' }; outcome: { value: string; provenance: string }; report: { at: number; kind: string } | null }
 }
 export interface StatusAction { id: string; kind: string; work_ids: string[]; recipients: StatusRecipient[]; needs_you: boolean; action: string; updated_seq: number; limits: string[] }
@@ -27,7 +28,8 @@ export function decodeStatus(v: unknown): ActionableStatus {
   if (r.schema_version !== 1) throw new Error('Unsupported shared status version')
   const work = list(r.work, 100, (v): StatusWork => {
     const w = record(v), op = record(w.operational), reservation = record(op.reservation), outcome = record(op.outcome), report = op.report === null ? null : record(op.report)
-    return { work_id: text(w.work_id), title: text(w.title, 500), generation: number(w.generation), updated_seq: number(w.updated_seq), state: choice(w.state, ['active', 'awaiting_party', 'blocked', 'reassessment_needed', 'retired']), recipient: recipient(w.recipient), needs_you: bool(w.needs_you), action: text(w.action), reported_next_action: optional(w.reported_next_action), freshness: choice(w.freshness, ['active', 'stale', 'unknown']), limits: strings(w.limits), operational: { reservation: { status: choice(reservation.status, ['held', 'none']) }, outcome: { value: text(outcome.value), provenance: text(outcome.provenance) }, report: report ? { at: number(report.at), kind: text(report.kind) } : null } }
+    const reconciliation = w.reconciliation === null ? null : record(w.reconciliation)
+    return { reconciliation: reconciliation ? { current: bool(reconciliation.current), declaration_seq: number(reconciliation.declaration_seq), current_evidence_digest: optional(reconciliation.current_evidence_digest), current_source_coverage: list(reconciliation.current_source_coverage, 32, (v) => { const p = record(v); return { source: text(p.source), state: text(p.state), checked_at_seconds: number(p.checked_at_seconds), unread_pages: number(p.unread_pages), deferred: number(p.deferred) } }), stale_reasons: strings(reconciliation.stale_reasons), digest: text(reconciliation.digest) } : null, work_id: text(w.work_id), title: text(w.title, 500), generation: number(w.generation), updated_seq: number(w.updated_seq), state: choice(w.state, ['active', 'awaiting_party', 'blocked', 'reassessment_needed', 'retired']), recipient: recipient(w.recipient), needs_you: bool(w.needs_you), action: text(w.action), reported_next_action: optional(w.reported_next_action), freshness: choice(w.freshness, ['active', 'stale', 'unknown']), limits: strings(w.limits), operational: { reservation: { status: choice(reservation.status, ['held', 'none']) }, outcome: { value: text(outcome.value), provenance: text(outcome.provenance) }, report: report ? { at: number(report.at), kind: text(report.kind) } : null } }
   })
   const actions = list(r.actions, 1000, (v): StatusAction => { const a = record(v); return { id: text(a.id, 2048), kind: text(a.kind), work_ids: strings(a.work_ids), recipients: list(a.recipients, 100, recipient), needs_you: bool(a.needs_you), action: text(a.action, 4096), updated_seq: number(a.updated_seq), limits: strings(a.limits) } })
   const c = record(r.counts)
@@ -47,3 +49,10 @@ export async function fetchStatus(token: string, signal: AbortSignal): Promise<A
 }
 export const statusLabel = (state: StatusState) => ({ active: 'Active', awaiting_party: 'Awaiting a named party', blocked: 'Blocked', reassessment_needed: 'Reassessment needed', retired: 'Retired' })[state]
 export const recipientLabel = (r: StatusRecipient): string => r.login ? r.kind === 'person' ? r.login : `${r.login}’s agent` : r.kind === 'none' ? 'No action assigned' : 'Recipient unknown'
+
+export const statusProvenance = (w: StatusWork): string => [
+  `Claim ${w.freshness}.`,
+  w.operational.report ? `Agent report ${w.operational.report.kind} at ${new Date(w.operational.report.at * 1000).toLocaleString()}.` : 'No retained agent report.',
+  ...(w.reconciliation?.current_source_coverage.map((p) => `${p.source}: ${p.state}; checked ${new Date(p.checked_at_seconds * 1000).toLocaleString()}.`) ?? ['Provider coverage unavailable.']),
+  ...(w.reconciliation && !w.reconciliation.current ? ['No current reconciliation synthesis; retained reports are history.'] : []),
+].join(' ')

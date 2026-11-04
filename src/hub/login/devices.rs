@@ -20,12 +20,12 @@ use super::super::device::{
 use super::super::forge_api::ForgeApi;
 use super::super::github::GhError;
 use super::super::http::{ApiError, JsonBody, bearer, blocking};
-use super::super::repository_summary::{Facts, is_live_overlap, summarize};
+use super::super::repository_summary::{Facts, summarize};
 use super::super::store::{
     NewAgentToken, Principal, User, agent_token_digest, device_digest, mint_web_read_token,
     unix_now, validate_agent_name, validate_repository,
 };
-use super::super::work::{WorkOverviewQuery, WorkState};
+use super::super::work::WorkOverviewQuery;
 use super::super::{HubError, HubState};
 use super::{ApiResult, Human, Login, random_hex, session_digest};
 use crate::team::auth::generate_secret;
@@ -664,7 +664,15 @@ async fn repositories_for_owner(
                 .repository_events(&scope, None, 1)?
                 .first()
                 .map(|row| row.event.at);
+            let status = super::super::work_http::actionable_status::read_person(
+                &*store,
+                &owner,
+                &repo.full_name,
+                repo.repository_id,
+                now,
+            )?;
             let facts = Facts {
+                status,
                 live_complete: intents.len() <= LIST_LIVE_LIMIT
                     && sessions.len() <= LIST_LIVE_LIMIT,
                 overview,
@@ -675,24 +683,38 @@ async fn repositories_for_owner(
             const PANEL_WORK_LIMIT: usize = 20;
             const PANEL_LIVE_LIMIT: usize = 40;
             let work_complete =
-                facts.overview.current_complete && facts.overview.current.len() <= PANEL_WORK_LIMIT;
+                facts.status.complete && facts.status.work.len() <= PANEL_WORK_LIMIT && facts.status.actions.len() <= PANEL_WORK_LIMIT;
             let live_complete = facts.live_complete
                 && facts.sessions.len().saturating_add(facts.intents.len()) <= PANEL_LIVE_LIMIT;
             let work = if include_work {
                 facts
-                    .overview
-                    .current
+                    .status
+                    .work
                     .iter()
                     .take(PANEL_WORK_LIMIT)
                     .map(|item| {
                         json!({
-                            "agent": item.lead_agent,
+                            "agent": super::super::work_http::actionable_status::recipient_label(&item.recipient),
                             "title": item.title,
                             "state": item.state,
-                            "claim_status": item.claim_status,
-                            "next_action": item.next_action,
+                            "claim_status": item.freshness,
+                            "next_action": item.action,
+                            "needs_you": item.needs_you,
+                            "recipient": item.recipient,
+                            "reconciliation": item.reconciliation,
+                            "limits": item.limits,
                         })
                     })
+                    .chain(facts.status.actions.iter().take(PANEL_WORK_LIMIT).map(|action| json!({
+                        "agent": action.recipients.iter().map(super::super::work_http::actionable_status::recipient_label).collect::<Vec<_>>().join(", "),
+                        "title": action.action,
+                        "state": "action",
+                        "claim_status": "unknown",
+                        "next_action": action.action,
+                        "needs_you": action.needs_you,
+                        "recipients": action.recipients,
+                        "limits": action.limits,
+                    })))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -742,7 +764,7 @@ async fn repositories_for_owner(
             let revision = if include_work && summary.needs_you > 0 {
                 revision_key
                     .as_deref()
-                    .map(|key| attention_revision(&facts, &summary.contested_markers, key))
+                    .map(|key| attention_revision(&facts.status, key))
             } else {
                 None
             };
@@ -781,27 +803,39 @@ async fn repositories_for_owner(
 }
 
 /// A stable change marker for actionable items, without returning paths or token values.
-fn attention_revision(facts: &Facts, contested_markers: &[String], key: &str) -> String {
-    let mut keys = Vec::new();
-    for item in &facts.overview.current {
-        if item.state == WorkState::Blocked {
-            keys.push(format!("work:{}", item.id));
-        }
-    }
-    for pair in facts
-        .overview
-        .overlaps
+fn attention_revision(
+    status: &super::super::work_http::actionable_status::ActionableStatus,
+    key: &str,
+) -> String {
+    let actions = status
+        .work
         .iter()
-        .filter(|pair| is_live_overlap(pair))
-    {
-        keys.push(format!("overlap:{}:{}", pair.left.id, pair.right.id));
-    }
-    // Only contested pairs and their overlapping keys affect this revision.
-    for marker in contested_markers {
-        keys.push(format!("intent-pair:{marker}"));
-    }
-    keys.sort();
-    crate::hmac::hmac_sha256(key.as_bytes(), keys.join("\0").as_bytes())
+        .filter(|w| w.needs_you)
+        .map(|w| {
+            serde_json::to_string(&(
+                &w.work_id,
+                w.generation,
+                w.updated_seq,
+                w.state,
+                &w.recipient,
+                &w.action,
+                w.operational.reservation.status,
+            ))
+            .expect("action version serializes")
+        })
+        .chain(status.actions.iter().filter(|a| a.needs_you).map(|a| {
+            serde_json::to_string(&(
+                &a.id,
+                &a.kind,
+                &a.work_ids,
+                a.updated_seq,
+                &a.recipients,
+                &a.action,
+            ))
+            .expect("action version serializes")
+        }))
+        .collect::<Vec<_>>();
+    crate::hmac::hmac_sha256(key.as_bytes(), actions.join("\0").as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -1164,6 +1198,49 @@ async fn admin_refusals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_revision_ignores_provider_poll_time_but_tracks_actions_and_recipients() {
+        use crate::hub::work_http::actionable_status::{ActionableStatus, StatusReconciliation};
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("../fixtures/actionable-status.json")).unwrap();
+        let before = super::attention_revision(&status, "synthetic-key");
+        status.observed_at += 1;
+        status.digest = "new-full-evidence-digest".into();
+        let row = status.work.iter_mut().find(|w| w.needs_you).unwrap();
+        row.reconciliation = Some(StatusReconciliation {
+            current: false,
+            declaration_seq: 1,
+            current_evidence_digest: Some("fresh-provider-read".into()),
+            current_source_coverage: vec![crate::hub::work_reconciliation::SourceEvidence {
+                source: "forge_pull".into(),
+                state: "observed_only".into(),
+                checked_at_seconds: 9876,
+                unread_pages: 0,
+                deferred: 0,
+            }],
+            stale_reasons: vec![],
+            digest: "new-reconciliation-digest".into(),
+        });
+        assert_eq!(super::attention_revision(&status, "synthetic-key"), before);
+        status
+            .work
+            .iter_mut()
+            .find(|w| w.needs_you)
+            .unwrap()
+            .recipient
+            .owner = Some("usr_other".into());
+        let changed = super::attention_revision(&status, "synthetic-key");
+        assert_ne!(changed, before);
+        status
+            .work
+            .iter_mut()
+            .find(|w| w.needs_you)
+            .unwrap()
+            .action
+            .push_str(" Updated action.");
+        assert_ne!(super::attention_revision(&status, "synthetic-key"), changed);
+    }
 
     #[test]
     fn github_roles_follow_missing_role() {

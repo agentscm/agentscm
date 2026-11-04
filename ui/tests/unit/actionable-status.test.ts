@@ -3,7 +3,7 @@ import { render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import fixture from '../../../src/hub/fixtures/actionable-status.json'
 import { needsYou } from '../../src/needs.ts'
-import { decodeStatus, recipientLabel, statusLabel } from '../../src/actionableStatus.ts'
+import { decodeStatus, recipientLabel, statusLabel, statusProvenance } from '../../src/actionableStatus.ts'
 import { DashboardPage, dashboardStatus, SharedAnswer, SharedNeeds } from '../../src/pages/Dashboard.tsx'
 import type { WorkOverview } from '../../src/standup.ts'
 import type { Derived } from '../../src/derive.ts'
@@ -20,6 +20,14 @@ describe('shared actionable status', () => {
     expect(recipientLabel(status.work[2]!.recipient)).toBe('viewer')
     expect(statusLabel(status.work[2]!.state)).toBe('Awaiting a named party')
     expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs).toHaveLength(3)
+  })
+  it('retains provider coverage and check time separately from status read time', () => {
+    const value = structuredClone(fixture) as unknown as { work: Record<string, unknown>[] }
+    value.work[0]!.reconciliation = { current: false, declaration_seq: 4, current_evidence_digest: 'synthetic-evidence', current_source_coverage: [{ source: 'forge_pull', state: 'unavailable', checked_at_seconds: 123, unread_pages: 1, deferred: 2 }], stale_reasons: ['provider_unavailable'], digest: 'synthetic-reconciliation' }
+    const status = decodeStatus(value)
+    expect(status.work[0]!.reconciliation!.current_source_coverage[0]!.checked_at_seconds).toBe(123)
+    expect(statusProvenance(status.work[0]!)).toContain('forge_pull: unavailable; checked')
+    expect(statusProvenance(status.work[0]!)).toContain('No current reconciliation synthesis')
   })
   it('rejects malformed flags and inconsistent counts', () => {
     expect(() => decodeStatus({ ...fixture, counts: { ...fixture.counts, needs_you: 4 } })).toThrow()
