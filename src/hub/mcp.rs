@@ -716,7 +716,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
          }), &["task"])}
     );
     let mut overview = json!({"name": "agentscm_work_overview",
-        "description": "Read before planning: ongoing assignments, reported completions and decisions in the last 24 hours, and declared scope overlaps. Work whose branch has a merged pull request is not listed as ongoing; settled_count says how many. Pure read; never acknowledges catch-up. Inspect completeness flags before relying on this bounded overview. Path overlap is not proof of a Git conflict or semantic duplication.",
+        "description": "Read before planning: ongoing assignments, reported completions and decisions in the last 24 hours, and declared scope overlaps. Unfinished Work holding a reservation stays listed even when its branch has a merged pull request. settled_count counts only nonholding Work hidden by the legacy branch-merge heuristic. Pure read; never acknowledges catch-up. Inspect completeness flags before relying on this bounded overview. Path overlap is not proof of a Git conflict or semantic duplication.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({"recent_since": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}}), &[])});
