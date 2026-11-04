@@ -4453,7 +4453,6 @@ fn other_eligible_scopes(
     tx: &Transaction<'_>,
     work: &str,
     token: &str,
-    session: Option<&str>,
 ) -> Result<Vec<Vec<String>>> {
     let mut statement = tx.prepare(
         "SELECT DISTINCT w.id, w.snapshot FROM hub_work_items w
@@ -4461,11 +4460,13 @@ fn other_eligible_scopes(
          WHERE w.id <> ?1 AND w.state IN ('active','blocked')
            AND w.reservation_basis IS NOT NULL
            AND p.token=?2 AND p.generation=w.generation
-           AND (?3 IS NULL OR p.session=?3)
-         ORDER BY w.id LIMIT 100",
+           AND w.scope <> '[]'
+         ORDER BY w.id LIMIT ?3",
     )?;
     let rows = statement
-        .query_map(params![work, token, session], |row| row.get::<_, String>(1))?
+        .query_map(params![work, token, MAX_TOKEN_WORK_SCOPES as i64], |row| {
+            row.get::<_, String>(1)
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     rows.iter()
         .map(|snapshot| json_value::<WorkItem>(snapshot).map(|item| item.scope))
@@ -4504,7 +4505,7 @@ fn release_sessionless_intents(
 ) -> Result<()> {
     // Paths another Work of the token covers while one of its sessions is eligible there are not
     // this Work's to free.
-    let elsewhere = other_eligible_scopes(tx, work, token, None)?;
+    let elsewhere = other_eligible_scopes(tx, work, token)?;
     let intents = {
         let mut statement = tx.prepare(
             "SELECT i.id FROM hub_intents i

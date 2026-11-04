@@ -4351,17 +4351,17 @@ fn other_eligible_scopes(
     tx: &mut postgres::Transaction<'_>,
     work: &str,
     token: &str,
-    session: Option<&str>,
 ) -> Result<Vec<Vec<String>>> {
+    let limit = MAX_TOKEN_WORK_SCOPES as i64;
     let rows = tx.query(
         "SELECT DISTINCT w.id, w.snapshot FROM hub_work_items w
          JOIN hub_work_participants p ON p.work=w.id
          WHERE w.id <> $1 AND w.state IN ('active','blocked')
            AND w.reservation_basis IS NOT NULL
            AND p.token=$2 AND p.generation=w.generation
-           AND ($3::text IS NULL OR p.session=$3)
-         ORDER BY w.id LIMIT 100",
-        &[&work, &token, &session],
+           AND w.scope <> '[]'
+         ORDER BY w.id LIMIT $3",
+        &[&work, &token, &limit],
     )?;
     rows.iter()
         .map(|row| json_value::<WorkItem>(&row.get::<_, String>(1)).map(|item| item.scope))
@@ -4398,7 +4398,7 @@ fn release_sessionless_intents(
 ) -> Result<()> {
     // Paths another Work of the token covers while one of its sessions is eligible there are not
     // this Work's to free.
-    let elsewhere = other_eligible_scopes(tx, work, token, None)?;
+    let elsewhere = other_eligible_scopes(tx, work, token)?;
     let intents = tx.query(
         "SELECT i.id FROM hub_intents i
          WHERE i.token = $1 AND i.released_at IS NULL AND i.expires_at > $2

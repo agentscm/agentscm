@@ -722,6 +722,10 @@ fn an_incomplete_overlap_scan_is_reported_as_such_and_not_as_a_busy_hub() {
         "PreToolUse",
     );
     assert!(text.contains("work_overlap_incomplete"), "{text}");
-    assert!(text.contains("more than 100"), "{text}");
+    assert!(
+        text.contains("could not finish its work overlap check, more than 100 items to compare"),
+        "{text}"
+    );
+    assert!(!text.contains("unfinished Work"), "{text}");
     assert!(!text.contains("hub busy"), "{text}");
 }

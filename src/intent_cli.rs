@@ -421,7 +421,7 @@ impl Hub {
                 "the agent token was rejected (expired or revoked; mint a new one)",
             )),
             503 if reply["error"] == "work_overlap_incomplete" => Err(invalid(
-                "hub refused the announce: this token has more than 100 unfinished Work items with a declared scope (work_overlap_incomplete)",
+                "the hub could not finish its work overlap check, more than 100 items to compare (work_overlap_incomplete)",
             )),
             429 | 503 => Err(invalid("hub busy")),
             _ => Ok((status, reply)),
