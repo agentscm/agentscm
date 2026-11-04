@@ -2887,3 +2887,121 @@ async fn value_metrics_and_receipts_are_scoped_and_automatic_delivery_is_idempot
         .await;
     assert_eq!(invalid_session["isError"], true);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_lead_start_on_released_work_is_not_ready_for_work() {
+    use agentscm::hub::catchup::{
+        CatchupCoverageState, CatchupMergeSource, CatchupRepositoryScope, CatchupSourceStatus,
+    };
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let hub = Hub::start().await;
+    let user = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 77,
+            },
+            "synthetic-lead",
+        )
+        .unwrap();
+    let (id, secret, _) =
+        mint_bound_agent_token(&*hub.store, &user.id, "lead", REPO, 100, 3600, false).unwrap();
+    let secret = secret.expose().to_owned();
+    let now = unix_now();
+    for source in [
+        CatchupMergeSource::TrackedPublication,
+        CatchupMergeSource::ForgePull,
+    ] {
+        hub.store
+            .record_catchup_source_status(
+                &CatchupRepositoryScope {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    repository: REPO.into(),
+                    repository_id: Some(100),
+                },
+                &CatchupSourceStatus {
+                    source,
+                    state: CatchupCoverageState::ObservedOnly,
+                    checked_at: now,
+                    unread_pages: 0,
+                    deferred: 0,
+                    window_from: None,
+                },
+            )
+            .unwrap();
+    }
+    let preflight = json!({"source_revision": "a".repeat(40), "merge_after": 0,
+        "merge_through": 0, "source_relation_checked": true, "checked_merges": []});
+    let arguments = |work_id: Option<&str>| {
+        let mut arguments = json!({"task": "continue released work", "session": "lead-session",
+            "paths": ["src/released.rs"], "preflight": preflight});
+        match work_id {
+            Some(id) => arguments["work_id"] = json!(id),
+            None => arguments["request_key"] = json!("released-ready"),
+        }
+        arguments
+    };
+    let first = hub
+        .tool_result(&secret, "agentscm_start", arguments(None))
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(
+        first["structuredContent"]["ready_for_work"], true,
+        "{first}"
+    );
+    let started = &first["structuredContent"]["work"]["item"];
+    let work_id = started["id"].as_str().unwrap().to_owned();
+    // A release keeps Blocked work Blocked, so it stays unfinished without holding a reservation.
+    let blocked = hub
+        .tool_result(
+            &secret,
+            "agentscm_work_checkpoint",
+            json!({"work_id": work_id, "operation_id": "block-1",
+                "generation": started["generation"],
+                "expected_updated_seq": started["updated_seq"], "session": "lead-session",
+                "kind": "blocker", "summary": "waiting for a decision"}),
+        )
+        .await;
+    assert_eq!(blocked["isError"], false, "{blocked}");
+    let item = blocked["structuredContent"]["item"].clone();
+    assert_eq!(item["state"], "blocked", "{item}");
+
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &id },
+            &WorkTransitionRequest {
+                work_id: work_id.clone(),
+                operation_id: "release-1".into(),
+                generation: item["generation"].as_i64().unwrap(),
+                expected_updated_seq: item["updated_seq"].as_i64().unwrap(),
+                session: Some("lead-session".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+
+    // The same lead naming the Work again, with no takeover, holds nothing and is told to resume.
+    let again = hub
+        .tool_result(&secret, "agentscm_start", arguments(Some(&work_id)))
+        .await;
+    // Like a paused or refused start, it reports that no claim was acquired.
+    assert_eq!(again["isError"], true, "{again}");
+    let content = &again["structuredContent"];
+    assert_eq!(content["ready_for_work"], false, "{again}");
+    assert_eq!(content["claim_acquired"], false, "{again}");
+    assert!(
+        content["alternatives"][0]
+            .as_str()
+            .unwrap()
+            .contains("takeover_generation"),
+        "{again}"
+    );
+}

@@ -2916,21 +2916,46 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
                     now,
                 )?;
             }
-            Ok(work)
+            // Unfinished Work that holds no reservation (released) is not claimed by a start
+            // that merely names it again as its lead; resuming needs a takeover.
+            let unreserved = work.conflict.is_none()
+                && work.coordination_request.is_none()
+                && !work.created
+                && !work.took_over
+                && !matches!(work.item.state, WorkState::Finished)
+                && store
+                    .work_operational(
+                        &WorkLifecycleReader::Token(&token),
+                        &OperationalSelect::One(&work.item.id),
+                        now,
+                    )?
+                    .work
+                    .first()
+                    .is_some_and(|view| {
+                        view.reservation.status == super::work_lifecycle::ReservationStatus::None
+                    });
+            Ok((work, unreserved))
         })
-        .map(|work| (work, resolved, paths))
+        .map(|(work, unreserved)| (work, unreserved, resolved, paths))
     })
     .await?;
-    let (mut work, resolved, paths) = work;
+    let (mut work, unreserved, resolved, paths) = work;
     work.context = Some(context);
-    if work.conflict.is_some()
+    if unreserved
+        || work.conflict.is_some()
         || work.coordination_request.is_some()
         || matches!(
             work.item.state,
             WorkState::Paused | WorkState::Finished | WorkState::Handover
         )
     {
-        return Ok(start_result(String::new(), briefing, work, catchup));
+        return Ok(start_result(
+            String::new(),
+            briefing,
+            work,
+            catchup,
+            unreserved,
+        ));
     }
 
     let advice = announce_for(
@@ -2976,7 +3001,13 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     {
         parts.push(HOOKED.to_owned());
     }
-    Ok(start_result(parts.join("\n"), briefing, work, catchup))
+    Ok(start_result(
+        parts.join("\n"),
+        briefing,
+        work,
+        catchup,
+        false,
+    ))
 }
 
 fn start_result(
@@ -2984,11 +3015,13 @@ fn start_result(
     briefing: Briefing,
     work: WorkStartResult,
     catchup: Option<CatchupPreview>,
+    unreserved: bool,
 ) -> Value {
-    let paused = matches!(
-        work.item.state,
-        WorkState::Paused | WorkState::Finished | WorkState::Handover
-    );
+    let paused = unreserved
+        || matches!(
+            work.item.state,
+            WorkState::Paused | WorkState::Finished | WorkState::Handover
+        );
     let preflight_ready = work.preflight.as_ref().is_some_and(|preflight| {
         preflight.status == WorkPreflightStatus::ClearWithinCheckedWindow && preflight.complete
     });
@@ -3023,6 +3056,10 @@ fn start_result(
         None if work.coordination_request.is_some() => &[
             "Inspect the queued coordination request and await the affected leads' replies.",
             "Make the agreed scope or participation change before continuing.",
+        ],
+        None if unreserved => &[
+            "This work holds no reservation, so this start did not claim its scope; resume it by retrying the work id with takeover_generation set to current_generation.",
+            "Use a new stable work identity instead if the work should not be resumed.",
         ],
         None if paused => &[
             "Paused work needs an explicit generation-checked resume; pass takeover_generation with the observed current generation.",
