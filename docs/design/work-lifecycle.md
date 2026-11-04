@@ -72,6 +72,22 @@ Actors:
 Anything else, and any read-only token, is unauthorized. A revoked or expired lead token does not
 block the owner or an administrator. The actor is recorded as itself and never written as the lead.
 
+The same owner and the same session keep the lead when the presented token or agent label changes.
+That carry updates `lead_token` and `lead_agent` in one transaction, appends `work_lead_credential`,
+and leaves the generation where it is. The event names the session and the previous and new agent
+labels. It carries no token id. A different owner is refused with `LEAD_SESSION_MISMATCH` and
+learns nothing about the lead. The same owner on a different session gets that code, the recorded
+lead agent and session, and the takeover call: `agentscm_start` with `work_id` and the current
+`takeover_generation`. HTTP and MCP pass the code, and any message that starts with it, through
+the way they pass `SESSION_REQUIRED`. Carry runs on checkpoint and on a session touch that
+identified the session, either by naming it or by arriving through a hook. An omitted MCP session
+does not carry, including when session resolution would land on the lead session. Before the touch
+heals the credential, startup context and `agentscm_status` say so, for the same owner only. The
+touch bumps `updated_seq`, so the next checkpoint sends that newer seq. A checkpoint compares
+`expected_updated_seq` before it carries, and a refused checkpoint writes nothing. Generation
+fencing and session resolution stay as they are. This is not a lease. A later renewal that matches
+`lead_token` and `lead_session` still matches, because the carry writes both of those fields.
+
 | Transition | Allowed from | Lead | Owner | Admin | Effect |
 |---|---|---|---|---|---|
 | release | unfinished, reservation held | yes | yes | yes | reservation cleared, generation +1, `active` becomes `paused`, other states kept |

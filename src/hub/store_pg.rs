@@ -70,6 +70,7 @@ use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
     finish, notice_events, plan, probe_set, validate_ttl,
 };
+use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1,
     PromiseCurrentAdmissionsV1, PromiseHistoryPageV1, PromiseInputPageV1, PromiseInputReceiptV1,
@@ -2061,7 +2062,7 @@ fn work_payload_bytes(
                    FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                     AND w.repository_id IS NOT DISTINCT FROM $4
-                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
+                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
                  UNION ALL
                  SELECT octet_length(r.proposed_scope)::bigint
                         + octet_length(r.proposed_title)::bigint + 256
@@ -2198,6 +2199,147 @@ fn stored_work_item_bytes(tx: &mut postgres::Transaction<'_>, id: &str) -> Resul
             &[&id],
         )?
         .get(0))
+}
+
+/// Same owner, same session, new token or agent label. Generation, session, role,
+/// last check-in and claim status stay. Coordination requests stay with this lead.
+fn carry_lead_credential(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    item: &mut WorkItem,
+    now: i64,
+) -> Result<()> {
+    lock_work_capacity(tx, who)?;
+    let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+    let carried = apply_carry(
+        item,
+        &who.token,
+        &who.agent,
+        &who.owner.id,
+        &who.owner.login,
+    );
+    let session = item.lead_session.clone();
+    if carried.previous_token != who.token {
+        tx.execute(
+            "DELETE FROM hub_work_participants
+             WHERE work = $1 AND token = $2 AND session = $3",
+            &[&item.id, &who.token, &session],
+        )?;
+        let updated = tx.execute(
+            "UPDATE hub_work_participants SET token = $2, agent = $3, updated_at = $4
+             WHERE work = $1 AND token = $5 AND session = $6 AND role = 'lead'",
+            &[
+                &item.id,
+                &who.token,
+                &who.agent,
+                &now,
+                &carried.previous_token,
+                &session,
+            ],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO hub_work_participants
+                    (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, 'lead', $6, $7, $7)",
+                &[
+                    &item.id,
+                    &who.token,
+                    &who.owner.id,
+                    &who.agent,
+                    &session,
+                    &item.generation,
+                    &now,
+                ],
+            )?;
+        }
+    } else {
+        let updated = tx.execute(
+            "UPDATE hub_work_participants SET agent = $2, updated_at = $3
+             WHERE work = $1 AND token = $4 AND session = $5 AND role = 'lead'",
+            &[&item.id, &who.agent, &now, &who.token, &session],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO hub_work_participants
+                    (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, 'lead', $6, $7, $7)",
+                &[
+                    &item.id,
+                    &who.token,
+                    &who.owner.id,
+                    &who.agent,
+                    &session,
+                    &item.generation,
+                    &now,
+                ],
+            )?;
+        }
+    }
+    item.updated_at = now;
+    let mut event = Event::new(
+        KIND,
+        &item.id,
+        json!({
+            "generation": item.generation,
+            "owner": item.owner,
+            "repository": item.repository,
+            "state": state_name(item.state),
+            "session": item.lead_session,
+            "previous_agent": carried.previous_agent,
+            "agent": item.lead_agent,
+        }),
+    )?;
+    event.at = now;
+    let seq = append(tx, &event)?;
+    item.updated_seq = seq;
+    let snapshot = save_work_version(tx, item, seq)?;
+    let delta = work_transition_payload_bytes(&snapshot, &event)?
+        .checked_sub(previous_item_bytes)
+        .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+    adjust_work_payload_capacity(tx, who, delta, now)?;
+    Ok(())
+}
+
+fn carry_identified_leads(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Vec<String>> {
+    let rows = tx.query(
+        "SELECT snapshot FROM hub_work_items
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4
+           AND owner = $5 AND lead_session = $6
+           AND state IN ('active', 'blocked', 'paused', 'handover')
+           AND (lead_token <> $7 OR lead_agent <> $8)
+         ORDER BY id",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.owner.id,
+            &session,
+            &who.token,
+            &who.agent,
+        ],
+    )?;
+    let mut notes = Vec::new();
+    for row in rows {
+        let mut item: WorkItem = json_value(&row.get::<_, String>(0))?;
+        if !matches!(
+            lead_access(&item, &who.owner.id, &who.token, &who.agent, session),
+            LeadAccess::Carry
+        ) {
+            continue;
+        }
+        let note = carry_notice(&item);
+        carry_lead_credential(tx, who, &mut item, now)?;
+        notes.push(note);
+    }
+    Ok(notes)
 }
 
 fn adjust_work_payload_capacity(
@@ -4903,13 +5045,21 @@ fn touch_in(
 ) -> Result<Touched> {
     let token = who.token.as_str();
     let work = work_who(tx, token, now)?;
-    lock_work_repository_shared(
-        tx,
-        &work.owner.identity.provider,
-        &work.owner.identity.host,
-        &work.repository,
-        work.repository_id,
-    )?;
+    // An identified session may carry the lead, which charges work capacity.
+    // Take that exclusive lock before the shared one: this transaction cannot
+    // upgrade a shared advisory lock to exclusive.
+    let may_carry = !work.read_only && (call.session.is_some() || call.via.starts_with("hook:"));
+    if may_carry {
+        lock_work_capacity(tx, &work)?;
+    } else {
+        lock_work_repository_shared(
+            tx,
+            &work.owner.identity.provider,
+            &work.owner.identity.host,
+            &work.repository,
+            work.repository_id,
+        )?;
+    }
     // Two calls of one session must not each start an intent.
     lock_repository(tx, &who.repository)?;
     tx.execute(
@@ -5064,7 +5214,15 @@ fn touch_in(
         append(tx, &event)?;
     }
     let requested = auto_ask(tx, who, &name, &guarded.denied_keys(), now);
-    Ok(guarded.touched(token, &name, announced, notices, handoffs, requested))
+    let lead_notes = if work.read_only || (call.session.is_none() && !call.via.starts_with("hook:"))
+    {
+        Vec::new()
+    } else {
+        carry_identified_leads(tx, &work, &name, now)?
+    };
+    Ok(guarded.touched(
+        token, &name, announced, notices, handoffs, requested, lead_notes,
+    ))
 }
 
 /// Files a handoff request from the session for `key`, if the limits and the holders allow.
@@ -8934,11 +9092,12 @@ impl Store for PgStore {
                     item.generation
                 )));
             }
-            if item.lead_token != token || item.lead_session != checkpoint.session {
-                return Err(HubError::Invalid(
-                    "only the current lead session may checkpoint work".into(),
-                ));
-            }
+            let carry =
+                match lead_access(&item, &who.owner.id, token, &who.agent, &checkpoint.session) {
+                    LeadAccess::Current => false,
+                    LeadAccess::Carry => true,
+                    LeadAccess::Refuse { message } => return Err(HubError::Invalid(message)),
+                };
             let prior_basis = work_reservation_basis(&mut tx, &item.id)?;
             let held = prior_basis.is_some();
             if !held {
@@ -9033,6 +9192,11 @@ impl Store for PgStore {
                         request: Box::new(request),
                     });
                 }
+            }
+            if carry {
+                // The sequence check above used the seq from before this bump.
+                // A refused checkpoint returns before this point and writes nothing.
+                carry_lead_credential(&mut tx, &who, &mut item, now)?;
             }
             let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
             let referenced = checkpoint
@@ -11747,7 +11911,7 @@ impl Store for PgStore {
                          JOIN hub_work_items w ON w.id = e.subject
                          WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                            AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
+                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
                            AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                            AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                         &[
@@ -11764,7 +11928,7 @@ impl Store for PgStore {
                      WHERE w.id = e.subject
                        AND w.provider = $1 AND w.host = $2 AND w.repository = $3
                        AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                     &[
