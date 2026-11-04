@@ -144,6 +144,7 @@ mod hub_insights_http;
 #[cfg(unix)]
 mod hub_insights_store;
 mod hub_intents;
+mod hub_leases;
 mod hub_login;
 mod hub_mcp;
 #[cfg(unix)]

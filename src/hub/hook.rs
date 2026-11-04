@@ -115,6 +115,8 @@ enum Kind {
     /// The person typed a prompt in this session: delivers pending requests, writes nothing.
     Prompt,
     Check,
+    /// Any other tool call: renews the lead session's lease, writes nothing else, says nothing.
+    Activity,
     Done,
     Fail(&'static str),
 }
@@ -533,6 +535,30 @@ impl Call {
             Kind::Fail(reason) => Err(reason),
             // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
             Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
+            Kind::Activity => {
+                // Best effort and silent: the touch renews the session's own leases, and a
+                // failure must not disturb the agent. An unnamed session renews nothing.
+                if self.session.is_some()
+                    && let Ok(principal) = authenticate(state, token, repo).await
+                {
+                    let store = state.store.clone();
+                    let heartbeat = call(Vec::new());
+                    let heartbeat = SessionCall {
+                        task: None,
+                        deny: false,
+                        report: false,
+                        ..heartbeat
+                    };
+                    if let Err(error) = blocking(state, move || {
+                        store.touch_session(&principal.token_id, &heartbeat, unix_now())
+                    })
+                    .await
+                    {
+                        eprintln!("hub: activity hook did not renew: {error}");
+                    }
+                }
+                Ok(Outcome::clean())
+            }
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
@@ -1037,6 +1063,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                 .deny()
                 .paths(edit_paths(tool, input), scope)
         }
+        Some("PreToolUse" | "PostToolUse") => call(Kind::Activity, Shape::Silent),
         Some("SessionEnd") => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
@@ -1044,7 +1071,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
 
 /// Copilot CLI and cloud agent: camelCase fields and no event name, so the event is read from
 /// the fields. Edits are checked on preToolUse, which can refuse but has no context field;
-/// postToolUse (it has a `toolResult`) is ignored.
+/// every other tool event, postToolUse (it has a `toolResult`) included, is activity.
 fn copilot(v: &Value, scope: &Scope) -> Call {
     let call = |kind, shape| Call::new(Agent::Copilot, kind, shape).session(str_at(v, "sessionId"));
     match str_at(v, "toolName") {
@@ -1058,7 +1085,7 @@ fn copilot(v: &Value, scope: &Scope) -> Call {
                 .deny()
                 .paths(edit_paths(tool, &args), scope)
         }
-        Some(_) => call(Kind::Ignore, Shape::Silent),
+        Some(_) => call(Kind::Activity, Shape::Silent),
         None if v.get("reason").is_some() => call(Kind::Done, Shape::Silent),
         None if v.get("source").is_some() || v.get("initialPrompt").is_some() => {
             call(Kind::Start, Shape::Camel)
@@ -1075,21 +1102,23 @@ fn cursor(v: &Value, scope: &Scope) -> Call {
     match event {
         "sessionStart" => call(Kind::Start, Shape::Snake),
         // No non-blocking context field before a tool runs: the check waits for postToolUse.
-        _ if CURSOR_PERMISSION_EVENTS.contains(&event) => call(Kind::Ignore, Shape::Allow),
+        _ if CURSOR_PERMISSION_EVENTS.contains(&event) => call(Kind::Activity, Shape::Allow),
         "postToolUse" if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Snake).paths(edit_paths(tool, input), scope)
         }
+        "postToolUse" => call(Kind::Activity, Shape::Silent),
         "sessionEnd" => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
 }
 
-/// `{agent?, session?, event: start|check|done, paths?, task?, cwd?}`.
+/// `{agent?, session?, event: start|check|activity|done, paths?, task?, cwd?}`.
 fn generic(v: &Value, scope: &Scope) -> Call {
     let kind = match str_at(v, "event") {
         Some("start") => Kind::Start,
         Some("check") => Kind::Check,
+        Some("activity") => Kind::Activity,
         Some("done") => Kind::Done,
         _ => return Call::failed(Agent::Generic, "hook event not recognised"),
     };
@@ -1479,15 +1508,25 @@ mod tests {
             Agent::Claude,
             &json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": "/r"}),
         );
-        assert_eq!((bash.kind, bash.shape), (Kind::Ignore, Shape::Silent));
+        assert_eq!((bash.kind, bash.shape), (Kind::Activity, Shape::Silent));
+        let post = parse(
+            Agent::Codex,
+            &json!({"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "apply_patch"}),
+        );
+        assert_eq!((post.kind, post.shape), (Kind::Activity, Shape::Silent));
         let cursor_pre = parse(
             Agent::Cursor,
             &json!({"hook_event_name": "preToolUse", "tool_name": "Write"}),
         );
         assert_eq!(
             (cursor_pre.kind, cursor_pre.shape),
-            (Kind::Ignore, Shape::Allow)
+            (Kind::Activity, Shape::Allow)
         );
+        let cursor_post = parse(
+            Agent::Cursor,
+            &json!({"hook_event_name": "postToolUse", "tool_name": "Shell"}),
+        );
+        assert_eq!(cursor_post.kind, Kind::Activity);
         let camel_pre = parse(
             Agent::Copilot,
             &json!({"sessionId": "s", "cwd": "/r", "toolName": "edit",
@@ -1509,7 +1548,7 @@ mod tests {
             Agent::Copilot,
             &json!({"sessionId": "s", "toolName": "bash"}),
         );
-        assert_eq!(camel_bash.kind, Kind::Ignore);
+        assert_eq!(camel_bash.kind, Kind::Activity);
         assert!(claude.deny && !cursor_pre.deny);
         // Without a tool or reason, a Copilot event is a start only when it says how it began.
         let camel = |v| parse(Agent::Copilot, &v).kind;
@@ -1540,8 +1579,8 @@ mod tests {
             &json!({"sessionId": "s", "cwd": "/r", "toolName": "edit", "toolResult": {},
                 "toolArgs": {"path": "/r/a.rs"}}),
         );
-        // The check ran on preToolUse; a second one would use up the dedupe.
-        assert_eq!(camel_post.kind, Kind::Ignore);
+        // The check ran on preToolUse; a second one would use up the dedupe, so it is activity.
+        assert_eq!(camel_post.kind, Kind::Activity);
         let bad_session = parse(
             Agent::Codex,
             &json!({"hook_event_name": "SessionStart", "session_id": "a\nb"}),
@@ -1555,6 +1594,11 @@ mod tests {
             (generic.via.as_str(), generic.paths),
             ("hook:generic", vec!["a.rs".into()])
         );
+        let tick = parse(
+            Agent::Generic,
+            &json!({"event": "activity", "agent": "gemini", "session": "s"}),
+        );
+        assert_eq!((tick.kind, tick.shape), (Kind::Activity, Shape::Generic));
         let unreadable = Call::parse(Agent::Claude, b"[1]", None);
         assert_eq!(unreadable.shape, Shape::Unreadable);
         assert!(matches!(
