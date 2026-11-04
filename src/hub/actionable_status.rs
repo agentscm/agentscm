@@ -265,6 +265,12 @@ pub fn project_work(
             StatusRecipient::none(),
             "Inspect the recorded outcome and its provenance.",
         )
+    } else if item.state == WorkState::Handover {
+        (
+            StatusState::AwaitingParty,
+            owner(item),
+            "Review the handover and choose the next responsible party.",
+        )
     } else if current.is_some_and(|r| !r.reassessments.is_empty()) {
         (
             StatusState::ReassessmentNeeded,
@@ -276,12 +282,6 @@ pub fn project_work(
             StatusState::ReassessmentNeeded,
             owner(item),
             "Decide whether to retain, release or finish the held reservation; merge alone does not complete Work.",
-        )
-    } else if item.state == WorkState::Handover {
-        (
-            StatusState::AwaitingParty,
-            owner(item),
-            "Review the handover and choose the next responsible party.",
         )
     } else if item.state == WorkState::Blocked {
         (
@@ -933,6 +933,30 @@ mod tests {
             }),
             stale_reasons: vec![],
         }
+    }
+    #[test]
+    fn handover_keeps_human_recipient_with_current_reassessment_and_merged_reservation() {
+        let item = item(WorkState::Handover);
+        let row = project_work(
+            &item,
+            op(&item, true, true),
+            Some(reassessment(&item)),
+            "usr_owner",
+        );
+        assert_eq!(row.state, StatusState::AwaitingParty);
+        assert_eq!(row.recipient.kind, RecipientKind::Person);
+        assert_eq!(row.recipient.owner.as_deref(), Some("usr_owner"));
+        assert!(row.needs_you);
+        assert_eq!(row.operational.reservation.status, ReservationStatus::Held);
+        assert!(row.operational.merge.hidden_by_merged_pr);
+        assert!(row.reconciliation.as_ref().unwrap().current);
+        let lead_row = project_work(
+            &item,
+            op(&item, true, true),
+            Some(reassessment(&item)),
+            "usr_lead",
+        );
+        assert!(!lead_row.needs_you);
     }
     #[test]
     fn only_current_matching_reconciliation_can_request_reassessment() {
