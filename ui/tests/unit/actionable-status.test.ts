@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import fixture from '../../../src/hub/fixtures/actionable-status.json'
-import { needsYou } from '../../src/needs.ts'
+import { needsYou, needHideKey } from '../../src/needs.ts'
 import { decodeStatus, recipientLabel, statusLabel, statusProvenance } from '../../src/actionableStatus.ts'
 import { DashboardPage, dashboardStatus, SharedAnswer, SharedNeeds } from '../../src/pages/Dashboard.tsx'
 import type { WorkOverview } from '../../src/standup.ts'
@@ -20,6 +20,22 @@ describe('shared actionable status', () => {
     expect(recipientLabel(status.work[2]!.recipient)).toBe('viewer')
     expect(statusLabel(status.work[2]!.state)).toBe('Awaiting a named party')
     expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs).toHaveLength(3)
+  })
+  it('uses semantic action versions for browser dismissals with legacy fixture compatibility', () => {
+    const status = decodeStatus(fixture)
+    const action = status.actions.find((a) => a.needs_you)!
+    const key = () => needHideKey(needsYou(null, null, undefined, status).find((n) => n.key === action.id)!)
+    expect(key()).toBe(`${action.id}@${action.updated_seq}`)
+    action.semantic_version = 'first-semantic-version'
+    const before = key()
+    status.observed_at += 60
+    status.digest = 'new-provider-read'
+    expect(key()).toBe(before)
+    action.semantic_version = 'changed-head-files-or-recipient'
+    expect(key()).not.toBe(before)
+    const wire = { ...fixture, actions: fixture.actions.map((a) => ({ ...a, semantic_version: 'typed-version' })) }
+    expect(decodeStatus(wire).actions[0]!.semantic_version).toBe('typed-version')
+    expect(() => decodeStatus({ ...wire, actions: [{ ...wire.actions[0], semantic_version: 12 }] })).toThrow()
   })
   it('retains provider coverage and check time separately from status read time', () => {
     const value = structuredClone(fixture) as unknown as { work: Record<string, unknown>[] }

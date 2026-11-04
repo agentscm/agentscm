@@ -829,6 +829,7 @@ fn attention_revision(
                 &a.kind,
                 &a.work_ids,
                 a.updated_seq,
+                &a.semantic_version,
                 &a.recipients,
                 &a.action,
             ))
@@ -1240,6 +1241,170 @@ mod tests {
             .action
             .push_str(" Updated action.");
         assert_ne!(super::attention_revision(&status, "synthetic-key"), changed);
+    }
+
+    #[test]
+    fn pr_attention_revision_tracks_semantics_across_real_store_polls() {
+        use crate::hub::{
+            connection::NewConnection,
+            intent::NewIntent,
+            store::{self, ForgeIdentity, agent_token_digest, mint_bound_agent_token},
+            work_http::actionable_status,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let now = store::unix_now();
+        let owner = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                "synthetic",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            &*store,
+            &owner.id,
+            "synthetic",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let who = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        let con = store
+            .insert_connection(
+                &NewConnection {
+                    id: format!("con_{}", "a".repeat(32)),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("synthetic".into()),
+                },
+                &owner.id,
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(&con.id, "github.com", 101, "acme/widgets", None, None)
+            .unwrap();
+        store
+            .announce_intent(
+                &who.token_id,
+                &NewIntent {
+                    id: format!("int_{}", "b".repeat(32)),
+                    task: "Synthetic overlap".into(),
+                    branch: None,
+                    base: None,
+                    machine: None,
+                    paths: vec!["src/a.rs".into()],
+                    ttl_seconds: 3600,
+                },
+                now,
+            )
+            .unwrap();
+        let read = || actionable_status::read(&*store, &who, now).unwrap();
+        let mut pull = json!({"number":1,"state":"open","head_sha":"first-head","files":["src/a.rs","src/b.rs"],"files_truncated":false});
+        store
+            .observe(&repo.id, "pull_request", "1", &pull.to_string(), 1000)
+            .unwrap();
+        let first = read();
+        let revision = attention_revision(&first, "synthetic-key");
+        store
+            .observe(&repo.id, "pull_request", "1", &pull.to_string(), 2000)
+            .unwrap();
+        let second = read();
+        assert_ne!(
+            first.digest, second.digest,
+            "full source version retains provider read time"
+        );
+        assert_eq!(revision, attention_revision(&second, "synthetic-key"));
+        pull["files"] = json!(["src/b.rs", "src/a.rs"]);
+        store
+            .observe(&repo.id, "pull_request", "1", &pull.to_string(), 3000)
+            .unwrap();
+        assert_eq!(revision, attention_revision(&read(), "synthetic-key"));
+        for (field, value) in [
+            ("head_sha", json!("second-head")),
+            ("files", json!(["src/a.rs", "src/c.rs"])),
+            ("files_truncated", json!(true)),
+        ] {
+            let before = attention_revision(&read(), "synthetic-key");
+            pull[field] = value;
+            store
+                .observe(
+                    &repo.id,
+                    "pull_request",
+                    "1",
+                    &pull.to_string(),
+                    store.observation_floor(&repo.id).unwrap() + 1000,
+                )
+                .unwrap();
+            assert_ne!(before, attention_revision(&read(), "synthetic-key"));
+        }
+        let before = attention_revision(&read(), "synthetic-key");
+        let other = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 2,
+                },
+                "synthetic-other",
+            )
+            .unwrap();
+        let (token, _, _) = mint_bound_agent_token(
+            &*store,
+            &other.id,
+            "synthetic-other",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        store
+            .announce_intent(
+                &token,
+                &NewIntent {
+                    id: format!("int_{}", "c".repeat(32)),
+                    task: "Synthetic second recipient".into(),
+                    branch: None,
+                    base: None,
+                    machine: None,
+                    paths: vec!["src/a.rs".into()],
+                    ttl_seconds: 3600,
+                },
+                now,
+            )
+            .unwrap();
+        let after = read();
+        assert_ne!(before, attention_revision(&after, "synthetic-key"));
+        assert_ne!(
+            first
+                .actions
+                .iter()
+                .find(|a| a.kind == "pr_overlap")
+                .unwrap()
+                .semantic_version,
+            after
+                .actions
+                .iter()
+                .find(|a| a.kind == "pr_overlap")
+                .unwrap()
+                .semantic_version
+        );
     }
 
     #[test]

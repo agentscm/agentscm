@@ -1695,3 +1695,266 @@ async fn unavailable_status_answers_unknown_privately_and_does_not_block_coordin
     );
     assert!(!sent.iter().any(|(u, _)| u == "CSHARED"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contention() {
+    use crate::hub::work_http::actionable_status;
+    for resolution in ["grant", "release", "end"] {
+        let f = Fixture::new().await;
+        f.contest();
+        let read = || {
+            tokio::task::block_in_place(|| {
+                let slack = f.slack();
+                let who = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+                actionable_status::read(&**f.store(), &who, unix_now()).unwrap()
+            })
+        };
+        assert!(
+            read()
+                .actions
+                .iter()
+                .any(|a| a.kind == "file_conflict" && a.needs_you)
+        );
+        tokio::task::block_in_place(|| match resolution {
+            "grant" => {
+                f.store()
+                    .answer_handoff(&f.alice, Some("a"), PATH, true, None, unix_now())
+                    .unwrap();
+            }
+            "release" => {
+                let held = f.store().live_intents(REPO, unix_now(), 100).unwrap();
+                f.store()
+                    .release_intent(
+                        &f.alice,
+                        &held.iter().find(|i| i.token == f.alice).unwrap().id,
+                        unix_now(),
+                    )
+                    .unwrap();
+            }
+            _ => {
+                f.store()
+                    .end_session(&f.bob, Some("b"), unix_now())
+                    .unwrap();
+            }
+        });
+        assert!(
+            !read().actions.iter().any(|a| a.kind == "file_conflict"),
+            "obsolete repeat after {resolution}"
+        );
+        tokio::task::block_in_place(|| {
+            f.store()
+                .end_session(&f.alice, Some("a"), unix_now())
+                .unwrap();
+            f.store()
+                .end_session(&f.bob, Some("b"), unix_now())
+                .unwrap();
+        });
+        f.contest();
+        assert!(
+            read()
+                .actions
+                .iter()
+                .any(|a| a.kind == "file_conflict" && a.needs_you),
+            "new repeat after {resolution}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn episode_maintenance_rotates_past_one_hundred_outstanding_subjects() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let now = unix_now();
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    // Retained subjects are confirmed individually even when the status list is bounded.
+    for n in 0..101 {
+        let work = status_work(&f, &f.alice, &format!("fair-{n}"));
+        let current = if n < 100 {
+            status_checkpoint(&f, &f.alice, &work, "blocker")
+        } else {
+            work
+        };
+        let subject = json!({"kind":"work","id":current.id,"generation":current.generation,"state":"blocked"}).to_string();
+        slack.database().unwrap().execute("INSERT INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)",params![format!("{n:04}"),key,subject,now,now+86400]).unwrap();
+    }
+    scan_status(&f, now);
+    let state = || {
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_episodes WHERE id='0100'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(state(), "active");
+    scan_status(&f, now + 1);
+    assert_eq!(state(), "resolved");
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_episodes WHERE id<'0100' AND state='active'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        100
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_episode_journal_resolves_before_new_subject_admission_and_recovers_after_retention() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let old = status_work(&f, &f.alice, "old-cleared");
+    let fresh = status_work(&f, &f.alice, "new-blocked");
+    status_checkpoint(&f, &f.alice, &fresh, "blocker");
+    let now = unix_now();
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    let subject = json!({"kind":"work","id":old.id,"generation":old.generation,"state":"blocked"})
+        .to_string();
+    {
+        let mut db = slack.database().unwrap();
+        let tx = db.transaction().unwrap();
+        for n in 0..4096 {
+            let encoded = if n == 0 {
+                subject.clone()
+            } else {
+                json!({"kind":"work","id":format!("unknown-{n}"),"generation":1,"state":"blocked"})
+                    .to_string()
+            };
+            tx.execute("INSERT INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)",params![format!("{n:04}"),key,encoded,now,now+86400]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let result = tokio::task::block_in_place(|| {
+        slack.collect_status_binding(&f.state, &slack.bindings[0], now)
+    });
+    assert!(matches!(result, Err(HubError::Busy)));
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_episodes WHERE id='0000'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        "resolved"
+    );
+    // Retained history still consumes its quota until expiry; Unknown subjects stay active.
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_episodes WHERE state='active'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        4095
+    );
+    // Advance only the local journal's retention age; forge credentials keep their real clock.
+    slack
+        .database()
+        .unwrap()
+        .execute(
+            "UPDATE status_episodes SET first_seen=?1 WHERE id='0000'",
+            [now - 8 * 86400],
+        )
+        .unwrap();
+    tokio::task::block_in_place(|| slack.collect_status(&f.state, now + 61)).unwrap();
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>("SELECT count(*) FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        4096
+    );
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_episodes WHERE id='0000'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_status_queue_retains_resolution_progress_without_crossing_reactivated_cycles() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "queue-resolution");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    {
+        let mut db = slack.database().unwrap();
+        let tx = db.transaction().unwrap();
+        // Synthetic completed jobs still occupy dedup history until its retention window ends.
+        for n in 0..CAPACITY {
+            tx.execute("INSERT INTO status_jobs(id,binding,user,kind,state,created,due) VALUES(?1,?2,'U1','query','done',?3,?3)",params![format!("history-{n}"),key,now]).unwrap();
+        }
+        tx.execute("UPDATE status_episodes SET delivered=1", [])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let active = status_checkpoint(&f, &f.alice, &blocked, "progress");
+    scan_status(&f, now + 1);
+    let db = slack.database().unwrap();
+    assert_eq!(
+        db.query_row::<String, _, _>("SELECT state FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        "resolved"
+    );
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM status_resolution_pending", [], |r| r
+            .get(0))
+            .unwrap(),
+        1
+    );
+    drop(db);
+    status_checkpoint(&f, &f.alice, &active, "blocker");
+    scan_status(&f, now + 2);
+    let db = slack.database().unwrap();
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT cycle FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM status_resolution_pending", [], |r| r
+            .get(0))
+            .unwrap(),
+        0
+    );
+    db.execute("DELETE FROM status_jobs WHERE id='history-0'", [])
+        .unwrap();
+    drop(db);
+    scan_status(&f, now + 3);
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_jobs WHERE kind='resolution'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        0
+    );
+}

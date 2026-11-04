@@ -11,7 +11,7 @@ export type NeedKind = 'blocked' | 'asked' | 'contested' | 'overlap' | 'pr'
 export interface Need {
   key: string
   /** Shared server revision used only for browser dismissals. */
-  revision?: number
+  revision?: number | string
   kind: NeedKind
   tone: 'bad' | 'warn' | 'brand'
   /** The work item it is about, when there is one. */
@@ -83,7 +83,7 @@ export function needsYou(ov: WorkOverview | null, d: Derived | null, asked?: Ask
       const item = candidate?.generation === w.generation && candidate.updated_seq === w.updated_seq ? candidate : undefined
       return { key: w.state === 'blocked' ? `blocked:${w.work_id}` : `status:${w.work_id}`, revision: w.updated_seq, kind: 'blocked', tone: w.state === 'blocked' ? 'bad' : 'warn', item, at: item?.updated_at ?? shared.observed_at, who: 'you' }
     }),
-    ...shared.actions.filter((a) => a.needs_you).map((a): Need => ({ key: a.id, revision: a.updated_seq, kind: 'asked', tone: 'warn', at: shared.observed_at, who: 'you' })),
+    ...shared.actions.filter((a) => a.needs_you).map((a): Need => ({ key: a.id, revision: a.semantic_version ?? a.updated_seq, kind: 'asked', tone: 'warn', at: shared.observed_at, who: 'you' })),
   ]
 }
 

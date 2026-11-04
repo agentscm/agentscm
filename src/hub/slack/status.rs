@@ -76,6 +76,8 @@ pub(super) fn initialize(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS status_jobs (id TEXT PRIMARY KEY, binding TEXT NOT NULL, user TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT, cycle INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, created INTEGER NOT NULL, due INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS status_episodes (id TEXT PRIMARY KEY, binding TEXT NOT NULL, subject TEXT NOT NULL, cycle INTEGER NOT NULL, state TEXT NOT NULL, first_seen INTEGER NOT NULL, next_due INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, escalated INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS status_scans (binding TEXT PRIMARY KEY, next_due INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS status_maintenance (binding TEXT PRIMARY KEY, last_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS status_resolution_pending (episode TEXT PRIMARY KEY);
         UPDATE status_jobs SET state='queued' WHERE state='sending';")?;
     Ok(())
 }
@@ -284,6 +286,8 @@ impl Slack {
                 [now - 7 * JOB_TTL],
             )?;
             db.execute("DELETE FROM status_episodes WHERE state='resolved' AND first_seen<?1 AND id NOT IN (SELECT subject FROM status_jobs WHERE state IN ('queued','sending') AND subject IS NOT NULL)", [now-7*JOB_TTL])?;
+            db.execute("DELETE FROM status_resolution_pending WHERE episode NOT IN (SELECT id FROM status_episodes)", [])?;
+            db.execute("DELETE FROM status_maintenance WHERE binding NOT IN (SELECT binding FROM status_episodes)", [])?;
             let configured: BTreeSet<String> = self.bindings.iter().map(binding_key).collect();
             let obsolete: Vec<(String, String)> = {
                 let mut q = db.prepare(
@@ -336,6 +340,67 @@ impl Slack {
         let pending = outstanding(&status);
         let key = binding_key(binding);
         let policy = &binding.config.reminders;
+        // Absence from a bounded list alone is never resolution. Check each retained subject.
+        let episodes: Vec<(String, String, i64, i64)> = {
+            let db = self.database()?;
+            let cursor: String = db
+                .query_row(
+                    "SELECT last_id FROM status_maintenance WHERE binding=?1",
+                    [&key],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            let mut q = db.prepare("SELECT id,subject,cycle,delivered FROM status_episodes WHERE binding=?1 AND (state='active' OR id IN (SELECT episode FROM status_resolution_pending)) ORDER BY (id<=?2),id LIMIT 100")?;
+            q.query_map(params![key, cursor], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        for (episode, encoded, cycle, delivered) in episodes {
+            self.database()?.execute("INSERT INTO status_maintenance(binding,last_id) VALUES(?1,?2) ON CONFLICT(binding) DO UPDATE SET last_id=excluded.last_id", params![key,episode])?;
+            let subject: Subject = serde_json::from_str(&encoded).map_err(|_| unavailable())?;
+            if pending.iter().any(|a| a.subject == subject) {
+                continue;
+            }
+            if confirmed_cleared(state, &principal, &subject, now)? {
+                let mut db = self.database()?;
+                let tx = db.transaction()?;
+                tx.execute(
+                    "UPDATE status_episodes SET state='resolved',first_seen=?3 WHERE id=?1 AND cycle=?2 AND state='active'",
+                    params![episode, cycle, now],
+                )?;
+                if delivered > 0 && policy.send_resolution {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO status_resolution_pending(episode) VALUES(?1)",
+                        [&episode],
+                    )?;
+                }
+                tx.commit()?;
+                let tx = db.transaction()?;
+                if delivered > 0 && policy.send_resolution {
+                    match queue(
+                        &tx,
+                        &format!("{episode}:{cycle}:resolution"),
+                        &key,
+                        &binding.config.slack_user,
+                        "resolution",
+                        (&episode, cycle),
+                        now,
+                    ) {
+                        Ok(()) => {
+                            tx.execute(
+                                "DELETE FROM status_resolution_pending WHERE episode=?1",
+                                [&episode],
+                            )?;
+                        }
+                        Err(HubError::Busy) => {} // Keep the confirmed resolution and retry its notice fairly.
+                        Err(error) => return Err(error),
+                    }
+                }
+                tx.commit()?;
+            }
+        }
         let mut db = self.database()?;
         let tx = db.transaction()?;
         let mut count: i64 =
@@ -352,6 +417,7 @@ impl Slack {
                 return Err(HubError::Busy);
             }
             count += tx.execute("INSERT OR IGNORE INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)", params![episode,key,subject,now,now+policy.interval_seconds])? as i64;
+            tx.execute("DELETE FROM status_resolution_pending WHERE episode=?1 AND EXISTS(SELECT 1 FROM status_episodes WHERE id=?1 AND state='resolved')", [&episode])?;
             // A confirmed earlier resolution permits a new episode, not a retry of its old job.
             tx.execute("UPDATE status_episodes SET cycle=cycle+1,state='active',first_seen=?2,next_due=?3,delivered=0,escalated=0 WHERE id=?1 AND state='resolved'", params![episode,now,now+policy.interval_seconds])?;
             let (cycle, first, due, delivered, escalated): (i64,i64,i64,i64,bool) = tx.query_row("SELECT cycle,first_seen,next_due,delivered,escalated FROM status_episodes WHERE id=?1", [&episode], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
@@ -383,40 +449,6 @@ impl Slack {
             }
         }
         tx.commit()?;
-        drop(db);
-        // Absence from a bounded list alone is never resolution. Check each retained subject.
-        let episodes: Vec<(String, String, i64, i64)> = {
-            let db = self.database()?;
-            let mut q = db.prepare("SELECT id,subject,cycle,delivered FROM status_episodes WHERE binding=?1 AND state='active' ORDER BY id LIMIT 100")?;
-            q.query_map([&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                .collect::<std::result::Result<_, _>>()?
-        };
-        for (episode, encoded, cycle, delivered) in episodes {
-            let subject: Subject = serde_json::from_str(&encoded).map_err(|_| unavailable())?;
-            if pending.iter().any(|a| a.subject == subject) {
-                continue;
-            }
-            if confirmed_cleared(state, &principal, &subject, now)? {
-                let mut db = self.database()?;
-                let tx = db.transaction()?;
-                tx.execute(
-                    "UPDATE status_episodes SET state='resolved' WHERE id=?1 AND cycle=?2",
-                    params![episode, cycle],
-                )?;
-                if delivered > 0 && policy.send_resolution {
-                    queue(
-                        &tx,
-                        &format!("{episode}:{cycle}:resolution"),
-                        &key,
-                        &binding.config.slack_user,
-                        "resolution",
-                        (&episode, cycle),
-                        now,
-                    )?;
-                }
-                tx.commit()?;
-            }
-        }
         Ok(())
     }
 

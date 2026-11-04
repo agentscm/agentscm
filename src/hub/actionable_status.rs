@@ -119,6 +119,9 @@ pub struct StatusAction {
     pub needs_you: bool,
     pub action: String,
     pub updated_seq: i64,
+    /// Semantic version for actions without a Work event sequence (for example forge reads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_version: Option<String>,
     pub limits: Vec<String>,
 }
 
@@ -532,6 +535,7 @@ fn read_scoped(
                 .any(|r| r.owner.as_deref() == Some(&principal.owner.id)),
             recipients,
             action: "Resolve the overlapping declared scopes with the named owners.".into(),
+            semantic_version: None,
             updated_seq: pair.iter().map(|i| i.updated_seq).max().unwrap_or(0),
             limits: vec![],
         });
@@ -790,6 +794,7 @@ fn request_actions(
                 recipients: vec![recipient],
                 action: "Answer the outstanding directed coordination request.".into(),
                 updated_seq: request.updated_seq,
+                semantic_version: None,
                 limits: if target.reasons_complete {
                     vec![]
                 } else {

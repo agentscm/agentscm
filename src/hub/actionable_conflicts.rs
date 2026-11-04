@@ -46,6 +46,7 @@ fn action(
         recipients,
         action: text,
         updated_seq: seq,
+        semantic_version: None,
         limits: vec![],
     }
 }
@@ -153,31 +154,75 @@ pub(super) fn read(
             }
         }
     }
-    // Repeated refusals still matter when the requester holds no intent. Resolve its stable
-    // owner only for the viewer's own token or a live intent; a login is not authority.
+    // Historical refusals are current only while the same requester session and a named
+    // holder from that refusal remain live. Token validity alone cannot prove contention.
+    let sessions = store.live_sessions(who, now, LIMIT + 1)?;
+    for session in &sessions {
+        capture(
+            &mut evidence,
+            &mut evidence_bytes,
+            &mut limits,
+            format!(
+                "{}:{}:{}:{:?}:{}:{}",
+                session.key,
+                session.token,
+                session.via,
+                session.intent,
+                session.created_at,
+                session.updated_at
+            )
+            .as_bytes(),
+        );
+    }
+    if sessions.len() > LIMIT {
+        limits.insert("conflict_sessions_truncated".into());
+    }
     let own_tokens = store.list_agent_tokens(&who.owner.id)?;
     let mut unknown_recipients = BTreeSet::new();
+    let mut live_repeated = BTreeSet::new();
     'event_paths: for (event, data) in &parsed {
         if event.event.kind != "edit_repeated" {
             continue;
         }
+        let Some(session_id) = data["session"].as_str() else {
+            limits.insert("conflict_session_unknown".into());
+            continue;
+        };
+        let key = crate::hub::store::session_key(&event.token, session_id);
+        if !sessions
+            .iter()
+            .take(LIMIT)
+            .any(|s| s.key == key && s.created_at <= event.event.at)
+            || parsed.iter().any(|(e, d)| {
+                e.token == event.token
+                    && e.event.seq > event.event.seq
+                    && matches!(e.event.kind.as_str(), "session_ended" | "session_started")
+                    && d["session"] == session_id
+            })
+        {
+            continue;
+        }
         for path in paths(data) {
-            let denied = parsed.iter().any(|(e, d)| {
+            let Some((_, denied)) = parsed.iter().find(|(e, d)| {
                 e.event.kind == "edit_denied"
                     && e.token == event.token
-                    && e.event.at <= event.event.at
+                    && e.event.seq < event.event.seq
+                    && d["session"] == session_id
                     && paths(d).iter().any(|p| overlaps(key_of(p), key_of(path)))
-            });
-            if !denied {
+            }) else {
                 continue;
-            }
-            if found.len() >= 200 && !found.contains_key(path) {
-                limits.insert("file_conflicts_truncated".into());
-                continue;
-            }
-            let owners = found.entry(path.into()).or_default();
+            };
+            let holders: BTreeSet<&str> = denied["holders"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let mut current = BTreeMap::new();
             for i in &intents {
-                let mut hit = false;
+                if !holders.contains(i.id.as_str()) {
+                    continue;
+                }
                 for spec in &i.paths {
                     comparisons += 1;
                     if comparisons > COMPARISONS {
@@ -185,22 +230,24 @@ pub(super) fn read(
                         break 'event_paths;
                     }
                     if overlaps(key_of(spec), key_of(path)) {
-                        hit = true;
+                        current.insert(i.owner.id.clone(), recipient(i));
                         break;
                     }
                 }
-                if hit {
-                    owners.insert(i.owner.id.clone(), recipient(i));
-                }
             }
-            let actor_known = intents.iter().any(|i| i.token == event.token)
-                || own_tokens
-                    .iter()
-                    .any(|t| t.id == event.token && !t.revoked && t.expires_at > now);
-            if !actor_known {
-                unknown_recipients.insert(path.to_owned());
+            if current.is_empty() {
+                continue;
             }
-            if own_tokens
+            if found.len() >= 200 && !found.contains_key(path) {
+                limits.insert("file_conflicts_truncated".into());
+                continue;
+            }
+            live_repeated.insert(path.to_owned());
+            let owners = found.entry(path.into()).or_default();
+            owners.extend(current);
+            if let Some(i) = intents.iter().find(|i| i.token == event.token) {
+                owners.insert(i.owner.id.clone(), recipient(i));
+            } else if own_tokens
                 .iter()
                 .any(|t| t.id == event.token && !t.revoked && t.expires_at > now)
             {
@@ -213,6 +260,8 @@ pub(super) fn read(
                         agent: Some(event.agent.clone()),
                     },
                 );
+            } else {
+                unknown_recipients.insert(path.to_owned());
             }
         }
     }
@@ -231,10 +280,7 @@ pub(super) fn read(
                         && answer["request"].as_str() == id
                 })
         });
-        let repeated = parsed.iter().any(|(e, d)| {
-            e.event.kind == "edit_repeated"
-                && paths(d).iter().any(|p| overlaps(key_of(p), key_of(&path)))
-        });
+        let repeated = live_repeated.contains(&path);
         let mut row = action(
             format!("file:{path}"),
             "file_conflict",
@@ -338,14 +384,27 @@ pub(super) fn read(
                 }
             }
             if !recipients.is_empty() {
-                actions.push(action(
+                let mut row = action(
                     format!("pr:{}:{number}", repo.id),
                     "pr_overlap",
                     recipients.into_values().collect(),
                     format!("Review pull request #{number} against the named holders' files."),
-                    observed.observed_at,
+                    0, // Forge reads do not carry a monotone Work event sequence.
                     &who.owner.id,
-                ));
+                );
+                let canonical_files: BTreeSet<&str> =
+                    files.iter().filter_map(Value::as_str).collect();
+                let version = serde_json::to_vec(&(
+                    &row.id,
+                    &pull["head_sha"],
+                    canonical_files,
+                    &pull["files_truncated"],
+                    &row.recipients,
+                ))
+                .expect("PR action version serializes");
+                row.semantic_version =
+                    Some(crate::hub::store::lower_hex_of(&Sha256::digest(version)));
+                actions.push(row);
             }
         }
         if pulls.len() > LIMIT {
