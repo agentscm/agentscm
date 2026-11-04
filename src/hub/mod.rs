@@ -21,6 +21,7 @@ pub mod hook;
 pub mod http;
 pub mod insights;
 pub mod intent;
+mod lead_credential;
 pub mod local_ci_devices;
 pub mod login;
 pub mod mcp;

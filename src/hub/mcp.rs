@@ -27,6 +27,7 @@ use super::coordination::{
 };
 use super::http::{ApiError, Reader, blocking};
 use super::insights::{InsightQuery, UsageRecord};
+use super::lead_credential::LEAD_SESSION_MISMATCH;
 use super::promise::{
     DEFAULT_PROMISE_PAGE, MAX_PROMISE_PAGE, PromiseConstraintV1, PromiseCriterionV1,
     PromiseInputV1, PromiseViewV1, current_admission,
@@ -1190,7 +1191,11 @@ pub(super) fn hub_failure(error: &HubError) -> Value {
             "checkpoint sequence changed; inspect current Work before retry"
         }
         HubError::Unavailable(_) => "hub unavailable",
-        HubError::Invalid(message) if message == SESSION_REQUIRED => SESSION_REQUIRED,
+        HubError::Invalid(message)
+            if message == SESSION_REQUIRED || message.starts_with(LEAD_SESSION_MISMATCH) =>
+        {
+            message.as_str()
+        }
         HubError::Invalid(_) => "invalid request",
         HubError::Unauthorized => "token not accepted",
     })
