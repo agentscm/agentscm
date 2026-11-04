@@ -63,6 +63,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/operational".into(), "".into(), Status(404));
+    row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/reconciliation".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work?q=x".into(), "".into(), Allowed);
     row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
@@ -298,6 +299,24 @@ async fn a_read_only_token_reaches_only_the_read_routes_and_writes_nothing() {
         .find(|r| matches!(r.3, AgentOnly) && r.0 == Method::POST && r.1.ends_with("/intents"))
         .unwrap();
     assert_eq!(hub.send(&announce, Some(&agent)).await.0, 200);
+
+    // An existing Work reads as 200 for the read-only token, and the read changes no event count.
+    let start: agentscm::hub::work::WorkStart = serde_json::from_value(
+        json!({"request_key": "k", "title": "Synthetic", "session": "s", "scope": ["a.rs"]}),
+    )
+    .unwrap();
+    let work = hub
+        .store
+        .work_start(&scope.token_id, &start, unix_now())
+        .unwrap()
+        .item;
+    let events = hub.store.events_after(0, 1000).unwrap().len();
+    let path = format!("/v1/hub/standup/work/{}/reconciliation", work.id);
+    let (status, body) = hub
+        .send(&(Method::GET, path, String::new(), Allowed), Some(&secret))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hub.store.events_after(0, 1000).unwrap().len(), events);
 
     let whoami = hub
         .client

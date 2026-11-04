@@ -42,6 +42,10 @@ pub fn routes() -> Router<HubState> {
             "/v1/hub/standup/work/{id}/operational",
             get(operational_one),
         )
+        .route(
+            "/v1/hub/standup/work/{id}/reconciliation",
+            get(reconciliation),
+        )
         .route("/v1/hub/standup/ack", post(acknowledge))
         .route("/v1/hub/standup/usage", post(usage))
         .route("/v1/hub/standup/insights", get(insights))
@@ -168,6 +172,20 @@ async fn operational_one(
         .next()
         .map(Json)
         .ok_or_else(ApiError::not_found)
+}
+
+async fn reconciliation(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(id): Path<String>,
+) -> Result<Json<super::work_reconcile::WorkReconciliationV1>, ApiError> {
+    let store = state.store.clone();
+    blocking(&state, move || {
+        super::work_reconcile::read(&*store, &principal, &id, unix_now())
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(ApiError::not_found)
 }
 
 async fn operational_overview(
