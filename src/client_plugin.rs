@@ -121,8 +121,11 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     };
     let mut pre = json!({"hooks":[hook(5)]});
     pre["matcher"] = json!("^(Edit|Write|MultiEdit|NotebookEdit)$");
+    // UserPromptSubmit fires only in the session the person types in, so requests reach it
+    // there rather than a subagent. It runs on every prompt, hence the short timeout.
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook(5)]}],
+        "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[pre],
         "SessionEnd":[{"hooks":[hook(3)]}]
     }});

@@ -1465,10 +1465,12 @@ fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<Route
 /// for coordination leave the machine. For patches, only recognized operation headers survive.
 fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
+    // `agent_id` marks a subagent's call, so the hub can keep requests for the lead session.
     for (key, max) in [
         ("hook_event_name", 64),
         ("session_id", 1024),
         ("tool_name", 128),
+        ("agent_id", 128),
     ] {
         if let Some(value) = payload[key]
             .as_str()
@@ -2949,6 +2951,21 @@ mod tests {
         let root = parent.join(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_prompt_forwards_the_subagent_marker_but_never_the_prompt() {
+        let payload = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s",
+            "agent_id": "a1b2c3",
+            "cwd": "/work/acme-widgets",
+            "prompt": "private prompt"
+        });
+        let safe = sanitized_codex(&payload, None).unwrap();
+        assert_eq!(safe["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(safe["agent_id"], "a1b2c3");
+        assert!(!safe.to_string().contains("private prompt"), "{safe}");
     }
 
     #[test]
