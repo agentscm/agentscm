@@ -2,25 +2,35 @@
 //!
 //! The caller-reported link, provider merge evidence, the open-PR observation, the agent-reported
 //! outcome, the reservation and coverage stay separate. A merge never proves task success, and a
-//! missing fact stays `unknown`. This module holds no store access and changes no state.
-// Nothing calls this projection yet; Phase 2 wires it in and removes this allowance.
-#![allow(dead_code)]
+//! missing fact stays `unknown`. `reconcile` is pure; `read` gathers its facts through the
+//! existing read-only Store calls and changes no state.
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::catchup::CatchupCoverageState;
+use super::catchup::{CatchupCoverageState, CatchupPreviewQuery, CatchupRepositoryScope};
+use super::store::{Principal, Store};
 use super::value_metrics::identity;
 use super::work::{CheckpointKind, WorkItem};
 use super::work_lifecycle::{
-    MergeStatus, OperationalFacts, OutcomeFact, OutcomeV1, OutcomeValue, ReservationBasis,
-    ReservationStatus, ReservationV1, SCHEMA_VERSION_V1, work_operational,
+    OutcomeV1, OutcomeValue, ReservationStatus, ReservationV1, SCHEMA_VERSION_V1,
 };
-use super::work_links::WorkPrLink;
+use super::work_links::{WorkPrLink, WorkPrLinkQuery};
+use super::work_transition::{OperationalSelect, WorkLifecycleReader};
+use super::{HubError, Result};
+
+/// Prerequisites read in full; the rest stay `unknown`.
+const MAX_PREREQUISITES_READ: usize = 16;
+/// The catch-up preview label; a preview reads cursors and creates no delivery.
+const PREVIEW_SUBSCRIBER: &str = "work-reconcile";
 
 /// Provider evidence for one Work's linked pull request.
+#[derive(Default)]
 pub(super) struct PrFacts<'a> {
     pub(super) link: Option<&'a WorkPrLink>,
+    /// The link could not be read (for example an unbound repository), which is not the same as
+    /// no link.
+    pub(super) link_unavailable: bool,
     /// Exact PR-number merge lookup: `Some(true)` merged, `Some(false)` no merge row, `None`
     /// lookup unavailable.
     pub(super) merged: Option<bool>,
@@ -37,11 +47,14 @@ pub(super) struct PrerequisiteFacts<'a> {
 
 pub(super) struct ReconcileFacts<'a> {
     pub(super) item: &'a WorkItem,
-    pub(super) outcome: Option<OutcomeFact>,
-    pub(super) basis: Option<ReservationBasis>,
+    /// The Store's operational projection of this Work.
+    pub(super) outcome: OutcomeV1,
+    pub(super) reservation: ReservationV1,
     pub(super) pr: PrFacts<'a>,
     pub(super) coverage: CatchupCoverageState,
     pub(super) prerequisites: &'a [PrerequisiteFacts<'a>],
+    /// Limits found while reading, such as `prerequisites_truncated`.
+    pub(super) read_limits: &'a [&'static str],
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -127,6 +140,8 @@ pub struct WorkReconciliationV1 {
     pub prerequisites: Vec<PrerequisiteV1>,
     pub reassess: ReassessV1,
     pub limits: Vec<String>,
+    /// Always false: the facts are separate reads, not one snapshot.
+    pub atomic_snapshot: bool,
     /// Over every field except clock fields; identical facts give an identical digest.
     pub digest: String,
 }
@@ -136,6 +151,10 @@ fn provider_status(
     limits: &mut BTreeSet<String>,
 ) -> (ProviderStatus, HeadRelation) {
     let Some(link) = pr.link else {
+        if pr.link_unavailable {
+            limits.insert("pr_link_unavailable".to_owned());
+            return (ProviderStatus::Unknown, HeadRelation::Unknown);
+        }
         limits.insert("no_pr_link".to_owned());
         return (ProviderStatus::NotLinked, HeadRelation::Unknown);
     };
@@ -189,14 +208,8 @@ fn prerequisite(facts: Option<&PrerequisiteFacts<'_>>, id: &str) -> Prerequisite
 
 pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
     let item = facts.item;
-    let operational = work_operational(&OperationalFacts {
-        item,
-        outcome: facts.outcome,
-        basis: facts.basis,
-        hidden_by_merged_pr: false,
-        merge: MergeStatus::Unknown,
-    });
     let mut limits = BTreeSet::from(["single_pr_link_only".to_owned()]);
+    limits.extend(facts.read_limits.iter().map(|l| (*l).to_owned()));
     let (status, head_relation) = provider_status(&facts.pr, &mut limits);
     match facts.coverage {
         CatchupCoverageState::ObservedOnly => {}
@@ -235,13 +248,14 @@ pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
             head_relation,
             coverage: facts.coverage,
         },
-        outcome: operational.outcome,
+        outcome: facts.outcome.clone(),
         merged_holding_reservation: status == ProviderStatus::Merged
-            && operational.reservation.status == ReservationStatus::Held,
-        reservation: operational.reservation,
+            && facts.reservation.status == ReservationStatus::Held,
+        reservation: facts.reservation.clone(),
         prerequisites,
         reassess,
         limits: limits.into_iter().collect(),
+        atomic_snapshot: false,
         digest: String::new(),
     };
     // The blocker time is a clock field; it stays out of the digest.
@@ -252,10 +266,223 @@ pub(super) fn reconcile(facts: &ReconcileFacts<'_>) -> WorkReconciliationV1 {
     out
 }
 
+/// Owned provider facts for one Work, read through the Store.
+#[derive(Default)]
+struct PrRead {
+    link: Option<WorkPrLink>,
+    link_unavailable: bool,
+    merged: Option<bool>,
+    open_head: Option<String>,
+}
+
+impl PrRead {
+    fn facts(&self) -> PrFacts<'_> {
+        PrFacts {
+            link: self.link.as_ref(),
+            link_unavailable: self.link_unavailable,
+            merged: self.merged,
+            open_head: self.open_head.as_deref(),
+        }
+    }
+}
+
+/// The link, exact merge lookup and open-PR observation for one Work. An unbound repository is
+/// an unreadable link, never an error; any other link error (unknown Work, refused token)
+/// propagates. `None` link means the Work is not readable or not linked.
+fn read_pr(
+    store: &dyn Store,
+    principal: &Principal,
+    scope: &CatchupRepositoryScope,
+    work_id: &str,
+    now: i64,
+    limits: &mut BTreeSet<&'static str>,
+) -> Result<Option<PrRead>> {
+    let view = match store.work_pr_link_get(
+        &principal.token_id,
+        work_id,
+        &WorkPrLinkQuery::default(),
+        now,
+    ) {
+        Ok(Some(view)) => view,
+        Ok(None) => return Ok(None),
+        Err(HubError::Invalid(_)) => {
+            return Ok(Some(PrRead {
+                link_unavailable: true,
+                ..PrRead::default()
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    let mut read = PrRead::default();
+    let Some(link) = view.link else {
+        return Ok(Some(read));
+    };
+    let number = link.target.number;
+    read.merged = store.catchup_merge_known(scope, number, None).ok();
+    match open_head(store, principal, number) {
+        Ok(head) => read.open_head = head,
+        Err(limit) => {
+            limits.insert(limit);
+        }
+    }
+    read.link = Some(link);
+    Ok(Some(read))
+}
+
+/// The head of an open observation. Closed pull requests have no observation; a malformed one
+/// gives no head and a limit.
+fn open_head(
+    store: &dyn Store,
+    principal: &Principal,
+    number: i64,
+) -> std::result::Result<Option<String>, &'static str> {
+    let Ok(repository) = super::sync::find_repository(
+        store,
+        &principal.owner.identity.host,
+        &principal.repository,
+        principal.repository_id,
+    ) else {
+        return Err("observation_unavailable");
+    };
+    let Some(repository) = repository else {
+        return Ok(None);
+    };
+    let observation = store
+        .observation(&repository.id, "pull_request", &number.to_string())
+        .map_err(|_| "observation_unavailable")?;
+    let Some(observation) = observation else {
+        return Ok(None);
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&observation.data).map_err(|_| "observation_malformed")?;
+    if value["state"] != "open" {
+        return Ok(None);
+    }
+    value["head_sha"]
+        .as_str()
+        .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|sha| Some(sha.to_owned()))
+        .ok_or("observation_malformed")
+}
+
+/// Coverage of the repository's merge sources: the weakest source wins, and no recorded source
+/// is unavailable. Read through the catch-up preview, which creates no delivery.
+fn read_coverage(store: &dyn Store, token: &str, now: i64) -> CatchupCoverageState {
+    let Ok(preview) = store.work_catchup_preview(
+        token,
+        &CatchupPreviewQuery {
+            subscriber: PREVIEW_SUBSCRIBER.to_owned(),
+        },
+        now,
+    ) else {
+        return CatchupCoverageState::Unavailable;
+    };
+    let states = preview.source_coverage.iter().map(|c| c.state);
+    if states.clone().count() == 0
+        || states
+            .clone()
+            .any(|s| s == CatchupCoverageState::Unavailable)
+    {
+        CatchupCoverageState::Unavailable
+    } else if states
+        .clone()
+        .any(|s| s == CatchupCoverageState::Incomplete)
+    {
+        CatchupCoverageState::Incomplete
+    } else {
+        CatchupCoverageState::ObservedOnly
+    }
+}
+
+/// Reconcile one Work from separate read-only Store calls. The reads are not one snapshot; the
+/// result says so, and says when the Work changed between the first and last read.
+pub fn read(
+    store: &dyn Store,
+    principal: &Principal,
+    work_id: &str,
+    now: i64,
+) -> Result<WorkReconciliationV1> {
+    let token = principal.token_id.as_str();
+    let item = store
+        .work_get(token, work_id, now)?
+        .ok_or_else(|| HubError::Invalid("unknown work in repository".into()))?;
+    let mut limits: BTreeSet<&'static str> = BTreeSet::new();
+    let all: BTreeSet<&str> = item.depends_on.iter().map(String::as_str).collect();
+    if all.len() > MAX_PREREQUISITES_READ {
+        limits.insert("prerequisites_truncated");
+    }
+    let wanted: Vec<String> = all
+        .into_iter()
+        .take(MAX_PREREQUISITES_READ)
+        .map(str::to_owned)
+        .collect();
+    let mut ids = vec![item.id.clone()];
+    ids.extend(wanted.iter().cloned());
+    let operational = store
+        .work_operational(
+            &WorkLifecycleReader::Token(token),
+            &OperationalSelect::Many(&ids),
+            now,
+        )?
+        .work;
+    let this = operational
+        .iter()
+        .find(|w| w.work_id == item.id)
+        .ok_or_else(|| HubError::Unavailable("operational projection missing".into()))?;
+    let scope = CatchupRepositoryScope {
+        provider: principal.owner.identity.provider.clone(),
+        host: principal.owner.identity.host.clone(),
+        repository: principal.repository.clone(),
+        repository_id: principal.repository_id,
+    };
+    let pr = read_pr(store, principal, &scope, &item.id, now, &mut limits)?.unwrap_or_default();
+    // Only a prerequisite the token can read gets facts; the others stay unknown, unnamed.
+    let mut prerequisite_reads = Vec::new();
+    for id in &wanted {
+        let Some(projection) = operational.iter().find(|w| &w.work_id == id) else {
+            continue;
+        };
+        let Ok(Some(read)) = read_pr(store, principal, &scope, id, now, &mut limits) else {
+            continue;
+        };
+        prerequisite_reads.push((id.as_str(), read, projection.outcome.value));
+    }
+    let prerequisites: Vec<PrerequisiteFacts<'_>> = prerequisite_reads
+        .iter()
+        .map(|(id, read, outcome)| PrerequisiteFacts {
+            work_id: id,
+            pr: Some(read.facts()),
+            outcome: Some(*outcome),
+        })
+        .collect();
+    let coverage = read_coverage(store, token, now);
+    let unchanged = store
+        .work_get(token, work_id, now)
+        .ok()
+        .flatten()
+        .is_some_and(|again| again.updated_seq == item.updated_seq);
+    if !unchanged {
+        limits.insert("work_changed_during_read");
+    }
+    let read_limits: Vec<&'static str> = limits.into_iter().collect();
+    Ok(reconcile(&ReconcileFacts {
+        item: &item,
+        outcome: this.outcome.clone(),
+        reservation: this.reservation.clone(),
+        pr: pr.facts(),
+        coverage,
+        prerequisites: &prerequisites,
+        read_limits: &read_limits,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::work::{Checkpoint, ClaimStatus, WorkSource, WorkState};
-    use super::super::work_lifecycle::{OutcomeProvenance, TerminalOutcome};
+    use super::super::work_lifecycle::{
+        MergeStatus, OperationalFacts, OutcomeFact, OutcomeProvenance, ReservationBasis,
+        TerminalOutcome, work_operational,
+    };
     use super::super::work_links::WorkPrLinkTarget;
     use super::*;
 
@@ -326,6 +553,32 @@ mod tests {
         }
     }
 
+    fn facts<'a>(
+        item: &'a WorkItem,
+        outcome: Option<OutcomeFact>,
+        basis: Option<ReservationBasis>,
+        pr: PrFacts<'a>,
+        coverage: CatchupCoverageState,
+        prerequisites: &'a [PrerequisiteFacts<'a>],
+    ) -> ReconcileFacts<'a> {
+        let operational = work_operational(&OperationalFacts {
+            item,
+            outcome,
+            basis,
+            hidden_by_merged_pr: false,
+            merge: MergeStatus::Unknown,
+        });
+        ReconcileFacts {
+            item,
+            outcome: operational.outcome,
+            reservation: operational.reservation,
+            pr,
+            coverage,
+            prerequisites,
+            read_limits: &[],
+        }
+    }
+
     fn run(
         item: &WorkItem,
         link: Option<&WorkPrLink>,
@@ -334,18 +587,19 @@ mod tests {
         basis: Option<ReservationBasis>,
         prerequisites: &[PrerequisiteFacts<'_>],
     ) -> WorkReconciliationV1 {
-        reconcile(&ReconcileFacts {
+        reconcile(&facts(
             item,
-            outcome: None,
+            None,
             basis,
-            pr: PrFacts {
+            PrFacts {
                 link,
                 merged,
                 open_head,
+                ..PrFacts::default()
             },
-            coverage: CatchupCoverageState::ObservedOnly,
+            CatchupCoverageState::ObservedOnly,
             prerequisites,
-        })
+        ))
     }
 
     type Case<'a> = (
@@ -442,18 +696,18 @@ mod tests {
     fn coverage_outage_keeps_retained_merge() {
         let l = link(5, "aaa");
         let it = item(WorkState::Active, &[], false);
-        let out = reconcile(&ReconcileFacts {
-            item: &it,
-            outcome: None,
-            basis: None,
-            pr: PrFacts {
+        let out = reconcile(&facts(
+            &it,
+            None,
+            None,
+            PrFacts {
                 link: Some(&l),
                 merged: Some(true),
-                open_head: None,
+                ..PrFacts::default()
             },
-            coverage: CatchupCoverageState::Unavailable,
-            prerequisites: &[],
-        });
+            CatchupCoverageState::Unavailable,
+            &[],
+        ));
         assert_eq!(out.provider.status, ProviderStatus::Merged);
         assert_eq!(out.provider.coverage, CatchupCoverageState::Unavailable);
         assert!(out.limits.contains(&"coverage_unavailable".to_owned()));
@@ -466,21 +720,21 @@ mod tests {
         let out = run(&it, Some(&l), Some(true), None, None, &[]);
         assert_eq!(out.outcome.value, OutcomeValue::None);
         let done = item(WorkState::Finished, &[], false);
-        let out = reconcile(&ReconcileFacts {
-            item: &done,
-            outcome: Some(OutcomeFact {
+        let out = reconcile(&facts(
+            &done,
+            Some(OutcomeFact {
                 outcome: TerminalOutcome::Abandoned,
                 provenance: OutcomeProvenance::AgentReport,
             }),
-            basis: None,
-            pr: PrFacts {
+            None,
+            PrFacts {
                 link: Some(&l),
                 merged: Some(true),
-                open_head: None,
+                ..PrFacts::default()
             },
-            coverage: CatchupCoverageState::ObservedOnly,
-            prerequisites: &[],
-        });
+            CatchupCoverageState::ObservedOnly,
+            &[],
+        ));
         assert_eq!(out.outcome.value, OutcomeValue::Abandoned);
     }
 
@@ -512,6 +766,7 @@ mod tests {
                 link,
                 merged,
                 open_head: open,
+                ..PrFacts::default()
             }),
             outcome,
         }
@@ -587,5 +842,25 @@ mod tests {
             assert!(!json.contains(secret), "{secret}");
         }
         assert!(json.contains("caller_reported"));
+    }
+
+    #[test]
+    fn unreadable_link_is_unknown_not_unlinked() {
+        let it = item(WorkState::Active, &[], false);
+        let out = reconcile(&facts(
+            &it,
+            None,
+            None,
+            PrFacts {
+                link_unavailable: true,
+                ..PrFacts::default()
+            },
+            CatchupCoverageState::ObservedOnly,
+            &[],
+        ));
+        assert_eq!(out.provider.status, ProviderStatus::Unknown);
+        assert!(out.limits.contains(&"pr_link_unavailable".to_owned()));
+        assert!(!out.limits.contains(&"no_pr_link".to_owned()));
+        assert!(!out.atomic_snapshot);
     }
 }
