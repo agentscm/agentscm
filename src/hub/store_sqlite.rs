@@ -4116,7 +4116,7 @@ fn briefing_page(
                AND w.repository_id IS ?4 AND w.id > ?5 AND v.event_seq = (
                    SELECT MAX(v2.event_seq) FROM hub_work_versions v2
                    WHERE v2.work = w.id AND v2.event_seq <= ?6)
-               AND v.state <> 'finished' AND NOT {settled}
+               AND v.state <> 'finished' AND (w.reservation_basis IS NOT NULL OR NOT {settled})
              ORDER BY w.id LIMIT ?7"
         ))?;
         let snapshots = statement
@@ -5967,7 +5967,7 @@ impl SqliteStore {
             let mut statement = tx.prepare(&format!(
                 "SELECT w.snapshot, w.reservation_basis IS NOT NULL FROM hub_work_items w
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
-                   AND w.state <> 'finished' AND NOT {settled} ORDER BY w.id LIMIT ?5"
+                   AND w.state <> 'finished' AND (w.reservation_basis IS NOT NULL OR NOT {settled}) ORDER BY w.id LIMIT ?5"
             ))?;
             statement
                 .query_map(
@@ -5989,7 +5989,7 @@ impl SqliteStore {
             &format!(
                 "SELECT COUNT(*) FROM hub_work_items w
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
-                   AND w.state <> 'finished' AND {settled}"
+                   AND w.state <> 'finished' AND w.reservation_basis IS NULL AND {settled}"
             ),
             params![
                 who.owner.identity.provider,

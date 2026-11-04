@@ -429,6 +429,48 @@ async fn mcp(
     })
 }
 
+/// Provider details remain available through the full HTTP/CLI view. The MCP summary never
+/// silently drops condition state: oversized summaries explicitly report omitted content.
+fn work_reconciliation_summary(mut value: Value) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("evidence");
+                for child in map.values_mut() {
+                    strip(child);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    strip(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(&mut value);
+    let mut complete = true;
+    if value.to_string().len() > 24 * 1024 {
+        complete = false;
+        let target = if value.get("view").is_some() {
+            value.get_mut("view").expect("view exists")
+        } else {
+            &mut value
+        };
+        for name in ["retained", "current"] {
+            if let Some(row) = target.get_mut(name).and_then(Value::as_object_mut) {
+                row.remove("conditions");
+                row.remove("links");
+                row.remove("reassessments");
+            }
+        }
+        if let Some(map) = target.as_object_mut() {
+            map.remove("declarations");
+        }
+    }
+    json!({"view":value,"summary_complete":complete,"evidence_omitted":true,"details":"Read the full Work declarations or reconciliation-v2 endpoint, or the corresponding agentscm work command."})
+}
+
 fn read_only_call(method: &str, params: Option<&Value>) -> bool {
     matches!(
         method,
@@ -451,6 +493,8 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_change_record"
                     | "agentscm_pr_context"
                     | "agentscm_work_pr_link"
+                    | "agentscm_work_declarations"
+                    | "agentscm_work_reconciliation"
                     | "agentscm_shared_conversation"
                     | "agentscm_workflow_status"
                     | "agentscm_work_search"
@@ -736,6 +780,17 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         "description":"Read the explicit caller-reported PR relationship for one Work item. Compare expected_updated_seq with the Work version you read. A link is not branch inference, current provider identity, or approval. Reading does not acknowledge Catch up.",
         "annotations":{"readOnlyHint":true},
         "inputSchema":schema(json!({"work_id":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"expected_head":{"type":"string"}}), &["work_id"])});
+    let pr_target_schema = json!({"type":"object","additionalProperties":false,"required":["repository_id","number","head_sha"],"properties":{"repository_id":{"type":"integer","minimum":1},"number":{"type":"integer","minimum":1},"head_sha":{"type":"string","pattern":"^([a-f0-9]{40}|[a-f0-9]{64})$"}}});
+    let work_declarations = json!({"name":"agentscm_work_declarations","description":"Read durable caller-declared PR links and prerequisite conditions. Declarations are not provider evidence or completion. Reading changes nothing.","annotations":{"readOnlyHint":true},"inputSchema":schema(json!({"work_id":{"type":"string"}}), &["work_id"])});
+    let work_reconciliation = json!({"name":"agentscm_work_reconciliation","description":"Read durable prerequisite reconciliation. Only current is current evidence; retained is history. Missing or stale evidence stays explicit. This bounded summary omits detailed provider evidence; use the HTTP or CLI read for details. Reading never applies or acknowledges.","annotations":{"readOnlyHint":true},"inputSchema":schema(json!({"work_id":{"type":"string"}}), &["work_id"])});
+    let condition_schema = json!({"oneOf":[{"type":"object","additionalProperties":false,"required":["kind","work_id","target"],"properties":{"kind":{"const":"merged_pull_request"},"work_id":{"type":"string"},"target":pr_target_schema}},{"type":"object","additionalProperties":false,"required":["kind","work_id"],"properties":{"kind":{"const":"legacy_work"},"work_id":{"type":"string"}}}]});
+    let declaration_schema = json!({"type":"object","additionalProperties":false,"required":["links","prerequisites"],"properties":{"links":{"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"required":["id","target"],"properties":{"id":{"type":"string","maxLength":255},"target":pr_target_schema}}},"prerequisites":{"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"required":["id","requirement"],"properties":{"id":{"type":"string","maxLength":255},"requirement":condition_schema}}}}});
+    let mut reconciliation_fields = json!({"work_id":{"type":"string"},"operation_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"session":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1}});
+    let mut declaration_fields = reconciliation_fields.clone();
+    declaration_fields["declarations"] = declaration_schema;
+    let work_declarations_set = json!({"name":"agentscm_work_declarations_set","description":"Replace durable caller declarations as the current lead. Requires generation, session, updated_seq and retry-stable operation_id. Empty arrays explicitly clear; legacy PR-link updates do not erase this set.","inputSchema":schema(declaration_fields, &["work_id","operation_id","generation","session","expected_updated_seq","declarations"])});
+    reconciliation_fields["declaration_seq"] = json!({"type":"integer","minimum":1});
+    let work_reconciliation_apply = json!({"name":"agentscm_work_reconciliation_apply","description":"Explicitly reconcile retained server evidence against current Work and declarations. Current lead only, version fenced and replay safe. Never completes Work, releases reservations or rewrites reports. Use a new fenced apply after synchronization; retry identical operation_id after an uncertain response.","inputSchema":schema(reconciliation_fields, &["work_id","operation_id","generation","session","expected_updated_seq","declaration_seq"])});
     let work_pr_link_set = json!({"name":"agentscm_work_pr_link_set",
         "description":"Current Work lead explicitly sets or removes its PR relationship using stable repository identity and a source head SHA. Reuse operation_id on retry. Requires current generation, session and updated_seq; link:null removes. Does not verify, publish or approve source.",
         "inputSchema":schema(json!({"work_id":{"type":"string"},"operation_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"session":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"link":{"oneOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["repository_id","number","head_sha"],"properties":{"repository_id":{"type":"integer","minimum":1},"number":{"type":"integer","minimum":1},"head_sha":{"type":"string","pattern":"^([a-f0-9]{40}|[a-f0-9]{64})$"}}}]}}), &["work_id","operation_id","generation","session","expected_updated_seq","link"])});
@@ -827,6 +882,8 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             change_record,
             pr_context,
             work_pr_link,
+            work_declarations,
+            work_reconciliation,
             shared_conversation,
             insight,
             insights,
@@ -984,6 +1041,10 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         pr_context,
         work_pr_link,
         work_pr_link_set,
+        work_declarations,
+        work_declarations_set,
+        work_reconciliation,
+        work_reconciliation_apply,
         shared_conversation,
         insight,
         insights,
@@ -1591,6 +1652,10 @@ async fn call_inner(
             | "agentscm_pr_context"
             | "agentscm_work_pr_link"
             | "agentscm_work_pr_link_set"
+            | "agentscm_work_declarations"
+            | "agentscm_work_declarations_set"
+            | "agentscm_work_reconciliation"
+            | "agentscm_work_reconciliation_apply"
             | "agentscm_shared_conversation"
             | "agentscm_work_usage"
             | "agentscm_coordination_inbox"
@@ -1823,6 +1888,83 @@ async fn call_inner(
                 Ok(Some(value)) => structured(&value),
                 Ok(None) => refused("work insight not found"),
                 Err(error) => work_failure(&error),
+            },
+        );
+    }
+    if matches!(
+        name,
+        "agentscm_work_declarations" | "agentscm_work_reconciliation"
+    ) {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            work_id: String,
+        }
+        let args = match try_args::<Args>(arguments) {
+            Ok(v) => v,
+            Err(e) => return Ok(invalid_args(name, &e)),
+        };
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        let declarations = name == "agentscm_work_declarations";
+        return Ok(
+            match blocking(state, move || {
+                if declarations {
+                    Ok(store
+                        .work_declarations_get(&token, &args.work_id, unix_now())?
+                        .map(|v| serde_json::to_value(v).expect("Work view serializes")))
+                } else {
+                    Ok(store
+                        .work_reconciliation_get(&token, &args.work_id, unix_now())?
+                        .map(|v| serde_json::to_value(v).expect("Work view serializes")))
+                }
+            })
+            .await
+            {
+                Ok(Some(v)) => structured(&work_reconciliation_summary(v)),
+                Ok(None) => refused("work not found"),
+                Err(e) => work_failure(&e),
+            },
+        );
+    }
+    if name == "agentscm_work_declarations_set" {
+        let request =
+            match try_args::<super::work_reconciliation::WorkDeclarationsUpdate>(arguments) {
+                Ok(v) => v,
+                Err(e) => return Ok(invalid_args(name, &e)),
+            };
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        return Ok(
+            match blocking(state, move || {
+                store.work_declarations_set(&token, &request, unix_now())
+            })
+            .await
+            {
+                Ok(v) => structured(&work_reconciliation_summary(
+                    serde_json::to_value(v).expect("declarations serialize"),
+                )),
+                Err(e) => work_failure(&e),
+            },
+        );
+    }
+    if name == "agentscm_work_reconciliation_apply" {
+        let request = match try_args::<super::work_reconciliation::ReconciliationApply>(arguments) {
+            Ok(v) => v,
+            Err(e) => return Ok(invalid_args(name, &e)),
+        };
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        return Ok(
+            match blocking(state, move || {
+                store.work_reconciliation_apply(&token, &request, unix_now())
+            })
+            .await
+            {
+                Ok(v) => structured(&work_reconciliation_summary(
+                    serde_json::to_value(v).expect("reconciliation serializes"),
+                )),
+                Err(e) => work_failure(&e),
             },
         );
     }
@@ -3234,7 +3376,22 @@ async fn check(state: &HubState, principal: &Principal, call: SessionCall) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::safe_detail;
+    use super::{safe_detail, work_reconciliation_summary};
+
+    #[test]
+    fn reconciliation_summaries_bound_content_and_expose_omissions() {
+        let value = serde_json::json!({"work_id":"wrk_synthetic","current":{"conditions":vec![serde_json::json!({"id":"x".repeat(255),"state":"unknown"});100],"links":[],"reassessments":[],"next_action":"Read current evidence","evidence":{"private_details":"omitted"}},"retained":null});
+        let summary = work_reconciliation_summary(value);
+        assert_eq!(summary["summary_complete"], false);
+        assert_eq!(summary["evidence_omitted"], true);
+        assert!(summary.to_string().len() < 24 * 1024);
+        assert_eq!(
+            summary["view"]["current"]["next_action"],
+            "Read current evidence"
+        );
+        assert!(summary["view"]["current"].get("conditions").is_none());
+        assert!(!summary.to_string().contains("private_details"));
+    }
 
     #[test]
     fn invalid_argument_details_never_echo_input() {
