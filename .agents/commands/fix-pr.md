@@ -48,21 +48,19 @@ Present a compact table with source, file and line when available, summary, deci
 
 ### 4. Fix and validate
 
-Make focused changes and add or update deterministic synthetic tests when appropriate. Run:
+Make focused changes and add or update deterministic synthetic tests when appropriate. Before each push, run:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo nextest run --locked
-cargo test --locked --doc
 git diff --check
 ```
 
-When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`; when the container image or its inputs change, also run `docker build -t agentscm . && .github/docker-smoke.sh agentscm`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite for a fix round when this machine has a signing key; attestation is the one full run.
 
-All applicable checks must pass before committing. Report missing prerequisites and failures explicitly; do not describe an incomplete gate as successful verification.
+When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `.github/hub-e2e.sh default` only when `compose.hub.yaml`, `.github/compose.e2e.yaml` or `.github/hub-e2e.sh` change. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
 
-Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
+All applicable checks must pass before committing. Report missing prerequisites and failures explicitly; do not describe an incomplete check as successful verification. Applicable reviews remain required.
 
 ### 5. Commit, push, and verify
 
@@ -73,7 +71,7 @@ git rev-parse HEAD
 gh pr view --json headRefOid --jq .headRefOid
 ```
 
-A new head has no valid attestation, so after pushing run `tools/attest-pr.sh <PR#>` as in step 11 of `.agents/commands/pr.md` and report the result.
+A new head has no valid attestation, so it is not ready to merge until it is attested. Do not attest each intermediate push. Once the review feedback is settled, run `tools/attest-pr.sh <PR#>` as in step 11 of `.agents/commands/pr.md` on the final head of the last fix round and report the result. Until then, report the head as not ready, with no attestation.
 
 If nothing changed, do not create an empty commit.
 
