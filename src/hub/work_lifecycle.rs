@@ -3,33 +3,51 @@
 //! This module holds no store access. It decides which transitions an actor may request from a
 //! state and builds the `WorkOperationalV1` projection from facts the caller has already read.
 //! The design is in `docs/design/work-lifecycle.md`.
-// The store, routes and MCP tool that call this module arrive in the next phase of the same
-// change, so the items are unused in the library until then.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
 use super::work::{CheckpointKind, ClaimStatus, WorkItem, WorkState};
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 pub(super) const SCHEMA_VERSION_V1: u16 = 1;
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Largest number of reservation-holding Work in one operational overview.
 pub(super) const MAX_OPERATIONAL_WORK: usize = 100;
 
 /// Why a finished Work item ended. Stored beside `WorkState::Finished`, never as a state.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum TerminalOutcome {
+pub enum TerminalOutcome {
     Completed,
     Abandoned,
     Superseded,
 }
 
+impl TerminalOutcome {
+    /// The `hub_work_items.terminal_outcome` column value.
+    pub(super) fn column(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub(super) fn from_column(value: &str) -> Option<Self> {
+        match value {
+            "completed" => Some(Self::Completed),
+            "abandoned" => Some(Self::Abandoned),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+
 /// How a reservation was acquired. No reservation is represented by the absence of a basis.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ReservationBasis {
+pub enum ReservationBasis {
     /// Backfilled or left behind by a pause or handover without an explicit decision.
     #[serde(rename = "implicit")]
     LegacyImplicit,
@@ -37,9 +55,29 @@ pub(super) enum ReservationBasis {
     Retained,
 }
 
+impl ReservationBasis {
+    /// The `hub_work_items.reservation_basis` column value.
+    pub(super) fn column(self) -> &'static str {
+        match self {
+            Self::LegacyImplicit => "legacy_implicit",
+            Self::Admitted => "admitted",
+            Self::Retained => "retained",
+        }
+    }
+
+    pub(super) fn from_column(value: &str) -> Option<Self> {
+        match value {
+            "legacy_implicit" => Some(Self::LegacyImplicit),
+            "admitted" => Some(Self::Admitted),
+            "retained" => Some(Self::Retained),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum WorkTransitionKind {
+pub enum WorkTransitionKind {
     Release,
     Retain,
     Complete,
@@ -49,6 +87,7 @@ pub(super) enum WorkTransitionKind {
 }
 
 impl WorkTransitionKind {
+    #[allow(dead_code)] // read by the projection, which the next phase wires in
     pub(super) const ALL: [Self; 6] = [
         Self::Release,
         Self::Retain,
@@ -58,6 +97,7 @@ impl WorkTransitionKind {
         Self::Reopen,
     ];
 
+    #[allow(dead_code)] // read by the projection, which the next phase wires in
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
@@ -72,7 +112,7 @@ impl WorkTransitionKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum WorkActorKind {
+pub enum WorkActorKind {
     Lead,
     Owner,
     Admin,
@@ -81,7 +121,7 @@ pub(super) enum WorkActorKind {
 /// How the actor authenticated. Only an agent session can become the lead of reopened Work.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ActorVia {
+pub enum ActorVia {
     Agent,
     Person,
 }
@@ -132,6 +172,7 @@ pub(super) fn decide_transition(
     }
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Transitions the state allows, sorted by wire name, without regard to who may request them.
 pub(super) fn remedies(state: WorkState, reservation_held: bool) -> Vec<WorkTransitionKind> {
     let mut found: Vec<_> = WorkTransitionKind::ALL
@@ -154,6 +195,7 @@ pub(super) fn remedies(state: WorkState, reservation_held: bool) -> Vec<WorkTran
     found
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum OutcomeValue {
@@ -168,13 +210,14 @@ pub(super) enum OutcomeValue {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum OutcomeProvenance {
+pub enum OutcomeProvenance {
     AgentReport,
     Person,
     Admin,
     Unknown,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// A stored outcome with who stated it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct OutcomeFact {
@@ -182,6 +225,7 @@ pub(super) struct OutcomeFact {
     pub(super) provenance: OutcomeProvenance,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OutcomeV1 {
@@ -189,6 +233,7 @@ pub(super) struct OutcomeV1 {
     pub(super) provenance: OutcomeProvenance,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ReservationStatus {
@@ -196,6 +241,7 @@ pub(super) enum ReservationStatus {
     None,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// The holder is the lead agent and session only. No token identifier is ever exposed.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +253,7 @@ pub(super) struct ReservationV1 {
     pub(super) holder_session: Option<String>,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReportV1 {
@@ -214,12 +261,14 @@ pub(super) struct ReportV1 {
     pub(super) kind: CheckpointKind,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ActivityStatus {
     Unknown,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ActivityV1 {
@@ -227,6 +276,7 @@ pub(super) struct ActivityV1 {
     pub(super) reason: String,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum MergeStatus {
@@ -235,6 +285,7 @@ pub(super) enum MergeStatus {
     Unknown,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MergeV1 {
@@ -242,6 +293,7 @@ pub(super) struct MergeV1 {
     pub(super) status: MergeStatus,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Recipient {
@@ -251,6 +303,7 @@ pub(super) enum Recipient {
     None,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ActionableV1 {
@@ -258,6 +311,7 @@ pub(super) struct ActionableV1 {
     pub(super) reason: String,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// A transition the state allows. Whether this caller may request it is decided on request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -266,6 +320,7 @@ pub(super) struct RemedyV1 {
     pub(super) requires_authorization: bool,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CompletenessV1 {
@@ -273,6 +328,7 @@ pub(super) struct CompletenessV1 {
     pub(super) unknown: Vec<String>,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WorkOperationalV1 {
@@ -293,6 +349,7 @@ pub(super) struct WorkOperationalV1 {
     pub(super) completeness: CompletenessV1,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OperationalOverviewV1 {
@@ -302,6 +359,7 @@ pub(super) struct OperationalOverviewV1 {
     pub(super) complete: bool,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Facts the caller read for one Work item.
 pub(super) struct OperationalFacts<'a> {
     pub(super) item: &'a WorkItem,
@@ -311,9 +369,11 @@ pub(super) struct OperationalFacts<'a> {
     pub(super) merge: MergeStatus,
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 const ACTIVITY_UNKNOWN_REASON: &str =
     "Activity is not observed; no lease or activity report exists yet.";
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV1 {
     let item = facts.item;
     let finished = item.state == WorkState::Finished;
@@ -398,6 +458,7 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
     }
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 fn actionable(
     state: WorkState,
     held: bool,
@@ -427,6 +488,7 @@ fn actionable(
     }
 }
 
+#[allow(dead_code)] // read by the projection, which the next phase wires in
 /// Orders by Work id and bounds the list. `more` says the caller already dropped some Work.
 pub(super) fn operational_overview(
     mut work: Vec<WorkOperationalV1>,

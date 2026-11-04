@@ -46,6 +46,10 @@ use super::work::{
 };
 use super::work_links::{WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView};
 use super::work_preflight::WorkPreflightResult;
+use super::work_transition::{
+    WorkLifecycleReader, WorkLifecycleView, WorkTransitionActor, WorkTransitionRequest,
+    WorkTransitionResult,
+};
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
@@ -727,6 +731,21 @@ pub trait Store: Send + Sync {
         update: &WorkPrLinkUpdate,
         now: i64,
     ) -> Result<WorkPrLinkResult>;
+    /// Release, retain, finish or reopen Work as its lead, owner or an administrator. One
+    /// transaction, idempotent by `operation_id`, fenced by generation and `updated_seq`.
+    fn work_transition(
+        &self,
+        actor: &WorkTransitionActor<'_>,
+        request: &WorkTransitionRequest,
+        now: i64,
+    ) -> Result<WorkTransitionResult>;
+    /// The stored outcome, its provenance and the reservation basis of one Work item.
+    fn work_lifecycle(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<WorkLifecycleView>>;
 
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).

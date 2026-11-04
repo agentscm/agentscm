@@ -7,7 +7,12 @@ use std::thread;
 use std::time::Duration;
 
 use agentscm::hub::HubError;
+use agentscm::hub::User;
 use agentscm::hub::catchup::{CatchupPreviewQuery, CatchupQuery};
+use agentscm::hub::coordination::{
+    CoordinationAck, CoordinationReply, CoordinationResponseKind, CoordinationStatus,
+    CoordinationWithdraw,
+};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
 };
@@ -18,6 +23,10 @@ use agentscm::hub::work::{
 };
 use agentscm::hub::work_links::{
     WorkPrHeadStatus, WorkPrLinkQuery, WorkPrLinkTarget, WorkPrLinkUpdate, WorkPrSnapshotStatus,
+};
+use agentscm::hub::work_transition::{
+    OutcomeProvenance, TerminalOutcome, WorkLifecycleReader, WorkTransitionActor,
+    WorkTransitionKind, WorkTransitionRequest,
 };
 use hub_pg::PgSchema;
 use postgres::NoTls;
@@ -191,7 +200,8 @@ impl Db {
                        WHERE w.provider = 'github' AND w.host = 'github.com'
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                          AND e.kind IN
-                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')";
+                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link',
+                             'work_transition')";
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
             let used: i64 = client
@@ -251,7 +261,7 @@ impl Db {
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
                             AND e.kind IN ('work_started', 'work_joined', 'work_takeover',
-                                           'work_checkpoint', 'work_pr_link')
+                                           'work_checkpoint', 'work_pr_link', 'work_transition')
                      )",
                     rusqlite::params![REPO, REPOSITORY_ID],
                     |row| row.get(0),
@@ -293,6 +303,47 @@ impl Db {
                 .query_row(&format!("{sql}?1"), [id], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })
+                .unwrap()
+        }
+    }
+
+    /// Runs a query and returns every column as text, with NULL as the empty string.
+    fn rows(&self, sql: &str) -> Vec<Vec<String>> {
+        if self._pg.is_some() {
+            postgres::Client::connect(&self.url, NoTls)
+                .unwrap()
+                .simple_query(sql)
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| match message {
+                    postgres::SimpleQueryMessage::Row(row) => Some(
+                        (0..row.len())
+                            .map(|index| row.get(index).unwrap_or("").to_owned())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            Ok(match row.get::<_, rusqlite::types::Value>(index)? {
+                                rusqlite::types::Value::Null => String::new(),
+                                rusqlite::types::Value::Integer(value) => value.to_string(),
+                                rusqlite::types::Value::Text(value) => value,
+                                other => format!("{other:?}"),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
                 .unwrap()
         }
     }
@@ -2108,6 +2159,19 @@ conformance!(
     announce_intent_refuses_fenced_and_finished_sessions_but_not_unlinked_ones,
     helper_join_on_finished_work_acquires_nothing,
     unreserved_work_needs_fresh_admission_to_be_taken_over,
+    transition_matrix_covers_every_actor_and_kind,
+    transition_state_rules_refuse_without_mutation,
+    transition_refuses_foreign_read_only_and_unrelated_callers,
+    owner_and_admin_act_after_the_lead_token_is_revoked,
+    release_alone_leaves_no_outcome_and_frees_the_scope,
+    old_session_after_release_is_fenced_and_not_reacquired,
+    concurrent_release_checkpoint_and_reopen_have_one_winner,
+    transition_retries_replay_after_later_transitions,
+    reopen_conflicts_on_overlap_and_fences_the_old_session,
+    responded_request_stays_responded_after_release,
+    release_succeeds_at_payload_quota_and_retain_refuses,
+    compaction_runs_after_transition_events_exist,
+    abandoned_work_is_not_a_reported_completion,
 );
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
@@ -3375,4 +3439,1148 @@ fn unreserved_work_needs_fresh_admission_to_be_taken_over(db: &Db) {
         db.reservation(&released.id),
         (None, Some("admitted".into()))
     );
+}
+
+// Work transitions: release, retain, finish and reopen.
+
+fn user_of(store: &dyn Store, who: &Agent) -> User {
+    store.user_by_id(&who.owner).unwrap().unwrap()
+}
+
+fn person(user: &User, is_admin: bool) -> WorkTransitionActor<'_> {
+    WorkTransitionActor::Person {
+        user,
+        repository: REPO,
+        repository_id: REPOSITORY_ID,
+        is_admin,
+    }
+}
+
+fn by_agent(who: &Agent) -> WorkTransitionActor<'_> {
+    WorkTransitionActor::Agent { token: &who.token }
+}
+
+fn transition_request(
+    item: &agentscm::hub::work::WorkItem,
+    operation_id: &str,
+    transition: WorkTransitionKind,
+    session: Option<&str>,
+) -> WorkTransitionRequest {
+    WorkTransitionRequest {
+        work_id: item.id.clone(),
+        operation_id: operation_id.into(),
+        generation: item.generation,
+        expected_updated_seq: item.updated_seq,
+        session: session.map(str::to_owned),
+        transition,
+        reason: "synthetic reason".into(),
+        superseded_by: None,
+    }
+}
+
+fn start_in(
+    store: &dyn Store,
+    who: &Agent,
+    key: &str,
+    session: &str,
+    scope: &str,
+    now: i64,
+) -> agentscm::hub::work::WorkItem {
+    let mut start = native_start(key, key, session);
+    start.scope = vec![scope.into()];
+    let result = store.work_start(&who.token, &start, now).unwrap();
+    assert!(result.created, "{key} should be created");
+    result.item
+}
+
+fn current_item(
+    store: &dyn Store,
+    who: &Agent,
+    id: &str,
+    now: i64,
+) -> agentscm::hub::work::WorkItem {
+    store.work_get(&who.token, id, now).unwrap().unwrap()
+}
+
+fn transition_events(store: &dyn Store) -> Vec<serde_json::Value> {
+    store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == "work_transition")
+        .map(|event| serde_json::from_str(&event.data).unwrap())
+        .collect()
+}
+
+/// Holds `path` for the token's named session, the way a hook or MCP session does.
+fn announce(store: &dyn Store, who: &Agent, session: &str, path: &str, now: i64) {
+    store
+        .touch_session(
+            &who.token,
+            &agentscm::hub::session::SessionCall {
+                session: Some(session.into()),
+                via: "mcp".into(),
+                task: Some("edit".into()),
+                paths: vec![path.into()],
+                deny: false,
+                report: false,
+            },
+            now,
+        )
+        .unwrap();
+}
+
+fn transition_matrix_covers_every_actor_and_kind(db: &Db) {
+    use WorkTransitionKind::{Abandon, Complete, Release, Reopen, Retain, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    // Columns: lead, owner agent, owner person, administrator.
+    let table = [
+        (Release, [true, true, true, true]),
+        (Retain, [true, true, true, false]),
+        (Complete, [true, true, true, false]),
+        (Abandon, [true, true, true, true]),
+        (Supersede, [true, true, true, true]),
+        (Reopen, [true, true, false, false]),
+    ];
+    let mut n = 0_i64;
+    for (kind, allowed) in table {
+        for (column, allowed) in allowed.into_iter().enumerate() {
+            n += 1;
+            let lead_session = format!("lead-s{n}");
+            let mut item = start_in(
+                &*store,
+                &alice,
+                &format!("m{n}"),
+                &lead_session,
+                &format!("m{n}/**"),
+                now + n,
+            );
+            let other = start_in(
+                &*store,
+                &alice,
+                &format!("o{n}"),
+                &format!("other-s{n}"),
+                &format!("o{n}/**"),
+                now + n,
+            );
+            if kind == Reopen {
+                item = lead_checkpoint(
+                    &*store,
+                    &alice,
+                    &item,
+                    "fin",
+                    &lead_session,
+                    CheckpointKind::Finish,
+                    now + n,
+                )
+                .item;
+            }
+            let session = [Some(lead_session.as_str()), Some("owner-s"), None, None][column];
+            let mut request = transition_request(&item, "op", kind, session);
+            if kind == Supersede {
+                request.superseded_by = Some(other.id.clone());
+            }
+            let actor = match column {
+                0 => by_agent(&alice),
+                1 => by_agent(&alice_b),
+                2 => person(&owner, false),
+                _ => person(&admin, true),
+            };
+            let before = serde_json::to_value(&item).unwrap();
+            let before_columns = db.reservation(&item.id);
+            let seq = store.latest_event_seq().unwrap();
+            let outcome = store.work_transition(&actor, &request, now + 100 + n);
+            let label = format!("{kind:?} column {column}");
+            if !allowed {
+                assert!(matches!(outcome, Err(HubError::Invalid(_))), "{label}");
+                assert_eq!(
+                    serde_json::to_value(current_item(&*store, &alice, &item.id, now + 200))
+                        .unwrap(),
+                    before,
+                    "{label}"
+                );
+                assert_eq!(db.reservation(&item.id), before_columns, "{label}");
+                assert_eq!(store.latest_event_seq().unwrap(), seq, "{label}");
+                continue;
+            }
+            let result = outcome.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert!(result.conflict.is_none(), "{label}");
+            let receipt = result.receipt.unwrap();
+            assert!(!receipt.replayed, "{label}");
+            let after = result.item;
+            assert_eq!(receipt.generation, after.generation, "{label}");
+            // Reports stay where their author left them.
+            assert_eq!(after.current, item.current, "{label}");
+            assert_eq!(after.blocker, item.blocker, "{label}");
+            let lead = column == 0;
+            match kind {
+                Release => {
+                    assert_eq!(after.state, WorkState::Paused, "{label}");
+                    assert_eq!(after.generation, item.generation + 1, "{label}");
+                    assert_eq!(db.reservation(&item.id), (None, None), "{label}");
+                }
+                Retain => {
+                    assert_eq!(after.state, WorkState::Active, "{label}");
+                    assert_eq!(after.generation, item.generation, "{label}");
+                    assert_eq!(
+                        db.reservation(&item.id),
+                        (None, Some("retained".into())),
+                        "{label}"
+                    );
+                }
+                Complete | Abandon | Supersede => {
+                    assert_eq!(after.state, WorkState::Finished, "{label}");
+                    assert_eq!(
+                        after.generation,
+                        item.generation + i64::from(!lead),
+                        "{label}"
+                    );
+                    let name = match kind {
+                        Complete => "completed",
+                        Abandon => "abandoned",
+                        _ => "superseded",
+                    };
+                    assert_eq!(
+                        db.reservation(&item.id),
+                        (Some(name.into()), None),
+                        "{label}"
+                    );
+                    assert_eq!(
+                        after.related_work.contains(&other.id),
+                        kind == Supersede,
+                        "{label}"
+                    );
+                }
+                Reopen => {
+                    assert_eq!(after.state, WorkState::Active, "{label}");
+                    assert_eq!(after.generation, item.generation + 1, "{label}");
+                    assert_eq!(
+                        db.reservation(&item.id),
+                        (None, Some("admitted".into())),
+                        "{label}"
+                    );
+                    assert_eq!(after.lead_session, session.unwrap(), "{label}");
+                    assert_eq!(
+                        after.lead_token,
+                        if lead { &alice.token } else { &alice_b.token }.as_str(),
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn transition_state_rules_refuse_without_mutation(db: &Db) {
+    use WorkTransitionKind::{Complete, Release, Reopen, Retain, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let other = start_in(&*store, &alice, "b", "s-b", "lib/**", now);
+    let try_it = |item: &agentscm::hub::work::WorkItem,
+                  op: &str,
+                  kind,
+                  edit: &dyn Fn(&mut WorkTransitionRequest)| {
+        let mut request = transition_request(item, op, kind, Some("s-a"));
+        edit(&mut request);
+        store.work_transition(&by_agent(&alice), &request, now + 5)
+    };
+    let invalid =
+        |result: Result<_, HubError>| assert!(matches!(result, Err(HubError::Invalid(_))));
+    // Reopen needs finished Work; a stale generation or sequence is fenced.
+    invalid(try_it(&item, "r0", Reopen, &|_| {}));
+    invalid(try_it(&item, "g", Retain, &|r| r.generation += 1));
+    invalid(try_it(&item, "q", Retain, &|r| r.expected_updated_seq -= 1));
+    // Supersede names an existing, different Work of the repository.
+    invalid(try_it(&item, "s0", Supersede, &|_| {}));
+    invalid(try_it(&item, "s1", Supersede, &|r| {
+        r.superseded_by = Some(item.id.clone())
+    }));
+    invalid(try_it(&item, "s2", Supersede, &|r| {
+        r.superseded_by = Some(format!("wrk_{:032x}", 7))
+    }));
+    invalid(try_it(&item, "s3", Complete, &|r| {
+        r.superseded_by = Some(other.id.clone())
+    }));
+    invalid(try_it(&item, "e", Complete, &|r| r.reason = String::new()));
+    assert_eq!(
+        current_item(&*store, &alice, &item.id, now + 6).updated_seq,
+        item.updated_seq
+    );
+    // Released Work holds nothing to release or retain again.
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 6,
+        )
+        .unwrap()
+        .item;
+    for (op, kind) in [("rel2", Release), ("ret", Retain)] {
+        let request = transition_request(&released, op, kind, Some("s-a"));
+        invalid(store.work_transition(&by_agent(&alice), &request, now + 7));
+    }
+    let missing = WorkTransitionRequest {
+        work_id: format!("wrk_{:032x}", 9),
+        ..transition_request(&released, "missing", Release, Some("s-a"))
+    };
+    assert_invalid(
+        store.work_transition(&by_agent(&alice), &missing, now + 7),
+        "unknown work item",
+    );
+}
+
+fn transition_refuses_foreign_read_only_and_unrelated_callers(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release, Retain};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let read_only = agent_with(
+        &*store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id: 1,
+            repository: REPO,
+            repository_id: Some(REPOSITORY_ID),
+            read_only: true,
+            ttl: TTL,
+        },
+    );
+    let carol = agent(&*store, 3);
+    let carol_user = user_of(&*store, &carol);
+    let bob_user = user_of(&*store, &bob);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let before = serde_json::to_value(&item).unwrap();
+    let before_columns = db.reservation(&item.id);
+    let seq = store.latest_event_seq().unwrap();
+    for kind in [Release, Retain, Abandon] {
+        let mut request = transition_request(&item, "op", kind, Some("s-a"));
+        let attempts = [
+            store.work_transition(&by_agent(&bob), &request, now + 1),
+            store.work_transition(&by_agent(&read_only), &request, now + 1),
+            store.work_transition(
+                &person(&carol_user, false),
+                &{
+                    request.session = None;
+                    request.clone()
+                },
+                now + 1,
+            ),
+            // A foreign person who claims the flag still holds no standing in an owner check,
+            // but an administrator is allowed to abandon and release.
+        ];
+        for (index, attempt) in attempts.into_iter().enumerate() {
+            assert!(
+                matches!(attempt, Err(HubError::Unauthorized)),
+                "{kind:?} caller {index}"
+            );
+        }
+    }
+    // A cross-owner person without the admin flag is refused even for read access to the repository.
+    let request = transition_request(&item, "op", Abandon, None);
+    assert!(matches!(
+        store.work_transition(&person(&bob_user, false), &request, now + 1),
+        Err(HubError::Unauthorized)
+    ));
+    assert_eq!(
+        serde_json::to_value(current_item(&*store, &alice, &item.id, now + 2)).unwrap(),
+        before
+    );
+    assert_eq!(db.reservation(&item.id), before_columns);
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+}
+
+fn owner_and_admin_act_after_the_lead_token_is_revoked(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let helper = agent(&*store, 2);
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    let first = start_in(&*store, &alice, "a", "default", "src/**", now);
+    let second = start_in(&*store, &alice, "b", "default2", "lib/**", now);
+    assert!(
+        store
+            .work_start(
+                &helper.token,
+                &join(&first.id, "default", WorkRole::Helper),
+                now + 1
+            )
+            .unwrap()
+            .joined
+    );
+    announce(&*store, &alice, "default", "src/a.rs", now + 2);
+    announce(&*store, &helper, "default", "src/b.rs", now + 2);
+    assert_eq!(store.live_intents(REPO, now + 3, 10).unwrap().len(), 2);
+    assert!(store.revoke_agent_token(&alice.token).unwrap());
+
+    let item = current_item(&*store, &helper, &first.id, now + 4);
+    let released = store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&item, "owner-release", Release, None),
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(released.item.state, WorkState::Paused);
+    assert_eq!(released.item.current, item.current);
+    assert_eq!(released.item.blocker, item.blocker);
+    // The lead's and the helper's claims are both gone.
+    let live = store.live_intents(REPO, now + 5, 10).unwrap();
+    assert!(
+        live.is_empty(),
+        "{:?}",
+        live.iter()
+            .map(|i| (i.agent.clone(), i.session.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    let second = current_item(&*store, &helper, &second.id, now + 5);
+    store
+        .work_transition(
+            &person(&admin, true),
+            &transition_request(&second, "admin-abandon", Abandon, None),
+            now + 5,
+        )
+        .unwrap();
+    let events = transition_events(&*store);
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0]["actor"],
+        serde_json::json!({
+            "kind": "owner", "id": owner.id, "login": owner.login, "via": "person"
+        })
+    );
+    assert_eq!(events[0]["lead"]["agent"], "agent1");
+    assert_eq!(events[0]["lead"]["session"], "default");
+    assert_eq!(events[1]["actor"]["kind"], "admin");
+    assert_eq!(events[1]["actor"]["login"], admin.login.as_str());
+    assert_eq!(events[1]["reason"], "synthetic reason");
+    assert_eq!(events[1]["prior_state"], "active");
+    let text = serde_json::to_string(&events).unwrap();
+    assert!(
+        !text.contains(&alice.token),
+        "the audit event must not hold a token id"
+    );
+    let lifecycle = |reader: WorkLifecycleReader<'_>, id: &str| {
+        store.work_lifecycle(&reader, id, now + 6).unwrap().unwrap()
+    };
+    let view = lifecycle(WorkLifecycleReader::Token(&helper.token), &second.id);
+    assert_eq!(view.outcome, Some(TerminalOutcome::Abandoned));
+    assert_eq!(view.provenance, Some(OutcomeProvenance::Admin));
+}
+
+fn release_alone_leaves_no_outcome_and_frees_the_scope(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 1,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(
+        (released.state, released.generation),
+        (WorkState::Paused, 2)
+    );
+    assert_eq!(db.reservation(&item.id), (None, None));
+    // Unfinished and unreserved: another start on the scope succeeds.
+    let taken = start_in(&*store, &bob, "b", "s-b", "src/**", now + 2);
+    assert_ne!(taken.id, item.id);
+    let still = current_item(&*store, &alice, &item.id, now + 3);
+    assert_eq!(still.state, WorkState::Paused);
+    assert_eq!(db.reservation(&item.id), (None, None));
+    // Fresh admission of the released Work is now an overlap with bob.
+    let resume = store
+        .work_start(&alice.token, &takeover(&item.id, "s-a", Some(2)), now + 4)
+        .unwrap();
+    assert_eq!(
+        resume.conflict.map(|conflict| conflict.kind),
+        Some(WorkConflictKind::ScopeOverlap)
+    );
+    assert_eq!(db.reservation(&item.id), (None, None));
+}
+
+fn old_session_after_release_is_fenced_and_not_reacquired(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let item = start_in(&*store, &alice, "a", "default", "src/**", now);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("default")),
+            now + 1,
+        )
+        .unwrap()
+        .item;
+    let mut stale = checkpoint(
+        &item.id,
+        "late",
+        item.generation,
+        "default",
+        CheckpointKind::Progress,
+        "late",
+    );
+    stale.expected_updated_seq = Some(released.updated_seq);
+    assert!(matches!(
+        store.work_checkpoint(&alice.token, &stale, now + 2),
+        Err(HubError::Invalid(_))
+    ));
+    // An ordinary start by the same session returns the Work and takes nothing.
+    let again = store
+        .work_start(
+            &alice.token,
+            &start_with(None, "a", "default", Some(&item.id), WorkRole::Lead),
+            now + 3,
+        )
+        .unwrap();
+    assert!(!again.took_over);
+    assert_eq!(db.reservation(&item.id), (None, None));
+    assert!(matches!(
+        store.announce_intent(
+            &alice.token,
+            &agentscm::hub::intent::NewIntent {
+                id: format!("int_{:032x}", 5),
+                task: "edit".into(),
+                branch: None,
+                base: None,
+                machine: None,
+                paths: vec!["src/a.rs".into()],
+                ttl_seconds: 600
+            },
+            now + 4
+        ),
+        Err(HubError::Invalid(_))
+    ));
+    // An explicit resume at the new generation is a fresh admission.
+    let resumed = store
+        .work_start(
+            &alice.token,
+            &takeover(&item.id, "default", Some(released.generation)),
+            now + 5,
+        )
+        .unwrap();
+    assert!(resumed.took_over);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+}
+
+fn concurrent_release_checkpoint_and_reopen_have_one_winner(db: &Db) {
+    use WorkTransitionKind::{Release, Reopen};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let item = start_in(&*store, &alice, "a", "lead-s", "src/**", now);
+
+    // Release against a checkpoint, both built from the same read.
+    let release = transition_request(&item, "race-release", Release, Some("lead-s"));
+    let mut progress = checkpoint(
+        &item.id,
+        "race-progress",
+        item.generation,
+        "lead-s",
+        CheckpointKind::Progress,
+        "newer report",
+    );
+    progress.expected_updated_seq = Some(item.updated_seq);
+    let barrier = Arc::new(Barrier::new(2));
+    let release_handle = {
+        let (connection, barrier, token) = (db.open(), barrier.clone(), alice.token.clone());
+        thread::spawn(move || {
+            barrier.wait();
+            connection.work_transition(
+                &WorkTransitionActor::Agent { token: &token },
+                &release,
+                now + 1,
+            )
+        })
+    };
+    let progress_handle = {
+        let (connection, barrier, token) = (db.open(), barrier.clone(), alice.token.clone());
+        thread::spawn(move || {
+            barrier.wait();
+            connection.work_checkpoint(&token, &progress, now + 1)
+        })
+    };
+    let (released, progressed) = (
+        release_handle.join().unwrap(),
+        progress_handle.join().unwrap(),
+    );
+    assert_eq!(
+        usize::from(released.is_ok()) + usize::from(progressed.is_ok()),
+        1
+    );
+    let after = current_item(&*store, &alice, &item.id, now + 2);
+    if released.is_ok() {
+        assert_eq!(db.reservation(&item.id), (None, None));
+        assert_eq!(after.generation, 2);
+        assert!(
+            after.current.is_none(),
+            "the refused report must not be written"
+        );
+    } else {
+        assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+        assert_eq!(after.generation, 1);
+        assert_eq!(after.current.unwrap().summary, "newer report");
+    }
+    // Nothing resurrects a reservation afterwards.
+    let before = db.reservation(&item.id);
+    let _ = store.work_checkpoint(
+        &alice.token,
+        &checkpoint(
+            &item.id,
+            "again",
+            1,
+            "lead-s",
+            CheckpointKind::Progress,
+            "x",
+        ),
+        now + 3,
+    );
+    assert_eq!(db.reservation(&item.id).1.is_some(), before.1.is_some());
+
+    // Two reopens of the same finished Work: one lead, one refusal.
+    let other = start_in(&*store, &alice, "b", "lead-b", "lib/**", now + 4);
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &other,
+        "fin",
+        "lead-b",
+        CheckpointKind::Finish,
+        now + 5,
+    )
+    .item;
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [(&alice, "lead-b"), (&alice_b, "owner-b")].map(|(who, session)| {
+        let (connection, barrier, token) = (db.open(), barrier.clone(), who.token.clone());
+        let request = transition_request(&finished, "race-reopen", Reopen, Some(session));
+        let request = WorkTransitionRequest {
+            operation_id: format!("race-reopen-{session}"),
+            ..request
+        };
+        thread::spawn(move || {
+            barrier.wait();
+            connection.work_transition(
+                &WorkTransitionActor::Agent { token: &token },
+                &request,
+                now + 6,
+            )
+        })
+    });
+    let results = handles.map(|handle| handle.join().unwrap());
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    let settled = current_item(&*store, &alice, &other.id, now + 7);
+    assert_eq!(settled.generation, finished.generation + 1);
+    assert_eq!(settled.lead_session, winner.item.lead_session);
+    assert_eq!(db.reservation(&other.id), (None, Some("admitted".into())));
+    assert_eq!(
+        settled
+            .participants
+            .iter()
+            .filter(|p| p.role == WorkRole::Lead)
+            .count(),
+        1
+    );
+}
+
+fn transition_retries_replay_after_later_transitions(db: &Db) {
+    use WorkTransitionKind::{Complete, Release, Reopen, Retain, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let target = start_in(&*store, &alice, "t", "s-t", "lib/**", now);
+    let mut at = now;
+    let mut step = |actor: WorkTransitionActor<'_>,
+                    op: &str,
+                    kind,
+                    session: Option<&str>,
+                    by: Option<&str>| {
+        at += 1;
+        let current = current_item(&*store, &alice_b, &item.id, at);
+        let mut request = transition_request(&current, op, kind, session);
+        request.superseded_by = by.map(str::to_owned);
+        let result = store.work_transition(&actor, &request, at).unwrap();
+        (request, result.receipt.unwrap())
+    };
+    let history = [
+        step(by_agent(&alice), "t-retain", Retain, Some("s-a"), None),
+        step(person(&owner, false), "t-release", Release, None, None),
+        step(
+            by_agent(&alice_b),
+            "t-complete",
+            Complete,
+            Some("owner-s"),
+            None,
+        ),
+        step(by_agent(&alice), "t-reopen", Reopen, Some("s-a"), None),
+        step(
+            person(&admin, true),
+            "t-supersede",
+            Supersede,
+            None,
+            Some(&target.id),
+        ),
+    ];
+    let actors = [
+        by_agent(&alice),
+        person(&owner, false),
+        by_agent(&alice_b),
+        by_agent(&alice),
+        person(&admin, true),
+    ];
+    let state = serde_json::to_value(current_item(&*store, &alice_b, &item.id, at + 1)).unwrap();
+    let columns = db.reservation(&item.id);
+    let seq = store.latest_event_seq().unwrap();
+    let usage = db.work_usage_and_aggregate();
+    for ((request, receipt), actor) in history.iter().zip(actors) {
+        let replay = store.work_transition(&actor, request, at + 2).unwrap();
+        let replayed = replay.receipt.unwrap();
+        assert!(replayed.replayed, "{}", request.operation_id);
+        assert_eq!(replayed.event_seq, receipt.event_seq);
+        assert_eq!(replayed.generation, receipt.generation);
+        assert_eq!(serde_json::to_value(&replay.item).unwrap(), state);
+        // Changed fields under the same operation are refused.
+        let mut changed = request.clone();
+        changed.reason = "different reason".into();
+        assert_invalid(
+            store.work_transition(&actor, &changed, at + 3),
+            "operation_id was already used for another request",
+        );
+    }
+    assert_eq!(db.reservation(&item.id), columns);
+    assert_eq!(columns, (Some("superseded".into()), None));
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+    assert_eq!(db.work_usage_and_aggregate(), usage);
+    assert_eq!(
+        db.work_usage_and_aggregate().0,
+        db.work_usage_and_aggregate().1
+    );
+}
+
+fn reopen_conflicts_on_overlap_and_fences_the_old_session(db: &Db) {
+    use WorkTransitionKind::Reopen;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &item,
+        "fin",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 1,
+    )
+    .item;
+    let blocker = start_in(&*store, &bob, "b", "s-b", "src/**", now + 2);
+
+    let before = serde_json::to_value(&finished).unwrap();
+    let seq = store.latest_event_seq().unwrap();
+    let request = transition_request(&finished, "reopen", Reopen, Some("s-a"));
+    let result = store
+        .work_transition(&by_agent(&alice), &request, now + 3)
+        .unwrap();
+    assert!(result.receipt.is_none());
+    assert_eq!(
+        result.conflict.as_ref().map(|c| c.kind),
+        Some(WorkConflictKind::ScopeOverlap)
+    );
+    assert_eq!(result.conflict.unwrap().overlaps[0].item.id, blocker.id);
+    assert_eq!(serde_json::to_value(&result.item).unwrap(), before);
+    assert_eq!(db.reservation(&item.id), (Some("completed".into()), None));
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+
+    // Once the overlap is gone, the owner's other agent reopens and leads under a new session.
+    lead_checkpoint(
+        &*store,
+        &bob,
+        &blocker,
+        "fin-b",
+        "s-b",
+        CheckpointKind::Finish,
+        now + 4,
+    );
+    let request = transition_request(&finished, "reopen-2", Reopen, Some("s-new"));
+    let reopened = store
+        .work_transition(&by_agent(&alice_b), &request, now + 5)
+        .unwrap();
+    assert!(reopened.conflict.is_none());
+    let item_after = reopened.item;
+    assert_eq!(
+        (item_after.state, item_after.generation),
+        (WorkState::Active, 2)
+    );
+    assert_eq!(item_after.lead_session, "s-new");
+    assert_eq!(item_after.lead_token, alice_b.token);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+    let roles: Vec<_> = item_after
+        .participants
+        .iter()
+        .map(|p| (p.session.as_str(), p.role))
+        .collect();
+    assert!(roles.contains(&("s-new", WorkRole::Lead)));
+    assert!(roles.contains(&("s-a", WorkRole::Helper)));
+    // The previous session is fenced.
+    let mut stale = checkpoint(&item.id, "old", 1, "s-a", CheckpointKind::Progress, "old");
+    stale.expected_updated_seq = Some(item_after.updated_seq);
+    assert!(matches!(
+        store.work_checkpoint(&alice.token, &stale, now + 6),
+        Err(HubError::Invalid(_))
+    ));
+
+    // The reopened Work is ordinary: once stale, another agent takes it over.
+    let later = now + CLAIM_STALE_SECONDS + 10;
+    let taken = store
+        .work_start(&bob.token, &takeover(&item.id, "s-bob", Some(2)), later)
+        .unwrap();
+    assert!(taken.took_over);
+    assert_eq!(taken.item.generation, 3);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+}
+
+fn responded_request_stays_responded_after_release(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    let ask = |who: &Agent, key: &str, at: i64| {
+        let mut start = native_start(key, key, &format!("s-{key}"));
+        start.scope = vec!["src/**".into()];
+        store
+            .work_start(&who.token, &start, at)
+            .unwrap()
+            .coordination_request
+            .unwrap()
+    };
+    let first = ask(&bob, "b", now + 1);
+    let second = ask(&carol, "c", now + 2);
+    let ack = CoordinationAck {
+        request_id: first.id.clone(),
+        target_work_id: Some(item.id.clone()),
+        session: "s-a".into(),
+        expected_updated_seq: first.updated_seq,
+    };
+    let acked = store.coordination_ack(&alice.token, &ack, now + 3).unwrap();
+    let responded = store
+        .coordination_reply(
+            &alice.token,
+            &CoordinationReply {
+                request_id: first.id.clone(),
+                operation_id: "reply".into(),
+                target_work_id: item.id.clone(),
+                session: "s-a".into(),
+                expected_updated_seq: acked.updated_seq,
+                kind: CoordinationResponseKind::Join,
+                note: None,
+                via_hub: false,
+            },
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(responded.status, CoordinationStatus::Responded);
+
+    let current = current_item(&*store, &alice, &item.id, now + 5);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-a")),
+            now + 5,
+        )
+        .unwrap();
+    let statuses = db.rows(&format!(
+        "SELECT id, status FROM hub_coordination_requests WHERE id IN ('{}', '{}') ORDER BY id",
+        first.id, second.id
+    ));
+    let mut expected = vec![
+        vec![first.id.clone(), "responded".to_owned()],
+        vec![second.id.clone(), "pending".to_owned()],
+    ];
+    expected.sort();
+    assert_eq!(statuses, expected);
+    let released: Vec<_> = store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "coordination_target_released")
+        .map(|event| event.subject)
+        .collect();
+    let mut want = vec![first.id.clone(), second.id.clone()];
+    want.sort();
+    let mut got = released;
+    got.sort();
+    assert_eq!(got, want);
+    // The requester can still withdraw its own request afterwards; nothing was closed for it.
+    let refreshed = store
+        .coordination_list(&bob.token, &Default::default(), now + 6)
+        .unwrap();
+    let mine = refreshed
+        .requests
+        .iter()
+        .find(|r| r.id == first.id)
+        .unwrap();
+    store
+        .coordination_withdraw(
+            &bob.token,
+            &CoordinationWithdraw {
+                request_id: first.id.clone(),
+                operation_id: "withdraw".into(),
+                session: "s-b".into(),
+                expected_updated_seq: mine.updated_seq,
+            },
+            now + 7,
+        )
+        .unwrap();
+}
+
+fn release_succeeds_at_payload_quota_and_retain_refuses(db: &Db) {
+    use WorkTransitionKind::{Release, Retain};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    db.sql(&format!(
+        "UPDATE hub_work_usage SET charged_bytes = {WORK_PAYLOAD_CAPACITY_BYTES}
+         WHERE repository = '{REPO}'"
+    ));
+    let seq = store.latest_event_seq().unwrap();
+    assert!(matches!(
+        store.work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "ret", Retain, Some("s-a")),
+            now + 1
+        ),
+        Err(HubError::WorkCapacity)
+    ));
+    assert_eq!(store.latest_event_seq().unwrap(), seq);
+    assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
+
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&item, "rel", Release, Some("s-a")),
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(released.item.state, WorkState::Paused);
+    assert_eq!(db.reservation(&item.id), (None, None));
+    let charged: i64 = db.rows(&format!(
+        "SELECT charged_bytes FROM hub_work_usage WHERE repository = '{REPO}'"
+    ))[0][0]
+        .parse()
+        .unwrap();
+    assert!(
+        charged > WORK_PAYLOAD_CAPACITY_BYTES,
+        "cleanup is recorded, not refused"
+    );
+}
+
+fn compaction_runs_after_transition_events_exist(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release};
+    let store = db.open();
+    let now = unix_now();
+    let old = now - 3 * 86_400;
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let item = start_in(&*store, &alice, "a", "s-a", "src/**", old);
+    let mut start = native_start("b", "b", "s-b");
+    start.scope = vec!["src/**".into()];
+    let request = store
+        .work_start(&bob.token, &start, old + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let current = current_item(&*store, &alice, &item.id, old + 2);
+    let released = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-a")),
+            old + 2,
+        )
+        .unwrap()
+        .item;
+    let mut abandon = transition_request(&released, "abandon", Abandon, Some("s-a"));
+    abandon.generation = released.generation;
+    store
+        .work_transition(&by_agent(&alice), &abandon, old + 3)
+        .unwrap();
+    let mine = store
+        .coordination_list(&bob.token, &Default::default(), old + 4)
+        .unwrap();
+    let mine = mine.requests.iter().find(|r| r.id == request.id).unwrap();
+    store
+        .coordination_withdraw(
+            &bob.token,
+            &CoordinationWithdraw {
+                request_id: request.id.clone(),
+                operation_id: "withdraw".into(),
+                session: "s-b".into(),
+                expected_updated_seq: mine.updated_seq,
+            },
+            old + 5,
+        )
+        .unwrap();
+    assert_eq!(transition_events(&*store).len(), 2);
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    let compacted = store.work_compact(&scope, now - 86_400, true, now).unwrap();
+    assert!(compacted.applied);
+    assert!(compacted.deleted_operations >= 1);
+    assert_eq!(compacted.deleted_coordination_requests, 1);
+    assert!(
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "coordination_target_released")
+    );
+}
+
+fn abandoned_work_is_not_a_reported_completion(db: &Db) {
+    use WorkTransitionKind::{Abandon, Complete, Supersede};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let alice_b = another_token(&*store, &alice, "agent-b");
+    let admin_agent = agent(&*store, 9);
+    let owner = user_of(&*store, &alice);
+    let admin = user_of(&*store, &admin_agent);
+    let reader = WorkLifecycleReader::Token(&alice.token);
+    let make =
+        |key: &str, scope: &str| start_in(&*store, &alice, key, &format!("s-{key}"), scope, now);
+    let finished = make("f", "f/**");
+    let abandoned = make("a", "a/**");
+    let superseded = make("s", "s/**");
+    let completed = make("c", "c/**");
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &finished,
+        "fin",
+        "s-f",
+        CheckpointKind::Finish,
+        now + 1,
+    );
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&abandoned, "x", Abandon, None),
+            now + 1,
+        )
+        .unwrap();
+    let mut request = transition_request(&superseded, "x", Supersede, None);
+    request.superseded_by = Some(completed.id.clone());
+    store
+        .work_transition(&person(&admin, true), &request, now + 1)
+        .unwrap();
+    store
+        .work_transition(
+            &by_agent(&alice_b),
+            &transition_request(&completed, "x", Complete, Some("owner-s")),
+            now + 1,
+        )
+        .unwrap();
+    let expect = [
+        (
+            &finished,
+            Some(TerminalOutcome::Completed),
+            OutcomeProvenance::AgentReport,
+            true,
+        ),
+        (
+            &abandoned,
+            Some(TerminalOutcome::Abandoned),
+            OutcomeProvenance::Person,
+            false,
+        ),
+        (
+            &superseded,
+            Some(TerminalOutcome::Superseded),
+            OutcomeProvenance::Admin,
+            false,
+        ),
+        (
+            &completed,
+            Some(TerminalOutcome::Completed),
+            OutcomeProvenance::AgentReport,
+            true,
+        ),
+    ];
+    for (item, outcome, provenance, reported) in expect {
+        let view = store
+            .work_lifecycle(&reader, &item.id, now + 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (view.outcome, view.provenance),
+            (outcome, Some(provenance)),
+            "{}",
+            item.title
+        );
+        assert_eq!(view.basis, None);
+        let insight = store
+            .work_insight(&alice.token, &item.id, now + 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(insight.state, WorkState::Finished);
+        assert_eq!(insight.reported_finished, reported, "{}", item.title);
+    }
+    // Recent outcomes list only reported completions and decisions, not transitions.
+    let overview = store
+        .work_overview(&alice.token, &Default::default(), now + 3)
+        .unwrap();
+    let recent: Vec<_> = overview
+        .recent
+        .iter()
+        .map(|outcome| outcome.item.id.as_str())
+        .collect();
+    assert!(recent.contains(&finished.id.as_str()));
+    assert!(!recent.contains(&abandoned.id.as_str()));
+    assert!(!recent.contains(&superseded.id.as_str()));
+    assert!(!recent.contains(&completed.id.as_str()));
+    // Pre-existing finished Work with no stored outcome reads as unstated.
+    db.sql(&format!(
+        "UPDATE hub_work_items SET terminal_outcome = NULL WHERE id = '{}'",
+        abandoned.id
+    ));
+    let view = store
+        .work_lifecycle(&reader, &abandoned.id, now + 4)
+        .unwrap()
+        .unwrap();
+    assert_eq!((view.outcome, view.provenance), (None, None));
 }

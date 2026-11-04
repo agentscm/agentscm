@@ -113,6 +113,10 @@ use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
 };
 use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
+use super::work_transition::{
+    self, WorkLifecycleReader, WorkLifecycleView, WorkTransitionActor, WorkTransitionRequest,
+    WorkTransitionResult,
+};
 use super::{HubError, Result};
 use crate::local_ci::DeviceAuthorization;
 
@@ -1700,8 +1704,17 @@ fn pg_insight_input(
         publications_complete = false;
     }
     project_claim(tx, &mut item, now)?;
+    let terminal_outcome = tx
+        .query_one(
+            "SELECT terminal_outcome FROM hub_work_items WHERE id = $1",
+            &[&item.id],
+        )?
+        .get::<_, Option<String>>(0)
+        .as_deref()
+        .and_then(work_transition::TerminalOutcome::from_column);
     Ok(InsightInput {
         usage: pg_usage_summary(tx, &item.id, group_limit)?,
+        terminal_outcome,
         item,
         history,
         history_complete: rows.len() <= MAX_HISTORY && !retention_gap,
@@ -1977,7 +1990,7 @@ fn work_payload_bytes(
                    FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                     AND w.repository_id IS NOT DISTINCT FROM $4
-                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
+                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
                  UNION ALL
                  SELECT octet_length(r.proposed_scope)::bigint
                         + octet_length(r.proposed_title)::bigint + 256
@@ -2122,6 +2135,26 @@ fn adjust_work_payload_capacity(
     delta: i64,
     now: i64,
 ) -> Result<()> {
+    charge_work_payload(tx, who, delta, now, true)
+}
+
+/// Cleanup such as a release records its size even at quota, so the accounting stays exact.
+fn record_work_payload_delta(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    delta: i64,
+    now: i64,
+) -> Result<()> {
+    charge_work_payload(tx, who, delta, now, false)
+}
+
+fn charge_work_payload(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    delta: i64,
+    now: i64,
+    enforce: bool,
+) -> Result<()> {
     let used: Option<i64> = tx
         .query_opt(
             "SELECT charged_bytes FROM hub_work_usage
@@ -2136,7 +2169,9 @@ fn adjust_work_payload_capacity(
         )?
         .map(|row| row.get(0));
     let used = used.unwrap_or(0);
-    check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+    if enforce {
+        check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+    }
     let charged = used
         .checked_add(delta)
         .filter(|charged| *charged >= 0)
@@ -8588,6 +8623,278 @@ impl Store for PgStore {
         })
     }
 
+    fn work_transition(
+        &self,
+        actor: &WorkTransitionActor<'_>,
+        request: &WorkTransitionRequest,
+        now: i64,
+    ) -> Result<WorkTransitionResult> {
+        request.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = match actor {
+                WorkTransitionActor::Agent { token } => work_who(&mut tx, token, now)?,
+                WorkTransitionActor::Person {
+                    user,
+                    repository,
+                    repository_id,
+                    ..
+                } => {
+                    if user.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(user, repository, *repository_id)
+                }
+            };
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            let via = match actor {
+                WorkTransitionActor::Agent { .. } => work_transition::ActorVia::Agent,
+                WorkTransitionActor::Person { .. } => work_transition::ActorVia::Person,
+            };
+            lock_work_capacity(&mut tx, &who)?;
+            lock_repository(&mut tx, &who.repository)?;
+            let mut item = scoped_work(&mut tx, &who, &request.work_id, now, true)?
+                .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+            let envelope = request.envelope(via, &who.owner.id)?;
+            if let Some(row) = tx.query_opt(
+                "SELECT o.request, v.snapshot, o.event_seq FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
+                 WHERE o.work = $1 AND o.operation_id = $2",
+                &[&item.id, &request.operation_id],
+            )? {
+                let previous: String = row.get(0);
+                if previous != envelope {
+                    return Err(HubError::Invalid(
+                        "operation_id was already used for another request".into(),
+                    ));
+                }
+                let snapshot: String = row.get(1);
+                let committed: WorkItem = json_value(&snapshot)?;
+                let event_seq: i64 = row.get(2);
+                tx.commit()?;
+                return Ok(WorkTransitionResult {
+                    item,
+                    receipt: Some(CheckpointReceipt {
+                        work_id: request.work_id.clone(),
+                        operation_id: request.operation_id.clone(),
+                        generation: committed.generation,
+                        event_seq,
+                        replayed: true,
+                    }),
+                    conflict: None,
+                });
+            }
+            let acting =
+                work_transition::classify(&item, &who, actor, request.session.as_deref())?
+                    .ok_or(HubError::Unauthorized)?;
+            let columns_row = tx.query_one(
+                "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = $1",
+                &[&item.id],
+            )?;
+            let outcome_column: Option<String> = columns_row.get(0);
+            let basis_column: Option<String> = columns_row.get(1);
+            let held = basis_column.is_some();
+            work_transition::check(&item, held, &acting, request)?;
+            if let Some(by) = &request.superseded_by {
+                relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
+            }
+            if request.transition == work_transition::WorkTransitionKind::Reopen {
+                // Reopening is a fresh admission whatever the client checked beforehand.
+                let overlaps =
+                    work_scope_overlaps(&mut tx, &who, &item.scope, Some(&item.id), now)?;
+                if let Some(first) = overlaps.first() {
+                    let conflict = WorkStartConflict {
+                        kind: WorkConflictKind::ScopeOverlap,
+                        current_generation: first.item.generation,
+                        overlaps,
+                    };
+                    return Ok(WorkTransitionResult {
+                        item,
+                        receipt: None,
+                        conflict: Some(conflict),
+                    });
+                }
+            }
+            let prior = work_transition::Prior {
+                state: item.state,
+                basis: basis_column
+                    .as_deref()
+                    .and_then(work_transition::ReservationBasis::from_column),
+                outcome: outcome_column
+                    .as_deref()
+                    .and_then(work_transition::TerminalOutcome::from_column),
+                generation: item.generation,
+                lead_agent: item.lead_agent.clone(),
+                lead_session: item.lead_session.clone(),
+            };
+            let claim_sessions = work_transition::claim_sessions(&item);
+            let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
+            let columns = work_transition::apply(&mut item, request, &acting, now)?;
+            let event = work_transition::event(&item, request, &acting, &prior, &columns)?;
+            let seq = append(&mut tx, &event)?;
+            item.updated_seq = seq;
+            let snapshot = save_work_version(&mut tx, &item, seq)?;
+            set_work_reservation(
+                &mut tx,
+                &item.id,
+                columns.outcome.map(work_transition::TerminalOutcome::column),
+                columns.basis.map(work_transition::ReservationBasis::column),
+            )?;
+            if request.superseded_by.is_some() {
+                replace_relations(
+                    &mut tx,
+                    &who,
+                    &item.id,
+                    &item.depends_on,
+                    &item.related_work,
+                )?;
+            }
+            if request.transition == work_transition::WorkTransitionKind::Reopen {
+                tx.execute(
+                    "UPDATE hub_work_participants SET role = 'helper', updated_at = $2
+                     WHERE work = $1 AND role = 'lead'",
+                    &[&item.id, &now],
+                )?;
+                tx.execute(
+                    "INSERT INTO hub_work_participants
+                        (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, 'lead', $6, $7, $7)
+                     ON CONFLICT (work, token, session) DO UPDATE SET role = 'lead',
+                        owner = excluded.owner, agent = excluded.agent,
+                        generation = excluded.generation, updated_at = excluded.updated_at",
+                    &[
+                        &item.id,
+                        &item.lead_token,
+                        &acting.user_id,
+                        &item.lead_agent,
+                        &item.lead_session,
+                        &item.generation,
+                        &now,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO hub_work_checkpoint_ops (work, operation_id, request, event_seq)
+                 VALUES ($1, $2, $3, $4)",
+                &[&item.id, &request.operation_id, &envelope, &seq],
+            )?;
+            let mut delta = work_transition_payload_bytes(&snapshot, &event)?
+                .checked_sub(previous_item_bytes)
+                .and_then(|bytes| bytes.checked_add(work_payload_row_bytes(envelope.len()).ok()?))
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            if work_transition::releases_claims(request.transition) {
+                for (token, session) in &claim_sessions {
+                    release_session_intent(&mut tx, token, session, now)?;
+                }
+                // Open requests keep their status: a response stays a response, and nothing resolves.
+                let open = tx.query(
+                    "SELECT r.id, r.status, r.proposed_work FROM hub_coordination_requests r
+                     JOIN hub_coordination_targets t ON t.request = r.id
+                     WHERE t.work = $1 AND r.status IN ('pending', 'responded')
+                     ORDER BY r.id",
+                    &[&item.id],
+                )?;
+                for row in open {
+                    let id: String = row.get(0);
+                    let status: String = row.get(1);
+                    let proposed_work: Option<String> = row.get(2);
+                    let released =
+                        work_transition::released_target_event(&id, &item, request, &acting)?;
+                    let released_seq = append(&mut tx, &released)?;
+                    save_coordination_version(
+                        &mut tx,
+                        &id,
+                        parse_status(&status)?,
+                        proposed_work.as_deref(),
+                        now,
+                        released_seq,
+                    )?;
+                    delta = delta
+                        .checked_add(coordination_payload_bytes(&[""], &released)?)
+                        .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+                }
+                record_work_payload_delta(&mut tx, &who, delta, now)?;
+            } else {
+                adjust_work_payload_capacity(&mut tx, &who, delta, now)?;
+            }
+            tx.commit()?;
+            Ok(WorkTransitionResult {
+                receipt: Some(CheckpointReceipt {
+                    work_id: item.id.clone(),
+                    operation_id: request.operation_id.clone(),
+                    generation: item.generation,
+                    event_seq: seq,
+                    replayed: false,
+                }),
+                item,
+                conflict: None,
+            })
+        })
+    }
+
+    fn work_lifecycle(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<WorkLifecycleView>> {
+        super::work::validate_id("work", id, "wrk")?;
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => work_transition::person_who(owner, repository, *repository_id),
+            };
+            let Some(item) = scoped_work(&mut tx, &who, id, now, false)? else {
+                return Ok(None);
+            };
+            let row = tx.query_one(
+                "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = $1",
+                &[&id],
+            )?;
+            let outcome: Option<String> = row.get(0);
+            let basis: Option<String> = row.get(1);
+            let outcome = outcome
+                .as_deref()
+                .and_then(work_transition::TerminalOutcome::from_column);
+            let provenance = if outcome.is_some() && item.state == WorkState::Finished {
+                let latest = tx.query_opt(
+                    "SELECT kind, data FROM hub_events
+                     WHERE subject = $1 AND kind IN ('work_checkpoint', 'work_transition')
+                     ORDER BY seq DESC LIMIT 1",
+                    &[&id],
+                )?;
+                Some(
+                    latest.map_or(work_transition::OutcomeProvenance::Unknown, |row| {
+                        let kind: String = row.get(0);
+                        let data: String = row.get(1);
+                        work_transition::provenance_from_event(&kind, &data)
+                    }),
+                )
+            } else {
+                None
+            };
+            tx.commit()?;
+            Ok(Some(WorkLifecycleView {
+                work_id: id.to_owned(),
+                outcome,
+                provenance,
+                basis: basis
+                    .as_deref()
+                    .and_then(work_transition::ReservationBasis::from_column),
+            }))
+        })
+    }
+
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
         self.run(true, |client| {
             let mut tx = client.transaction()?;
@@ -10525,7 +10832,7 @@ impl Store for PgStore {
                          SELECT MAX(e.seq) FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
                            'coordination_requested','coordination_bound','coordination_retargeted',
                            'coordination_acknowledged','coordination_responded',
-                           'coordination_resolved','coordination_withdrawn'))
+                           'coordination_resolved','coordination_withdrawn','coordination_target_released'))
                      FROM hub_coordination_requests r
                      WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
                        AND r.repository_id IS NOT DISTINCT FROM $4
@@ -10533,12 +10840,12 @@ impl Store for PgStore {
                        AND EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
                            'coordination_requested','coordination_bound','coordination_retargeted',
                            'coordination_acknowledged','coordination_responded',
-                           'coordination_resolved','coordination_withdrawn'))
+                           'coordination_resolved','coordination_withdrawn','coordination_target_released'))
                        AND NOT EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id
                            AND e.kind IN ('coordination_requested','coordination_bound',
                              'coordination_retargeted','coordination_acknowledged',
                              'coordination_responded','coordination_resolved',
-                             'coordination_withdrawn') AND e.at >= $5)",
+                             'coordination_withdrawn','coordination_target_released') AND e.at >= $5)",
                     &[
                         &scope.provider,
                         &scope.host,
@@ -10613,7 +10920,7 @@ impl Store for PgStore {
                          JOIN hub_work_items w ON w.id = e.subject
                          WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                            AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
+                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
                            AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                            AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                         &[
@@ -10630,7 +10937,7 @@ impl Store for PgStore {
                      WHERE w.id = e.subject
                        AND w.provider = $1 AND w.host = $2 AND w.repository = $3
                        AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                     &[
@@ -10709,7 +11016,7 @@ impl Store for PgStore {
                         "DELETE FROM hub_events WHERE subject=$1 AND kind IN (
                            'coordination_requested','coordination_bound','coordination_retargeted',
                            'coordination_acknowledged','coordination_responded',
-                           'coordination_resolved','coordination_withdrawn') AND at < $2",
+                           'coordination_resolved','coordination_withdrawn','coordination_target_released') AND at < $2",
                         &[request, &before],
                     )?;
                 }

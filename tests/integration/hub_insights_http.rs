@@ -5,6 +5,9 @@ use std::sync::Arc;
 use agentscm::backend::LocalBackend;
 use agentscm::hub::insights::{MAX_OBSERVATIONS, UsageRecord};
 use agentscm::hub::store::{ForgeIdentity, Store, mint_bound_agent_token, unix_now};
+use agentscm::hub::work_transition::{
+    WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+};
 use agentscm::hub::{HubState, router, store};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -356,19 +359,26 @@ async fn stale_finished_checkpoint_replays_do_not_report_completion() {
         .await;
     assert_eq!(status, StatusCode::OK, "{finished}");
 
-    // Finished work accepts no checkpoint or takeover; the transition that reopens it is a
-    // separate operation. Stage the state a reopen leaves: active, generation two, same lead.
-    rusqlite::Connection::open(hub._directory.path().join("hub.sqlite"))
-        .unwrap()
-        .execute_batch(&format!(
-            "UPDATE hub_work_items SET state = 'active', generation = 2,
-                 terminal_outcome = NULL, reservation_basis = 'admitted',
-                 snapshot = json_set(snapshot, '$.state', 'active', '$.generation', 2)
-             WHERE id = '{id}';
-             UPDATE hub_work_participants SET generation = 2 WHERE work = '{id}';"
-        ))
+    // Finished work accepts no checkpoint or takeover; reopening it is a separate transition.
+    let reopened = hub
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token_id },
+            &WorkTransitionRequest {
+                work_id: id.to_owned(),
+                operation_id: "reopen-generation-two".into(),
+                generation: 1,
+                expected_updated_seq: finished["item"]["updated_seq"].as_i64().unwrap(),
+                session: Some("surface-session".into()),
+                transition: WorkTransitionKind::Reopen,
+                reason: "continue after review".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
         .unwrap();
-    let reopened = json!({"item": hub.store.work_get(&token_id, id, unix_now()).unwrap().unwrap()});
+    assert!(reopened.conflict.is_none());
+    let reopened = json!({"item": reopened.item});
     assert_eq!(reopened["item"]["generation"], 2);
     assert_eq!(reopened["item"]["state"], "active");
 
