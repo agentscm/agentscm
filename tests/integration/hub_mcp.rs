@@ -3004,4 +3004,8 @@ async fn a_same_lead_start_on_released_work_is_not_ready_for_work() {
             .contains("takeover_generation"),
         "{again}"
     );
+    // Resuming is conditional on the Work being the caller's owner's; otherwise ask its owner.
+    let step = content["alternatives"][0].as_str().unwrap();
+    assert!(step.contains("If it is your owner's Work"), "{step}");
+    assert!(step.contains("otherwise ask its owner"), "{step}");
 }

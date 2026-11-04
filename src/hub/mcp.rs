@@ -3058,7 +3058,7 @@ fn start_result(
             "Make the agreed scope or participation change before continuing.",
         ],
         None if unreserved => &[
-            "This work holds no reservation, so this start did not claim its scope; resume it by retrying the work id with takeover_generation set to current_generation.",
+            "This work holds no reservation, so this start did not claim its scope. If it is your owner's Work, resume it by retrying the work id with takeover_generation set to current_generation; otherwise ask its owner to resume it.",
             "Use a new stable work identity instead if the work should not be resumed.",
         ],
         None if paused => &[
