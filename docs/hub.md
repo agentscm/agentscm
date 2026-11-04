@@ -514,7 +514,7 @@ body or query string is a 400 with a fixed body.
   idempotent: it writes no event and sends no notice (only the expiry moves, as
   a renewal, if `ttl_s` gives a different one). A changed announce of the same
   id replaces it and notices only the intents that overlap a path added by the
-  change. An id held by another token, or one that was released, is a 400 whose `message` says "intent was released" or "intent id is in use". An announce is also a 400 with a `message` that names the Work and says to resume it when a path lies in the scope of unfinished Work that the token no longer holds (see [stand-up](standup.md)). When a Work is released, finished or abandoned, the Hub releases the live intents of its participant sessions and, if the Work held a reservation, the token's session-less intents that overlap its scope, except those another Work with an eligible session of the token covers.
+  change. An id held by another token, or one that was released, is a 400; a released id also carries the `message` "intent was released". An announce is also a 400 with a `message` that names the Work and says to resume it when a path lies in the scope of unfinished Work that the token no longer holds (see [stand-up](standup.md)). When a Work is released, finished or abandoned, the Hub releases the live intents of its participant sessions and, if the Work held a reservation, the token's session-less intents that overlap its scope, except those another Work with an eligible session of the token covers.
 - `GET /v1/hub/repos/{repo}/intents` returns `{"intents": [I...], "truncated":
   bool}`: the live intents, by id, at most 1000.
 - `POST /v1/hub/repos/{repo}/intents/{id}/renew` with `{ttl_s}` returns

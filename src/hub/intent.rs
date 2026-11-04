@@ -559,8 +559,14 @@ async fn announce(
     })
     .await
     .map_err(|error| match error {
-        // The refusal says what to do: a released id, or Work to resume.
-        HubError::Invalid(message) => ApiError::invalid().with_message(message),
+        // Only the two refusals that tell the client what to do carry their text; every other
+        // validation failure keeps the fixed body.
+        HubError::Invalid(message)
+            if message == "intent was released"
+                || message.starts_with("These files are in the scope of Work ") =>
+        {
+            ApiError::invalid().with_message(message)
+        }
         other => ApiError::from(other),
     })?;
     NOTICES.notify_waiters();
