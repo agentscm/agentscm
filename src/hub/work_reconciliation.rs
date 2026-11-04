@@ -244,6 +244,8 @@ pub struct PullEvidence {
     pub observed_at_ms: Option<i64>,
     pub observed_state: String,
     pub observed_head: Option<String>,
+    #[serde(default)]
+    pub observed_merge_sha: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -402,6 +404,28 @@ fn digest(value: &impl Serialize) -> String {
         &serde_json::to_string(value).expect("reconciliation serializes")
     ])
 }
+/// A retained individual provider read can qualify a publication's otherwise unverified head.
+/// The observation key is already bound to the stable repository and PR; validate its payload too.
+pub(super) fn merged_observation(
+    number: i64,
+    value: &serde_json::Value,
+) -> Option<(String, String)> {
+    if value["observation_conflict"] == true
+        || value["number"].as_i64() != Some(number)
+        || value["state"] != "closed"
+        || value["merged"] != true
+    {
+        return None;
+    }
+    let sha = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|s| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+    };
+    Some((sha("head_sha")?, sha("merge_commit_sha")?))
+}
+
 pub(super) fn pull_evidence(
     target: WorkPrLinkTarget,
     merges: Vec<super::catchup::CatchupMergeObservation>,
@@ -425,12 +449,17 @@ pub(super) fn pull_evidence(
         observed_at_ms: None,
         observed_state: "unobserved".into(),
         observed_head: None,
+        observed_merge_sha: None,
     };
     if let Some((data, at, deleted)) = observation {
         out.observed_at_ms = Some(at);
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+            let merged = merged_observation(out.target.number, &v);
+            out.observed_merge_sha = merged.as_ref().map(|(_, commit)| commit.clone());
             out.observed_state = if v["observation_conflict"] == true {
                 "ambiguous"
+            } else if merged.is_some() {
+                "merged"
             } else if v["state"] == "closed" && v["merged"] == false {
                 "closed_unmerged"
             } else if !deleted && v["state"] == "open" {
@@ -463,27 +492,38 @@ fn disposition(
             limits.push("unbound_legacy_condition".into());
             ConditionState::Unknown
         }
-        Some(p)
-            if p.merges.len() == 1
-                && p.merges[0]
-                    .head_sha
-                    .eq_ignore_ascii_case(&p.target.head_sha) =>
-        {
-            if p.merges[0].occurred_at_seconds.is_none() {
+        Some(p) if !p.merges.is_empty() => {
+            let head = if p.merges.len() != 1 {
+                limits.push("ambiguous_merge_evidence".into());
+                None
+            } else {
+                let merge = &p.merges[0];
+                if merge.source == "forge_pull" {
+                    Some(merge.head_sha.as_str())
+                } else if p.observed_state == "merged"
+                    && p.observed_merge_sha
+                        .as_deref()
+                        .is_some_and(|sha| sha.eq_ignore_ascii_case(&merge.merge_sha))
+                {
+                    p.observed_head.as_deref()
+                } else {
+                    limits.push("merge_head_unconfirmed".into());
+                    None
+                }
+            };
+            if p.merges.iter().any(|m| m.occurred_at_seconds.is_none()) {
                 limits.push("merge_time_unknown".into());
             }
-            ConditionState::Satisfied
-        }
-        Some(p) if !p.merges.is_empty() => {
-            limits.push(
-                if p.merges.len() > 1 {
-                    "ambiguous_merge_evidence"
-                } else {
-                    "merge_head_changed"
+            match head {
+                Some(head) if head.eq_ignore_ascii_case(&p.target.head_sha) => {
+                    ConditionState::Satisfied
                 }
-                .into(),
-            );
-            ConditionState::Unknown
+                Some(_) => {
+                    limits.push("merge_head_changed".into());
+                    ConditionState::Unknown
+                }
+                None => ConditionState::Unknown,
+            }
         }
         Some(p) => {
             if evidence.merge_floor > 0 {

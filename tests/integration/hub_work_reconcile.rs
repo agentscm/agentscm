@@ -1710,3 +1710,231 @@ fn postgres_durable_reconciliation_actors_checkpoint_race() {
         reconciliation_actors(&f);
     }
 }
+
+/// Exercise the real publication-update projection, whose saved commit is not a provider head.
+fn publication_head_provenance(fixture: &StoreFixture) {
+    use agentscm::hub::publish::{Create, NewPublication, Update, derive_id};
+    use agentscm::hub::work_reconciliation::{
+        ConditionState, PrerequisiteCondition, PrerequisiteRequirement, WorkDeclarations,
+        WorkDeclarationsUpdate,
+    };
+    let mut ctx = setup(fixture);
+    let cases = [
+        ("absent", None, false, false),
+        ("actual-b", Some((HEAD_B, true)), false, false),
+        ("actual-a", Some((HEAD_A, true)), false, false),
+        ("wrong-merge", Some((HEAD_A, false)), false, false),
+        ("malformed", Some(("short", true)), false, false),
+        ("wrong-number", Some((HEAD_A, true)), true, false),
+        ("ambiguous", Some((HEAD_A, true)), false, true),
+    ];
+    for (index, (name, observation, wrong_number, ambiguous)) in cases.into_iter().enumerate() {
+        let number = 910 + index as i64;
+        let branch = format!("publication-{number}");
+        let merge_sha = format!("{number:040x}");
+        let prerequisite = ctx.start(
+            &format!("prereq-{name}"),
+            &format!("src/prereq-{name}"),
+            &[],
+        );
+        let work = ctx.start(
+            &format!("work-{name}"),
+            &format!("src/work-{name}"),
+            &[&prerequisite],
+        );
+        ctx.link(&prerequisite, number, HEAD_A);
+        let publication = NewPublication {
+            id: derive_id(REPOSITORY, 3, HEAD_A, &branch),
+            manifest: serde_json::from_value(json!({
+                "revision":"a".repeat(64),"event_seq":3,"commit":HEAD_A,
+                "tree":"c".repeat(40),"parent":"d".repeat(40),"branch":branch,
+                "base":"main","title":"Synthetic publication","body":"","message":"message\n",
+                "author":{"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+                "committer":{"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+                "changes":[{"path":"src/a.rs","mode":"100644","blob":"e".repeat(40),"sha256":"f".repeat(64),"size":5}]
+            })).unwrap(),
+        };
+        assert!(matches!(
+            ctx.store
+                .create_publication(ctx.token(), &publication, unix_now())
+                .unwrap(),
+            Create::Done(_)
+        ));
+        for update in [
+            Update::BranchAttempt,
+            Update::BranchCreated,
+            Update::PullRequest {
+                number,
+                node_id: format!("PR_{number}"),
+                html_url: format!("https://github.com/acme/widgets/pull/{number}"),
+            },
+            Update::Merged {
+                merge_commit: merge_sha.clone(),
+            },
+        ] {
+            ctx.store
+                .update_publication(&publication.id, &update, unix_now())
+                .unwrap();
+        }
+        let rows = ctx.store.catchup_merges_for_pull(&scope(), number).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, CatchupMergeSource::TrackedPublication);
+        assert_eq!(rows[0].head_commit, HEAD_A);
+        // The immutable publication fact deduplicates subsequent provider merge ingestion.
+        let later = NewCatchupMerge {
+            source: CatchupMergeSource::ForgePull,
+            source_id: format!("forge-{number}"),
+            occurred_at: Some(10),
+            title: None,
+            branch: branch.clone(),
+            base: "main".into(),
+            head_commit: HEAD_B.into(),
+            merge_commit: merge_sha.clone(),
+            pull_number: number,
+            paths: vec![],
+            paths_complete: false,
+            same_repository_head: true,
+        };
+        let retained = ctx
+            .store
+            .record_catchup_merge(&scope(), &later, 11)
+            .unwrap();
+        assert_eq!(retained.source, CatchupMergeSource::TrackedPublication);
+        assert_eq!(retained.head_commit, HEAD_A);
+        // A normal individual reread leaves the independent provider tombstone needed to qualify it.
+        if let Some((head, same_merge)) = observation {
+            ctx.clock += 1;
+            let data=json!({"number":if wrong_number {number+1}else{number},"state":"closed","merged":true,
+                "head_sha":head,"merge_commit_sha":if same_merge {merge_sha.clone()}else{"f".repeat(40)}}).to_string();
+            ctx.store
+                .forget(
+                    &ctx.repo.id,
+                    "pull_request",
+                    &number.to_string(),
+                    ctx.clock,
+                    &data,
+                    "pull_request_closed",
+                )
+                .unwrap();
+            if ambiguous {
+                let conflicting =
+                    json!({"number":number,"state":"open","head_sha":HEAD_A}).to_string();
+                ctx.store
+                    .observe(
+                        &ctx.repo.id,
+                        "pull_request",
+                        &number.to_string(),
+                        &conflicting,
+                        ctx.clock,
+                    )
+                    .unwrap();
+            }
+        }
+        let expected_a = if name == "actual-a" {
+            ConditionState::Satisfied
+        } else {
+            ConditionState::Unknown
+        };
+        let expected_b = if name == "actual-b" {
+            ConditionState::Satisfied
+        } else {
+            ConditionState::Unknown
+        };
+        let v1 = ctx.read(&work);
+        assert_eq!(
+            v1.prerequisites[0].state,
+            if expected_a == ConditionState::Satisfied {
+                PrerequisiteState::Satisfied
+            } else {
+                PrerequisiteState::Unknown
+            },
+            "{name}"
+        );
+        if name == "actual-b" {
+            assert!(
+                v1.prerequisites[0]
+                    .limits
+                    .iter()
+                    .any(|l| l == "merge_head_changed")
+            );
+        }
+        if name == "absent" {
+            assert!(
+                v1.prerequisites[0]
+                    .limits
+                    .iter()
+                    .any(|l| l == "merge_head_unconfirmed")
+            );
+        }
+        let item = ctx.item(&work.id);
+        ctx.store
+            .work_declarations_set(
+                ctx.token(),
+                &WorkDeclarationsUpdate {
+                    work_id: item.id.clone(),
+                    operation_id: format!("declare-{name}"),
+                    generation: item.generation,
+                    session: item.lead_session,
+                    expected_updated_seq: item.updated_seq,
+                    declarations: WorkDeclarations {
+                        links: vec![],
+                        prerequisites: [("published", HEAD_A), ("provider-b", HEAD_B)]
+                            .into_iter()
+                            .map(|(id, head)| PrerequisiteCondition {
+                                id: id.into(),
+                                requirement: PrerequisiteRequirement::MergedPullRequest {
+                                    work_id: prerequisite.id.clone(),
+                                    target: WorkPrLinkTarget {
+                                        repository_id: REPOSITORY_ID,
+                                        number,
+                                        head_sha: head.into(),
+                                    },
+                                },
+                            })
+                            .collect(),
+                    },
+                },
+                unix_now(),
+            )
+            .unwrap();
+        let result = ctx
+            .store
+            .work_reconciliation_apply(
+                ctx.token(),
+                &durable_request(&ctx, &work.id, &format!("apply-{name}")),
+                unix_now(),
+            )
+            .unwrap();
+        let current = result.view.current.unwrap();
+        for (id, expected) in [("published", expected_a), ("provider-b", expected_b)] {
+            assert_eq!(
+                current
+                    .conditions
+                    .iter()
+                    .find(|c| c.id == id)
+                    .unwrap()
+                    .state,
+                expected,
+                "{name}/{id}"
+            );
+        }
+        if name == "absent" {
+            assert!(
+                current.conditions[0]
+                    .limits
+                    .iter()
+                    .any(|l| l == "merge_head_unconfirmed")
+            );
+        }
+    }
+}
+#[test]
+fn publication_heads_require_provider_confirmation_sqlite() {
+    publication_head_provenance(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_publication_heads_require_provider_confirmation() {
+    if let Some(fixture) = StoreFixture::postgres() {
+        publication_head_provenance(&fixture);
+    }
+}

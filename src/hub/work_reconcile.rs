@@ -222,6 +222,9 @@ fn provider_status(
             }
             None => {
                 limits.insert("merge_head_not_compared".to_owned());
+                if pr.merge_evidence.len() == 1 {
+                    limits.insert("merge_head_unconfirmed".to_owned());
+                }
                 HeadRelation::Unknown
             }
         };
@@ -371,6 +374,7 @@ struct PrRead {
     link_unavailable: bool,
     merged: Option<bool>,
     merges: Vec<CatchupMergeObservation>,
+    merged_observation: Option<(String, String)>,
     closed_unmerged: bool,
     open: Option<(String, i64)>,
     observation_limit: Option<&'static str>,
@@ -384,7 +388,15 @@ impl PrRead {
             link_unavailable: self.link_unavailable,
             merged: self.merged,
             merge_head: if self.merges.len() == 1 {
-                Some(self.merges[0].head_commit.as_str())
+                let merge = &self.merges[0];
+                if merge.source == super::catchup::CatchupMergeSource::ForgePull {
+                    Some(merge.head_commit.as_str())
+                } else {
+                    self.merged_observation
+                        .as_ref()
+                        .filter(|(_, sha)| sha.eq_ignore_ascii_case(&merge.merge_commit))
+                        .map(|(head, _)| head.as_str())
+                }
             } else {
                 None
             },
@@ -439,6 +451,7 @@ fn read_pr(
     }
     match read_pull_observation(store, principal, number) {
         Ok(observation) => {
+            read.merged_observation = observation.merged;
             read.open = observation.open;
             read.closed_unmerged = observation.closed_unmerged;
         }
@@ -450,6 +463,7 @@ fn read_pr(
 
 #[derive(Default)]
 struct PullObservation {
+    merged: Option<(String, String)>,
     open: Option<(String, i64)>,
     closed_unmerged: bool,
 }
@@ -484,10 +498,17 @@ fn read_pull_observation(
     if value["observation_conflict"] == true {
         return Err("observation_order_ambiguous");
     }
+    if let Some(merged) = super::work_reconciliation::merged_observation(number, &value) {
+        return Ok(PullObservation {
+            merged: Some(merged),
+            ..PullObservation::default()
+        });
+    }
     if value["state"] == "closed" && value["merged"] == false {
         return Ok(PullObservation {
             open: None,
             closed_unmerged: true,
+            ..PullObservation::default()
         });
     }
     if deleted || value["state"] != "open" {
@@ -499,6 +520,7 @@ fn read_pull_observation(
         .map(|sha| PullObservation {
             open: Some((sha.to_owned(), observation.observed_at)),
             closed_unmerged: false,
+            ..PullObservation::default()
         })
         .ok_or("observation_malformed")
 }
