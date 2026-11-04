@@ -2176,6 +2176,9 @@ conformance!(
     plain_announce_allows_paths_covered_by_eligible_work,
     plain_announce_refuses_a_directory_that_overlaps_fenced_work_either_way,
     plain_announce_fails_closed_beyond_the_token_work_bound,
+    cleanup_succeeds_for_a_token_with_more_work_than_the_announce_bound,
+    a_helper_with_many_work_cannot_block_the_owners_release,
+    plain_announce_ignores_empty_scope_work_in_its_bound,
     release_frees_session_and_sessionless_intents_of_the_scope,
     finish_checkpoint_cleans_up_like_a_terminal_transition,
     ending_work_spares_a_tokens_live_intents_elsewhere,
@@ -4833,6 +4836,91 @@ fn plain_announce_fails_closed_beyond_the_token_work_bound(db: &Db) {
         store.announce_intent(&alice.token, &plain_intent(2, "d1/a.rs"), now + 2),
         Err(HubError::WorkOverlapIncomplete)
     ));
+}
+
+/// Cleanup is not bounded by the announce guard: a token with more empty-scope Work than the
+/// guard reads can still release, abandon and finish its Work.
+fn cleanup_succeeds_for_a_token_with_more_work_than_the_announce_bound(db: &Db) {
+    use WorkTransitionKind::{Abandon, Release};
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let mut items = Vec::new();
+    for index in 0..102 {
+        let key = format!("k{index}");
+        let mut start = native_start(&key, &key, &key);
+        start.scope = vec![];
+        items.push(store.work_start(&alice.token, &start, now).unwrap().item);
+    }
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&items[0], "rel", Release, Some("k0")),
+            now + 1,
+        )
+        .unwrap();
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&items[1], "ab", Abandon, Some("k1")),
+            now + 2,
+        )
+        .unwrap();
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &items[2],
+        "fin",
+        "k2",
+        CheckpointKind::Finish,
+        now + 3,
+    );
+    assert_eq!(finished.item.state, WorkState::Finished);
+}
+
+/// Another token's pile of empty-scope Work, joined as a helper to the victim's Work, cannot make
+/// the victim's owner's release fail.
+fn a_helper_with_many_work_cannot_block_the_owners_release(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let victim = start_in(&*store, &alice, "v", "s-v", "src/**", now);
+    for index in 0..102 {
+        let key = format!("k{index}");
+        let mut start = native_start(&key, &key, &key);
+        start.scope = vec![];
+        store.work_start(&bob.token, &start, now).unwrap();
+    }
+    let mut helper = join(&victim.id, "s-h", WorkRole::Helper);
+    helper.scope = vec![];
+    store.work_start(&bob.token, &helper, now + 1).unwrap();
+    announce(&*store, &bob, "s-h", "src/h.rs", now + 2);
+    let current = current_item(&*store, &alice, &victim.id, now + 3);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&current, "rel", Release, Some("s-v")),
+            now + 4,
+        )
+        .unwrap();
+}
+
+/// Empty-scope Work cannot affect an announce, so it does not count toward the guard's bound.
+fn plain_announce_ignores_empty_scope_work_in_its_bound(db: &Db) {
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    for index in 0..101 {
+        let key = format!("k{index}");
+        let mut start = native_start(&key, &key, &key);
+        start.scope = vec![];
+        store.work_start(&alice.token, &start, now).unwrap();
+    }
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "d1/a.rs"), now + 1)
+        .unwrap();
 }
 
 /// A lead, a helper with a session intent, a session-less intent of each of them and of an

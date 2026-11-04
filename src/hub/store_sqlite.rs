@@ -4426,8 +4426,29 @@ fn release_in(tx: &Transaction<'_>, token: &str, intent: &str, now: i64) -> Resu
     Ok(changed > 0)
 }
 
-/// The declared scopes of other unfinished Work on which one of the token's sessions (the given
-/// one, or any) is currently eligible: held reservation, active or blocked, current generation.
+/// Whether the token's session is currently eligible on unfinished Work other than `work`: held
+/// reservation, active or blocked, current generation. An exact query, so it has no bound.
+fn session_eligible_elsewhere(
+    tx: &Transaction<'_>,
+    work: &str,
+    token: &str,
+    session: &str,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hub_work_items w
+         JOIN hub_work_participants p ON p.work=w.id
+         WHERE w.id <> ?1 AND w.state IN ('active','blocked')
+           AND w.reservation_basis IS NOT NULL
+           AND p.token=?2 AND p.generation=w.generation AND p.session=?3)",
+        params![work, token, session],
+        |row| row.get(0),
+    )?)
+}
+
+/// The declared scopes of up to `MAX_TOKEN_WORK_SCOPES` other unfinished Work on which one of the
+/// token's sessions is currently eligible (see `session_eligible_elsewhere`). Cleanup must not
+/// fail on a busy token, so a read past the bound is truncated: a covered advisory intent may
+/// then be released, and the next hook announces a new one. Only `guard_announce` fails closed.
 fn other_eligible_scopes(
     tx: &Transaction<'_>,
     work: &str,
@@ -4441,15 +4462,11 @@ fn other_eligible_scopes(
            AND w.reservation_basis IS NOT NULL
            AND p.token=?2 AND p.generation=w.generation
            AND (?3 IS NULL OR p.session=?3)
-         ORDER BY w.id LIMIT 101",
+         ORDER BY w.id LIMIT 100",
     )?;
     let rows = statement
         .query_map(params![work, token, session], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    // A partial read could let an intent through, so more than the bound fails closed.
-    if rows.len() > MAX_TOKEN_WORK_SCOPES {
-        return Err(HubError::WorkOverlapIncomplete);
-    }
     rows.iter()
         .map(|snapshot| json_value::<WorkItem>(snapshot).map(|item| item.scope))
         .collect()
@@ -4531,7 +4548,7 @@ fn release_work_holds(
     let sessions = work_transition::claim_sessions(item);
     for (token, session) in &sessions {
         // A session that is currently eligible on other Work keeps the intent it holds there.
-        if other_eligible_scopes(tx, &item.id, token, Some(session))?.is_empty() {
+        if !session_eligible_elsewhere(tx, &item.id, token, session)? {
             release_session_intent(tx, token, session, now)?;
         }
     }
@@ -4798,6 +4815,7 @@ fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()
              JOIN hub_work_participants p ON p.work=w.id
              WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
                AND w.repository_id IS ?4 AND w.state <> 'finished' AND p.token=?5
+               AND w.scope <> '[]'
              GROUP BY w.id ORDER BY w.id LIMIT 101",
         )?;
         statement
