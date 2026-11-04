@@ -36,7 +36,8 @@ says whether the Work holds a reservation on that scope and how it got it:
 
 - `legacy_implicit` (wire name `implicit`): the migration sets it for every row whose state is not
   `finished`, so blocking behavior does not change and no decision is invented. A pause or handover
-  checkpoint, including the hook and MCP automatic pause, converts `admitted` or `retained` to it.
+  checkpoint, including the hook and MCP automatic pause, converts `admitted` to it. `retained` stays
+  `retained`, so an explicit decision survives the end of a session; a takeover sets `admitted`.
 - `admitted`: acquired by fresh admission: a new start, takeover or resume of released Work, or reopen.
 - `retained`: a lead or owner kept the reservation through the `retain` transition, with a reason.
 - NULL: no reservation. Unfinished Work may have NULL. Finished Work always has NULL.
@@ -47,7 +48,12 @@ rename-alias scan, overview overlaps and request resolution. Work with no reserv
 own scope without an overlap check. The bound on overlap results (101 rows, `WorkOverlapIncomplete`)
 counts reservations. Takeover or resume of Work with no reservation needs fresh admission: the
 overlap check runs, a conflict is returned with no change on overlap, and otherwise the basis
-becomes `admitted`.
+becomes `admitted`. With a matching `takeover_generation` any token of the owner may resume such
+Work in any state, even when the claim is not stale, so a released `blocked` item can be resumed
+and a rotated token works; other owners keep the ordinary takeover rules. Progress, decision and
+blocker checkpoints on unfinished Work with no reservation are refused with `HubError::Invalid`
+saying to resume first. Pause, handover and finish checkpoints stay allowed, and an exact replay
+resolves before this check.
 
 ## 3. Transitions and authorization
 
@@ -112,26 +118,44 @@ In the same transaction, in both stores:
   authenticated), the reason, the prior state, basis and outcome, the generation and the
   `operation_id`. For an owner or administrator it also records the lead it acted on. A Work version
   is saved the way a checkpoint saves one.
-- Release and terminal transitions release the live intent of every participant session and the
-  lead through `release_session_intent`. This must work when tokens are revoked.
-- Open coordination requests that target the Work get a new event kind
-  `coordination_target_released` and a saved version with their status unchanged, so a responded
-  request stays responded. No request is resolved automatically. All of them are processed; creation
-  already bounds how many exist.
+- Release and terminal transitions, and a `finish` checkpoint, run one shared cleanup. It releases
+  the live intent of every participant session and the lead through `release_session_intent`, and
+  the session-less intents (announced through the plain route, tied to no session) of the tokens of
+  those participants whose paths overlap the Work's scope. This must work when tokens are revoked.
+- Open coordination requests that target the Work, or name it as their proposed Work, get a new
+  event kind `coordination_target_released` and a saved version with their status unchanged, so a
+  responded request stays responded. No request is resolved automatically. All of them are
+  processed; creation already bounds how many exist. A reopen that changes the lead session
+  retargets the requests that target the Work, as a takeover does, so they wait for the new lead.
 - Release and terminal transitions are cleanup and succeed at the payload quota; the accounting
-  records the change without refusing. Reopen and retain use the normal capacity check.
+  records the change without refusing. A `finish` checkpoint keeps the normal capacity check for
+  itself and records its cleanup rows without one, so the cleanup never causes a refusal. Reopen
+  (including its retarget) and retain use the normal capacity check.
 - The new event kinds are added to the `hub_events_no_delete` trigger in the new migration (recreated
   with the full list), the compaction and history lists in both stores, and the UI event list.
 
-The legacy fallback is closed in the same change: `announce_intent` calls `guard_managed_touch` in
-its transaction, and the guard refuses sessions linked to Work that is finished, fenced by generation
-or has no reservation. A session never linked to Work keeps the legacy advice. The plain intent announce route has no
-session field, so its guard applies to the token's default session only, and intents announced that
-way are not tied to a session and are not released by a transition.
+The legacy fallback is closed in the same change. The managed-touch guard refuses sessions linked
+to Work that is finished, fenced by generation or has no reservation, and `announce_intent` runs a
+guard in its transaction too. The plain announce route has no session field, and the session it
+would resolve (the lone recent hook session or `default`) may never have joined Work, so the guard
+is not limited to that session. If the token has any session linked to Work in the repository, the
+announce passes only when its paths are covered by Work on which one of the token's sessions is
+currently eligible (held reservation, `active` or `blocked`, current generation). A token never
+linked to Work keeps the legacy advice. A token that invents a new session name is not linked and
+keeps the legacy advice; that is a documented limit. The plain-announce guard looks the token up by
+its stored repository id and does not refuse a token whose repository was renamed, as the announce
+never did. Release and terminal transitions and the finish checkpoint release the session-less
+intents of the participants' tokens that overlap the scope, so a fenced token has nothing left
+that blocks others.
+
+Resuming released Work (no reservation) needs a start with the current `takeover_generation`. Any
+token of the owner may do it in any state, and the claim need not be stale; the admission check then
+runs. While no reservation is held, progress, decision and blocker checkpoints are refused with a
+request to resume first, so a re-reading lead cannot flip the state to active with nothing held.
 
 The `agentscm_done` and hook flow that releases the intent and then pauses the Work stays two
 separate steps. A crash between them leaves active Work with a reservation and no intent. The
-projection reports that state and release can clear it.
+projection has no intent field, so that state looks like ordinary held Work; a release clears it.
 
 ## 6. The WorkOperationalV1 projection
 
@@ -148,12 +172,21 @@ to the Work, otherwise `unknown`); `actionable` (a recipient of
 the list of `unknown` field names).
 
 `actionable` is derived from stored facts only (state, reservation, merge observation), so the only
-field that follows the request clock is `freshness`.
+field that follows the request clock is `freshness`. Finished Work and Work with no reservation name
+no recipient. A held reservation hidden by a merged pull request, or held by paused or handed-over
+Work, names the owner. A held reservation on active or blocked Work names the lead. The reason says
+which in plain words. `completeness.unknown` also lists `freshness` when the claim status is unknown
+and `outcome_provenance` when a stated outcome has no surviving event that says who stated it.
 
 Remedies are the transitions the matrix allows from the state and reservation, sorted by name and
 marked `requires_authorization`. They are not filtered by caller. Activity is always listed as
 unknown, so `complete` is false for every item in this change. Ordering is by work id and no
 request-time value enters any digest; no digest is added here.
+
+Recent outcomes list a Work item as a completion when its last version is a `finish` checkpoint or
+a `complete` transition (a `work_transition` version whose outcome is `completed`), newest first.
+Abandoned, superseded, release, retain and reopen versions do not appear. The Hub records no
+completion observation for a `complete` transition; completion observations stay checkpoint-only.
 
 Delivery without breaking strict older decoders: `GET /v1/hub/standup/work/{id}/operational`;
 `GET /v1/hub/standup/operational` for every reservation-holding Work in the repository including
@@ -161,7 +194,12 @@ Work hidden by a merged pull request, ordered by id, at most 100, with a `comple
 itself is unchanged; the HTTP and MCP surfaces add an `operational` key to its JSON (the projection of every
 reservation-holding Work). `WorkStartConflict` and `WorkPreflightResult` gain an `operational` list of the
 overlapping Work, skipped when empty. Over HTTP all of these are filled only when the request carries
-`operational=1`; MCP always fills them, so they appear whenever there is something to report. The agent route is
+`operational=1`; MCP always fills them, so they appear whenever there is something to report. Only
+a conflict result carries `operational`: the HTTP error bodies for `WorkPreflight` and
+`WorkCoordinationRequired` do not. The `operational` key of an overview is fitted to what the overview
+leaves of `MAX_BRIEFING_BYTES`: entries that do not fit are shed and `complete` turns false. The
+`operational` flag on `start` and `preflight` ignores other unknown query parameters, as those routes
+always did; the overview query stays strict. The agent route is
 `POST /v1/hub/standup/work-transition`, the person route is
 `POST /v1/hub/session/work/transition` with a web sign-in and CSRF check, and the MCP tool is
 `agentscm_work_transition`. There is no UI action or CLI command in this change; #313 owns
