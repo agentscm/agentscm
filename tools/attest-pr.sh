@@ -22,6 +22,7 @@
 # (see docs/contributor-testing.md) must be on PATH, or the run fails rather than skipping them.
 set -euo pipefail
 umask 077
+renice -n 10 -p $$ >/dev/null 2>&1 || true # Keep the laptop responsive; children inherit this.
 cd "$(git rev-parse --show-toplevel)"
 
 die() {
