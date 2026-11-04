@@ -2176,6 +2176,9 @@ conformance!(
     plain_announce_allows_paths_covered_by_eligible_work,
     release_frees_session_and_sessionless_intents_of_the_scope,
     finish_checkpoint_cleans_up_like_a_terminal_transition,
+    ending_work_spares_a_tokens_live_intents_elsewhere,
+    ending_work_spares_a_session_that_is_eligible_on_other_work,
+    ending_work_that_held_nothing_leaves_sessionless_intents,
     released_work_resumes_in_any_state_and_refuses_reports_until_then,
     resuming_released_work_conflicts_on_overlap_without_mutation,
     reopen_by_another_session_retargets_open_requests,
@@ -4811,6 +4814,93 @@ fn release_frees_session_and_sessionless_intents_of_the_scope(db: &Db) {
         .unwrap();
     // Only the unrelated token's intent is left.
     assert_eq!(live_intents(db), 1);
+}
+
+fn live_keys(db: &Db) -> Vec<String> {
+    db.rows("SELECT key FROM hub_intent_paths ORDER BY key")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect()
+}
+
+fn ending_work_spares_a_tokens_live_intents_elsewhere(db: &Db) {
+    use WorkTransitionKind::Abandon;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let owner = user_of(&*store, &alice);
+    // Bob helped on A and leads B now. Ending A takes only what belongs to A.
+    let a = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .work_start(&bob.token, &join(&a.id, "s-h", WorkRole::Helper), now + 1)
+        .unwrap();
+    start_in(&*store, &bob, "b", "s-b", "lib/**", now + 2);
+    announce(&*store, &bob, "s-h", "src/h.rs", now + 3);
+    announce(&*store, &bob, "s-b", "lib/b.rs", now + 3);
+    for (id, path) in [(1, "lib/p.rs"), (2, "doc/q.rs"), (3, "src/p.rs")] {
+        store
+            .announce_intent(&bob.token, &plain_intent(id, path), now + 4)
+            .unwrap();
+    }
+    let a = current_item(&*store, &alice, &a.id, now + 5);
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&a, "ab", Abandon, None),
+            now + 5,
+        )
+        .unwrap();
+    // A's helper session intent and the session-less intent inside A's scope are freed; B's
+    // intent and the non-overlapping session-less intents stay.
+    assert_eq!(live_keys(db), ["doc/q.rs", "lib/b.rs", "lib/p.rs"]);
+}
+
+fn ending_work_spares_a_session_that_is_eligible_on_other_work(db: &Db) {
+    use WorkTransitionKind::Abandon;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let owner = user_of(&*store, &alice);
+    let a = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .work_start(&bob.token, &join(&a.id, "s-h", WorkRole::Helper), now + 1)
+        .unwrap();
+    announce(&*store, &bob, "s-h", "src/h.rs", now + 2);
+    // The same session now leads other Work, so it is not ended with A.
+    start_in(&*store, &bob, "b", "s-h", "lib/**", now + 3);
+    let a = current_item(&*store, &alice, &a.id, now + 4);
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&a, "ab", Abandon, None),
+            now + 4,
+        )
+        .unwrap();
+    assert_eq!(live_keys(db), ["src/h.rs"]);
+}
+
+fn ending_work_that_held_nothing_leaves_sessionless_intents(db: &Db) {
+    use WorkTransitionKind::Abandon;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let owner = user_of(&*store, &alice);
+    let a = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "src/x.rs"), now + 1)
+        .unwrap();
+    db.sql("UPDATE hub_work_items SET reservation_basis = NULL");
+    let a = current_item(&*store, &alice, &a.id, now + 2);
+    store
+        .work_transition(
+            &person(&owner, false),
+            &transition_request(&a, "ab", Abandon, None),
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(live_keys(db), ["src/x.rs"]);
 }
 
 fn finish_checkpoint_cleans_up_like_a_terminal_transition(db: &Db) {

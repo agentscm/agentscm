@@ -4313,6 +4313,29 @@ fn release_in(
     Ok(changed > 0)
 }
 
+/// The declared scopes of other unfinished Work on which one of the token's sessions (the given
+/// one, or any) is currently eligible: held reservation, active or blocked, current generation.
+fn other_eligible_scopes(
+    tx: &mut postgres::Transaction<'_>,
+    work: &str,
+    token: &str,
+    session: Option<&str>,
+) -> Result<Vec<Vec<String>>> {
+    tx.query(
+        "SELECT DISTINCT w.id, w.snapshot FROM hub_work_items w
+         JOIN hub_work_participants p ON p.work=w.id
+         WHERE w.id <> $1 AND w.state IN ('active','blocked')
+           AND w.reservation_basis IS NOT NULL
+           AND p.token=$2 AND p.generation=w.generation
+           AND ($3::text IS NULL OR p.session=$3)
+         ORDER BY w.id",
+        &[&work, &token, &session],
+    )?
+    .iter()
+    .map(|row| json_value::<WorkItem>(&row.get::<_, String>(1)).map(|item| item.scope))
+    .collect()
+}
+
 fn release_session_intent(
     tx: &mut postgres::Transaction<'_>,
     token: &str,
@@ -4336,10 +4359,14 @@ fn release_session_intent(
 /// A plain intent announce has no session, so only the path overlap ties it to the Work.
 fn release_sessionless_intents(
     tx: &mut postgres::Transaction<'_>,
+    work: &str,
     token: &str,
     scope: &[String],
     now: i64,
 ) -> Result<()> {
+    // Paths another Work of the token covers while one of its sessions is eligible there are not
+    // this Work's to free.
+    let elsewhere = other_eligible_scopes(tx, work, token, None)?;
     let intents = tx.query(
         "SELECT i.id FROM hub_intents i
          WHERE i.token = $1 AND i.released_at IS NULL AND i.expires_at > $2
@@ -4357,7 +4384,10 @@ fn release_sessionless_intents(
             .iter()
             .map(|row| row.get::<_, String>(0))
             .collect::<Vec<_>>();
-        if !scope_overlap_reasons(scope, &keys).is_empty() {
+        let ours = elsewhere.iter().fold(keys, |keys, other| {
+            super::work::uncovered_scope(other, &keys)
+        });
+        if !scope_overlap_reasons(scope, &ours).is_empty() {
             release_in(tx, token, &intent, now)?;
         }
     }
@@ -4372,17 +4402,23 @@ fn release_work_holds(
     tx: &mut postgres::Transaction<'_>,
     item: &WorkItem,
     cause: &work_transition::ReleaseCause,
+    held: bool,
     now: i64,
 ) -> Result<i64> {
     let sessions = work_transition::claim_sessions(item);
     for (token, session) in &sessions {
-        release_session_intent(tx, token, session, now)?;
+        // A session that is currently eligible on other Work keeps the intent it holds there.
+        if other_eligible_scopes(tx, &item.id, token, Some(session))?.is_empty() {
+            release_session_intent(tx, token, session, now)?;
+        }
     }
-    let mut tokens: Vec<&str> = sessions.iter().map(|(token, _)| token.as_str()).collect();
-    tokens.sort_unstable();
-    tokens.dedup();
-    for token in tokens {
-        release_sessionless_intents(tx, token, &item.scope, now)?;
+    if held {
+        let mut tokens: Vec<&str> = sessions.iter().map(|(token, _)| token.as_str()).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        for token in tokens {
+            release_sessionless_intents(tx, &item.id, token, &item.scope, now)?;
+        }
     }
     // Requests that target the Work or propose it stay open: a response stays a response and
     // nothing resolves.
@@ -8810,7 +8846,7 @@ impl Store for PgStore {
                 // The same cleanup as a terminal transition. It follows the quota check above and
                 // records its own size without one, so a finish is never refused for the cleanup.
                 let cause = work_transition::ReleaseCause::finish_checkpoint(&who.owner.id);
-                let cleanup = release_work_holds(&mut tx, &item, &cause, now)?;
+                let cleanup = release_work_holds(&mut tx, &item, &cause, held, now)?;
                 record_work_payload_delta(&mut tx, &who, cleanup, now)?;
             }
             tx.commit()?;
@@ -9005,7 +9041,13 @@ impl Store for PgStore {
             if work_transition::releases_claims(request.transition) {
                 let cause = work_transition::ReleaseCause::transition(request, &acting);
                 delta = delta
-                    .checked_add(release_work_holds(&mut tx, &item, &cause, now)?)
+                    .checked_add(release_work_holds(
+                        &mut tx,
+                        &item,
+                        &cause,
+                        prior.basis.is_some(),
+                        now,
+                    )?)
                     .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
                 record_work_payload_delta(&mut tx, &who, delta, now)?;
             } else {

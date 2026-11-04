@@ -4416,6 +4416,31 @@ fn release_in(tx: &Transaction<'_>, token: &str, intent: &str, now: i64) -> Resu
     Ok(changed > 0)
 }
 
+/// The declared scopes of other unfinished Work on which one of the token's sessions (the given
+/// one, or any) is currently eligible: held reservation, active or blocked, current generation.
+fn other_eligible_scopes(
+    tx: &Transaction<'_>,
+    work: &str,
+    token: &str,
+    session: Option<&str>,
+) -> Result<Vec<Vec<String>>> {
+    let mut statement = tx.prepare(
+        "SELECT DISTINCT w.id, w.snapshot FROM hub_work_items w
+         JOIN hub_work_participants p ON p.work=w.id
+         WHERE w.id <> ?1 AND w.state IN ('active','blocked')
+           AND w.reservation_basis IS NOT NULL
+           AND p.token=?2 AND p.generation=w.generation
+           AND (?3 IS NULL OR p.session=?3)
+         ORDER BY w.id",
+    )?;
+    let rows = statement
+        .query_map(params![work, token, session], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.iter()
+        .map(|snapshot| json_value::<WorkItem>(snapshot).map(|item| item.scope))
+        .collect()
+}
+
 fn release_session_intent(
     tx: &Transaction<'_>,
     token: &str,
@@ -4441,10 +4466,14 @@ fn release_session_intent(
 /// A plain intent announce has no session, so only the path overlap ties it to the Work.
 fn release_sessionless_intents(
     tx: &Transaction<'_>,
+    work: &str,
     token: &str,
     scope: &[String],
     now: i64,
 ) -> Result<()> {
+    // Paths another Work of the token covers while one of its sessions is eligible there are not
+    // this Work's to free.
+    let elsewhere = other_eligible_scopes(tx, work, token, None)?;
     let intents = {
         let mut statement = tx.prepare(
             "SELECT i.id FROM hub_intents i
@@ -4464,7 +4493,10 @@ fn release_sessionless_intents(
                 .query_map([&intent], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
-        if !scope_overlap_reasons(scope, &keys).is_empty() {
+        let ours = elsewhere.iter().fold(keys, |keys, other| {
+            super::work::uncovered_scope(other, &keys)
+        });
+        if !scope_overlap_reasons(scope, &ours).is_empty() {
             release_in(tx, token, &intent, now)?;
         }
     }
@@ -4479,17 +4511,23 @@ fn release_work_holds(
     tx: &Transaction<'_>,
     item: &WorkItem,
     cause: &work_transition::ReleaseCause,
+    held: bool,
     now: i64,
 ) -> Result<i64> {
     let sessions = work_transition::claim_sessions(item);
     for (token, session) in &sessions {
-        release_session_intent(tx, token, session, now)?;
+        // A session that is currently eligible on other Work keeps the intent it holds there.
+        if other_eligible_scopes(tx, &item.id, token, Some(session))?.is_empty() {
+            release_session_intent(tx, token, session, now)?;
+        }
     }
-    let mut tokens: Vec<&str> = sessions.iter().map(|(token, _)| token.as_str()).collect();
-    tokens.sort_unstable();
-    tokens.dedup();
-    for token in tokens {
-        release_sessionless_intents(tx, token, &item.scope, now)?;
+    if held {
+        let mut tokens: Vec<&str> = sessions.iter().map(|(token, _)| token.as_str()).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        for token in tokens {
+            release_sessionless_intents(tx, &item.id, token, &item.scope, now)?;
+        }
     }
     // Requests that target the Work or propose it stay open: a response stays a response and
     // nothing resolves.
@@ -8829,7 +8867,7 @@ impl Store for SqliteStore {
             // The same cleanup as a terminal transition. It follows the quota check above and
             // records its own size without one, so a finish is never refused for the cleanup.
             let cause = work_transition::ReleaseCause::finish_checkpoint(&who.owner.id);
-            let cleanup = release_work_holds(&tx, &item, &cause, now)?;
+            let cleanup = release_work_holds(&tx, &item, &cause, held, now)?;
             record_work_payload_delta(&tx, &who, cleanup, now)?;
         }
         tx.commit()?;
@@ -9023,7 +9061,13 @@ impl Store for SqliteStore {
         if work_transition::releases_claims(request.transition) {
             let cause = work_transition::ReleaseCause::transition(request, &acting);
             delta = delta
-                .checked_add(release_work_holds(&tx, &item, &cause, now)?)
+                .checked_add(release_work_holds(
+                    &tx,
+                    &item,
+                    &cause,
+                    prior.basis.is_some(),
+                    now,
+                )?)
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
             record_work_payload_delta(&tx, &who, delta, now)?;
         } else {
