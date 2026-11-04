@@ -48,6 +48,7 @@ pub mod value_metrics;
 pub mod view_settings;
 pub mod work;
 pub mod work_http;
+mod work_lifecycle;
 pub mod work_links;
 pub mod work_preflight;
 pub mod workspace;
