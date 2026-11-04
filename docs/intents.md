@@ -132,6 +132,9 @@ should resume). The edit proceeds either way.
   retries once. An intent from this command is advisory and reserves nothing; the hub
   refuses it only for a path in the scope of unfinished Work the agent no longer holds,
   and a token whose Work is finished can still post advisory intents.
+  The hook drops a refused path from its state, announces the other paths once and shows the
+  reason; the edit proceeds because the hook exits 0. After the agent resumes the Work, a
+  dropped path stays unannounced until it is edited again.
 - Only files the agent edits through Edit, Write or MultiEdit are announced, not files
   written by shell commands.
 - An intent expires two hours after its last announce. SessionEnd may not run after a
