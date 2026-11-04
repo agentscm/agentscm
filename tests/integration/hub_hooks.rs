@@ -717,3 +717,83 @@ async fn the_root_header_sets_what_paths_are_relative_to() {
         ]
     );
 }
+
+/// A request reaches the session the person types in. A subagent of that session, whose
+/// context ends when it returns, gets a pointer instead and is never held for a reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let other = hub.agent();
+    let token_id = |secret: &str| {
+        hub.store
+            .authenticate(&agent_token_digest(secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id
+    };
+    let start = |key: &str, session: &str| WorkStart {
+        work_id: None,
+        source: None,
+        request_key: Some(key.into()),
+        title: key.into(),
+        session: session.into(),
+        role: WorkRole::Lead,
+        scope: vec!["src/widget.rs".into()],
+        branch: None,
+        worktree: None,
+        next_action: None,
+        depends_on: Vec::new(),
+        related_work: Vec::new(),
+        takeover_generation: None,
+        preflight: None,
+    };
+    // The session of the Claude fixtures.
+    let session = "11111111-2222-3333-4444-555555555555";
+    hub.store
+        .work_start(&token_id(&lead), &start("hold-widget", session), unix_now())
+        .unwrap();
+    let request = hub
+        .store
+        .work_start(
+            &token_id(&other),
+            &start("needs-widget", "other-session"),
+            unix_now(),
+        )
+        .unwrap()
+        .coordination_request
+        .expect("an overlapping start queues a request")
+        .id;
+
+    let mut prompt = json!({"hook_event_name":"UserPromptSubmit", "session_id":session,
+        "cwd":"/work/acme-widgets", "prompt":"not read"});
+    let answer = hub.hook("claude", &lead, &prompt);
+    assert_eq!(
+        answer.pointer("/hookSpecificOutput/hookEventName"),
+        Some(&json!("UserPromptSubmit")),
+        "{answer}"
+    );
+    assert!(
+        text_at(&answer, CLAUDE_CONTEXT).contains(&request),
+        "{answer}"
+    );
+    // The requester has nothing to answer, so its prompts stay quiet.
+    prompt["session_id"] = json!("other-session");
+    assert_eq!(hub.hook("claude", &other, &prompt), json!({}));
+
+    // The lead's own edit is still held until it answers.
+    let edit = fixture("claude-PreToolUse-Write");
+    let refused = hub.hook_raw("claude", &lead, &edit);
+    assert!(
+        refused.to_string().contains("needs your response"),
+        "{refused}"
+    );
+
+    let mut subagent = edit.clone();
+    subagent["agent_id"] = json!("a1b2c3");
+    subagent["agent_type"] = json!("general-purpose");
+    let answer = hub.hook("claude", &lead, &subagent);
+    let context = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(context.contains("wait for your lead session"), "{answer}");
+    assert!(!context.contains(&request), "{answer}");
+}
