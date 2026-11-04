@@ -25,6 +25,9 @@ use super::work_transition::{
 };
 use super::{HubError, HubState};
 
+#[path = "actionable_status.rs"]
+pub mod actionable_status;
+
 pub fn routes() -> Router<HubState> {
     Router::new()
         .merge(super::coordination_http::routes())
@@ -33,6 +36,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/catchup/ack", post(catchup_ack))
         .route("/v1/hub/standup/briefing", get(briefing))
         .route("/v1/hub/standup/overview", get(overview))
+        .route("/v1/hub/standup/status", get(actionable_status))
         .route("/v1/hub/standup/preflight", post(preflight))
         .route("/v1/hub/standup/start", post(start))
         .route("/v1/hub/standup/checkpoint", post(checkpoint))
@@ -623,4 +627,17 @@ async fn acknowledge(
     })
     .await?;
     Ok(Json(json!({"acknowledged": true})))
+}
+
+async fn actionable_status(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+) -> Result<Json<actionable_status::ActionableStatus>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            actionable_status::read(&*store, &principal, unix_now())
+        })
+        .await?,
+    ))
 }
