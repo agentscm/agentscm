@@ -113,7 +113,7 @@ The hooks written by `client setup` run `agentscm hook <agent> --client-connecti
 
 ### Holds stay live while the agent works
 
-A reservation on shared files is a lease. It blocks other Work only while the lead session is live: 20 minutes from that session's last renewal, or 2 hours from a `retain` (see the [Work lifecycle design](design/work-lifecycle.md#8-liveness-leases)). Only the lead session's own calls renew it, at most once a minute, so the hook client forwards at most one tool event a minute per session and answers the rest locally. A shell call is different: its start and end always reach the Hub, and while one runs the lease stays live for up to 60 minutes, so a long test run or build keeps the hold. A shell call that never reports its end, because the agent crashed, holds for at most those 60 minutes. A lapsed lease, a stopped or idle session and a crash never mark Work finished: the Work stays unfinished, its outcome unstated, and only its hold goes.
+A reservation on shared files is a lease. It blocks other Work only while the lead session is live: 20 minutes from that session's last renewal, or 2 hours from a `retain` (see the [Work lifecycle design](design/work-lifecycle.md#8-liveness-leases)). Only the lead session's own calls renew it, at most once a minute, so the hook client forwards at most one tool event a minute per session and answers the rest locally. A shell call is different: its start and end always reach the Hub, and while one runs the lease stays live for up to 60 minutes from the first of the shell calls still running, so a long test run or build keeps the hold. A shell call that never reports its end, because the agent crashed, holds for at most those 60 minutes. Once a lease lapses, the lead starts its Work again before it edits, even when nobody took the scope. The agent whose start takes a lapsed hold's scope is told so in the start's `reclaimed` list, because that hold's branch may have edits its lead never pushed. A lapsed lease, a stopped or idle session and a crash never mark Work finished: the Work stays unfinished, its outcome unstated, and only its hold goes.
 
 | Agent | What renews the lead session's lease | Not covered |
 | --- | --- | --- |
@@ -124,7 +124,7 @@ A reservation on shared files is a lease. It blocks other Work only while the le
 | Gemini CLI | `BeforeTool` and `AfterTool` for all tools; `run_shell_command` while it runs | a non-shell tool call longer than 20 minutes |
 | An agent with MCP only | named MCP session calls and checkpoints | everything between them |
 
-The Work projection shows which case applies to a lead session as `activity.coverage`: `tool_calls` once a hook reported one of its tool calls, `edits` for hooks that report only edits, `mcp_only`, or `unknown` when the Hub keeps no record of the session. Anything but `tool_calls` is listed as unknown coverage, with a reason that says what to run.
+The Work projection shows which case applies to a lead session as `activity.coverage`: `tool_calls` once a hook reported one of its tool calls, `tool_ends` for Cursor, whose hook reports only each call's end, `edits` for hooks that report only edits, `mcp_only`, or `unknown` when the Hub keeps no record of the session. Anything but `tool_calls` is listed as unknown coverage, with a reason that says what to run.
 
 An agent that is not wired, or wired with an older `client setup` that hooked only edits, renews only on edits, MCP calls and checkpoints; run `agentscm client setup` again to install the tool hooks.
 

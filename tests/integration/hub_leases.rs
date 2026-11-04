@@ -11,7 +11,6 @@ use agentscm::hub::session::SessionCall;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
 use agentscm::hub::work::{
     CheckpointKind, WorkCheckpoint, WorkConflictKind, WorkRole, WorkStart, WorkStartResult,
-    WorkState,
 };
 use agentscm::hub::work_lifecycle::{
     ActivityStatus, CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_LAPSED, LEASE_SECONDS,
@@ -545,11 +544,11 @@ fn a_partitioned_lead_reconnects_to_a_fence(db: &Db) {
         ),
         Err(HubError::Invalid(_))
     ));
-    let again = store.work_start(&alice.token, &start_a, back).unwrap();
-    assert_eq!(
-        (again.item.state, again.item.generation),
-        (WorkState::Paused, held.generation + 1)
-    );
+    // Starting the Work again is told about the lapse rather than handed a paused item.
+    assert!(matches!(
+        store.work_start(&alice.token, &start_a, back),
+        Err(HubError::Invalid(message)) if message.starts_with(LEASE_LAPSED)
+    ));
     assert_eq!(db.lease(&held.id), (String::new(), String::new()));
     assert_overlap(
         &store
@@ -627,21 +626,25 @@ fn a_running_shell_call_stays_live_up_to_the_cap(db: &Db) {
             .work_start(&bob.token, &start("b1", "s-b", "src/**"), busy)
             .unwrap(),
     );
-    // Two calls overlap; the lease falls back to the idle lease only when the last one ends.
-    tool_call(&*store, &alice, "s-a", CallPhase::Start, busy);
-    tool_call(&*store, &alice, "s-a", CallPhase::End, busy + 10);
+    // When it ends the lease falls back to the idle lease.
+    tool_call(&*store, &alice, "s-a", CallPhase::End, busy);
+    assert_eq!(db.lease(&held.id).1, (busy + LEASE_SECONDS).to_string());
+    // Two calls overlap; the cap counts from the first, and only the last end shortens the lease.
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, busy + 30);
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, busy + 40);
+    tool_call(&*store, &alice, "s-a", CallPhase::End, busy + 50);
     assert_eq!(
         db.lease(&held.id).1,
-        (busy + IN_FLIGHT_CAP_SECONDS).to_string()
+        (busy + 30 + IN_FLIGHT_CAP_SECONDS).to_string()
     );
-    tool_call(&*store, &alice, "s-a", CallPhase::End, busy + 20);
+    tool_call(&*store, &alice, "s-a", CallPhase::End, busy + 60);
     assert_eq!(
         db.lease(&held.id).1,
-        (busy + 20 + LEASE_SECONDS).to_string()
+        (busy + 60 + LEASE_SECONDS).to_string()
     );
     // A call whose end never arrives (the client crashed) holds at most the cap.
-    tool_call(&*store, &alice, "s-a", CallPhase::Start, busy + 30);
-    let capped = busy + 30 + IN_FLIGHT_CAP_SECONDS;
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, busy + 70);
+    let capped = busy + 70 + IN_FLIGHT_CAP_SECONDS;
     tick(&*store, busy, capped - 1);
     assert_overlap(
         &store
@@ -650,6 +653,193 @@ fn a_running_shell_call_stays_live_up_to_the_cap(db: &Db) {
     );
     tick(&*store, capped - 1, capped);
     admitted(&*store, &bob, &start("b3", "s-b3", "src/**"), capped);
+}
+
+fn a_leaked_call_count_falls_back_to_the_idle_lease(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = admitted(&*store, &alice, &start("a", "s-a", "src/**"), now).item;
+    // Two calls start and one end is lost, so the count stays open.
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, now + 10);
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, now + 20);
+    tool_call(&*store, &alice, "s-a", CallPhase::End, now + 30);
+    // Later starts while the count is open never move the cap past the first start.
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, now + 600);
+    assert_eq!(
+        db.lease(&held.id).1,
+        (now + 10 + IN_FLIGHT_CAP_SECONDS).to_string()
+    );
+    // Other activity keeps the lease live; past the cap the count is stale, so the next call
+    // starts it afresh and its end falls back to the idle lease.
+    touch(
+        &*store,
+        &alice,
+        "s-a",
+        &[],
+        now + 10 + IN_FLIGHT_CAP_SECONDS - 100,
+    )
+    .unwrap();
+    let later = now + 10 + IN_FLIGHT_CAP_SECONDS + 1;
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, later);
+    tool_call(&*store, &alice, "s-a", CallPhase::End, later + 5);
+    assert_eq!(
+        db.lease(&held.id).1,
+        (later + 5 + LEASE_SECONDS).to_string()
+    );
+}
+
+fn every_overlapping_lapsed_reservation_is_cleared(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    // More lapsed reservations than one page, every one inside the scope bob asks for. They are
+    // admitted in two batches, the first lapsed before the second, since at most 100 may be live.
+    let mut held = Vec::new();
+    let mut at = now;
+    for batch in 0..2 {
+        for n in 0..60 {
+            let key = format!("a{batch}-{n}");
+            let scope = format!("src/m{batch}-{n}/**");
+            let item = admitted(
+                &*store,
+                &alice,
+                &start(&key, &format!("s-{key}"), &scope),
+                at,
+            );
+            held.push(item.item.id);
+        }
+        let next = at + LEASE_SECONDS + 1;
+        tick(&*store, at, next);
+        at = next;
+    }
+    admitted(&*store, &bob, &start("b", "s-b", "src/**"), at);
+    for id in &held {
+        assert_eq!(db.lapse_events(id), 1, "{id}");
+        assert_eq!(db.lease(id), (String::new(), String::new()), "{id}");
+    }
+}
+
+fn takeovers_by_other_owners_respect_their_share(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = admitted(&*store, &alice, &start("a", "s-a", "src/**"), now).item;
+    for n in 0..MAX_OTHER_OWNER_PARTICIPANTS {
+        let other = agent(&*store, 100 + n as i64);
+        assert!(
+            store
+                .work_start(
+                    &other.token,
+                    &joined(&held.id, &format!("s-{n}"), WorkRole::Reviewer),
+                    now + 1,
+                )
+                .unwrap()
+                .joined
+        );
+    }
+    let after = now + LEASE_SECONDS + 1;
+    tick(&*store, now, after);
+    let taker = agent(&*store, 999);
+    assert!(matches!(
+        store.work_start(&taker.token, &takeover(&held.id, "s-take", held.generation), after),
+        Err(HubError::Invalid(message)) if message.contains("participants from other owners")
+    ));
+    // Nor can another owner reopen its way in: only the lead or the owner's agents may reopen.
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let reopen = WorkTransitionRequest {
+        work_id: held.id.clone(),
+        operation_id: "reopen-other-owner".into(),
+        generation: held.generation,
+        expected_updated_seq: held.updated_seq,
+        session: Some("s-take".into()),
+        transition: WorkTransitionKind::Reopen,
+        reason: "synthetic reason".into(),
+        superseded_by: None,
+    };
+    assert!(matches!(
+        store.work_transition(
+            &WorkTransitionActor::Agent {
+                token: &taker.token
+            },
+            &reopen,
+            after
+        ),
+        Err(HubError::Unauthorized)
+    ));
+}
+
+fn a_pause_or_retain_never_revives_a_lapsed_lease(db: &Db) {
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = admitted(&*store, &alice, &start("a", "s-a", "src/**"), now).item;
+    let after = now + LEASE_SECONDS + 1;
+    tick(&*store, now, after);
+    let expired = db.lease(&held.id).1;
+    // A retain cannot revive it.
+    let retain = WorkTransitionRequest {
+        work_id: held.id.clone(),
+        operation_id: "retain-lapsed".into(),
+        generation: held.generation,
+        expected_updated_seq: held.updated_seq,
+        session: Some("s-a".into()),
+        transition: WorkTransitionKind::Retain,
+        reason: "synthetic reason".into(),
+        superseded_by: None,
+    };
+    assert!(matches!(
+        store.work_transition(&WorkTransitionActor::Agent { token: &alice.token }, &retain, after),
+        Err(HubError::Invalid(message)) if message.starts_with(LEASE_LAPSED)
+    ));
+    // A pause is recorded but keeps the lapsed expiry.
+    let pause = WorkCheckpoint {
+        kind: CheckpointKind::Pause,
+        operation_id: "pause-lapsed".into(),
+        next_action: Some("resume".into()),
+        ..checkpoint(&held.id, held.generation, "s-a", held.updated_seq)
+    };
+    store.work_checkpoint(&alice.token, &pause, after).unwrap();
+    assert_eq!(db.lease(&held.id).1, expired);
+    admitted(&*store, &bob, &start("b", "s-b", "src/**"), after + 1);
+}
+
+fn a_lapsed_lease_refuses_edits_until_held_again(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let start_a = start("a", "s-a", "src/**");
+    let held = admitted(&*store, &alice, &start_a, now).item;
+    let after = now + LEASE_SECONDS + 1;
+    tick(&*store, now, after);
+    // Nobody took the scope, but the lapsed lease no longer holds it.
+    let Err(HubError::Invalid(message)) = touch(&*store, &alice, "s-a", &["src/lib.rs"], after)
+    else {
+        panic!("an edit under a lapsed lease must be refused");
+    };
+    assert!(message.starts_with(LEASE_LAPSED), "{message}");
+    assert!(
+        message.contains("Nothing held the scope when this was refused"),
+        "{message}"
+    );
+    assert!(message.contains("20 minutes after"), "{message}");
+    assert!(
+        message.contains(&format!("agentscm_start with work_id {}", held.id)),
+        "{message}"
+    );
+    // Starting the Work again holds it, and the edit passes.
+    store.work_start(&alice.token, &start_a, after + 1).unwrap();
+    touch(&*store, &alice, "s-a", &["src/lib.rs"], after + 2).unwrap();
 }
 
 fn coverage_follows_what_the_hub_saw_of_the_lead_session(db: &Db) {
@@ -741,15 +931,44 @@ fn a_lapsed_lead_is_told_when_who_and_how_to_resume(db: &Db) {
     let held = admitted(&*store, &alice, &start("a", "s-a", "src/**"), now).item;
     let after = now + LEASE_SECONDS + 1;
     tick(&*store, now, after);
-    let taken = admitted(&*store, &bob, &start("b", "s-b", "src/**"), after).item;
+    let taken = admitted(&*store, &bob, &start("b", "s-b", "src/**"), after);
+    // The admission that took the scope says the old lead may have left unpushed edits.
+    assert_eq!(taken.reclaimed.len(), 1, "{taken:?}");
+    let reclaimed = &taken.reclaimed[0];
+    assert_eq!(
+        (
+            reclaimed.work_id.as_str(),
+            reclaimed.lead_agent.as_str(),
+            reclaimed.branch.as_deref(),
+            reclaimed.lapsed_at
+        ),
+        (
+            held.id.as_str(),
+            "agent1",
+            Some("feature/a"),
+            now + LEASE_SECONDS
+        )
+    );
+    assert!(reclaimed.notice.contains("never pushed"), "{reclaimed:?}");
+    let taken = taken.item;
     let Err(HubError::Invalid(message)) = touch(&*store, &alice, "s-a", &["src/lib.rs"], after + 1)
     else {
         panic!("a lapsed lead's edit must be refused");
     };
     assert!(message.starts_with(LEASE_LAPSED), "{message}");
+    // Starting the Work again gets the same answer as the edit.
+    let Err(HubError::Invalid(started)) =
+        store.work_start(&alice.token, &start("a", "s-a", "src/**"), after + 1)
+    else {
+        panic!("a lapsed lead's start must be told about the lapse");
+    };
+    assert_eq!(started, message);
     for part in [
         format!("lapsed at Unix {}", now + LEASE_SECONDS),
-        format!("{} (agent agent2) holds the scope now", taken.id),
+        format!(
+            "{} (led by agent agent2 when this was refused) took the scope then",
+            taken.id
+        ),
         "Branch feature/a may hold unpushed work".to_owned(),
         format!(
             "agentscm_start work_id {} takeover_generation {}",
@@ -801,35 +1020,149 @@ fn other_owners_fill_at_most_their_share_of_participants(db: &Db) {
     );
 }
 
-fn the_owner_recovers_from_a_dead_lead_token_while_others_wait(db: &Db) {
+fn a_renewed_token_keeps_its_lead_from_sibling_sessions(db: &Db) {
     let store = db.open();
     let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
     let now = unix_now();
     store.observe_lease_clock(now).unwrap();
     let held = admitted(&*store, &alice, &start("a", "s-a", "src/**"), now).item;
-    assert!(store.revoke_agent_token(&alice.token).unwrap());
-    // The lease is still live, so another owner waits for it to lapse.
-    let refused = store
-        .work_start(
-            &bob.token,
-            &takeover(&held.id, "s-b", held.generation),
-            now + 60,
-        )
-        .unwrap();
-    assert_eq!(
-        refused.conflict.map(|conflict| conflict.kind),
-        Some(WorkConflictKind::ClaimHeld)
-    );
-    // The owner's rotated token takes its Work back now: the revoked token can never renew.
+    tool_call(&*store, &alice, "s-a", CallPhase::Start, now + 10);
+    // Token renewal: a new token, the old one revoked, while the lead is inside a shell call.
     let rotated = another_token(&*store, &alice.owner, 11);
-    let recovered = store
+    assert!(store.revoke_agent_token(&alice.token).unwrap());
+    for (who, session) in [(&rotated, "s-sibling"), (&bob, "s-b")] {
+        let refused = store
+            .work_start(
+                &who.token,
+                &takeover(&held.id, session, held.generation),
+                now + 600,
+            )
+            .unwrap();
+        assert!(!refused.took_over, "{refused:?}");
+        assert_eq!(
+            refused.conflict.map(|conflict| conflict.kind),
+            Some(WorkConflictKind::ClaimHeld)
+        );
+    }
+    // The lead's next call under the new token carries the lead and renews it.
+    tool_call(&*store, &rotated, "s-a", CallPhase::End, now + 900);
+    assert_eq!(
+        db.lease(&held.id).1,
+        (now + 900 + LEASE_SECONDS).to_string()
+    );
+    // Only a lapse opens it to the owner's other sessions and to other owners alike.
+    let after = now + 900 + LEASE_SECONDS;
+    tick(&*store, now, after);
+    let taken = store
         .work_start(
             &rotated.token,
-            &takeover(&held.id, "s-a2", held.generation),
-            now + 61,
+            &takeover(&held.id, "s-sibling", held.generation),
+            after,
         )
         .unwrap();
-    assert!(recovered.took_over, "{recovered:?}");
+    assert!(taken.took_over, "{taken:?}");
+}
+
+fn an_unnamed_call_renews_no_lease(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = (agent(&*store, 1), agent(&*store, 2));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = admitted(&*store, &alice, &start("a", "s-a", "src/**"), now).item;
+    touch(&*store, &alice, "s-a", &[], now + 1).unwrap();
+    // An MCP client on the same token that names no session resolves to the hook session s-a,
+    // but its calls are not that session's own, so they renew nothing.
+    for at in [now + 600, now + 1100] {
+        store
+            .touch_session(
+                &alice.token,
+                &SessionCall {
+                    session: None,
+                    via: "mcp".into(),
+                    task: None,
+                    paths: Vec::new(),
+                    deny: false,
+                    report: false,
+                },
+                at,
+            )
+            .unwrap();
+    }
+    assert_eq!(db.lease(&held.id).1, (now + LEASE_SECONDS).to_string());
+    tick(&*store, now, now + LEASE_SECONDS);
+    admitted(
+        &*store,
+        &bob,
+        &start("b", "s-b", "src/**"),
+        now + LEASE_SECONDS,
+    );
+}
+
+fn a_takeover_of_a_lapsed_hold_is_fenced_like_a_new_start(db: &Db) {
+    let store = db.open();
+    let (alice, bob, carol) = (agent(&*store, 1), agent(&*store, 2), agent(&*store, 3));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = admitted(&*store, &alice, &start("a", "s-a", "src/a/**"), now).item;
+    let after = now + LEASE_SECONDS + 1;
+    tick(&*store, now, after);
+    let live = admitted(&*store, &bob, &start("b", "s-b", "lib/**"), after).item;
+    // Admission never lets a live hold overlap a lapsed one that keeps its basis, so the state is
+    // planted in the stored (normalized) scope: the takeover must still check the scope as a fresh
+    // admission does.
+    db.row(&format!(
+        r#"UPDATE hub_work_items SET scope = '["src/"]' WHERE id = '{}' RETURNING id"#,
+        live.id
+    ));
+    let refused = store
+        .work_start(
+            &carol.token,
+            &takeover(&held.id, "s-c", held.generation),
+            after + 1,
+        )
+        .unwrap();
+    assert!(!refused.took_over, "{refused:?}");
+    assert_eq!(
+        refused.conflict.map(|conflict| conflict.kind),
+        Some(WorkConflictKind::ScopeOverlap)
+    );
+}
+
+fn two_takeovers_of_one_lapsed_hold_have_one_winner(db: &Db) {
+    let store = db.open();
+    let (alice, bob, carol) = (agent(&*store, 1), agent(&*store, 2), agent(&*store, 3));
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = admitted(&*store, &alice, &start("a", "s-a", "src/**"), now).item;
+    let after = now + LEASE_SECONDS + 1;
+    tick(&*store, now, after);
+    let barrier = Arc::new(Barrier::new(2));
+    // Each racer has its own store and connection, so the two transactions really overlap.
+    let racers: Vec<_> = [(bob, "s-b"), (carol, "s-c")]
+        .into_iter()
+        .map(|(who, session)| {
+            let (store, barrier, id) = (db.open(), barrier.clone(), held.id.clone());
+            thread::spawn(move || {
+                barrier.wait();
+                store
+                    .work_start(&who.token, &takeover(&id, session, held.generation), after)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let results: Vec<WorkStartResult> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+    let winners: Vec<_> = results.iter().filter(|result| result.took_over).collect();
+    assert_eq!(winners.len(), 1, "{results:?}");
+    assert_eq!(winners[0].item.generation, held.generation + 1);
+    // The winner is told the previous lead may have left unpushed edits.
+    assert_eq!(winners[0].reclaimed.len(), 1);
+    assert_eq!(winners[0].reclaimed[0].work_id, held.id);
+    assert_eq!(winners[0].reclaimed[0].lead_agent, "agent1");
+    let loser = results.iter().find(|result| !result.took_over).unwrap();
+    assert_eq!(
+        loser.conflict.as_ref().map(|conflict| conflict.kind),
+        Some(WorkConflictKind::GenerationChanged)
+    );
 }
 
 macro_rules! conformance {
@@ -861,5 +1194,13 @@ conformance!(
     a_stale_report_alone_never_opens_takeover,
     a_lapsed_lead_is_told_when_who_and_how_to_resume,
     other_owners_fill_at_most_their_share_of_participants,
-    the_owner_recovers_from_a_dead_lead_token_while_others_wait,
+    a_renewed_token_keeps_its_lead_from_sibling_sessions,
+    an_unnamed_call_renews_no_lease,
+    a_takeover_of_a_lapsed_hold_is_fenced_like_a_new_start,
+    two_takeovers_of_one_lapsed_hold_have_one_winner,
+    a_leaked_call_count_falls_back_to_the_idle_lease,
+    every_overlapping_lapsed_reservation_is_cleared,
+    takeovers_by_other_owners_respect_their_share,
+    a_pause_or_retain_never_revives_a_lapsed_lease,
+    a_lapsed_lease_refuses_edits_until_held_again,
 );

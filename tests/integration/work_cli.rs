@@ -585,6 +585,18 @@ fn start_claim_conflicts_keep_json_and_exit_nonzero() {
             .revoke_agent_token(&first_client.token_id)
             .unwrap()
     );
+    // A revoked lead token no longer renews, but another owner waits for the lease to lapse.
+    conflict_result(
+        &second_client.start(&request.to_string()),
+        WorkConflictKind::ClaimHeld,
+    );
+    hub.sqlite()
+        .execute(
+            "UPDATE hub_work_items SET reservation_expires_at = ?2 WHERE id = ?1",
+            rusqlite::params![first_result.item.id, unix_now() - 1],
+        )
+        .unwrap();
+    hub.store.observe_lease_clock(unix_now()).unwrap();
     let stale = conflict_result(
         &second_client.start(&request.to_string()),
         WorkConflictKind::StaleTakeoverRequired,

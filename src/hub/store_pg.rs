@@ -102,7 +102,7 @@ use super::store::{
 };
 use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
-    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
+    ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
     WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
@@ -112,9 +112,9 @@ use super::work::{
     work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_lifecycle::{
-    CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, MAX_OTHER_OWNER_PARTICIPANTS,
-    OperationalRow, OutcomeFact, RENEW_INTERVAL_SECONDS, RenewalCoverage, lapsed_refusal_text,
-    lease_seconds, operational_page,
+    CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
+    RENEW_INTERVAL_SECONDS, RenewalCoverage, lapsed_refusal_text, lapsed_unheld_text,
+    lease_seconds, operational_page, reclaimed_hold,
 };
 use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
@@ -1760,15 +1760,7 @@ fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i
         item.claim_status = ClaimStatus::Unknown;
         return Ok(());
     }
-    let active = lead_token_active(tx, &item.lead_token, now)?;
-    item.claim_status = claim_status(item.last_checkin_at, active, now);
-    Ok(())
-}
-
-/// Whether the token can still act for its Work: not revoked, not expired, its owner not disabled
-/// and its repository not renamed under it.
-fn lead_token_active(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<bool> {
-    Ok(tx
+    let active = tx
         .query_opt(
             "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
              WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled AND NOT EXISTS (
@@ -1776,9 +1768,11 @@ fn lead_token_active(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) 
                  WHERE c.provider = u.provider AND r.host = u.host
                    AND r.repository_id = t.repository_id AND r.full_name <> t.repository
              )",
-            &[&token, &now],
+            &[&item.lead_token, &now],
         )?
-        .is_some())
+        .is_some();
+    item.claim_status = claim_status(item.last_checkin_at, active, now);
+    Ok(())
 }
 
 /// `project_claim` for many items with one token lookup.
@@ -1992,7 +1986,8 @@ fn lease_clock_fresh(tx: &mut postgres::Transaction<'_>, now: i64) -> Result<boo
 
 /// The Hub's clock heartbeat. After a gap longer than a lease since the last observation, every
 /// reservation that was live then gets one lease of grace instead of lapsing. A backward jump only
-/// moves the observation back. The clock row lock serializes heartbeats; admissions only read it.
+/// moves the observation back. The clock row lock serializes heartbeats; admissions only read it,
+/// and the grace takes each repository's Work lock in the order admissions do.
 fn observe_lease_clock(tx: &mut postgres::Transaction<'_>, now: i64) -> Result<()> {
     let observed: i64 = tx
         .query_one(
@@ -2001,12 +1996,36 @@ fn observe_lease_clock(tx: &mut postgres::Transaction<'_>, now: i64) -> Result<(
         )?
         .get(0);
     if now - observed > LEASE_SECONDS {
-        tx.execute(
-            "UPDATE hub_work_items SET reservation_expires_at = $2
+        let until = now + LEASE_SECONDS;
+        // Each repository's Work lock first, as an admission takes it before any Work row, so the
+        // grace never holds a row an admission waits on while it waits on one the admission holds.
+        let repositories = tx.query(
+            "SELECT DISTINCT provider, host, repository, repository_id FROM hub_work_items
              WHERE reservation_basis IS NOT NULL AND reservation_expires_at > $1
-               AND reservation_expires_at < $2",
-            &[&observed, &(now + LEASE_SECONDS)],
+               AND reservation_expires_at < $2
+             ORDER BY provider, host, repository, repository_id",
+            &[&observed, &until],
         )?;
+        for row in repositories {
+            let (provider, host, repository, repository_id): (String, String, String, Option<i64>) =
+                (row.get(0), row.get(1), row.get(2), row.get(3));
+            lock_work_repository(tx, &provider, &host, &repository, repository_id)?;
+            tx.execute(
+                "UPDATE hub_work_items SET reservation_expires_at = $2
+                 WHERE provider = $3 AND host = $4 AND repository = $5
+                   AND repository_id IS NOT DISTINCT FROM $6
+                   AND reservation_basis IS NOT NULL AND reservation_expires_at > $1
+                   AND reservation_expires_at < $2",
+                &[
+                    &observed,
+                    &until,
+                    &provider,
+                    &host,
+                    &repository,
+                    &repository_id,
+                ],
+            )?;
+        }
     }
     tx.execute(
         "UPDATE hub_lease_clock SET observed_at = $1 WHERE id = 1",
@@ -2064,20 +2083,27 @@ fn session_tool_call(
             )?;
         }
         CallPhase::Start => {
-            tx.execute(
-                "UPDATE hub_sessions SET tool_activity_at = $3, open_call_at = $3,
-                     open_calls = CASE WHEN open_call_at IS NULL OR open_call_at < $4 THEN 1
-                                       ELSE open_calls + 1 END
-                 WHERE token = $1 AND session = $2",
-                &[&token, &session, &now, &stale],
-            )?;
+            // A count still open since before the cap is stale: its ends were lost, so it restarts.
+            let opened: i64 = tx
+                .query_opt(
+                    "UPDATE hub_sessions SET tool_activity_at = $3,
+                         open_calls = CASE WHEN open_calls = 0 OR open_call_at IS NULL
+                                                OR open_call_at < $4 THEN 1
+                                           ELSE open_calls + 1 END,
+                         open_call_at = CASE WHEN open_calls = 0 OR open_call_at IS NULL
+                                                  OR open_call_at < $4 THEN $3
+                                             ELSE open_call_at END
+                     WHERE token = $1 AND session = $2 RETURNING open_call_at",
+                    &[&token, &session, &now, &stale],
+                )?
+                .map_or(now, |row| row.get(0));
             tx.execute(
                 "UPDATE hub_work_items SET reservation_renewed_at = $3,
-                     reservation_expires_at = GREATEST(reservation_expires_at, $3::bigint + $4::bigint)
+                     reservation_expires_at = GREATEST(reservation_expires_at, $4::bigint + $5::bigint)
                  WHERE lead_token = $1 AND lead_session = $2
                    AND state <> 'finished' AND state IN ('active', 'blocked')
                    AND reservation_basis IS NOT NULL AND reservation_expires_at > $3",
-                &[&token, &session, &now, &IN_FLIGHT_CAP_SECONDS],
+                &[&token, &session, &now, &opened, &IN_FLIGHT_CAP_SECONDS],
             )?;
         }
         CallPhase::End => {
@@ -2112,13 +2138,14 @@ fn lapsed_hold_refusal(
     tx: &mut postgres::Transaction<'_>,
     work: &WorkWho,
     session: &str,
+    only: Option<&str>,
 ) -> Result<Option<String>> {
     let Some(row) = tx.query_opt(
         "SELECT w.id, w.generation, e.data FROM hub_work_items w
          JOIN hub_events e ON e.seq = w.updated_seq AND e.kind = 'reservation_lapsed'
          WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
            AND w.repository_id IS NOT DISTINCT FROM $4
-           AND w.lead_token = $5 AND w.lead_session = $6
+           AND w.lead_token = $5 AND w.lead_session = $6 AND ($7::text IS NULL OR w.id = $7)
          ORDER BY e.seq DESC LIMIT 1",
         &[
             &work.owner.identity.provider,
@@ -2127,6 +2154,7 @@ fn lapsed_hold_refusal(
             &work.repository_id,
             &work.token,
             &session,
+            &only,
         ],
     )?
     else {
@@ -2148,6 +2176,27 @@ fn lapsed_hold_refusal(
         &holder,
         agent.as_deref(),
     )))
+}
+
+/// When this Work's lease was last renewed and when it lapsed, if it did and the clock is fresh.
+fn lapsed_at(tx: &mut postgres::Transaction<'_>, id: &str, now: i64) -> Result<Option<(i64, i64)>> {
+    if !lease_lapsed(tx, id, now)? {
+        return Ok(None);
+    }
+    let row = tx.query_one(
+        "SELECT reservation_renewed_at, reservation_expires_at FROM hub_work_items WHERE id = $1",
+        &[&id],
+    )?;
+    Ok(Some((row.get(0), row.get(1))))
+}
+
+/// Changes the basis and keeps the lease as it is, so a lapsed one stays lapsed.
+fn set_work_basis(tx: &mut postgres::Transaction<'_>, id: &str, basis: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_work_items SET reservation_basis = $2 WHERE id = $1",
+        &[&id, &basis],
+    )?;
+    Ok(())
 }
 
 /// Whether this Work's reservation lease has lapsed. A stale clock knows of no lapse.
@@ -2175,31 +2224,39 @@ fn lapsed_overlapping(
     if scope.is_empty() || !lease_clock_fresh(tx, now)? {
         return Ok(Vec::new());
     }
-    // shortcut: at most 100 lapsed reservations are cleared per admission; the rest block nobody
-    // and a later admission clears them.
-    let rows = tx.query(
-        "SELECT id, scope FROM hub_work_items
-         WHERE provider = $1 AND host = $2 AND repository = $3
-           AND repository_id IS NOT DISTINCT FROM $4 AND reservation_basis IS NOT NULL
-           AND ($5::text IS NULL OR id <> $5) AND reservation_expires_at <= $6
-         ORDER BY id LIMIT 100 FOR UPDATE",
-        &[
-            &who.owner.identity.provider,
-            &who.owner.identity.host,
-            &who.repository,
-            &who.repository_id,
-            &exclude,
-            &now,
-        ],
-    )?;
+    // Every lapsed row is read, page by page in id order, so none that overlaps is left unfenced.
     let mut lapsed = Vec::new();
-    for row in rows {
-        let their_scope: String = row.get(1);
-        if !scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?).is_empty() {
-            lapsed.push(row.get(0));
+    let mut after = String::new();
+    loop {
+        let rows = tx.query(
+            "SELECT id, scope FROM hub_work_items
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 AND reservation_basis IS NOT NULL
+               AND ($5::text IS NULL OR id <> $5) AND reservation_expires_at <= $6 AND id > $7
+             ORDER BY id LIMIT 100 FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &exclude,
+                &now,
+                &after,
+            ],
+        )?;
+        let full = rows.len() == 100;
+        for row in rows {
+            let id: String = row.get(0);
+            let their_scope: String = row.get(1);
+            if !scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?).is_empty() {
+                lapsed.push(id.clone());
+            }
+            after = id;
+        }
+        if !full {
+            return Ok(lapsed);
         }
     }
-    Ok(lapsed)
 }
 
 /// Clears each lapsed reservation in `ids` for the admission of the Work `admitted`. The basis is
@@ -2212,7 +2269,8 @@ fn lapse_reservations(
     ids: &[String],
     admitted: &str,
     now: i64,
-) -> Result<()> {
+) -> Result<Vec<ReclaimedHold>> {
+    let mut reclaimed = Vec::with_capacity(ids.len());
     for id in ids {
         let row = tx.query_one(
             "SELECT snapshot, reservation_basis, reservation_renewed_at, reservation_expires_at
@@ -2267,8 +2325,9 @@ fn lapse_reservations(
             .and_then(|bytes| bytes.checked_add(released))
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         record_work_payload_delta(tx, who, delta, now)?;
+        reclaimed.push(reclaimed_hold(&item, expires_at));
     }
-    Ok(())
+    Ok(reclaimed)
 }
 
 fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
@@ -3855,6 +3914,12 @@ fn start_in(
                     &[&item.id, &who.token, &start.session],
                 )?
                 .map(|row| row.get::<_, i64>(0));
+            work_transition::check_other_owner_share(
+                &item,
+                &who.owner.id,
+                &who.token,
+                &start.session,
+            )?;
             if let Some(existing) = item
                 .participants
                 .iter()
@@ -3867,6 +3932,7 @@ fn start_in(
                 }
                 if existing.role == start.role && participant_generation == Some(item.generation) {
                     return Ok(WorkStartResult {
+                        reclaimed: Vec::new(),
                         item,
                         created: false,
                         joined: false,
@@ -3883,17 +3949,6 @@ fn start_in(
                 return Err(HubError::Invalid(
                     "work has the maximum of 100 participants".into(),
                 ));
-            } else if who.owner.id != item.owner
-                && item
-                    .participants
-                    .iter()
-                    .filter(|p| p.owner != item.owner)
-                    .count()
-                    >= MAX_OTHER_OWNER_PARTICIPANTS
-            {
-                return Err(HubError::Invalid(format!(
-                    "work has the maximum of {MAX_OTHER_OWNER_PARTICIPANTS} participants from other owners"
-                )));
             }
             item.participants.push(WorkParticipant {
                 owner: who.owner.id.clone(),
@@ -3934,6 +3989,7 @@ fn start_in(
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
             adjust_work_payload_capacity(tx, who, delta, now)?;
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 item,
                 created: false,
                 joined: true,
@@ -3953,6 +4009,12 @@ fn start_in(
             && item.lead_session == start.session
             && start.takeover_generation.is_none()
         {
+            // A woken lead whose scope another Work took gets the answer the edit guard gives it.
+            if !work_holds_reservation(tx, &item.id)?
+                && let Some(refusal) = lapsed_hold_refusal(tx, who, &start.session, Some(&item.id))?
+            {
+                return Err(HubError::Invalid(refusal));
+            }
             if item.title != start.title
                 || item.scope != scope
                 || item.branch != start.branch
@@ -3962,6 +4024,7 @@ fn start_in(
                 || item.related_work != start.related_work
             {
                 return Ok(WorkStartResult {
+                    reclaimed: Vec::new(),
                     conflict: Some(WorkStartConflict {
                         kind: WorkConflictKind::MetadataChanged,
                         current_generation: item.generation,
@@ -3983,10 +4046,11 @@ fn start_in(
                 Vec::new()
             };
             // The lead asking again for its own lapsed Work is a fresh admission.
+            let mut reclaimed = Vec::new();
             if overlaps.is_empty() && lease_lapsed(tx, &item.id, now)? {
                 let lapsed = lapsed_overlapping(tx, who, &item.scope, Some(&item.id), now)?;
                 set_work_reservation(tx, &item.id, None, Some("admitted"), now)?;
-                lapse_reservations(tx, who, &lapsed, &item.id, now)?;
+                reclaimed = lapse_reservations(tx, who, &lapsed, &item.id, now)?;
             }
             let coordination_request = if overlaps.is_empty() {
                 None
@@ -4007,6 +4071,7 @@ fn start_in(
                 )?)
             };
             return Ok(WorkStartResult {
+                reclaimed,
                 item,
                 created: false,
                 joined: false,
@@ -4018,12 +4083,11 @@ fn start_in(
             });
         }
         let held = work_holds_reservation(tx, &item.id)?;
-        // A held reservation is open to takeover once its lease lapsed, or for its own owner once
-        // the lead token can no longer act; a stale progress report alone never opens it. Work
-        // that holds nothing keeps the claim-age rule.
+        // A held reservation is open to takeover only once its lease lapsed: a revoked lead token
+        // may still be carried to its successor (#337), and a stale progress report alone never
+        // opens it. Work that holds nothing keeps the claim-age rule.
         let open = if held {
             lease_lapsed(tx, &item.id, now)?
-                || (item.owner == who.owner.id && !lead_token_active(tx, &item.lead_token, now)?)
         } else {
             item.claim_status == ClaimStatus::Stale
         };
@@ -4036,6 +4100,7 @@ fn start_in(
                 WorkConflictKind::ClaimHeld
             };
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind,
                     current_generation: item.generation,
@@ -4060,6 +4125,7 @@ fn start_in(
             || released_by_owner;
         if !resuming_own_paused && !open && item.state != WorkState::Handover {
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind: WorkConflictKind::ClaimHeld,
                     current_generation: item.generation,
@@ -4075,13 +4141,20 @@ fn start_in(
                 preflight: None,
             });
         }
-        // Work that released its reservation must win the scope again before anyone leads it.
+        // Work that holds no live reservation, released or lapsed, must win the scope again before
+        // anyone leads it.
+        let own_lapse = if held {
+            lapsed_at(tx, &item.id, now)?
+        } else {
+            None
+        };
         let mut lapsed = Vec::new();
-        if !work_holds_reservation(tx, &item.id)? {
+        if !held || own_lapse.is_some() {
             lapsed = lapsed_overlapping(tx, who, &item.scope, Some(&item.id), now)?;
             let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
             if let Some(first) = overlaps.first() {
                 return Ok(WorkStartResult {
+                    reclaimed: Vec::new(),
                     conflict: Some(WorkStartConflict {
                         kind: WorkConflictKind::ScopeOverlap,
                         current_generation: first.item.generation,
@@ -4103,6 +4176,7 @@ fn start_in(
             && current.id != item.id
         {
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind: WorkConflictKind::SessionGoalChanged,
                     current_generation: current.generation,
@@ -4118,6 +4192,10 @@ fn start_in(
                 preflight: None,
             });
         }
+        // Its previous lead may have unpushed edits too, so another taker is told before it leads.
+        let own_reclaimed = own_lapse
+            .filter(|_| item.lead_token != who.token || item.lead_session != start.session)
+            .map(|(_, expired)| reclaimed_hold(&item, expired));
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
         let previous_lead_token = item.lead_token.clone();
         let previous_lead_session = item.lead_session.clone();
@@ -4126,6 +4204,7 @@ fn start_in(
                 participant.role = WorkRole::Helper;
             }
         }
+        work_transition::check_other_owner_share(&item, &who.owner.id, &who.token, &start.session)?;
         if !item.participants.iter().any(|participant| {
             participant.token == who.token && participant.session == start.session
         }) && item.participants.len() >= 100
@@ -4181,7 +4260,8 @@ fn start_in(
         )?;
         let snapshot = save_work_version(tx, &item, seq)?;
         set_work_reservation(tx, &item.id, None, Some("admitted"), now)?;
-        lapse_reservations(tx, who, &lapsed, &item.id, now)?;
+        let mut reclaimed: Vec<ReclaimedHold> = own_reclaimed.into_iter().collect();
+        reclaimed.extend(lapse_reservations(tx, who, &lapsed, &item.id, now)?);
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
         // Requests follow a new lead; the same lead resuming keeps them as they are.
         if previous_lead_token != who.token || previous_lead_session != start.session {
@@ -4199,6 +4279,7 @@ fn start_in(
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(tx, who, delta, now)?;
         return Ok(WorkStartResult {
+            reclaimed,
             item,
             created: false,
             joined: false,
@@ -4214,6 +4295,7 @@ fn start_in(
     }
     if let Some(item) = unfinished_for_session(tx, who, &start.session, now)? {
         return Ok(WorkStartResult {
+            reclaimed: Vec::new(),
             conflict: Some(WorkStartConflict {
                 kind: WorkConflictKind::SessionGoalChanged,
                 current_generation: item.generation,
@@ -4247,6 +4329,7 @@ fn start_in(
             now,
         )?;
         return Ok(WorkStartResult {
+            reclaimed: Vec::new(),
             item: first.item.clone(),
             created: false,
             joined: false,
@@ -4403,9 +4486,10 @@ fn start_in(
             + work_payload_row_bytes(declarations_snapshot.len())?,
         now,
     )?;
-    lapse_reservations(tx, who, &lapsed, &id, now)?;
+    let reclaimed = lapse_reservations(tx, who, &lapsed, &id, now)?;
     bind_coordination_request(tx, who, &start.session, &item, now)?;
     Ok(WorkStartResult {
+        reclaimed,
         item,
         created: true,
         joined: false,
@@ -5282,6 +5366,7 @@ fn guard_managed_touch(
     who: &WorkWho,
     name: &str,
     keys: &[String],
+    now: i64,
 ) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
@@ -5329,10 +5414,19 @@ fn guard_managed_touch(
         eligible.push(json_value::<WorkItem>(&row.get::<_, String>(0))?);
     }
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
-        if let Some(refusal) = lapsed_hold_refusal(tx, who, name)? {
+        if let Some(refusal) = lapsed_hold_refusal(tx, who, name, None)? {
             return Err(HubError::Invalid(refusal));
         }
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
+    }
+    // A lapsed lease no longer holds the scope, so editing under it needs fresh admission first.
+    if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
+        return Err(HubError::Invalid(lapsed_unheld_text(
+            &eligible[0].id,
+            renewed,
+            expired,
+            false,
+        )));
     }
     Ok(())
 }
@@ -5420,7 +5514,7 @@ fn touch_in(
     {
         name = alias_hook_session(tx, token, observed, now)?;
     }
-    guard_managed_touch(tx, &work, &name, &call.keys)?;
+    guard_managed_touch(tx, &work, &name, &call.keys, now)?;
     let mut row = session_row(tx, token, &name)?;
     if row.is_none() && name != DEFAULT_SESSION && call.via.starts_with("hook:") {
         // An agent that called agentscm_start before its first hook keeps that session.
@@ -5567,8 +5661,11 @@ fn touch_in(
     } else {
         carry_identified_leads(tx, &work, &name, now)?
     };
-    // After the carry above, so a session whose token changed renews in the same touch.
-    renew_leases(tx, token, &name, now)?;
+    // After the carry above, so a session whose token changed renews in the same touch. Only a
+    // named call renews: an unnamed one resolves to whichever session the token used last.
+    if call.session.is_some() {
+        renew_leases(tx, token, &name, now)?;
+    }
     Ok(guarded.touched(
         token, &name, announced, notices, handoffs, requested, lead_notes,
     ))
@@ -7279,7 +7376,9 @@ impl Store for PgStore {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
             let touched = touch_in(&mut tx, &who, &call, now)?;
-            session_tool_call(&mut tx, token, &touched.session, phase, now)?;
+            if call.session.is_some() {
+                session_tool_call(&mut tx, token, &touched.session, phase, now)?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -9370,6 +9469,7 @@ impl Store for PgStore {
                     operational: Vec::new(),
                 });
                 let result = WorkStartResult {
+                    reclaimed: Vec::new(),
                     item,
                     created: false,
                     joined: false,
@@ -9438,6 +9538,7 @@ impl Store for PgStore {
                 let event_seq: i64 = row.get(2);
                 tx.commit()?;
                 return Ok(WorkCheckpointResult {
+                    reclaimed: Vec::new(),
                     item,
                     receipt: CheckpointReceipt {
                         work_id: checkpoint.work_id.clone(),
@@ -9636,14 +9737,27 @@ impl Store for PgStore {
                 }
                 super::work::CheckpointKind::Pause | super::work::CheckpointKind::Handover => {
                     if let Some(basis) = work_transition::basis_after_pause(prior_basis) {
-                        set_work_reservation(&mut tx, &item.id, None, Some(basis.column()), now)?;
+                        // A pause reports on a live lease; it never revives a lapsed one.
+                        if lease_lapsed(&mut tx, &item.id, now)? {
+                            set_work_basis(&mut tx, &item.id, basis.column())?;
+                        } else {
+                            set_work_reservation(
+                                &mut tx,
+                                &item.id,
+                                None,
+                                Some(basis.column()),
+                                now,
+                            )?;
+                        }
                     }
                 }
                 _ => {}
             }
-            if checkpoint.kind != super::work::CheckpointKind::Finish {
-                lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?;
-            }
+            let reclaimed = if checkpoint.kind != super::work::CheckpointKind::Finish {
+                lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?
+            } else {
+                Vec::new()
+            };
             tx.execute(
                 "INSERT INTO hub_work_checkpoint_ops
                     (work, operation_id, request, event_seq)
@@ -9665,6 +9779,7 @@ impl Store for PgStore {
             }
             tx.commit()?;
             Ok(WorkCheckpointResult {
+                reclaimed,
                 item,
                 receipt: CheckpointReceipt {
                     work_id: checkpoint.work_id.clone(),
@@ -9729,6 +9844,7 @@ impl Store for PgStore {
                 let event_seq: i64 = row.get(2);
                 tx.commit()?;
                 return Ok(WorkTransitionResult {
+                    reclaimed: Vec::new(),
                     item,
                     receipt: Some(CheckpointReceipt {
                         work_id: request.work_id.clone(),
@@ -9751,6 +9867,11 @@ impl Store for PgStore {
             let basis_column: Option<String> = columns_row.get(1);
             let held = basis_column.is_some();
             work_transition::check(&item, held, &acting, request)?;
+            if request.transition == work_transition::WorkTransitionKind::Retain
+                && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
+            {
+                return Err(HubError::Invalid(lapsed_unheld_text(&item.id, renewed, expired, true)));
+            }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
             }
@@ -9768,6 +9889,7 @@ impl Store for PgStore {
                         operational: Vec::new(),
                     };
                     return Ok(WorkTransitionResult {
+                        reclaimed: Vec::new(),
                         item,
                         receipt: None,
                         conflict: Some(conflict),
@@ -9800,7 +9922,7 @@ impl Store for PgStore {
                 columns.basis.map(work_transition::ReservationBasis::column),
                 now,
             )?;
-            lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?;
+            let reclaimed = lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?;
             if request.superseded_by.is_some() {
                 replace_relations(
                     &mut tx,
@@ -9873,6 +9995,7 @@ impl Store for PgStore {
             }
             tx.commit()?;
             Ok(WorkTransitionResult {
+                reclaimed,
                 receipt: Some(CheckpointReceipt {
                     work_id: item.id.clone(),
                     operation_id: request.operation_id.clone(),

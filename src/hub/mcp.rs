@@ -3273,6 +3273,10 @@ fn start_result(
             }
         }
     }
+    for reclaimed in &work.reclaimed {
+        text.push('\n');
+        text.push_str(&reclaimed.notice);
+    }
     if work.item.scope.is_empty() {
         text.push_str("\nScope is undeclared and coverage is unknown. Have the lead checkpoint the intended scope before editing.");
     }

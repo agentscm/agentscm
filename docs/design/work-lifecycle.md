@@ -268,15 +268,21 @@ NULL when nothing is held.
   tool calls and edit checks, its named MCP session calls (`touch_session`) and its checkpoints.
   Renewal follows the lead credential (#337): a checkpoint and a touch renew after the credential
   carry, so the same owner and session renew under a new token in the same call. Another session
-  of the same token, a helper and another token renew nothing.
+  of the same token, a helper and another token renew nothing, and neither does a call that names
+  no session, even when the Hub resolves it to the lead session.
 - Renewal is a conditional update that matches only a live lease of `active` or `blocked` Work, so
   a late touch never revives a lapsed lease, and a paused or handed-over item lapses on its own
   clock even while its session works on something else.
+- A pause or handover checkpoint restarts a live lease and a retain extends it. Neither revives a
+  lapsed one: a pause or handover keeps the lapsed expiry, and a retain is refused with
+  `LEASE_LAPSED`. Only fresh admission holds the scope again.
 - A shell call may run longer than a lease. The hooks report its start and end, the session counts
-  the calls still running (`open_calls`), and each start extends the session's live leases to 60
-  minutes ahead (`IN_FLIGHT_CAP_SECONDS`). When the last call ends they fall back to the idle lease;
-  a retain keeps its own longer expiry. A count older than the cap is stale, its end lost, so a call
-  whose agent crashed holds for at most 60 minutes. Nothing renews from the background: every
+  the calls still running (`open_calls`) and when the first of them started (`open_call_at`), and
+  each start extends the session's live leases to 60 minutes (`IN_FLIGHT_CAP_SECONDS`) after that
+  first start. When the last call ends they fall back to the idle lease; a retain keeps its own
+  longer expiry. A count older than the cap is stale, its ends lost: the next start counts afresh
+  and the next end falls back to the idle lease, so calls whose ends were lost hold for at most 60
+  minutes. Nothing renews from the background: every
   renewal is a call the session made.
 
 ### Lapse
@@ -290,16 +296,26 @@ NULL when nothing is held.
   prior lead agent and session, the basis, the last renewal, the expiry, the branch, the scope, the
   paths the Hub saw the lead session hold, `push_state: unknown` and the admitting Work. Compaction
   never deletes that event kind.
+- The admission response lists every lapsed hold it took the scope of in `reclaimed`: the Work, its
+  lead agent, its branch, when it lapsed and a notice that the branch may hold edits its lead never
+  pushed. A start, a takeover, a scope-changing checkpoint and a reopen all report it.
 - A woken lead whose scope was taken is refused by the managed-edit guard with `LEASE_LAPSED`: when
-  the hold lapsed, which Work and agent hold the scope now, that the branch may hold unpushed work,
-  and the `agentscm_start` with `work_id` and `takeover_generation` that resumes it through fresh
-  admission. Hooks, MCP and HTTP pass that text through. The guard's refusal is not the advisory
-  overlap guard, so the pass-through after three refusals in ten minutes never applies to it.
-- Taking over Work that holds a reservation needs its lease to have lapsed, or, for the Work's own
-  owner, a lead token that can no longer act (revoked, expired, its owner disabled or its repository
-  renamed), since such a token never renews. A stale claim, a progress report older than
-  `CLAIM_STALE_SECONDS`, never opens it alone. Work that holds nothing keeps the claim-age rule, and
-  `handover` Work is open as before.
+  the hold lapsed and how long after the session last renewed it, which Work took the scope, that
+  the branch may hold unpushed work, and the `agentscm_start` with `work_id` and
+  `takeover_generation` that resumes it through fresh admission. Its `agentscm_start` of the same
+  Work without `takeover_generation` gets the same answer. Hooks, MCP and HTTP pass that text
+  through. The guard's refusal is not the advisory overlap guard, so the pass-through after three
+  refusals in ten minutes never applies to it.
+- A lead whose lease lapsed while nobody took its scope is refused by the same guard with
+  `LEASE_LAPSED`: nothing holds the scope, so it must start its Work again before editing.
+- Taking over Work that holds a reservation needs its lease to have lapsed, for its owner's other
+  sessions as for other owners. A revoked lead token never opens it early: token renewal revokes
+  the old token before the lead's next call carries the lead to the new one (#337), so a live lead
+  can look revoked for up to a lease. A stale claim, a progress report older than
+  `CLAIM_STALE_SECONDS`, never opens it either. Work that holds nothing keeps the claim-age rule,
+  and `handover` Work is open as before.
+- A takeover of a lapsed hold is a fresh admission, like the resume of released Work: it checks
+  the scope against live holds and clears the lapsed ones it overlaps.
 
 ### Clock
 
@@ -310,14 +326,18 @@ NULL when nothing is held.
 - In PostgreSQL an admission holds the repository's Work lock, then locks the lapsed candidate rows,
   then checks overlaps. A touch and a reported tool call hold the same lock in shared mode and a
   checkpoint in exclusive mode before renewing, so a renewal never lands between the check and the
-  lapse. The heartbeat locks only the clock row before extending leases, and admissions only read
-  that row.
+  lapse. Admissions only read the clock row. A heartbeat that extends leases after a gap takes the
+  clock row, then each affected repository's Work lock in repository order before updating its
+  rows, the lock an admission takes before any Work row, so it never waits in a cycle with an
+  admission. If PostgreSQL still aborts a transaction for a deadlock or a serialization failure,
+  the call fails as `Busy` with nothing written, and a retry is safe.
 
 ### Coverage and participants
 
 - `activity.coverage` says what renews the lead session: `tool_calls` once a hook reported one of
-  its tool calls, `edits` for hooks that report only edits (an older `client setup`), `mcp_only`,
-  or `unknown` when the Hub keeps no session record. Anything but `tool_calls` adds
+  its tool calls, `tool_ends` when its only hook reports each call's end and none's start (Cursor),
+  `edits` for hooks that report only edits (an older `client setup`), `mcp_only`, or `unknown`
+  when the Hub keeps no session record. Anything but `tool_calls` adds
   `activity_coverage` to `completeness.unknown` and a reason that names the fix. The per-agent
   table is in [Coding agents](../agents.md#holds-stay-live-while-the-agent-works).
 - Any writer on the repository may join Work as a helper or reviewer, but a Work item takes at most

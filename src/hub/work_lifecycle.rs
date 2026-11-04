@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::work::{CheckpointKind, ClaimStatus, WorkItem, WorkState};
+use super::work::{CheckpointKind, ClaimStatus, ReclaimedHold, WorkItem, WorkState};
 
 /// Version 1 of the reports that embed these types without `activity`, such as reconciliation.
 pub(super) const SCHEMA_VERSION_V1: u16 = 1;
@@ -27,8 +27,28 @@ pub const LEASE_LAPSED: &str = "LEASE_LAPSED";
 /// the owner's sessions, so other owners cannot block a resume or slow cleanup without bound.
 pub const MAX_OTHER_OWNER_PARTICIPANTS: usize = 25;
 
-/// The refusal of an edit by the lead of Work `id` whose reservation lapsed, from the
-/// `reservation_lapsed` event `data`: when it lapsed, who holds the scope now and how to resume.
+/// Whole minutes from a hold's last renewal to its lapse: 20 for an idle lease, longer after a
+/// shell call or a retain.
+fn held_minutes(renewed: i64, expired: i64) -> i64 {
+    (expired - renewed).max(0) / 60
+}
+
+/// The refusal of an edit or a retain on Work `id` whose lease, last renewed at `renewed`, lapsed
+/// at `expired` while nothing took its scope: it must be held again through fresh admission first.
+pub(super) fn lapsed_unheld_text(id: &str, renewed: i64, expired: i64, retain: bool) -> String {
+    let what = if retain {
+        "A retain cannot revive it: hold it again with"
+    } else {
+        "Hold it again before editing: the lead runs"
+    };
+    format!(
+        "{LEASE_LAPSED}: the hold on {id} lapsed at Unix {expired}, {} minutes after its lead session last renewed it. Nothing held the scope when this was refused, but other Work may take it at any time. {what} agentscm_start with work_id {id}; a helper rejoins after that.",
+        held_minutes(renewed, expired)
+    )
+}
+
+/// The refusal of an edit or a start by the lead of Work `id` whose reservation lapsed, from the
+/// `reservation_lapsed` event `data`: when it lapsed, which Work took the scope and how to resume.
 pub(super) fn lapsed_refusal_text(
     id: &str,
     generation: i64,
@@ -37,18 +57,39 @@ pub(super) fn lapsed_refusal_text(
     holder_agent: Option<&str>,
 ) -> String {
     let expired = data["expires_at"].as_i64().unwrap_or_default();
+    let renewed = data["renewed_at"].as_i64().unwrap_or(expired);
     let branch = data["branch"].as_str().map_or_else(
         || "Its branch".to_owned(),
         |branch| format!("Branch {branch}"),
     );
     let holder = match holder_agent {
-        Some(agent) => format!("{holder} (agent {agent})"),
+        Some(agent) => format!("{holder} (led by agent {agent} when this was refused)"),
         None => holder.to_owned(),
     };
     format!(
-        "{LEASE_LAPSED}: your hold on {id} lapsed at Unix {expired} because this session did not renew it for {} minutes, and {holder} holds the scope now. {branch} may hold unpushed work: push or set it aside before you continue. Resume with agentscm_start work_id {id} takeover_generation {generation}, a fresh admission that conflicts while the scope is held.",
-        LEASE_SECONDS / 60
+        "{LEASE_LAPSED}: your hold on {id} lapsed at Unix {expired}, {} minutes after this session last renewed it, and {holder} took the scope then. {branch} may hold unpushed work: push or set it aside before you continue. Resume with agentscm_start work_id {id} takeover_generation {generation}, a fresh admission that conflicts while the scope is held.",
+        held_minutes(renewed, expired)
     )
+}
+
+/// What an admission tells its caller about the lapsed hold of `item`, which lapsed at `expired`,
+/// whose scope it took.
+pub(super) fn reclaimed_hold(item: &WorkItem, expired: i64) -> ReclaimedHold {
+    let branch = item.branch.as_deref().map_or_else(
+        || "its branch".to_owned(),
+        |branch| format!("branch {branch}"),
+    );
+    ReclaimedHold {
+        work_id: item.id.clone(),
+        lead_agent: item.lead_agent.clone(),
+        branch: item.branch.clone(),
+        lapsed_at: expired,
+        notice: format!(
+            "AgentSCM: this admission took the scope of {id}, whose hold lapsed at Unix {expired}. Its lead agent {agent} may have edits on {branch} that it never pushed: check with that agent or its owner before you change the same files.",
+            id = item.id,
+            agent = item.lead_agent,
+        ),
+    }
 }
 
 /// Where a hook saw a tool call: a shell call may run longer than a lease, so its start and end
@@ -66,6 +107,9 @@ pub enum CallPhase {
 pub enum RenewalCoverage {
     /// A hook reported the session's tool calls, so every tool call renews.
     ToolCalls,
+    /// The only hook reports each tool call's end and none's start (Cursor's `postToolUse`), so a
+    /// session inside one long call does not renew.
+    ToolEnds,
     /// Hooks report only edits (an older `client setup`): edits, MCP calls and checkpoints renew.
     Edits,
     /// MCP only: named MCP calls and checkpoints renew.
@@ -81,9 +125,16 @@ impl RenewalCoverage {
             return Self::Unknown;
         };
         let modes: Vec<String> = serde_json::from_str(via).unwrap_or_default();
-        if tool_activity {
+        let mut hooks = modes
+            .iter()
+            .filter(|mode| mode.starts_with("hook:"))
+            .peekable();
+        let hooked = hooks.peek().is_some();
+        if tool_activity && hooked && hooks.all(|mode| mode == "hook:cursor") {
+            Self::ToolEnds
+        } else if tool_activity {
             Self::ToolCalls
-        } else if modes.iter().any(|mode| mode.starts_with("hook:")) {
+        } else if hooked {
             Self::Edits
         } else {
             Self::McpOnly
@@ -93,6 +144,9 @@ impl RenewalCoverage {
     fn hint(self) -> &'static str {
         match self {
             Self::ToolCalls => "It renews on every tool call.",
+            Self::ToolEnds => {
+                "Its agent reports only the end of each tool call, so a session inside one call longer than the lease lapses meanwhile."
+            }
             Self::Edits => {
                 "Its agent reports only edits, so a busy session that edits nothing lapses; run agentscm client setup in its checkout to renew on every tool call."
             }
@@ -1015,12 +1069,13 @@ mod tests {
 
     #[test]
     fn the_lapse_refusal_says_when_who_and_how_to_resume() {
-        let data = serde_json::json!({"expires_at": 1200, "branch": "feature/a"});
+        // A shell call kept this hold for an hour, so the text gives that, not the idle lease.
+        let data = serde_json::json!({"renewed_at": 0, "expires_at": 3600, "branch": "feature/a"});
         let text = lapsed_refusal_text("wrk_a", 2, &data, "wrk_b", Some("agent-b"));
         assert!(text.starts_with(LEASE_LAPSED));
         for part in [
-            "lapsed at Unix 1200",
-            "wrk_b (agent agent-b) holds the scope now",
+            "lapsed at Unix 3600, 60 minutes after this session last renewed it",
+            "wrk_b (led by agent agent-b when this was refused) took the scope then",
             "Branch feature/a may hold unpushed work",
             "agentscm_start work_id wrk_a takeover_generation 2",
         ] {
@@ -1033,6 +1088,10 @@ mod tests {
         assert_eq!(
             RenewalCoverage::of(Some(r#"["hook:claude","mcp"]"#), true),
             RenewalCoverage::ToolCalls
+        );
+        assert_eq!(
+            RenewalCoverage::of(Some(r#"["hook:cursor","mcp"]"#), true),
+            RenewalCoverage::ToolEnds
         );
         assert_eq!(
             RenewalCoverage::of(Some(r#"["hook:codex"]"#), false),

@@ -6341,10 +6341,23 @@ fn lead_activity_renews_the_lease_without_reviving_it(db: &Db) {
     announce(&*store, &alice, "s-other", "docs/y.md", renewed + 600);
     announce(&*store, &bob, "s-b", "docs/z.md", renewed + 600);
     assert_eq!(lease_of(db, &held.id), expected);
-    // Once lapsed, a late touch of the lead does not revive it.
+    // Once lapsed, a late touch of the lead does not revive it, and its edit needs fresh admission.
     let late = renewed + LEASE_SECONDS + 1;
     tick(&*store, renewed + 600, late);
-    announce(&*store, &alice, "s-a", "src/x.rs", late);
+    store
+        .touch_session(
+            &alice.token,
+            &agentscm::hub::session::SessionCall {
+                session: Some("s-a".into()),
+                via: "mcp".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            late,
+        )
+        .unwrap();
     assert_eq!(lease_of(db, &held.id), expected);
     assert_eq!(
         activity(&*store, &alice, &held.id, late).status,

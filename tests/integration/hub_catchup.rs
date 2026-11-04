@@ -2754,18 +2754,26 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
         0
     );
     assert_eq!(fixture.store.latest_event_seq().unwrap(), before_repeat);
+    // The old lead token can no longer renew, so the hold opens to takeover once its lease lapses.
+    let lapsed = now + 4 + agentscm::hub::work_lifecycle::LEASE_SECONDS + 1;
+    let mut at = now + 4;
+    while at < lapsed {
+        fixture.store.observe_lease_clock(at).unwrap();
+        at += 60;
+    }
+    fixture.store.observe_lease_clock(lapsed).unwrap();
     let mut takeover = start("retained", "src/retained.rs");
     takeover.takeover_generation = Some(original.generation);
     let resumed = fixture
         .store
-        .work_start(&new_token, &takeover, now + 4)
+        .work_start(&new_token, &takeover, lapsed)
         .unwrap();
     assert!(resumed.took_over);
     assert_eq!(resumed.item.id, original.id);
     assert_eq!(resumed.item.generation, original.generation + 1);
     let requests = fixture
         .store
-        .coordination_list(&new_token, &Default::default(), now + 5)
+        .coordination_list(&new_token, &Default::default(), lapsed + 1)
         .unwrap();
     let request = requests
         .requests
@@ -2782,7 +2790,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 session: resumed.item.lead_session.clone(),
                 expected_updated_seq: request.updated_seq,
             },
-            now + 5,
+            lapsed + 1,
         )
         .unwrap();
     // A different repository reusing the old name cannot see the migrated Work.
