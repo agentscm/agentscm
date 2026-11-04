@@ -557,6 +557,36 @@ fn other_repository_and_unbound(fixture: &StoreFixture) {
     let unknown = work_reconcile::read(&*ctx.store, &ctx.principal, "wrk_missing", unix_now());
     assert!(matches!(unknown, Ok(None)), "{unknown:?}");
 
+    // A bound token with no connected repository read no observation, so nothing says closed.
+    let linked = ctx
+        .store
+        .work_start(&other.token_id, &start("other", "src/o", &[]), unix_now())
+        .unwrap()
+        .item;
+    ctx.store
+        .work_pr_link_set(
+            &other.token_id,
+            &WorkPrLinkUpdate {
+                work_id: linked.id.clone(),
+                operation_id: "link-other".into(),
+                generation: linked.generation,
+                session: linked.lead_session.clone(),
+                expected_updated_seq: linked.updated_seq,
+                link: Some(WorkPrLinkTarget {
+                    repository_id: 202,
+                    number: 9,
+                    head_sha: "a".repeat(40),
+                }),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let out = work_reconcile::read(&*ctx.store, &other, &linked.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert!(has(&out, "observation_unavailable") && !has(&out, "closed_state_not_readable"));
+    assert_eq!(out.provider.status, ProviderStatus::Unknown);
+
     // An unbound repository has no readable link, which is not an error.
     let (_, secret) = mint_agent_token(&*ctx.store, &owner, "legacy", "legacy/repo", 3600).unwrap();
     let legacy = principal(&*ctx.store, secret.expose());

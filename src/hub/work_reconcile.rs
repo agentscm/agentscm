@@ -417,8 +417,9 @@ fn open_head(
     ) else {
         return Err("observation_unavailable");
     };
+    // No connected repository means no observation was read, which is not "nothing open".
     let Some(repository) = repository else {
-        return Ok(None);
+        return Err("observation_unavailable");
     };
     let observation = store
         .observation(&repository.id, "pull_request", &number.to_string())
@@ -519,10 +520,10 @@ pub fn read(
             now,
         )?
         .work;
-    let this = operational
-        .iter()
-        .find(|w| w.work_id == item.id)
-        .ok_or_else(|| HubError::Unavailable("operational projection missing".into()))?;
+    // A repository repair can move the Work between the two reads: it is no longer here.
+    let Some(this) = operational.iter().find(|w| w.work_id == item.id) else {
+        return Ok(None);
+    };
     let scope = CatchupRepositoryScope {
         provider: principal.owner.identity.provider.clone(),
         host: principal.owner.identity.host.clone(),
