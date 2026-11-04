@@ -4722,11 +4722,12 @@ fn guard_managed_touch(
     Ok(())
 }
 
-/// The guard for a plain intent announce, which names no session. A token that has any session
-/// linked to Work in its repository may announce only paths covered by Work on which one of its
-/// sessions is currently eligible (held reservation, active or blocked, current generation); a
-/// token never linked to Work keeps the legacy advice. It looks the token up by its stored
-/// repository id, as the announce always has, so a renamed repository does not refuse it.
+/// The guard for a plain intent announce, which names no session and is advisory. It refuses a
+/// path only when the path lies in the scope of unfinished Work the token took part in and none of
+/// the token's sessions is currently eligible on it (held reservation, active or blocked, current
+/// generation), unless Work with an eligible session of the token covers the path. It looks the
+/// token up by its stored repository id, as the announce always has, so a renamed repository does
+/// not refuse it.
 fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
@@ -4736,43 +4737,47 @@ fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()
         [&who.token],
         |row| row.get(0),
     )?;
-    let scope = params![
-        who.owner.identity.provider,
-        who.owner.identity.host,
-        who.repository,
-        repository_id,
-        who.token
-    ];
-    let linked: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM hub_work_items w
-         JOIN hub_work_participants p ON p.work=w.id
-         WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
-           AND w.repository_id IS ?4 AND p.token=?5)",
-        scope,
-        |row| row.get(0),
-    )?;
-    if !linked {
-        return Ok(());
-    }
-    let eligible = {
+    let rows = {
         let mut statement = tx.prepare(
-            "SELECT DISTINCT w.snapshot FROM hub_work_items w
+            "SELECT w.id, w.snapshot,
+                    MAX(w.state IN ('active','blocked') AND w.reservation_basis IS NOT NULL
+                        AND p.generation=w.generation)
+             FROM hub_work_items w
              JOIN hub_work_participants p ON p.work=w.id
              WHERE w.provider=?1 AND w.host=?2 AND w.repository=?3
-               AND w.repository_id IS ?4 AND w.state IN ('active','blocked')
-               AND w.reservation_basis IS NOT NULL
-               AND p.token=?5 AND p.generation=w.generation
-             ORDER BY w.id",
+               AND w.repository_id IS ?4 AND w.state <> 'finished' AND p.token=?5
+             GROUP BY w.id ORDER BY w.id",
         )?;
         statement
-            .query_map(scope, |row| row.get::<_, String>(0))?
+            .query_map(
+                params![
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    who.repository,
+                    repository_id,
+                    who.token
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let scopes = eligible
-        .iter()
-        .map(|snapshot| json_value::<WorkItem>(snapshot).map(|item| item.scope))
-        .collect::<Result<Vec<_>>>()?;
-    work_transition::check_announce(true, &scopes, keys)
+    let mut eligible = Vec::new();
+    let mut ineligible = Vec::new();
+    for (id, snapshot, held) in rows {
+        let scope = json_value::<WorkItem>(&snapshot)?.scope;
+        if held {
+            eligible.push(scope);
+        } else {
+            ineligible.push((id, scope));
+        }
+    }
+    work_transition::check_announce(&eligible, &ineligible, keys)
 }
 
 /// the session's behalf, or answered without text) tells and consumes nothing.

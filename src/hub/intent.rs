@@ -557,7 +557,12 @@ async fn announce(
     let announced = blocking(&state, move || {
         store.announce_intent(&principal.token_id, &intent, unix_now())
     })
-    .await?;
+    .await
+    .map_err(|error| match error {
+        // The refusal says what to do: a released id, or Work to resume.
+        HubError::Invalid(message) => ApiError::invalid().with_message(message),
+        other => ApiError::from(other),
+    })?;
     NOTICES.notify_waiters();
     let host = principal.owner.identity.host.clone();
     // The announce is committed; a failed look at pull requests must not fail it.

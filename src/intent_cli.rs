@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::hub_cli::{clean, config_dir, map_hub_error, write_private};
 
 const TTL_SECONDS: i64 = 7200;
+/// The Hub's refusal text for an announce that reuses a released intent id.
+const RELEASED: &str = "intent was released";
 /// Claude Code runs hooks with a 10 s budget; one hook makes up to three calls.
 const HOOK_LIMIT: Duration = Duration::from_secs(3);
 const CLI_LIMIT: Duration = Duration::from_secs(10);
@@ -403,7 +405,10 @@ impl Hub {
                 "the agent token was rejected (expired or revoked; mint a new one)",
             )),
             429 | 503 => Err(invalid("hub busy")),
-            _ => Err(Error::Invalid(format!("hub error {status}"))),
+            _ => Err(Error::Invalid(match reply["message"].as_str() {
+                Some(message) => format!("hub error {status}: {}", bound_message(message)),
+                None => format!("hub error {status}"),
+            })),
         }
     }
 
@@ -485,11 +490,15 @@ fn save(path: &Path, state: &State) -> Result<()> {
     write_private(path, &serde_json::to_string(state)?)
 }
 
-fn fresh(ctx: &Ctx) -> Result<State> {
+fn new_intent_id() -> Result<String> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random).map_err(|_| invalid("random source"))?;
+    Ok(format!("int_{}", hex(&random)))
+}
+
+fn fresh(ctx: &Ctx) -> Result<State> {
     Ok(State {
-        intent_id: format!("int_{}", hex(&random)),
+        intent_id: new_intent_id()?,
         repo: String::new(),
         task: default_task(&ctx.cwd),
         branch: head_branch(&ctx.cwd),
@@ -498,6 +507,11 @@ fn fresh(ctx: &Ctx) -> Result<State> {
         remote_ok: None,
         notice_cursor: 0,
     })
+}
+
+/// The Hub's one-sentence reason, cleaned and cut so it cannot flood a hook's output.
+fn bound_message(message: &str) -> String {
+    bound(message, 300).unwrap_or_default()
 }
 
 /// Cleaned, non-empty and at most `max` bytes, as the hub requires.
@@ -839,7 +853,19 @@ async fn track(
     let body = json!({"intent_id": state.intent_id, "task": state.task, "branch": state.branch,
         "machine": machine(), "paths": state.paths, "ttl_s": TTL_SECONDS});
     let url = format!("{}/intents", Hub::repo_path(&state.repo));
-    let reply = hub.call(Method::POST, &url, Some(body)).await?;
+    let reply = match hub.call(Method::POST, &url, Some(body)).await {
+        // The stored id was released (its Work finished or was released). A resumed agent must
+        // not stay stuck on a dead id: keep the paths, mint a new id and retry once.
+        Err(Error::Invalid(message)) if message.ends_with(RELEASED) => {
+            state.intent_id = new_intent_id()?;
+            save(path, state)?;
+            let body = json!({"intent_id": state.intent_id, "task": state.task,
+                "branch": state.branch, "machine": machine(), "paths": state.paths,
+                "ttl_s": TTL_SECONDS});
+            hub.call(Method::POST, &url, Some(body)).await?
+        }
+        other => other?,
+    };
     let mut lines = announce_warnings(&reply, &state.pending, unix_now());
     state.pending.clear();
     // The announce already succeeded; a notice failure only defers them to the next call.

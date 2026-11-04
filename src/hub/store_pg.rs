@@ -4587,10 +4587,10 @@ fn guard_managed_touch(
     Ok(())
 }
 
-/// The guard for a plain intent announce, which names no session. A token that has any session
-/// linked to Work in its repository may announce only paths covered by Work on which one of its
-/// sessions is currently eligible (held reservation, active or blocked, current generation); a
-/// token never linked to Work keeps the legacy advice.
+/// The guard for a plain intent announce, which names no session and is advisory. It refuses a
+/// path only when the path lies in the scope of unfinished Work the token took part in and none of
+/// the token's sessions is currently eligible on it (held reservation, active or blocked, current
+/// generation), unless Work with an eligible session of the token covers the path.
 fn guard_announce(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
@@ -4606,33 +4606,28 @@ fn guard_announce(
         &who.repository_id,
         &who.token,
     ];
-    let linked: bool = tx
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM hub_work_items w
-             JOIN hub_work_participants p ON p.work=w.id
-             WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
-               AND w.repository_id IS NOT DISTINCT FROM $4 AND p.token=$5)",
-            &scope,
-        )?
-        .get(0);
-    if !linked {
-        return Ok(());
-    }
     let rows = tx.query(
-        "SELECT DISTINCT w.id, w.snapshot FROM hub_work_items w
+        "SELECT w.id, w.snapshot,
+                BOOL_OR(w.state IN ('active','blocked') AND w.reservation_basis IS NOT NULL
+                        AND p.generation=w.generation)
+         FROM hub_work_items w
          JOIN hub_work_participants p ON p.work=w.id
          WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
-           AND w.repository_id IS NOT DISTINCT FROM $4 AND w.state IN ('active','blocked')
-           AND w.reservation_basis IS NOT NULL
-           AND p.token=$5 AND p.generation=w.generation
-         ORDER BY w.id",
+           AND w.repository_id IS NOT DISTINCT FROM $4 AND w.state <> 'finished' AND p.token=$5
+         GROUP BY w.id, w.snapshot ORDER BY w.id",
         &scope,
     )?;
-    let mut scopes = Vec::new();
+    let mut eligible = Vec::new();
+    let mut ineligible = Vec::new();
     for row in rows {
-        scopes.push(json_value::<WorkItem>(&row.get::<_, String>(1))?.scope);
+        let scope = json_value::<WorkItem>(&row.get::<_, String>(1))?.scope;
+        if row.get::<_, bool>(2) {
+            eligible.push(scope);
+        } else {
+            ineligible.push((row.get::<_, String>(0), scope));
+        }
     }
-    work_transition::check_announce(true, &scopes, keys)
+    work_transition::check_announce(&eligible, &ineligible, keys)
 }
 
 fn touch_in(

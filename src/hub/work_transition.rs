@@ -485,25 +485,28 @@ pub(super) fn needs_resume(kind: super::work::CheckpointKind) -> Result<()> {
     Ok(())
 }
 
-/// Whether a no-session intent announce may proceed for a token, given the scopes of the Work its
-/// sessions are currently eligible on and whether any session was ever linked to Work here.
-/// A token never linked to Work keeps the legacy advice.
+/// Whether a no-session intent announce may proceed for a token. The plain route names no
+/// session and an intent is advisory, so it is refused only for a path that lies in the declared
+/// scope of unfinished Work the token took part in but on which none of its sessions is currently
+/// eligible, and that no Work with an eligible session of the token covers. Every other path keeps
+/// the legacy advice: a token never linked to Work, one linked only to finished Work, Work with an
+/// empty scope, and paths outside every linked scope.
 pub(super) fn check_announce(
-    linked: bool,
     eligible_scopes: &[Vec<String>],
+    ineligible: &[(String, Vec<String>)],
     keys: &[String],
 ) -> Result<()> {
-    if !linked {
-        return Ok(());
-    }
-    let mut uncovered = keys.to_vec();
+    let mut open = keys.to_vec();
     for scope in eligible_scopes {
-        uncovered = super::work::uncovered_scope(scope, &uncovered);
+        open = super::work::uncovered_scope(scope, &open);
     }
-    if eligible_scopes.is_empty() || !uncovered.is_empty() {
-        return Err(invalid(
-            "These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.",
-        ));
+    for (id, scope) in ineligible {
+        let outside = super::work::uncovered_scope(scope, &open);
+        if outside.len() < open.len() {
+            return Err(invalid(&format!(
+                "These files are in the scope of Work {id}, which this agent no longer holds. Resume it with agentscm_start for that Work before editing."
+            )));
+        }
     }
     Ok(())
 }

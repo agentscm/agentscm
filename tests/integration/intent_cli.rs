@@ -463,3 +463,77 @@ fn watch_starts_from_now_not_from_history() {
     assert_eq!(lines.lines().count(), 1, "{lines}");
     assert!(lines.contains("started working on src/x.rs (which you are changing)"));
 }
+
+fn work_start(session: &str, scope: &[&str]) -> agentscm::hub::work::WorkStart {
+    serde_json::from_value(json!({
+        "work_id": null, "source": null, "request_key": "synthetic-key",
+        "title": "Synthetic work", "session": session, "role": "lead",
+        "scope": scope, "branch": null, "worktree": null, "next_action": null,
+        "depends_on": [], "related_work": [], "takeover_generation": null, "preflight": null
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_released_intent_id_is_replaced_and_a_refusal_is_shown() {
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let client = Client::new(&hub, &alice, "laptop-a");
+    let work = repo();
+    let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+
+    // One id is reused across calls; the first edit announces it.
+    silent(&client.edit("s", "Edit", work.path(), &path("src/a.rs")));
+    let first = hub.live();
+    assert_eq!(first, vec![vec!["src/a.rs".to_owned()]]);
+
+    // The Hub releases the stored id (as when its Work finishes). The next edit must mint a new
+    // id, keep the earlier path and not stay stuck.
+    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let first_id = live[0].id.clone();
+    assert!(
+        hub.store
+            .release_intent(&alice.id, &first_id, unix_now())
+            .unwrap()
+    );
+    assert!(hub.live().is_empty());
+    silent(&client.edit("s", "Edit", work.path(), &path("src/b.rs")));
+    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_ne!(live[0].id, first_id);
+    let mut paths = live[0].paths.clone();
+    paths.sort();
+    assert_eq!(paths, ["src/a.rs", "src/b.rs"]);
+
+    // Work whose reservation was released refuses its scope on the plain route and says why;
+    // the hook still exits 0.
+    let started = hub
+        .store
+        .work_start(&alice.id, &work_start("w", &["lib/**"]), unix_now())
+        .unwrap()
+        .item;
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &alice.id },
+            &WorkTransitionRequest {
+                work_id: started.id.clone(),
+                operation_id: "rel".into(),
+                generation: started.generation,
+                expected_updated_seq: started.updated_seq,
+                session: Some("w".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let output = client.edit("s", "Edit", work.path(), &path("lib/c.rs"));
+    let text = context(&output, "PreToolUse");
+    assert!(text.contains(&started.id), "{text}");
+    assert!(text.contains("Resume"), "{text}");
+    assert!(!hub.live().iter().flatten().any(|p| p == "lib/c.rs"));
+}

@@ -2156,7 +2156,7 @@ conformance!(
     finish_frees_scope_for_a_new_start_and_pause_keeps_blocking,
     finished_work_refuses_checkpoints_but_replays_the_finish_receipt,
     stale_finished_work_cannot_be_taken_over,
-    announce_intent_refuses_fenced_and_finished_sessions_but_not_unlinked_ones,
+    announce_intent_refuses_fenced_sessions_but_not_finished_or_unlinked_ones,
     helper_join_on_finished_work_acquires_nothing,
     unreserved_work_needs_fresh_admission_to_be_taken_over,
     transition_matrix_covers_every_actor_and_kind,
@@ -2173,6 +2173,7 @@ conformance!(
     compaction_runs_after_transition_events_exist,
     abandoned_work_is_not_a_reported_completion,
     plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover,
+    plain_announce_allows_paths_covered_by_eligible_work,
     release_frees_session_and_sessionless_intents_of_the_scope,
     finish_checkpoint_cleans_up_like_a_terminal_transition,
     released_work_resumes_in_any_state_and_refuses_reports_until_then,
@@ -3243,7 +3244,7 @@ fn stale_finished_work_cannot_be_taken_over(db: &Db) {
     );
 }
 
-fn announce_intent_refuses_fenced_and_finished_sessions_but_not_unlinked_ones(db: &Db) {
+fn announce_intent_refuses_fenced_sessions_but_not_finished_or_unlinked_ones(db: &Db) {
     use agentscm::hub::intent::NewIntent;
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -3289,7 +3290,8 @@ fn announce_intent_refuses_fenced_and_finished_sessions_but_not_unlinked_ones(db
         .announce_intent(&bob.token, &intent(3, "src/c.rs"), later + 1)
         .unwrap();
 
-    // A session linked to finished Work gets no new paths either.
+    // A token linked only to finished Work may post advisory intents: the plain route carries no
+    // session, an intent reserves nothing, and finishing acquired no reservation to lose.
     let mut lib_start = native_start("d", "d", "default");
     lib_start.scope = vec!["lib/**".into()];
     let lib = store
@@ -3308,10 +3310,9 @@ fn announce_intent_refuses_fenced_and_finished_sessions_but_not_unlinked_ones(db
         CheckpointKind::Finish,
         later + 2,
     );
-    assert!(matches!(
-        store.announce_intent(&dave.token, &intent(5, "lib/b.rs"), later + 3),
-        Err(HubError::Invalid(_))
-    ));
+    store
+        .announce_intent(&dave.token, &intent(5, "lib/b.rs"), later + 3)
+        .unwrap();
 
     // A session never linked to Work keeps the legacy advisory behavior.
     store
@@ -4642,6 +4643,12 @@ fn live_intents(db: &Db) -> usize {
         .len()
 }
 
+fn plain_intent_of(id: u128, paths: &[&str]) -> agentscm::hub::intent::NewIntent {
+    let mut intent = plain_intent(id, paths[0]);
+    intent.paths = paths.iter().map(|path| (*path).to_owned()).collect();
+    intent
+}
+
 fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(db: &Db) {
     use WorkTransitionKind::{Abandon, Release};
     let store = db.open();
@@ -4650,20 +4657,19 @@ fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(
     let bob = agent(&*store, 2);
     let carol = agent(&*store, 3);
     let dave = agent(&*store, 4);
+    let erin = agent(&*store, 5);
     let owner = user_of(&*store, &alice);
-    let announce_plain = |who: &Agent, n: u128, path: &str, at: i64| {
-        store.announce_intent(&who.token, &plain_intent(n, path), at)
+    let announce_plain = |who: &Agent, id: u128, paths: &[&str], at: i64| {
+        store.announce_intent(&who.token, &plain_intent_of(id, paths), at)
     };
 
-    // A named session, not the default one: the plain route still sees it.
+    // One id, the paths accumulated, as the `agentscm intent` hook posts them. A path outside
+    // every linked scope is advisory and never refused.
     let item = start_in(&*store, &alice, "a", "abc", "src/**", now);
-    announce_plain(&alice, 1, "src/a.rs", now + 1).unwrap();
-    assert!(matches!(
-        announce_plain(&alice, 2, "lib/x.rs", now + 1),
-        Err(HubError::Invalid(_))
-    ));
+    announce_plain(&alice, 1, &["src/a.rs", "lib/x.rs"], now + 1).unwrap();
 
-    // After a release the same token may not regain paths through the plain route.
+    // After a release the path inside the Work's scope is refused and names the Work; the path
+    // outside it passes in the same token.
     let released = store
         .work_transition(
             &by_agent(&alice),
@@ -4672,11 +4678,16 @@ fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(
         )
         .unwrap()
         .item;
-    assert!(matches!(
-        announce_plain(&alice, 3, "src/b.rs", now + 3),
-        Err(HubError::Invalid(_))
-    ));
-    // An explicit resume is a fresh admission and the paths work again.
+    let refused = announce_plain(&alice, 2, &["lib/x.rs", "src/b.rs"], now + 3);
+    match refused {
+        Err(HubError::Invalid(message)) => {
+            assert!(message.contains(&item.id), "{message}");
+            assert!(message.contains("Resume"), "{message}");
+        }
+        other => panic!("expected a refusal naming the Work, got {other:?}"),
+    }
+    announce_plain(&alice, 2, &["lib/x.rs"], now + 3).unwrap();
+    // An explicit resume is a fresh admission and the refused path works again.
     let resumed = store
         .work_start(
             &alice.token,
@@ -4685,9 +4696,10 @@ fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(
         )
         .unwrap();
     assert!(resumed.took_over);
-    announce_plain(&alice, 4, "src/b.rs", now + 5).unwrap();
+    announce_plain(&alice, 2, &["lib/x.rs", "src/b.rs"], now + 5).unwrap();
 
-    // Abandoned Work gives no paths either.
+    // Abandoned Work is finished: its token may post advisory intents, but a released id stays
+    // released, so the client mints a new one.
     let current = current_item(&*store, &alice, &item.id, now + 6);
     store
         .work_transition(
@@ -4697,13 +4709,14 @@ fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(
         )
         .unwrap();
     assert!(matches!(
-        announce_plain(&alice, 5, "src/c.rs", now + 7),
-        Err(HubError::Invalid(_))
+        announce_plain(&alice, 2, &["src/c.rs"], now + 7),
+        Err(HubError::Invalid(message)) if message == "intent was released"
     ));
+    announce_plain(&alice, 3, &["src/c.rs"], now + 7).unwrap();
 
     // A stale takeover fences the previous holder's named session.
     let other = start_in(&*store, &bob, "b", "abc", "lib/**", now + 8);
-    announce_plain(&bob, 6, "lib/a.rs", now + 9).unwrap();
+    announce_plain(&bob, 6, &["lib/a.rs"], now + 9).unwrap();
     let later = now + 8 + CLAIM_STALE_SECONDS + 10;
     assert!(
         store
@@ -4712,13 +4725,47 @@ fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(
             .took_over
     );
     assert!(matches!(
-        announce_plain(&bob, 7, "lib/b.rs", later + 1),
+        announce_plain(&bob, 6, &["lib/a.rs", "lib/b.rs"], later + 1),
         Err(HubError::Invalid(_))
     ));
-    announce_plain(&carol, 8, "lib/c.rs", later + 1).unwrap();
+    announce_plain(&carol, 8, &["lib/c.rs"], later + 1).unwrap();
 
     // A token never linked to Work keeps the legacy advice.
-    announce_plain(&dave, 9, "lib/c.rs", later + 2).unwrap();
+    announce_plain(&dave, 9, &["lib/c.rs"], later + 2).unwrap();
+
+    // Work with an empty scope refuses nothing.
+    let mut empty = native_start("e", "e", "s-e");
+    empty.scope = vec![];
+    store.work_start(&erin.token, &empty, later + 3).unwrap();
+    announce_plain(&erin, 10, &["src/z.rs"], later + 4).unwrap();
+}
+
+/// A path covered by Work on which a session is eligible passes even when other, fenced Work of
+/// the same token also covers it.
+fn plain_announce_allows_paths_covered_by_eligible_work(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let first = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&first, "rel", Release, Some("s-a")),
+            now + 1,
+        )
+        .unwrap();
+    // The released Work holds nothing, so the second may take a part of its scope.
+    let second = start_in(&*store, &alice, "b", "s-b", "src/sub/**", now + 2);
+    // `src/sub/` is still held by the second Work; the rest of `src/` is fenced.
+    store
+        .announce_intent(&alice.token, &plain_intent(1, "src/sub/a.rs"), now + 3)
+        .unwrap();
+    assert!(matches!(
+        store.announce_intent(&alice.token, &plain_intent(2, "src/a.rs"), now + 3),
+        Err(HubError::Invalid(_))
+    ));
+    assert_eq!(second.state, WorkState::Active);
 }
 
 /// A lead, a helper with a session intent, a session-less intent of each of them and of an
