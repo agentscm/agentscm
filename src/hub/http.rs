@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::login::{Login, LoginConfig};
+use super::session::SESSION_REQUIRED;
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
 use super::store::{self, Principal, agent_token_digest, unix_now, web_read_token_digest};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
@@ -298,6 +299,9 @@ impl ApiError {
 impl From<HubError> for ApiError {
     fn from(error: HubError) -> Self {
         match error {
+            HubError::Invalid(message) if message == SESSION_REQUIRED => {
+                Self::invalid().with_message(message)
+            }
             HubError::Invalid(detail) => {
                 eprintln!("hub: request rejected as invalid: {detail:?}");
                 Self::invalid()

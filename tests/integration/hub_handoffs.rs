@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier};
 use agentscm::hub::HubError;
 use agentscm::hub::handoff::{Answered, Asked, HandoffView, Via};
 use agentscm::hub::intent::Intent;
-use agentscm::hub::session::{HOLD_CAP_SECONDS, SessionCall, Touched};
+use agentscm::hub::session::{HOLD_CAP_SECONDS, SESSION_REQUIRED, SessionCall, Touched};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, agent_token_digest, mint_agent_token, unix_now,
 };
@@ -221,7 +221,7 @@ fn a_grant_moves_the_file_and_is_told_once(db: &Db) {
     assert_eq!(held_by(&*store, &bob, T0 + 6), [A]);
     // A second answer finds nothing.
     assert_eq!(
-        answer(&*store, &alice, None, A, true, T0 + 7),
+        answer(&*store, &alice, Some("ha"), A, true, T0 + 7),
         Answered::NoRequest
     );
 
@@ -708,12 +708,12 @@ fn an_omitted_answer_session_resolves_like_the_other_tools(db: &Db) {
         ask(&*store, &bob, "hb", A, T0 + 2),
         Asked::AlreadyAsked { .. }
     ));
-    // Two hook sessions of one token: an omitted session is the default one, not any of them.
+    // Two hook sessions of one token: an omitted session is refused, not guessed.
     touch(&*store, &alice, "hz", &[], T0 + 3);
-    assert_eq!(
-        answer(&*store, &alice, None, A, true, T0 + 4),
-        Answered::NoRequest
-    );
+    assert!(matches!(
+        store.answer_handoff(&alice.token, None, A, true, None, T0 + 4),
+        Err(HubError::Invalid(message)) if message == SESSION_REQUIRED
+    ));
     assert!(matches!(
         answer(&*store, &alice, Some("ha"), A, true, T0 + 4),
         Answered::Granted { .. }
