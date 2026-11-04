@@ -511,7 +511,7 @@ pub(super) fn check_announce(
     for scope in eligible_scopes {
         open = super::work::uncovered_scope(scope, &open);
     }
-    let mut refused: Vec<&String> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
     let mut first: Option<&str> = None;
     for key in &open {
         let hit = ineligible.iter().find(|(_, scope)| {
@@ -519,7 +519,8 @@ pub(super) fn check_announce(
         });
         if let Some((id, _)) = hit {
             first.get_or_insert(id);
-            refused.push(key);
+            // The display form the rest of the API uses, so a directory `src/**` round-trips.
+            refused.push(super::intent::display(key));
         }
     }
     let Some(id) = first else {

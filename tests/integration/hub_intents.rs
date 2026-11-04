@@ -1041,3 +1041,83 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     assert_eq!(events[0]["agent"], session["agent"]);
     assert!(events[0]["data"].is_object() && events[0]["seq"].is_i64());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let hub = Hub::start().await;
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 1,
+    };
+    let user = hub.store.upsert_user(&identity, "user1").unwrap();
+    let (token, secret) = mint_agent_token(&*hub.store, &user.id, "a", REPO, TTL).unwrap();
+    let started = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: Some("w".into()),
+                title: "Synthetic work".into(),
+                session: "w".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/**".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: None,
+                preflight: None,
+            },
+            unix_now(),
+        )
+        .unwrap()
+        .item;
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token },
+            &WorkTransitionRequest {
+                work_id: started.id.clone(),
+                operation_id: "rel".into(),
+                generation: started.generation,
+                expected_updated_seq: started.updated_seq,
+                session: Some("w".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let body = announce_body(1, &["src/b.rs", "lib/ok.rs", "src/sub/**", "src/a.rs"]);
+    let (status, reply) = hub
+        .call(
+            reqwest::Method::POST,
+            INTENTS,
+            Some(secret.expose()),
+            Some(&body),
+        )
+        .await;
+    assert_eq!(status, 400);
+    let mut keys: Vec<&str> = reply
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["error", "message", "refused_paths"]);
+    assert_eq!(reply["error"], "invalid_request");
+    assert!(reply["message"].as_str().unwrap().contains(&started.id));
+    assert_eq!(
+        reply["refused_paths"],
+        json!(["src/a.rs", "src/b.rs", "src/sub/**"])
+    );
+}
