@@ -2174,6 +2174,7 @@ conformance!(
     abandoned_work_is_not_a_reported_completion,
     plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover,
     plain_announce_allows_paths_covered_by_eligible_work,
+    plain_announce_refuses_a_directory_that_overlaps_fenced_work_either_way,
     release_frees_session_and_sessionless_intents_of_the_scope,
     finish_checkpoint_cleans_up_like_a_terminal_transition,
     ending_work_spares_a_tokens_live_intents_elsewhere,
@@ -4773,6 +4774,44 @@ fn plain_announce_allows_paths_covered_by_eligible_work(db: &Db) {
         Err(HubError::Invalid(_))
     ));
     assert_eq!(second.state, WorkState::Active);
+}
+
+/// A broader directory key against a narrower fenced scope, and the reverse, is refused; an
+/// unrelated directory is not.
+fn plain_announce_refuses_a_directory_that_overlaps_fenced_work_either_way(db: &Db) {
+    use WorkTransitionKind::Release;
+    let store = db.open();
+    let now = unix_now();
+    let alice = agent(&*store, 1);
+    let narrow = start_in(&*store, &alice, "a", "s-a", "src/sub/**", now);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&narrow, "rel", Release, Some("s-a")),
+            now + 1,
+        )
+        .unwrap();
+    match store.announce_intent(&alice.token, &plain_intent(1, "src/**"), now + 2) {
+        Err(HubError::Invalid(message)) => assert!(message.contains(&narrow.id), "{message}"),
+        other => panic!("expected a refusal naming the Work, got {other:?}"),
+    }
+    store
+        .announce_intent(&alice.token, &plain_intent(2, "lib/**"), now + 2)
+        .unwrap();
+
+    let bob = agent(&*store, 2);
+    let broad = start_in(&*store, &bob, "b", "s-b", "docs/**", now + 3);
+    store
+        .work_transition(
+            &by_agent(&bob),
+            &transition_request(&broad, "rel-b", Release, Some("s-b")),
+            now + 4,
+        )
+        .unwrap();
+    match store.announce_intent(&bob.token, &plain_intent(3, "docs/deep/**"), now + 5) {
+        Err(HubError::Invalid(message)) => assert!(message.contains(&broad.id), "{message}"),
+        other => panic!("expected a refusal naming the Work, got {other:?}"),
+    }
 }
 
 /// A lead, a helper with a session intent, a session-less intent of each of them and of an
