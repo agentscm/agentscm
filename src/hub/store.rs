@@ -748,6 +748,20 @@ pub trait Store: Send + Sync {
         update: &WorkPrLinkUpdate,
         now: i64,
     ) -> Result<WorkPrLinkResult>;
+    /// Read retained reconciliation and expose it as current only while its facts still match.
+    fn work_reconciliation_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_reconciliation::ReconciliationView>>;
+    /// Persist server-read evidence with Work/declaration fences and an idempotent receipt.
+    fn work_reconciliation_apply(
+        &self,
+        token: &str,
+        request: &super::work_reconciliation::ReconciliationApply,
+        now: i64,
+    ) -> Result<super::work_reconciliation::ReconciliationResult>;
     /// Read durable declarations without modifying legacy checkpoint relations.
     fn work_declarations_get(
         &self,

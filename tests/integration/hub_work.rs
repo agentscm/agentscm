@@ -183,6 +183,11 @@ impl Db {
                        WHERE w.provider = 'github' AND w.host = 'github.com'
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                      UNION ALL
+                     SELECT octet_length(d.snapshot)::bigint + 256 FROM hub_work_reconciliation_state d
+                       JOIN hub_work_items w ON w.id = d.work
+                       WHERE w.provider = 'github' AND w.host = 'github.com'
+                         AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
+                     UNION ALL
                      SELECT octet_length(l.snapshot)::bigint + 256 FROM hub_work_pr_links l
                        JOIN hub_work_items w ON w.id = l.work
                        WHERE w.provider = 'github' AND w.host = 'github.com'
@@ -250,6 +255,10 @@ impl Db {
                             AND w.repository = ?1 AND w.repository_id IS ?2
                          UNION ALL SELECT length(CAST(d.snapshot AS BLOB)) + 256
                           FROM hub_work_declarations d JOIN hub_work_items w ON w.id = d.work
+                          WHERE w.provider = 'github' AND w.host = 'github.com'
+                            AND w.repository = ?1 AND w.repository_id IS ?2
+                         UNION ALL SELECT length(CAST(d.snapshot AS BLOB)) + 256
+                          FROM hub_work_reconciliation_state d JOIN hub_work_items w ON w.id = d.work
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
                          UNION ALL SELECT length(CAST(l.snapshot AS BLOB)) + 256

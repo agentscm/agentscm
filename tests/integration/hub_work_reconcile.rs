@@ -1282,3 +1282,431 @@ fn postgres_work_declarations_migrates_legacy_once() {
         .get(0);
     assert_eq!(charged, 100 + snapshot.len() as i64 + 256);
 }
+
+fn durable_request(
+    ctx: &Ctx,
+    id: &str,
+    operation: &str,
+) -> agentscm::hub::work_reconciliation::ReconciliationApply {
+    let view = ctx
+        .store
+        .work_declarations_get(ctx.token(), id, unix_now())
+        .unwrap()
+        .unwrap();
+    let item = ctx.item(id);
+    agentscm::hub::work_reconciliation::ReconciliationApply {
+        work_id: id.into(),
+        operation_id: operation.into(),
+        generation: item.generation,
+        session: item.lead_session,
+        expected_updated_seq: item.updated_seq,
+        declaration_seq: view.declaration_seq,
+    }
+}
+fn durable_reconciliation(fixture: &StoreFixture) {
+    use agentscm::hub::work_reconciliation::{
+        ConditionState, DeclaredPrLink, PrerequisiteCondition, PrerequisiteRequirement,
+        WorkDeclarations, WorkDeclarationsUpdate,
+    };
+    let mut ctx = setup(fixture);
+    let prerequisite = ctx.start("durable-prereq", "src/prereq", &[]);
+    let work = ctx.start("durable-main", "src/main", &[]);
+    ctx.checkpoint(&work, CheckpointKind::Blocker);
+    let item = ctx.item(&work.id);
+    let target = |number, head: &str| WorkPrLinkTarget {
+        repository_id: REPOSITORY_ID,
+        number,
+        head_sha: head.into(),
+    };
+    ctx.store
+        .work_declarations_set(
+            ctx.token(),
+            &WorkDeclarationsUpdate {
+                work_id: item.id.clone(),
+                operation_id: "declare-durable".into(),
+                generation: item.generation,
+                session: item.lead_session.clone(),
+                expected_updated_seq: item.updated_seq,
+                declarations: WorkDeclarations {
+                    links: vec![
+                        DeclaredPrLink {
+                            id: "partial-1".into(),
+                            target: target(81, HEAD_A),
+                        },
+                        DeclaredPrLink {
+                            id: "partial-2".into(),
+                            target: target(82, HEAD_A),
+                        },
+                    ],
+                    prerequisites: vec![
+                        PrerequisiteCondition {
+                            id: "required-a".into(),
+                            requirement: PrerequisiteRequirement::MergedPullRequest {
+                                work_id: prerequisite.id.clone(),
+                                target: target(81, HEAD_A),
+                            },
+                        },
+                        PrerequisiteCondition {
+                            id: "required-b".into(),
+                            requirement: PrerequisiteRequirement::MergedPullRequest {
+                                work_id: prerequisite.id.clone(),
+                                target: target(82, HEAD_A),
+                            },
+                        },
+                        PrerequisiteCondition {
+                            id: "wrong-head".into(),
+                            requirement: PrerequisiteRequirement::MergedPullRequest {
+                                work_id: prerequisite.id.clone(),
+                                target: target(81, HEAD_B),
+                            },
+                        },
+                    ],
+                },
+            },
+            unix_now(),
+        )
+        .unwrap();
+    ctx.observe_pull(81, "open", HEAD_A);
+    ctx.observe_pull(82, "open", HEAD_A);
+    ctx.merge(81);
+    let before = ctx.item(&work.id);
+    let request = durable_request(&ctx, &work.id, "evaluate-1");
+    let result = ctx
+        .store
+        .work_reconciliation_apply(ctx.token(), &request, unix_now())
+        .unwrap();
+    let current = result.view.current.as_ref().unwrap();
+    assert_eq!(
+        current
+            .conditions
+            .iter()
+            .find(|c| c.id == "required-a")
+            .unwrap()
+            .state,
+        ConditionState::Satisfied
+    );
+    assert_eq!(
+        current
+            .conditions
+            .iter()
+            .find(|c| c.id == "required-b")
+            .unwrap()
+            .state,
+        ConditionState::NotSatisfied
+    );
+    assert_eq!(
+        current
+            .conditions
+            .iter()
+            .find(|c| c.id == "wrong-head")
+            .unwrap()
+            .state,
+        ConditionState::Unknown
+    );
+    assert_eq!(current.reassessments.len(), 1);
+    assert_eq!(
+        current.reservation_disposition,
+        "held_owner_decision_required"
+    );
+    let after = ctx.item(&work.id);
+    assert_eq!(before.current, after.current);
+    assert_eq!(before.blocker, after.blocker);
+    assert_eq!(before.state, after.state);
+    assert_eq!(ctx.read(&work).outcome.value, OutcomeValue::None);
+    assert_eq!(ctx.read(&work).reservation.status, ReservationStatus::Held);
+    let replay = ctx
+        .store
+        .work_reconciliation_apply(ctx.token(), &request, unix_now())
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, result.receipt.event_seq);
+    assert_eq!(
+        replay.view.retained.as_ref().unwrap().reassessments,
+        current.reassessments
+    );
+    let raw = serde_json::to_string(&result.view).unwrap();
+    assert!(!raw.contains(ctx.token()));
+    assert!(!raw.contains(&ctx.secret));
+    let mut mismatch = request.clone();
+    mismatch.declaration_seq += 1;
+    assert!(
+        ctx.store
+            .work_reconciliation_apply(ctx.token(), &mismatch, unix_now())
+            .is_err()
+    );
+    ctx.close_pull(82);
+    let stale = ctx
+        .store
+        .work_reconciliation_get(ctx.token(), &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert!(stale.current.is_none());
+    assert!(stale.retained.is_some());
+    assert!(
+        stale
+            .stale_reasons
+            .contains(&"provider_or_prerequisite_evidence_changed".into())
+    );
+    let result = ctx
+        .store
+        .work_reconciliation_apply(
+            ctx.token(),
+            &durable_request(&ctx, &work.id, "evaluate-closed"),
+            unix_now(),
+        )
+        .unwrap();
+    assert_eq!(
+        result
+            .view
+            .current
+            .unwrap()
+            .conditions
+            .iter()
+            .find(|c| c.id == "required-b")
+            .unwrap()
+            .state,
+        ConditionState::NotSatisfied
+    );
+    ctx.observe_pull(82, "open", HEAD_A);
+    ctx.set_coverage(CatchupCoverageState::Unavailable);
+    let result = ctx
+        .store
+        .work_reconciliation_apply(
+            ctx.token(),
+            &durable_request(&ctx, &work.id, "evaluate-outage"),
+            unix_now(),
+        )
+        .unwrap();
+    let current = result.view.current.unwrap();
+    assert_eq!(
+        current
+            .conditions
+            .iter()
+            .find(|c| c.id == "required-a")
+            .unwrap()
+            .state,
+        ConditionState::Satisfied
+    );
+    assert_eq!(
+        current
+            .conditions
+            .iter()
+            .find(|c| c.id == "required-b")
+            .unwrap()
+            .state,
+        ConditionState::Unknown
+    );
+    ctx.checkpoint(&work, CheckpointKind::Progress);
+    let stale = ctx
+        .store
+        .work_reconciliation_get(ctx.token(), &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert!(stale.current.is_none());
+    assert!(stale.stale_reasons.contains(&"work_changed".into()));
+    assert!(
+        ctx.store
+            .work_reconciliation_apply(
+                ctx.token(),
+                &durable_request(&ctx, &work.id, "evaluate-outage"),
+                unix_now()
+            )
+            .is_err()
+    );
+    let old = durable_request(&ctx, &work.id, "stale-apply");
+    ctx.checkpoint(&work, CheckpointKind::Decision);
+    assert!(
+        ctx.store
+            .work_reconciliation_apply(ctx.token(), &old, unix_now())
+            .is_err()
+    );
+    let (_, secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &ctx.principal.owner.id,
+        "durable-reader",
+        REPOSITORY,
+        REPOSITORY_ID,
+        3600,
+        true,
+    )
+    .unwrap();
+    let reader = principal(&*ctx.store, secret.expose());
+    assert!(
+        ctx.store
+            .work_reconciliation_get(&reader.token_id, &work.id, unix_now())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        ctx.store
+            .work_reconciliation_apply(
+                &reader.token_id,
+                &durable_request(&ctx, &work.id, "readonly"),
+                unix_now()
+            )
+            .is_err()
+    );
+}
+#[test]
+fn durable_reconciliation_sqlite() {
+    durable_reconciliation(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_durable_reconciliation() {
+    if let Some(f) = StoreFixture::postgres() {
+        durable_reconciliation(&f);
+    }
+}
+
+fn reconciliation_concurrent(fixture: &StoreFixture) {
+    let ctx = setup(fixture);
+    let work = ctx.start("reconcile-race", "src/race", &[]);
+    let request = durable_request(&ctx, &work.id, "race-1");
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = (0..2)
+        .map(|index| {
+            let store = ctx.store.clone();
+            let token = ctx.token().to_owned();
+            let barrier = barrier.clone();
+            let mut update = request.clone();
+            update.operation_id = format!("race-{index}");
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.work_reconciliation_apply(&token, &update, unix_now())
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    let current = ctx
+        .store
+        .work_reconciliation_get(ctx.token(), &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, winner.view);
+    // A reopened connection retains both the snapshot and the exact retry receipt.
+    let reopened = if let Some(directory) = &fixture._directory {
+        store::open(&format!(
+            "sqlite://{}",
+            directory.path().join("hub.sqlite").display()
+        ))
+        .unwrap()
+    } else {
+        store::open(&fixture._pg.as_ref().unwrap().url).unwrap()
+    };
+    assert_eq!(
+        reopened
+            .work_reconciliation_get(ctx.token(), &work.id, unix_now())
+            .unwrap()
+            .unwrap(),
+        current
+    );
+}
+#[test]
+fn durable_reconciliation_sqlite_concurrent_restart() {
+    reconciliation_concurrent(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_durable_reconciliation_concurrent_restart() {
+    if let Some(f) = StoreFixture::postgres() {
+        reconciliation_concurrent(&f);
+    }
+}
+
+fn reconciliation_actors(fixture: &StoreFixture) {
+    let ctx = setup(fixture);
+    let work = ctx.start("reconcile-auth", "src/auth", &[]);
+    let update = durable_request(&ctx, &work.id, "auth");
+    let (_, helper_secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &ctx.principal.owner.id,
+        "reconcile-helper",
+        REPOSITORY,
+        REPOSITORY_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let helper = principal(&*ctx.store, helper_secret.expose());
+    assert!(
+        ctx.store
+            .work_reconciliation_apply(&helper.token_id, &update, unix_now())
+            .is_err()
+    );
+    let owner = user(&*ctx.store, 852, "foreign-reconcile");
+    let (_, foreign_secret, _) = mint_bound_agent_token(
+        &*ctx.store,
+        &owner,
+        "foreign-reconcile",
+        "acme/foreign",
+        999,
+        3600,
+        false,
+    )
+    .unwrap();
+    let foreign = principal(&*ctx.store, foreign_secret.expose());
+    assert!(
+        ctx.store
+            .work_reconciliation_get(&foreign.token_id, &work.id, unix_now())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ctx.store
+            .work_reconciliation_apply(&foreign.token_id, &update, unix_now())
+            .is_err()
+    );
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let a = {
+        let barrier = barrier.clone();
+        let store = ctx.store.clone();
+        let token = ctx.token().to_owned();
+        std::thread::spawn(move || {
+            barrier.wait();
+            store
+                .work_reconciliation_apply(&token, &update, unix_now())
+                .map(|r| r.receipt.event_seq)
+        })
+    };
+    let b = {
+        let barrier = barrier.clone();
+        let store = ctx.store.clone();
+        let token = ctx.token().to_owned();
+        let request = WorkCheckpoint {
+            work_id: work.id.clone(),
+            operation_id: "concurrent-report".into(),
+            generation: work.generation,
+            session: work.lead_session.clone(),
+            expected_updated_seq: Some(work.updated_seq),
+            kind: CheckpointKind::Decision,
+            summary: "new report must survive".into(),
+            next_action: None,
+            scope: None,
+            branch: None,
+            worktree: None,
+            resolve_blocker: false,
+            source_refs: vec![],
+            depends_on: vec![],
+            related_work: vec![],
+        };
+        std::thread::spawn(move || {
+            barrier.wait();
+            store
+                .work_checkpoint(&token, &request, unix_now())
+                .map(|r| r.receipt.event_seq)
+        })
+    };
+    let results = [a.join().unwrap(), b.join().unwrap()];
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+}
+#[test]
+fn durable_reconciliation_sqlite_actors_checkpoint_race() {
+    reconciliation_actors(&StoreFixture::sqlite());
+}
+#[test]
+fn postgres_durable_reconciliation_actors_checkpoint_race() {
+    if let Some(f) = StoreFixture::postgres() {
+        reconciliation_actors(&f);
+    }
+}

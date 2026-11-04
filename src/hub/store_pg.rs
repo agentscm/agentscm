@@ -2030,6 +2030,11 @@ fn work_payload_bytes(
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                     AND w.repository_id IS NOT DISTINCT FROM $4
                  UNION ALL
+                 SELECT octet_length(d.snapshot)::bigint + 256 FROM hub_work_reconciliation_state d
+                  JOIN hub_work_items w ON w.id = d.work
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
                  SELECT octet_length(l.snapshot)::bigint + 256 FROM hub_work_pr_links l
                   JOIN hub_work_items w ON w.id = l.work
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
@@ -2287,6 +2292,88 @@ fn work_retention_floors(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> R
             ],
         )?
         .map_or((0, 0), |row| (row.get(0), row.get(1))))
+}
+
+fn reconciliation_evidence(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    view: &WorkDeclarationsView,
+    now: i64,
+) -> Result<declarations::ReconciliationEvidence> {
+    let repository = repository_namespace(&who.repository, who.repository_id);
+
+    let key = catchup_repository_key(who.repository_id);
+
+    let (through,floor)=tx.query_opt("SELECT next_merge_seq-1,merge_floor_seq FROM hub_catchup_repositories WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",&[&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.map_or((0,0),|r|(r.get(0),r.get(1)));
+
+    let sources=tx.query("SELECT source,state,checked_at,unread_pages,deferred FROM hub_catchup_sources WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 ORDER BY source COLLATE \"C\" LIMIT 3",&[&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.iter().map(|r|declarations::SourceEvidence{
+source:r.get(0),state:r.get(1),checked_at_seconds:r.get(2),unread_pages:r.get(3),deferred:r.get(4)}
+).collect();
+
+    let connected:Option<String>=tx.query_opt("SELECT r.id FROM hub_repositories r JOIN hub_connections c ON c.id=r.connection WHERE c.provider=$1 AND r.host=$2 AND r.repository_id IS NOT DISTINCT FROM $3",&[&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id])?.map(|r|r.get(0));
+
+    let mut pulls = Vec::new();
+
+    for target in declarations::ReconciliationEvidence::targets(view) {
+        let merges=tx.query(&format!("SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND pull_number=$5 ORDER BY merge_commit COLLATE \"C\" LIMIT 17"),&[&who.owner.identity.provider,&who.owner.identity.host,&repository,&key,&target.number])?.iter().map(pg_catchup_merge).collect::<Result<Vec<_>>>()?;
+
+        let observation = if let Some(repo) = &connected {
+            tx.query_opt("SELECT data,observed_at,deleted FROM hub_observations WHERE repository=$1 AND kind='pull_request' AND key=$2",&[&repo,&target.number.to_string()])?.map(|r|(r.get(0),r.get(1),r.get(2)))
+        } else {
+            None
+        };
+
+        pulls.push(declarations::pull_evidence(target, merges, observation));
+    }
+
+    let mut prerequisites = Vec::new();
+
+    let ids: BTreeSet<_> = view.declarations.targets().into_iter().collect();
+
+    for id in ids {
+        let item = scoped_work(tx, who, &id, now, false)?;
+
+        prerequisites.push(declarations::PrerequisiteVersion {
+            work_id: id,
+            updated_seq: item.map(|w| w.updated_seq),
+        });
+    }
+
+    Ok(declarations::ReconciliationEvidence {
+        provider: who.owner.identity.provider.clone(),
+        host: who.owner.identity.host.clone(),
+        repository_id: who.repository_id,
+        merge_through: through,
+        merge_floor: floor,
+        sources,
+        pulls,
+        prerequisites,
+    })
+}
+
+fn reconciliation_read(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    item: &WorkItem,
+    now: i64,
+) -> Result<declarations::ReconciliationView> {
+    let view = declaration_view(tx, item)?;
+
+    let evidence = reconciliation_evidence(tx, who, &view, now)?;
+
+    let retained: Option<String> = tx
+        .query_opt(
+            "SELECT snapshot FROM hub_work_reconciliation_state WHERE work=$1",
+            &[&item.id],
+        )?
+        .map(|r| r.get(0));
+
+    Ok(declarations::reconciliation_view(
+        item,
+        &view,
+        &evidence,
+        retained.as_deref().map(json_value).transpose()?,
+    ))
 }
 
 fn declaration_view(
@@ -9369,6 +9456,142 @@ impl Store for PgStore {
             let item = scoped_work(&mut tx, &who, id, now, false)?;
             tx.commit()?;
             Ok(item)
+        })
+    }
+
+    fn work_reconciliation_get(
+        &self,
+        token: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<declarations::ReconciliationView>> {
+        super::work::validate_id("work", id, "wrk")?;
+
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+
+            let who = work_who(&mut tx, token, now)?;
+
+            let Some(item) = scoped_work(&mut tx, &who, id, now, false)? else {
+                return Ok(None);
+            };
+
+            let view = reconciliation_read(&mut tx, &who, &item, now)?;
+
+            tx.commit()?;
+
+            Ok(Some(view))
+        })
+    }
+
+    fn work_reconciliation_apply(
+        &self,
+        token: &str,
+        update: &declarations::ReconciliationApply,
+        now: i64,
+    ) -> Result<declarations::ReconciliationResult> {
+        update.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead).start()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let request = json_string(&json!({"operation": "work_reconciliation", "update": update}))?;
+            let mut item = scoped_work(&mut tx, &who, &update.work_id, now, true)?
+                .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+            let sql = "SELECT o.request,v.snapshot,o.event_seq FROM hub_work_checkpoint_ops o
+                JOIN hub_work_versions v ON v.work=o.work AND v.event_seq=o.event_seq
+                WHERE o.work=$1 AND o.operation_id=$2";
+            if let Some(row) = tx.query_opt(sql, &[&item.id, &update.operation_id])? {
+                let previous: String = row.get(0);
+                let snapshot: String = row.get(1);
+                let seq: i64 = row.get(2);
+                if previous != request {
+                    return Err(HubError::Invalid("operation_id was already used for another request".into()));
+                }
+                let committed: WorkItem = json_value(&snapshot)?;
+                update.authorize(&who, &committed)?;
+                let view = reconciliation_read(&mut tx, &who, &item, now)?;
+                tx.commit()?;
+                return Ok(declarations::ReconciliationResult {
+                    view,
+                    receipt: CheckpointReceipt {
+                        work_id: item.id,
+                        operation_id: update.operation_id.clone(),
+                        generation: committed.generation,
+                        event_seq: seq,
+                        replayed: true,
+                    },
+                });
+            }
+            update.authorize(&who, &item)?;
+            let declared = declaration_view(&mut tx, &item)?;
+            if item.updated_seq != update.expected_updated_seq || declared.declaration_seq != update.declaration_seq {
+                return Err(HubError::Invalid("Work or declarations changed; reread before reconciliation".into()));
+            }
+            let evidence = reconciliation_evidence(&mut tx, &who, &declared, now)?;
+            let basis: Option<String> = tx.query_one(
+                "SELECT reservation_basis FROM hub_work_items WHERE id=$1", &[&item.id],
+            )?.get(0);
+            let old: Option<String> = tx.query_opt(
+                "SELECT snapshot FROM hub_work_reconciliation_state WHERE work=$1", &[&item.id],
+            )?.map(|row| row.get(0));
+            let prior_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
+            let mut evaluated = declarations::evaluate(&item, &declared, evidence, basis.as_deref());
+            let mut event = Event::new("work_pr_link", &item.id, json!({
+                "operation": "reconciliation_applied",
+                "generation": item.generation,
+                "owner": item.owner,
+                "repository": item.repository,
+                "evidence_digest": evaluated.evidence_digest,
+                "reassessments": evaluated.reassessments,
+                "conditions": evaluated.conditions,
+                "reservation_disposition": evaluated.reservation_disposition,
+            }))?;
+            event.at = now;
+            let seq = append(&mut tx, &event)?;
+            item.updated_seq = seq;
+            item.updated_at = now;
+            evaluated.work_seq = seq;
+            let snapshot = json_string(&evaluated)?;
+            if snapshot.len() > 131072 {
+                return Err(HubError::Invalid("reconciliation evidence exceeds bounded snapshot capacity".into()));
+            }
+            let work_snapshot = save_work_version(&mut tx, &item, seq)?;
+            tx.execute(
+                "INSERT INTO hub_work_reconciliation_state(work,snapshot) VALUES ($1,$2)
+                 ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot", &[&item.id, &snapshot],
+            )?;
+            tx.execute(
+                "INSERT INTO hub_work_checkpoint_ops(work,operation_id,request,event_seq) VALUES ($1,$2,$3,$4)",
+                &[&item.id, &update.operation_id, &request, &seq],
+            )?;
+            let old_bytes = old.as_ref().map_or(Ok(0), |value| work_payload_row_bytes(value.len()))?;
+            let delta = work_transition_payload_bytes(&work_snapshot, &event)?
+                .checked_sub(prior_bytes)
+                .and_then(|value| value.checked_add(work_payload_row_bytes(request.len()).ok()?))
+                .and_then(|value| value.checked_add(work_payload_row_bytes(snapshot.len()).ok()?))
+                .and_then(|value| value.checked_sub(old_bytes))
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            adjust_work_payload_capacity(&mut tx, &who, delta, now)?;
+            let view = reconciliation_read(&mut tx, &who, &item, now)?;
+            tx.commit()?;
+            Ok(declarations::ReconciliationResult {
+                view,
+                receipt: CheckpointReceipt {
+                    work_id: item.id,
+                    operation_id: update.operation_id.clone(),
+                    generation: update.generation,
+                    event_seq: seq,
+                    replayed: false,
+                },
+            })
         })
     }
 
