@@ -1807,6 +1807,30 @@ fn relation_targets(
     Ok(())
 }
 
+/// Whether the Work item currently holds its declared scope against other Work.
+fn work_holds_reservation(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<bool> {
+    Ok(tx
+        .query_one(
+            "SELECT reservation_basis IS NOT NULL FROM hub_work_items WHERE id = $1",
+            &[&id],
+        )?
+        .get(0))
+}
+
+/// Overwrites the reservation columns, which the Work snapshot does not carry.
+fn set_work_reservation(
+    tx: &mut postgres::Transaction<'_>,
+    id: &str,
+    outcome: Option<&str>,
+    basis: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_work_items SET terminal_outcome = $2, reservation_basis = $3 WHERE id = $1",
+        &[&id, &outcome, &basis],
+    )?;
+    Ok(())
+}
+
 fn work_scope_overlaps(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
@@ -1821,7 +1845,7 @@ fn work_scope_overlaps(
     let rows = tx.query(
         "SELECT id, scope FROM hub_work_items
          WHERE provider = $1 AND host = $2 AND repository = $3
-           AND repository_id IS NOT DISTINCT FROM $4 AND state <> 'finished'
+           AND repository_id IS NOT DISTINCT FROM $4 AND reservation_basis IS NOT NULL
            AND ($5::text IS NULL OR id <> $5)
          ORDER BY id LIMIT 101",
         &[
@@ -3203,6 +3227,11 @@ fn start_in(
                 preflight: None,
             });
         }
+        if item.state == WorkState::Finished && start.takeover_generation.is_some() {
+            return Err(HubError::Invalid(
+                "finished work cannot be taken over; reopen it instead".into(),
+            ));
+        }
         if item.lead_token == who.token
             && item.lead_session == start.session
             && start.takeover_generation.is_none()
@@ -3230,7 +3259,11 @@ fn start_in(
                     preflight: None,
                 });
             }
-            let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            let overlaps = if work_holds_reservation(tx, &item.id)? {
+                work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?
+            } else {
+                Vec::new()
+            };
             let coordination_request = if overlaps.is_empty() {
                 None
             } else {
@@ -3305,6 +3338,26 @@ fn start_in(
                 preflight: None,
             });
         }
+        // Work that released its reservation must win the scope again before anyone leads it.
+        if !work_holds_reservation(tx, &item.id)? {
+            let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            if let Some(first) = overlaps.first() {
+                return Ok(WorkStartResult {
+                    conflict: Some(WorkStartConflict {
+                        kind: WorkConflictKind::ScopeOverlap,
+                        current_generation: first.item.generation,
+                        overlaps,
+                    }),
+                    item,
+                    created: false,
+                    joined: false,
+                    took_over: false,
+                    context: None,
+                    coordination_request: None,
+                    preflight: None,
+                });
+            }
+        }
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
         let previous_lead_token = item.lead_token.clone();
         let previous_lead_session = item.lead_session.clone();
@@ -3367,6 +3420,7 @@ fn start_in(
             ],
         )?;
         let snapshot = save_work_version(tx, &item, seq)?;
+        set_work_reservation(tx, &item.id, None, Some("admitted"))?;
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
         retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
         let delta = work_transition_payload_bytes(&snapshot, &event)?
@@ -3512,9 +3566,10 @@ fn start_in(
             (id, provider, host, repository, repository_id, owner, lead_token, lead_agent,
              lead_session, generation, source_provider, source_host, source_repository,
              source_issue, request_key, title, state, scope, branch, worktree, next_action,
-             current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq)
+             current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq,
+             reservation_basis)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14,
-                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22)",
+                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22, 'admitted')",
         &[
             &item.id,
             &who.owner.identity.provider,
@@ -4304,6 +4359,7 @@ fn guard_managed_touch(
          JOIN hub_work_participants p ON p.work=w.id
          WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
            AND w.repository_id IS NOT DISTINCT FROM $4 AND w.state IN ('active','blocked')
+           AND w.reservation_basis IS NOT NULL
            AND p.token=$5 AND p.session=$6 AND p.generation=w.generation
          ORDER BY w.id LIMIT 2",
         &[
@@ -5226,10 +5282,10 @@ impl PgStore {
             let catchup_key = catchup_repository_key(who.repository_id);
             let settled =
                 settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 6, 7, 8]);
-            let mut current = tx
+            let current = tx
                 .query(
                     &format!(
-                        "SELECT w.snapshot FROM hub_work_items w
+                        "SELECT w.snapshot, w.reservation_basis IS NOT NULL FROM hub_work_items w
                          WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                            AND w.repository_id IS NOT DISTINCT FROM $4 AND w.state <> 'finished'
                            AND NOT {settled} ORDER BY w.id LIMIT $5"
@@ -5246,8 +5302,22 @@ impl PgStore {
                     ],
                 )?
                 .into_iter()
-                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
+                .map(|row| {
+                    Ok((
+                        json_value::<WorkItem>(&row.get::<_, String>(0))?,
+                        row.get::<_, bool>(1),
+                    ))
+                })
                 .collect::<Result<Vec<_>>>()?;
+            let reserved_ids = current
+                .iter()
+                .filter(|(_, held)| *held)
+                .map(|(item, _)| item.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let mut current = current
+                .into_iter()
+                .map(|(item, _)| item)
+                .collect::<Vec<_>>();
             let settled_count: i64 = tx
                 .query_one(
                     &format!(
@@ -5320,7 +5390,13 @@ impl PgStore {
             if fit_json_budget(&mut recent, overview_part_budget)? {
                 recent_complete = false;
             }
-            let mut overlaps = work_overlap_pairs(&current, query.limit + 1);
+            // Only Work that holds its scope can overlap; released Work is listed but claims nothing.
+            let reserved = current
+                .iter()
+                .filter(|item| reserved_ids.contains(&item.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut overlaps = work_overlap_pairs(&reserved, query.limit + 1);
             let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
             overlaps.truncate(query.limit);
             if fit_json_budget(&mut overlaps, overview_part_budget)? {
@@ -6122,6 +6198,16 @@ impl Store for PgStore {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
+            let work = work_who(&mut tx, token, now)?;
+            lock_work_repository_shared(
+                &mut tx,
+                &work.owner.identity.provider,
+                &work.owner.identity.host,
+                &work.repository,
+                work.repository_id,
+            )?;
+            let name = session_name(&mut tx, token, None, now)?;
+            guard_managed_touch(&mut tx, &work, &name, &keys)?;
             let announced = announce_in(&mut tx, &who, intent, &keys, &[], now)?;
             tx.commit()?;
             Ok(announced)
@@ -8295,6 +8381,11 @@ impl Store for PgStore {
                     },
                 });
             }
+            if item.state == WorkState::Finished {
+                return Err(HubError::Invalid(
+                    "finished work accepts no checkpoint; reopen it first".into(),
+                ));
+            }
             if item.generation != checkpoint.generation {
                 return Err(HubError::Invalid(format!(
                     "checkpoint generation is fenced; current generation is {}",
@@ -8366,8 +8457,14 @@ impl Store for PgStore {
                     }
                 }
             }
+            let held = work_holds_reservation(&mut tx, &item.id)?;
             if let Some(scope) = checkpoint.normalized_scope()? {
-                let overlaps = work_scope_overlaps(&mut tx, &who, &scope, Some(&item.id), now)?;
+                // Work without a reservation claims nothing, so its scope change has nothing to check.
+                let overlaps = if held {
+                    work_scope_overlaps(&mut tx, &who, &scope, Some(&item.id), now)?
+                } else {
+                    Vec::new()
+                };
                 if !overlaps.is_empty() {
                     let request = create_coordination_request(
                         &mut tx,
@@ -8451,6 +8548,17 @@ impl Store for PgStore {
             let seq = append(&mut tx, &event)?;
             item.updated_seq = seq;
             let snapshot = save_work_version(&mut tx, &item, seq)?;
+            match checkpoint.kind {
+                super::work::CheckpointKind::Finish => {
+                    set_work_reservation(&mut tx, &item.id, Some("completed"), None)?;
+                }
+                super::work::CheckpointKind::Pause | super::work::CheckpointKind::Handover
+                    if held =>
+                {
+                    set_work_reservation(&mut tx, &item.id, None, Some("legacy_implicit"))?;
+                }
+                _ => {}
+            }
             tx.execute(
                 "INSERT INTO hub_work_checkpoint_ops
                     (work, operation_id, request, event_seq)
@@ -11215,7 +11323,8 @@ impl Store for PgStore {
             let proposal_scope = if let Some(work) = &request.proposal.work_id {
                 let item = scoped_work(&mut tx, &who, work, now, true)?
                     .ok_or_else(|| HubError::Unavailable("proposed work item is missing".into()))?;
-                if item.state == WorkState::Finished {
+                if item.state == WorkState::Finished || !work_holds_reservation(&mut tx, &item.id)?
+                {
                     Vec::new()
                 } else if coordination_was_initially_bound(&mut tx, &request.id)? {
                     if item.scope != request.proposal.scope {

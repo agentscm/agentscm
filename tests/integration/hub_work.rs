@@ -69,6 +69,8 @@ impl Db {
             "work_takeover",
             "work_checkpoint",
             "work_pr_link",
+            "work_transition",
+            "coordination_target_released",
         ];
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
@@ -256,6 +258,42 @@ impl Db {
                 )
                 .unwrap();
             (used, aggregate)
+        }
+    }
+
+    /// Runs raw SQL, to build or inspect a database state the Store cannot reach.
+    fn sql(&self, sql: &str) {
+        if self._pg.is_some() {
+            postgres::Client::connect(&self.url, NoTls)
+                .unwrap()
+                .batch_execute(sql)
+                .unwrap();
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+    }
+
+    /// The stored `(terminal_outcome, reservation_basis)` of one Work item.
+    fn reservation(&self, id: &str) -> (Option<String>, Option<String>) {
+        let sql = "SELECT terminal_outcome, reservation_basis FROM hub_work_items WHERE id = ";
+        if self._pg.is_some() {
+            let row = postgres::Client::connect(&self.url, NoTls)
+                .unwrap()
+                .query_one(&format!("{sql}$1"), &[&id])
+                .unwrap();
+            (row.get(0), row.get(1))
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(&format!("{sql}?1"), [id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
         }
     }
 
@@ -1344,10 +1382,19 @@ fn stale_observed_pause_cannot_overwrite_newer_checkpoint(db: &Db) {
             "automatic session-end pause",
         );
         stale_pause.expected_updated_seq = Some(observed);
-        assert!(matches!(
-            store.work_checkpoint(&lead.token, &stale_pause, now + index as i64 * 10 + 2),
-            Err(HubError::WorkCheckpointSequenceConflict { current_seq }) if current_seq == fresh.updated_seq
-        ));
+        let attempt = store.work_checkpoint(&lead.token, &stale_pause, now + index as i64 * 10 + 2);
+        if kind == CheckpointKind::Finish {
+            // Finished work refuses every new checkpoint before the sequence is compared.
+            assert_invalid(
+                attempt,
+                "finished work accepts no checkpoint; reopen it first",
+            );
+        } else {
+            assert!(matches!(
+                attempt,
+                Err(HubError::WorkCheckpointSequenceConflict { current_seq }) if current_seq == fresh.updated_seq
+            ));
+        }
 
         let retained = store
             .work_get(&lead.token, &started.id, now + index as i64 * 10 + 3)
@@ -2054,6 +2101,13 @@ conformance!(
     postgres_read_briefings_share_the_repository_maintenance_lock,
     concurrent_delivery_reservations_enforce_capacity_and_roll_back,
     briefing_sessions_on_one_token_have_independent_cursors,
+    reservation_migration_backfills_unfinished_work_and_leaves_finished_unstated,
+    finish_frees_scope_for_a_new_start_and_pause_keeps_blocking,
+    finished_work_refuses_checkpoints_but_replays_the_finish_receipt,
+    stale_finished_work_cannot_be_taken_over,
+    announce_intent_refuses_fenced_and_finished_sessions_but_not_unlinked_ones,
+    helper_join_on_finished_work_acquires_nothing,
+    unreserved_work_needs_fresh_admission_to_be_taken_over,
 );
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
@@ -2849,5 +2903,476 @@ fn checkpoint_rejection_respects_removed_history_without_a_checkpoint_baseline(d
             .unwrap()
             .updated_seq,
         current.item.updated_seq
+    );
+}
+
+fn lead_checkpoint(
+    store: &dyn Store,
+    who: &Agent,
+    item: &agentscm::hub::work::WorkItem,
+    operation_id: &str,
+    session: &str,
+    kind: CheckpointKind,
+    now: i64,
+) -> agentscm::hub::work::WorkCheckpointResult {
+    let mut request = checkpoint(
+        &item.id,
+        operation_id,
+        item.generation,
+        session,
+        kind,
+        "step",
+    );
+    request.expected_updated_seq = Some(item.updated_seq);
+    store.work_checkpoint(&who.token, &request, now).unwrap()
+}
+
+fn assert_scope_overlap(result: &agentscm::hub::work::WorkStartResult) {
+    assert!(!result.created);
+    assert_eq!(
+        result.conflict.as_ref().map(|conflict| conflict.kind),
+        Some(WorkConflictKind::ScopeOverlap)
+    );
+}
+
+fn reservation_migration_backfills_unfinished_work_and_leaves_finished_unstated(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let start = |key: &str, session: &str, scope: &str| {
+        let mut start = native_start(key, key, session);
+        start.scope = vec![scope.into()];
+        start
+    };
+    let active = store
+        .work_start(&alice.token, &start("active", "s-active", "src/**"), now)
+        .unwrap()
+        .item;
+    let paused = store
+        .work_start(&alice.token, &start("paused", "s-paused", "lib/**"), now)
+        .unwrap()
+        .item;
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &paused,
+        "pause",
+        "s-paused",
+        CheckpointKind::Pause,
+        now + 1,
+    );
+    let finished = store
+        .work_start(
+            &alice.token,
+            &start("finished", "s-finished", "docs/**"),
+            now,
+        )
+        .unwrap()
+        .item;
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &finished,
+        "finish",
+        "s-finished",
+        CheckpointKind::Finish,
+        now + 1,
+    );
+    drop(store);
+
+    // Rebuild the schema a binary without this change leaves behind: no columns, no marker.
+    db.sql(
+        "DROP INDEX hub_work_reserved;
+         ALTER TABLE hub_work_items DROP COLUMN reservation_basis;
+         ALTER TABLE hub_work_items DROP COLUMN terminal_outcome;
+         DELETE FROM hub_named_migrations WHERE name = 'work_reservations';",
+    );
+
+    let store = db.open();
+    let implicit = (None, Some("legacy_implicit".to_owned()));
+    assert_eq!(db.reservation(&active.id), implicit);
+    assert_eq!(db.reservation(&paused.id), implicit);
+    assert_eq!(db.reservation(&finished.id), (None, None));
+    // Blocking is unchanged: the backfilled Work still holds its scope, finished Work does not.
+    let blocked = store
+        .work_start(&alice.token, &start("new-src", "s-new", "src/**"), now + 2)
+        .unwrap();
+    assert_scope_overlap(&blocked);
+    let free = store
+        .work_start(
+            &alice.token,
+            &start("new-docs", "s-docs", "docs/**"),
+            now + 2,
+        )
+        .unwrap();
+    assert!(free.created);
+}
+
+fn finish_frees_scope_for_a_new_start_and_pause_keeps_blocking(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let now = unix_now();
+    let first = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    assert_eq!(db.reservation(&first.id), (None, Some("admitted".into())));
+    assert_scope_overlap(
+        &store
+            .work_start(&bob.token, &native_start("b1", "b", "s-b"), now + 1)
+            .unwrap(),
+    );
+
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &first,
+        "finish",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 2,
+    );
+    assert_eq!(finished.item.state, WorkState::Finished);
+    assert_eq!(db.reservation(&first.id), (Some("completed".into()), None));
+
+    let second = store
+        .work_start(&bob.token, &native_start("b2", "b", "s-b2"), now + 3)
+        .unwrap();
+    assert!(second.created);
+    assert_eq!(
+        db.reservation(&second.item.id),
+        (None, Some("admitted".into()))
+    );
+
+    // A pause keeps the scope held, as an implicit reservation.
+    lead_checkpoint(
+        &*store,
+        &bob,
+        &second.item,
+        "pause",
+        "s-b2",
+        CheckpointKind::Pause,
+        now + 4,
+    );
+    assert_eq!(
+        db.reservation(&second.item.id),
+        (None, Some("legacy_implicit".into()))
+    );
+    assert_scope_overlap(
+        &store
+            .work_start(&carol.token, &native_start("c", "c", "s-c"), now + 5)
+            .unwrap(),
+    );
+}
+
+fn finished_work_refuses_checkpoints_but_replays_the_finish_receipt(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    let mut finish = checkpoint(
+        &started.id,
+        "finish",
+        1,
+        "s-a",
+        CheckpointKind::Finish,
+        "done",
+    );
+    finish.expected_updated_seq = Some(started.updated_seq);
+    let first = store
+        .work_checkpoint(&alice.token, &finish, now + 1)
+        .unwrap();
+    assert!(!first.receipt.replayed);
+    let before = store
+        .work_get(&alice.token, &started.id, now + 2)
+        .unwrap()
+        .unwrap();
+    let events = work_event_count(&*store, "work_checkpoint");
+
+    let mut resume = checkpoint(
+        &started.id,
+        "resume",
+        1,
+        "s-a",
+        CheckpointKind::Progress,
+        "again",
+    );
+    resume.expected_updated_seq = Some(before.updated_seq);
+    assert_invalid(
+        store.work_checkpoint(&alice.token, &resume, now + 3),
+        "finished work accepts no checkpoint; reopen it first",
+    );
+    let after = store
+        .work_get(&alice.token, &started.id, now + 4)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    assert_eq!(after.state, WorkState::Finished);
+    assert_eq!(work_event_count(&*store, "work_checkpoint"), events);
+    assert_eq!(
+        db.reservation(&started.id),
+        (Some("completed".into()), None)
+    );
+
+    let replay = store
+        .work_checkpoint(&alice.token, &finish, now + 5)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, first.receipt.event_seq);
+}
+
+fn stale_finished_work_cannot_be_taken_over(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &started,
+        "finish",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 1,
+    )
+    .item;
+    let message = "finished work cannot be taken over; reopen it instead";
+    for at in [now + 2, now + 1 + CLAIM_STALE_SECONDS + 10] {
+        let attempt = takeover(&started.id, "s-b", Some(finished.generation));
+        let result = store.work_start(&bob.token, &attempt, at);
+        assert!(
+            matches!(result, Err(HubError::Invalid(ref actual)) if actual == message && actual.contains("reopen")),
+            "takeover at {at} must name reopen"
+        );
+    }
+    let after = store
+        .work_get(&alice.token, &started.id, now + 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.lead_token, alice.token);
+    assert_eq!(after.generation, finished.generation);
+    assert_eq!(after.updated_seq, finished.updated_seq);
+    assert_eq!(
+        db.reservation(&started.id),
+        (Some("completed".into()), None)
+    );
+}
+
+fn announce_intent_refuses_fenced_and_finished_sessions_but_not_unlinked_ones(db: &Db) {
+    use agentscm::hub::intent::NewIntent;
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let dave = agent(&*store, 4);
+    let now = unix_now();
+    let intent = |n: u128, path: &str| NewIntent {
+        id: format!("int_{n:032x}"),
+        task: "edit".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec![path.into()],
+        ttl_seconds: 600,
+    };
+    // The announce route names no session, so it resolves to the default session.
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "default"), now)
+        .unwrap()
+        .item;
+    store
+        .announce_intent(&alice.token, &intent(1, "src/a.rs"), now + 1)
+        .unwrap();
+
+    // Bob takes over after the claim went stale; alice's session is now fenced.
+    let later = now + CLAIM_STALE_SECONDS + 10;
+    assert!(
+        store
+            .work_start(
+                &bob.token,
+                &takeover(&started.id, "default", Some(1)),
+                later
+            )
+            .unwrap()
+            .took_over
+    );
+    assert!(matches!(
+        store.announce_intent(&alice.token, &intent(2, "src/b.rs"), later + 1),
+        Err(HubError::Invalid(_))
+    ));
+    store
+        .announce_intent(&bob.token, &intent(3, "src/c.rs"), later + 1)
+        .unwrap();
+
+    // A session linked to finished Work gets no new paths either.
+    let mut lib_start = native_start("d", "d", "default");
+    lib_start.scope = vec!["lib/**".into()];
+    let lib = store
+        .work_start(&dave.token, &lib_start, later)
+        .unwrap()
+        .item;
+    store
+        .announce_intent(&dave.token, &intent(4, "lib/a.rs"), later + 1)
+        .unwrap();
+    lead_checkpoint(
+        &*store,
+        &dave,
+        &lib,
+        "finish-lib",
+        "default",
+        CheckpointKind::Finish,
+        later + 2,
+    );
+    assert!(matches!(
+        store.announce_intent(&dave.token, &intent(5, "lib/b.rs"), later + 3),
+        Err(HubError::Invalid(_))
+    ));
+
+    // A session never linked to Work keeps the legacy advisory behavior.
+    store
+        .announce_intent(&carol.token, &intent(6, "src/a.rs"), later + 4)
+        .unwrap();
+}
+
+fn helper_join_on_finished_work_acquires_nothing(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let helper = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let now = unix_now();
+    let started = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    let finished = lead_checkpoint(
+        &*store,
+        &alice,
+        &started,
+        "finish",
+        "s-a",
+        CheckpointKind::Finish,
+        now + 1,
+    )
+    .item;
+
+    for (who, session, role) in [
+        (&helper, "s-h", WorkRole::Helper),
+        (&carol, "s-r", WorkRole::Reviewer),
+    ] {
+        let joined = store
+            .work_start(&who.token, &join(&started.id, session, role), now + 2)
+            .unwrap();
+        assert!(joined.joined);
+        assert_eq!(joined.item.state, WorkState::Finished);
+        assert_eq!(joined.item.generation, finished.generation);
+        assert_eq!(joined.item.lead_session, "s-a");
+    }
+    assert_eq!(
+        db.reservation(&started.id),
+        (Some("completed".into()), None)
+    );
+    // Participants of finished Work do not hold its scope against new Work.
+    let fresh = store
+        .work_start(&helper.token, &native_start("h", "h", "s-h2"), now + 3)
+        .unwrap();
+    assert!(fresh.created);
+}
+
+fn unreserved_work_needs_fresh_admission_to_be_taken_over(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    let carol = agent(&*store, 3);
+    let now = unix_now();
+    let released = store
+        .work_start(&alice.token, &native_start("a", "a", "s-a"), now)
+        .unwrap()
+        .item;
+    // No store operation releases a reservation yet; stage the state a later release leaves.
+    db.sql("UPDATE hub_work_items SET reservation_basis = NULL");
+    let holder = store
+        .work_start(&bob.token, &native_start("b", "b", "s-b"), now + 1)
+        .unwrap();
+    assert!(holder.created, "unreserved Work does not block a new start");
+
+    // Its own scope change checks nothing, so it may overlap the new holder.
+    let mut widen = checkpoint(
+        &released.id,
+        "widen",
+        1,
+        "s-a",
+        CheckpointKind::Progress,
+        "widen",
+    );
+    widen.expected_updated_seq = Some(released.updated_seq);
+    widen.scope = Some(vec!["src/**".into(), "lib/**".into()]);
+    let widened = store
+        .work_checkpoint(&alice.token, &widen, now + 2)
+        .unwrap()
+        .item;
+    assert_eq!(db.reservation(&released.id), (None, None));
+
+    // Taking it over must win the scope first; the overlap leaves the Work untouched.
+    let handover = lead_checkpoint(
+        &*store,
+        &alice,
+        &widened,
+        "handover",
+        "s-a",
+        CheckpointKind::Handover,
+        now + 3,
+    )
+    .item;
+    assert_eq!(db.reservation(&released.id), (None, None));
+    let blocked = store
+        .work_start(
+            &carol.token,
+            &takeover(&released.id, "s-c", Some(handover.generation)),
+            now + 4,
+        )
+        .unwrap();
+    assert_scope_overlap(&blocked);
+    assert!(!blocked.took_over);
+    let unchanged = store
+        .work_get(&alice.token, &released.id, now + 5)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.generation, handover.generation);
+    assert_eq!(unchanged.lead_session, "s-a");
+    assert_eq!(db.reservation(&released.id), (None, None));
+
+    // Once the holder finishes, the same takeover is admitted.
+    lead_checkpoint(
+        &*store,
+        &bob,
+        &holder.item,
+        "finish-b",
+        "s-b",
+        CheckpointKind::Finish,
+        now + 6,
+    );
+    let admitted = store
+        .work_start(
+            &carol.token,
+            &takeover(&released.id, "s-c", Some(handover.generation)),
+            now + 7,
+        )
+        .unwrap();
+    assert!(admitted.took_over);
+    assert_eq!(
+        db.reservation(&released.id),
+        (None, Some("admitted".into()))
     );
 }

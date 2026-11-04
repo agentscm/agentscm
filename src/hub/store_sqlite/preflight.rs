@@ -127,7 +127,7 @@ pub(super) fn evaluate(
 
     let mut reasons = Vec::new();
     if let Some(repository_id) = who.repository_id {
-        let mut statement=tx.prepare("SELECT id,scope,state,request_key,source_provider,source_host,source_issue
+        let mut statement=tx.prepare("SELECT id,scope,reservation_basis IS NOT NULL,request_key,source_provider,source_host,source_issue
             FROM hub_work_items WHERE provider=?1 AND host=?2 AND repository_id=?3 AND repository<>?4")?;
         let aliases = statement
             .query_map(
@@ -141,7 +141,7 @@ pub(super) fn evaluate(
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
@@ -151,7 +151,7 @@ pub(super) fn evaluate(
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let alias_relevant = aliases.into_iter().any(
-            |(id, stored_scope, state, request_key, provider, host, issue)| {
+            |(id, stored_scope, reserved, request_key, provider, host, issue)| {
                 let exact = start.work_id.as_deref() == Some(id.as_str())
                     || start
                         .request_key
@@ -162,7 +162,7 @@ pub(super) fn evaluate(
                             && host.as_ref() == Some(&source.host)
                             && issue.as_ref() == Some(&source.issue)
                     });
-                let overlap = state != "finished"
+                let overlap = reserved
                     && json_value::<Vec<String>>(&stored_scope)
                         .is_ok_and(|stored| !scope_overlap_reasons(scope, &stored).is_empty());
                 exact || overlap

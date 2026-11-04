@@ -338,7 +338,7 @@ async fn http_and_mcp_finish_share_one_opted_in_completion_observation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_finished_checkpoint_replays_do_not_report_completion() {
     let hub = Hub::start().await;
-    let writer = hub.token(false);
+    let (token_id, writer) = hub.token_with_id(false);
     let work = start_work(&hub, &writer).await;
     let id = work["item"]["id"].as_str().unwrap();
     let stale_finish = finish(
@@ -356,38 +356,19 @@ async fn stale_finished_checkpoint_replays_do_not_report_completion() {
         .await;
     assert_eq!(status, StatusCode::OK, "{finished}");
 
-    let handover = json!({
-        "work_id":id,"operation_id":"handover-after-finish","generation":1,
-        "expected_updated_seq":finished["item"]["updated_seq"],
-        "session":"surface-session","kind":"handover",
-        "summary":"Reopen this work under a new generation","next_action":null,
-        "scope":null,"branch":null,"worktree":null,"resolve_blocker":false,
-        "source_refs":[],"depends_on":[],"related_work":[]
-    });
-    let (status, handed_over) = hub
-        .request(
-            reqwest::Method::POST,
-            "/v1/hub/standup/checkpoint",
-            &writer,
-            Some(handover),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{handed_over}");
-    let takeover = json!({
-        "work_id":id,"source":null,"request_key":null,
-        "title":"verify insight contracts","session":"surface-session","role":"lead",
-        "scope":["src/synthetic.rs"],"branch":null,"worktree":null,"next_action":null,
-        "depends_on":[],"related_work":[],"takeover_generation":1
-    });
-    let (status, reopened) = hub
-        .request(
-            reqwest::Method::POST,
-            "/v1/hub/standup/start",
-            &writer,
-            Some(takeover),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{reopened}");
+    // Finished work accepts no checkpoint or takeover; the transition that reopens it is a
+    // separate operation. Stage the state a reopen leaves: active, generation two, same lead.
+    rusqlite::Connection::open(hub._directory.path().join("hub.sqlite"))
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE hub_work_items SET state = 'active', generation = 2,
+                 terminal_outcome = NULL, reservation_basis = 'admitted',
+                 snapshot = json_set(snapshot, '$.state', 'active', '$.generation', 2)
+             WHERE id = '{id}';
+             UPDATE hub_work_participants SET generation = 2 WHERE work = '{id}';"
+        ))
+        .unwrap();
+    let reopened = json!({"item": hub.store.work_get(&token_id, id, unix_now()).unwrap().unwrap()});
     assert_eq!(reopened["item"]["generation"], 2);
     assert_eq!(reopened["item"]["state"], "active");
 
