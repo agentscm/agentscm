@@ -3,7 +3,8 @@
 <style>
 :root{--frame:#17142e;--ink:#ece9ff;--dim:#aaa5d2;--hi:#b3abff;--coral:#ff9c84;--green:#6fdba6;--amber:#f6bd7a;--line:rgba(255,255,255,.08)}
 @media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark}}:root[data-theme=dark]{color-scheme:dark}:root[data-theme=light]{color-scheme:light}
-*{box-sizing:border-box}body{margin:0;padding:4px;background:transparent;color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+/* Reserve the scrollbar's width so a scrollbar appearing cannot rewrap text and change the height sent in size-changed. */
+html{scrollbar-gutter:stable}*{box-sizing:border-box}body{margin:0;padding:4px;background:transparent;color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
 .c{position:relative;overflow:hidden;background:var(--frame);border-radius:20px;padding:16px 18px 12px}
 .c::before{content:"";position:absolute;right:-80px;top:-120px;width:300px;height:300px;border-radius:50%;background:radial-gradient(closest-side,rgba(109,92,224,.45),transparent);pointer-events:none}
 .c>*{position:relative}
