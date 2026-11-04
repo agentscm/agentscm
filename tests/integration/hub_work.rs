@@ -4593,8 +4593,10 @@ fn abandoned_work_is_not_a_reported_completion(db: &Db) {
         assert_eq!(insight.state, WorkState::Finished);
         assert_eq!(insight.reported_finished, reported, "{}", item.title);
     }
-    // Recent outcomes list completions (a finish checkpoint or a `complete` transition) and
-    // decisions; abandoned and superseded Work are not completions.
+    // Recent outcomes stay checkpoint-only: a transition leaves `current` unchanged and carries
+    // no actor, so listing it would show a stale summary under the lead's name. Only the finish
+    // checkpoint is listed; abandoned, superseded and transition-completed Work are not (the
+    // latter is visible through history and the operational projection).
     let overview = store
         .work_overview(&alice.token, &Default::default(), now + 3)
         .unwrap();
@@ -4606,15 +4608,7 @@ fn abandoned_work_is_not_a_reported_completion(db: &Db) {
     assert!(recent.contains(&finished.id.as_str()));
     assert!(!recent.contains(&abandoned.id.as_str()));
     assert!(!recent.contains(&superseded.id.as_str()));
-    assert!(recent.contains(&completed.id.as_str()));
-    // Newest first: the `complete` transition came after the finish checkpoint.
-    let position = |id: &str| {
-        recent
-            .iter()
-            .position(|candidate| *candidate == id)
-            .unwrap()
-    };
-    assert!(position(&completed.id) < position(&finished.id));
+    assert!(!recent.contains(&completed.id.as_str()));
     // Pre-existing finished Work with no stored outcome reads as unstated.
     db.sql(&format!(
         "UPDATE hub_work_items SET terminal_outcome = NULL WHERE id = '{}'",

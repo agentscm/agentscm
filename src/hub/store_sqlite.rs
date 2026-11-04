@@ -5724,10 +5724,8 @@ impl SqliteStore {
                  JOIN hub_events e ON e.seq = v.event_seq
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at >= ?5 AND e.at <= ?6
-                   AND ((e.kind = 'work_checkpoint'
-                         AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish'))
-                        OR (e.kind = 'work_transition'
-                            AND json_extract(e.data, '$.outcome') = 'completed'))
+                   AND e.kind = 'work_checkpoint'
+                   AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish')
                  ORDER BY v.event_seq DESC LIMIT ?7",
             )?;
             statement

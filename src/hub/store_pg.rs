@@ -5584,11 +5584,8 @@ impl PgStore {
                      WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                        AND w.repository_id IS NOT DISTINCT FROM $4
                        AND e.at >= $5 AND e.at <= $6
-                       AND ((e.kind = 'work_checkpoint'
-                             AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish'))
-                            OR (e.kind = 'work_transition'
-                                AND CASE WHEN e.kind = 'work_transition'
-                                    THEN e.data::jsonb ->> 'outcome' END = 'completed'))
+                       AND e.kind = 'work_checkpoint'
+                       AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish')
                      ORDER BY v.event_seq DESC LIMIT $7",
                     &[
                         &who.owner.identity.provider,
