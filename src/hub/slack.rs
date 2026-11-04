@@ -54,6 +54,8 @@ const NO: &str = "agentscm_handoff_no";
 const OPEN: &str = "agentscm_open_hub";
 
 pub mod setup;
+mod status;
+pub use status::ReminderPolicy;
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +81,8 @@ pub struct BindingConfig {
     pub repository: String,
     pub repository_id: i64,
     pub agent_token_file: PathBuf,
+    #[serde(default)]
+    pub reminders: ReminderPolicy,
 }
 
 struct Binding {
@@ -109,6 +113,9 @@ struct Person {
     slack_user: String,
     login: String,
     repository: String,
+    provider: String,
+    host: String,
+    repository_id: i64,
     /// The binding's read-only token, for reads scoped to the repository.
     token: String,
     /// The person's agent tokens in the repository: id -> name.
@@ -268,6 +275,7 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
             return Err(invalid());
         }
         super::store::validate_repository(&binding.repository)?;
+        binding.reminders.validate(binding, &config.bindings)?;
         let digest = agent_token_digest(&secret(&binding.agent_token_file)?)?;
         if !digests.insert(digest.as_str().to_owned()) {
             return Err(invalid());
@@ -518,6 +526,7 @@ impl Slack {
         if identity != (config.team_id.clone(), config.app_id.clone()) {
             return Err(invalid());
         }
+        status::initialize(&db)?;
         // A send interrupted by a restart is tried again: a direct message may arrive twice.
         db.execute(
             "UPDATE messages SET state='queued' WHERE state='sending'",
@@ -593,8 +602,11 @@ impl Slack {
             .collect();
         Ok(Person {
             slack_user: binding.config.slack_user.clone(),
-            login: who.owner.login,
+            login: who.owner.login.clone(),
             repository: who.repository,
+            provider: who.owner.identity.provider.clone(),
+            host: who.owner.identity.host.clone(),
+            repository_id: who.repository_id.ok_or(HubError::Unauthorized)?,
             token: who.token_id,
             agents,
         })
@@ -684,6 +696,9 @@ impl Slack {
     /// first pass starts at the newest event: history from before installation is never sent.
     fn collect(&self, state: &HubState) -> Result<()> {
         self.active()?;
+        if self.collect_status(state, unix_now()).is_err() {
+            eprintln!("Slack status collection unavailable");
+        }
         let _store_slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
         let cursor: Option<i64> = self
             .database()?
@@ -744,6 +759,12 @@ impl Slack {
                     "INSERT OR IGNORE INTO messages(id,user,body,state,created,due) VALUES(?1,?2,?3,'queued',?4,?4)",
                     params![id, user, body.to_string(), now],
                 )?;
+                if let Some(binding) = self.bindings.iter().find(|b| b.config.slack_user == user) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO message_bindings(message,binding) VALUES(?1,?2)",
+                        params![id, status::binding_key(binding)],
+                    )?;
+                }
             }
             reached = Some(seq);
         }
@@ -1080,7 +1101,7 @@ impl Slack {
         let mut out = Vec::new();
         let mut done = BTreeSet::new();
         for reader in people {
-            if !done.insert(reader.repository.as_str()) {
+            if !done.insert((&reader.provider, &reader.host, reader.repository_id)) {
                 continue;
             }
             let repository = &reader.repository;
@@ -1191,7 +1212,7 @@ impl Slack {
         let mut out = Vec::new();
         let mut done = BTreeSet::new();
         for reader in people {
-            if !done.insert(reader.repository.as_str()) {
+            if !done.insert((&reader.provider, &reader.host, reader.repository_id)) {
                 continue;
             }
             let repository = &reader.repository;
@@ -1246,11 +1267,22 @@ impl Slack {
         let Some((id, user, body, attempts)) = job else {
             return Ok(None);
         };
+        let retained_binding: Option<String> = self
+            .database()?
+            .query_row(
+                "SELECT binding FROM message_bindings WHERE message=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()?;
         let authorized = {
             let _store_slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
             self.bindings
                 .iter()
-                .find(|b| b.config.slack_user == user)
+                .find(|b| {
+                    b.config.slack_user == user
+                        && retained_binding.as_deref() == Some(status::binding_key(b).as_str())
+                })
                 .map(|binding| self.principal(state, binding))
         };
         match authorized {
@@ -1272,6 +1304,11 @@ impl Slack {
 
     /// Sends the next due message; `false` when none was due.
     async fn deliver(self: &Arc<Self>, state: &HubState) -> Result<bool> {
+        match self.deliver_status(state).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(_) => eprintln!("Slack status delivery unavailable"),
+        }
         let service = self.clone();
         let context = state.clone();
         let Some((id, user, mut body, attempts)) =
@@ -1553,6 +1590,9 @@ fn prepare(
         {
             return Err(HubError::Unauthorized);
         }
+        if event.pointer("/event/type").and_then(Value::as_str) == Some("app_mention") {
+            slack.enqueue_status_query(state, &event, unix_now())?;
+        }
         if let Some("app_uninstalled" | "tokens_revoked") =
             event.pointer("/event/type").and_then(Value::as_str)
         {
@@ -1560,6 +1600,10 @@ fn prepare(
             db.execute("UPDATE installation SET revoked=1 WHERE id=1", [])?;
             db.execute(
                 "UPDATE messages SET state='failed' WHERE state IN ('queued','sending')",
+                [],
+            )?;
+            db.execute(
+                "UPDATE status_jobs SET state='failed' WHERE state IN ('queued','sending')",
                 [],
             )?;
         }

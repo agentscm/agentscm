@@ -4,7 +4,7 @@ title: "Slack adapter"
 
 # Slack adapter
 
-The Slack adapter is an optional Core Edition integration for a single-server Unix Hub. It tells people, by direct message as it happens, about the coordination moments that need a person, and lets a file's holder answer a handoff with a button. It accepts only signed Slack lifecycle events and button clicks at `POST /v1/hub/slack` (`src/hub/slack.rs`). A successful installation is separate from verified Slack delivery.
+The Slack adapter is an optional Core Edition integration for a single-server Unix Hub. It tells people, by direct message as it happens, about the coordination moments that need a person, and lets a file's holder answer a handoff with a button. It accepts signed lifecycle events, narrow app-mention status queries and button clicks at `POST /v1/hub/slack` (`src/hub/slack.rs`). A successful installation is separate from verified Slack delivery.
 
 Agents already get every coordination warning in their own replies. People hear about four moments:
 
@@ -15,7 +15,7 @@ Agents already get every coordination warning in their own replies. People hear 
 | `task_overlap` | An `agentscm_start` creates work that reads like other ongoing work or an open pull request. | The starting agent's person and the person leading each matched work item. |
 | `coordination_requested` | An `agentscm_start` is refused because its scope overlaps work whose lead agent is paused or has stopped checking in, so that agent cannot answer the request. | The person leading that work, once per request. |
 
-Everything else (overlap notes, refusals, open or merged pull request notices, granted handoffs) stays between agents. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and every message links to the page about its item: the contested-file box (`#box-contested`) for a repeated edit, the Inbox (`#inbox`) for a declined handoff or a request to an idle agent, and the Work page (`#work/<id>`) for similar work.
+Other event notifications (overlap notes, refusals, open or merged pull request notices, granted handoffs) stay between agents. Private mention replies and optional outstanding-action reminders use the shared deterministic status projection described below. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and event notifications link to the page about their item: the contested-file box (`#box-contested`) for a repeated edit, the Inbox (`#inbox`) for a declined handoff or a request to an idle agent, and the Work page (`#work/<id>`) for similar work.
 
 The adapter does not read channel history, post to channels, copy raw Slack messages, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. The only write a Slack user can make is answering a handoff for their own agent. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
 
@@ -127,13 +127,15 @@ The `hub_url` must be an HTTPS origin with no credentials, query, fragment or ex
 
 ## Slack app manifest
 
-The example manifest requests one bot scope, `chat:write`, which `chat.postMessage` (direct messages) and `chat.update` (replacing a clicked message's buttons with the outcome) need; `auth.test` needs none. Posting to a user ID delivers to the app's direct message with that user, so the manifest enables the Messages tab, read-only: people cannot write to the app. The Home tab and slash command are off. It requests no history, search, file, channel, or message-reading scopes.
+The example manifest requests `chat:write` for private replies and updates, and `app_mentions:read` for the [`app_mention` event](https://docs.slack.dev/reference/events/app_mention/). Its subscriptions are `app_mention`, `tokens_revoked` and `app_uninstalled`, with interactivity for handoff buttons. Both callbacks terminate at `/v1/hub/slack`. The manifest does not request channel history, search, files or `chat:write.public`.
 
-The manifest subscribes only to `tokens_revoked` and `app_uninstalled`, and enables interactivity for the buttons. Slack's [manifest reference](https://docs.slack.dev/reference/app-manifest/) defines these fields; [interactivity](https://docs.slack.dev/interactivity/handling-user-interaction/) documents button clicks. Set the same absolute HTTPS endpoint for the Events API and interactivity request URL; it must terminate at `/v1/hub/slack`.
+Mention the installed app in a conversation it has joined or been invited into: `@AgentSCM status`, `@AgentSCM needs`, or `@AgentSCM proceed`, optionally followed by the exact configured repository name. These are aliases for the same bounded deterministic status answer. The adapter sends its answer privately to the requester's App Home using [`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/); it never posts repository facts into the originating channel because the channel audience's repository access is not established. Direct-message queries are unsupported: Slack does not dispatch them as `app_mention`, and `message.im`/history scopes are not requested. The Messages tab stays read-only; Home and slash commands are off.
+
+Replies include counts, named recipients, deterministic next actions, held reservations, an evidence revision and incomplete-coverage warnings. They prioritize personal actions and list at most four tasks and four actions. Provider unavailability is identified separately from clear status; missing generated prose does not prevent a deterministic answer. An unbound user, a repository that does not match the binding, bot messages and unsupported commands produce no reply and disclose no repository details. A revoked or changed binding suppresses its queued reply. A temporary provider/store failure leaves a job pending rather than sending an all-clear. Jobs expire after one day.
 
 Create the app with the manifest URL settings omitted initially if Slack cannot yet verify the endpoint. Save the app signing secret, install it into the intended workspace, and save the bot token. Configure and start the Hub, then enable Events API and interactivity. The signed URL-verification challenge is handled before a user lookup. Replace `https://example.invalid` before importing the manifest.
 
-An app created from an earlier version of this manifest (Home tab, `/agentscm` command, `commands` scope) is not upgraded by `hub slack install`: update its manifest in Slack's app settings to this one and reinstall it to grant `chat:write`.
+Existing installations must update their manifest and reinstall or reauthorize the app to grant `app_mentions:read`, then enable the `app_mention` subscription at the configured callback. Until then, coordination messages may work while mention queries receive no events. Generated-manifest tests verify the requested scope/subscription contract; `doctor --verify` checks identity and callback reachability, not the installed subscription or granted mention scope. Verify those in Slack’s app settings and exercise a real mention before claiming live support.
 
 ## Messages and buttons
 
@@ -178,9 +180,30 @@ A click the Hub cannot take is answered with an ephemeral message that only the 
 
 The ephemeral message is sent with `chat.postEphemeral`, which uses the same `chat:write` scope. A request that fails Slack's signature, workspace or app checks still returns an HTTP error without a message, and so does one that does not finish within the 2.5-second admission window.
 
+## Optional outstanding-action reminders
+
+Each binding may add a `reminders` object; omission means disabled. The operator opts in explicitly, for example:
+
+```json
+"reminders": {
+  "enabled": true,
+  "interval_seconds": 3600,
+  "max_reminders": 2,
+  "escalation_user": "U0234567890",
+  "escalation_after_seconds": 7200,
+  "send_resolution": true
+}
+```
+
+Cadence is 900–86400 seconds, each episode sends at most 1–3 successful reminders, and an optional escalation sends once after 900 seconds to seven days (never before the configured cadence). The escalation user must have a separate configured, currently authorized binding to the same provider, host, repository name and stable repository ID. No administrator is selected implicitly. One binding per Slack user remains supported; the adapter rejects ambiguous duplicate-user bindings.
+
+Only a personal blocked task, handover review or unanswered directed coordination request enters the reminder journal. Quiet/paused work alone does not. The worker scans one due binding per pass, at most once per minute per binding, with at most 4096 retained episodes and 4096 status jobs. Every delivery and retry reauthorizes the exact binding and recomputes the shared action; changed recipients, state or generation suppress obsolete jobs. Quotas bind the action episode rather than provider polling timestamps. A confirmed Work state/generation change can close an episode and optionally send a resolution notice to its still-authorized original recipient; that means the action ended, not that all work succeeded. Omitted/truncated or otherwise unknown facts never establish resolution. Directed requests resolve only when the exact retained request is withdrawn/resolved or a complete current-target response is observed with unchanged request and Work versions; missing requests remain unknown.
+
+Status jobs retain normalized identities and command kind, not raw mention text or source-channel content. Completed status jobs expire after a day; resolved episodes and inactive-binding history are retained for at most seven days. Rotation/configuration changes fence old jobs to their original identity, and legacy queued coordination messages without an exact binding marker are suppressed. The journal is local SQLite and single-worker even when Hub facts come from PostgreSQL; it is not a PostgreSQL delivery journal or a multiwriter service.
+
 ## Delivery and recovery behavior
 
-The private journal holds a cursor into the Hub event log and the queued messages: recipient, message body, state, attempt count and due time. It does not keep Slack payloads. Messages that are sent or failed are deleted after a day; the journal holds at most 4096 rows, and past that the worker waits for deliveries to drain before reading further events.
+The existing coordination journal holds a cursor into the Hub event log and the queued messages: recipient, message body, state, attempt count and due time. It does not keep Slack payloads. Messages that are sent or failed are deleted after a day; the journal holds at most 4096 rows, and past that the worker waits for deliveries to drain before reading further events.
 
 `chat.postMessage` retries Slack rate limits and server errors up to eight attempts; then a message becomes `failed` for operator inspection. A mismatched workspace or bot token fails a message without sending it. A message whose send was interrupted by a restart is sent again, so a person may get it twice. A Hub store failure while reading an event leaves the cursor where it was, and the event is read again on the next pass; events with malformed data are skipped.
 
@@ -196,4 +219,4 @@ Local checks use synthetic IDs, signed requests and a fake Slack API; they do no
 - A declined handoff and similar work at start message both people; events from before installation are not sent.
 - A rate-limited send stays queued; a mismatched bot, a revoked binding token, `tokens_revoked` and `app_uninstalled` stop delivery.
 
-Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, makes one agent repeat an edit of a file another agent holds, checks both direct messages arrive and read as shown above, answers with a button, checks the outcome line, the Open Hub link and the ephemeral explanation (a click by the wrong person is the easy one to try), and confirms revoke/uninstall behavior in the actual workspace. The local tests use a fake Slack API, so how Slack renders the header, the fields, the ephemeral message and a message sent after a failed update has not been seen.
+Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, makes one agent repeat an edit of a file another agent holds, checks both direct messages arrive and read as shown above, answers with a button, checks the outcome line, the Open Hub link and the ephemeral explanation (a click by the wrong person is the easy one to try), and confirms revoke/uninstall behavior in the actual workspace. Mention status, reminder retry/deduplication, obsolete-action suppression, escalation and resolution are exercised with synthetic requests and a fake Slack API. Live mention installation, delivery and desktop/mobile rendering remain operator qualification in issue #7. The local tests use a fake Slack API, so how Slack renders the header, the fields, the ephemeral message and a message sent after a failed update has not been seen.
