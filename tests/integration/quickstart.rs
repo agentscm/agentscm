@@ -2765,7 +2765,7 @@ case "$1" in
   case "$FAKE_PRINT_MODE" in
    unavailable) echo "fixture: GUI domain unavailable" >&2; exit 5 ;;
    wrong-label) echo 'Could not find service "com.counterbranch.agentscm.other" in domain for user gui' >&2; exit 113 ;;
-   # Stay well past the 30-second control deadline so load cannot turn this into a successful exit.
+   # Stay well past the control deadline (shortened by AGENTSCM_TEST_CONTROL_TIMEOUT_SECS) so load cannot turn this into a successful exit.
    timeout) exec /bin/sleep 120 ;;
    absent) printf 'Could not find service "%s" in domain for user gui\n' "${2##*/}" >&2; exit 113 ;;
   esac
@@ -2844,6 +2844,7 @@ fn native_pending_recovery_requires_a_known_service_state() {
             )
             .env("FAKE_PRINT_MODE", mode)
             .env("FAKE_EXECUTABLE", &executable)
+            .env("AGENTSCM_TEST_CONTROL_TIMEOUT_SECS", "5")
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{mode}: {output:?}");
@@ -2893,6 +2894,7 @@ fn native_configuration_failure_restores_plist_record_and_previous_service() {
             .env("FAKE_FAILURE", failure)
             .env("FAKE_PLIST", &plist)
             .env("FAKE_HEALTH_MARKER", &marker)
+            .env("AGENTSCM_TEST_HEALTH_WAIT_SECS", "5")
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{failure}: {output:?}");
@@ -2961,6 +2963,7 @@ fn native_uninstall_settles_unhealthy_recovery_without_restarting_the_hub() {
             .env("FAKE_FAILURE", "health-stop")
             .env("FAKE_PLIST", &plist)
             .env("FAKE_HEALTH_MARKER", &marker)
+            .env("AGENTSCM_TEST_HEALTH_WAIT_SECS", "5")
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{wipe}: {output:?}");
@@ -3398,6 +3401,7 @@ fn native_uninstall_recovers_a_missing_plist_but_preserves_unknown_service_state
             .command(repo.path(), &["uninstall", "--yes"])
             .env("FAKE_PRINT_MODE", mode)
             .env("FAKE_EXECUTABLE", &executable)
+            .env("AGENTSCM_TEST_CONTROL_TIMEOUT_SECS", "5")
             .output()
             .unwrap();
         if mode == "unavailable" {
@@ -3622,6 +3626,7 @@ fn a_first_native_install_that_fails_its_health_check_can_be_run_again() {
                 ],
             )
             .env("FAKE_PLIST", &plist)
+            .env("AGENTSCM_TEST_HEALTH_WAIT_SECS", "5")
             .output()
             .unwrap()
     };
