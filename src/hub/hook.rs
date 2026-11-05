@@ -706,7 +706,11 @@ impl Call {
                     Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
                     _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
                 }
-                if !principal.read_only {
+                // Only while a requested briefing waits for an agent.
+                if !principal.read_only
+                    && super::narrative::pending(state, &principal)
+                        .is_ok_and(|requests| !requests.is_empty())
+                {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
                 }

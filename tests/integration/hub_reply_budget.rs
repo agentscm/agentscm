@@ -99,7 +99,9 @@ fn busy(hub: &Hub) -> Vec<(String, String)> {
             title: words(n, 180),
             session: session.clone(),
             role: WorkRole::Lead,
-            scope: (0..6).map(|p| format!("src/area{n:03}/module{p}.rs")).collect(),
+            scope: (0..6)
+                .map(|p| format!("src/area{n:03}/module{p}.rs"))
+                .collect(),
             branch: Some(format!("feat/fixture-{n:03}-bounded-validation")),
             worktree: Some(format!("fixture-{n:03}")),
             next_action: Some(words(n + 1000, 250)),
@@ -173,12 +175,22 @@ async fn default_start_and_overview_replies_fit_the_budget_on_a_busy_repository(
     let tokens = busy(&hub);
     let secret = &tokens[0].1;
     let start = hub
-        .result(secret, "agentscm_start", json!({"task": "Measure reply sizes",
-            "session": "budget-session", "request_key": "budget", "paths": ["src/budget.rs"]}))
+        .result(
+            secret,
+            "agentscm_start",
+            json!({"task": "Measure reply sizes",
+            "session": "budget-session", "request_key": "budget", "paths": ["src/budget.rs"]}),
+        )
         .await;
-    let overview = hub.result(secret, "agentscm_work_overview", json!({})).await;
-    let overview_10 = hub.result(secret, "agentscm_work_overview", json!({"limit": 10})).await;
-    let overview_20 = hub.result(secret, "agentscm_work_overview", json!({"limit": 20})).await;
+    let overview = hub
+        .result(secret, "agentscm_work_overview", json!({}))
+        .await;
+    let overview_10 = hub
+        .result(secret, "agentscm_work_overview", json!({"limit": 10}))
+        .await;
+    let overview_20 = hub
+        .result(secret, "agentscm_work_overview", json!({"limit": 20}))
+        .await;
     let started: Value = serde_json::from_str(&start).unwrap();
     let work_id = started["structuredContent"]["work"]["item"]["id"].clone();
     let checkpoint = hub
@@ -201,6 +213,68 @@ async fn default_start_and_overview_replies_fit_the_budget_on_a_busy_repository(
         eprintln!("reply size {name}: {size}");
     }
     for (name, size) in sizes {
-        assert!(size < BUDGET, "{name} is {size} characters");
+        // A caller that asks for twice the default page gets about twice the items.
+        let budget = if name.ends_with("limit 20") {
+            2 * BUDGET
+        } else {
+            BUDGET
+        };
+        assert!(size < budget, "{name} is {size} characters");
     }
+
+    // The earlier shape stays available to readers that depend on it.
+    let full: Value = serde_json::from_str(
+        &hub.result(
+            secret,
+            "agentscm_start",
+            json!({"task": "Measure reply sizes",
+            "session": "budget-session", "request_key": "budget", "paths": ["src/budget.rs"],
+            "detail": "full"}),
+        )
+        .await,
+    )
+    .unwrap();
+    let context = &full["structuredContent"]["work"]["context"];
+    assert_eq!(
+        context["current"].as_array().map(Vec::len),
+        Some(37),
+        "{context}"
+    );
+    assert!(full["structuredContent"]["briefing"]["items"].is_array());
+    assert!(full["structuredContent"]["actionable_status"]["work"].is_array());
+    let full: Value = serde_json::from_str(
+        &hub.result(secret, "agentscm_work_overview", json!({"detail": "full"}))
+            .await,
+    )
+    .unwrap();
+    assert!(
+        full["structuredContent"]["current"][0]["participants"].is_array(),
+        "{full}"
+    );
+    assert!(full["structuredContent"]["operational"]["work"].is_array());
+
+    // Compact pages walk every listed item once.
+    let mut seen = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let page: Value = serde_json::from_str(
+            &hub.result(secret, "agentscm_work_overview", json!({"after": after}))
+                .await,
+        )
+        .unwrap();
+        let page = &page["structuredContent"];
+        seen.extend(
+            page["current"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["id"].clone()),
+        );
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    let unique: std::collections::BTreeSet<String> = seen.iter().map(|id| id.to_string()).collect();
+    assert_eq!((seen.len(), unique.len()), (37, 37));
 }
