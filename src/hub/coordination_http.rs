@@ -20,6 +20,7 @@ use super::handoff::{Answered, Asked, HandoffParty, Via};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::login::HumanSession;
 use super::store::unix_now;
+use super::viewer::{Viewer, masked_label, shown};
 use super::{HubError, HubState, Result};
 
 pub(super) static CHANGED: Notify = Notify::const_new();
@@ -110,7 +111,9 @@ async fn list(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            store.coordination_list(&principal.token_id, &query, unix_now())
+            store
+                .coordination_list(&principal.token_id, &query, unix_now())
+                .map(|page| shown(page, &principal.owner.id))
         })
         .await?,
     ))
@@ -134,7 +137,7 @@ async fn inbox(
         query.wait_seconds,
     )
     .await?;
-    Ok(Json(page))
+    Ok(Json(shown(page, &principal.owner.id)))
 }
 
 async fn ack(
@@ -144,7 +147,9 @@ async fn ack(
 ) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
     let store = state.store.clone();
     let result = blocking(&state, move || {
-        store.coordination_ack(&principal.token_id, &request, unix_now())
+        store
+            .coordination_ack(&principal.token_id, &request, unix_now())
+            .map(|result| shown(result, &principal.owner.id))
     })
     .await?;
     CHANGED.notify_waiters();
@@ -158,7 +163,9 @@ async fn reply(
 ) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
     let store = state.store.clone();
     let result = blocking(&state, move || {
-        store.coordination_reply(&principal.token_id, &request, unix_now())
+        store
+            .coordination_reply(&principal.token_id, &request, unix_now())
+            .map(|result| shown(result, &principal.owner.id))
     })
     .await?;
     CHANGED.notify_waiters();
@@ -172,7 +179,9 @@ async fn resolve(
 ) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
     let store = state.store.clone();
     let result = blocking(&state, move || {
-        store.coordination_resolve(&principal.token_id, &request, unix_now())
+        store
+            .coordination_resolve(&principal.token_id, &request, unix_now())
+            .map(|result| shown(result, &principal.owner.id))
     })
     .await?;
     CHANGED.notify_waiters();
@@ -186,7 +195,9 @@ async fn withdraw(
 ) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
     let store = state.store.clone();
     let result = blocking(&state, move || {
-        store.coordination_withdraw(&principal.token_id, &request, unix_now())
+        store
+            .coordination_withdraw(&principal.token_id, &request, unix_now())
+            .map(|result| shown(result, &principal.owner.id))
     })
     .await?;
     CHANGED.notify_waiters();
@@ -258,7 +269,9 @@ async fn person_reply(
             note: body.note,
             via_hub: true,
         };
-        store.coordination_reply(&body.token, &reply, now)
+        store
+            .coordination_reply(&body.token, &reply, now)
+            .map(|result| shown(result, &owner))
     })
     .await
     .map_err(person_error)?;
@@ -291,6 +304,7 @@ async fn person_transition(
 ) -> std::result::Result<Json<super::work_transition::WorkTransitionResult>, ApiError> {
     let reclaimed = super::work_http::ReclaimedFlag::requested(reclaimed)?;
     let user = human.web_user()?.clone();
+    let viewer = user.id.clone();
     let is_admin = human.admin().is_ok();
     super::store::validate_repository(&body.repository)?;
     // The same allow-list and current forge role checks a read-token mint makes.
@@ -330,7 +344,7 @@ async fn person_transition(
         result.reclaimed.clear();
     }
     CHANGED.notify_waiters();
-    Ok(Json(result))
+    Ok(Json(shown(result, &viewer)))
 }
 
 #[derive(Deserialize)]
@@ -373,8 +387,9 @@ async fn person_answer(
         Answered::NoRequest => ("no_open_request", None),
         Answered::NotHeld => ("not_held", None),
     };
+    // The requester's owner is not in the answer, so its label is masked for everyone.
     Ok(Json(json!({"outcome": outcome,
-        "requester": requester.map(|(agent, login)| json!({"agent": agent, "login": login}))})))
+        "requester": requester.map(|(agent, login)| json!({"agent": masked_label(&agent), "login": login}))})))
 }
 
 #[derive(Deserialize)]
@@ -393,6 +408,7 @@ async fn person_ask(
     JsonBody(body): JsonBody<PersonAsk>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     let owner = human.web_user()?.id.clone();
+    let viewer = owner.clone();
     let store = state.store.clone();
     let asked = blocking(&state, move || {
         let now = unix_now();
@@ -418,7 +434,10 @@ async fn person_ask(
         Asked::TooMany => ("too_many", None),
     };
     Ok(Json(json!({"outcome": outcome,
-        "holder": holder.map(|h| json!({"agent": h.agent, "login": h.owner.login}))})))
+    "holder": holder.map(|mut h| {
+        Viewer(&viewer).label(Some(&h.owner.id), &mut h.agent);
+        json!({"agent": h.agent, "login": h.owner.login})
+    })})))
 }
 
 #[derive(Deserialize)]
@@ -433,7 +452,9 @@ const PERSON_HANDOFFS: usize = 50;
 /// One side of a handoff. The token and session, which the page needs to answer, are given only
 /// for the person's own agent; every reader gets the session's key and kind, never its id.
 fn party_json(party: &HandoffParty, me: &str) -> Value {
-    let mut out = json!({"agent": party.agent, "login": party.login, "mine": party.owner == me,
+    let mut agent = party.agent.clone();
+    Viewer(me).label(Some(&party.owner), &mut agent);
+    let mut out = json!({"agent": agent, "login": party.login, "mine": party.owner == me,
         "session_key": party.key, "session_kind": party.kind});
     if party.owner == me {
         out["token"] = json!(party.token);

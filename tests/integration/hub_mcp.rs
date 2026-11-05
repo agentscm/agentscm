@@ -1805,10 +1805,18 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
         post_takeover_retry["structuredContent"]["item"]["generation"],
         generation + 1
     );
-    assert_eq!(
-        post_takeover_retry["structuredContent"]["item"]["lead_session"],
-        "bob"
-    );
+    // Bob is another owner: Alice reads his session by its digest, the same one his
+    // participant entry carries.
+    let item = &post_takeover_retry["structuredContent"]["item"];
+    let lead = item["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["role"] == "lead")
+        .unwrap();
+    assert_ne!(item["lead_session"], "bob");
+    assert_eq!(item["lead_session"].as_str().map(str::len), Some(16));
+    assert_eq!(lead["session"], item["lead_session"]);
     let new_old_generation_operation = hub
         .tool_result(
             &alice,

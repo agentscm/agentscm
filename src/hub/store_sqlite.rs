@@ -10273,7 +10273,13 @@ impl Store for SqliteStore {
             _ => None,
         };
         tx.commit()?;
-        Ok(operational_page(rows, forge_window_from, more, now))
+        Ok(operational_page(
+            rows,
+            forge_window_from,
+            more,
+            now,
+            super::viewer::Viewer(&who.owner.id),
+        ))
     }
 
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
@@ -10770,13 +10776,17 @@ impl Store for SqliteStore {
         let pattern = search.map(like_pattern);
         let number = search.and_then(search_number).map(|n| n.to_string());
         let mut statement = tx.prepare(
-            "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
+            // Another owner's generated `client-…` label, which can hold a host name, is neither
+            // matched nor shown as stored.
+            "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at,
+                    COALESCE(lt.owner = ?10, 0)
              FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
+             LEFT JOIN hub_agent_tokens lt ON lt.id = w.lead_token
              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
                AND (?5 IS NULL OR (w.created_at, w.id) < (?5, ?6))
                AND (?7 IS NULL OR w.source_issue = ?8
                  OR lower(w.title) LIKE ?7 ESCAPE '\\' OR lower(w.branch) LIKE ?7 ESCAPE '\\'
-                 OR lower(w.lead_agent) LIKE ?7 ESCAPE '\\' OR lower(u.login) LIKE ?7 ESCAPE '\\'
+                 OR ((lt.owner = ?10 OR w.lead_agent NOT LIKE 'client-%') AND lower(w.lead_agent) LIKE ?7 ESCAPE '\\') OR lower(u.login) LIKE ?7 ESCAPE '\\'
                  OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\')
              ORDER BY w.created_at DESC, w.id DESC LIMIT ?9",
         )?;
@@ -10791,14 +10801,15 @@ impl Store for SqliteStore {
                     after.as_ref().map(|a| a.1.as_str()),
                     pattern,
                     number,
-                    limit as i64 + 1
+                    limit as i64 + 1,
+                    who.owner.id
                 ],
                 |row| {
                     Ok(WorkSearchItem {
                         id: row.get(0)?,
                         title: row.get(1)?,
                         state: row.get(2)?,
-                        lead_agent: row.get(3)?,
+                        lead_agent: super::viewer::shown_label(row.get(3)?, row.get(9)?),
                         owner: row.get(4)?,
                         branch: row.get(5)?,
                         source_issue: row.get(6)?,
@@ -11885,6 +11896,7 @@ impl Store for SqliteStore {
             action,
             decision,
             now,
+            super::viewer::Viewer(&who.owner.id),
         );
         tx.commit()?;
         Ok(Some(summary))

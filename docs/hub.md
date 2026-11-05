@@ -324,8 +324,9 @@ status shown; clients show `message` as is.
   minutes (the current client labels it `client-<random machine id>-<hex>`, or `<machine-name>-<hex>`
   when the user wrote a `machine-name` file, never the host name; the Hub only validates the name, so
   an older client can still send one. Stored labels stay, masked in hook and MCP text, `agentscm
-  intent`, Slack and pull-request text, but not in structured JSON fields such as `agent.name` and
-  `lead_agent`, the Hub page's `title` attribute or the owner's own `agentscm hub tokens` listing),
+  intent`, Slack and pull-request text, and, for other owners, in structured JSON such as `agent.name`
+  and `lead_agent` (see [other owners' agents](standup.md#other-owners-agents)); the owner's own
+  replies, the Hub page's `title` attribute and `agentscm hub tokens` show them as stored),
   and re-checks at every call: the owner is enabled (else 403 `user_disabled`), on
   `AGENTSCM_ALLOWED_USERS` when set (else 403 `not_allowed`; administrators pass), the repository
   is connected on the owner's host (else 403 `not_connected`), and the owner has the role

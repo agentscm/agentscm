@@ -39,6 +39,7 @@ use super::session::{
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
 use super::view_settings::{ViewOverride, ViewSettings};
+use super::viewer::{Shown, Viewer, shown};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, ForgeWorkRef, WorkCheckpoint,
     WorkConflictKind, WorkItem, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
@@ -752,7 +753,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         "description":"Read or set this repository token and session's contribution receipt mode. Legacy sessions default to requested_only; automatic appends once per evidence version at supported completion/check/premerge calls. Disabled suppresses automatic receipts and explicit receipt reads.",
         "inputSchema":schema(json!({"session":{"type":"string","maxLength":255},"mode":{"type":"string","enum":["automatic","requested_only","disabled"]}}), &[])});
     let work_search = json!({"name": "agentscm_work_search",
-        "description": "Finds work in this repository by text, finished work included, in creation order, newest first. q matches title, branch, lead agent, owner, work id, scope paths or a source issue number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
+        "description": "Finds work in this repository by text, finished work included, in creation order, newest first. q matches title, branch, owner, work id, scope paths, a source issue number (123 or #123) or the lead agent label (another owner's generated client label is not matched). Pass next_cursor as cursor for the next page. Pure read.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({
             "q":{"type":"string","maxLength":200},
@@ -1264,7 +1265,8 @@ async fn call(
             super::work_http::actionable_status::read(&*store, &scope, unix_now())
         })
         .await
-        .ok();
+        .ok()
+        .map(|status| shown(status, &principal.owner.id));
         append_actionable_status(&mut value, status.as_ref());
     }
     contribution_receipt::append(
@@ -1392,6 +1394,7 @@ async fn call(
     .await;
     match inbox {
         Ok(page) if !page.requests.is_empty() || !page.complete => {
+            let page = shown(page, &principal.owner.id);
             let notices = page.requests.iter().filter(|request| !matches!(request.status, CoordinationStatus::Resolved | CoordinationStatus::Withdrawn))
                 .map(|request| json!({"request_id":request.id,"title":request.proposal.title,
                     "status":request.status,"updated_seq":request.updated_seq,
@@ -1806,7 +1809,7 @@ async fn call_inner(
             )
             .await
             {
-                Ok(page) => structured(&page),
+                Ok(page) => structured(&shown(page, &principal.owner.id)),
                 Err(error) => work_failure(&error),
             },
         );
@@ -1863,8 +1866,11 @@ async fn call_inner(
             }
         };
         return Ok(match outcome {
-            Ok(request) => structured(&request),
-            Err(error) => work_failure(&error),
+            Ok(request) => structured(&shown(request, &principal.owner.id)),
+            Err(mut error) => {
+                error.show(Viewer(&principal.owner.id));
+                work_failure(&error)
+            }
         });
     }
     if name == "agentscm_view_settings" {
@@ -1912,6 +1918,7 @@ async fn call_inner(
             .await
             {
                 Ok(status) => {
+                    let status = shown(status, &principal.owner.id);
                     json!({"isError":false,"structuredContent":status,"content":[{"type":"text","text":super::work_http::actionable_status::render_compact_text(&status)}]})
                 }
                 Err(error) => work_failure(&error),
@@ -1925,10 +1932,11 @@ async fn call_inner(
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
+        let viewer = principal.owner.id.clone();
         return Ok(
             match blocking(state, move || {
                 let now = unix_now();
-                let overview = store.work_overview(&token, &query, now)?;
+                let overview = shown(store.work_overview(&token, &query, now)?, &viewer);
                 let held = store.work_operational(
                     &WorkLifecycleReader::Token(&token),
                     &OperationalSelect::Holders,
@@ -2069,7 +2077,7 @@ async fn call_inner(
             })
             .await
             {
-                Ok(Some(value)) => structured(&value),
+                Ok(Some(value)) => structured(&shown(value, &principal.owner.id)),
                 Ok(None) => refused("work not found"),
                 Err(error) => work_failure(&error),
             },
@@ -2088,7 +2096,7 @@ async fn call_inner(
             })
             .await
             {
-                Ok(value) => structured(&value),
+                Ok(value) => structured(&shown(value, &principal.owner.id)),
                 Err(error) => work_failure(&error),
             },
         );
@@ -2260,7 +2268,7 @@ async fn call_inner(
             Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(match work_preflight(state, principal, arguments).await {
-            Ok(value) => structured(&value),
+            Ok(value) => structured(&shown(value, &principal.owner.id)),
             Err(error) => work_failure(&error),
         });
     }
@@ -2292,7 +2300,10 @@ async fn call_inner(
         };
         return Ok(match start(state, principal, arguments).await {
             Ok(value) => value,
-            Err(error) => work_failure(&error),
+            Err(mut error) => {
+                error.show(Viewer(&principal.owner.id));
+                work_failure(&error)
+            }
         });
     }
     let outcome = match run(state, principal, name, arguments, completion_reporting).await {
@@ -2453,7 +2464,7 @@ async fn work_briefing(state: &HubState, principal: &Principal, arguments: Brief
     })
     .await
     {
-        Ok(briefing) => structured(&briefing),
+        Ok(briefing) => structured(&shown(briefing, &principal.owner.id)),
         Err(error) => hub_failure(&error),
     }
 }
@@ -2520,7 +2531,7 @@ async fn work_catchup(state: &HubState, principal: &Principal, arguments: Catchu
     })
     .await
     {
-        Ok(page) => structured(&page),
+        Ok(page) => structured(&shown(page, &principal.owner.id)),
         Err(error) => hub_failure(&error),
     }
 }
@@ -2630,8 +2641,11 @@ async fn work_checkpoint(
     })
     .await
     {
-        Ok(item) => structured(&item),
-        Err(error) => work_failure(&error),
+        Ok(item) => structured(&shown(item, &principal.owner.id)),
+        Err(mut error) => {
+            error.show(Viewer(&principal.owner.id));
+            work_failure(&error)
+        }
     }
 }
 
@@ -2660,7 +2674,7 @@ async fn work_transition(
     })
     .await
     {
-        Ok(result) => structured(&result),
+        Ok(result) => structured(&shown(result, &principal.owner.id)),
         Err(error) => work_failure(&error),
     }
 }
@@ -3054,7 +3068,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let requested_session = session.clone();
-    let (briefing, context, catchup) = blocking(state, move || {
+    let (mut briefing, context, mut catchup) = blocking(state, move || {
         let now = unix_now();
         let session = store.session_name_for(&token, requested_session.as_deref(), now)?;
         let briefing = store.work_briefing_preview_for(&token, Some(&session), 20, now)?;
@@ -3162,6 +3176,11 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     .await?;
     let (mut work, unreserved, resolved, paths) = work;
     work.context = Some(context);
+    // The reply's text reads ids and counts only, so it can be built from the redacted copy.
+    let viewer = Viewer(&principal.owner.id);
+    work.show(viewer);
+    briefing.show(viewer);
+    catchup.show(viewer);
     if unreserved
         || work.conflict.is_some()
         || work.coordination_request.is_some()
