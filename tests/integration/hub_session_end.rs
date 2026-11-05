@@ -183,6 +183,7 @@ fn start(key: &str, session: &str, scope: &str) -> WorkStart {
         depends_on: vec![],
         related_work: vec![],
         takeover_generation: None,
+        issue_choice: None,
         preflight: None,
     }
 }

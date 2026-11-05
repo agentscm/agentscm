@@ -392,6 +392,7 @@ async fn a_session_end_naming_no_session_pauses_no_work() {
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
                 takeover_generation: None,
+                issue_choice: None,
                 preflight: None,
             },
             unix_now(),
