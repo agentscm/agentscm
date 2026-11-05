@@ -11,6 +11,8 @@ fn plan(root: &std::path::Path) -> TransferPlan {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/task.rs"), "pub fn answer() -> i32 { 1 }\n").unwrap();
     let work = WorkItem {
+        initial_issue_choice: Default::default(),
+        issue_link: None,
         id: "work-test".into(),
         repository: "synthetic/project".into(),
         owner: "owner".into(),
@@ -1488,6 +1490,7 @@ fn checkpoint_replay_cannot_adopt_narrowed_scope_or_a_later_external_executor() 
                 "/v1/hub/standup/start",
                 Some(
                     serde_json::to_value(WorkStart {
+                        issue_choice: None,
                         work_id: Some(work.clone()),
                         source: None,
                         request_key: None,

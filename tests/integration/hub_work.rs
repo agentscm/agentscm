@@ -80,6 +80,7 @@ impl Db {
             "work_takeover",
             "work_checkpoint",
             "work_pr_link",
+            "work_issue_link",
             "work_transition",
             "work_lead_credential",
             "coordination_target_released",
@@ -213,7 +214,7 @@ impl Db {
                        WHERE w.provider = 'github' AND w.host = 'github.com'
                          AND w.repository = $1 AND w.repository_id IS NOT DISTINCT FROM $2
                          AND e.kind IN
-                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link',
+                            ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link',
                              'work_transition', 'work_lead_credential')";
         if self._pg.is_some() {
             let mut client = postgres::Client::connect(&self.url, NoTls).unwrap();
@@ -282,7 +283,7 @@ impl Db {
                           WHERE w.provider = 'github' AND w.host = 'github.com'
                             AND w.repository = ?1 AND w.repository_id IS ?2
                             AND e.kind IN ('work_started', 'work_joined', 'work_takeover',
-                                           'work_checkpoint', 'work_pr_link', 'work_transition',
+                                           'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_transition',
                                            'work_lead_credential')
                      )",
                     rusqlite::params![REPO, REPOSITORY_ID],
@@ -489,6 +490,7 @@ fn start_with(
     role: WorkRole,
 ) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: work_id.map(str::to_owned),
         source: None,
         request_key: request_key.map(str::to_owned),
@@ -2378,6 +2380,7 @@ conformance!(
     pr_links_fence_stale_updates_and_idempotency_collisions,
     pr_link_receipts_replay_after_takeover_changes_and_removal,
     pr_links_survive_compaction_with_correct_capacity,
+    issue_links_survive_compaction_with_correct_capacity,
     pr_link_noops_leave_no_mutation_or_receipt,
     concurrent_pr_link_updates_fence_and_replay,
     concurrent_forge_start_has_one_work_and_one_lead,
@@ -6528,4 +6531,115 @@ fn lease_migration_starts_existing_reservations_now(db: &Db) {
     }
     let observed = db.rows("SELECT observed_at FROM hub_lease_clock");
     assert!((before..=after).contains(&observed[0][0].parse::<i64>().unwrap()));
+}
+
+fn issue_links_survive_compaction_with_correct_capacity(db: &Db) {
+    use agentscm::hub::planned_issues::IssueIdentity;
+    use agentscm::hub::work_issues::{WorkIssueChoice, WorkIssueLinkUpdate};
+    let store = db.open();
+    let now = unix_now();
+    let old = now - 3 * 86_400;
+    let lead = agent(&*store, 1);
+    let issue = IssueIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository_id: REPOSITORY_ID,
+        number: 7,
+    };
+    let choice = WorkIssueChoice::NewIssue {
+        title: "New issue intention".into(),
+    };
+    let mut start = native_start("issue-retain", "Issue retention", "lead");
+    start.issue_choice = Some(choice.clone());
+    let item = store.work_start(&lead.token, &start, old).unwrap().item;
+    let update = WorkIssueLinkUpdate {
+        work_id: item.id.clone(),
+        operation_id: "retained-issue".into(),
+        generation: 1,
+        session: "lead".into(),
+        expected_updated_seq: item.updated_seq,
+        link: Some(issue.clone()),
+    };
+    let linked = store
+        .work_issue_link_set(&lead.token, &update, old + 1)
+        .unwrap();
+    let mut cp = checkpoint(
+        &item.id,
+        "retained-issue-progress",
+        1,
+        "lead",
+        CheckpointKind::Progress,
+        "new baseline",
+    );
+    cp.expected_updated_seq = Some(linked.item.updated_seq);
+    let progress = store.work_checkpoint(&lead.token, &cp, old + 2).unwrap();
+    let (charged, aggregate) = db.work_usage_and_aggregate();
+    assert_eq!(charged, aggregate);
+    let scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id: Some(REPOSITORY_ID),
+    };
+    store
+        .work_compact(&scope, now - 2 * 86_400, true, now)
+        .unwrap();
+    let current = store.work_get(&lead.token, &item.id, now).unwrap().unwrap();
+    assert_eq!(current.issue_link, Some(issue));
+    assert_eq!(current.initial_issue_choice, choice);
+    assert_eq!(current.updated_seq, progress.item.updated_seq);
+    assert!(
+        !store
+            .events_after(0, 100)
+            .unwrap()
+            .iter()
+            .any(|e| e.seq == linked.receipt.event_seq)
+    );
+    assert_invalid(
+        store.work_issue_link_set(&lead.token, &update, now),
+        "issue link receipt expired or Work changed",
+    );
+    let mut finish = checkpoint(
+        &item.id,
+        "issue-finished",
+        1,
+        "lead",
+        CheckpointKind::Finish,
+        "finished report",
+    );
+    finish.expected_updated_seq = Some(current.updated_seq);
+    let finished = store
+        .work_checkpoint(&lead.token, &finish, now)
+        .unwrap()
+        .item;
+    let before = lifecycle(
+        &*store,
+        &WorkLifecycleReader::Token(&lead.token),
+        &item.id,
+        now,
+    );
+    let removal = WorkIssueLinkUpdate {
+        work_id: item.id.clone(),
+        operation_id: "finished-issue-remove".into(),
+        generation: 1,
+        session: "lead".into(),
+        expected_updated_seq: finished.updated_seq,
+        link: None,
+    };
+    let removed = store
+        .work_issue_link_set(&lead.token, &removal, now + 1)
+        .unwrap()
+        .item;
+    assert_eq!(removed.current, finished.current);
+    assert_eq!(
+        lifecycle(
+            &*store,
+            &WorkLifecycleReader::Token(&lead.token),
+            &item.id,
+            now + 1
+        ),
+        before
+    );
+    let (charged, aggregate) = db.work_usage_and_aggregate();
+    assert_eq!(charged, aggregate);
 }

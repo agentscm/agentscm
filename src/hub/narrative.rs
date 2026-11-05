@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use super::catchup::{CatchupCoverageState, CatchupPreview, CatchupPreviewQuery, HUMAN_SUBSCRIBER};
 use super::http::blocking;
 use super::store::{Principal, lower_hex_of, new_id, unix_now};
+use super::viewer::masked_label;
 use super::work::{WorkItem, WorkOverview, WorkOverviewQuery, normalized_scope};
 use super::work_http::actionable_status::{self, ActionableStatus};
 use super::{HubError, HubState, Result};
@@ -213,6 +214,7 @@ struct FactSections {
     overlaps: Vec<Fact>,
     attention: Vec<Fact>,
     status: Option<Fact>,
+    planning: Vec<Fact>,
 }
 
 pub async fn read(
@@ -843,6 +845,43 @@ fn snapshot(
     };
     let mut shortened = false;
     let mut sections = attention_sections(status, &mut shortened);
+    let planning = &overview.planned_issues;
+    let source = NarrativeSource {
+        id: "planned-issue-coverage".into(),
+        label: "Bounded planned issue coverage".into(),
+        work_id: None,
+        commit: None,
+        pull_number: None,
+    };
+    sections.planning.push(Fact { value: json!({"source":source.id,"evaluated_at_ms":planning.evaluated_at_ms,"coverage":planning.coverage,"freshness":planning.freshness,"complete":planning.complete,"linkage_complete":planning.linkage_complete,"attempted_at_ms":planning.attempted_at_ms,"facts_observed_at_ms":planning.facts_observed_at_ms,"unread_pages":planning.unread_pages}), sources: vec![source] });
+    for (issue, linkage, work_ids) in planning
+        .unclaimed
+        .iter()
+        .map(|i| (i, "unclaimed", Vec::new()))
+        .chain(
+            planning
+                .linked
+                .iter()
+                .map(|l| (&l.issue, "linked", l.work_ids.clone())),
+        )
+        .chain(
+            planning
+                .linkage_unknown
+                .iter()
+                .map(|i| (i, "unknown", Vec::new())),
+        )
+        .take(20)
+    {
+        let source = NarrativeSource {
+            id: format!("planned-issue:{}", issue.identity.number),
+            label: format!("Provider issue {}", issue.identity.number),
+            work_id: None,
+            commit: None,
+            pull_number: None,
+        };
+        sections.planning.push(Fact { value:json!({"source":source.id,"issue":issue,"linkage":linkage,"work_ids":work_ids.iter().take(5).collect::<Vec<_>>(),"work_ids_complete":work_ids.len()<=5,"provenance":"provider_facts_and_caller_links"}),sources:vec![source] });
+    }
+
     for event in &catchup.work_events {
         let source = NarrativeSource {
             id: format!("event:{}", event.seq),
@@ -1009,6 +1048,17 @@ fn snapshot(
         warnings.push("Some untrusted text or path lists were sanitized or shortened.".into());
     }
 
+    if !overview.planned_issues.complete {
+        warnings.push("Planned issue coverage is incomplete, stale or unavailable; absence remains unknown. Issue links are caller assertions, not execution evidence.".into());
+    }
+    if overview.planned_issues.unclaimed.len()
+        + overview.planned_issues.linked.len()
+        + overview.planned_issues.linkage_unknown.len()
+        > 20
+    {
+        warnings.push("The narrative includes at most 20 planned issues; inspect the overview for the bounded inventory.".into());
+    }
+
     let coverage = catchup
         .source_coverage
         .iter()
@@ -1110,6 +1160,16 @@ fn facts_for_digest(facts: &Value) -> Value {
             }
         }
     }
+    if let Some(planning) = canonical
+        .get_mut("planned_issues")
+        .and_then(Value::as_array_mut)
+    {
+        for fact in planning {
+            if let Some(fact) = fact.as_object_mut() {
+                fact.remove("evaluated_at_ms");
+            }
+        }
+    }
     canonical
 }
 
@@ -1133,6 +1193,7 @@ fn facts_value(
         .chain(&sections.overlaps)
         .chain(&sections.attention)
         .chain(sections.status.iter())
+        .chain(&sections.planning)
     {
         for source in &fact.sources {
             sources
@@ -1163,6 +1224,7 @@ fn facts_value(
             "reported_overlaps": values(&sections.overlaps),
             "actionable_status": sections.status.as_ref().map(|f| &f.value),
             "attention": values(&sections.attention),
+            "planned_issues": values(&sections.planning),
             "source_coverage": coverage,
             "retention": retention,
             "warnings": warnings,
@@ -1204,7 +1266,7 @@ fn attention_sections(status: &ActionableStatus, shortened: &mut bool) -> FactSe
                 "state": row.state, "needs_you": row.needs_you,
                 "recipient_kind": row.recipient.kind, "recipient_owner": row.recipient.owner,
                 "recipient_login": row.recipient.login.as_deref().map(|v| safe(v, 255, shortened)),
-                "recipient_agent": row.recipient.agent.as_deref().map(|v| safe(v, 255, shortened)),
+                "recipient_agent": row.recipient.agent.as_deref().map(|v| safe(&masked_label(v), 255, shortened)),
                 "action": row.action, "freshness": row.freshness,
                 "reported_next_action": row.reported_next_action.as_deref().map(|v| safe(v, 500, shortened)),
                 "report": row.operational.report, "outcome": row.operational.outcome,
@@ -1242,6 +1304,7 @@ fn drop_one_fact(sections: &mut FactSections) -> bool {
         &mut sections.work_events,
         &mut sections.coordination_events,
         &mut sections.merges,
+        &mut sections.planning,
     ] {
         if facts.pop().is_some() {
             return true;
@@ -1278,7 +1341,7 @@ fn compact_work(item: &WorkItem, shortened: &mut bool) -> Value {
         "state": item.state,
         "claim_status": item.claim_status,
         "lead_owner": safe(&item.owner_login, 160, shortened),
-        "lead_agent": safe(&item.lead_agent, 160, shortened),
+        "lead_agent": safe(&masked_label(&item.lead_agent), 160, shortened),
         "generation": item.generation,
         "updated_seq": item.updated_seq,
         "summary": item.current.as_ref().map(|checkpoint| safe(&checkpoint.summary, 600, shortened)),

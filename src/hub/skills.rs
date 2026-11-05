@@ -7,7 +7,7 @@
 //! branch when the repository is connected, else from what a checkout reported (a connected
 //! repository refuses checkout reports).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -24,6 +24,7 @@ use super::github::GhError;
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::mcp::{hub_failure, invalid_args, try_args};
 use super::store::{Store, new_id, unix_now};
+use super::viewer::Viewer;
 use super::{HubError, HubState, Principal, Result};
 use crate::skill_workflow::supported::{
     self, AdoptionStatus, Assurance, Detail, Evidence, EvidenceKind, GateState, PinStatus,
@@ -286,6 +287,24 @@ pub(super) fn views(
         out.extend(run_view(store, repo, &head, &pins)?);
     }
     Ok(out)
+}
+
+/// Runs as the owner `viewer` may see them: evidence another owner's token recorded names its
+/// session by digest and its label masked.
+fn shown_runs(store: &dyn Store, viewer: &str, runs: &mut [RunView]) -> Result<()> {
+    let mine: BTreeSet<String> = store
+        .list_agent_tokens(viewer)?
+        .into_iter()
+        .map(|token| token.id)
+        .collect();
+    for run in runs {
+        let gates = run.gates.iter_mut().flat_map(|gate| &mut gate.evidence);
+        for e in gates.chain(&mut run.stale_evidence) {
+            let owner = mine.contains(&e.token_id).then_some(viewer);
+            Viewer(viewer).agent(owner, &e.token_id, &mut e.agent, &mut e.session);
+        }
+    }
+    Ok(())
 }
 
 fn enforce_stop(view: &RunView) -> bool {
@@ -664,7 +683,13 @@ async fn runs_route(
     let limit = query.limit.unwrap_or(DEFAULT_RUNS).clamp(1, MAX_RUNS);
     let store = state.store.clone();
     // Filtering happens after evaluation, so scan the newest MAX_RUNS runs.
-    let all = blocking(&state, move || views(&*store, &repo, None, None, MAX_RUNS)).await?;
+    let viewer = principal.owner.id.clone();
+    let all = blocking(&state, move || {
+        let mut all = views(&*store, &repo, None, None, MAX_RUNS)?;
+        shown_runs(&*store, &viewer, &mut all)?;
+        Ok(all)
+    })
+    .await?;
     let mut runs: Vec<RunView> = all
         .into_iter()
         .filter(|r| want.is_none_or(|w| r.state == w))
@@ -688,7 +713,9 @@ async fn by_branch_route(
     scope(&principal, &repo)?;
     let store = state.store.clone();
     let mut found = blocking(&state, move || {
-        views(&*store, &repo, Some(&query.branch), None, 1)
+        let mut found = views(&*store, &repo, Some(&query.branch), None, 1)?;
+        shown_runs(&*store, &principal.owner.id, &mut found)?;
+        Ok(found)
     })
     .await?;
     found.pop().map(Json).ok_or_else(not_found)
@@ -702,7 +729,9 @@ async fn run_route(
     scope(&principal, &repo)?;
     let store = state.store.clone();
     let mut found = blocking(&state, move || {
-        views(&*store, &repo, None, Some(&run_id), 1)
+        let mut found = views(&*store, &repo, None, Some(&run_id), 1)?;
+        shown_runs(&*store, &principal.owner.id, &mut found)?;
+        Ok(found)
     })
     .await?;
     found.pop().map(Json).ok_or_else(not_found)
@@ -725,7 +754,7 @@ async fn evidence_route(
     scope(&principal, &repo)?;
     let store = state.store.clone();
     let view = blocking(&state, move || {
-        Ok(record(
+        let mut out = record(
             &*store,
             Recorder {
                 repo: &repo,
@@ -734,7 +763,11 @@ async fn evidence_route(
                 session: request.session.as_deref(),
             },
             request.evidence,
-        ))
+        );
+        if let Ok(view) = &mut out {
+            shown_runs(&*store, &principal.owner.id, std::slice::from_mut(view))?;
+        }
+        Ok(out)
     })
     .await??;
     Ok(Json(view))
@@ -948,8 +981,11 @@ pub(super) async fn mcp_call(
             if repo != principal.repository {
                 return other_repository();
             }
+            let viewer = principal.owner.id.clone();
             let found = blocking(state, move || {
-                views(&*store, &repo, Some(&branch), None, MAX_RUNS)
+                let mut found = views(&*store, &repo, Some(&branch), None, MAX_RUNS)?;
+                shown_runs(&*store, &viewer, &mut found)?;
+                Ok(found)
             })
             .await;
             match found {
@@ -995,8 +1031,9 @@ pub(super) async fn mcp_call(
                 a.repo,
                 a.session,
             );
+            let viewer = principal.owner.id.clone();
             let out = blocking(state, move || {
-                Ok(record(
+                let mut out = record(
                     &*store,
                     Recorder {
                         repo: &repo,
@@ -1005,7 +1042,11 @@ pub(super) async fn mcp_call(
                         session: session.as_deref(),
                     },
                     evidence,
-                ))
+                );
+                if let Ok(view) = &mut out {
+                    shown_runs(&*store, &viewer, std::slice::from_mut(view))?;
+                }
+                Ok(out)
             })
             .await;
             match out {

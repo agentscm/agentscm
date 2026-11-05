@@ -553,6 +553,31 @@ fn append_all(tx: &mut postgres::Transaction<'_>, events: &[Event]) -> Result<()
     Ok(())
 }
 
+fn planning_for(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    now: i64,
+) -> Result<super::planned_issues::PlannedIssuesView> {
+    let snapshot: Option<String> = tx.query_opt(
+        "SELECT o.data FROM hub_repositories r JOIN hub_connections c ON c.id=r.connection
+         JOIN hub_observations o ON o.repository=r.id AND o.kind='planned_issues' AND o.key='_snapshot' AND o.deleted=FALSE
+         WHERE c.provider=$1 AND r.host=$2 AND r.repository_id IS NOT DISTINCT FROM $3 LIMIT 1",
+        &[&who.owner.identity.provider, &who.owner.identity.host, &who.repository_id])?.map(|row| row.get(0));
+    let rows = tx.query(
+        "SELECT id, CASE WHEN source_provider=provider AND source_host=host AND source_repository=repository THEN source_issue ELSE NULL END,
+         snapshot::jsonb ->> 'issue_link' FROM hub_work_items
+         WHERE provider=$1 AND host=$2 AND repository_id IS NOT DISTINCT FROM $3 AND ($3::BIGINT IS NOT NULL OR repository=$4)
+         ORDER BY id LIMIT 1001",
+        &[&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id,&who.repository])?
+        .into_iter().map(|row| (row.get(0),row.get(1),row.get(2))).collect();
+    Ok(super::planned_issues::project(
+        who,
+        snapshot.as_deref(),
+        rows,
+        now,
+    ))
+}
+
 fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
     work_who_in(tx, token, now, true)
 }
@@ -2359,6 +2384,12 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
         json!({"generation": item.generation, "owner": item.owner,
             "repository": item.repository, "state": state_name(item.state)}),
     )?;
+    if kind == "work_started" {
+        let mut data: serde_json::Value = json_value(&event.data)?;
+        data["initial_issue_choice"] = json!(&item.initial_issue_choice);
+        data["issue_choice_provenance"] = json!("caller_asserted");
+        event.data = json_string(&data)?;
+    }
     event.at = item.updated_at;
     Ok(event)
 }
@@ -2457,7 +2488,7 @@ fn work_payload_bytes(
                    FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                     AND w.repository_id IS NOT DISTINCT FROM $4
-                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential', 'reservation_lapsed')
+                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_transition', 'work_lead_credential', 'reservation_lapsed')
                  UNION ALL
                  SELECT octet_length(r.proposed_scope)::bigint
                         + octet_length(r.proposed_title)::bigint + 256
@@ -3931,6 +3962,15 @@ fn start_in(
     }
     let scope = start.validate(who)?;
     if let Some(mut item) = resolve_work(tx, who, start, now)? {
+        if start
+            .issue_choice
+            .as_ref()
+            .is_some_and(|choice| *choice != item.initial_issue_choice)
+        {
+            return Err(HubError::Invalid(
+                "initial issue choice differs; use the explicit issue link update".into(),
+            ));
+        }
         if start.role != WorkRole::Lead {
             let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
             let participant_generation = tx
@@ -4408,6 +4448,12 @@ fn start_in(
         _ => return Err(HubError::Invalid("invalid work resolver".into())),
     };
     let mut item = WorkItem {
+        initial_issue_choice: start.issue_choice.clone().unwrap_or_default(),
+        issue_link: start
+            .issue_choice
+            .as_ref()
+            .and_then(|choice| choice.linked_issue())
+            .cloned(),
         id: id.clone(),
         repository: who.repository.clone(),
         owner: who.owner.id.clone(),
@@ -4670,6 +4716,7 @@ fn briefing_page(
     let retention_gap =
         from < event_floor || minimum.is_some_and(|minimum| from < minimum.saturating_sub(1));
     Ok(Briefing {
+        planned_issues: planning_for(tx, who, now)?,
         subscriber,
         delivery,
         from,
@@ -6580,8 +6627,10 @@ impl PgStore {
             if fit_json_budget(&mut overlaps, overview_part_budget)? {
                 overlaps_complete = false;
             }
+            let planned_issues = planning_for(&mut tx, &who, now)?;
             tx.commit()?;
             Ok(WorkOverview {
+                planned_issues,
                 recent_since,
                 until: now,
                 current,
@@ -9561,7 +9610,11 @@ impl Store for PgStore {
                 let preflight =
                     preflight::evaluate(&mut tx, &who, &inspected, &planned_scope, now)?;
                 require_clear_preflight(&who, start, &preflight)?;
-                let changed = item.title != start.title
+                let changed = start
+                    .issue_choice
+                    .as_ref()
+                    .is_some_and(|choice| *choice != item.initial_issue_choice)
+                    || item.title != start.title
                     || item.scope != planned_scope
                     || item.branch != start.branch
                     || item.worktree != start.worktree
@@ -10231,7 +10284,13 @@ impl Store for PgStore {
                 _ => None,
             };
             tx.commit()?;
-            Ok(operational_page(rows, forge_window_from, more, now))
+            Ok(operational_page(
+            rows,
+            forge_window_from,
+            more,
+            now,
+            super::viewer::Viewer(&who.owner.id),
+        ))
         })
     }
 
@@ -10560,6 +10619,71 @@ impl Store for PgStore {
         })
     }
 
+    fn work_issue_link_set(
+        &self,
+        token: &str,
+        update: &super::work_issues::WorkIssueLinkUpdate,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        update.validate()?;
+        let request = json_string(&json!({"operation": "work_issue_link", "update": update}))?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only { return Err(HubError::Unauthorized); }
+            lock_work_capacity(&mut tx, &who)?;
+            let mut item = scoped_work(&mut tx, &who, &update.work_id, now, true)?
+                .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+            if let Some(row) = tx.query_opt(
+                "SELECT o.request,v.snapshot,o.event_seq FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work=o.work AND v.event_seq=o.event_seq
+                 WHERE o.work=$1 AND o.operation_id=$2", &[&item.id, &update.operation_id],
+            )? {
+                let previous: String = row.get(0);
+                let committed_snapshot: String = row.get(1);
+                let event_seq: i64 = row.get(2);
+                if previous != request { return Err(HubError::Invalid("operation_id was already used for another request".into())); }
+                let committed: WorkItem = json_value(&committed_snapshot)?;
+                update.authorize(&who, &committed)?;
+                tx.commit()?;
+                return Ok(WorkCheckpointResult {
+                    item,
+                    receipt: CheckpointReceipt { work_id: update.work_id.clone(), operation_id: update.operation_id.clone(), generation: committed.generation, event_seq, replayed: true },
+                    reclaimed: Vec::new(),
+                });
+            }
+            update.authorize(&who, &item)?;
+            if item.updated_seq != update.expected_updated_seq { return Err(HubError::Invalid("issue link receipt expired or Work changed".into())); }
+            if item.issue_link == update.link { return Err(HubError::Invalid("issue relationship is unchanged".into())); }
+            let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
+            item.issue_link = update.link.clone();
+            item.updated_at = now;
+            let mut event = Event::new("work_issue_link", &item.id, json!({
+                "operation": if update.link.is_some() { "issue_link_set" } else { "issue_link_remove" },
+                "generation": item.generation, "owner": item.owner, "repository": item.repository,
+                "repository_id": who.repository_id, "issue_link": update.link,
+                "author": who.owner.id, "token": who.token, "agent": who.agent, "session": update.session,
+                "provenance": "caller_asserted"
+            }))?;
+            event.at = now;
+            let seq = append(&mut tx, &event)?;
+            item.updated_seq = seq;
+            let snapshot = save_work_version(&mut tx, &item, seq)?;
+            tx.execute("INSERT INTO hub_work_checkpoint_ops (work,operation_id,request,event_seq) VALUES ($1,$2,$3,$4)", &[&item.id, &update.operation_id, &request, &seq])?;
+            let delta = work_transition_payload_bytes(&snapshot, &event)?
+                .checked_sub(previous_item_bytes)
+                .and_then(|v| v.checked_add(work_payload_row_bytes(request.len()).ok()?))
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            adjust_work_payload_capacity(&mut tx, &who, delta, now)?;
+            tx.commit()?;
+            Ok(WorkCheckpointResult {
+                item,
+                receipt: CheckpointReceipt { work_id: update.work_id.clone(), operation_id: update.operation_id.clone(), generation: update.generation, event_seq: seq, replayed: false },
+                reclaimed: Vec::new(),
+            })
+        })
+    }
+
     fn work_pr_link_get(
         &self,
         token: &str,
@@ -10756,14 +10880,18 @@ impl Store for PgStore {
             let after_at = after.as_ref().map(|a| a.0);
             let after_id = after.as_ref().map(|a| a.1.clone());
             let rows = tx.query(
-                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
+                // Another owner's generated `client-…` label, which can hold a host name, is neither
+                // matched nor shown as stored.
+                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at,
+                        COALESCE(lt.owner = $10, false)
                  FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
+                 LEFT JOIN hub_agent_tokens lt ON lt.id = w.lead_token
                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                    AND w.repository_id IS NOT DISTINCT FROM $4
                    AND ($5::bigint IS NULL OR (w.created_at, w.id) < ($5::bigint, $6::text))
                    AND ($7::text IS NULL OR w.source_issue = $8::text
                      OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
-                     OR w.lead_agent ILIKE $7 ESCAPE '\\' OR u.login ILIKE $7 ESCAPE '\\'
+                     OR ((lt.owner = $10 OR w.lead_agent NOT LIKE 'client-%') AND w.lead_agent ILIKE $7 ESCAPE '\\') OR u.login ILIKE $7 ESCAPE '\\'
                      OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
                  ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
                 &[
@@ -10776,6 +10904,7 @@ impl Store for PgStore {
                     &pattern,
                     &number,
                     &(limit as i64 + 1),
+                    &who.owner.id,
                 ],
             )?;
             let items = rows
@@ -10784,7 +10913,7 @@ impl Store for PgStore {
                     id: row.get(0),
                     title: row.get(1),
                     state: row.get(2),
-                    lead_agent: row.get(3),
+                    lead_agent: super::viewer::shown_label(row.get(3), row.get(9)),
                     owner: row.get(4),
                     branch: row.get(5),
                     source_issue: row.get(6),
@@ -11424,7 +11553,7 @@ impl Store for PgStore {
                 SELECT start_request,finish_request,source_id FROM ranked
                 WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2)})}).transpose()?;
             let decision=tx.query_opt("SELECT event_seq,snapshot::text FROM hub_work_versions WHERE work=$1 AND snapshot::jsonb #>> '{current,kind}'='decision' ORDER BY event_seq DESC LIMIT 1",&[&work_id])?.map(|r| -> Result<StoredDecisionV1> {let retained:WorkItem=json_value(&r.get::<_,String>(1))?;Ok(StoredDecisionV1{event_seq:r.get(0),checkpoint:retained.current.ok_or_else(||HubError::Unavailable("retained decision checkpoint is missing".into()))?})}).transpose()?;
-            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now);tx.commit()?;Ok(Some(summary))})
+            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now,super::viewer::Viewer(&who.owner.id));tx.commit()?;Ok(Some(summary))})
     }
 
     fn receipt_mode_get(&self, token: &str, session: &str, now: i64) -> Result<Option<String>> {
@@ -12596,7 +12725,7 @@ impl Store for PgStore {
                          JOIN hub_work_items w ON w.id = e.subject
                          WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                            AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
+                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_transition', 'work_lead_credential')
                            AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                            AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                         &[
@@ -12613,7 +12742,7 @@ impl Store for PgStore {
                      WHERE w.id = e.subject
                        AND w.provider = $1 AND w.host = $2 AND w.repository = $3
                        AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_transition', 'work_lead_credential')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                     &[

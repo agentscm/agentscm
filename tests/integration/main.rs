@@ -151,6 +151,7 @@ mod hub_mcp;
 mod hub_merge_queue;
 #[cfg(unix)]
 mod hub_narrative;
+mod hub_planned_issues;
 #[cfg(unix)]
 mod hub_promises;
 #[cfg(unix)]
@@ -159,6 +160,7 @@ mod hub_publication_store;
 mod hub_publish;
 #[cfg(unix)]
 mod hub_read_only;
+mod hub_session_privacy;
 mod hub_sessions;
 #[cfg(unix)]
 mod hub_skill_workflow;

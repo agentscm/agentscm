@@ -750,17 +750,20 @@ pub(super) fn merge_status(
     }
 }
 
-/// Builds the overview from rows ordered or not. `more` says the reader found more rows than it
-/// returned. `forge_window_from` is the start of the last complete forge pull-request read, if any.
+/// Builds the overview from rows ordered or not, as `viewer` may see their holders. `more` says
+/// the reader found more rows than it returned. `forge_window_from` is the start of the last
+/// complete forge pull-request read, if any.
 pub(super) fn operational_page(
     rows: Vec<OperationalRow>,
     forge_window_from: Option<i64>,
     more: bool,
     now: i64,
+    viewer: super::viewer::Viewer<'_>,
 ) -> OperationalOverviewV1 {
     let work = rows
-        .iter()
-        .map(|row| {
+        .into_iter()
+        .map(|mut row| {
+            viewer.work(&mut row.item);
             work_operational(&OperationalFacts {
                 item: &row.item,
                 outcome: row.outcome,
@@ -1007,6 +1010,8 @@ mod tests {
 
     fn item(state: WorkState) -> WorkItem {
         WorkItem {
+            initial_issue_choice: Default::default(),
+            issue_link: None,
             id: "work-1".to_owned(),
             repository: "example/repo".to_owned(),
             owner: "user-1".to_owned(),
