@@ -14,6 +14,30 @@ The Hub keeps durable engineering work separate from short-lived sessions and fi
 
 This gives agents working at different times a shared starting point without treating a new chat or session as a new engineering goal. It also works for repositories that stay on plain Git. Native source workflows remain a separate system with their own revisions, execution evidence, approvals and landing checks.
 
+## Planned issues and native Work
+
+For a connected GitHub repository, overview and briefing responses include `planned_issues` separately from Work. The Hub reads at most three pages and 300 raw rows of open issues, excluding pull requests, with embedded milestone labels. It retains no issue descriptions. Provider, host and stable numeric repository ID bind the facts; a repository rename does not change issue identity. GitLab issue discovery is unsupported.
+
+`unclaimed` contains issues with no durable linked Work in the checked inventory. `linked` pairs each issue with its Work IDs, including original forge-source Work and explicit native links. An issue appears in exactly one bucket. Finished Work links remain historical relationships; they prove neither active responsibility nor execution. Heartbeat age, reservation expiry and overview pagination do not make an issue unclaimed. The linkage inventory reads at most 1,000 Work rows independently of the displayed Work page; when it cannot establish absence, affected issues appear in `linkage_unknown`.
+
+Inspect `coverage`, `freshness`, `complete`, `linkage_complete`, `unread_pages` and the provider timestamps. Facts become stale after five minutes. An outage, missing permission, malformed or missing retained snapshot, retention loss or incomplete page inventory never means nothing is planned. Earlier facts may remain visible with unavailable coverage and their original `facts_observed_at_ms`; `attempted_at_ms` is not a successful refresh. `evaluated_at_ms` states when the projection assessed these facts. Frozen legacy briefing pages preserve that capture-time assessment on replay. Generated narrative context includes at most 20 planned issues, sourced separately from Work reports, with explicit omission and coverage warnings.
+
+Before starting native Work with a `request_key`, call `agentscm_work_preflight` (HTTP `POST /v1/hub/standup/preflight`, CLI `work preflight --request FILE`) with the intended task text and inspect `issue_advice`. Candidates come only from exact whitespace-delimited references in the caller's title/task or next action: `#42`, `acme/widgets#42`, or a canonical HTTPS issue URL such as `https://github.com/acme/widgets/issues/42`. Qualified references and URLs must identify the authorized repository; foreign references never fall back to their embedded number. Canonical URLs have no credentials, port, query or fragment. Candidates are sorted, deduplicated and capped at 20; `references_complete` reports truncation. There is no fuzzy or generated ownership matching.
+
+Then supply an explicit `issue_choice` on start, using one of these forms:
+
+```json
+{"kind":"link","issue":{"provider":"github","host":"github.com","repository_id":101,"number":42}}
+{"kind":"new_issue","title":"Investigate the separate import failure"}
+{"kind":"none_applies","reason":"This maintenance task is outside the listed issues"}
+```
+
+These are caller assertions. `new_issue` records an intention and creates no forge issue. Advice does not assign ownership or change preflight admission status, and planning uncertainty never refuses Work. Older callers may omit the field or send `{"kind":"not_provided"}`; that remains unassessed, not an assertion that no issue applies. The immutable `initial_issue_choice` is retained with the start history. A retry cannot replace it with a contradictory choice.
+
+To link existing native Work later, use `agentscm_work_issue_link_set`, HTTP `POST /v1/hub/standup/issue-link`, or CLI `work issue-link-set --request FILE`. The current lead supplies a fresh operation ID, session, generation and `expected_updated_seq`, plus the stable issue identity in `link`; explicit `link:null` removes the current caller assertion. The issue must belong to the authenticated stable repository, but the mutation does not require a provider refresh. Exact retained retries return the original receipt and current Work; changed reuse of the operation ID, stale fences and unauthorized updates are rejected. Later linkage changes only `issue_link`, preserving the Work ID, original source, native request key and initial choice. It records an issue metadata event without manufacturing a progress report or completion. Issue closure never completes Work or releases a reservation.
+
+Qualification is limited to synthetic fixtures and local fake GitHub HTTP, with SQLite and disposable PostgreSQL conformance. Live GitHub permissions and pagination, installed harness behavior, multi-machine delivery and hosted deployment remain unqualified.
+
 ## Work identity and claims
 
 Every work item has a stable `wrk_…` identifier. New work can use a caller-supplied request key for durable retries, or link to an issue in the token's configured GitHub or GitLab repository. The forge remains authoritative for issue content and state; AgentSCM owns the claim and checkpoint history. It does not mirror issue descriptions or publish checkpoint text to the forge.

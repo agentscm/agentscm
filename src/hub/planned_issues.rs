@@ -415,14 +415,13 @@ impl PlannedIssuesView {
                         && url.port().is_none()
                         && url.query().is_none()
                         && url.fragment().is_none()
-                    {
-                        url.path()
+                        && let Some(number) = url
+                            .path()
                             .strip_prefix(&prefix)
                             .and_then(|n| n.parse::<i64>().ok())
                             .filter(|n| *n > 0)
-                            .map(|n| {
-                                numbers.insert(n);
-                            });
+                    {
+                        numbers.insert(number);
                     }
                     None
                 } else {
