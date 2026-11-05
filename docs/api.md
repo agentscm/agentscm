@@ -58,6 +58,24 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
 | `GET /v1/hub/session/handoffs?repository=…` | The person's 50 newest file handoffs there, either side |
 
+## Hub: Work recovery
+
+The same recovery service for agents and people. A preview never writes; every apply re-checks
+identity, permission, generation and `updated_seq` in its own transaction. See
+[stand-up](standup.md#recover-stuck-work).
+
+| Route | Caller | Effect |
+|---|---|---|
+| `POST /v1/hub/standup/recovery` | Agent or read-only bearer token | Body `RecoveryQuery` (`work_id`, `paths`, `after`, `limit`, `session`, all optional): the owner's unfinished Work page, live holds over the paths, resumable Work and typed remedies |
+| `POST /v1/hub/standup/recovery/preview` | Agent or read-only bearer token | Body `work_id`, `remedy`, optional `session`, `scope` (handover) and `superseded_by` (supersede): effects, fences and the apply call |
+| `POST /v1/hub/standup/work-transitions` | Writable agent token | Body `session` and up to 25 `items`; one outcome per item |
+| `POST /v1/hub/session/work/recovery` | Web sign-in with CSRF | The person's inspection in `repository`: their own Work, anyone's as a Hub administrator |
+| `POST /v1/hub/session/work/recovery/preview` | Web sign-in with CSRF | The person's preview; `repository`, `work_id`, `remedy`, optional `scope` and `superseded_by` |
+| `POST /v1/hub/session/work/transitions` | Web sign-in with CSRF | The person's batch: `repository` and up to 25 `items` |
+
+MCP exposes the same service as `agentscm_work_recovery`, `agentscm_work_recovery_preview` and
+`agentscm_work_transitions`.
+
 ## Hub PR context
 
 | Route | Token and effect |
@@ -104,7 +122,7 @@ Work store. The relationship records caller-reported identity, not provider appr
 `link` is required; explicit `null` removes the current link. Only the current write-capable native Work lead may change it, with the inspected generation and sequence. A target must match the authenticated provider, host and stable repository ID. The response is a `WorkCheckpointResult` with the current `item` and immutable operation `receipt`; an exact retained retry returns the original receipt even if later linkage changed. A different request with the same operation ID is rejected. The caller assertion is stored separately as `item.issue_link`; `initial_issue_choice`, Work ID, original source and native request key remain unchanged. The metadata event is `work_issue_link`, not a progress or completion report. MCP exposes the same mutation as `agentscm_work_issue_link_set`; existing Work reads expose the current link. No provider write or automatic assignment occurs.
 
 
-The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on); clients must tolerate new kinds.
+The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work); clients must tolerate new kinds.
 
 ## Hub change-record routes
 
@@ -412,6 +430,149 @@ read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind
 `html_url` may be null. At most 200 rows of each kind are shown. Names and links come from the provider and are untrusted.
 These outcomes are separate from source approval and from `forge_check`. See
 [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes).
+
+## Hub errors
+
+Every error the Hub returns carries the same fields on every surface: HTTP bodies, MCP tool
+results, hook notes and the `agentscm` CLI. `error` stays the stable machine code, as before; the
+other fields are additive, so a client that reads only `error` keeps working.
+
+| Field | Meaning |
+| --- | --- |
+| `error` | The stable machine code (MCP: `structuredContent.error.code`, also `kind`). Codes are never renamed or removed. |
+| `message` | One sentence saying what happened and what to do. Hub-authored text only. |
+| `retryable` | `true` only if the same request can succeed unchanged later. Retry a mutation with the same idempotency key or operation id. |
+| `retry_after_seconds` | Present only when `retryable` and the Hub knows a wait. |
+| `recovery` | `{action, command?}`. `action` is one of `retry`, `wait`, `sign_in`, `renew_credential`, `reconnect`, `provide_field`, `start_session`, `inspect_work`, `ask_owner`, `update_client`, `contact_operator`, `none`. `command` is a fixed command such as `agentscm client renew`, never built from caller text. |
+| `fields` | For input problems: `{name, problem, hint}` where `name` is a request field name and `problem` is `missing`, `unknown`, `wrong_type`, `invalid`, `too_long` or `conflict`. A value the caller sent is never echoed. |
+| `correlation_id` | `cor_` plus 32 hex characters, generated by the Hub for this failure, also sent as the `x-agentscm-correlation-id` response header. The Hub's single diagnostic log line for the failure carries the same `ref`, so an operator can find the server-side cause. It is never taken from the caller and never derived from a token, session or user. If the operating system cannot supply entropy the field is omitted. |
+
+Per-code keys that already existed (`current_seq` on `work_checkpoint_sequence_conflict`, the
+`overlaps`, `preflight` and `coordination_request` payloads, `limit` on `work_storage_capacity`)
+stay where they were. An untyped internal `Invalid` reason is never forwarded over HTTP: the
+caller gets `invalid_request` with `fields` when a request field can be named, and the cause goes
+to the Hub log with the reference. Session, lead-session and lease refusals are typed
+(`session_required`, `lead_session_mismatch`, `lease_lapsed`) and keep their messages. A caller with
+no valid token always gets the same `unauthorized` body, and an unknown resource and one the caller
+cannot see both answer `not_found`; another owner's session, Work or token never appears in an
+error (the viewer rules in [session privacy](hub.md) are applied before the error is built).
+
+**Hooks** stay fail-open: the edit is not blocked, and the note reads
+`AgentSCM: coordination unknown (<reason>; <recovery>; ref cor_...)`. Unseen coordination is not
+protection. A failed `SessionStart` (start, resume or replay) always shows its note; repeats of the
+same failure for ordinary events are shown once per token, session and code. When the Hub is
+unreachable the note says so and carries no reference, because none exists. Hooks that Claude
+Code, Cursor or others run as permission-only or lifecycle events have no channel for a note; the
+reference still travels in the `x-agentscm-correlation-id` header of the hook response.
+
+**Clients** read the same fields with one tolerant decoder. An older Hub's `{"error":"..."}` gets a
+fallback message and recovery from the registry. An unknown future code is kept as an opaque
+`[a-z0-9_]{1,64}` string, `retryable` follows the HTTP status class (never guessed `true`), and
+remote text is bounded and stripped of control characters, terminal escapes and anything shaped
+like a credential before it is shown. The workspace task MCP keeps its own
+deliberately terse refusals and does not attach a reference.
+
+Registered codes:
+
+| Code | HTTP | Retryable | Recovery action |
+| --- | ---: | --- | --- |
+| `invalid_request` | 400 | no | `provide_field` |
+| `not_found` | 404 | no | `none` |
+| `read_only` | 403 | no | `ask_owner` |
+| `forbidden` | 403 | no | `ask_owner` |
+| `gone` | 410 | no | `inspect_work` |
+| `unauthorized` | 401 | no | `sign_in` |
+| `wrong_repository` | 403 | no | `reconnect` |
+| `busy` | 503 | yes | `retry` |
+| `unavailable` | 503 | yes | `retry` |
+| `work_storage_capacity` | 503 | no | `contact_operator` |
+| `work_scope_overlap` | 409 | no | `inspect_work` |
+| `work_coordination_required` | 409 | no | `inspect_work` |
+| `work_overlap_incomplete` | 503 | yes | `retry` |
+| `work_preflight_required` | 409 | no | `inspect_work` |
+| `work_checkpoint_sequence_conflict` | 409 | no | `inspect_work` |
+| `session_required` | 400 | no | `start_session` |
+| `lead_session_mismatch` | 400 | no | `inspect_work` |
+| `lease_lapsed` | 400 | no | `inspect_work` |
+| `not_your_agent` | 403 | no | `ask_owner` |
+| `not_your_work` | 403 | no | `ask_owner` |
+| `login_failed` | 400 | no | `sign_in` |
+| `device_flow_unavailable` | 409 | no | `sign_in` |
+| `csrf` | 403 | no | `sign_in` |
+| `insufficient_role` | 403 | no | `ask_owner` |
+| `login_denied` | 403 | no | `sign_in` |
+| `not_allowed` | 403 | no | `ask_owner` |
+| `not_connected` | 403 | no | `ask_owner` |
+| `user_disabled` | 403 | no | `ask_owner` |
+| `too_many_logins` | 429 | yes | `wait` |
+| `device_revoked` | 403 | no | `sign_in` |
+| `promise_conflict` | 409 | no | `inspect_work` |
+| `too_many_publications` | 429 | no | `contact_operator` |
+| `already_connected` | 409 | no | `none` |
+| `not_configured` | 404 | no | `contact_operator` |
+| `work_not_found` | 404 | no | `inspect_work` |
+| `generation_conflict` | 409 | no | `inspect_work` |
+| `idempotency_conflict` | 409 | no | `inspect_work` |
+| `last_administrator` | 409 | no | `ask_owner` |
+| `member_limit` | 409 | no | `contact_operator` |
+| `native_subject_conflict` | 409 | no | `inspect_work` |
+| `csrf_required` | 403 | no | `sign_in` |
+| `execution_not_configured` | 503 | no | `contact_operator` |
+| `expected_json` | 415 | no | `provide_field` |
+| `expected_source_bundle` | 415 | no | `provide_field` |
+| `source_body_too_large` | 413 | no | `provide_field` |
+| `source_body_invalid` | 413 | no | `provide_field` |
+| `source_body_timeout` | 408 | yes | `retry` |
+| `source_response_invalid` | 500 | no | `contact_operator` |
+| `integrity_failure` | 424 | no | `contact_operator` |
+| `retry_upload` | 503 | yes | `retry` |
+| `no_repository_role` | 403 | no | `ask_owner` |
+| `access_check_unavailable` | 503 | yes | `wait` |
+| `permission_unavailable` | 503 | yes | `wait` |
+| `hub_unreachable` | 503 | yes | `reconnect` |
+| `invalid_response` | 502 | no | `update_client` |
+| `sign_in_required` | 401 | no | `sign_in` |
+| `invalid_or_changed` | 400 | no | `inspect_work` |
+| `not_adopted` | 409 | no | `ask_owner` |
+| `run_full` | 409 | no | `contact_operator` |
+| `unknown_gate` | 409 | no | `provide_field` |
+| `stale_head` | 409 | no | `inspect_work` |
+| `not_independent` | 409 | no | `ask_owner` |
+| `forge_authoritative` | 409 | no | `ask_owner` |
+| `method_not_allowed` | 405 | no | `provide_field` |
+| `request_too_large` | 413 | no | `provide_field` |
+| `request_timeout` | 408 | yes | `retry` |
+| `rate_limited` | 429 | yes | `wait` |
+| `context_too_large` | 503 | no | `contact_operator` |
+| `invalid_params` | 400 | no | `provide_field` |
+| `encoding_failed` | 500 | no | `contact_operator` |
+| `unsupported_provider` | 409 | no | `update_client` |
+| `outbound_disabled` | 409 | no | `ask_owner` |
+| `candidate_endpoint_mismatch` | 409 | no | `provide_field` |
+| `ambiguous_repository_name` | 409 | no | `provide_field` |
+| `candidate_default_unavailable` | 409 | yes | `retry` |
+| `unsupported_candidate_default` | 409 | no | `provide_field` |
+| `candidate_output_is_default_or_alias` | 409 | no | `provide_field` |
+| `publication_conflict` | 409 | no | `inspect_work` |
+| `workspace_publication_required` | 409 | no | `update_client` |
+| `blobs_missing` | 409 | no | `provide_field` |
+| `candidate_required` | 409 | no | `provide_field` |
+| `invalid_request_id` | 400 | no | `provide_field` |
+| `unknown_repository` | 404 | no | `none` |
+| `invalid_expiry` | 400 | no | `provide_field` |
+| `enrollment_invalid` | 400 | no | `provide_field` |
+| `unknown_device` | 404 | no | `none` |
+| `device_exists` | 409 | no | `inspect_work` |
+| `stale_generation` | 409 | no | `inspect_work` |
+| `request_conflict` | 409 | no | `inspect_work` |
+| `duplicate_key` | 409 | no | `provide_field` |
+| `owner_role_missing` | 409 | no | `ask_owner` |
+| `role_check_unavailable` | 503 | yes | `retry` |
+| `unknown_owner` | 404 | no | `ask_owner` |
+| `owner_disabled` | 409 | no | `ask_owner` |
+| `owner_wrong_forge` | 409 | no | `provide_field` |
+| `repository_renamed` | 409 | no | `inspect_work` |
+
 
 ## HTTP boundaries
 

@@ -100,6 +100,12 @@ export function inboxBadge(ov: WorkOverview | null, asked?: Asked, shared?: Acti
   return { n: overlaps + waiting, tip: parts.filter(Boolean).join(' · ') }
 }
 
+/** The Setup badge: the viewer's own agent setup problems in the shared status, whether or not their agent leads unfinished Work (only those also count in Needs you). */
+export function setupBadge(shared: ActionableStatus | null): { n: number; tip: string } {
+  const n = shared?.actions.filter((a) => a.kind === 'agent_setup' && a.recipients.some((r) => r.owner === shared.viewer_owner)).length ?? 0
+  return { n, tip: `${n} of your agents ${n === 1 ? 'has a setup problem' : 'have setup problems'}` }
+}
+
 /** When a need last changed: its own time or its task's last update, whichever is newer. */
 export const needUpdatedAt = (n: Need): number => Math.max(n.at, n.item?.updated_at ?? 0)
 /** The browser-only hide key: a need that changes gets a new key, so it shows again. */

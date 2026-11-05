@@ -159,7 +159,7 @@ fn assert_unknown(run: &Run, agent: &str, reason: &str) {
     }
     let has_reason = run
         .stdout
-        .contains(&format!("coordination unknown ({reason})"));
+        .contains(&format!("coordination unknown ({reason}"));
     let carries_text =
         out.get("hookSpecificOutput").is_some() || out.get("additional_context").is_some();
     assert!(has_reason || !carries_text, "{agent}: {out}");
@@ -220,12 +220,24 @@ fn nothing_configured_exits_zero_with_valid_json_for_every_agent() {
 #[test]
 fn hub_failures_fail_open() {
     let cases = [
-        (Reply::Status(500, r#"{"error":"boom"}"#), "hub error 500"),
-        (Reply::Status(401, "{}"), "token rejected"),
-        (Reply::Status(403, "{}"), "token rejected"),
-        (Reply::Status(200, "this is not json"), "bad reply"),
-        (Reply::Status(200, "[1,2]"), "bad reply"),
-        (Reply::Status(200, "\"text\""), "bad reply"),
+        (
+            Reply::Status(500, r#"{"error":"boom"}"#),
+            "The Hub refused the request",
+        ),
+        (Reply::Status(401, "{}"), "The credential was not accepted"),
+        (Reply::Status(403, "{}"), "This operation is not allowed"),
+        (
+            Reply::Status(200, "this is not json"),
+            "The Hub reply could not be read",
+        ),
+        (
+            Reply::Status(200, "[1,2]"),
+            "The Hub reply could not be read",
+        ),
+        (
+            Reply::Status(200, "\"text\""),
+            "The Hub reply could not be read",
+        ),
     ];
     for (reply, reason) in cases {
         let (url, _seen) = stub(reply);
@@ -389,12 +401,12 @@ fn the_repo_guard_and_git_root_are_sent() {
     let sub = repo.path().join("src/deep");
     std::fs::create_dir_all(&sub).unwrap();
     let seen = seen_for(&sub, &["--repo", "acme/widgets"]);
-    assert_eq!(seen.path, "/v1/hub/hook/claude?repo=acme/widgets");
+    assert_eq!(seen.path, "/v1/hub/hook/claude?repo=acme%2Fwidgets");
     let root = std::fs::canonicalize(repo.path()).unwrap();
     assert_eq!(seen.root, root.to_str().unwrap());
     // The equals form works too.
     let seen = seen_for(&sub, &["--repo=acme/widgets"]);
-    assert_eq!(seen.path, "/v1/hub/hook/claude?repo=acme/widgets");
+    assert_eq!(seen.path, "/v1/hub/hook/claude?repo=acme%2Fwidgets");
 }
 
 #[test]

@@ -211,7 +211,7 @@ async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
             missing["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .ends_with("missing field `agent`"),
+                .contains("missing field `agent`"),
             "{missing}"
         );
         let (endpoint, edit, lifecycle) = match agent {
@@ -574,6 +574,9 @@ async fn protocol_basics() {
             "agentscm_work_usage",
             "agentscm_work_checkpoint",
             "agentscm_work_transition",
+            "agentscm_work_transitions",
+            "agentscm_work_recovery",
+            "agentscm_work_recovery_preview",
             "agentscm_work_ack",
             "agentscm_workflow_status",
             "agentscm_skill_list",
@@ -741,6 +744,8 @@ async fn protocol_basics() {
         "agentscm_work_insight",
         "agentscm_work_insights",
         "agentscm_coordination_inbox",
+        "agentscm_work_recovery",
+        "agentscm_work_recovery_preview",
     ] {
         assert_eq!(tool(name)["annotations"]["readOnlyHint"], true);
     }
@@ -1008,10 +1013,9 @@ async fn change_record_is_a_read_only_bounded_projection() {
         )
         .await;
     assert_eq!(missing["isError"], true);
-    assert_eq!(
-        missing["content"][0]["text"],
-        "AgentSCM: coordination unknown (change record not found). Other agents' work on these files is not visible."
-    );
+    let text = missing["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("The resource was not found;"), "{text}");
+    assert_eq!(missing["structuredContent"]["error"]["code"], "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1022,7 +1026,9 @@ async fn method_and_auth_rules() {
 
     for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
         let reply = hub.send(method, "/mcp", Some(&key), "").await;
-        assert_eq!((reply.status, reply.text.as_str()), (405, ""));
+        assert_eq!(reply.status, 405);
+        let body: Value = serde_json::from_str(&reply.text).unwrap();
+        assert_eq!(body["error"], "method_not_allowed");
         assert_eq!(reply.headers["allow"], "POST");
     }
     for secret in [None, Some("agt_not-a-token")] {
@@ -1279,7 +1285,10 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
         ("agentscm_handoff", json!({"path": file, "accept": "yes"})),
     ] {
         let (text, error) = call(&bob, name, arguments).await;
-        assert!(error && text.contains("invalid arguments"), "{text}");
+        assert!(
+            error && text.contains("invalid arguments") && text.contains("ref cor_"),
+            "{text}"
+        );
     }
 
     // Declining: the requester hears it on its next call.
@@ -1956,10 +1965,9 @@ async fn errors_are_tool_results_with_fixed_text() {
     for path in ["/mcp?repo=acme/other", "/mcp?repo=acme%2Fother"] {
         let (text, error) = hub.tool(&key, path, "agentscm_status", json!({})).await;
         assert!(error);
-        assert_eq!(
-            text,
-            "AgentSCM: coordination unknown (this token is for another repository). \
-             Other agents' work on these files is not visible."
+        assert!(
+            text.starts_with("This token is for another repository;"),
+            "{text}"
         );
     }
     let (_, error) = hub
@@ -1996,7 +2004,7 @@ async fn errors_are_tool_results_with_fixed_text() {
         let (text, error) = hub.tool(&key, "/mcp", name, arguments).await;
         assert!(error, "{name}");
         assert!(
-            text.starts_with(&format!("AgentSCM: invalid arguments for {name}: ")),
+            text.contains("invalid arguments") && text.contains("ref cor_"),
             "{text}"
         );
         assert!(!text.contains("sekrit"), "{text}");
@@ -2010,7 +2018,10 @@ async fn errors_are_tool_results_with_fixed_text() {
         )
         .await;
     assert!(error && !text.contains("sekrit"), "{text}");
-    assert!(text.contains("invalid_or_changed"), "{text}");
+    assert!(
+        text.contains("path must be a repo-relative path") && text.contains("ref cor_"),
+        "{text}"
+    );
 
     // An unknown tool or a call without a name is a protocol error.
     for params in [json!({"name": "nope"}), json!({}), json!("x")] {
@@ -2648,7 +2659,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (46, 49, 54));
+    assert_eq!((before.len(), listed.len(), all.len()), (49, 52, 57));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
@@ -2855,7 +2866,7 @@ async fn value_metrics_and_receipts_are_scoped_and_automatic_delivery_is_idempot
             json!({}),
         )
         .await;
-    assert!(error && foreign.contains("another repository"));
+    assert!(error && foreign.contains("another repository"), "{foreign}");
     // The typed MCP query must not allow an aggregate repository escape.
     let foreign = hub
         .tool_result(
@@ -3382,4 +3393,184 @@ async fn actionable_status_agrees_across_explicit_read_overview_start_and_catchu
         )
         .await;
     assert_eq!(http.json()["digest"], status["structuredContent"]["digest"]);
+}
+
+#[tokio::test]
+async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "session": "session-a", "request_key": "billing",
+                "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let item = started["structuredContent"]["work"]["item"].clone();
+    let work_id = item["id"].as_str().unwrap().to_owned();
+    // Alice's session goes away; her next session releases the obsolete hold, keeping the Work.
+    let preview = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_recovery_preview",
+            json!({"work_id": work_id, "remedy": "release", "session": "session-b"}),
+        )
+        .await;
+    let preview = &preview["structuredContent"];
+    assert_eq!(preview["permitted"], true, "{preview}");
+    assert_eq!(preview["effects"]["follow_up"]["unfinished"], true);
+    let call = &preview["apply"];
+    assert_eq!(call["tool"], "agentscm_work_transition");
+    let batch = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_transitions",
+            json!({"session": "session-b", "items": [{"work_id": work_id,
+                "operation_id": "mcp-release", "generation": call["arguments"]["generation"],
+                "expected_updated_seq": call["arguments"]["expected_updated_seq"],
+                "transition": "release", "reason": "old session is gone"}]}),
+        )
+        .await;
+    assert_eq!(batch["isError"], false, "{batch}");
+    assert_eq!(batch["structuredContent"]["items"][0]["outcome"], "applied");
+
+    // A new start over the same paths under another identity is pointed at the released Work
+    // first, and nothing is created.
+    let duplicate = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing again", "session": "session-b", "request_key": "billing-2",
+                "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(duplicate["isError"], true, "{duplicate}");
+    let resolve = &duplicate["structuredContent"];
+    assert_eq!(resolve["claim_acquired"], false);
+    assert_eq!(resolve["resolve_existing"][0]["work_id"], work_id.as_str());
+    let text = duplicate["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(&format!("work_id {work_id}")), "{text}");
+    assert!(text.contains("new_work true"), "{text}");
+    let overview = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
+        .await;
+    assert_eq!(
+        overview["structuredContent"]["current"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{overview}"
+    );
+    // The original identity resolves itself, so it is not refused.
+    let same = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "session": "session-b", "request_key": "billing",
+                "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert!(
+        same["structuredContent"].get("resolve_existing").is_none(),
+        "{same}"
+    );
+    // Different work goes ahead when it says so.
+    let different = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "invoices", "session": "session-c", "request_key": "invoices",
+                "paths": ["src/billing.rs"], "new_work": true}),
+        )
+        .await;
+    assert_eq!(
+        different["structuredContent"]["work"]["created"], true,
+        "{different}"
+    );
+    let invoices = different["structuredContent"]["work"]["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Bob's start is refused by Alice's live hold; the reply names the hold, its exact paths and
+    // what Bob may do, without taking it over.
+    let refused = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "rival", "session": "session-r", "request_key": "rival",
+                "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let recovery = &refused["structuredContent"]["recovery"];
+    assert_eq!(
+        recovery["conflicts"][0]["work_id"],
+        invoices.as_str(),
+        "{refused}"
+    );
+    assert_eq!(recovery["conflicts"][0]["mine"], false);
+    assert_eq!(
+        recovery["conflicts"][0]["paths"][0]["their_path"],
+        "src/billing.rs"
+    );
+    assert!(
+        recovery["work"][0]["remedies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|remedy| remedy["permitted"] == false),
+        "{recovery}"
+    );
+
+    // The HTTP route answers from the same service.
+    let query = json!({"paths": ["src/billing.rs"], "session": "session-r"});
+    let mcp = hub
+        .tool_result(&bob, "agentscm_work_recovery", query.clone())
+        .await;
+    let http = hub
+        .send(
+            reqwest::Method::POST,
+            "/v1/hub/standup/recovery",
+            Some(&bob),
+            &query.to_string(),
+        )
+        .await;
+    assert_eq!(http.status, 200, "{}", http.text);
+    let mut http = http.json();
+    let mut mcp = mcp["structuredContent"].clone();
+    http["observed_at"] = json!(0);
+    mcp["observed_at"] = json!(0);
+    assert_eq!(http, mcp);
+
+    // A read-only token sees the recovery tools and can read, never apply.
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 1,
+    };
+    let owner = hub.store.upsert_user(&identity, "user1").unwrap();
+    let (_, reader, _) =
+        mint_bound_agent_token(&*hub.store, &owner.id, "reader", REPO, 1, 3600, true).unwrap();
+    let reader = reader.expose().to_owned();
+    let read = hub
+        .tool_result(&reader, "agentscm_work_recovery", json!({}))
+        .await;
+    assert_eq!(read["structuredContent"]["read_only"], true, "{read}");
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let tools = hub.rpc(&reader, &list).await.json();
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"agentscm_work_recovery"));
+    assert!(!names.contains(&"agentscm_work_transitions"));
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "agentscm_work_transitions", "arguments": {"session": "s", "items": []}}});
+    let denied = hub.rpc(&reader, &body).await;
+    assert_ne!(denied.status, 200, "{}", denied.text);
 }

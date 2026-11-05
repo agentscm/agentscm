@@ -940,7 +940,8 @@ export function WorkspacePage() {
       {signOutError && <Notice title={signOutError} />}
       {session.kind === 'loading' && <Skeleton rows={4} />}
       {signedOut && <Login />}
-      {session.kind === 'error' && !signedOut && <Notice title={pollError(session)} action={<button className="btn btn-sm btn-outline-secondary" onClick={session.retry}>Retry</button>} />}
+      {/* 404/503: the Hub has workspace sign-in off, which Retry cannot change. */}
+      {session.kind === 'error' && !signedOut && <Notice title={pollError(session)} action={session.status === 404 || session.status === 503 ? undefined : <button className="btn btn-sm btn-outline-secondary" onClick={session.retry}>Retry</button>} />}
       {s && (
         <div className="stack">
           <Box

@@ -37,6 +37,7 @@ pub mod git_snapshot;
 pub mod guided_service;
 pub mod history;
 pub(crate) mod hmac;
+pub mod hook_relay;
 #[doc(hidden)]
 pub mod http_listener;
 pub mod hub;

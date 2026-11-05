@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::hub::coordination::{CoordinationInbox, CoordinationListQuery, CoordinationStatus};
+use crate::hub::onboarding::Observations;
 use crate::hub::store::{Principal, Store};
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
@@ -355,9 +356,16 @@ pub fn project_work(
 
 /// Read through the caller's authenticated repository scope. Counts are lower bounds when any
 /// collection is truncated. Reservation holders are selected first, including legacy-hidden Work.
-pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<ActionableStatus> {
+/// `setup` is the Hub's onboarding observations, for the viewer's own agent setup problems.
+pub fn read(
+    store: &dyn Store,
+    setup: &Observations,
+    principal: &Principal,
+    now: i64,
+) -> Result<ActionableStatus> {
     read_scoped(
         store,
+        setup,
         principal,
         &WorkLifecycleReader::Token(&principal.token_id),
         now,
@@ -367,6 +375,7 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
 /// Internal role-checked person read. Never infer person authority from an empty token.
 pub(crate) fn read_person(
     store: &dyn Store,
+    setup: &Observations,
     owner: &crate::hub::store::User,
     repository: &str,
     repository_id: i64,
@@ -386,6 +395,7 @@ pub(crate) fn read_person(
     };
     read_scoped(
         store,
+        setup,
         &principal,
         &WorkLifecycleReader::Person {
             owner,
@@ -398,6 +408,7 @@ pub(crate) fn read_person(
 
 fn read_scoped(
     store: &dyn Store,
+    setup: &Observations,
     principal: &Principal,
     reader: &WorkLifecycleReader<'_>,
     now: i64,
@@ -573,6 +584,7 @@ fn read_scoped(
         checks::read(store, principal, &items, now)?;
     actions.extend(checks);
     limits.extend(check_limits);
+    actions.extend(setup_actions(store, setup, principal, &items, now)?);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -665,6 +677,51 @@ fn read_scoped(
     ))
     .expect("status serializes")]);
     Ok(result)
+}
+
+/// The viewer's own agent setup problems: always the viewer's (the Setup badge counts them),
+/// and needs-you only when the agent concerned leads unfinished Work.
+fn setup_actions(
+    store: &dyn Store,
+    setup: &Observations,
+    principal: &Principal,
+    items: &BTreeMap<String, WorkItem>,
+    now: i64,
+) -> Result<Vec<StatusAction>> {
+    let viewer = StatusRecipient {
+        kind: RecipientKind::Person,
+        owner: Some(principal.owner.id.clone()),
+        login: Some(principal.owner.login.clone()),
+        agent: None,
+    };
+    Ok(
+        crate::hub::setup_attention::problems(store, setup, principal, now)?
+            .into_iter()
+            .map(|problem| {
+                let work_ids = items
+                    .values()
+                    .filter(|i| problem.tokens.contains(&i.lead_token))
+                    .map(|i| i.id.clone())
+                    .collect::<Vec<_>>();
+                StatusAction {
+                    id: format!("setup:{}:{}", problem.reason.code(), problem.key),
+                    kind: "agent_setup".into(),
+                    needs_you: !work_ids.is_empty(),
+                    work_ids,
+                    recipients: vec![viewer.clone()],
+                    action: format!(
+                        "Your agent {} {}. {}",
+                        crate::hub::advice::sanitize(&problem.agent, 64),
+                        problem.reason.what(),
+                        problem.reason.next_action()
+                    ),
+                    updated_seq: 0,
+                    semantic_version: None,
+                    limits: vec![],
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Deterministic text used by agent-facing clients; generated prose is optional.
@@ -830,6 +887,27 @@ fn request_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reads without onboarding observations; setup tests pass their own.
+    fn read(store: &dyn Store, who: &Principal, now: i64) -> Result<ActionableStatus> {
+        super::read(store, &Observations::default(), who, now)
+    }
+    fn read_person(
+        store: &dyn Store,
+        owner: &crate::hub::store::User,
+        repository: &str,
+        repository_id: i64,
+        now: i64,
+    ) -> Result<ActionableStatus> {
+        super::read_person(
+            store,
+            &Observations::default(),
+            owner,
+            repository,
+            repository_id,
+            now,
+        )
+    }
     use crate::hub::store::{self, ForgeIdentity, agent_token_digest, mint_bound_agent_token};
     use crate::hub::work::{CheckpointKind, WorkCheckpoint, WorkStart};
     use crate::hub::work_lifecycle::{LEASE_SECONDS, Lease, RenewalCoverage};
@@ -867,6 +945,7 @@ mod tests {
             lease: held.then_some(Lease {
                 renewed_at: 100,
                 expires_at: 100 + LEASE_SECONDS,
+                grace_at: None,
             }),
             coverage: RenewalCoverage::ToolCalls,
             now: 100,
@@ -1163,7 +1242,7 @@ mod tests {
         assert!(!a.atomic_snapshot);
         assert!(
             !a.complete,
-            "unsupported producers cannot be presented as clear"
+            "missing provider and reconciliation coverage cannot be presented as clear"
         );
         assert!(!a.work[0].reconciliation.as_ref().unwrap().current);
         assert_eq!(
@@ -1621,6 +1700,224 @@ mod tests {
             [format!("check:{}:6:agentscm/workflow/main", repo.id)],
             "the other person's failed Hub check counts for them"
         );
+    }
+
+    /// #292 from a real store: the viewer's own setup blockers and unverified edit hook, and a
+    /// person whose every agent token for the repository stopped working. Only an agent that
+    /// leads unfinished Work needs the person; other people's problems never show.
+    fn setup_contract(store: &dyn Store) {
+        use crate::hub::onboarding::{Agent, Blocker, Observations, SetupCall};
+        let now = crate::hub::store::unix_now();
+        let person = |user_id: i64, login: &str| {
+            store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap()
+        };
+        let token = |user: &crate::hub::store::User, name: &str, ttl: i64, read_only: bool| {
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, name, "acme/widgets", 101, ttl, read_only)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let start = |who: &Principal, title: &str| {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": title, "title": title, "session": format!("{title}-session"),
+                "scope": [format!("src/{title}.rs")]
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap().item
+        };
+        let viewer_user = person(501, "viewer");
+        let viewer = token(&viewer_user, "viewer-laptop", 3600, false);
+        let work = start(&viewer, "viewer-work");
+        let observations = Observations::default();
+        let setup = |session: &str, blocker: Option<Blocker>| {
+            observations.restart(
+                &viewer,
+                Some("root-a"),
+                "claude",
+                Some(session),
+                observations.epoch(),
+            );
+            observations
+                .verify_mcp(
+                    &viewer,
+                    Some("root-a"),
+                    SetupCall {
+                        agent: Agent::Claude,
+                        session: session.into(),
+                        blocker,
+                    },
+                    observations.epoch(),
+                )
+                .unwrap();
+        };
+        setup("blocked-session", Some(Blocker::Trust));
+        setup("verifying-session", None);
+        // A session that only started is the normal state, not a setup problem.
+        observations.restart(
+            &viewer,
+            Some("root-a"),
+            "claude",
+            Some("quiet-session"),
+            observations.epoch(),
+        );
+        let status = super::read(store, &observations, &viewer, now).unwrap();
+        let mut setup_rows = status
+            .actions
+            .iter()
+            .filter(|a| a.kind == "agent_setup")
+            .map(|a| {
+                (
+                    a.id.split(':').nth(1).unwrap().to_owned(),
+                    a.needs_you,
+                    a.work_ids.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        setup_rows.sort();
+        assert_eq!(
+            setup_rows,
+            [
+                (
+                    "agent_trust_required".to_owned(),
+                    true,
+                    vec![work.id.clone()]
+                ),
+                (
+                    "edit_hook_unverified".to_owned(),
+                    true,
+                    vec![work.id.clone()]
+                ),
+            ]
+        );
+        assert!(
+            status
+                .actions
+                .iter()
+                .filter(|a| a.kind == "agent_setup")
+                .all(|a| a.recipients[0].owner.as_deref() == Some(viewer_user.id.as_str()))
+        );
+
+        // Another person whose only agent token expired, while their Work still names it.
+        let other_user = person(502, "other");
+        let short = token(&other_user, "other-laptop", 60, false);
+        let other_work = start(&short, "other-work");
+        // A read-only web or menu-bar token never stands in for an agent token.
+        token(&other_user, "agentscm-tray-attention", 3600, true);
+        let later = now + 120;
+        let theirs = super::read_person(
+            store,
+            &observations,
+            &other_user,
+            "acme/widgets",
+            101,
+            later,
+        )
+        .unwrap();
+        let token_rows = theirs
+            .actions
+            .iter()
+            .filter(|a| a.kind == "agent_setup")
+            .map(|a| (a.id.clone(), a.needs_you, a.work_ids.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            token_rows,
+            [(
+                "setup:agent_token_expired:repository".to_owned(),
+                true,
+                vec![other_work.id.clone()]
+            )]
+        );
+        // The viewer sees neither the other person's token problem nor counts it.
+        assert!(
+            !super::read(store, &observations, &viewer, now)
+                .unwrap()
+                .actions
+                .iter()
+                .any(|a| a.id.contains("token"))
+        );
+        // A valid token the forge never gave an id to still counts for the repository.
+        let legacy_user = person(503, "legacy");
+        token(&legacy_user, "legacy-laptop", 60, false);
+        crate::hub::store::mint_agent_token(
+            store,
+            &legacy_user.id,
+            "legacy-client",
+            "acme/widgets",
+            3600,
+        )
+        .unwrap();
+        assert!(
+            !super::read_person(
+                store,
+                &observations,
+                &legacy_user,
+                "acme/widgets",
+                101,
+                later
+            )
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| a.kind == "agent_setup")
+        );
+        // A revoked newest token says so; a long-expired one is history.
+        store.revoke_agent_token(&short.token_id).unwrap();
+        assert!(
+            super::read_person(
+                store,
+                &observations,
+                &other_user,
+                "acme/widgets",
+                101,
+                later
+            )
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| a.id == "setup:agent_token_revoked:repository")
+        );
+        assert!(
+            !super::read_person(
+                store,
+                &observations,
+                &other_user,
+                "acme/widgets",
+                101,
+                later + crate::hub::setup_attention::RECENT_EXPIRY_SECONDS,
+            )
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| a.kind == "agent_setup")
+        );
+    }
+
+    #[test]
+    fn sqlite_setup_problems_reach_only_their_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        setup_contract(&*store);
+    }
+
+    #[test]
+    fn setup_problems_reach_only_their_owner_on_postgres() {
+        on_postgres(setup_contract);
     }
 
     #[test]

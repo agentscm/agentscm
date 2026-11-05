@@ -276,8 +276,14 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
     token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may
     release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or
-    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. There is no Hub page
-    action for it yet. See [stand-up](standup.md#work-transitions).
+    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. A task's page offers
+    these as **Release or end this task**, after a preview. See
+    [stand-up](standup.md#recover-stuck-work).
+  - `POST /v1/hub/session/work/recovery`, `POST /v1/hub/session/work/recovery/preview` and
+    `POST /v1/hub/session/work/transitions` are the agent recovery routes for a person, with
+    `repository` in the body and the same allow-list and role check. They read and apply through
+    the same service as `agentscm_work_recovery`: the owner's Work and, for a Hub administrator,
+    anyone's. A batch item another person may not apply is `refused` with code `unauthorized`.
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
   on the person's forge host that they can read now, for the web pages' All repositories list.
   Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,
@@ -616,6 +622,18 @@ calls `POST /mcp`, and an agent's hooks post their raw hook JSON to
 Bearer <token>` and the token's repository; both share one code path, so the
 same edit gives the same advice either way. Configuration files must take the
 token from an environment variable, never contain it.
+
+Native command hooks first try the local relay hosted by `agentscm client mcp`. The relay keeps
+its own hardened HTTPS connection pool; it ends with that host's stdio session, with
+another live host taking over if needed. macOS/Linux use an owner-private Unix socket and
+Windows uses a same-user named pipe. Only hooks with the same Hub, config directory, binary
+and proxy environment share it; others call the Hub directly. Missing or incompatible relays
+cost at most a 10 ms probe, within the existing 3 s hook / 4.5 s session-start budget. Once a
+relay accepts a call it is never resent, even if its reply is lost: coordination is unknown
+and the hook fails open. Pools with no completed reply in 30 s are refreshed using
+wall time, including laptop sleep. A connection that dies silently inside that window fails
+that one call open; it is never retried. Tokens cross only the same-user local transport per
+request and HTTPS, never a relay file or log. No secret is persisted by the relay.
 
 A **session** is one agent conversation, keyed by the token and a session id
 (the hook's session or conversation id, or the MCP `session` argument). It
@@ -1227,8 +1245,10 @@ sign-in (and no PAT) makes a one-time setup link itself.
    first decides which GitHub App the hub trusts, so keep it out of proxy access logs.
    Optional `AGENTSCM_GITHUB_APP_NAME` (default `agentscm-hub`) and `AGENTSCM_GITHUB_APP_ORG`
    choose the app's name and owner.
-3. Open the link in a browser signed in to GitHub, create the app, then follow the install link on
-   the success page and choose one repository.
+3. Open the link in a browser signed in to GitHub. The page names the owner (your personal
+   account or the organization) and the app name, taken from step 2's variables; change either in
+   its form if they are wrong, then click Continue to GitHub, create the app, follow the install
+   link on the success page and choose one repository. Nothing is sent to GitHub until you click.
 4. The success page and the hub log print `AGENTSCM_GITHUB_CLIENT_ID=...` and
    `AGENTSCM_GITHUB_CLIENT_SECRET_FILE=...`. The second is a path inside the hub's own secrets
    directory, so it works as printed (with compose too); never loosen that file's mode. Set them

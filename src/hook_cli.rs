@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use agentscm::hook_relay::{self, Address, HookRequest, REPLY_BYTES, STDIN_BYTES};
 use agentscm::hub::forge_http::{self, check_base_url, send};
 use clap::Args;
 use serde_json::{Value, json};
@@ -21,8 +22,60 @@ const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
 const AUTO_CONNECT_WAIT: Duration = Duration::from_millis(2500);
 /// A failed auto-connect or renewal is not retried for this long.
 const RETRY_EVERY: Duration = Duration::from_secs(5 * 60);
-const STDIN_BYTES: usize = 4 << 20;
-const REPLY_BYTES: usize = 1 << 20;
+
+struct HookFailure {
+    text: String,
+    code: String,
+    token_marker: Option<String>,
+}
+
+impl HookFailure {
+    fn remote(envelope: agentscm::hub::error_envelope::ErrorEnvelope, token: &str) -> Self {
+        Self {
+            text: envelope.render(),
+            code: envelope.code,
+            token_marker: None,
+        }
+        .with_token(token)
+    }
+
+    fn with_token(mut self, token: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        self.token_marker = Some(format!("{:x}", Sha256::digest(token)));
+        self
+    }
+
+    fn note_key(&self, session: &str) -> String {
+        format!(
+            "{}\0{session}\0{}",
+            self.token_marker.as_deref().unwrap_or("local"),
+            self.code
+        )
+    }
+}
+
+impl From<String> for HookFailure {
+    fn from(text: String) -> Self {
+        use agentscm::hub::error_envelope::ErrorCode;
+        let code = match text.as_str() {
+            "hub unreachable" => ErrorCode::HubUnreachable,
+            "bad reply" => ErrorCode::InvalidResponse,
+            "no token" | "no token for this hub; set AGENTSCM_HUB_TOKEN" => ErrorCode::Unauthorized,
+            _ => ErrorCode::InvalidRequest,
+        };
+        Self {
+            text,
+            code: code.as_str().into(),
+            token_marker: None,
+        }
+    }
+}
+
+impl From<&str> for HookFailure {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
 
 #[derive(Debug, Args)]
 pub struct HookArgs {
@@ -126,7 +179,7 @@ async fn hook(
     ));
     let reply = match tokio::time::timeout(remaining, &mut call).await {
         Ok(Ok(Ok(reply))) => reply,
-        Ok(Ok(Err(reason))) => unknown_output(agent, &payload, &reason),
+        Ok(Ok(Err(reason))) => unknown_failure(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
         Err(_) => {
             activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
@@ -213,7 +266,7 @@ async fn call_hub(
     destination_args: bool,
     payload: std::sync::Arc<Value>,
     context: HubCallContext,
-) -> Result<Value, String> {
+) -> Result<Value, HookFailure> {
     let HubCallContext {
         original_body,
         activity_tracker,
@@ -336,33 +389,47 @@ async fn call_hub(
         .as_ref()
         .map(|connection| crate::client_activity::activity_binding(connection, &token));
     let mut activity = ActivityAttempt::new(activity_tracker, activity_binding);
-    let client = forge_http::client().map_err(|_| "hub unreachable")?;
     let outbound_body = if plugin_route || agent == "codex" {
         serde_json::to_vec(&outbound).map_err(|_| "payload unreadable")?
     } else {
         // Preserve the legacy transport contract, including original JSON bytes.
         original_body
     };
-    let mut request = hub_request(
-        &client,
-        &url,
-        &endpoint_agent,
-        repo.as_deref(),
-        &token,
-        &outbound_body,
-        root.as_deref(),
-    )?;
-    if let Some(connection) = client_connection.as_ref() {
-        request = request.header(
-            agentscm::hub::onboarding::CLIENT_HEADER,
-            client_config::onboarding_client(&connection.root, &token),
-        );
-    }
-    request = client_config::with_completion_reporting(request, report_completion);
-    // `send` errors carry no URL or credentials.
-    let (status, reply) = send(request, REPLY_BYTES)
-        .await
-        .map_err(|_| "hub unreachable")?;
+    let request = HookRequest {
+        agent: path_segment(&endpoint_agent),
+        repo,
+        client: client_connection
+            .as_ref()
+            .map(|connection| client_config::onboarding_client(&connection.root, &token)),
+        token: token.clone(),
+        root: root.as_deref().and_then(Path::to_str).map(str::to_owned),
+        report_completion,
+        body: outbound_body,
+    };
+    // Legacy hooks also use the relay: its key binds the Hub/config, and framing preserves raw JSON.
+    let forwarded = match config_dir()
+        .ok()
+        .and_then(|dir| Address::new(&dir, &url).ok())
+    {
+        Some(address) => hook_relay::try_forward(&address, &request, deadline).await,
+        None => None,
+    };
+    let (status, reply) = match forwarded {
+        Some(reply) => {
+            reply.map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?
+        }
+        None => {
+            let client = forge_http::client()
+                .map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?;
+            let request = request
+                .request(&client, &url)
+                .map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?;
+            // `send` errors carry no URL or credentials. An accepted relay call is never resent.
+            send(request, REPLY_BYTES)
+                .await
+                .map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?
+        }
+    };
     match status {
         200 if reply.is_object() => {
             activity.finish(successful_hook_outcome(&outbound));
@@ -378,15 +445,26 @@ async fn call_hub(
         }
         200 => {
             activity.finish(crate::client_activity::ActivityOutcome::InvalidResponse);
-            Err("bad reply".into())
+            Err(HookFailure::remote(
+                agentscm::hub::error_envelope::ErrorEnvelope::local(
+                    agentscm::hub::error_envelope::ErrorCode::InvalidResponse,
+                ),
+                &token,
+            ))
         }
         401 | 403 => {
             activity.finish(crate::client_activity::ActivityOutcome::TokenRejected);
-            Err("token rejected".into())
+            Err(HookFailure::remote(
+                agentscm::hub::error_envelope::decode(status, &reply),
+                &token,
+            ))
         }
         _ => {
             activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
-            Err(format!("hub error {status}"))
+            Err(HookFailure::remote(
+                agentscm::hub::error_envelope::decode(status, &reply),
+                &token,
+            ))
         }
     }
 }
@@ -919,38 +997,6 @@ fn successful_hook_outcome(payload: &Value) -> crate::client_activity::ActivityO
     } else {
         crate::client_activity::ActivityOutcome::Acknowledged
     }
-}
-
-fn hub_request(
-    client: &reqwest::Client,
-    url: &str,
-    agent: &str,
-    repo: Option<&str>,
-    token: &str,
-    outbound: &[u8],
-    root: Option<&Path>,
-) -> Result<reqwest::RequestBuilder, String> {
-    // The hub answers "coordination unknown" when the repository differs from the token's.
-    let query = repo.map_or_else(String::new, |repo| format!("?repo={repo}"));
-    let request = client
-        .post(format!("{url}/v1/hub/hook/{}{query}", path_segment(agent)))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .bearer_auth(token)
-        .body(outbound.to_vec());
-    Ok(with_root_header(request, root))
-}
-
-fn with_root_header(
-    mut request: reqwest::RequestBuilder,
-    root: Option<&Path>,
-) -> reqwest::RequestBuilder {
-    if let Some(root) = root
-        .and_then(Path::to_str)
-        .and_then(|root| reqwest::header::HeaderValue::from_str(root).ok())
-    {
-        request = request.header("X-Agentscm-Root", root);
-    }
-    request
 }
 
 const MAX_WORKSPACE_ROOTS: usize = 16;
@@ -1814,14 +1860,20 @@ fn resolve(
 /// What the agent gets when the hub cannot be consulted: valid JSON that never blocks. The note
 /// is printed once per (agent, session); later calls in that session get the silent no-op.
 fn unknown_output(agent: &str, payload: &Value, reason: &str) -> Value {
+    unknown_failure(agent, payload, &HookFailure::from(reason))
+}
+
+fn unknown_failure(agent: &str, payload: &Value, failure: &HookFailure) -> Value {
+    let reason = failure.text.as_str();
     // The user-wide hooks run in every project; an edit no connected checkout covers stays quiet.
     if reason == NO_EDIT_CONNECTION {
         return fail_open(agent, payload, None);
     }
-    let note = match (session_of(payload), config_dir()) {
-        (Some(session), Ok(dir)) => first_note(&dir, agent, session),
-        _ => true,
-    };
+    let note = is_session_start(agent, payload)
+        || match (session_of(payload), config_dir()) {
+            (Some(session), Ok(dir)) => first_note(&dir, agent, &failure.note_key(session)),
+            _ => true,
+        };
     fail_open(agent, payload, note.then_some(reason))
 }
 
@@ -1897,9 +1949,33 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
         Some(reason) => context_reply(
             agent,
             payload,
-            &format!(
-                "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
-            ),
+            &if reason == "hub unreachable" {
+                let mut error = agentscm::hub::error_envelope::ErrorEnvelope::local(
+                    agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+                );
+                error.message = "hub unreachable".into();
+                error.hook_note()
+            } else {
+                use agentscm::hub::error_envelope::{ErrorCode, RecoveryAction, sanitize};
+                let reason = sanitize(reason);
+                let recovery = match reason.as_str() {
+                    "no token" => ErrorCode::Unauthorized.action(),
+                    "bad reply" => ErrorCode::InvalidResponse.action(),
+                    "payload unreadable" => ErrorCode::InvalidRequest.action(),
+                    _ => RecoveryAction::Reconnect,
+                };
+                let reason = if RecoveryAction::ALL
+                    .iter()
+                    .any(|action| reason.contains(action.sentence()))
+                {
+                    reason
+                } else {
+                    format!("{reason}; {}", recovery.sentence())
+                };
+                format!(
+                    "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
+                )
+            },
         ),
         None => context_reply_with(agent, payload, None),
     }
@@ -2860,6 +2936,37 @@ mod tests {
     }
 
     #[test]
+    fn failure_suppression_changes_with_code_and_credential_but_never_hides_startup() {
+        use agentscm::hub::error_envelope::{ErrorCode, ErrorEnvelope};
+        let dir = tempfile::TempDir::new().unwrap();
+        let busy =
+            HookFailure::remote(ErrorEnvelope::local(ErrorCode::Busy), "synthetic-token-one");
+        let rejected = HookFailure::remote(
+            ErrorEnvelope::local(ErrorCode::Unauthorized),
+            "synthetic-token-one",
+        );
+        let renewed =
+            HookFailure::remote(ErrorEnvelope::local(ErrorCode::Busy), "synthetic-token-two");
+        let first =
+            |failure: &HookFailure| first_note(dir.path(), "claude", &failure.note_key("session"));
+        assert!(first(&busy));
+        assert!(!first(&busy));
+        assert!(first(&rejected));
+        assert!(first(&renewed));
+        assert!(!busy.note_key("session").contains("synthetic-token-one"));
+        for source in ["startup", "startup", "resume"] {
+            let payload =
+                json!({"hook_event_name":"SessionStart", "session_id":"session", "source":source});
+            let reply = unknown_failure("claude", &payload, &rejected);
+            let text = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(text.contains("Sign in again"));
+            assert!(!text.contains("ref cor_"));
+        }
+    }
+
+    #[test]
     fn a_repeat_note_is_the_agents_silent_no_op() {
         let pre = event("PreToolUse");
         let note = fail_open("claude", &pre, Some("hub unreachable"));
@@ -3565,15 +3672,16 @@ mod tests {
             &connections,
         )
         .unwrap();
-        let request = hub_request(
-            &reqwest::Client::new(),
-            "https://hub.example.test",
-            "codex",
-            Some("acme/widgets"),
-            "synthetic-token",
-            &serde_json::to_vec(&routed.payload).unwrap(),
-            None,
-        )
+        let request = HookRequest {
+            agent: "codex".into(),
+            repo: Some("acme/widgets".into()),
+            token: "synthetic-token".into(),
+            root: None,
+            client: None,
+            report_completion: false,
+            body: serde_json::to_vec(&routed.payload).unwrap(),
+        }
+        .request(&reqwest::Client::new(), "https://hub.example.test")
         .unwrap()
         .build()
         .unwrap();
@@ -3597,11 +3705,13 @@ mod tests {
                 let text = out["hookSpecificOutput"]["additionalContext"]
                     .as_str()
                     .unwrap();
-                assert_eq!(
-                    text,
-                    "AgentSCM: coordination unknown (hub unreachable). \
-                     Other agents' work on these files is not visible."
-                );
+                assert_eq!(text, {
+                    let mut error = agentscm::hub::error_envelope::ErrorEnvelope::local(
+                        agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+                    );
+                    error.message = "hub unreachable".into();
+                    error.hook_note()
+                });
                 assert_eq!(out.as_object().unwrap().len(), 1);
             }
             for other in [
@@ -3638,7 +3748,7 @@ mod tests {
                 reply["additional_context"]
                     .as_str()
                     .unwrap()
-                    .contains("coordination unknown (no token)")
+                    .contains("coordination unknown (no token;")
             );
         }
         assert_eq!(out(&event("sessionEnd")), json!({}));

@@ -10,7 +10,7 @@ title: "Native CLI reference"
 
 ## Commands
 
-Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no-telemetry` flag disables product usage telemetry for that invocation. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...,"error_kind":...}`) on standard error with a nonzero exit on failure. When standard error is a terminal, a failure is one plain `error: ...` line instead, without `error_kind`; scripts and agents that read standard error through a pipe keep the JSON. A usage error (an unknown flag or a missing argument) is never JSON: it prints the parser's plain usage text, and exits 2 (1 for the Stop hook), whether or not standard error is a terminal. The exceptions are:
+Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no-telemetry` flag disables product usage telemetry for that invocation. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...,"error_kind":...}`) on standard error with a nonzero exit on failure. When standard error is a terminal, a failure is one plain `error: ...` line instead, without `error_kind`; a failure that came from the Hub also carries `code`, `retryable`, `recovery` and `correlation_id` in the JSON form, and the plain line adds the recovery and `ref cor_...` (see [Hub errors](../api.md#hub-errors)); scripts and agents that read standard error through a pipe keep the JSON. A usage error (an unknown flag or a missing argument) is never JSON: it prints the parser's plain usage text, and exits 2 (1 for the Stop hook), whether or not standard error is a terminal. The exceptions are:
 
 - `--help` and `--version` print plain text.
 - `serve`, `hub serve` and `team serve` print nothing on standard output; they log to standard error.
@@ -86,6 +86,32 @@ Captured-event identities are declarations; the CLI and Hub do not fetch or veri
 body. A prior-Work version can explicitly identify the checkpoint being corrected or superseded.
 The Hub requires that exact same-Work version to exist when first recording the checkpoint, while
 an exact operation replay continues to return its original receipt. See [stand-up and handover](../standup.md).
+
+`agentscm work recovery` shows what you can recover: your owner's unfinished Work page by page
+(active, needs you, can resume, finished), why each item still exists, the open requests and
+dependent Work that ending it would reach, and every remedy marked permitted or refused for you
+with the exact call that applies it. `--path` (repeat it, at most 32) also lists the live holds over
+those paths with the exact overlapping paths, and your owner's resumable Work there. `--work-id`
+reads one Work item of the repository, whoever owns it. `--session` tells your lead session from
+your owner's other sessions; without it you act as your owner's agent. Page with `--after` set to
+the previous `next_after` and `--limit` (1 to 50, default 20). `--json` prints the versioned
+response.
+
+```sh
+agentscm work recovery --session "$SESSION" --path src/billing.rs
+agentscm work recovery-preview --work-id wrk_… --remedy release --session "$SESSION"
+agentscm work transitions --request batch.json
+```
+
+`agentscm work recovery-preview` says what one remedy would change and prints the call and fences
+(`generation`, `expected_updated_seq`) to apply it; it changes nothing. Remedies are `release`,
+`retain`, `complete`, `abandon`, `supersede` and `reopen` (applied as transitions), `resume` (a
+start with `takeover_generation`) and `handover` (the lead's checkpoint; `--scope` keeps only those
+paths for the next lead and frees the rest). `agentscm work transitions` applies a strict
+`{"session": …, "items": [...]}` batch of up to 25 transitions in order, each in its own transaction,
+and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (with a `code` and a
+`retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
+items stay applied, and sending the same batch again is safe.
 
 ### `change-capture` (experimental, Unix)
 
@@ -389,6 +415,25 @@ also shows local hook and MCP transport outcomes observed while it is running; t
 stay in memory and expire. Missing or idle activity stays unknown. `--json` emits a versioned
 status contract, including separate onboarding and local-activity binding identifiers.
 
+A saved token is configuration, not proof of coordination. Each connection reports one
+`connection` state in text and as `health` in `--json`, from the strongest evidence available:
+
+| State | Meaning |
+| --- | --- |
+| `configured` | A token is saved and the Hub was not asked (no `--check`). |
+| `no_usable_token` | The saved token file is missing, unreadable or not private. |
+| `authenticated` | The Hub accepted the token during this check. |
+| `renewal_pending` | Accepted, but inside the renewal window and not yet renewed. |
+| `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
+| `expired` | The token ended and nothing renewed it. The Hub is not consulted. |
+| `revoked` | The Hub rejected a token that has not ended. |
+| `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
+
+`coverage` is separate: `verified` only when the Hub has seen both an agent's MCP and a native hook
+for the checkout; `partial`, `unverified` and `unknown` otherwise. A valid check also reports the
+Hub's deployed `hub_build` (version and commit) when the Hub states one; `client doctor` prints the
+same state and build, and stops with the reason when the Hub does not accept the token.
+
 Each connected checkout has **Agent Integrations** actions for Claude Code, Codex, Cursor,
 Copilot and Gemini. They reuse the existing owned hooks, MCP and skill installers with the saved
 connection and stable installed binary. **Reapply** repeats setup; it does not certify runtime
@@ -575,7 +620,7 @@ post-merge events reserve bounded artifact workflows; the operator runs the reta
 Pause and revoke prevent subsequent managed effects and preserve history. See
 [operating policy](../advanced/operating-policy.md) for inspection, activation, dispatch and recovery.
 
-`operating-policy recover` accepts paired `--reconcile-operation OPERATION_ID` and `--observed-seq N` for explicit owner reconciliation of a retained ambiguous administrative request. It preserves that request with an unknown outcome; see the [operating-policy recovery guide](../advanced/operating-policy.md#pause-revoke-and-recover).
+`operating-policy recover` accepts paired `--reconcile-operation OPERATION_ID` and `--observed-seq N` for explicit owner reconciliation of a retained ambiguous administrative request. It preserves that request with an unknown outcome; see the [operating-policy recovery guide](../advanced/operating-policy.md#pause-revoke-and-recover). `operating-policy rebind DISPATCH_ID --expected-generation N --work-generation M` points the dispatch's Work binding at the Work's current generation after a release and resume, or a reopen, by the dispatch's own session; it previews unless `--apply`.
 
 Neither command grants forge merge permission or controls unrestricted tools in unrelated agents.
 

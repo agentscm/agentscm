@@ -87,9 +87,9 @@ use super::publish::{
     SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
-    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_REQUIRED, SESSION_TTL_SECONDS,
-    STALE_SESSION_SECONDS, SessionCall, SessionEnd, Touched, check, check_name, expiry_cause,
-    guard, held, plan as plan_touch,
+    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
+    SessionCall, SessionEnd, Touched, check, check_name, expiry_cause, guard, held,
+    plan as plan_touch,
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
@@ -124,6 +124,9 @@ use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::work_reconciliation::{
     self as declarations, WorkDeclarations, WorkDeclarationsResult, WorkDeclarationsUpdate,
     WorkDeclarationsView,
+};
+use super::work_recovery::{
+    MAX_RECOVERY_LISTED, RecoveryFacts, RecoveryRead, RecoveryRow, RecoveryViewer,
 };
 use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
@@ -295,7 +298,7 @@ impl Drop for PgStore {
             Ok(thread) => {
                 let _ = thread.join();
             }
-            Err(error) => eprintln!("hub: postgres client not closed: {error}"),
+            Err(error) => crate::hub::error_envelope::log_internal(&error),
         }
     }
 }
@@ -1955,7 +1958,8 @@ fn set_work_reservation(
     // A basis starts its lease now; clearing the basis clears the lease.
     tx.execute(
         "UPDATE hub_work_items SET terminal_outcome = $2, reservation_basis = $3,
-             reservation_renewed_at = $4, reservation_expires_at = $5 WHERE id = $1",
+             reservation_renewed_at = $4, reservation_expires_at = $5,
+             reservation_grace_at = NULL WHERE id = $1",
         &[
             &id,
             &outcome,
@@ -2059,7 +2063,7 @@ fn observe_lease_clock(tx: &mut postgres::Transaction<'_>, now: i64) -> Result<(
                 (row.get(0), row.get(1), row.get(2), row.get(3));
             lock_work_repository(tx, &provider, &host, &repository, repository_id)?;
             tx.execute(
-                "UPDATE hub_work_items SET reservation_expires_at = $2
+                "UPDATE hub_work_items SET reservation_expires_at = $2, reservation_grace_at = $7
                  WHERE provider = $3 AND host = $4 AND repository = $5
                    AND repository_id IS NOT DISTINCT FROM $6
                    AND reservation_basis IS NOT NULL AND reservation_expires_at > $1
@@ -2071,6 +2075,7 @@ fn observe_lease_clock(tx: &mut postgres::Transaction<'_>, now: i64) -> Result<(
                     &host,
                     &repository,
                     &repository_id,
+                    &now,
                 ],
             )?;
         }
@@ -2094,7 +2099,8 @@ fn renew_leases(
 ) -> Result<()> {
     tx.execute(
         "UPDATE hub_work_items SET reservation_renewed_at = $3,
-             reservation_expires_at = GREATEST(reservation_expires_at, $3::bigint + $4::bigint)
+             reservation_expires_at = GREATEST(reservation_expires_at, $3::bigint + $4::bigint),
+             reservation_grace_at = NULL
          WHERE lead_token = $1 AND lead_session = $2
            AND state <> 'finished' AND state IN ('active', 'blocked')
            AND reservation_basis IS NOT NULL AND reservation_expires_at > $3
@@ -2147,7 +2153,8 @@ fn session_tool_call(
                 .map_or(now, |row| row.get(0));
             tx.execute(
                 "UPDATE hub_work_items SET reservation_renewed_at = $3,
-                     reservation_expires_at = GREATEST(reservation_expires_at, $4::bigint + $5::bigint)
+                     reservation_expires_at = GREATEST(reservation_expires_at, $4::bigint + $5::bigint),
+                     reservation_grace_at = NULL
                  WHERE lead_token = $1 AND lead_session = $2
                    AND state <> 'finished' AND state IN ('active', 'blocked')
                    AND reservation_basis IS NOT NULL AND reservation_expires_at > $3",
@@ -2376,6 +2383,171 @@ fn lapse_reservations(
         reclaimed.push(reclaimed_hold(&item, expires_at));
     }
     Ok(reclaimed)
+}
+
+/// The operational rows of the repository's Work: `ids` when given, otherwise every Work that
+/// holds a reservation, ordered by id and bounded to `MAX_OPERATIONAL_WORK`; true when more
+/// matched.
+fn operational_rows(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    ids: Option<&[String]>,
+    now: i64,
+) -> Result<(Vec<OperationalRow>, bool)> {
+    let ids: Option<Vec<String>> = ids.map(<[String]>::to_vec);
+    let catchup_repository = repository_namespace(&who.repository, who.repository_id);
+    let catchup_key = catchup_repository_key(who.repository_id);
+    let settled = settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 5, 6, 7]);
+    let filter = if ids.is_some() {
+        "w.id = ANY($8)"
+    } else {
+        "w.reservation_basis IS NOT NULL"
+    };
+    let sql = format!(
+        "SELECT w.snapshot, w.terminal_outcome, w.reservation_basis, {settled},
+                w.reservation_renewed_at, w.reservation_expires_at,
+                s.via, s.tool_activity_at IS NOT NULL, w.reservation_grace_at
+         FROM hub_work_items w
+         LEFT JOIN hub_sessions s
+           ON s.token = w.lead_token AND s.session = w.lead_session
+         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+           AND w.repository_id IS NOT DISTINCT FROM $4 AND {filter}
+         ORDER BY w.id LIMIT 101"
+    );
+    let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+        &who.owner.identity.provider,
+        &who.owner.identity.host,
+        &who.repository,
+        &who.repository_id,
+        &catchup_repository,
+        &catchup_key,
+        &AUTO_PAUSE_SUMMARY,
+    ];
+    if let Some(ids) = &ids {
+        params.push(ids);
+    }
+    let mut found = tx.query(&sql, &params)?;
+    let more = found.len() > super::work_lifecycle::MAX_OPERATIONAL_WORK;
+    found.truncate(super::work_lifecycle::MAX_OPERATIONAL_WORK);
+    let mut items = found
+        .iter()
+        .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
+        .collect::<Result<Vec<_>>>()?;
+    project_claims(tx, &mut items, now)?;
+    let mut rows = Vec::new();
+    for (item, row) in items.into_iter().zip(&found) {
+        let outcome = row
+            .get::<_, Option<String>>(1)
+            .as_deref()
+            .and_then(work_transition::TerminalOutcome::from_column)
+            .filter(|_| item.state == WorkState::Finished);
+        let outcome = match outcome {
+            Some(outcome) => Some(OutcomeFact {
+                outcome,
+                provenance: terminal_provenance(tx, &item.id)?,
+            }),
+            None => None,
+        };
+        rows.push(OperationalRow {
+            item,
+            outcome,
+            basis: row
+                .get::<_, Option<String>>(2)
+                .as_deref()
+                .and_then(work_transition::ReservationBasis::from_column),
+            hidden_by_merged_pr: row.get::<_, bool>(3),
+            lease: row
+                .get::<_, Option<i64>>(4)
+                .zip(row.get::<_, Option<i64>>(5))
+                .map(|(renewed_at, expires_at)| Lease {
+                    renewed_at,
+                    expires_at,
+                    grace_at: row.get::<_, Option<i64>>(8),
+                }),
+            coverage: RenewalCoverage::of(
+                row.get::<_, Option<String>>(6).as_deref(),
+                row.get::<_, Option<bool>>(7).unwrap_or(false),
+            ),
+        });
+    }
+    Ok((rows, more))
+}
+
+/// The start of the last complete forge pull-request read of the repository, if any.
+fn forge_window_from(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<Option<i64>> {
+    let catchup_repository = repository_namespace(&who.repository, who.repository_id);
+    let catchup_key = catchup_repository_key(who.repository_id);
+    let forge_window = tx.query_opt(
+        "SELECT state, window_from FROM hub_catchup_sources
+         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND source=$5",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &catchup_repository,
+            &catchup_key,
+            &source_name(CatchupMergeSource::ForgePull),
+        ],
+    )?;
+    let forge_window_from = match forge_window {
+        Some(row)
+            if parse_coverage(&row.get::<_, String>(0))?
+                == super::catchup::CatchupCoverageState::ObservedOnly =>
+        {
+            row.get::<_, Option<i64>>(1)
+        }
+        _ => None,
+    };
+    Ok(forge_window_from)
+}
+
+/// The open coordination requests of the repository, by each Work they target or propose. Open
+/// requests are bounded by admission, so one read serves a whole recovery page.
+fn open_requests_by_work(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let rows = tx.query(
+        "SELECT r.id, r.proposed_work, t.work FROM hub_coordination_requests r
+         LEFT JOIN hub_coordination_targets t ON t.request = r.id
+         WHERE r.provider = $1 AND r.host = $2 AND r.repository = $3
+           AND r.repository_id IS NOT DISTINCT FROM $4
+           AND r.status IN ('pending', 'responded')",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+        ],
+    )?;
+    let mut by_work: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in rows {
+        let request: String = row.get(0);
+        for work in [
+            row.get::<_, Option<String>>(1),
+            row.get::<_, Option<String>>(2),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            by_work.entry(work).or_default().insert(request.clone());
+        }
+    }
+    Ok(by_work)
+}
+
+/// The unfinished Work that depends on `id`, bounded to one past `MAX_RECOVERY_LISTED`.
+fn work_dependents(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<Vec<String>> {
+    let limit = i64::try_from(MAX_RECOVERY_LISTED + 1).unwrap_or(i64::MAX);
+    Ok(tx
+        .query(
+            "SELECT r.work FROM hub_work_relations r JOIN hub_work_items w ON w.id = r.work
+             WHERE r.related = $1 AND r.kind = 'depends_on' AND w.state <> 'finished'
+             ORDER BY r.work LIMIT $2",
+            &[&id, &limit],
+        )?
+        .iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
 fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
@@ -4081,7 +4253,7 @@ fn start_in(
             if !work_holds_reservation(tx, &item.id)?
                 && let Some(refusal) = lapsed_hold_refusal(tx, who, &start.session, Some(&item.id))?
             {
-                return Err(HubError::Invalid(refusal));
+                return Err(HubError::lease_lapsed(refusal));
             }
             if item.title != start.title
                 || item.scope != scope
@@ -4120,7 +4292,7 @@ fn start_in(
                 && let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)?
             {
                 if !named {
-                    return Err(HubError::Invalid(lapsed_unheld_text(
+                    return Err(HubError::lease_lapsed(lapsed_unheld_text(
                         &item.id,
                         renewed,
                         expired,
@@ -5396,7 +5568,7 @@ fn session_name(
     match kept.as_slice() {
         [] => Ok(DEFAULT_SESSION.to_owned()),
         [only] if only.get::<_, bool>(1) => Ok(only.get(0)),
-        _ => Err(HubError::Invalid(SESSION_REQUIRED.into())),
+        _ => Err(HubError::session_required()),
     }
 }
 
@@ -5539,13 +5711,13 @@ fn guard_managed_touch(
     }
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
         if let Some(refusal) = lapsed_hold_refusal(tx, who, name, None)? {
-            return Err(HubError::Invalid(refusal));
+            return Err(HubError::lease_lapsed(refusal));
         }
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
     // A lapsed lease no longer holds the scope, so editing under it needs fresh admission first.
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
-        return Err(HubError::Invalid(lapsed_unheld_text(
+        return Err(HubError::lease_lapsed(lapsed_unheld_text(
             &eligible[0].id,
             renewed,
             expired,
@@ -5938,7 +6110,7 @@ fn auto_ask(
             Ok(Asked::Requested { holder }) => requested.push((key.clone(), holder)),
             Ok(_) => {}
             Err(error) => {
-                eprintln!("hub: handoff request for a refused edit: {error}");
+                crate::hub::error_envelope::log_internal(&error);
                 let _ = tx.batch_execute("ROLLBACK TO auto_ask; RELEASE auto_ask");
             }
         }
@@ -6738,7 +6910,7 @@ fn work_checkpoint_in(
     let carry = match lead_access(&item, &who.owner.id, token, &who.agent, &checkpoint.session) {
         LeadAccess::Current => false,
         LeadAccess::Carry => true,
-        LeadAccess::Refuse { message } => return Err(HubError::Invalid(message)),
+        LeadAccess::Refuse { message } => return Err(HubError::lead_session_mismatch(message)),
     };
     let prior_basis = work_reservation_basis(tx, &item.id)?;
     let held = prior_basis.is_some();
@@ -10174,7 +10346,7 @@ impl Store for PgStore {
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {
-                return Err(HubError::Invalid(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
+                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
             }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
@@ -10333,109 +10505,151 @@ impl Store for PgStore {
                     repository_id,
                 } => work_transition::person_who(owner, repository, *repository_id),
             };
-            let catchup_repository = repository_namespace(&who.repository, who.repository_id);
-            let catchup_key = catchup_repository_key(who.repository_id);
-            let settled =
-                settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 5, 6, 7]);
-            let filter = if ids.is_some() {
-                "w.id = ANY($8)"
-            } else {
-                "w.reservation_basis IS NOT NULL"
-            };
-            let sql = format!(
-                "SELECT w.snapshot, w.terminal_outcome, w.reservation_basis, {settled},
-                        w.reservation_renewed_at, w.reservation_expires_at,
-                        s.via, s.tool_activity_at IS NOT NULL
-                 FROM hub_work_items w
-                 LEFT JOIN hub_sessions s
-                   ON s.token = w.lead_token AND s.session = w.lead_session
-                 WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
-                   AND w.repository_id IS NOT DISTINCT FROM $4 AND {filter}
-                 ORDER BY w.id LIMIT 101"
-            );
-            let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
-                &who.owner.identity.provider,
-                &who.owner.identity.host,
-                &who.repository,
-                &who.repository_id,
-                &catchup_repository,
-                &catchup_key,
-                &AUTO_PAUSE_SUMMARY,
-            ];
-            if let Some(ids) = &ids {
-                params.push(ids);
-            }
-            let mut found = tx.query(&sql, &params)?;
-            let more = found.len() > super::work_lifecycle::MAX_OPERATIONAL_WORK;
-            found.truncate(super::work_lifecycle::MAX_OPERATIONAL_WORK);
-            let mut items = found
-                .iter()
-                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
-                .collect::<Result<Vec<_>>>()?;
-            project_claims(&mut tx, &mut items, now)?;
-            let mut rows = Vec::new();
-            for (item, row) in items.into_iter().zip(&found) {
-                let outcome = row
-                    .get::<_, Option<String>>(1)
-                    .as_deref()
-                    .and_then(work_transition::TerminalOutcome::from_column)
-                    .filter(|_| item.state == WorkState::Finished);
-                let outcome = match outcome {
-                    Some(outcome) => Some(OutcomeFact {
-                        outcome,
-                        provenance: terminal_provenance(&mut tx, &item.id)?,
-                    }),
-                    None => None,
-                };
-                rows.push(OperationalRow {
-                    item,
-                    outcome,
-                    basis: row
-                        .get::<_, Option<String>>(2)
-                        .as_deref()
-                        .and_then(work_transition::ReservationBasis::from_column),
-                    hidden_by_merged_pr: row.get::<_, bool>(3),
-                    lease: row
-                        .get::<_, Option<i64>>(4)
-                        .zip(row.get::<_, Option<i64>>(5))
-                        .map(|(renewed_at, expires_at)| Lease {
-                            renewed_at,
-                            expires_at,
-                        }),
-                    coverage: RenewalCoverage::of(
-                        row.get::<_, Option<String>>(6).as_deref(),
-                        row.get::<_, Option<bool>>(7).unwrap_or(false),
-                    ),
-                });
-            }
-            let forge_window = tx.query_opt(
-                "SELECT state, window_from FROM hub_catchup_sources
-                 WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND source=$5",
-                &[
-                    &who.owner.identity.provider,
-                    &who.owner.identity.host,
-                    &catchup_repository,
-                    &catchup_key,
-                    &source_name(CatchupMergeSource::ForgePull),
-                ],
-            )?;
-            let forge_window_from = match forge_window {
-                Some(row)
-                    if parse_coverage(&row.get::<_, String>(0))?
-                        == super::catchup::CatchupCoverageState::ObservedOnly =>
-                {
-                    row.get::<_, Option<i64>>(1)
-                }
-                _ => None,
-            };
+            let (rows, more) = operational_rows(&mut tx, &who, ids.as_deref(), now)?;
+            let forge_window_from = forge_window_from(&mut tx, &who)?;
             tx.commit()?;
             Ok(operational_page(
-            rows,
-            forge_window_from,
-            more,
-            now,
-            super::viewer::Viewer(&who.owner.id),
-        ))
+                rows,
+                forge_window_from,
+                more,
+                now,
+                super::viewer::Viewer(&who.owner.id),
+            ))
+        })
+    }
+
+    fn work_recovery_read(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        read: &RecoveryRead,
+        now: i64,
+    ) -> Result<RecoveryFacts> {
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
+            let (page, more) = match &read.work_id {
+                Some(id) => (vec![id.clone()], false),
+                None => {
+                    let limit = i64::try_from(read.limit + 1).unwrap_or(i64::MAX);
+                    let mut ids: Vec<String> = tx
+                        .query(
+                            "SELECT id FROM hub_work_items
+                             WHERE provider = $1 AND host = $2 AND repository = $3
+                               AND repository_id IS NOT DISTINCT FROM $4
+                               AND owner = $5 AND state <> 'finished' AND id > $6
+                             ORDER BY id LIMIT $7",
+                            &[
+                                &who.owner.identity.provider,
+                                &who.owner.identity.host,
+                                &who.repository,
+                                &who.repository_id,
+                                &who.owner.id,
+                                &read.after.as_deref().unwrap_or(""),
+                                &limit,
+                            ],
+                        )?
+                        .iter()
+                        .map(|row| row.get(0))
+                        .collect();
+                    let more = ids.len() > read.limit;
+                    ids.truncate(read.limit);
+                    (ids, more)
+                }
+            };
+            let (mut conflicts, mut conflicts_complete) = (Vec::new(), true);
+            let (mut matches, mut matches_complete) = (Vec::new(), true);
+            if !read.paths.is_empty() {
+                match work_scope_overlaps(&mut tx, &who, &read.paths, None, now) {
+                    Ok(found) => conflicts = found,
+                    Err(HubError::WorkOverlapIncomplete) => conflicts_complete = false,
+                    Err(error) => return Err(error),
+                }
+                let owned = tx.query(
+                    "SELECT id, scope FROM hub_work_items
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4
+                       AND owner = $5 AND state <> 'finished'
+                     ORDER BY id LIMIT 101",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &who.owner.id,
+                    ],
+                )?;
+                matches_complete = owned.len() <= 100;
+                for row in owned.iter().take(100) {
+                    let scope: Vec<String> = json_value(&row.get::<_, String>(1))?;
+                    if !scope_overlap_reasons(&read.paths, &scope).is_empty() {
+                        matches.push(row.get::<_, String>(0));
+                    }
+                }
+                matches_complete &= matches.len() <= MAX_RECOVERY_LISTED;
+                matches.truncate(MAX_RECOVERY_LISTED);
+            }
+            let mut ids: Vec<String> = page
+                .iter()
+                .chain(&matches)
+                .cloned()
+                .chain(
+                    conflicts
+                        .iter()
+                        .take(MAX_RECOVERY_LISTED)
+                        .map(|overlap| overlap.item.id.clone()),
+                )
+                .collect();
+            ids.sort();
+            ids.dedup();
+            let (rows, _) = operational_rows(&mut tx, &who, Some(&ids), now)?;
+            let mut requests = open_requests_by_work(&mut tx, &who)?;
+            let mut recovery = Vec::with_capacity(rows.len());
+            for row in rows {
+                let dependents = work_dependents(&mut tx, &row.item.id)?;
+                let requests = requests
+                    .remove(&row.item.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(MAX_RECOVERY_LISTED + 1)
+                    .collect();
+                recovery.push(RecoveryRow {
+                    row,
+                    requests,
+                    dependents,
+                });
+            }
+            let forge_window_from = forge_window_from(&mut tx, &who)?;
+            tx.commit()?;
+            Ok(RecoveryFacts {
+                viewer: RecoveryViewer {
+                    owner: who.owner.id.clone(),
+                    token: who.token.clone(),
+                    read_only: who.read_only,
+                },
+                page,
+                more,
+                conflicts,
+                conflicts_complete,
+                matches,
+                matches_complete,
+                rows: recovery,
+                forge_window_from,
+            })
         })
     }
 

@@ -19,7 +19,7 @@ use super::http::blocking;
 use super::publish::{Publication, Update, publication_on_forge};
 use super::store::unix_now;
 use super::workspace_execution::AgentTaskProfile;
-use super::{HubError, HubState, Result};
+use super::{HubState, Result};
 use crate::authority::workflows::CurrentEvidence;
 use crate::candidate::CandidateSubject;
 use crate::skill_workflow::LiveImportedOrigins;
@@ -252,18 +252,9 @@ pub fn binding_digest(
     format!("{:x}", hasher.finalize())
 }
 
-/// `agentscm/workflow/{target}` for a conservative target spelling.
-pub fn status_context(target: &str) -> Result<String> {
-    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
-    if target.is_empty()
-        || target.len() > 100
-        || !target.chars().all(allowed)
-        || !super::github::valid_ref_name(target)
-    {
-        return Err(HubError::Invalid("invalid status target".into()));
-    }
-    Ok(format!("agentscm/workflow/{target}"))
-}
+// The context spelling lives in `github`, which also builds on Windows, where the actionable
+// status projection matches it.
+pub use super::github::status_context;
 
 /// Pull requests examined per pass; the rest wait for the next one.
 const MAX_PULLS_PER_PASS: usize = 50;
@@ -395,7 +386,7 @@ pub(super) async fn reconcile_repo(
                     Ok(false) => break,
                     Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
                     Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                        eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
+                        crate::hub::error_envelope::log_internal(&detail);
                         break;
                     }
                 }
@@ -445,10 +436,10 @@ async fn retire_disabled(
                     if let Err(error) =
                         record_merge(state, conn, repo, number, merge_commit, head).await
                     {
-                        eprintln!(
+                        crate::hub::error_envelope::log_internal(&format!(
                             "hub: forge check for {}#{number}: recording the merge: {error}",
                             repo.full_name
-                        );
+                        ));
                     }
                     continue;
                 }
@@ -468,7 +459,7 @@ async fn retire_disabled(
             Ok(None) => None,
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
+                crate::hub::error_envelope::log_internal(&detail);
                 continue;
             }
         };
@@ -803,10 +794,10 @@ async fn post(
     };
     let gitlab = conn.provider == "gitlab";
     let uncertain = |detail: &str| {
-        eprintln!(
+        crate::hub::error_envelope::log_internal(&format!(
             "hub: forge check post for {}#{number}: {detail}",
             repo.full_name
-        );
+        ));
         Ok(Posting::Unknown)
     };
     // A list that cannot be read leaves the status uncertain; a stopped pass still stops.

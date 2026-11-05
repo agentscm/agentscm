@@ -559,7 +559,6 @@ describe('sign out', () => {
 describe('errors', () => {
   it.each([
     [403, /role in this workspace doesn’t allow this action/],
-    [503, /doesn’t have workspace sign-in turned on/],
     [429, /hub is busy/],
   ])('session %i → a readable notice with retry, no data', async (status, text) => {
     stubHub((url) => (path(url) === '/session' ? json(status, { error: 'x' }) : undefined))
@@ -567,6 +566,13 @@ describe('errors', () => {
     expect(await screen.findByText(text, {}, LOAD)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy()
     expect(screen.queryByRole('navigation', { name: 'Workspace sections' })).toBeNull()
+  })
+
+  it.each([404, 503])('session %i → workspace sign-in is off, and Retry is not offered', async (status) => {
+    stubHub((url) => (path(url) === '/session' ? json(status, { error: 'x' }) : undefined))
+    render(<WorkspacePage />)
+    expect(await screen.findByText(/doesn’t have workspace sign-in turned on/, {}, LOAD)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
   })
 
   it('401 shows the sign-in entrance, not an error', async () => {

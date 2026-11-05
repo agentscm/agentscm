@@ -43,7 +43,7 @@ fn required(name: &str) -> bool {
                 extra.is_none() && check.is_some_and(id) && constituent.is_none_or(id)
             })
         || name.strip_prefix(HUB_CHECK_PREFIX).is_some_and(|target| {
-            crate::hub::forge_check::status_context(target).is_ok_and(|c| c == name)
+            crate::hub::github::status_context(target).is_ok_and(|c| c == name)
         })
 }
 

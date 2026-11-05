@@ -41,6 +41,12 @@ pub fn routes() -> Router<HubState> {
             post(person_withdraw),
         )
         .route("/v1/hub/session/work/transition", post(person_transition))
+        .route("/v1/hub/session/work/transitions", post(person_transitions))
+        .route("/v1/hub/session/work/recovery", post(person_recovery))
+        .route(
+            "/v1/hub/session/work/recovery/preview",
+            post(person_recovery_preview),
+        )
         .route("/v1/hub/session/handoff/answer", post(person_answer))
         .route("/v1/hub/session/handoff/ask", post(person_ask))
 }
@@ -219,7 +225,6 @@ async fn withdraw(
 fn person_error(error: HubError) -> ApiError {
     match error {
         HubError::Unauthorized => not_your_agent(),
-        HubError::Invalid(message) => ApiError::invalid().with_message(message),
         other => other.into(),
     }
 }
@@ -396,6 +401,158 @@ async fn person_transition(
     }
     CHANGED.notify_waiters();
     Ok(Json(shown(result, &viewer)))
+}
+
+/// The repository a person acts in, checked the way a read-token mint checks it.
+async fn person_repository(
+    state: &HubState,
+    user: &super::store::User,
+    repository: &str,
+    via: &'static str,
+) -> std::result::Result<super::connection::ConnectedRepository, ApiError> {
+    super::store::validate_repository(repository)?;
+    super::login::devices::mint_check(state, user, repository, via).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonRecovery {
+    repository: String,
+    #[serde(default)]
+    work_id: Option<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// What a signed-in person can recover in one repository: their own Work, and anyone's as a
+/// Hub administrator. The same service and remedy rules an agent's inspection uses.
+async fn person_recovery(
+    State(state): State<HubState>,
+    human: HumanSession,
+    JsonBody(body): JsonBody<PersonRecovery>,
+) -> std::result::Result<Json<super::work_recovery::WorkRecoveryV1>, ApiError> {
+    let user = human.web_user()?.clone();
+    let is_admin = human.admin().is_ok();
+    let repository = person_repository(&state, &user, &body.repository, "work_recovery").await?;
+    let query = super::work_recovery::RecoveryQuery {
+        work_id: body.work_id,
+        paths: body.paths,
+        after: body.after,
+        limit: body.limit,
+        session: None,
+    };
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            super::work_recovery::inspect(
+                &*store,
+                &super::work_recovery::RecoveryCaller::Person {
+                    user: &user,
+                    repository: &repository.full_name,
+                    repository_id: repository.repository_id,
+                    is_admin,
+                },
+                &query,
+                unix_now(),
+            )
+        })
+        .await
+        .map_err(person_error)?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonPreview {
+    repository: String,
+    work_id: String,
+    remedy: super::work_recovery::RemedyKind,
+    #[serde(default)]
+    scope: Option<Vec<String>>,
+    #[serde(default)]
+    superseded_by: Option<String>,
+}
+
+async fn person_recovery_preview(
+    State(state): State<HubState>,
+    human: HumanSession,
+    JsonBody(body): JsonBody<PersonPreview>,
+) -> std::result::Result<Json<super::work_recovery::RemedyPreviewV1>, ApiError> {
+    let user = human.web_user()?.clone();
+    let is_admin = human.admin().is_ok();
+    let repository = person_repository(&state, &user, &body.repository, "work_recovery").await?;
+    let request = super::work_recovery::RemedyPreviewRequest {
+        work_id: body.work_id,
+        remedy: body.remedy,
+        session: None,
+        scope: body.scope,
+        superseded_by: body.superseded_by,
+    };
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            super::work_recovery::preview(
+                &*store,
+                &super::work_recovery::RecoveryCaller::Person {
+                    user: &user,
+                    repository: &repository.full_name,
+                    repository_id: repository.repository_id,
+                    is_admin,
+                },
+                &request,
+                unix_now(),
+            )
+        })
+        .await
+        .map_err(person_error)?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonTransitions {
+    repository: String,
+    items: Vec<super::work_recovery::BatchTransitionItem>,
+}
+
+/// A person's batch: each item is the person transition, applied in its own transaction.
+async fn person_transitions(
+    State(state): State<HubState>,
+    human: HumanSession,
+    JsonBody(body): JsonBody<PersonTransitions>,
+) -> std::result::Result<Json<super::work_recovery::WorkTransitionBatchV1>, ApiError> {
+    let user = human.web_user()?.clone();
+    let is_admin = human.admin().is_ok();
+    let repository = person_repository(&state, &user, &body.repository, "work_transition").await?;
+    let batch = super::work_recovery::WorkTransitionBatch {
+        session: None,
+        items: body.items,
+    };
+    let store = state.store.clone();
+    let result = blocking(&state, move || {
+        super::work_recovery::apply_batch(
+            &*store,
+            &super::work_transition::WorkTransitionActor::Person {
+                user: &user,
+                repository: &repository.full_name,
+                repository_id: repository.repository_id,
+                is_admin,
+            },
+            &batch,
+            unix_now(),
+        )
+        .map(|result| super::viewer::shown(result, &user.id))
+    })
+    .await
+    .map_err(person_error)?;
+    if result.applied > 0 {
+        CHANGED.notify_waiters();
+    }
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]

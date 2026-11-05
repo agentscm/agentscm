@@ -2523,7 +2523,8 @@ async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contenti
             tokio::task::block_in_place(|| {
                 let slack = f.slack();
                 let who = slack.principal(&f.state, &slack.bindings[0]).unwrap();
-                actionable_status::read(&**f.store(), &who, unix_now()).unwrap()
+                actionable_status::read(&**f.store(), &f.state.onboarding, &who, unix_now())
+                    .unwrap()
             })
         };
         assert!(

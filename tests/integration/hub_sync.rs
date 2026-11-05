@@ -505,6 +505,34 @@ async fn manifest_flow_creates_the_app_and_keeps_secrets_off_the_wire() {
     assert!(page.contains("name=manifest") && !page.contains("&quot;default_events&quot;"));
     assert!(!page.contains(&format!("/v1/hub/webhooks/github/{connection}")));
     assert!(page.contains("/v1/hub/github/setup/callback"));
+    // The page shows the owner and name and waits for a click: nothing submits by itself.
+    assert!(!page.contains("<script"), "{page}");
+    assert!(page.contains("Continue to GitHub") && page.contains("your personal GitHub account"));
+    // The owner and name can be changed before continuing; markup in them cannot get through.
+    let setup_path = format!("/v1/hub/github/setup/{secret}");
+    let (status, changed) = env
+        .raw(
+            Method::GET,
+            &format!("{setup_path}?owner=acme-co&name=my%20app"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(changed.contains(&format!(
+        "{}/organizations/acme-co/settings/apps/new?state={secret}",
+        env.fake.base
+    )));
+    assert!(changed.contains("the acme-co organization") && changed.contains("my app"));
+    for bad in [
+        "owner=a%2Fb",
+        "owner=%3Cb%3E",
+        "name=%3Cb%3E",
+        "name=bad%2Fname",
+    ] {
+        let uri = format!("{setup_path}?{bad}");
+        assert_eq!(env.raw(Method::GET, &uri, None, None).await.0, 400, "{bad}");
+    }
     assert_eq!(
         env.raw(Method::GET, "/v1/hub/github/setup/nope", None, None)
             .await
@@ -2244,7 +2272,7 @@ async fn a_pat_connection_is_created_once_and_acts_as_its_owner() {
         let (status, body) = env
             .post(&path, Some(&admin), json!({"full_name": refused}))
             .await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, body),
             (403, json!({"error": "forbidden"})),
             "{refused}"
@@ -2355,7 +2383,7 @@ async fn work_merges_intents_pulls_and_branches_for_the_tokens_repository() {
     let (status, body) = env
         .get("/v1/hub/repos/acme%2Fother/work", Some(&agent))
         .await;
-    assert_eq!((status, body), (404, json!({"error": "not_found"})));
+    crate::assert_hub_error!((status, body), (404, json!({"error": "not_found"})));
     assert_eq!(
         env.get("/v1/hub/repos/acme%2Fwidgets/work", None).await.0,
         401
@@ -2976,7 +3004,7 @@ async fn a_pat_that_changed_owner_stops_startup_and_a_shared_repository_stays_wi
             json!({"full_name": "acme/shared"}),
         )
         .await;
-    assert_eq!((status, body), (409, json!({"error": "already_connected"})));
+    crate::assert_hub_error!((status, body), (409, json!({"error": "already_connected"})));
 
     // A different account behind the same token: the label would be wrong.
     env.fake
@@ -3094,8 +3122,22 @@ async fn the_cli_sets_up_and_manages_connections() {
         )
         .await;
     assert!(
-        page.contains("/organizations/acme/settings/apps/new?state="),
+        page.contains("/organizations/acme/settings/apps/new?state=")
+            && page.contains("the acme organization"),
         "{page}"
+    );
+    // An empty owner switches this view to the personal account.
+    let (_, personal) = env
+        .raw(
+            Method::GET,
+            &format!("/v1/hub/github/setup/{secret}?owner="),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        personal.contains("/settings/apps/new?state=") && !personal.contains("/organizations/"),
+        "{personal}"
     );
 
     // Without a session, or as a non-administrator, nothing works.
@@ -3437,7 +3479,12 @@ async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
         )
         .await;
     assert_eq!(foreign["result"]["isError"], true);
-    assert!(foreign["result"]["structuredContent"].is_null());
+    // A token for another repository learns nothing but the refusal itself.
+    assert_eq!(
+        foreign["result"]["structuredContent"]["error"]["code"],
+        "wrong_repository"
+    );
+    assert!(foreign["result"]["structuredContent"]["work"].is_null());
     assert!(
         foreign["result"]["content"][0]["text"]
             .as_str()

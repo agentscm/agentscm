@@ -39,6 +39,7 @@ dependencies = [
  "tower-service",
  "tray-icon",
  "winit",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

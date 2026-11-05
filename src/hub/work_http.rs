@@ -42,6 +42,9 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/start", post(start))
         .route("/v1/hub/standup/checkpoint", post(checkpoint))
         .route("/v1/hub/standup/work-transition", post(work_transition))
+        .route("/v1/hub/standup/work-transitions", post(work_transitions))
+        .route("/v1/hub/standup/recovery", post(recovery))
+        .route("/v1/hub/standup/recovery/preview", post(recovery_preview))
         .route("/v1/hub/standup/operational", get(operational_overview))
         .route(
             "/v1/hub/standup/work/{id}/operational",
@@ -350,6 +353,78 @@ async fn work_transition(
     Ok(Json(result))
 }
 
+/// What the token's owner can recover: a pure read that read-only tokens may make. Every
+/// remedy it lists for a read-only token is refused as `read_only`.
+async fn recovery(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    JsonBody(query): JsonBody<super::work_recovery::RecoveryQuery>,
+) -> Result<Json<super::work_recovery::WorkRecoveryV1>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            super::work_recovery::inspect(
+                &*store,
+                &super::work_recovery::RecoveryCaller::Agent {
+                    token: &principal.token_id,
+                    session: query.session.as_deref(),
+                },
+                &query,
+                unix_now(),
+            )
+        })
+        .await?,
+    ))
+}
+
+/// What one remedy would change and the exact call that applies it. Never writes.
+async fn recovery_preview(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    JsonBody(request): JsonBody<super::work_recovery::RemedyPreviewRequest>,
+) -> Result<Json<super::work_recovery::RemedyPreviewV1>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            super::work_recovery::preview(
+                &*store,
+                &super::work_recovery::RecoveryCaller::Agent {
+                    token: &principal.token_id,
+                    session: request.session.as_deref(),
+                },
+                &request,
+                unix_now(),
+            )
+        })
+        .await?,
+    ))
+}
+
+/// Up to 25 transitions, each applied in its own transaction with its own outcome.
+async fn work_transitions(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(batch): JsonBody<super::work_recovery::WorkTransitionBatch>,
+) -> Result<Json<super::work_recovery::WorkTransitionBatchV1>, ApiError> {
+    let store = state.store.clone();
+    let result = blocking(&state, move || {
+        super::work_recovery::apply_batch(
+            &*store,
+            &WorkTransitionActor::Agent {
+                token: &principal.token_id,
+            },
+            &batch,
+            unix_now(),
+        )
+        .map(|result| shown(result, &principal.owner.id))
+    })
+    .await?;
+    if result.applied > 0 {
+        super::coordination_http::CHANGED.notify_waiters();
+    }
+    Ok(Json(result))
+}
+
 /// A cached agent synthesis of the bounded source window; never acknowledges review.
 async fn narrative(
     State(state): State<HubState>,
@@ -613,19 +688,10 @@ async fn start(
     .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(HubError::WorkPreflight(mut preflight)) => {
-            preflight.show(Viewer(&viewer));
-            (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "work_preflight_required",
-                "message": "Atomic admission found changed, incomplete or conflicting source facts. No new Work was claimed.",
-                "preflight": preflight,
-            })),
-        )
-            .into_response()
+        Err(mut error) => {
+            error.show(Viewer(&viewer));
+            ApiError::from(error).into_response()
         }
-        Err(error) => ApiError::from(error).into_response(),
     }
 }
 
@@ -674,21 +740,10 @@ async fn checkpoint(
 }
 
 fn work_error(error: HubError) -> Response {
-    match error {
-        HubError::WorkCoordinationRequired { overlaps, request } => {
-            super::coordination_http::CHANGED.notify_waiters();
-            (StatusCode::CONFLICT, Json(json!({"error": "work_coordination_required",
-                "overlaps": overlaps, "coordination_request": request,
-                "message": "Scope was not changed. A durable request is queued for the affected leads."}))).into_response()
-        },
-        HubError::WorkOverlap(overlaps) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "work_scope_overlap", "overlaps": overlaps,
-                "alternatives": ["Split the declared scope or join the existing work as helper or reviewer.",
-                    "Arrange a deliberate handover with the current lead."]})),
-        ).into_response(),
-        error => ApiError::from(error).into_response(),
+    if matches!(&error, HubError::WorkCoordinationRequired { .. }) {
+        super::coordination_http::CHANGED.notify_waiters();
     }
+    ApiError::from(error).into_response()
 }
 
 async fn acknowledge(
@@ -709,9 +764,10 @@ async fn actionable_status(
     Reader(principal): Reader,
 ) -> Result<Json<actionable_status::ActionableStatus>, ApiError> {
     let store = state.store.clone();
+    let setup = state.onboarding.clone();
     Ok(Json(
         blocking(&state, move || {
-            let mut status = actionable_status::read(&*store, &principal, unix_now())?;
+            let mut status = actionable_status::read(&*store, &setup, &principal, unix_now())?;
             status.show(Viewer(&principal.owner.id));
             Ok(status)
         })
