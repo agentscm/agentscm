@@ -313,10 +313,8 @@ fn setup_cli_strict_arguments_and_unsupported_profiles_have_no_installation_effe
         let output = invoke(&temp, &arguments);
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&output.stderr).unwrap()["ok"],
-            false
-        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+        assert!(serde_json::from_slice::<Value>(&output.stderr).is_err());
     }
     for profile in ["team", "linux-service", "model-assisted"] {
         failure(

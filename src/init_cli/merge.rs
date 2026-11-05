@@ -3,7 +3,7 @@
 //! alone.
 
 /// The start of the begin line, which identifies it whatever follows.
-const BEGIN_PREFIX: &str = "<!-- agentscm:begin";
+pub(super) const BEGIN_PREFIX: &str = "<!-- agentscm:begin";
 const BEGIN: &str = "<!-- agentscm:begin -->";
 const END: &str = "<!-- agentscm:end -->";
 

@@ -3924,8 +3924,23 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
     assert_eq!(record["clients"], json!([root.to_str().unwrap()]));
     assert!(record.get("hooks").is_none() && record.get("tokens").is_none());
 
-    // Nothing is proven until a native session and the MCP server have both spoken.
+    // Nothing is proven until a native session and the MCP server have both spoken. Doctor says
+    // so in words, and a token file that was handed in is never described as renewing.
     assert!(onboarding(&hub, &token).is_empty());
+    let doctor = |extra: &[&str]| {
+        let mut args = vec!["--no-telemetry", "client", "doctor", "--agent", "claude"];
+        args.extend(extra);
+        ok(&machine.run(&root, &args))
+    };
+    let said = doctor(&[]);
+    assert!(
+        said.starts_with("Unverified: call agentscm_setup_status"),
+        "{said}"
+    );
+    assert_eq!(doctor(&["--json"]).trim(), "[]");
+    let checked = ok(&machine.run(&root, &["--no-telemetry", "client", "check"]));
+    assert!(checked.contains("token expires"), "{checked}");
+    assert!(!checked.contains("renew"), "{checked}");
     let session = "quickstart-session";
     let hook = |event: &str, tool: bool| {
         let mut payload = json!({"session_id": session, "cwd": root, "hook_event_name": event});
@@ -3957,11 +3972,27 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
         onboarding(&hub, &token),
         [("claude".to_owned(), "unverified".to_owned())]
     );
+    let said = doctor(&[]);
+    assert!(
+        said.starts_with(
+            "claude session quickstart-session: unverified (MCP seen, native edit hook not seen). "
+        ),
+        "{said}"
+    );
     hook("PreToolUse", true);
     assert_eq!(
         onboarding(&hub, &token),
         [("claude".to_owned(), "ready".to_owned())]
     );
+    // The same proof, read back through doctor: a summary line, not a stray `[]`, and the JSON on request.
+    let said = doctor(&[]);
+    assert_eq!(
+        said.lines().collect::<Vec<_>>(),
+        ["claude session quickstart-session: ready (MCP seen, native edit hook seen)."],
+        "{said}"
+    );
+    let rows: Value = serde_json::from_str(&doctor(&["--json"])).unwrap();
+    assert_eq!(rows[0]["state"], "ready", "{rows}");
 }
 
 #[test]

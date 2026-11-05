@@ -23,6 +23,9 @@ pub(super) const RENEW_INTERVAL_SECONDS: i64 = 60;
 pub const IN_FLIGHT_CAP_SECONDS: i64 = 3600;
 /// The start of the refusal a lead meets after its reservation lapsed; every surface shows it.
 pub const LEASE_LAPSED: &str = "LEASE_LAPSED";
+/// The start of the refusal of an edit not linked to a current assignment of its session. Like
+/// `LEASE_LAPSED`, it holds for every repeat until a start or checkpoint links the edit.
+pub const EDIT_UNLINKED: &str = "EDIT_UNLINKED";
 /// Participants from owners other than the Work's own. The rest of the 100 participants stay for
 /// the owner's sessions, so other owners cannot block a resume or slow cleanup without bound.
 pub const MAX_OTHER_OWNER_PARTICIPANTS: usize = 25;

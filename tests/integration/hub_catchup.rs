@@ -2789,6 +2789,8 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 operation_id: "cleanup-renamed-requester".into(),
                 session: resumed.item.lead_session.clone(),
                 expected_updated_seq: request.updated_seq,
+                target: None,
+                via_hub: false,
             },
             lapsed + 1,
         )
