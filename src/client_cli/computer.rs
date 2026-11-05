@@ -344,6 +344,16 @@ pub(crate) enum Renewal {
     Unavailable,
 }
 
+/// True when `latest` is a concurrent renewal of `saved`: a different managed token that is not
+/// due yet.
+fn superseded(saved: &Connection, latest: &Connection, now: i64) -> bool {
+    latest.owned_token_id.is_some()
+        && latest.owned_token_id != saved.owned_token_id
+        && latest.hub == saved.hub
+        && latest.repo == saved.repo
+        && !due(latest, now)
+}
+
 /// Renews the checkout's managed token when it is due: mint a new one, save it, then revoke
 /// the old one, so a failure part way leaves a working token.
 async fn renew(root: &Path) -> Result<Renewal> {
@@ -387,10 +397,20 @@ async fn renew(root: &Path) -> Result<Renewal> {
     renewed.owned_token_id = Some(minted.id.clone());
     renewed.owned_token_expires_at = Some(verified.expires_at);
     let lifecycle = lifecycle_lock()?;
-    let unchanged = load()?
+    let latest = load()?
         .into_iter()
-        .find(|connection| connection.root == root)
-        .is_some_and(|latest| latest == saved);
+        .find(|connection| connection.root == root);
+    // Another hook process renewed this checkout while we minted: its token is current, so ours
+    // is surplus. Reporting that as unavailable would show a working connection as failed.
+    if latest
+        .as_ref()
+        .is_some_and(|latest| superseded(&saved, latest, unix_now()))
+    {
+        drop(lifecycle);
+        revoke_minted(&saved, &minted).await;
+        return Ok(Renewal::Renewed);
+    }
+    let unchanged = latest.is_some_and(|latest| latest == saved);
     let saved_new = unchanged
         && write_owned_token(&renewed.token_file, &minted.token).is_ok()
         && match update(root, Some(&saved), Some(renewed.clone())) {
@@ -599,6 +619,26 @@ mod tests {
         assert!(due(&connection(id, Some(now - 10)), now));
         // A supplied token's lifecycle is managed elsewhere.
         assert!(!due(&connection(None, None), now));
+    }
+
+    #[test]
+    fn a_concurrent_renewal_supersedes_ours_but_other_changes_do_not() {
+        let now = 1_000_000;
+        let stale = connection(Some("tok_old"), Some(now - 10));
+        let fresh = connection(Some("tok_new"), Some(now + 2 * RENEW_BEFORE_SECONDS));
+        assert!(superseded(&stale, &fresh, now));
+        // The same token, a renewal that is itself already due, or another repository is not.
+        assert!(!superseded(&stale, &stale, now));
+        assert!(!superseded(
+            &stale,
+            &connection(Some("tok_new"), Some(now)),
+            now
+        ));
+        let mut other = fresh.clone();
+        other.repo = "acme/other".into();
+        assert!(!superseded(&stale, &other, now));
+        // A binding switched to a supplied token is not a renewal either.
+        assert!(!superseded(&stale, &connection(None, None), now));
     }
 
     #[test]
