@@ -131,6 +131,6 @@ jobs:
           BRANCH: ${{ needs.prepare.outputs.branch }}
         run: |
           set -euo pipefail
-          for workflow in ci windows hub-e2e container execution-live; do
+          for workflow in ci windows container execution-live; do
             gh workflow run "$workflow.yml" --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
           done
