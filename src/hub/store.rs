@@ -36,7 +36,7 @@ use super::promise::{
     PromiseReceiptV1, PromiseViewV1,
 };
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
-use super::session::{SessionCall, Touched};
+use super::session::{SessionCall, SessionEnd, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
@@ -367,6 +367,18 @@ pub trait Store: Send + Sync {
     /// Release the session's intent (if any) and delete the session row. `None` resolves like
     /// `SessionCall.session`. True if a session existed.
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool>;
+    /// `end_session`, and in the same transaction pause the active Work the session leads, with
+    /// the pause checkpoint a lead would write (`work_checkpoint`). Blocked Work stays blocked;
+    /// Work with no session row is still paused. If the pause fails nothing is written, so the
+    /// intent stays held and the call can be repeated. `via` (`mcp` or `hook:<agent>`) names the
+    /// pause's operation, which is fixed by the Work's generation and sequence.
+    fn end_session_pausing(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        via: &str,
+        now: i64,
+    ) -> Result<SessionEnd>;
     /// Asks the live session intent holding exactly the file `path` to hand it over to the
     /// requesting session (`session` resolves like `SessionCall.session`). `note` is filtered and
     /// cut to 200 chars. One request per file and session, at most 3 open per session.

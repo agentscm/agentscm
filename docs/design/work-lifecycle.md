@@ -176,9 +176,12 @@ token of the owner may do it in any state, and the claim need not be stale; the 
 runs. While no reservation is held, progress, decision and blocker checkpoints are refused with a
 request to resume first, so a re-reading lead cannot flip the state to active with nothing held.
 
-The `agentscm_done` and hook flow that releases the intent and then pauses the Work stays two
-separate steps. A crash between them leaves active Work with a reservation and no intent. The
-projection has no intent field, so that state looks like ordinary held Work; a release clears it.
+The `agentscm_done` and hook session end release the intent and pause the Work in one transaction,
+on both stores. The Work is the active Work the session leads, read inside that transaction, and the
+pause is the checkpoint a lead would write: the reservation keeps its basis, so a `retained` hold
+stays `retained`. If the pause fails, nothing is written: the intent stays held and the end can be
+repeated. Blocked Work stays blocked, and paused, handed-over and finished Work are not found, so a
+repeat of an end that committed changes nothing. A session with no Work still releases its intent.
 
 ## 6. The WorkOperationalV1 projection
 
