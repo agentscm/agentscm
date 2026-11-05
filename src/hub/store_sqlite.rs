@@ -5494,9 +5494,11 @@ fn alias_hook_session(
     }
     let eligible = tx
         .query_row(
+            // Only unfinished Work is worth adopting; finished Work binds nobody.
             "SELECT 1 WHERE EXISTS (
                  SELECT 1 FROM hub_work_participants p
-                 WHERE p.token=?1 AND p.session=?2)",
+                 JOIN hub_work_items w ON w.id = p.work
+                 WHERE p.token=?1 AND p.session=?2 AND w.state <> 'finished')",
             params![token, DEFAULT_SESSION],
             |_| Ok(()),
         )
