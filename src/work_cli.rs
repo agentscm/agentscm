@@ -15,6 +15,10 @@ use agentscm::hub::work::{
 };
 use agentscm::hub::work_links::WorkPrLinkUpdate;
 use agentscm::hub::work_reconciliation::WorkDeclarationsUpdate;
+use agentscm::hub::work_recovery::{
+    RecoveryQuery, RemedyKind, RemedyPreviewRequest, WorkRecoveryV1, WorkTransitionBatch,
+    WorkTransitionBatchV1,
+};
 use agentscm::{Error, Result};
 use clap::Subcommand;
 use reqwest::Method;
@@ -176,6 +180,53 @@ pub enum WorkCommand {
         #[arg(long, default_value = "-")]
         request: PathBuf,
     },
+    /// Show what you can recover: your owner's unfinished Work (active, needs you, can resume),
+    /// why each still exists, and every remedy typed as permitted or refused with its exact call.
+    /// With --path, also the live holds over those paths and your owner's resumable Work there.
+    Recovery {
+        /// One Work item of the repository, whoever owns it.
+        #[arg(long)]
+        work_id: Option<String>,
+        /// A path you mean to edit; repeat for more (at most 32).
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// The next_after of the previous page.
+        #[arg(long)]
+        after: Option<String>,
+        /// Work items per page, 1 to 50; defaults to 20.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Your agent session, which tells its lead from your owner's other sessions.
+        #[arg(long)]
+        session: Option<String>,
+        /// Print the versioned JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview what one remedy would change and the exact call that applies it. Changes nothing.
+    RecoveryPreview {
+        #[arg(long)]
+        work_id: String,
+        /// release, retain, complete, abandon, supersede, reopen, resume or handover.
+        #[arg(long)]
+        remedy: String,
+        /// Your agent session.
+        #[arg(long)]
+        session: Option<String>,
+        /// For a handover: a path the next lead takes; repeat for more. The rest is freed.
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        /// For a supersede: the Work that replaces this one.
+        #[arg(long)]
+        superseded_by: Option<String>,
+    },
+    /// Apply up to 25 Work transitions in order, each on its own, with one outcome per item.
+    /// Exits non-zero when any item was not applied; earlier items stay applied.
+    Transitions {
+        /// Strict WorkTransitionBatch JSON file, or - for standard input.
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
     /// Record work and print its committed-operation receipt plus the current item.
     Checkpoint {
         /// Strict WorkCheckpoint JSON; new operations require expected_updated_seq. Use - for stdin.
@@ -291,6 +342,8 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Reconciliation { .. }
         | WorkCommand::Declarations { .. }
         | WorkCommand::Insight { .. }
+        | WorkCommand::Recovery { .. }
+        | WorkCommand::RecoveryPreview { .. }
         | WorkCommand::Insights { .. } => false,
         WorkCommand::Compact { apply, .. }
         | WorkCommand::RepairMerge { apply, .. }
@@ -305,6 +358,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::DeclarationsSet { .. }
         | WorkCommand::ReconcileApply { .. }
         | WorkCommand::Checkpoint { .. }
+        | WorkCommand::Transitions { .. }
         | WorkCommand::Ack { .. } => true,
         WorkCommand::CatchupAck { .. } => true,
     }
@@ -749,6 +803,83 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                         | agentscm::hub::work::WorkState::Handover
                 );
             (reply, claim_conflict)
+        }
+        WorkCommand::Recovery {
+            work_id,
+            paths,
+            after,
+            limit,
+            session,
+            json,
+        } => {
+            let query = RecoveryQuery {
+                work_id,
+                paths,
+                after,
+                limit,
+                session,
+            };
+            let reply = hub
+                .call(
+                    Method::POST,
+                    "/v1/hub/standup/recovery",
+                    Some(serde_json::to_value(query)?),
+                )
+                .await?;
+            let recovery: WorkRecoveryV1 = serde_json::from_value(reply.clone())?;
+            if json {
+                println!("{reply}");
+            } else {
+                println!("{}", agentscm::hub::work_recovery::render_text(&recovery));
+            }
+            return Ok(());
+        }
+        WorkCommand::RecoveryPreview {
+            work_id,
+            remedy,
+            session,
+            scope,
+            superseded_by,
+        } => {
+            let remedy: RemedyKind = serde_json::from_value(json!(remedy)).map_err(|_| {
+                invalid("unknown remedy; see agentscm work recovery-preview --help")
+            })?;
+            let request = RemedyPreviewRequest {
+                work_id,
+                remedy,
+                session,
+                scope: (!scope.is_empty()).then_some(scope),
+                superseded_by,
+            };
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/recovery/preview",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::Transitions { request } => {
+            let request: WorkTransitionBatch = read_request(&request)?;
+            let reply = hub
+                .call(
+                    Method::POST,
+                    "/v1/hub/standup/work-transitions",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?;
+            let result: WorkTransitionBatchV1 = serde_json::from_value(reply.clone())?;
+            println!("{reply}");
+            if result.not_applied > 0 {
+                return Err(Error::Conflict(format!(
+                    "{} of {} transitions were not applied; each item's outcome, code and retry are in the JSON result",
+                    result.not_applied,
+                    result.items.len()
+                )));
+            }
+            return Ok(());
         }
         WorkCommand::Checkpoint { request } => {
             let request: WorkCheckpoint = read_request(&request)?;

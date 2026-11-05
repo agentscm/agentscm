@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import type { BrowserSession } from '../devices.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import {
   fetchBriefing,
@@ -280,10 +281,10 @@ function useWorkRoute() {
 }
 
 /** History › Finished and Changes, and the page of one task. */
-export function WorkPage({ token, overview, handoff }: { token: string; overview: Poll<WorkOverview>; handoff?: Handoff }) {
+export function WorkPage({ token, overview, handoff, session = null }: { token: string; overview: Poll<WorkOverview>; handoff?: Handoff; session?: BrowserSession | null }) {
   const { id, tab } = useWorkRoute()
   const [search, setSearch] = useState('')
-  if (id) return <WorkDetail id={id} token={token} overview={overview} handoff={handoff} />
+  if (id) return <WorkDetail id={id} token={token} overview={overview} handoff={handoff} session={session} />
   const ov = overview.kind === 'ready' ? overview.value : null
   const finished = ov?.recent.filter((o) => o.kind === 'completion').length ?? 0
   const history = tab === 'history'

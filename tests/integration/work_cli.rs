@@ -784,3 +784,94 @@ fn shared_status_cli_has_text_and_json_without_generated_prose() {
     assert_eq!(status["counts"]["active"], 1);
     assert_eq!(status["work"][0]["state"], "active");
 }
+
+#[test]
+fn recovery_cli_inspects_previews_and_applies_a_batch_with_per_item_outcomes() {
+    let hub = Hub::start();
+    let client = hub.bound_client(902, "synthetic-recovery-owner", 101);
+    let started = client.start(r#"{"request_key":"recover-cli","title":"Obsolete task","session":"old-session","scope":["src/old.rs"]}"#);
+    assert!(started.status.success(), "{started:?}");
+    let start: WorkStartResult = serde_json::from_slice(&started.stdout).unwrap();
+    let id = start.item.id.clone();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(args)
+            .env_clear()
+            .env("HOME", client.config.path())
+            .env("XDG_CONFIG_HOME", client.config.path())
+            .env("AGENTSCM_HUB_URL", &client.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+            .output()
+            .unwrap()
+    };
+    // Text and JSON inspection, with the live hold over the path listed exactly.
+    let text = run(&[
+        "work",
+        "recovery",
+        "--session",
+        "new-session",
+        "--path",
+        "src/old.rs",
+    ]);
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.starts_with("AgentSCM recovery: 1 active"), "{text}");
+    assert!(
+        text.contains(&format!("conflict {id} on src/old.rs")),
+        "{text}"
+    );
+    let json = run(&["work", "recovery", "--json", "--session", "new-session"]);
+    assert!(json.status.success(), "{json:?}");
+    let page: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(page["work"][0]["work_id"], id.as_str());
+    assert_eq!(page["work"][0]["standing"], "owner");
+
+    let preview = run(&[
+        "work",
+        "recovery-preview",
+        "--work-id",
+        &id,
+        "--remedy",
+        "release",
+        "--session",
+        "new-session",
+    ]);
+    assert!(preview.status.success(), "{preview:?}");
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["permitted"], true);
+    assert_eq!(preview["effects"]["follow_up"]["unfinished"], true);
+    let unknown = run(&[
+        "work",
+        "recovery-preview",
+        "--work-id",
+        &id,
+        "--remedy",
+        "steal",
+    ]);
+    assert!(!unknown.status.success());
+
+    // One item applies; a second with a stale fence is refused and the command exits non-zero.
+    let batch = serde_json::json!({"session": "new-session", "items": [
+        {"work_id": id, "operation_id": "cli-release", "generation": preview["generation"],
+         "expected_updated_seq": preview["expected_updated_seq"], "transition": "release",
+         "reason": "its session is gone"},
+        {"work_id": id, "operation_id": "cli-abandon", "generation": preview["generation"],
+         "expected_updated_seq": preview["expected_updated_seq"], "transition": "abandon",
+         "reason": "stale read"}
+    ]});
+    let applied = client.request("transitions", &batch.to_string());
+    assert!(!applied.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(result["items"][0]["outcome"], "applied");
+    assert_eq!(result["items"][1]["outcome"], "refused");
+    assert_eq!(result["items"][1]["code"], "generation_changed");
+    assert_eq!(
+        (result["applied"].as_u64(), result["not_applied"].as_u64()),
+        (Some(1), Some(1))
+    );
+    let stderr = String::from_utf8_lossy(&applied.stderr);
+    assert!(
+        stderr.contains("1 of 2 transitions were not applied"),
+        "{stderr}"
+    );
+}

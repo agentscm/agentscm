@@ -831,6 +831,18 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<OperationalOverviewV1>;
 
+    /// What a recovery inspection or preview needs, in one snapshot: the page of the reader
+    /// owner's unfinished Work after the cursor (or the one `work_id`), the live holds over the
+    /// paths with their exact overlaps, the owner's unfinished Work whose scope overlaps them,
+    /// and for each listed Work its open coordination requests and unfinished dependents.
+    /// Never writes. A person reader must already have passed the repository role check.
+    fn work_recovery_read(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        read: &super::work_recovery::RecoveryRead,
+        now: i64,
+    ) -> Result<super::work_recovery::RecoveryFacts>;
+
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
     /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, owner login,

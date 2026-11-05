@@ -856,6 +856,7 @@ mod tests {
             lease: held.then_some(Lease {
                 renewed_at: 100,
                 expires_at: 100 + LEASE_SECONDS,
+                grace_at: None,
             }),
             coverage: RenewalCoverage::ToolCalls,
             now: 100,

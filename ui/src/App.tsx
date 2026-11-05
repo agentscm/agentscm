@@ -223,7 +223,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
       case 'inbox':
         return <InboxPage token={token} overview={overview} handoff={handoff} session={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session : null} live={d ? { agents: d.agents, contested: d.contested } : null} />
       case 'work':
-        return <WorkPage token={token} overview={overview} handoff={handoff} />
+        return <WorkPage token={token} overview={overview} handoff={handoff} session={device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' ? device.auth.value.session : null} />
       case 'promises':
         return <PromisesPage />
       case 'workflows':
