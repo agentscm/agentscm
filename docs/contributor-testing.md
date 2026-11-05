@@ -66,6 +66,22 @@ For a maintainer with a signing key, the attestation from `tools/attest-pr.sh` s
 
 Any later change invalidates the evidence for affected checks. Rerun those checks and complete the required final validation before the head is reported ready. That validation is an accepted attestation; a hand-run gate's result is reported as unsigned and does not make the head ready. Changes to the test runner or its configuration always require the full nextest suite, separate doctests and corresponding documentation checks even when the configuration diff is small.
 
+## Heavy-job queue helper
+
+`tools/attest-pr.sh --queue` shows the per-user local FIFO shared by attestations and `--with-lock` commands. Use `tools/attest-pr.sh --with-lock --kind focused COMMAND [ARG...]` to admit a resource-intensive focused check alongside other queued work. Kind labels do not change order. See [local admission and recovery](advanced/local-validation.md#run-verify-and-post) for thresholds, dependencies, status fields and rollout limits.
+
+The standalone `tools/heavy-job-queue.rs` tests are outside Cargo and are not selected by the active attestation recipe. After changing the helper, compile and run its process tests explicitly from the repository root:
+
+```sh
+rustfmt --edition 2024 --check tools/heavy-job-queue.rs
+queue_tests=$(mktemp -d)
+rustc --edition=2024 -D warnings --test tools/heavy-job-queue.rs -o "$queue_tests/tests"
+"$queue_tests/tests"
+rm -rf "$queue_tests"
+```
+
+The seven tests cover FIFO ordering, cancellation, status and argument boundaries, stale waiters and legacy locks, supervisor death and process-group exclusion, blocked-head resource admission, and malformed, oversized or symlinked metadata. They compile their own supervisor with the pinned `rustc` and need Unix shell tools, `ps` and Python 3; wrapper bootstrap additionally needs `shasum`. Qualification on macOS uses synthetic memory and disk probes with real processes and file locks. Linux runtime behavior remains unqualified; a cross-target compile establishes compilation only. These helper tests supplement the full-head gate and do not establish recovery from every interrupted metadata write or support descendants that both escape the group and close the inherited descriptor.
+
 ## Compare coverage
 
 Use one fixed source revision, Rust toolchain, nextest version, feature set and service environment. Retain the inventories from these commands:

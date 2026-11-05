@@ -301,12 +301,14 @@ fn status(root: &Path) -> io::Result<()> {
         count += 1;
         let since: u64 = fields[3].parse().map_err(io::Error::other)?;
         println!(
-            "{} {} kind={} {}={}s repo={} blocked={}",
+            "{} {} kind={} {}={}s pid={} repo={} blocked={}",
             if pid.is_some() { "holder" } else { "waiter" },
             count,
             fields[1],
             if pid.is_some() { "elapsed" } else { "waited" },
             now().saturating_sub(since),
+            pid.map(|p| p.to_string())
+                .unwrap_or_else(|| "pending".into()),
             fields[2],
             fields[4]
         );
@@ -357,7 +359,7 @@ fn legacy_ready(root: &Path, own: &Path, legacy: &Path) -> io::Result<bool> {
     };
     let legacy_empty = match read(&legacy.join("pid")) {
         Ok(text) => {
-            if text.parse::<u32>().ok().filter(|p| *p > 0).is_none() {
+            if text.trim().parse::<u32>().ok().filter(|p| *p > 0).is_none() {
                 return Err(io::Error::other("invalid legacy PID"));
             }
             false
@@ -612,7 +614,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicU64};
+
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture {
         root: PathBuf,
@@ -621,8 +625,9 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let root = env::temp_dir().join(format!(
-                "agentscm-queue-test-{}-{}",
+                "agentscm-queue-test-{}-{}-{}",
                 process::id(),
+                FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -770,7 +775,7 @@ mod tests {
         let f = Fixture::new();
         let legacy = f.root.join("legacy");
         fs::DirBuilder::new().mode(0o700).create(&legacy).unwrap();
-        write(&legacy.join("pid"), &process::id().to_string()).unwrap();
+        write(&legacy.join("pid"), &format!("{}\n", process::id())).unwrap();
         let output = f.root.join("started");
         let mut canceled = f.start("touch \"$1\"", &[&output]);
         f.wait(|| f.ticket_count() == 1);
@@ -819,6 +824,11 @@ mod tests {
         assert!(lines[1].starts_with("waiter 2 kind=focused waited="));
         assert!(lines[2].starts_with("waiter 3 kind=attestation waited="));
         assert!(text.contains("repo=\""));
+        let fields = read(&f.root.join("state/00000000000000000001.job")).unwrap();
+        let pid = fields.lines().next().unwrap();
+        assert!(lines[0].contains(&format!(" pid={pid} ")));
+        assert!(lines[1].contains(" pid=pending "));
+        assert!(lines[2].contains(" pid=pending "));
         fs::write(release, "").unwrap();
         assert!(holder.wait().unwrap().success());
         assert!(a.wait().unwrap().success());
