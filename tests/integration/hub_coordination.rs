@@ -1183,8 +1183,9 @@ fn default_work_session_is_durably_aliased_to_the_first_hook(db: &Db) {
         )
         .unwrap();
     assert_eq!(touched.session, "default");
-    assert!(matches!(
-        store.touch_session(
+    // Once `default` is adopted, a later new native session is its own session, not refused.
+    let alternate = store
+        .touch_session(
             &lead,
             &SessionCall {
                 session: Some("alternate-hook".into()),
@@ -1195,9 +1196,10 @@ fn default_work_session_is_durably_aliased_to_the_first_hook(db: &Db) {
                 report: true,
             },
             delayed + 2,
-        ),
-        Err(HubError::Invalid(message)) if message.contains("already bound")
-    ));
+        )
+        .unwrap();
+    assert_eq!(alternate.session, "alternate-hook");
+    assert!(store.default_session_bound(&lead).unwrap());
     assert_eq!(
         store
             .session_name_for(&lead, Some("observed-hook"), delayed + 3)
@@ -1815,3 +1817,45 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
     let encoded = serde_json::to_vec(&request).unwrap();
     assert!(encoded.len() < 2 * 1024 * 1024, "{} bytes", encoded.len());
 }
+
+fn finished_default_work_binds_no_hook_session(db: &Db) {
+    let store = db.open();
+    let lead = token(&*store, 53, "alias-finished");
+    let now = unix_now();
+    let item = store
+        .work_start(&lead, &start("alias-finished-work", "default"), now)
+        .unwrap()
+        .item;
+    let mut finish = checkpoint(
+        &item.id,
+        "finish-alias-finished-work",
+        "default",
+        item.updated_seq,
+        CheckpointKind::Finish,
+        None,
+    );
+    finish.generation = item.generation;
+    store.work_checkpoint(&lead, &finish, now + 1).unwrap();
+    // Nothing unfinished is led by `default`, so a new native session stays its own.
+    let touched = store
+        .touch_session(
+            &lead,
+            &SessionCall {
+                session: Some("after-finish-hook".into()),
+                via: "hook:claude".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: true,
+            },
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(touched.session, "after-finish-hook");
+    assert!(!store.default_session_bound(&lead).unwrap());
+}
+
+parity_case!(
+    finished_default_alias,
+    finished_default_work_binds_no_hook_session
+);
