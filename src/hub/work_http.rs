@@ -692,9 +692,10 @@ async fn actionable_status(
     Reader(principal): Reader,
 ) -> Result<Json<actionable_status::ActionableStatus>, ApiError> {
     let store = state.store.clone();
+    let setup = state.onboarding.clone();
     Ok(Json(
         blocking(&state, move || {
-            let mut status = actionable_status::read(&*store, &principal, unix_now())?;
+            let mut status = actionable_status::read(&*store, &setup, &principal, unix_now())?;
             status.show(Viewer(&principal.owner.id));
             Ok(status)
         })

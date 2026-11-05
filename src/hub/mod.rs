@@ -37,6 +37,7 @@ pub mod provider_context;
 pub mod publish;
 mod repository_summary;
 pub mod session;
+pub mod setup_attention;
 pub mod skill_workflow;
 pub mod skills;
 pub mod slack;

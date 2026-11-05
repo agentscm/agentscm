@@ -511,6 +511,33 @@ impl Observations {
     }
 }
 
+impl Observations {
+    /// Current rows of `principal`'s repository owned by `owner`, as the Setup page lists them,
+    /// with the token each row was observed through. Revocation is the caller's to recheck.
+    pub(super) fn owned_rows(
+        &self,
+        principal: &Principal,
+        owner: &str,
+        now: i64,
+    ) -> Result<Vec<(String, Status)>> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| HubError::Busy)?
+            .values()
+            .filter(|row| {
+                same_repository(&row.principal, principal)
+                    && row.principal.owner.id == owner
+                    && (!row.closed || row.call.blocker.is_some())
+                    && row.updated <= now
+                    && now - row.updated < TTL
+                    && row.principal.expires_at > now
+            })
+            .map(|row| (row.principal.token_id.clone(), row.status(now)))
+            .collect())
+    }
+}
+
 fn same_repository(left: &Principal, right: &Principal) -> bool {
     left.repository == right.repository
         && left.repository_id == right.repository_id
@@ -624,19 +651,32 @@ pub(super) fn mcp(
     call: SetupCall,
     epoch: u64,
 ) -> Result<Status> {
-    let client = client.ok_or_else(|| {
-        HubError::Invalid(
-            "Restart the checkout-bound AgentSCM MCP transport to verify setup".into(),
+    state.onboarding.verify_mcp(principal, client, call, epoch)
+}
+
+impl Observations {
+    /// An `agentscm_setup_status` call over MCP: MCP proof, or the blocker it reports.
+    pub(super) fn verify_mcp(
+        &self,
+        principal: &Principal,
+        client: Option<&str>,
+        call: SetupCall,
+        epoch: u64,
+    ) -> Result<Status> {
+        let client = client.ok_or_else(|| {
+            HubError::Invalid(
+                "Restart the checkout-bound AgentSCM MCP transport to verify setup".into(),
+            )
+        })?;
+        self.update_fenced(
+            principal,
+            client,
+            call,
+            (true, false),
+            Some(epoch),
+            unix_now(),
         )
-    })?;
-    state.onboarding.update_fenced(
-        principal,
-        client,
-        call,
-        (true, false),
-        Some(epoch),
-        unix_now(),
-    )
+    }
 }
 
 #[cfg(test)]

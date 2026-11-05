@@ -622,6 +622,7 @@ async fn repositories_for_owner(
     candidates.truncate(super::MAX_SIGN_IN_PROBES);
     let (readable, unchecked) = readable(&state, &owner, candidates, !include_work).await;
     let store = state.store.clone();
+    let setup = state.onboarding.clone();
     let mut rows = blocking(&state, move || {
         let now = unix_now();
         let revision_key = if include_work {
@@ -667,6 +668,7 @@ async fn repositories_for_owner(
             let status = super::super::viewer::shown(
                 super::super::work_http::actionable_status::read_person(
                     &*store,
+                    &setup,
                     &owner,
                     &repo.full_name,
                     repo.repository_id,
@@ -1324,7 +1326,8 @@ mod tests {
                 now,
             )
             .unwrap();
-        let read = || actionable_status::read(&*store, &who, now).unwrap();
+        let setup = crate::hub::onboarding::Observations::default();
+        let read = || actionable_status::read(&*store, &setup, &who, now).unwrap();
         let mut pull = json!({"number":1,"state":"open","head_sha":"first-head","files":["src/a.rs","src/b.rs"],"files_truncated":false});
         store
             .observe(&repo.id, "pull_request", "1", &pull.to_string(), 1000)

@@ -578,6 +578,7 @@ const ACTION_LINK: Record<string, [string, string, string]> = {
   file_conflict: ['#now', 'Open current work', 'envelope-exclamation'],
   failed_check: ['#landed', 'Open changes', 'x-circle'],
   skill_gate: ['#skills', 'Open Skills', 'sign-stop'],
+  agent_setup: ['#setup', 'Open Agents', 'plug'],
 }
 
 export function SharedNeeds({ status, legacy }: { status: Poll<ActionableStatus>; legacy?: { ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff } }) {

@@ -696,13 +696,19 @@ impl Call {
                     format!("{}\n{listing}", advice.text)
                 };
                 let store = state.store.clone();
+                let setup = state.onboarding.clone();
                 let scope = principal.clone();
                 // Bound optional enrichment after the committed touch; a slow read cannot consume
                 // the native client's whole startup deadline or hide that touch's outcome.
                 let current_status = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
                     blocking(state, move || {
-                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
+                        super::work_http::actionable_status::read(
+                            &*store,
+                            &setup,
+                            &scope,
+                            unix_now(),
+                        )
                     }),
                 )
                 .await;

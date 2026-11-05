@@ -278,6 +278,7 @@ async fn prepare_snapshot(
     request: u64,
 ) -> Result<Snapshot> {
     let store = state.store.clone();
+    let setup = state.onboarding.clone();
     let token = principal.token_id.clone();
     let query = query.clone();
     let principal = principal.clone();
@@ -298,7 +299,7 @@ async fn prepare_snapshot(
             },
             now,
         )?;
-        let status = actionable_status::read(&*store, &principal, now)?;
+        let status = actionable_status::read(&*store, &setup, &principal, now)?;
         snapshot(&query, catchup, overview, &status, now, request)
     })
     .await

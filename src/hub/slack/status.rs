@@ -372,7 +372,7 @@ impl Slack {
             Err(HubError::Unauthorized) => return Ok(()),
             Err(e) => return Err(e),
         };
-        let status = actionable_status::read(&*state.store, &principal, now)?;
+        let status = actionable_status::read(&*state.store, &state.onboarding, &principal, now)?;
         let pending = outstanding(&status);
         let key = binding_key(binding);
         let policy = &binding.config.reminders;
@@ -575,7 +575,12 @@ impl Slack {
         if kind == "query" && user != binding.config.slack_user {
             return Err(HubError::Unauthorized);
         }
-        let status = match actionable_status::read(&*state.store, &principal, now) {
+        let status = match actionable_status::read(
+            &*state.store,
+            &state.onboarding,
+            &principal,
+            now,
+        ) {
             Ok(status) => status,
             Err(HubError::Unauthorized) => {
                 self.obsolete_status_job(&id)?;
