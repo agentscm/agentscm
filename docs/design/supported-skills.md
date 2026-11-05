@@ -106,8 +106,8 @@ Today's loop ran on Git and GitHub, not on a native target. On that path:
 Supported skills are a library any repository can browse and adopt a few at a time into its own
 workflow. A first-party skill carries nothing specific to one repository: CI labels, merge methods,
 build parallelism and resource limits are parameters with general defaults, which a repository sets
-in its own lock file. AgentSCM's own repository adopts `pr-gate` with its own values (the
-`ci-extended` label, squash merges); a repository-specific AgentSCM workflow and a commercial or
+in its own lock file. AgentSCM's own repository adopts `pr-gate` with its own values (squash
+merges); a repository-specific AgentSCM workflow and a commercial or
 infrastructure-as-code offering can come later through the skill sources in 2.5, without changing
 the schema or the lock format.
 
@@ -222,7 +222,7 @@ capture excludes it.
   "skills": [
     { "name": "pr-gate", "workflow_version": 1, "sha256": "…",
       "source": { "kind": "first_party" },
-      "params": { "ci_label": "ci-extended", "merge_method": "squash" } }
+      "params": { "merge_method": "squash" } }
   ]
 }
 ```
@@ -324,7 +324,7 @@ the hook lets that session finish.
 | tests | `revision_tests` on head | self-reported (phase 2); receipt when a managed recipe or native step exists | stop | The command and its result for the exact head SHA. A new push invalidates it. |
 | review | `independent_review` on head | self-reported; receipt for `claude_code_review` | stop | The hub refuses a review recorded with the same agent token and session as an author; it cannot tell two sessions apart beyond that. Records findings with IDs and `blocking` flags. |
 | fix | `findings_resolved` | self-reported | stop | Each blocking finding is fixed at a later head (and the review is re-run on that head) or dismissed by a maintainer. |
-| ci | `hosted_ci` | self-reported (phase 2); observed later | forge status | Green on the exact head. With `ci_label` set, the next action names the label to add; with the default (null) it waits for whatever checks the repository requires. |
+| ci | `hosted_ci` | self-reported (phase 2); observed later | forge status | Green on the exact head. With `ci_label` set, the next action names the label to add; with the default (null) it waits for whatever checks the repository requires ("Wait for green CI"). AgentSCM's own lock sets no `ci_label`, and its routine pull requests may have no hosted source for this evidence because the hosted suites run on dispatch; the manifest is unchanged. |
 | approval | `human_approval` on head | self-reported (phase 2); observed later | forge status | Forge approval or native `approve`. |
 | merge | `merged` | self-reported (phase 2); observed later | advise | Uses `merge_method` (default `any`). With `retarget_stacked` (default true), the next action reminds the author to retarget dependent pull requests to the default branch. |
 | post_merge | `post_merge_check` on target tip | self-reported or observed | signal | Hands off to `post-merge` (c). A failure raises the main-red signal. |
@@ -438,7 +438,7 @@ Semantic Field Rule (every state color has a text label) and keeps to GET reads.
 │                                                                                        │
 │ #40  Cache parsed manifests              codex · session 3c6f   head 9e8d7f6          │
 │   ●branch ─ ●tests ─ ●review ─ ●fix ─ ◐ci ─ ○approval ─ ○merge ─ ○check                 │
-│   [Waiting on CI]  ci-extended green on 4 of 6 checks.                                 │
+│   [Waiting on CI]  Required checks green on 4 of 6.                                    │
 │                                                                                        │
 │ #38  Tighten upload limits               claude · session 37ad  merged as 55af0e1     │
 │   ●… ●merge ─ ✕check                                                                    │
@@ -460,7 +460,7 @@ Semantic Field Rule (every state color has a text label) and keeps to GET reads.
 │ tests       [Done]         cargo nextest run … exit 0 on a1b2c3d      self-reported     │ ← assurance column always visible
 │ review      [Current]      —                                                            │
 │ fix         [Not reached]                                                               │
-│ ci          [Not reached]  label ci-extended: absent                                     │
+│ ci          [Not reached]  required checks: 4 of 6 green on a1b2c3d                      │
 │ approval    [Not reached]                                                               │
 │ merge       [Not reached]  method: squash                                                │
 │ check       [Not reached]                                                               │
