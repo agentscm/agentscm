@@ -107,6 +107,7 @@ fn start(key: &str, session: &str, scope: &str) -> WorkStart {
         related_work: vec![],
         takeover_generation: None,
         preflight: None,
+        issue_choice: None,
     }
 }
 

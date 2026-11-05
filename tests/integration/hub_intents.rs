@@ -1126,6 +1126,7 @@ async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("w".into()),

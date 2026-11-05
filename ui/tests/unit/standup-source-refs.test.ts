@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { decodeWorkItem } from '../../src/standup.ts'
+import { decodeBriefing, decodeWorkItem } from '../../src/standup.ts'
 
 const WORK_ID = `wrk_${'a'.repeat(32)}`
 
@@ -69,4 +69,9 @@ describe('stand-up intent source references', () => {
     missingVersion.current.source_refs[1] = { kind: 'prior_work_version', work_id: WORK_ID, event_seq: 0 }
     expect(() => decodeWorkItem(missingVersion)).toThrow(/source_ref.event_seq/)
   })
+})
+
+it('decodes issue-link changes as metadata events', () => {
+  const page = { delivery: null, from: 0, through: 20, after: 0, work_after: null, next_after: 20, next_work_after: null, next_work_done: true, items: [], events: [{ seq: 20, at: 1_798_000_010, kind: 'work_issue_link', work_id: WORK_ID, item: fixture() }], retention_gap: false, complete: true }
+  expect(decodeBriefing(page).events[0]?.kind).toBe('work_issue_link')
 })

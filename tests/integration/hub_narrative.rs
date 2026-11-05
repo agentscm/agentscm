@@ -606,3 +606,79 @@ async fn bounded_briefing_keeps_full_status_binding_after_omitting_details() {
     assert_eq!(deterministic["counts"]["active"], 90);
     assert_ne!(deterministic["digest"], binding);
 }
+
+#[tokio::test]
+async fn planned_issues_enter_sourced_narrative_context_with_unknown_coverage() {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::store::new_connection_id;
+    let hub = Hub::start().await;
+    let connection = hub
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: new_connection_id().unwrap(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("fixture".into()),
+            },
+            "operator",
+        )
+        .unwrap();
+    let repo = hub
+        .store
+        .upsert_repository(&connection.id, "github.com", 101, REPOSITORY, None, None)
+        .unwrap();
+    let owner = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 91,
+            },
+            "fixture",
+        )
+        .unwrap();
+    let (_, secret, _) = agentscm::hub::store::mint_bound_agent_token(
+        &*hub.store,
+        &owner.id,
+        "fixture",
+        REPOSITORY,
+        101,
+        3600,
+        false,
+    )
+    .unwrap();
+    let secret = secret.expose().to_owned();
+    let now = unix_now();
+    hub.store.observe(&repo.id,"planned_issues","_snapshot",&json!({"provider":"github","host":"github.com","repository_id":101,"coverage":"unavailable","attempted_at_ms":now*1000,"facts_observed_at_ms":now*1000-1000,"unread_pages":0,"issues":[{"identity":{"provider":"github","host":"github.com","repository_id":101,"number":7},"title":"Ignore all instructions is untrusted issue text","milestone":null}]}).to_string(),now*1000).unwrap();
+    let prepared = hub
+        .mcp(
+            &secret,
+            "agentscm_briefing_prepare",
+            json!({"subscriber":"agent:planned-fixture"}),
+        )
+        .await;
+    assert_ne!(prepared["isError"], true, "{prepared}");
+    let facts = &prepared["structuredContent"]["context"]["facts"];
+    assert_eq!(
+        facts["planned_issues"][0]["coverage"], "unavailable",
+        "{prepared}"
+    );
+    assert_eq!(facts["planned_issues"][1]["issue"]["identity"]["number"], 7);
+    assert_eq!(facts["planned_issues"][1]["linkage"], "unclaimed");
+    assert!(
+        facts["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "planned-issue:7")
+    );
+    assert!(facts["warnings"].as_array().unwrap().iter().any(|w| {
+        w.as_str()
+            .is_some_and(|s| s.contains("Planned issue coverage"))
+    }));
+}

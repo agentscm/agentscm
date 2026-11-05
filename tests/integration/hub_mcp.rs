@@ -557,6 +557,7 @@ async fn protocol_basics() {
             "agentscm_pr_context",
             "agentscm_work_pr_link",
             "agentscm_work_pr_link_set",
+            "agentscm_work_issue_link_set",
             "agentscm_work_declarations",
             "agentscm_work_declarations_set",
             "agentscm_work_reconciliation",
@@ -2616,7 +2617,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (48, 51, 56));
+    assert_eq!((before.len(), listed.len(), all.len()), (49, 52, 57));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});

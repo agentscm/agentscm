@@ -112,6 +112,7 @@ fn agent(store: &dyn Store, user_id: i64, repository: &str, repository_id: i64) 
 
 fn start(key: &str, session: &str) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(key.into()),

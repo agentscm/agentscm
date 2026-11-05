@@ -30,6 +30,7 @@ pub mod narrative;
 pub mod onboarding;
 #[cfg(unix)]
 pub mod pipeline_rules;
+pub mod planned_issues;
 pub mod pr_context;
 pub mod promise;
 mod promise_http;
@@ -51,6 +52,7 @@ pub mod view_settings;
 pub mod viewer;
 pub mod work;
 pub mod work_http;
+pub mod work_issues;
 pub mod work_lifecycle;
 pub mod work_links;
 pub mod work_preflight;

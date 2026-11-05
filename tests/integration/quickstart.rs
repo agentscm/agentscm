@@ -3986,11 +3986,11 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
         onboarding(&hub, &token),
         [("claude".to_owned(), "ready".to_owned())]
     );
-    // The same proof, read back through doctor: a summary line, not a stray `[]`, and the JSON on request.
+    // The same proof among doctor's other findings, and the JSON on request.
     let said = doctor(&[]);
-    assert_eq!(
-        said.lines().collect::<Vec<_>>(),
-        ["claude session quickstart-session: ready (MCP seen, native edit hook seen)."],
+    assert!(
+        said.lines().any(|line| line
+            == "claude session quickstart-session: ready (MCP seen, native edit hook seen)."),
         "{said}"
     );
     let rows: Value = serde_json::from_str(&doctor(&["--json"])).unwrap();

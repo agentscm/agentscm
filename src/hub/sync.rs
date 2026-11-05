@@ -889,6 +889,7 @@ async fn catchup_connection_status(
         let _guard = state.sync.lock_repo(&repo.id).await;
         if coverage == super::catchup::CatchupCoverageState::Unavailable {
             provider_health(state, conn, &repo, "unavailable", None).await?;
+            planned_issue_health(state, conn, &repo).await?;
         }
         super::catchup_sync::source_status(
             state,
@@ -1025,6 +1026,7 @@ async fn sync_repo(
     let _guard = sync.lock_repo(&repo.id).await;
     // Token acquisition and API setup are part of the attempted source read.
     super::catchup_sync::begin(state, conn, repo).await?;
+    planned_issue_health(state, conn, repo).await?;
     let result = async {
         // A failure to get a token is the connection's credential failing.
         let token = sync.token(conn, repo.installation_id).await?;
@@ -1048,6 +1050,34 @@ async fn read_repo(
 ) -> Gh<PollReport> {
     let sync = &state.sync;
     let (api, config) = (sync.forge(conn)?, sync.config()?);
+    // Independent planning advice: failure here never suppresses the coordination poll.
+    // Marking unknown before the attempt also covers cancellation and token failures.
+    if conn.provider == "github" {
+        let stamp = observation_stamp(state, &repo.id).await?;
+        if let Ok(Ok(page)) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.open_issues(token, repo),
+        )
+        .await
+            && let Ok(snapshot) =
+                super::planned_issues::PlannedIssueSnapshot::from_github(conn, repo, stamp, page)
+        {
+            let id = repo.id.clone();
+            let data = serde_json::to_string(&snapshot)
+                .map_err(|_| GhError::Failed("could not encode planned issue snapshot".into()))?;
+            db(state, move |store| {
+                store.observe(
+                    &id,
+                    super::planned_issues::OBSERVATION_KIND,
+                    super::planned_issues::OBSERVATION_KEY,
+                    &data,
+                    stamp,
+                )?;
+                Ok(())
+            })
+            .await?;
+        }
+    }
     let mut report = PollReport {
         connection: conn.id.clone(),
         repository: repo.full_name.clone(),
@@ -1155,6 +1185,30 @@ async fn read_repo(
         super::skills::sync_adoption(state, api, repo, token).await;
     }
     Ok(report)
+}
+
+/// Invalidate current planning coverage before a read while retaining its earlier fact time.
+/// Callers hold the repository sync lock. This never acknowledges Catch up.
+async fn planned_issue_health(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+) -> Result<()> {
+    let stamp = observation_stamp(state, &repo.id)
+        .await
+        .map_err(gh_to_hub)?;
+    let (conn, repo) = (conn.clone(), repo.clone());
+    db(state, move |store| {
+        use super::planned_issues::{OBSERVATION_KEY, OBSERVATION_KIND, PlannedIssueSnapshot};
+        let previous = store.observation(&repo.id, OBSERVATION_KIND, OBSERVATION_KEY)?;
+        let previous = previous.and_then(|row| serde_json::from_str(&row.data).ok());
+        let snapshot = PlannedIssueSnapshot::unavailable(&conn, &repo, stamp, previous);
+        let data = serde_json::to_string(&snapshot)
+            .map_err(|_| HubError::Unavailable("could not encode planned issue snapshot".into()))?;
+        store.observe(&repo.id, OBSERVATION_KIND, OBSERVATION_KEY, &data, stamp)?;
+        Ok(())
+    })
+    .await
 }
 
 /// Provider health is retained separately so a failed repository/discovery read hides

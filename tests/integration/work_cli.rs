@@ -875,3 +875,30 @@ fn recovery_cli_inspects_previews_and_applies_a_batch_with_per_item_outcomes() {
         "{stderr}"
     );
 }
+
+#[test]
+fn issue_link_set_preserves_native_identity() {
+    let hub = Hub::start();
+    let client = hub.bound_client(91, "fixture", 101);
+    let created = client.start(
+        r#"{"request_key":"issue-cli","title":"Synthetic issue task","session":"issue-cli"}"#,
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let item = &started["item"];
+    let request = serde_json::json!({"work_id":item["id"],"operation_id":"cli-link","generation":item["generation"],"session":"issue-cli","expected_updated_seq":item["updated_seq"],"link":{"provider":"github","host":"github.com","repository_id":101,"number":7}});
+    let updated = client.request("issue-link-set", &request.to_string());
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(result["item"]["id"], item["id"]);
+    assert_eq!(result["item"]["source"], item["source"]);
+    assert_eq!(result["item"]["issue_link"]["number"], 7);
+}

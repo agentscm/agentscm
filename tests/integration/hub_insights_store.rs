@@ -119,6 +119,7 @@ fn ordinary_agent(store: &dyn Store, user_id: i64) -> Agent {
 
 fn start(key: &str, title: &str, session: &str) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(key.into()),
@@ -138,6 +139,7 @@ fn start(key: &str, title: &str, session: &str) -> WorkStart {
 
 fn join(work_id: &str, session: &str, role: WorkRole) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: Some(work_id.into()),
         source: None,
         request_key: None,

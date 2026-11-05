@@ -1390,6 +1390,8 @@ mod tests {
 
     fn overlap_side(title: &str, state: WorkState, claim_status: ClaimStatus) -> WorkItem {
         WorkItem {
+            initial_issue_choice: Default::default(),
+            issue_link: None,
             id: format!("wrk_{title}"),
             repository: "example-org/api".into(),
             owner: "usr_1".into(),
@@ -1431,6 +1433,7 @@ mod tests {
             reasons_complete: true,
         };
         let overview = WorkOverview {
+            planned_issues: Default::default(),
             recent_since: 0,
             until: 100,
             current: vec![],

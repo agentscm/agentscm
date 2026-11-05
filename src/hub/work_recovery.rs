@@ -1445,6 +1445,8 @@ mod tests {
 
     fn item(state: WorkState) -> WorkItem {
         WorkItem {
+            initial_issue_choice: Default::default(),
+            issue_link: None,
             id: "wrk_00000000000000000000000000000001".to_owned(),
             repository: "example/repo".to_owned(),
             owner: OWNER.to_owned(),
