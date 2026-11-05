@@ -2,25 +2,20 @@ name: Hub end-to-end
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
     paths:
-      - "src/hub/**"
-      - "src/hub_cli.rs"
-      - "src/intent_cli.rs"
-      - "src/backend.rs"
-      - "src/backend_s3.rs"
-      - "src/lib.rs"
-      - "src/main.rs"
+      - "src/hub/migrations/*.pg.sql"
+      - "src/hub/migrations/named/*.pg.sql"
+      - "src/hub/store_pg.rs"
+      - "src/hub/store_pg/**"
       - "examples/hub_seed.rs"
       - "Dockerfile"
       - "compose.hub.yaml"
       - ".github/compose.e2e.yaml"
       - ".github/hub-e2e.sh"
       - ".github/workflows/hub-e2e.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
   workflow_dispatch:
-  # Replaces the push to main; the release PR also runs this workflow through ci-extended.
+  # Nightly and manual runs cover everything else; the release PR dispatches it.
   schedule:
     - cron: '13 8 * * *'
 
@@ -28,18 +23,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   hub-e2e:
-    # Gate for cost and abuse control, not isolation: fork code can run on any hosted runner, which is
-    # ephemeral and has a read-only token and no secrets. Scheduled and manual runs always pass.
-    # A pull request runs this job only when a maintainer adds the `ci-extended` label (same-repository
-    # PRs rely on a local validation attestation otherwise). A fork PR runs once per labelling, against
-    # the head at that moment; pushing again does not re-run it. A same-repository PR also re-runs on
-    # each update while the label stays. Remove and re-add the label to run a fork PR again.
-    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')) }}
+    # A cost control, not isolation: fork code can run on any hosted runner, which is ephemeral with a read-only
+    # token and no secrets, and a fork pull request takes its workflow file from the merge commit, so this `if`
+    # skips forks only for an unmodified workflow.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:

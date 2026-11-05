@@ -6,7 +6,7 @@
       "workflow_version": 1,
       "sha256": "aa420a27dc4badcb731daf68b3040b3f3e6ca6730bcaedcb73acab1d528dad57",
       "source": { "kind": "first_party" },
-      "params": { "ci_label": "ci-extended", "merge_method": "squash" }
+      "params": { "merge_method": "squash" }
     }
   ]
 }
