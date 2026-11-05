@@ -114,8 +114,20 @@ pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
 }
 
 /// A strong validator: the asset's SHA-256, which changes exactly when the embedded bytes do.
-fn tag(body: &[u8]) -> String {
+pub(super) fn tag(body: &[u8]) -> String {
     format!("\"{}\"", super::store::lower_hex_of(&Sha256::digest(body)))
+}
+
+/// Whether `If-None-Match` names `tag` (or `*`); weak validators compare by their opaque tag.
+pub(super) fn tag_is_current(headers: &HeaderMap, tag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').map(str::trim).any(|candidate| {
+                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == tag
+            })
+        })
 }
 
 /// `no-cache` still lets a browser keep the asset; it revalidates and gets 304 while it is current.
@@ -125,15 +137,7 @@ fn asset(
     body: &'static [u8],
     tag: &'static str,
 ) -> Response {
-    let current = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.split(',').map(str::trim).any(|candidate| {
-                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == tag
-            })
-        });
-    let (status, body) = if current {
+    let (status, body) = if tag_is_current(headers, tag) {
         (StatusCode::NOT_MODIFIED, &[][..])
     } else {
         (StatusCode::OK, body)

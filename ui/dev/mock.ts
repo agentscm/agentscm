@@ -8,6 +8,7 @@ import { CONTEXT_PULLS, contextFixture, expandedContextFixture } from './prConte
 //   MOCK=down   the hub is failing: health 503, work and activity 503
 //   MOCK=demo   `agentscm demo` hub: health.demo true, simulated agents, no forge connection, no PRs
 // While running, GET /__mock/down and /__mock/up flip the failure on and off; /__mock/reset un-revokes computers.
+import { createHash } from 'node:crypto'
 import type { Plugin } from 'vite'
 
 const START = Date.now()
@@ -863,19 +864,34 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           return retained ? send(200, retained) : send(404, { error: 'not found' })
         }
         // Any repository a read token names gets the synthetic team's work, so switching repositories shows a page.
-        if (/^\/repos\/[^/]+\/work$/.test(url.pathname)) {
-          if (scenario === 'demo') return send(200, { ...work(), pull_requests: [], connected: false })
-          return send(200, empty || billingDocs ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work(scenario === 'context'))
+        const workBody = () => {
+          if (scenario === 'demo') return { ...work(), pull_requests: [], connected: false }
+          return empty || billingDocs ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work(scenario === 'context')
         }
-        if (/^\/repos\/[^/]+\/activity$/.test(url.pathname)) {
-          if (empty || billingDocs) return send(200, { sessions: [], events: [], next_before: null })
+        const activityBody = (limit: number, before: number | null) => {
+          if (empty || billingDocs) return { sessions: [], events: [], next_before: null }
           const all = activity()
+          const older = before === null ? all.events : all.events.filter((e) => e.seq < before)
+          const events = older.slice(0, limit)
+          return { ...all, events, next_before: older.length > events.length ? events.at(-1)!.seq : null }
+        }
+        if (/^\/repos\/[^/]+\/work$/.test(url.pathname)) return send(200, workBody())
+        if (/^\/repos\/[^/]+\/activity$/.test(url.pathname)) {
           const limit = clampLimit(url.searchParams.get('limit'), 50, 200)
           const rawBefore = url.searchParams.get('before')
           if (rawBefore !== null && !/^[1-9][0-9]{0,15}$/.test(rawBefore)) return send(400, { error: 'invalid' })
-          const older = rawBefore === null ? all.events : all.events.filter((e) => e.seq < Number(rawBefore))
-          const events = older.slice(0, limit)
-          return send(200, { ...all, events, next_before: older.length > events.length ? events.at(-1)!.seq : null })
+          return send(200, activityBody(limit, rawBefore === null ? null : Number(rawBefore)))
+        }
+        // Like the Hub: one body, a strong ETag of it, and 304 when the client already has that body.
+        if (/^\/repos\/[^/]+\/snapshot$/.test(url.pathname)) {
+          const body = { work: workBody(), activity: activityBody(50, null) }
+          const etag = `"${createHash('sha256').update(JSON.stringify(body)).digest('hex')}"`
+          res.setHeader('etag', etag)
+          if (String(req.headers['if-none-match'] ?? '').split(',').some((tag) => tag.trim() === etag)) {
+            res.statusCode = 304
+            return res.end()
+          }
+          return send(200, body)
         }
         send(404, { error: 'not found' })
       })

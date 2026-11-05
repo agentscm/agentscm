@@ -116,7 +116,10 @@ export async function fetchWhoami(token: string, signal: AbortSignal): Promise<W
 const repoPath = (repo: string) => `/v1/hub/repos/${encodeURIComponent(repo)}`
 
 export async function fetchWork(repo: string, token: string, signal: AbortSignal): Promise<Work> {
-  const j = rec(await getJson(`${repoPath(repo)}/work`, signal, token))
+  return decodeWork(rec(await getJson(`${repoPath(repo)}/work`, signal, token)))
+}
+
+function decodeWork(j: Record<string, unknown>): Work {
   return {
     intents: list(j['intents']).map(
       (i): Intent => ({
@@ -159,7 +162,10 @@ export async function fetchActivity(repo: string, token: string, signal: AbortSi
 
 /** One page of events, newest first; `before` is an event `seq` and `next_before` the next page's cursor (null when exhausted). */
 export async function fetchActivityPage(repo: string, token: string, signal: AbortSignal, before?: number): Promise<Activity & { next_before: number | null }> {
-  const j = rec(await getJson(`${repoPath(repo)}/activity?limit=50${before !== undefined ? `&before=${before}` : ''}`, signal, token))
+  return decodeActivityPage(rec(await getJson(`${repoPath(repo)}/activity?limit=50${before !== undefined ? `&before=${before}` : ''}`, signal, token)))
+}
+
+function decodeActivityPage(j: Record<string, unknown>): Activity & { next_before: number | null } {
   return {
     next_before: typeof j['next_before'] === 'number' ? j['next_before'] : null,
     sessions: list(j['sessions']).map(
@@ -186,6 +192,31 @@ export async function fetchActivityPage(repo: string, token: string, signal: Abo
       }),
     ),
   }
+}
+
+export interface Snapshot {
+  work: Work
+  activity: Activity
+  /** Send back as `etag` on the next call. */
+  etag: string | null
+}
+
+/**
+ * Work and the newest activity in one request. Pass the previous `etag`: the Hub answers 304 while
+ * nothing changed, which is `null` here (keep what you have). Older activity stays on `fetchActivityPage`.
+ */
+export async function fetchSnapshot(repo: string, token: string, signal: AbortSignal, etag: string | null): Promise<Snapshot | null> {
+  const res = await fetch(`${repoPath(repo)}/snapshot`, {
+    signal: withTimeout(signal),
+    cache: 'no-store',
+    credentials: 'omit',
+    headers: { Authorization: `Bearer ${token}`, ...(etag ? { 'If-None-Match': etag } : {}) },
+  })
+  if (res.status === 304) return null
+  if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`, refusalFrom(await errorBody(res)))
+  const j = rec(await res.json())
+  const { sessions, events } = decodeActivityPage(rec(j['activity']))
+  return { work: decodeWork(rec(j['work'])), activity: { sessions, events }, etag: res.headers.get('etag') }
 }
 
 /**

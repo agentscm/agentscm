@@ -90,15 +90,10 @@ test('change record detail wraps long source, recipe and setup identities', asyn
     contentType: 'application/json',
     body: JSON.stringify({ status: 'ok', storage: 'sqlite', coordination: {} }),
   }))
-  await page.route('**/v1/hub/repos/**/work', (route) => route.fulfill({
+  await page.route('**/v1/hub/repos/**/snapshot', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ intents: [], intents_truncated: false, connected: true, pull_requests: [] }),
-  }))
-  await page.route('**/v1/hub/repos/**/activity?limit=50', (route) => route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    body: JSON.stringify({ sessions: [], events: [] }),
+    body: JSON.stringify({ work: { intents: [], intents_truncated: false, connected: true, pull_requests: [] }, activity: { sessions: [], events: [] } }),
   }))
   await page.route('**/v1/hub/whoami', (route) => route.fulfill({
     status: 200,
