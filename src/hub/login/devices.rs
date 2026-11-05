@@ -45,6 +45,10 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/admin/devices", get(admin_devices))
         .route("/v1/hub/admin/repositories", get(admin_repositories))
         .route("/v1/hub/admin/sign-in-refusals", get(admin_refusals))
+        .route(
+            "/v1/hub/admin/capacity-refusals",
+            get(admin_capacity_refusals),
+        )
 }
 
 /// Why a mint was refused: a kind, or a role from [`super::missing_role`].
@@ -1201,6 +1205,28 @@ async fn admin_refusals(
             json!({"at": r.at, "count": r.count, "provider": r.provider, "host": r.host,
                 "login": r.login, "forge_user_id": r.forge_user_id, "reason": r.reason,
                 "via": r.via})
+        })
+        .collect();
+    Ok(Json(json!({"refusals": refusals})))
+}
+
+/// Writes a store capacity limit refused in the last 30 days, with what to run for each.
+async fn admin_capacity_refusals(
+    State(state): State<HubState>,
+    human: super::HumanSession,
+) -> ApiResult<Json<Value>> {
+    human.admin()?;
+    let store = state.store.clone();
+    let now = unix_now();
+    let rows = blocking(&state, move || store.capacity_refusals(now)).await?;
+    let refusals: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({"limit": r.limit.as_str(), "what": r.limit.what(),
+                "provider": r.repository.provider, "host": r.repository.host,
+                "repository": r.repository.repository, "repository_id": r.repository.repository_id,
+                "at": r.at, "count": r.count, "remedy": r.remedy(),
+                "recent": r.at > now - crate::hub::capacity::RECENT_SECONDS})
         })
         .collect();
     Ok(Json(json!({"refusals": refusals})))

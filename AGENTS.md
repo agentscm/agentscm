@@ -4,7 +4,7 @@ Instructions for AI coding agents and the people running them. The human rules a
 
 ## Orient
 
-Read README.md, CONTRIBUTING.md, STYLE.md, docs/README.md (the index) and docs/architecture.md before changing code. `docs/spec/agentic-scm.md` is the draft specification; `docs/roadmap.md` says what is implemented and what is only proposed. Never describe a proposed capability as implemented.
+Read README.md, CONTRIBUTING.md, STYLE.md, docs/README.md (the index) and docs/architecture.md before changing code. `docs/spec/agentic-scm.md` is the draft specification; `docs/roadmap.md` says what is implemented and what is only proposed. Never describe a proposed capability as implemented. Do not edit `docs/roadmap.md` in a feature PR; record its effect as `Roadmap:` lines in the PR body (see CONTRIBUTING.md).
 
 ## Commands
 

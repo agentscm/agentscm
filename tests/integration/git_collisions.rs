@@ -236,6 +236,7 @@ fn request(repo: PathBuf, git: PathBuf) -> agentscm::git_collisions::Request {
         include_merged: false,
         deadline: None,
         max_bytes: None,
+        merge_order: false,
     }
 }
 
@@ -475,6 +476,74 @@ fn deadline_truncates_with_marker() {
     let report = agentscm::git_collisions::collisions(&req).unwrap();
     assert_eq!(report["truncated"], "deadline");
     assert!(start.elapsed() < std::time::Duration::from_secs(25));
+}
+
+/// `x` and `z` each conflict with `y`, `w` shares nothing, and `s` conflicts with `x`,
+/// `y` and with main, which moved after `s` forked. Counting `s`'s pairs in the search
+/// would give `x` a new head too.
+fn merge_order_repo(dir: &Path) -> PathBuf {
+    let repo = dir.join("order");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    for file in ["f", "g", "h", "u"] {
+        fs::write(repo.join(file), "1\n2\n3\n").unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    for (branch, edits) in [
+        ("s", &[("h", "1\nS\n3\n"), ("f", "1\nS\n3\n")][..]),
+        ("w", &[("u", "1\nW\n3\n")]),
+        ("x", &[("f", "1\nX\n3\n")]),
+        ("y", &[("f", "1\nY\n3\n"), ("g", "1\nY\n3\n")]),
+        ("z", &[("g", "1\nZ\n3\n")]),
+    ] {
+        git(&repo, &["checkout", "-q", "-b", branch, "main"]);
+        for (file, text) in edits {
+            commit_file(&repo, branch, file, text);
+        }
+    }
+    git(&repo, &["checkout", "-q", "main"]);
+    commit_file(&repo, "main", "h", "1\nM\n3\n");
+    repo
+}
+
+#[test]
+fn merge_order_gives_new_heads_to_the_fewest_branches() {
+    let dir = TempDir::new().unwrap();
+    let repo = merge_order_repo(dir.path());
+    assert!(report(&repo, &["--json"]).get("merge_order").is_none());
+
+    let order = &report(&repo, &["--json", "--merge-order"])["merge_order"];
+    assert_eq!(
+        *order,
+        serde_json::json!({"complete": true, "merge_first": ["w", "x", "z"], "new_head_first": [
+            {"id": "s", "conflicts_with": ["x", "y"], "base_conflicted_paths": ["h"]},
+            {"id": "y", "conflicts_with": ["s", "x", "z"], "base_conflicted_paths": []},
+        ]})
+    );
+    let text = String::from_utf8(run(&repo, &["--text", "--merge-order"]).stdout).unwrap();
+    assert!(
+        text.contains(
+            "Merge order (2 branches need a new head):\n  First, in any order: w, x, z\n  Then, one at a time, update from the base and merge:\n    s   conflicts with main in h; conflicts with x, y\n    y   conflicts with s, x, z\n"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn merge_order_breaks_ties_by_name_and_refuses_a_partial_scan() {
+    let dir = TempDir::new().unwrap();
+    let mut req = request(conflicting_repo(dir.path()), git_path());
+    req.merge_order = true;
+    let order = &collisions(&req)["merge_order"];
+    assert_eq!(order["merge_first"], serde_json::json!(["feat-c"]));
+    assert_eq!(order["new_head_first"][0]["id"], "feat-d");
+
+    req.max_bytes = Some(1);
+    assert_eq!(
+        collisions(&req)["merge_order"],
+        serde_json::json!({"complete": false, "reason": "the scan stopped early"})
+    );
 }
 
 #[test]
@@ -882,6 +951,7 @@ fn branch_advisory_skips_own_status_without_changing_full_collision_scan() {
         include_merged: false,
         deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
         max_bytes: None,
+        merge_order: false,
     })
     .unwrap();
     assert_eq!(full["collisions"].as_array().unwrap().len(), 1);

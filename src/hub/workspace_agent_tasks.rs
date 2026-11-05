@@ -61,7 +61,7 @@ impl WorkspaceGuard<'_> {
     fn guard_error(error: HubError) -> crate::Error {
         match error {
             HubError::Busy
-            | HubError::WorkCapacity
+            | HubError::WorkCapacity(_)
             | HubError::WorkOverlapIncomplete
             | HubError::Unavailable(_) => crate::Error::Io(std::io::Error::other(
                 "workspace task authorization unavailable",
@@ -1096,7 +1096,7 @@ async fn mcp(
         Ok(result) => axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response(),
         Err(
             HubError::Busy
-            | HubError::WorkCapacity
+            | HubError::WorkCapacity(_)
             | HubError::WorkOverlapIncomplete
             | HubError::Unavailable(_),
         ) => mcp_failure(

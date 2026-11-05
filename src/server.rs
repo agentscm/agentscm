@@ -827,6 +827,7 @@ fn collisions_report(repository: &std::path::Path) -> Result<serde_json::Value> 
         deadline: Some(std::time::Instant::now() + COLLISIONS_DEADLINE),
         // Headroom for the base, version and notes outside the budgeted lists.
         max_bytes: Some(MAX_COLLISIONS_BYTES - 16 * 1024),
+        merge_order: false,
     })
 }
 

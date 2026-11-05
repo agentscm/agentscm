@@ -21,6 +21,7 @@ use crate::change_record::{ChangeRecordResponseV1, MAX_CHANGE_RECORD_RESPONSE_BY
 
 use super::advice::{answered, asked, unknown};
 use super::catchup::{CatchupAck, CatchupPreview, CatchupPreviewQuery, CatchupQuery};
+use super::compact::{self, Detail};
 use super::coordination::{
     CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResolve,
     CoordinationStatus, CoordinationWithdraw,
@@ -147,6 +148,19 @@ struct StartArgs {
     related_work: Vec<String>,
     takeover_generation: Option<i64>,
     preflight: Option<WorkPreflightRequest>,
+    #[serde(default)]
+    detail: Detail,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverviewArgs {
+    recent_since: Option<i64>,
+    limit: Option<usize>,
+    #[serde(default)]
+    detail: Detail,
+    after: Option<String>,
+    recent_before: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -599,6 +613,7 @@ pub fn agent_tools() -> Value {
 fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> Value {
     let session = json!({"type": "string", "description": "Your native session ID (the AgentSCM SessionStart context shows it). Pass it on every call; omitting it is refused while this agent token has more than one hook session or only an idle one."});
     let paths = |description: &str| json!({"type": "array", "items": {"type": "string"}, "description": description});
+    let detail = |description: &str| json!({"type": "string", "enum": ["compact", "full"], "default": "compact", "description": description});
     let schema = |properties: Value, required: &[&str]| {
         json!({"type": "object", "properties": properties, "required": required,
             "additionalProperties": false})
@@ -737,7 +752,10 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         "description": "Read before planning: ongoing assignments, reported completions and decisions in the last 24 hours, and declared scope overlaps. Unfinished Work holding a reservation stays listed even when its branch has a merged pull request. settled_count counts only nonholding Work hidden by the legacy branch-merge heuristic. Pure read; never acknowledges catch-up. Inspect completeness flags before relying on this bounded overview. Path overlap is not proof of a Git conflict or semantic duplication.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({"recent_since": {"type": "integer", "minimum": 0},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}}), &[])});
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Items per page: 10 by default; with detail full, the bound of each list, 100 by default."},
+            "detail": detail("compact pages bounded items and names the reads that hold the rest; full returns every field of up to 100 items per list, the earlier shape."),
+            "after": {"type": "string", "description": "next_after from the previous compact page."},
+            "recent_before": {"type": "integer", "description": "next_recent_before from the previous compact page."}}), &[])});
     let insight = json!({"name": "agentscm_work_insight",
         "description": "Reads a conservative projection for one work item from retained work history, caller-reported usage, and stored publication observations. This does not prove exhaustive usage, billing, acceptance, approval, or merge status.",
         "annotations": {"readOnlyHint": true},
@@ -1022,7 +1040,8 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "related_work": {"type": "array", "items": {"type": "string"}},
              "takeover_generation": {"type": "integer", "minimum": 1},
              "issue_choice": issue_choice_schema,
-             "preflight": source_preflight_schema
+             "preflight": source_preflight_schema,
+             "detail": detail("compact returns the decision, your Work, bounded conflict and preflight evidence, and counts with the paged reads for the overview, briefing and catch-up; full embeds them all, the earlier shape.")
          }), &["task"])},
         {"name": "agentscm_check",
          "description": "Call before editing a file you have not edited yet in this session; not needed in Claude Code, Codex or Copilot with AgentSCM hooks, which check each edit. Says when another agent is already working on those files.",
@@ -1202,7 +1221,7 @@ fn refused(reason: &str) -> Value {
 pub(super) fn hub_failure(error: &HubError) -> Value {
     refused(match error {
         HubError::Busy => "hub busy",
-        HubError::WorkCapacity => "work storage capacity reached",
+        HubError::WorkCapacity(_) => "work storage capacity reached",
         HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
         HubError::WorkCoordinationRequired { .. } => {
             "work scope needs coordination; inspect the agent inbox"
@@ -1266,6 +1285,8 @@ async fn call(
         return Ok(value);
     }
     let name = params.and_then(|p| p["name"].as_str()).unwrap_or("");
+    // Enrichment is compact unless the call asked for every field.
+    let full = params.is_some_and(|p| p["arguments"]["detail"] == "full");
     if value["isError"] != true
         && matches!(
             name,
@@ -1285,6 +1306,12 @@ async fn call(
         .ok()
         .map(|status| shown(status, &principal.owner.id));
         append_actionable_status(&mut value, status.as_ref());
+        if !full
+            && let Some(status) = &status
+            && let Some(object) = value["structuredContent"].as_object_mut()
+        {
+            object.insert("actionable_status".into(), compact::status(status));
+        }
     }
     contribution_receipt::append(
         state,
@@ -1353,6 +1380,16 @@ async fn call(
         };
         // Optional synthesis cannot change admission or fail an otherwise successful start.
         let narrative = match super::narrative::read(state, principal, query).await {
+            Ok(narrative) if !full => {
+                let brief = compact::narrative(&narrative);
+                if narrative.output.is_some()
+                    && let Some(content) = value["content"].as_array_mut()
+                {
+                    let text = format!("{}\n{brief}", compact::NARRATIVE_FRAMING);
+                    content.push(json!({"type":"text", "text":text}));
+                }
+                brief
+            }
             Ok(narrative) => {
                 if narrative.output.is_some()
                     && let Some(content) = value["content"].as_array_mut()
@@ -1367,11 +1404,14 @@ async fn call(
             content.insert("agent_briefing".to_owned(), narrative);
         }
     }
+    // Only a reply that went through, and only while a requested briefing waits for an agent.
     if !principal.read_only
-        && (matches!(name, "agentscm_start" | "agentscm_work_overview")
-            || name == "agentscm_work_checkpoint"
-                && super::narrative::pending(state, principal)
-                    .is_ok_and(|requests| !requests.is_empty()))
+        && value["isError"] != true
+        && matches!(
+            name,
+            "agentscm_start" | "agentscm_work_overview" | "agentscm_work_checkpoint"
+        )
+        && super::narrative::pending(state, principal).is_ok_and(|requests| !requests.is_empty())
         && let Some(content) = value["content"].as_array_mut()
     {
         content.push(json!({"type":"text", "text":NARRATIVE_GUIDANCE}));
@@ -1944,9 +1984,38 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_overview" {
-        let query = match try_args::<WorkOverviewQuery>(arguments) {
+        let args = match try_args::<OverviewArgs>(arguments) {
             Ok(value) => value,
             Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        if args
+            .limit
+            .is_some_and(|limit| !(1..=super::work::MAX_WORK_PAGE).contains(&limit))
+            || args
+                .after
+                .as_deref()
+                .is_some_and(|id| super::work::validate_id("after", id, "wrk").is_err())
+        {
+            return Ok(invalid_args(
+                name,
+                "limit is 1 to 100 and after is a work id",
+            ));
+        }
+        // The compact page is cut from the store's own bounded read.
+        let (detail, page) = (
+            args.detail,
+            compact::Page {
+                size: args.limit.unwrap_or(compact::PAGE),
+                after: args.after,
+                recent_before: args.recent_before,
+            },
+        );
+        let query = WorkOverviewQuery {
+            recent_since: args.recent_since,
+            limit: match detail {
+                Detail::Full => args.limit.unwrap_or(super::work::MAX_WORK_PAGE),
+                Detail::Compact => super::work::MAX_WORK_PAGE,
+            },
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -1960,13 +2029,20 @@ async fn call_inner(
                     &OperationalSelect::Holders,
                     now,
                 )?;
-                Ok(super::work_lifecycle::overview_with_operational(
-                    &overview, &held,
-                ))
+                Ok(match detail {
+                    Detail::Full => structured(&super::work_lifecycle::overview_with_operational(
+                        &overview, &held,
+                    )),
+                    Detail::Compact => {
+                        let value = compact::overview(&overview, &held, &page);
+                        json!({"content": [{"type": "text", "text": compact::overview_text(&value)}],
+                            "structuredContent": value, "isError": false})
+                    }
+                })
             })
             .await
             {
-                Ok(value) => structured(&value),
+                Ok(value) => value,
                 Err(error) => work_failure(&error),
             },
         );
@@ -2606,6 +2682,7 @@ async fn work_preflight(
         related_work,
         takeover_generation,
         preflight,
+        detail: _,
     } = arguments;
     super::session::check(&session_call(
         session.clone(),
@@ -2880,7 +2957,7 @@ fn work_failure(error: &HubError) -> Value {
             "hub busy",
             &["Retry the same idempotent request later."],
         ),
-        HubError::WorkCapacity => (
+        HubError::WorkCapacity(_) => (
             "work_storage_capacity",
             "work storage capacity reached",
             &[
@@ -3092,6 +3169,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         related_work,
         takeover_generation,
         preflight,
+        detail,
     } = arguments;
 
     // Validate every legacy session/path field before a briefing receipt or durable claim can be
@@ -3235,6 +3313,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             work,
             catchup,
             unreserved,
+            detail,
         ));
     }
 
@@ -3300,7 +3379,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     {
         parts.push(HOOKED.to_owned());
     }
-    let mut result = start_result(parts.join("\n"), briefing, work, catchup, false);
+    let mut result = start_result(parts.join("\n"), briefing, work, catchup, false, detail);
     if let Some(warning) = unlinked
         && let Some(object) = result["structuredContent"].as_object_mut()
     {
@@ -3331,6 +3410,7 @@ fn start_result(
     work: WorkStartResult,
     catchup: Option<CatchupPreview>,
     unreserved: bool,
+    detail: Detail,
 ) -> Value {
     let paused = unreserved
         || matches!(
@@ -3388,28 +3468,41 @@ fn start_result(
         ],
         None => &[],
     };
-    let structured = json!({
+    // The compact default names the paged reads instead of embedding them.
+    let (briefing_json, catchup_json, work_json) = match detail {
+        Detail::Full => (json!(&briefing), json!(&catchup), json!(&work)),
+        Detail::Compact => (
+            compact::briefing(&briefing),
+            json!(catchup.as_ref().map(compact::catchup)),
+            compact::start_work(&work),
+        ),
+    };
+    let mut structured = json!({
         "coordination": &coordination,
-        "briefing": &briefing,
+        "briefing": briefing_json,
         "briefing_kind": "preview",
         "acknowledgement_required": false,
         "briefing_acknowledgement_required": false,
-        "catchup": &catchup,
+        "catchup": catchup_json,
         "catchup_acknowledgement_required": false,
-        "work": &work,
+        "work": work_json,
         "alternatives": alternatives,
         "acknowledged": false,
         "claim_acquired": !claim_blocked,
         "source_preflight_ready": preflight_ready,
         "ready_for_work": !blocked,
     });
+    if detail == Detail::Compact {
+        structured["detail"] = json!("compact");
+        structured["context"] = json!(work.context.as_ref().map(compact::context));
+    }
     let mut text = coordination;
     if !text.is_empty() {
         text.push('\n');
     }
     text.push_str(&briefing_summary(&briefing));
     if let Some(context) = &work.context {
-        text.push_str(&format!("\nStartup recap: {} ongoing assignments, {} recent outcomes, {} overlaps in this bounded overview. Inspect work.context; coverage complete: current={}, recent={}, overlaps={}. Recent means Unix {} through {} and is independent of acknowledgement.",
+        text.push_str(&format!("\nStartup recap: {} ongoing assignments, {} recent outcomes, {} overlaps in this bounded overview. Page them with agentscm_work_overview; coverage complete: current={}, recent={}, overlaps={}. Recent means Unix {} through {} and is independent of acknowledgement.",
             context.current.len(), context.recent.len(), context.overlaps.len(),
             context.current_complete, context.recent_complete, context.overlaps_complete,
             context.recent_since, context.until));

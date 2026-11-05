@@ -12,6 +12,10 @@
 
 <!-- Known gaps, unsupported cases, follow-ups. -->
 
+## Roadmap
+
+<!-- One `Roadmap:` line per affected docs/roadmap.md row: the row and its new status, or `Roadmap: none`. Do not edit docs/roadmap.md in this PR; it is updated from these lines before each release. -->
+
 ## AI assistance
 
 - [ ] No AI assistance
