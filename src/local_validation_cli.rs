@@ -588,6 +588,12 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         agentscm::local_validation::checks::load(&args.repo.join(&args.config_dir), &|path| {
             read_bounded(path, MAX_INPUT_BYTES)
         })?;
+    if loaded.iter().any(|check| check.name.is_some()) {
+        agentscm::local_validation::checks::refuse_config_dir_symlinks(
+            &args.repo,
+            &args.config_dir,
+        )?;
+    }
     let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")?)?;
     for check in &loaded {
         if check.policy.repository != format!("github.com/{}", args.github_repo) {

@@ -35,7 +35,8 @@ use super::comment::MARKER_PREFIX;
 use super::fetch::FetchContext;
 use super::run::{observe, only_exempt, required_commands, trust_paths};
 use super::{
-    Observed, ValidationPolicy, ValidationRecipe, ValidationRecord, VerdictState, assess, select,
+    Observed, ValidationPolicy, ValidationRecipe, ValidationRecord, VerdictState, assess_lifecycle,
+    select,
 };
 use crate::evidence::EvaluationClock;
 use crate::hub::github::{Api, CommitStatus, Gh, GhError, StatusState};
@@ -228,6 +229,8 @@ struct Candidate {
     head: String,
     fingerprint: Vec<String>,
     bodies: Vec<String>,
+    /// Lifecycle evidence from unrecognized authors: used only to choose a pending reason.
+    hints: Vec<String>,
     /// `(envelope digest, html_url)` of each eligible comment that supplied a URL.
     links: Vec<(String, String)>,
 }
@@ -266,44 +269,55 @@ impl Context<'_> {
     /// Association visibility depends on the API viewer. An otherwise unrecognized author
     /// can opt in only with fresh, currently trusted signed evidence for this repository,
     /// head and base. The record's tree and merge-base are used here only for discovery;
-    /// `verdict` still fetches Git and independently checks every source binding.
-    fn eligible<'a>(&self, comments: &'a [IssueComment], pull: &OpenPull) -> Vec<&'a IssueComment> {
+    /// `verdict` still fetches Git and independently checks every source binding. Evidence
+    /// from such an author that is authentic for this check but revoked, stale or expired is
+    /// returned separately as a hint: it never opts a head in or joins the fingerprint, and
+    /// `select` still verifies it fully before it can choose a pending reason.
+    fn eligible<'a>(
+        &self,
+        comments: &'a [IssueComment],
+        pull: &OpenPull,
+    ) -> (Vec<&'a IssueComment>, Vec<&'a IssueComment>) {
         let required: Vec<String> = self.recipe.commands.iter().map(|c| c.id.clone()).collect();
         let now = clock();
-        comments
-            .iter()
-            .filter(|comment| {
-                if !comment.body.starts_with(MARKER_PREFIX) {
-                    return false;
-                }
-                if TRUSTED_ASSOCIATIONS.contains(&comment.author_association.as_str()) {
-                    return true;
-                }
-                let Ok((envelope, bytes)) = super::comment::parse(&comment.body) else {
-                    return false;
-                };
-                let Ok(record) = ValidationRecord::from_slice(&bytes) else {
-                    return false;
-                };
-                assess(
-                    &envelope,
-                    &bytes,
-                    self.recipe,
-                    self.registry,
-                    self.policy,
-                    Observed {
-                        repository: self.repository,
-                        commit: &pull.head,
-                        tree: &record.subject.tree,
-                        base_ref: &pull.base,
-                        merge_base: &record.context.merge_base,
-                        required: &required,
-                    },
-                    now,
-                )
-                .applies_to_head
-            })
-            .collect()
+        let (mut eligible, mut hints) = (Vec::new(), Vec::new());
+        for comment in comments {
+            if !comment.body.starts_with(MARKER_PREFIX) {
+                continue;
+            }
+            if TRUSTED_ASSOCIATIONS.contains(&comment.author_association.as_str()) {
+                eligible.push(comment);
+                continue;
+            }
+            let Ok((envelope, bytes)) = super::comment::parse(&comment.body) else {
+                continue;
+            };
+            let Ok(record) = ValidationRecord::from_slice(&bytes) else {
+                continue;
+            };
+            let (verdict, lifecycle) = assess_lifecycle(
+                &envelope,
+                &bytes,
+                self.recipe,
+                self.registry,
+                self.policy,
+                Observed {
+                    repository: self.repository,
+                    commit: &pull.head,
+                    tree: &record.subject.tree,
+                    base_ref: &pull.base,
+                    merge_base: &record.context.merge_base,
+                    required: &required,
+                },
+                now,
+            );
+            if verdict.applies_to_head {
+                eligible.push(comment);
+            } else if lifecycle {
+                hints.push(comment);
+            }
+        }
+        (eligible, hints)
     }
 
     async fn open_pulls(&self) -> Gh<Vec<OpenPull>> {
@@ -444,7 +458,7 @@ impl Context<'_> {
             return Ok(Recheck::Changed("head or base changed"));
         }
         let comments = self.comments(c.number).await?;
-        if fingerprint(&self.eligible(&comments, pull)) != c.fingerprint {
+        if fingerprint(&self.eligible(&comments, pull).0) != c.fingerprint {
             return Ok(Recheck::Changed("attestation comments changed"));
         }
         Ok(if shared(&pulls, &c.head) {
@@ -498,7 +512,12 @@ impl Context<'_> {
             Ok(required) => required,
             Err(error) => return Err(format!("{error:?}")),
         };
-        let bodies: Vec<&str> = c.bodies.iter().map(String::as_str).collect();
+        let bodies: Vec<&str> = c
+            .bodies
+            .iter()
+            .chain(&c.hints)
+            .map(String::as_str)
+            .collect();
         let verdict = select(
             &bodies,
             self.recipe,
@@ -581,7 +600,7 @@ impl Context<'_> {
                 Ok(comments) => comments,
                 Err(error) => return read_error("comments", &error),
             };
-            let attestations = self.eligible(&comments, pull);
+            let (attestations, hints) = self.eligible(&comments, pull);
             let opted_in = if attestations.is_empty() {
                 match self.has_status(&pull.head).await {
                     Ok(has) => has,
@@ -595,6 +614,7 @@ impl Context<'_> {
                 head: pull.head.clone(),
                 fingerprint: fingerprint(&attestations),
                 bodies: attestations.iter().map(|c| c.body.clone()).collect(),
+                hints: hints.iter().map(|c| c.body.clone()).collect(),
                 links: attestations
                     .iter()
                     .filter_map(|c| {

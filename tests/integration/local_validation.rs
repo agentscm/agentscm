@@ -1746,6 +1746,17 @@ fn lifecycle_causes_are_distinct_non_success_and_chosen_only_by_authenticated_ev
     c.registry = revoked.clone();
     expect_cause(one(c, &revoked, known_now), Outcome::Revoked);
 
+    // The signing key's own validity ended: re-attesting with it cannot help.
+    let mut key_expired = registry();
+    key_expired.issuers[0].keys[0].not_after_ms = ISSUED + 1;
+    let key_expired_verdict = one(check("alpha"), &key_expired, known_now);
+    assert_eq!(
+        key_expired_verdict.reason,
+        "attestation signing key expired"
+    );
+    expect_cause(key_expired_verdict, Outcome::KeyExpired);
+    assert_eq!(Outcome::KeyExpired.as_str(), "key_expired");
+
     // A real revocation edits the registry after signing, so the registry digest changed too.
     // The revocation is still the cause reported; a change that revokes nothing stays stale.
     let signed_before_revocation = one(check("alpha"), &revoked, known_now);

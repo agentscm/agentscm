@@ -142,7 +142,7 @@ The config directory (`--config-dir`, default `.github/local-validation`) may ho
     recipe.json
 ```
 
-Each entry reads `<dir>/policy.json` and `<dir>/recipe.json`; `registry.json` stays in the config directory. `name` is display text only. A check's identity comes from its policy alone: an optional `check_id` (`^[a-z0-9][a-z0-9-]{0,39}$`). Without `checks.json` the directory is exactly one legacy check with no name prefix, as before. The whole run fails closed with nothing written on: unknown fields, a `schema_version` other than 1, an empty list, more than 20 checks, an absolute `dir` or one containing `..`, duplicate identities, more than one policy without a `check_id`, a policy repository that differs from `--github-repo`, a symbolic link at `checks.json` (a dangling one is refused, not read as absent), `registry.json`, a check directory component, or a `policy.json` or `recipe.json`, a recipe whose digest differs from its policy, or a recipe with constituents under a policy without a `check_id`.
+Each entry reads `<dir>/policy.json` and `<dir>/recipe.json`; `registry.json` stays in the config directory. `name` is display text only. A check's identity comes from its policy alone: an optional `check_id` (`^[a-z0-9][a-z0-9-]{0,39}$`). Without `checks.json` the directory is exactly one legacy check with no name prefix, as before. The whole run fails closed with nothing written on: unknown fields, a `schema_version` other than 1, an empty list, more than 20 checks, an absolute `dir` or one containing `..`, duplicate identities, more than one policy without a `check_id`, a policy repository that differs from `--github-repo`, a symbolic link at `checks.json` (a dangling one is refused, not read as absent), `registry.json`, any component of `--config-dir` below `--repo` when a manifest is in use (components of `--repo` itself may be links), a check directory component, or a `policy.json` or `recipe.json`, a recipe whose digest differs from its policy, or a recipe with constituents under a policy without a `check_id`.
 
 A grouped `static` recipe maps recipe command ids to constituents (policy `{"check_id":"static", ...}`; recipe excerpt):
 
@@ -180,7 +180,8 @@ Status descriptions are `<Check>: <reason>` for the aggregate and `<Check>: <Con
 | missing | pending | `no attestation for this head` |
 | stale head | pending | `attestation is for a different head` (an attestation for this check exists, but not for this head) |
 | stale policy | pending | `attestation predates the current policy` |
-| expired | pending | `attestation expired` (older than the policy maximum age) |
+| expired | pending | `attestation expired` (older than the policy maximum age or no longer fresh; re-attesting helps) |
+| key expired | pending | `attestation signing key expired` (the issuer key's own validity ended; re-attesting with that key does not help) |
 | revoked | pending | `attestation signing key revoked`. A real revocation edits `registry.json`, which also changes the registry digest; the revocation is checked first and is the reason reported. |
 | registry stale | pending | `issuer registry changed since attestation` (a registry change that does not revoke the signing key) |
 | unverified coverage | failure | `coverage mismatch`: the signed coverage differs from the signed record |
@@ -238,7 +239,7 @@ Do these in order, and stop at any step that does not behave as described.
 5. Only then does a repository operator add the new contexts to the ruleset, bound to integration `15368`.
 6. Only then remove the hosted checks that the new contexts replace.
 
-Rollback: the operator removes the new contexts from the ruleset first, then removes `checks.json` or pins back. Removing a required context from the configuration before the ruleset strands every pull request on a check that is never written. Older binaries ignore `checks.json` and read the root `policy.json`, and they refuse a policy that has a `check_id`. Nothing edits branch protection or a ruleset automatically. Retired contexts are reset to `pending` on open heads and stay `pending`; they are harmless once those contexts are not required.
+Rollback: the operator removes the new contexts from the ruleset first, then removes `checks.json` or pins back. Removing a required context from the configuration before the ruleset strands every pull request on a check that is never written. Older binaries ignore `checks.json` and read the root `policy.json`, and they refuse a policy that has a `check_id`. Nothing edits branch protection or a ruleset automatically. Whether retired contexts change depends on the route. Pinning back to an older workflow only touches the legacy context, so the named contexts keep their last status. Removing `checks.json` while still on the new workflow resets a retired `success` to `pending` on open heads, where it stays. Either is harmless, because rollback removes those contexts from the ruleset first.
 
 ## Hosted CI and required checks
 

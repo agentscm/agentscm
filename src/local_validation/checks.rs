@@ -91,6 +91,27 @@ fn refuse_symlinks(root: &Path, dir: &Path) -> Result<()> {
     refuse_link(path.join("recipe.json"))
 }
 
+/// With a manifest in use, no component of `config_dir` below `repo` may be a symbolic link.
+/// The components of `repo` itself are not examined: a checkout may legitimately sit under one.
+pub fn refuse_config_dir_symlinks(repo: &Path, config_dir: &Path) -> Result<()> {
+    let mut path = repo.to_path_buf();
+    for component in config_dir.components() {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(invalid(format!(
+                    "--config-dir component {} must not be a symbolic link",
+                    path.strip_prefix(repo).unwrap_or(&path).display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Loads every check under `root`. `read` returns a file's bytes, bounded; a missing manifest is
 /// the only read failure that is not an error. Any problem fails the whole load.
 pub fn load(root: &Path, read: &dyn Fn(&Path) -> Result<Vec<u8>>) -> Result<Vec<LoadedCheck>> {
@@ -281,6 +302,27 @@ mod tests {
         fs::rename(&path, dir.path().join("real-registry")).unwrap();
         symlink("real-registry", &path).unwrap();
         refused(&dir, "registry.json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_dir_components_below_the_repo_are_not_symbolic_links() {
+        use std::os::unix::fs::symlink;
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("real/lv")).unwrap();
+        assert!(refuse_config_dir_symlinks(repo.path(), Path::new("real/lv")).is_ok());
+        symlink("real", repo.path().join("linked")).unwrap();
+        let error = refuse_config_dir_symlinks(repo.path(), Path::new("linked/lv"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        // The repository path itself may be reached through a link.
+        let outer = tempfile::tempdir().unwrap();
+        symlink(repo.path(), outer.path().join("repo-link")).unwrap();
+        assert!(
+            refuse_config_dir_symlinks(&outer.path().join("repo-link"), Path::new("real/lv"))
+                .is_ok()
+        );
     }
 
     #[test]

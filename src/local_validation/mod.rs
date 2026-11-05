@@ -811,6 +811,8 @@ pub enum Outcome {
     StaleHead,
     StalePolicy,
     Expired,
+    /// The signing key's own validity ended; re-attesting with that key cannot help.
+    KeyExpired,
     Revoked,
     RegistryStale,
     /// Evidence that does not authenticate or does not bind to this check, head or recipe.
@@ -833,6 +835,7 @@ impl Outcome {
             Self::StaleHead => "stale_head",
             Self::StalePolicy => "stale_policy",
             Self::Expired => "expired",
+            Self::KeyExpired => "key_expired",
             Self::Revoked => "revoked",
             Self::RegistryStale => "registry_stale",
             Self::Unverified => "unverified",
@@ -849,6 +852,7 @@ impl Outcome {
             Self::StaleHead => "attestation is for a different head",
             Self::StalePolicy => "attestation predates the current policy",
             Self::Expired => "attestation expired",
+            Self::KeyExpired => "attestation signing key expired",
             Self::Revoked => "attestation signing key revoked",
             Self::RegistryStale => "issuer registry changed since attestation",
             _ => return None,
@@ -970,6 +974,31 @@ pub fn assess(
         clock,
     )
     .0
+}
+
+/// Like [`assess`], also reporting whether the envelope is authenticated evidence for this check
+/// that failed only for a lifecycle cause. Such evidence may explain a pending reason but never
+/// opts a head in.
+pub(crate) fn assess_lifecycle(
+    envelope_bytes: &[u8],
+    record_bytes: &[u8],
+    recipe: &ValidationRecipe,
+    registry: &IssuerRegistrySnapshot,
+    policy: &ValidationPolicy,
+    observed: Observed<'_>,
+    clock: EvaluationClock,
+) -> (Verdict, bool) {
+    let (verdict, standing) = assess_standing(
+        envelope_bytes,
+        record_bytes,
+        recipe,
+        registry,
+        policy,
+        observed,
+        clock,
+    );
+    let lifecycle = standing == Standing::ThisCheck && verdict.outcome.lifecycle_reason().is_some();
+    (verdict, lifecycle)
 }
 
 fn assess_standing(
@@ -1229,7 +1258,7 @@ fn assess_envelope(
         other => {
             let outcome = match other {
                 CurrentIssuerTrust::Revoked => Outcome::Revoked,
-                CurrentIssuerTrust::Expired => Outcome::Expired,
+                CurrentIssuerTrust::Expired => Outcome::KeyExpired,
                 _ => Outcome::Unverified,
             };
             return Verdict::failure(outcome, "issuer not trusted", format!("{other:?}"));

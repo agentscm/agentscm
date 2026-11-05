@@ -1864,6 +1864,81 @@ async fn a_new_head_or_a_revoked_key_leaves_no_check_green() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_authors_lifecycle_evidence_explains_pending_on_an_opted_in_head() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "NONE", unit, None), (11, "NONE", stat, None)]);
+    let checkout = env.root().join("checkout");
+    let path = checkout.join(".github/local-validation/registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry["issuers"][0]["keys"][0]["revoked_at_ms"] = 1.into();
+    fs::write(path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    git(&checkout, &["commit", "-qam", "revoke synthetic issuer"]);
+    git(&checkout, &["push", "-q", "origin", "HEAD:main"]);
+    // The comments alone do not opt the head in; an earlier status does.
+    env.fake.with(|s| {
+        let status = serde_json::json!({"state": "pending", "context": UNIT, "description": "old"});
+        s.repos
+            .get_mut(&1)
+            .unwrap()
+            .record_status(&env.head, status, "bot");
+    });
+    ok(&reconciled(&env));
+    for context in [UNIT, STATIC] {
+        let (state, description) = env.last(context);
+        assert_eq!(state, "pending", "{context}");
+        assert!(description.contains("signing key revoked"), "{description}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_authors_stale_evidence_alone_does_not_opt_a_head_in() {
+    let mut env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "NONE", unit, None), (11, "NONE", stat, None)]);
+    env.push_head(&[("another.txt", "new head")]);
+    ok(&reconciled(&env));
+    assert_eq!(env.posts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_authors_tampered_evidence_still_reads_as_missing() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    let tamper = |body: String| {
+        altered_attestation(&body, |e, _| {
+            let replacement = if e.signature_hex.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            };
+            e.signature_hex.replace_range(..1, replacement);
+        })
+    };
+    env.set_comments(vec![
+        (10, "NONE", tamper(unit), None),
+        (11, "NONE", tamper(stat), None),
+    ]);
+    env.fake.with(|s| {
+        let status = serde_json::json!({"state": "pending", "context": UNIT, "description": "old"});
+        s.repos
+            .get_mut(&1)
+            .unwrap()
+            .record_status(&env.head, status, "bot");
+    });
+    ok(&reconciled(&env));
+    for context in [UNIT, STATIC] {
+        let (state, description) = env.last(context);
+        assert_eq!(state, "pending", "{context}");
+        assert!(description.contains("no attestation"), "{description}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_comment_added_during_the_run_leaves_that_check_pending_with_no_stale_success() {
     let env = Env::two(true, true).await;
     let (unit, stat) =
