@@ -5,6 +5,7 @@ pub mod catchup;
 mod catchup_sync;
 pub mod change_record;
 pub mod change_record_http;
+mod compact;
 pub mod connection;
 pub mod continuity;
 pub mod coordination;

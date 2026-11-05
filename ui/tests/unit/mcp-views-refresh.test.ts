@@ -91,13 +91,13 @@ const inbox = (requests: Data[], over: Data = {}) => ({ requests, complete: true
 
 const views = [
   {
-    name: 'work overview', file: 'work-overview.html', tool: 'agentscm_work_overview', fold: 'All work',
+    name: 'work overview', file: 'work-overview.html', tool: 'agentscm_work_overview', fold: 'All work', args: { detail: 'full' },
     before: overview([item({})]),
     after: overview([item({}), item({ id: 'wrk_b', title: 'Stuck', state: 'blocked', blocker: { summary: 'needs api' } })]),
     said: '1 action needs you',
   },
   {
-    name: 'coordination inbox', file: 'coordination-inbox.html', tool: 'agentscm_coordination_inbox', fold: 'Receipts',
+    name: 'coordination inbox', file: 'coordination-inbox.html', tool: 'agentscm_coordination_inbox', fold: 'Receipts', args: {},
     before: inbox([request('crq_1', 'pending')]),
     after: inbox([request('crq_1', 'responded')]),
     said: '1 replied',
@@ -118,7 +118,7 @@ describe('MCP views auto-refresh', () => {
     expect(host.calls()).toHaveLength(0)
     await host.wait(1)
     expect(host.calls()).toHaveLength(1)
-    expect(host.calls()[0]!.params!.arguments).toEqual({})
+    expect(host.calls()[0]!.params!.arguments).toEqual(v.args)
     await host.answer(v.before)
 
     await host.hide(true)
@@ -223,6 +223,16 @@ describe('MCP views auto-refresh', () => {
     await host.answer(v.after)
     expect(live.textContent).toBe('')
     expect(host.sent.filter((m) => m.method === 'ui/message' || m.method === 'ui/update-model-context')).toEqual([])
+  })
+
+  it("overview asks for every field when the agent's reply is compact", async () => {
+    const v = views[0]!
+    const host = mount(v.file, v.tool)
+    host.push({ detail: 'compact', actionable_status: { detail: 'compact', counts: statusFixture.counts } })
+    expect(host.calls()).toHaveLength(1)
+    expect(host.calls()[0]!.params!.arguments).toEqual({ detail: 'full' })
+    await host.answer(v.after)
+    expect(host.root.textContent).toContain(v.said)
   })
 
   it.each(views)('$name has no conversation-pushing call in its source', (v) => {

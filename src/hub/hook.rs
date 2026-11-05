@@ -725,7 +725,11 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
-                if !principal.read_only {
+                // Only while a requested briefing waits for an agent.
+                if !principal.read_only
+                    && super::narrative::pending(state, &principal)
+                        .is_ok_and(|requests| !requests.is_empty())
+                {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
                 }

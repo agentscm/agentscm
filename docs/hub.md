@@ -785,7 +785,7 @@ cannot write another repository's intents.
 
 An `agentscm_start` that creates new work (not a join, takeover or resumed start) compares its
 task with the titles of other agents' ongoing work (from the same
-overview `work.context` shows) and of the repository's open observed pull requests. Two titles
+overview `agentscm_work_overview` pages) and of the repository's open observed pull requests. Two titles
 match when they share at least two words of three or more letters, ignoring a few filler words
 ("fix", "add", "update", "work" ...), and those shared words are at least half of both together.
 On a match the reply lists them, with each work id, and tells the agent to decide from the titles
