@@ -67,6 +67,8 @@ impl WorkspaceGuard<'_> {
                 "workspace task authorization unavailable",
             )),
             HubError::Invalid(_)
+            | HubError::Rejected(_)
+            | HubError::Input(_)
             | HubError::WorkCheckpointSequenceConflict { .. }
             | HubError::Unauthorized
             | HubError::WorkOverlap(_)
@@ -391,6 +393,7 @@ fn encode(value: impl Serialize) -> Result<Value> {
 
 fn native_action_error(error: crate::Error) -> HubError {
     match error {
+        crate::Error::Hub(envelope) => HubError::from(envelope),
         crate::Error::Conflict(_) => HubError::Invalid("workspace_native_conflict".into()),
         crate::Error::Invalid(_) | crate::Error::NotFound(_) => {
             HubError::Invalid("invalid native action".into())
@@ -401,6 +404,7 @@ fn native_action_error(error: crate::Error) -> HubError {
 
 fn task_error(error: crate::Error) -> HubError {
     match error {
+        crate::Error::Hub(envelope) => HubError::from(envelope),
         crate::Error::Conflict(message) if message == "workflow task ID is stale or refused" => {
             HubError::Invalid("invalid agent task request".into())
         }
@@ -1117,7 +1121,7 @@ async fn mcp(
             json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"AgentSCM task request conflicted with current state; inspect task status or recovery"}],"isError":true}}),
         )
         .into_response(),
-        Err(HubError::Invalid(_)) => axum::Json(
+        Err(HubError::Invalid(_) | HubError::Rejected(_) | HubError::Input(_)) => axum::Json(
             json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"AgentSCM task request was invalid or not found"}],"isError":true}}),
         )
         .into_response(),
@@ -1524,17 +1528,30 @@ mod tests {
 
     #[test]
     fn workspace_guard_keeps_authorization_outages_uncertain() {
-        assert!(matches!(
-            WorkspaceGuard::guard_error(HubError::Busy),
-            crate::Error::Io(_)
-        ));
-        assert!(matches!(
-            WorkspaceGuard::guard_error(HubError::Unavailable("store".into())),
-            crate::Error::Io(_)
-        ));
-        assert!(matches!(
-            WorkspaceGuard::guard_error(HubError::Unauthorized),
-            crate::Error::Conflict(_)
-        ));
+        for (error, code, retryable) in [
+            (HubError::Busy, "busy", true),
+            (HubError::Unavailable("store".into()), "unavailable", true),
+            (HubError::Unauthorized, "unauthorized", false),
+            (HubError::session_required(), "session_required", false),
+        ] {
+            let crate::Error::Hub(envelope) = WorkspaceGuard::guard_error(error) else {
+                panic!("workspace guard discarded the envelope");
+            };
+            assert_eq!(envelope.code, code);
+            assert_eq!(envelope.retryable, retryable);
+            let expected = serde_json::to_value(&envelope).unwrap();
+            let recovered = task_error(crate::Error::Hub(envelope.clone()));
+            assert_eq!(
+                serde_json::to_value(super::super::error_envelope::from_hub_error(&recovered))
+                    .unwrap(),
+                expected
+            );
+            let recovered = native_action_error(crate::Error::Hub(envelope));
+            assert_eq!(
+                serde_json::to_value(super::super::error_envelope::from_hub_error(&recovered))
+                    .unwrap(),
+                expected
+            );
+        }
     }
 }

@@ -199,7 +199,7 @@ impl Env {
                 json!({"handle": started["handle"]}),
             )
             .await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, signed["admin"].clone()),
             (200, json!(true)),
             "{signed}"

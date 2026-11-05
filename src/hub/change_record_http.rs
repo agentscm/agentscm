@@ -280,7 +280,7 @@ pub(super) async fn conversation_body(
                         && let Err(error) =
                             store.shared_body_demote_available(&work_id, &sha256, None)
                     {
-                        eprintln!("hub: shared body not demoted: {error}");
+                        crate::hub::error_envelope::log_internal(&error);
                     }
                     Ok(Err(ApiError::new(
                         StatusCode::FAILED_DEPENDENCY,
@@ -399,7 +399,7 @@ fn physically_delete(
         if let Err(error) =
             store.shared_body_delete_failed(&row.work, &row.digest, &row.author, retry_at)
         {
-            eprintln!("hub: shared body retry not recorded: {error}");
+            crate::hub::error_envelope::log_internal(&error);
         }
     }
     removed
@@ -459,7 +459,7 @@ async fn upload_body(
             if let Err(revert) =
                 store.shared_body_demote_available(&work_id, &sha256, Some(&row.author))
             {
-                eprintln!("hub: shared body not reverted: {revert}");
+                super::error_envelope::log_internal(&revert);
             }
             return Err(error.into());
         }
@@ -476,7 +476,7 @@ async fn upload_body(
                 }
                 _ => {
                     if let Err(error) = physically_delete(&*store, &*objects, row, now, true) {
-                        eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
+                        crate::hub::error_envelope::log_internal(&error);
                     }
                     ApiError::gone()
                 }
@@ -518,7 +518,7 @@ async fn delete_body(
                 continue;
             }
             if let Err(error) = physically_delete(&*store, &*objects, &row, now, false) {
-                eprintln!("hub: shared body removal deferred to the sweep: {error}");
+                crate::hub::error_envelope::log_internal(&error);
             }
         }
         Ok(Ok(()))
@@ -614,7 +614,7 @@ pub async fn sweep_shared_bodies(state: &HubState, now: i64) -> Result<SweepRepo
                     Ok(()) => batch.deleted += 1,
                     Err(error) => {
                         batch.failed += 1;
-                        eprintln!("hub: shared body removal failed, will retry: {error}");
+                        crate::hub::error_envelope::log_internal(&error);
                     }
                 }
             }
@@ -640,7 +640,7 @@ pub async fn sweep_loop(state: HubState) {
             match sweep_shared_bodies(&state, unix_now()).await {
                 Err(HubError::Busy) => tokio::time::sleep(SWEEP_BUSY_RETRY).await,
                 Err(error) => {
-                    eprintln!("hub: shared body sweep failed: {error}");
+                    crate::hub::error_envelope::log_internal(&error);
                     break;
                 }
                 Ok(_) => break,

@@ -177,9 +177,7 @@ impl IntoResponse for Failure {
     fn into_response(self) -> Response {
         match self {
             Self::Hub(error) => ApiError::from(error).into_response(),
-            Self::Refused(status, code, message) => {
-                (status, Json(json!({"error": code, "message": message}))).into_response()
-            }
+            Self::Refused(status, code, _) => ApiError::new(status, code).into_response(),
         }
     }
 }
@@ -553,14 +551,14 @@ pub(super) async fn sync_adoption(
     let (branch, file) = match read {
         Ok(read) => read,
         Err(error) => {
-            eprintln!("hub: skills lock read for {}: {error:?}", repo.full_name);
+            crate::hub::error_envelope::log_internal(&error);
             let (store, name) = (state.store.clone(), repo.full_name.clone());
             let cleared = blocking(state, move || {
                 store.skill_adoption_clear(&name, Some("reported_by_checkout"))
             })
             .await;
             if let Err(error) = cleared {
-                eprintln!("hub: skills adoption store for {}: {error}", repo.full_name);
+                crate::hub::error_envelope::log_internal(&error);
             }
             return;
         }
@@ -583,7 +581,7 @@ pub(super) async fn sync_adoption(
     })
     .await;
     if let Err(error) = done {
-        eprintln!("hub: skills adoption store for {}: {error}", repo.full_name);
+        crate::hub::error_envelope::log_internal(&error);
     }
 }
 
@@ -610,7 +608,7 @@ pub fn routes() -> Router<HubState> {
 
 fn scope(principal: &Principal, repo: &str) -> std::result::Result<(), Failure> {
     if principal.repository != repo {
-        return Err(Failure::Hub(HubError::Unauthorized));
+        return Err(not_found());
     }
     Ok(())
 }
@@ -812,11 +810,7 @@ fn tool_result(text: String, structured: Value, is_error: bool) -> Value {
 fn refusal_result(failure: Failure) -> Value {
     match failure {
         Failure::Hub(error) => hub_failure(&error),
-        Failure::Refused(_, code, message) => tool_result(
-            format!("AgentSCM: {message} ({code})"),
-            json!({"error": code, "message": message}),
-            true,
-        ),
+        Failure::Refused(status, code, _) => ApiError::new(status, code).envelope().mcp(),
     }
 }
 
@@ -939,11 +933,7 @@ pub(super) fn is_tool(name: &str) -> bool {
 }
 
 fn other_repository() -> Value {
-    tool_result(
-        "AgentSCM: this token is for another repository.".into(),
-        json!({"error": "other_repository"}),
-        true,
-    )
+    super::error_envelope::from_code(super::error_envelope::ErrorCode::NotFound).mcp()
 }
 
 /// Runs a skill tool for `principal`; `arguments` is the raw tool arguments.

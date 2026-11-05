@@ -620,7 +620,7 @@ async fn announce(
     )
     .await
     .unwrap_or_else(|error| {
-        eprintln!("hub: pull requests for an announce: {error}");
+        crate::hub::error_envelope::log_internal(&error);
         Vec::new()
     });
     let overlaps: Vec<Value> = announced

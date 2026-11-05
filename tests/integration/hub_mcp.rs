@@ -1284,7 +1284,10 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
         ("agentscm_handoff", json!({"path": file, "accept": "yes"})),
     ] {
         let (text, error) = call(&bob, name, arguments).await;
-        assert!(error && text.contains("invalid arguments"), "{text}");
+        assert!(
+            error && text.contains("invalid request") && text.contains("ref cor_"),
+            "{text}"
+        );
     }
 
     // Declining: the requester hears it on its next call.
@@ -2001,7 +2004,7 @@ async fn errors_are_tool_results_with_fixed_text() {
         let (text, error) = hub.tool(&key, "/mcp", name, arguments).await;
         assert!(error, "{name}");
         assert!(
-            text.starts_with(&format!("AgentSCM: invalid arguments for {name}: ")),
+            text.contains("invalid request") && text.contains("ref cor_"),
             "{text}"
         );
         assert!(!text.contains("sekrit"), "{text}");
@@ -2015,7 +2018,10 @@ async fn errors_are_tool_results_with_fixed_text() {
         )
         .await;
     assert!(error && !text.contains("sekrit"), "{text}");
-    assert!(text.contains("invalid_or_changed"), "{text}");
+    assert!(
+        text.contains("invalid or changed") && text.contains("ref cor_"),
+        "{text}"
+    );
 
     // An unknown tool or a call without a name is a protocol error.
     for params in [json!({"name": "nope"}), json!({}), json!("x")] {

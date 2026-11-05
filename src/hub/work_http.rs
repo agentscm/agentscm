@@ -688,19 +688,10 @@ async fn start(
     .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(HubError::WorkPreflight(mut preflight)) => {
-            preflight.show(Viewer(&viewer));
-            (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "work_preflight_required",
-                "message": "Atomic admission found changed, incomplete or conflicting source facts. No new Work was claimed.",
-                "preflight": preflight,
-            })),
-        )
-            .into_response()
+        Err(mut error) => {
+            error.show(Viewer(&viewer));
+            ApiError::from(error).into_response()
         }
-        Err(error) => ApiError::from(error).into_response(),
     }
 }
 
@@ -749,21 +740,10 @@ async fn checkpoint(
 }
 
 fn work_error(error: HubError) -> Response {
-    match error {
-        HubError::WorkCoordinationRequired { overlaps, request } => {
-            super::coordination_http::CHANGED.notify_waiters();
-            (StatusCode::CONFLICT, Json(json!({"error": "work_coordination_required",
-                "overlaps": overlaps, "coordination_request": request,
-                "message": "Scope was not changed. A durable request is queued for the affected leads."}))).into_response()
-        },
-        HubError::WorkOverlap(overlaps) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "work_scope_overlap", "overlaps": overlaps,
-                "alternatives": ["Split the declared scope or join the existing work as helper or reviewer.",
-                    "Arrange a deliberate handover with the current lead."]})),
-        ).into_response(),
-        error => ApiError::from(error).into_response(),
+    if matches!(&error, HubError::WorkCoordinationRequired { .. }) {
+        super::coordination_http::CHANGED.notify_waiters();
     }
+    ApiError::from(error).into_response()
 }
 
 async fn acknowledge(

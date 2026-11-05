@@ -146,6 +146,259 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
+async fn i295_startup_scenario(scenario: &str) {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    if scenario == "later_new_session" {
+        let principal = hub
+            .store
+            .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap();
+        let start: WorkStart = serde_json::from_value(json!({
+            "title":"Synthetic default Work", "session":"default", "scope":["src/example.rs"]
+        }))
+        .unwrap();
+        hub.store
+            .work_start_auto(&principal.token_id, &start, unix_now())
+            .unwrap();
+    }
+    let mut payload = fixture("claude-SessionStart");
+    let first = hub.hook("claude", &secret, &payload);
+    let first_text = text_at(&first, CLAUDE_CONTEXT);
+    assert!(
+        !first_text.contains("coordination unknown"),
+        "first start: {first}"
+    );
+    assert!(
+        first_text.contains("native session ID"),
+        "first start: {first}"
+    );
+    if scenario == "first_start" {
+        return;
+    }
+    match scenario {
+        "replay" => {}
+        "resume" => payload["source"] = json!("resume"),
+        "later_new_session" => {
+            payload["session_id"] = json!("22222222-3333-4444-5555-666666666666")
+        }
+        _ => panic!("unknown synthetic scenario"),
+    }
+    let answer = hub.hook("claude", &secret, &payload);
+    let text = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(
+        !text.contains("coordination unknown"),
+        "{scenario}: {answer}"
+    );
+    assert!(text.contains("native session ID"), "{scenario}: {answer}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i295_first_start() {
+    i295_startup_scenario("first_start").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i295_immediate_replay() {
+    i295_startup_scenario("replay").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i295_resume() {
+    i295_startup_scenario("resume").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i295_later_new_session_after_default_adoption() {
+    i295_startup_scenario("later_new_session").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_preflight_explains_the_missing_work_identity() {
+    let mut hub = Hub::start().await;
+    let token = hub.agent();
+    let (status, body) = hub.post(
+        "/v1/hub/standup/preflight",
+        Some(&token),
+        br#"{"title":"Synthetic task","session":"synthetic-session"}"#,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["recovery"]["action"], "provide_field");
+    let fields = body["fields"].as_array().unwrap();
+    for name in ["work_id", "source", "request_key"] {
+        assert!(body["message"].as_str().unwrap().contains(name));
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"] == name && field["problem"] == "missing")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_session_start_replay_and_resume_always_repeat_the_note() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    hub.store.revoke_agent_token(&principal.token_id).unwrap();
+    let mut payload = fixture("claude-SessionStart");
+    let client = reqwest::Client::new();
+    for source in ["startup", "startup", "resume"] {
+        payload["source"] = json!(source);
+        let response = client
+            .post(format!("http://{}/v1/hub/hook/claude", hub.address))
+            .bearer_auth(&secret)
+            .header("content-type", "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let reference = response.headers()["x-agentscm-correlation-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let answer: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        let text = text_at(&answer, CLAUDE_CONTEXT);
+        assert!(text.contains("coordination unknown"), "{answer}");
+        assert!(
+            text.contains("sign in") || text.contains("Sign in"),
+            "{answer}"
+        );
+        assert!(text.contains(&format!("ref {reference}")), "{answer}");
+        assert!(!text.contains(&secret));
+        assert!(text.chars().count() <= 9000);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthorized_callers_get_indistinguishable_envelopes() {
+    let mut hub = Hub::start().await;
+    let revoked = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&revoked).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    hub.store.revoke_agent_token(&principal.token_id).unwrap();
+    let expired = "d".repeat(64);
+    let expired_id = hub
+        .store
+        .insert_agent_token(&store::NewAgentToken {
+            owner: principal.owner.id.clone(),
+            name: "expired".into(),
+            repository: REPO.into(),
+            digest: agent_token_digest(&expired).unwrap(),
+            expires_at: unix_now() + 3600,
+            repository_id: None,
+            read_only: false,
+        })
+        .unwrap();
+    rusqlite::Connection::open(hub._dir.path().join("hub.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE hub_agent_tokens SET expires_at = ?1 WHERE id = ?2",
+            rusqlite::params![unix_now() - 1, expired_id],
+        )
+        .unwrap();
+    let disabled = hub.agent();
+    let disabled_principal = hub
+        .store
+        .authenticate(&agent_token_digest(&disabled).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    hub.store
+        .set_user_disabled(&disabled_principal.owner.id, true)
+        .unwrap();
+    let unknown = "e".repeat(64);
+    let mut baseline = None;
+    for token in [
+        None,
+        Some("not-a-token"),
+        Some(unknown.as_str()),
+        Some(revoked.as_str()),
+        Some(expired.as_str()),
+        Some(disabled.as_str()),
+    ] {
+        let (status, mut body) = hub.post("/v1/hub/standup/preflight", token, b"not-json");
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "unauthorized");
+        body.as_object_mut().unwrap().remove("correlation_id");
+        if let Some(expected) = &baseline {
+            assert_eq!(&body, expected);
+        } else {
+            baseline = Some(body);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inaccessible_repository_resources_look_exactly_like_missing_resources() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    let (other_token, _) = mint_agent_token(
+        &*hub.store,
+        &principal.owner.id,
+        "other",
+        "other/hidden",
+        3600,
+    )
+    .unwrap();
+    let start: WorkStart = serde_json::from_value(json!({"title":"Synthetic hidden Work", "session":"hidden-session", "request_key":"hidden-request"})).unwrap();
+    let hidden = hub
+        .store
+        .work_start(&other_token, &start, unix_now())
+        .unwrap()
+        .item;
+    assert!(
+        hub.store
+            .work_get(&other_token, &hidden.id, unix_now())
+            .unwrap()
+            .is_some()
+    );
+    let client = reqwest::Client::new();
+    let mut baseline = None;
+    for work_id in ["wrk_00000000000000000000000000000000", &hidden.id] {
+        let response = client
+            .get(format!(
+                "http://{}/v1/hub/standup/work/{work_id}",
+                hub.address
+            ))
+            .bearer_auth(&secret)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        let reference = response.headers()["x-agentscm-correlation-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(agentscm::hub::error_envelope::valid_correlation_id(
+            &reference
+        ));
+        let mut body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(body["correlation_id"], reference);
+        assert_eq!(body["error"], "not_found");
+        body.as_object_mut().unwrap().remove("correlation_id");
+        if let Some(expected) = &baseline {
+            assert_eq!(&body, expected);
+        } else {
+            baseline = Some(body);
+        }
+    }
+}
+
 fn text_at<'a>(answer: &'a Value, pointer: &str) -> &'a str {
     answer
         .pointer(pointer)

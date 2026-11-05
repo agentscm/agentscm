@@ -12,6 +12,7 @@ pub mod continuity;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
+pub mod error_envelope;
 pub mod external_runs;
 pub mod forge_api;
 #[cfg(unix)]
@@ -94,6 +95,8 @@ const MAX_CONCURRENT_STORE_CALLS: usize = 32;
 #[derive(Debug)]
 pub enum HubError {
     Invalid(String),
+    Rejected(error_envelope::ReviewedRejection),
+    Input(Vec<error_envelope::InputProblem>),
     Unauthorized,
     /// Too many concurrent store operations; the request is not queued.
     Busy,
@@ -128,6 +131,8 @@ impl fmt::Display for HubError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => write!(f, "invalid: {message}"),
+            Self::Rejected(rejection) => f.write_str(&rejection.message),
+            Self::Input(_) => f.write_str("invalid request fields"),
             Self::Unauthorized => write!(f, "authentication required"),
             Self::Busy => write!(f, "busy"),
             Self::WorkCapacity(capacity) => write!(
@@ -181,7 +186,10 @@ impl From<std::io::Error> for HubError {
 
 impl From<crate::Error> for HubError {
     fn from(error: crate::Error) -> Self {
-        Self::Unavailable(error.to_string())
+        match error {
+            crate::Error::Hub(envelope) => Self::from(envelope),
+            error => Self::Unavailable(error.to_string()),
+        }
     }
 }
 
@@ -254,7 +262,7 @@ pub async fn work_compaction_loop(state: HubState) {
                     applied.len(),
                 );
             }
-            Err(error) => eprintln!("hub: work compaction failed: {error}"),
+            Err(error) => crate::hub::error_envelope::log_internal(&error),
         }
     }
 }
@@ -486,7 +494,9 @@ pub fn router(state: HubState) -> Router {
     let router = bounded(router, publication, &state);
     #[cfg(unix)]
     let router = router.merge(source_bounded(workspace_source_http::routes()));
-    router.with_state(state)
+    router
+        .with_state(state)
+        .layer(axum::middleware::map_response(http::envelope_response))
 }
 
 /// Source bundles may take [`workspace_source_http::BODY_TIMEOUT`] to arrive, longer than the

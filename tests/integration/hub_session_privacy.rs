@@ -283,6 +283,103 @@ async fn other_owners_see_session_digests_and_masked_labels() {
     scenario(Hub::start(None).await).await;
 }
 
+async fn error_envelope_scenario(hub: Hub) {
+    let alice = hub.secret(1, ALICE_LABEL).await;
+    let bob = hub.secret(2, BOB_LABEL).await;
+    let mut starts = Vec::new();
+    for (secret, key, session, path) in [
+        (&alice, "alice-error-work", ALICE_SESSION, "src/shared.rs"),
+        (&bob, "bob-error-work", BOB_SESSION, "src/bob.rs"),
+    ] {
+        let text = hub
+            .tool(
+                secret,
+                "agentscm_start",
+                json!({
+                    "task":key,"request_key":key,"session":session,"paths":[path]
+                }),
+            )
+            .await;
+        let result: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["result"]["isError"], false, "{text}");
+        starts.push(result["result"]["structuredContent"]["work"]["item"].clone());
+    }
+    let alice_token = starts[0]["lead_token"].as_str().unwrap();
+    let bob_work = &starts[1];
+    for surface in ["http", "mcp"] {
+        let checkpoint = json!({
+            "work_id":bob_work["id"],"session":BOB_SESSION,"generation":bob_work["generation"],
+            "expected_updated_seq":bob_work["updated_seq"],"operation_id":format!("{surface}-overlap"),
+            "kind":"progress","summary":"Synthetic overlapping scope", "scope":["src/shared.rs"]
+        });
+        let preflight = json!({"source_revision":"1".repeat(40),"merge_after":0,"merge_through":0,
+            "source_relation_checked":false,"checked_merges":[]});
+        let start = json!({"title":"Synthetic preflight","request_key":format!("{surface}-preflight"),
+            "session":"synthetic-preflight-session","scope":["src/shared.rs"],"preflight":preflight});
+        for (tool, path, mut arguments, code) in [
+            (
+                "agentscm_work_checkpoint",
+                "/v1/hub/standup/checkpoint",
+                checkpoint,
+                "work_coordination_required",
+            ),
+            (
+                "agentscm_start",
+                "/v1/hub/standup/start",
+                start,
+                "work_preflight_required",
+            ),
+        ] {
+            let (envelope, text) = if surface == "http" {
+                let (status, text) = hub.call(Method::POST, path, &bob, Some(arguments)).await;
+                assert_eq!(status, 409, "{text}");
+                let envelope: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(envelope["error"], code, "{text}");
+                (envelope, text)
+            } else {
+                if tool == "agentscm_start" {
+                    arguments["task"] = arguments["title"].take();
+                    arguments.as_object_mut().unwrap().remove("title");
+                    arguments["paths"] = arguments["scope"].take();
+                    arguments.as_object_mut().unwrap().remove("scope");
+                }
+                let text = hub.tool(&bob, tool, arguments).await;
+                let reply: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(reply["result"]["isError"], true, "{text}");
+                let envelope = reply["result"]["structuredContent"]["error"].clone();
+                assert_eq!(envelope["code"], code, "{text}");
+                (envelope, text)
+            };
+            assert!(
+                envelope["correlation_id"]
+                    .as_str()
+                    .is_some_and(agentscm::hub::error_envelope::valid_correlation_id),
+                "{text}"
+            );
+            assert_hidden(code, &text);
+            assert!(
+                !text.contains(alice_token),
+                "{code} exposes the other owner's token: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_error_envelopes_hide_other_owner_identifiers() {
+    error_envelope_scenario(Hub::start(None).await).await;
+}
+
+#[test]
+fn work_error_envelopes_hide_other_owner_identifiers_on_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime
+        .block_on(async { error_envelope_scenario(Hub::start(Some(pg.url.clone())).await).await });
+}
+
 #[test]
 fn postgres_other_owners_see_session_digests_and_masked_labels() {
     let Some(pg) = hub_pg::PgSchema::create() else {
