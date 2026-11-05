@@ -1,7 +1,7 @@
 //! Private deterministic status queries and opt-in action reminders. No Slack message text is
 //! retained. Jobs bind an exact configured identity and re-read their facts before every send.
 use super::*;
-use crate::hub::work::WorkState;
+use crate::hub::work::{WorkItem, WorkState};
 use crate::hub::work_http::actionable_status::{self, ActionableStatus, StatusState};
 
 const SCAN_SECONDS: i64 = 60;
@@ -172,6 +172,49 @@ fn outstanding(status: &ActionableStatus) -> Vec<Outstanding> {
 fn body(text: &str) -> Value {
     json!({"text": escape(&clip_plain_text(text, 3500)), "parse":"none", "mrkdwn":false, "unfurl_links":false,
         "unfurl_media":false, "blocks":[{"type":"section","text":plain_lines(text, 3000)}]})
+}
+
+fn entry_message(item: &WorkItem, repository: &str, link: &str) -> Option<Value> {
+    let (headline, field, guidance, report) = match item.state {
+        WorkState::Blocked => (
+            "Your agent's work is blocked",
+            "Blocked on",
+            "Answer the blocker where your agent is running, or reassign the task.",
+            item.blocker.as_ref(),
+        ),
+        WorkState::Handover => (
+            "Work is offered for handover",
+            "Handover note",
+            "Review the handover in the Hub. Pick an agent to take it over.",
+            item.current.as_ref(),
+        ),
+        _ => return None,
+    };
+    Some(message(
+        headline,
+        &[
+            ("Work", sanitize(&item.title, TEXT_CHARS)),
+            ("Repository", sanitize(repository, TEXT_CHARS)),
+            (
+                "Agent",
+                format!(
+                    "{} session {}",
+                    agent_name(&item.lead_agent),
+                    &session_key(&item.lead_token, &item.lead_session)[..8]
+                ),
+            ),
+            (
+                field,
+                sanitize(
+                    report.map_or("No note reported.", |report| &report.summary),
+                    TEXT_CHARS,
+                ),
+            ),
+        ],
+        guidance,
+        None,
+        link,
+    ))
 }
 fn render_status(status: &ActionableStatus) -> String {
     let mut copy = status.clone();
@@ -366,13 +409,16 @@ impl Slack {
         binding: &Binding,
         now: i64,
     ) -> Result<()> {
+        if !binding.config.reminders.enabled {
+            return Ok(());
+        }
         let _slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
         let principal = match self.principal(state, binding) {
             Ok(p) => p,
             Err(HubError::Unauthorized) => return Ok(()),
             Err(e) => return Err(e),
         };
-        let status = actionable_status::read(&*state.store, &principal, now)?;
+        let status = actionable_status::read(&*state.store, &state.onboarding, &principal, now)?;
         let pending = outstanding(&status);
         let key = binding_key(binding);
         let policy = &binding.config.reminders;
@@ -452,11 +498,23 @@ impl Slack {
             if !exists && count >= EPISODE_LIMIT {
                 return Err(HubError::Busy);
             }
-            count += tx.execute("INSERT OR IGNORE INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)", params![episode,key,subject,now,now+policy.interval_seconds])? as i64;
+            let inserted = tx.execute("INSERT OR IGNORE INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)", params![episode,key,subject,now,now+policy.interval_seconds])?;
+            count += inserted as i64;
             tx.execute("DELETE FROM status_resolution_pending WHERE episode=?1 AND EXISTS(SELECT 1 FROM status_episodes WHERE id=?1 AND state='resolved')", [&episode])?;
             // A confirmed earlier resolution permits a new episode, not a retry of its old job.
-            tx.execute("UPDATE status_episodes SET cycle=cycle+1,state='active',first_seen=?2,next_due=?3,delivered=0,escalated=0 WHERE id=?1 AND state='resolved'", params![episode,now,now+policy.interval_seconds])?;
+            let reactivated = tx.execute("UPDATE status_episodes SET cycle=cycle+1,state='active',first_seen=?2,next_due=?3,delivered=0,escalated=0 WHERE id=?1 AND state='resolved'", params![episode,now,now+policy.interval_seconds])?;
             let (cycle, first, due, delivered, escalated): (i64,i64,i64,i64,bool) = tx.query_row("SELECT cycle,first_seen,next_due,delivered,escalated FROM status_episodes WHERE id=?1", [&episode], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+            if inserted + reactivated > 0 && matches!(action.subject, Subject::Work { .. }) {
+                queue(
+                    &tx,
+                    &format!("{episode}:{cycle}:entry"),
+                    &key,
+                    &binding.config.slack_user,
+                    "entry",
+                    (&episode, cycle),
+                    now,
+                )?;
+            }
             if now >= due && delivered < policy.max_reminders {
                 queue(
                     &tx,
@@ -575,7 +633,16 @@ impl Slack {
         if kind == "query" && user != binding.config.slack_user {
             return Err(HubError::Unauthorized);
         }
-        let status = match actionable_status::read(&*state.store, &principal, now) {
+        if kind != "query" && !binding.config.reminders.enabled {
+            self.obsolete_status_job(&id)?;
+            return Ok(None);
+        }
+        let status = match actionable_status::read(
+            &*state.store,
+            &state.onboarding,
+            &principal,
+            now,
+        ) {
             Ok(status) => status,
             Err(HubError::Unauthorized) => {
                 self.obsolete_status_job(&id)?;
@@ -590,16 +657,12 @@ impl Slack {
                 return Ok(None);
             }
         };
-        let text = if kind == "query" {
+        let payload = if kind == "query" {
             if user != binding.config.slack_user {
                 return Err(HubError::Unauthorized);
             }
-            render_status(&status)
+            body(&render_status(&status))
         } else {
-            if !binding.config.reminders.enabled {
-                self.obsolete_status_job(&id)?;
-                return Ok(None);
-            }
             let Some(episode) = &episode else {
                 return Err(unavailable());
             };
@@ -623,10 +686,10 @@ impl Slack {
                     self.obsolete_status_job(&id)?;
                     return Ok(None);
                 }
-                format!(
+                body(&format!(
                     "An action previously sent to you for {} is no longer outstanding. This does not establish task success. Evidence {} (read {}; non-atomic).",
                     principal.repository, status.digest, now
-                )
+                ))
             } else {
                 let pending = outstanding(&status);
                 let Some(action) = pending.iter().find(|a| a.subject == subject) else {
@@ -661,32 +724,71 @@ impl Slack {
                         Err(error) => return Err(error),
                     }
                 } else if user != binding.config.slack_user {
-                    return Err(HubError::Unauthorized);
+                    self.obsolete_status_job(&id)?;
+                    return Ok(None);
                 }
-                format!(
-                    "{} for {}: {}\nEvidence {} (read {}; non-atomic). {}",
-                    if kind == "escalation" {
-                        "Escalation requested by configured policy"
-                    } else {
-                        "Outstanding action reminder"
-                    },
-                    status.repository,
-                    action.text,
-                    status.digest,
-                    now,
-                    if status.complete {
-                        "Observed coverage complete."
-                    } else {
-                        "Coverage incomplete; missing facts remain unknown."
-                    }
-                )
+                if kind == "entry" {
+                    let Subject::Work {
+                        id: work_id,
+                        generation,
+                        state: work_state,
+                    } = &subject
+                    else {
+                        self.obsolete_status_job(&id)?;
+                        return Ok(None);
+                    };
+                    let item = match state.store.work_get(&principal.token_id, work_id, now) {
+                        Ok(item) => item,
+                        Err(HubError::Unauthorized) => None,
+                        Err(_) => {
+                            self.database()?.execute("UPDATE status_jobs SET due=?2,attempts=attempts+1 WHERE id=?1 AND state='queued'", params![id,now+SCAN_SECONDS])?;
+                            return Ok(None);
+                        }
+                    };
+                    let Some(item) = item.filter(|item| {
+                        item.generation == *generation
+                            && matches!(
+                                (item.state, work_state),
+                                (WorkState::Blocked, StatusState::Blocked)
+                                    | (WorkState::Handover, StatusState::AwaitingParty)
+                            )
+                    }) else {
+                        self.obsolete_status_job(&id)?;
+                        return Ok(None);
+                    };
+                    let Some(payload) =
+                        entry_message(&item, &status.repository, &self.work_link(work_id))
+                    else {
+                        self.obsolete_status_job(&id)?;
+                        return Ok(None);
+                    };
+                    payload
+                } else {
+                    body(&format!(
+                        "{} for {}: {}\nEvidence {} (read {}; non-atomic). {}",
+                        if kind == "escalation" {
+                            "Escalation requested by configured policy"
+                        } else {
+                            "Outstanding action reminder"
+                        },
+                        status.repository,
+                        action.text,
+                        status.digest,
+                        now,
+                        if status.complete {
+                            "Observed coverage complete."
+                        } else {
+                            "Coverage incomplete; missing facts remain unknown."
+                        }
+                    ))
+                }
             }
         };
         let claimed = self.database()?.execute("UPDATE status_jobs SET state='sending',attempts=attempts+1 WHERE id=?1 AND state='queued'", [&id])?;
         if claimed != 1 {
             return Ok(None);
         }
-        Ok(Some((id, user, body(&text), attempts)))
+        Ok(Some((id, user, payload, attempts)))
     }
     fn obsolete_status_job(&self, id: &str) -> Result<()> {
         self.database()?.execute(
@@ -824,6 +926,76 @@ fn confirmed_cleared(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outstanding_work_requires_personal_stable_waiting_status() {
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("../fixtures/actionable-status.json")).unwrap();
+        status.work.truncate(1);
+        status.actions.clear();
+        assert_eq!(outstanding(&status).len(), 1);
+        status.work[0].needs_you = false;
+        assert!(outstanding(&status).is_empty());
+        status.work[0].needs_you = true;
+        for state in [
+            StatusState::Active,
+            StatusState::ReassessmentNeeded,
+            StatusState::Retired,
+        ] {
+            status.work[0].state = state;
+            assert!(outstanding(&status).is_empty());
+        }
+        for state in [StatusState::Blocked, StatusState::AwaitingParty] {
+            status.work[0].state = state;
+            for limit in ["work_changed_during_read", "reconciliation_work_changed"] {
+                status.work[0].limits = vec![limit.into()];
+                assert!(outstanding(&status).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn entry_copy_is_bounded_inert_and_names_the_session_without_a_hostname() {
+        let hostile = format!(
+            "<@U2> <!channel> *bold* `code` \"quote\"\u{7}\u{202e}{}",
+            "x".repeat(200)
+        );
+        let report = json!({"kind":"blocker","summary":hostile,"next_action":null,"source_refs":[],"at":1,"token":"synthetic-token","agent":"client-build-host-abcdef12","session":"synthetic-session","generation":1});
+        let mut item: WorkItem = serde_json::from_value(json!({
+            "id":"wrk_synthetic","repository":"acme/widgets","owner":"synthetic-owner","owner_login":"alice",
+            "source":{"kind":"native","request_key":"synthetic"},"title":hostile,"state":"blocked",
+            "claim_status":"active","last_checkin_at":1,"generation":1,"lead_token":"synthetic-token",
+            "lead_agent":"client-build-host-abcdef12","lead_session":"synthetic-session","participants":[],"scope":[],
+            "branch":null,"worktree":null,"next_action":null,"current":report,"blocker":report,
+            "depends_on":[],"related_work":[],"created_at":1,"updated_at":1,"created_seq":1,"updated_seq":1
+        })).unwrap();
+        let link = "https://hub.example.test/#work/wrk_synthetic";
+        for state in [WorkState::Blocked, WorkState::Handover] {
+            item.state = state;
+            let payload = entry_message(&item, &hostile, link).unwrap();
+            let text = payload["text"].as_str().unwrap();
+            assert!(!text.contains("<@"));
+            assert!(text.chars().count() <= 300);
+            assert_eq!(payload["blocks"][2]["elements"][0]["url"], link);
+            for field in payload["blocks"][1]["fields"].as_array().unwrap() {
+                assert_eq!(field["type"], "plain_text");
+                assert_eq!(field["emoji"], false);
+                let value = field["text"].as_str().unwrap();
+                assert!(value.chars().count() <= TEXT_CHARS + NAME_CHARS);
+                assert!(!value.contains('\u{7}'));
+                assert!(!value.contains('\u{202e}'));
+                assert!(!value.contains("build-host"));
+                assert!(!value.contains("synthetic-token"));
+                assert!(!value.contains("synthetic-session"));
+            }
+            assert!(
+                payload["blocks"][1]["fields"][2]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Agent abcd session ")
+            );
+        }
+    }
     #[test]
     fn long_visible_status_keeps_coverage_evidence_and_omission_notice() {
         let mut status: ActionableStatus =

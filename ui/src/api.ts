@@ -196,10 +196,13 @@ export async function fetchHealth(signal: AbortSignal, token?: string): Promise<
   try {
     const j = rec(await getJson('/v1/hub/health', signal, token))
     const c = rec(j['coordination'])
+    const cap = j['capacity'] && typeof j['capacity'] === 'object' ? rec(j['capacity']) : null
+    const last = cap?.['last_refused_at']
     return {
       status: j['status'] === 'ok' ? 'ok' : 'unavailable',
       storage: str(j['storage']),
       ...(j['demo'] === true ? { demo: true as const } : {}),
+      ...(cap ? { capacity: { recent_limits: num(cap['recent_limits']), last_refused_at: typeof last === 'number' && Number.isFinite(last) && last > 0 ? last : null } } : {}),
       coordination: {
         denied: num(c['denied']),
         repeated: num(c['repeated']),

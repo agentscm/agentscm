@@ -238,6 +238,9 @@ pub(super) fn lease_seconds(basis: &str) -> i64 {
 pub(super) struct Lease {
     pub(super) renewed_at: i64,
     pub(super) expires_at: i64,
+    /// When the Hub's clock heartbeat last extended the lease after a restart or a forward clock
+    /// jump; None once the lead's activity, an admission or a decision set it again.
+    pub(super) grace_at: Option<i64>,
 }
 
 impl ReservationBasis {
@@ -415,7 +418,11 @@ pub struct OutcomeV1 {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReservationStatus {
+    /// The reservation blocks overlapping Work: its lease is live or not known.
     Held,
+    /// The lease expired. The reservation blocks nobody and the next admission over its scope
+    /// clears it; its lead resumes it through fresh admission.
+    Lapsed,
     None,
 }
 
@@ -456,6 +463,10 @@ pub struct ActivityV1 {
     pub lease_renewed_at: Option<i64>,
     /// When the lease lapses without another renewal, None while no lease is known.
     pub lease_expires_at: Option<i64>,
+    /// When the Hub last extended the lease by one lease after a restart or a forward clock jump,
+    /// which is not activity of the lead session. None when the lease was set since.
+    #[serde(default)]
+    pub lease_grace_at: Option<i64>,
     /// What renews the lease; anything but `tool_calls` lists `activity_coverage` as unknown.
     pub coverage: RenewalCoverage,
 }
@@ -552,6 +563,8 @@ const ACTIVITY_UNKNOWN_REASON: &str = "Activity is not observed; the Work holds 
 const ACTIVITY_LIVE_REASON: &str =
     "The lead session renewed the lease; it lapses at lease_expires_at unless renewed again.";
 const ACTIVITY_LAPSED_REASON: &str = "The lead session did not renew the lease in time. The reservation blocks nobody and the next admission over its scope clears it; the lead resumes with agentscm_start, the work_id and the current takeover_generation.";
+const ACTIVITY_GRACE_REASON: &str = "The Hub, not the lead session, last extended the lease: it gave one lease of grace at lease_grace_at after a restart or a clock gap. The lead session last renewed it at lease_renewed_at; it lapses at lease_expires_at unless the lead renews it.";
+const ACTIVITY_LAPSED_AFTER_GRACE: &str = "Its last extension was the Hub's restart grace at lease_grace_at, not activity of the lead session.";
 
 pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV1 {
     let item = facts.item;
@@ -577,35 +590,49 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
             provenance: OutcomeProvenance::Unknown,
         },
     };
+    let lease = facts.lease.filter(|_| held);
+    let lapsed = lease.is_some_and(|lease| lease.expires_at <= facts.now);
     let reservation = ReservationV1 {
-        status: if held {
-            ReservationStatus::Held
-        } else {
+        status: if !held {
             ReservationStatus::None
+        } else if lapsed {
+            ReservationStatus::Lapsed
+        } else {
+            ReservationStatus::Held
         },
         basis,
         scope: if held { item.scope.clone() } else { Vec::new() },
         holder_agent: held.then(|| item.lead_agent.clone()),
         holder_session: held.then(|| item.lead_session.clone()),
     };
-    let activity = match facts.lease.filter(|_| held) {
+    let status = reservation.status;
+    let activity = match lease {
         Some(lease) => ActivityV1 {
-            status: if lease.expires_at > facts.now {
-                ActivityStatus::Live
-            } else {
+            status: if lapsed {
                 ActivityStatus::Lapsed
+            } else {
+                ActivityStatus::Live
             },
-            reason: format!(
-                "{} {}",
-                if lease.expires_at > facts.now {
-                    ACTIVITY_LIVE_REASON
-                } else {
-                    ACTIVITY_LAPSED_REASON
+            reason: [
+                match (lapsed, lease.grace_at) {
+                    (false, None) => ACTIVITY_LIVE_REASON,
+                    (false, Some(_)) => ACTIVITY_GRACE_REASON,
+                    (true, _) => ACTIVITY_LAPSED_REASON,
                 },
-                facts.coverage.hint()
-            ),
+                if lapsed && lease.grace_at.is_some() {
+                    ACTIVITY_LAPSED_AFTER_GRACE
+                } else {
+                    ""
+                },
+                facts.coverage.hint(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
             lease_renewed_at: Some(lease.renewed_at),
             lease_expires_at: Some(lease.expires_at),
+            lease_grace_at: lease.grace_at,
             coverage: facts.coverage,
         },
         None => ActivityV1 {
@@ -613,6 +640,7 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
             reason: ACTIVITY_UNKNOWN_REASON.to_owned(),
             lease_renewed_at: None,
             lease_expires_at: None,
+            lease_grace_at: None,
             coverage: facts.coverage,
         },
     };
@@ -653,7 +681,7 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
             hidden_by_merged_pr: facts.hidden_by_merged_pr,
             status: facts.merge,
         },
-        actionable: actionable(item.state, held, facts.hidden_by_merged_pr),
+        actionable: actionable(item.state, status, facts.hidden_by_merged_pr),
         remedies: remedies(item.state, held)
             .into_iter()
             .map(|transition| RemedyV1 {
@@ -668,15 +696,25 @@ pub(super) fn work_operational(facts: &OperationalFacts<'_>) -> WorkOperationalV
     }
 }
 
-/// Who should look at the Work, from stored facts only. Claim currency is request-time and is
-/// reported as `freshness`; mixing it in here would make this field change with the clock.
-fn actionable(state: WorkState, held: bool, hidden_by_merged_pr: bool) -> ActionableV1 {
+/// Who should look at the Work, from stored facts and the lease. Claim currency is request-time
+/// and is reported as `freshness`; mixing it in here would make this field change with the clock.
+/// A lapsed lease blocks nobody, so it names nobody, as a release does.
+fn actionable(
+    state: WorkState,
+    reservation: ReservationStatus,
+    hidden_by_merged_pr: bool,
+) -> ActionableV1 {
     let (recipient, reason) = if state == WorkState::Finished {
         (Recipient::None, "Work is finished.")
-    } else if !held {
+    } else if reservation == ReservationStatus::None {
         (
             Recipient::None,
             "No reservation is held, so this Work blocks nobody.",
+        )
+    } else if reservation == ReservationStatus::Lapsed {
+        (
+            Recipient::None,
+            "The hold lapsed, so this Work blocks nobody; it stays unfinished until someone resumes, releases or ends it.",
         )
     } else if hidden_by_merged_pr {
         (
@@ -716,7 +754,7 @@ pub(super) fn operational_overview(
 }
 
 /// One Work row as a store read it: the snapshot and the facts kept beside it.
-pub(super) struct OperationalRow {
+pub struct OperationalRow {
     pub(super) item: WorkItem,
     pub(super) outcome: Option<OutcomeFact>,
     pub(super) basis: Option<ReservationBasis>,
@@ -1074,15 +1112,30 @@ mod tests {
         input.lease = Some(Lease {
             renewed_at: 40,
             expires_at: 100 + 1,
+            grace_at: None,
         });
         let live = work_operational(&input);
         assert_eq!(live.activity.status, ActivityStatus::Live);
         assert_eq!(live.activity.lease_expires_at, Some(101));
         assert!(!live.completeness.unknown.contains(&"activity".to_owned()));
+        assert_eq!(live.reservation.status, ReservationStatus::Held);
+        assert_eq!(live.actionable.recipient, Recipient::Lead);
         input.now = 101;
         let lapsed = work_operational(&input);
         assert_eq!(lapsed.activity.status, ActivityStatus::Lapsed);
         assert_eq!(lapsed.activity.lease_renewed_at, Some(40));
+        // A lapsed hold blocks nobody, so it is not reported as held and names nobody.
+        assert_eq!(lapsed.reservation.status, ReservationStatus::Lapsed);
+        assert_eq!(lapsed.reservation.scope, item.scope);
+        assert_eq!(lapsed.actionable.recipient, Recipient::None);
+        assert!(lapsed.actionable.reason.contains("lapsed"));
+        // Release still clears its basis.
+        assert!(
+            lapsed
+                .remedies
+                .iter()
+                .any(|r| r.transition == WorkTransitionKind::Release)
+        );
         // A lease without a reservation is never reported.
         input.basis = None;
         assert_eq!(
@@ -1091,6 +1144,40 @@ mod tests {
         );
         assert_eq!(lease_seconds("retained"), RETAIN_CAP_SECONDS);
         assert_eq!(lease_seconds("legacy_implicit"), LEASE_SECONDS);
+    }
+
+    #[test]
+    fn restart_grace_is_never_reported_as_a_renewal() {
+        for state in [WorkState::Paused, WorkState::Active] {
+            let item = item(state);
+            let mut input = facts(&item, Some(ReservationBasis::Admitted));
+            input.lease = Some(Lease {
+                renewed_at: 10,
+                expires_at: 100 + LEASE_SECONDS,
+                grace_at: Some(100),
+            });
+            let graced = work_operational(&input);
+            assert_eq!(graced.activity.status, ActivityStatus::Live);
+            assert_eq!(graced.activity.lease_grace_at, Some(100));
+            assert_eq!(graced.activity.lease_renewed_at, Some(10));
+            assert!(
+                graced
+                    .activity
+                    .reason
+                    .starts_with("The Hub, not the lead session"),
+                "{}",
+                graced.activity.reason
+            );
+            assert!(!graced.activity.reason.contains("The lead session renewed"));
+            input.now = 100 + LEASE_SECONDS;
+            let lapsed = work_operational(&input);
+            assert_eq!(lapsed.reservation.status, ReservationStatus::Lapsed);
+            assert!(lapsed.activity.reason.contains("restart grace"));
+            assert_eq!(
+                serde_json::to_value(&lapsed).unwrap()["reservation"]["status"],
+                "lapsed"
+            );
+        }
     }
 
     #[test]
@@ -1142,6 +1229,7 @@ mod tests {
         input.lease = Some(Lease {
             renewed_at: 90,
             expires_at: 200,
+            grace_at: None,
         });
         input.coverage = RenewalCoverage::McpOnly;
         let view = work_operational(&input);

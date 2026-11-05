@@ -11,7 +11,7 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 ## What exists
 
 - `agentscm local-validation run|show|post|verify|reconcile`: see the [CLI reference](../reference/cli.md#local-validation-attestations). `run` refuses a dirty tree, runs `.github/local-validation/recipe.json` with an allowlisted environment (see the trust boundary), retains each command's output as `<sha>.cmd<N>.stdout|stderr` in the state directory, and signs a portable-evidence-v1 envelope plus a `record` artifact bound to the repository, commit, tree, base ref and merge-base. Failed runs are signed too.
-- Repository configuration in `.github/local-validation/`: `recipe.json` (the path-selected Rust gate, skipped only when every changed path is in the excluded UI and design set, plus path-selected routine checks, both described in [contributor testing](../contributor-testing.md#routine-local-checks)), `policy.json` (repository ID, recipe digest, required PostgreSQL and S3 services, 30-day maximum age, epoch) and `registry.json` (issuer keys). A test fails when `policy.json` drifts from `recipe.json`.
+- Repository configuration in `.github/local-validation/`: `recipe.json` (the path-selected Rust gate, skipped only when every changed path is in the excluded UI, design and Markdown documentation set, plus path-selected routine checks, both described in [contributor testing](../contributor-testing.md#routine-local-checks)), `policy.json` (repository ID, recipe digest, required PostgreSQL and S3 services, 30-day maximum age, epoch) and `registry.json` (issuer keys). A test fails when `policy.json` drifts from `recipe.json`.
 - Optional recipe fields for non-Rust repositories: `dependency_files` (relative paths, 1 to 16, no duplicates, only letters, digits and `-_.:/`; each is digested at the commit and bound into the signed evidence as a dependency, and a missing file fails `run` before any command runs) and `toolchain_probes` (argv lists, 1 to 15, each recorded as its first output line or `<argv>: unavailable`). When absent they default to `Cargo.lock`, `rust-toolchain.toml` and `rustc -V`, `cargo -V`, `cargo nextest --version`; `git --version` is always appended. Declaring either field changes the recipe digest, so the policy must pin the new digest.
 - Optional recipe command field `paths`: a list of 1 to 64 Git pathspecs, evaluated relative to `--repo` against `git diff-tree -r --no-renames` between the merge-base and the head. A command is required only when the change touches a matching path; absent means always required, and an empty list is rejected. Matching is Git's default wildcard matching, so `*` also matches `/` and `*.md` matches Markdown at any depth. The only long magic allowed is `:(glob|literal|exclude|top)`; short magic, `attr` and `icase` are rejected. Declaring `paths` changes the recipe digest, so the policy must pin the new digest. `run` runs only the required commands, in recipe order, and records the rest in the record's `not_required`; the coverage list reports them as `not required: <id>`, separate from `skipped: <id>` (commands not run after a failure). `verify` and `reconcile` recompute the required set from Git and fail unless every required command ran in order and `not_required` equals the remaining recipe ids exactly, so a forged "not required" claim fails.
 - Trust inputs: `--config-dir` (default `.github/local-validation`) and `--verifier-workflow` (default `.github/workflows/local-validation.yml`), `--config-dir` relative to `--repo` and `--verifier-workflow` relative to the repository root, on `run`, `verify` and `reconcile`. A change to either requires every command regardless of `paths` and is never exempt. This is built in and not configurable in the policy.
@@ -20,7 +20,7 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 - Every anonymous or authenticated reconciliation fetch runs through one per-run private bare Git directory with an empty template and empty private home. System, global, include and checkout transport configuration are excluded; credential helpers, prompts, redirects, hooks, fsmonitor, submodules, maintenance, lazy fetching and executable transports are disabled. The explicit validated origin URL is used for the base, pull ref and final default-branch configuration freshness fetch, with objects written to the checkout's resolved object directory. After a base fetch succeeds, a separate bounded credential-free command updates the checkout's `origin/<base>` ref. Pull code is never checked out or executed.
 - Anonymous fetch is the default. It passes no API token to Git and accepts credential-free HTTP(S), `file` and local-path origins; userinfo, SSH, Git and external-command transports are refused. `--github-authenticated-fetch` is an explicit private-repository opt-in and works only with the exact API URL `https://api.github.com`, a policy repository matching `github.com/OWNER/NAME`, and one direct origin exactly `https://github.com/OWNER/NAME` with an optional `.git` suffix. It reuses the selected API token as an `Authorization: Basic base64(x-access-token:TOKEN)` extra header only in each fetch child's runtime Git environment, scoped to the canonical repository URL. The token and encoded header are absent from argv, persistent Git configuration and surfaced transport diagnostics.
 - When the policy sets `exempt_paths`, `reconcile` also checks every open pull request on `--base`, opted in or not, against Git: one fetch per pull request, so cost grows with the number of open pull requests. If the change from the merge-base to the head is non-empty, touches no trust input and every changed path matches an exempt pathspec, it posts `success` with the description `not required: only exempt paths changed`, with no attestation, no opt-in and no `max_age_seconds`. This wins over any attestation verdict for that head. An empty diff, a mixed change or a head that cannot be read is never exempt, and a head shared by several open pull requests is not exempted. Other unmarked heads still get no status. If an unmarked head cannot be fetched or read, nothing is written for it and a warning is logged; it does not affect the exit code, because an unmarked head has not opted in. An opted-in head that cannot be fetched still exits 1.
-- `.github/workflows/local-validation.yml` is a thin caller of the reusable `.github/workflows/local-validation-reconcile.yml`, pinned to an exact published release and full commit SHA, which installs that provenance-checked binary and runs `reconcile`. The verifier does not pick up a change to its own code until the pin moves. It runs on `pull_request_target` (opened, synchronize, reopened, and edited only when the base branch changed) so that a head that changes only exempt paths gets its status promptly, on a PR comment that starts with the attestation marker from an `OWNER`, `MEMBER` or `COLLABORATOR` (created, edited or deleted; an edit that removes the marker also runs it; other commenters are ignored and the signature still decides), on pushes to `main` that touch `.github/local-validation/**` or the workflow itself, and daily. There is no manual dispatch. All runs that pass the trust filter share one repository-wide job-level concurrency group (`local-validation`, queued rather than cancelled; job-level so that ignored comments never enter it and cannot cancel the queued run) and every run reconciles all open pull requests on the default branch. Runs are full sweeps because GitHub keeps only the newest queued run per concurrency group, so a per-PR run could be superseded by another PR's run and leave a stale `success`. Its first step, `Invalidate stale successes`, runs before checkout, toolchain and build and uses only `gh` to set to `pending` every open default-branch pull request head whose latest `agentscm/local-validation` status is `success`, so a setup failure cannot leave a stale `success`. It reads every page of each head's status. A head whose status read fails is treated as unknown and set to `pending` anyway. A failed or unexpected write for one head is reported with `::error::` and the SHA, the step continues with the next head and still exits 0 so that setup and `reconcile` run (reconcile retries and reports its own errors). It leaves heads with no such status (not opted in), `pending`, `failure` and `error` alone. A listing failure or an invalid head SHA fails the step before any status is written. The 5-minute step timeout can also stop it partway, leaving later heads unchanged and skipping `reconcile`. It never checks out, builds or runs PR code.
+- `.github/workflows/local-validation.yml` is a thin caller of the reusable `.github/workflows/local-validation-reconcile.yml`, pinned to an exact published release and full commit SHA, which installs that provenance-checked binary and runs `reconcile`. The verifier does not pick up a change to its own code until the pin moves. It runs on `pull_request_target` (opened, synchronize, reopened, and edited only when the base branch changed) so that a head that changes only exempt paths gets its status promptly, on a PR comment that starts with the attestation marker from an `OWNER`, `MEMBER` or `COLLABORATOR` (created, edited or deleted; an edit that removes the marker also runs it; other commenters are ignored and the signature still decides), on pushes to `main` that touch `.github/local-validation/**` or the workflow itself, and daily. There is no manual dispatch. All runs that pass the trust filter share one repository-wide job-level concurrency group (`local-validation`, queued rather than cancelled; job-level so that ignored comments never enter it and cannot cancel the queued run) and every run reconciles all open pull requests on the default branch. Runs are full sweeps because GitHub keeps only the newest queued run per concurrency group, so a per-PR run could be superseded by another PR's run and leave a stale `success`. Its first step, `Invalidate stale successes`, runs before checkout, toolchain and build and uses only `gh` to set to `pending` every `success` among the `agentscm/local-validation` context and any `agentscm/local-validation/<check>[/<constituent>]` contexts (see [multiple checks](#multiple-checks-experimental-unqualified)) on every open default-branch pull request head, each written with its own context name, so a setup failure cannot leave a stale `success`. It reads every page of each head's status. A head whose status read fails is treated as unknown and its legacy context is set to `pending` anyway. A failed or unexpected write for one head is reported with `::error::` and the SHA, the step continues with the next head and still exits 0 so that setup and `reconcile` run (reconcile retries and reports its own errors). It leaves contexts that are absent (not opted in), `pending`, `failure` and `error` alone. A listing failure or an invalid head SHA fails the step before any status is written. The 5-minute step timeout can also stop it partway, leaving later heads unchanged and skipping `reconcile`. It never checks out, builds or runs PR code.
 - Status count: every run (each trusted attestation comment event, each pull request opened, synchronize, reopened or retarget event from any author, each push touching verifier inputs, and the daily run) writes two statuses (`pending`, then the verdict) on every opted-in head, plus one earlier `pending` from the invalidation step on a head whose latest verdict is `success`, so up to three. GitHub keeps at most 1000 statuses per SHA and context, so a head reaches the cap after about 333 runs (about 500 if the head never holds a `success` when a run starts). After that the `pending` write is refused, that head is not re-verified, the run exits 1 and the earlier verdict remains on the head, which may be stale. Because pull request events from any author start a sweep, an untrusted author can drive status writes toward that cap on opted-in heads; a head with an exempt success is opted in through its status. This is a limit, not handled.
 
 ## Compact comment display and compatibility
@@ -57,9 +57,27 @@ Recipes and policies that do not use `paths` or `exempt_paths` serialize as befo
 
 In this repository, run `tools/attest-pr.sh [PR_NUMBER]` on a clean checkout of the pushed head. It does the steps below using the release the verifier pins, and starts disposable PostgreSQL and S3 containers from the images in `.github/workflows/ci.yml` when the service variables are unset. The issuer defaults to the signed-in GitHub login. The key is the file named by `AGENTSCM_LV_KEY`, or else `$AGENTSCM_LV_DIR/$ISSUER.ed25519`, or else `$AGENTSCM_LV_DIR/$ISSUER.key`. The binary refuses a symlinked or hard-linked key, or one whose folder is not owner-private, so point `AGENTSCM_LV_KEY` at the key rather than linking or copying it. With no key it exits 0 without signing or posting; any other failure exits nonzero and posts nothing. Tools the recipe selects for the change must be on `PATH`.
 
-Only one attestation runs at a time for a user account on a machine, across worktrees, because concurrent full suites fail timing-sensitive tests. Before it installs the pinned release, starts containers or runs the recipe, the script takes the lock directory `~/.agentscm/attest-pr.lock`, which holds the holder's pid. A second run prints `waiting for <pid> (<command>)` and waits. A lock whose pid is no longer running is reclaimed, so a crashed or killed run does not block the next one. The script lowers its own priority with `renice`, and its children inherit that, which reduces contention with interactive work; it does not show anything about flakiness under load, and containers started by Docker keep the daemon's priority. To keep another full suite from overlapping an attestation, run it under the same lock: `tools/attest-pr.sh --with-lock sh -c 'cargo nextest run --locked && cargo test --locked --doc'`. A process killed in the moment between creating the lock and writing its pid leaves a lock that is never reclaimed; remove it, and `attest-pr.lock.reclaim` if present, by hand.
+Attestations and `--with-lock` commands share a per-user, per-machine FIFO in `~/.agentscm/heavy-job-queue`, across repositories and worktrees. Arrival means completed registration under the queue mutex, not shell invocation time. Tickets run strictly in registration order, with no priority or overtaking: a blocked head keeps later jobs waiting. This changes local admission only; the active full-head attestation recipe and required checks remain unchanged. To keep another full suite from overlapping an attestation, use `tools/attest-pr.sh --with-lock sh -c 'cargo nextest run --locked && cargo test --locked --doc'`. Optionally label a focused run with `--with-lock --kind focused COMMAND [ARG...]`; the default kind is `other`, and neither label changes priority.
+
+Run `tools/attest-pr.sh --queue` to inspect the holder and ordered waiters. Status shows kind, escaped repository path, queue position and blocker, with holder PID and elapsed time since launch or waiter time since registration. A waiter has `pid=pending` until launch; the PID identifies the launched command's process group, not necessarily its remaining descendants. There is no ETA. Queue metadata and status omit command arguments. Status does not create a missing queue or remove stale entries; admission reclaims identifiable idle entries.
+
+Only the head checks admission resources, retrying every second while blocked. `AGENTSCM_HEAVY_MIN_MEMORY_PERCENT` defaults to `35`: macOS uses `sysctl kern.memorystatus_level`, while Linux computes `MemAvailable / MemTotal` from `/proc/meminfo`. These are different metrics, not interchangeable measurements of free RAM. `AGENTSCM_HEAVY_MIN_DISK_BYTES` defaults to `10737418240` (10 GiB) available on the repository filesystem and, when set, the `CARGO_TARGET_DIR` filesystem (using an existing ancestor if needed). Failed resource probes block admission rather than permitting execution. Subprocess probes have a three-second timeout and 16 KiB output cap; queued commands themselves have no runtime timeout.
+
+The lightweight standalone Rust supervisor is compiled before admission, without Cargo, and cached by source hash under `~/.agentscm/bin`. Bootstrap needs the pinned `rustc` and `shasum`; supervision also needs `ps`, with `sysctl` on macOS and `df` for disk probes. Compilation itself does not occupy a heavy-job slot. The wrapper lowers its priority with `renice`, inherited by children; Docker containers retain the daemon's priority. This is not evidence of flake resistance under load.
+
+New wrappers also honor the legacy `~/.agentscm/attest-pr.lock`. Drain old wrappers before rolling out the queue: FIFO and descendant exclusion guarantees require all participants to use the new supervisor. An inherited slot descriptor and a dedicated command process group preserve exclusion while descendants remain after supervisor death; descendants that both leave the group and close the descriptor are unsupported. Cancellation forwards signals to the command group. Identifiable stale registrations and dead legacy PIDs can be reclaimed, but missing, malformed or otherwise unidentifiable state requires manual inspection when it cannot be tied to a recoverable registration. Slot locks use stable files; metadata is published by atomic rename, so interrupted writes retain the previous record and unpublished idle slots can be reclaimed. This does not establish durability across power loss. Inspect the recorded processes and queue state before recovery; never blindly delete a live queue or legacy lock. See [manual helper qualification](../contributor-testing.md#heavy-job-queue-helper) for coverage and limits.
 
 When the recipe does not pass, the script posts nothing and exits 1. It prints where `run` kept the signed failure record and envelope in the state directory, which commands failed with the paths of their retained `<sha>.cmd<N>.stdout` and `.stderr` output, and the `local-validation show` command that renders the summary.
+
+A new worktree per pull request has no `target/`, so every attestation compiles the workspace and its test binaries from scratch. To reuse build output, keep one dedicated validation checkout and move it to each pushed head of a same-repository pull request:
+
+```sh
+git fetch origin <BRANCH>
+git checkout --detach FETCH_HEAD
+tools/attest-pr.sh <PR_NUMBER>
+```
+
+Pass the PR number: a detached checkout has no branch for the script to look up the pull request from. The script and `run` treat a checkout as clean when Git reports no modified or untracked files; ignored files such as `target/` do not count. Later runs reuse the compiled dependencies and rebuild only crates whose inputs changed. `npm ci` deletes `node_modules` on every run, so the UI and docs steps gain nothing. `CARGO_TARGET_DIR` is on the environment allowlist, so a cache directory shared between checkouts also reaches the recipe's Cargo commands. The attestation does not record which directory was used. Reused output carries files written by earlier pull requests' build scripts and tests, and can hide a problem that only a clean build shows. Delete `target/`, or the `CARGO_TARGET_DIR` directory, before an attestation that needs to show a clean build. A warm cache does not make fork code safe to run: never attest it on a signing host.
 
 The manual equivalent follows. This example uses the enrolled `boorad` issuer and conventional key location; set `AGENTSCM_LV_DIR` to another absolute private directory when needed. It requires an installed compatible `agentscm`, `gh`, `jq`, the recipe's tools and the service variables already exported. The example never prints private key bytes. Missing prerequisites, services, a dirty checkout or an unpushed head stop the example rather than silently skipping attestation.
 
@@ -119,12 +137,134 @@ Use absolute key, state, Cargo and Rustup paths. The temporary `HOME` gives reci
 
 If a PR changes the policy or recipe, its accepted pre-merge attestation still uses the current default branch's configuration. Qualify the candidate recipe separately and retain that result locally; do not post it before its policy lands, because a newer applicable attestation with a mismatched recipe can replace an older success with failure. After merge, new attestations use the newly trusted configuration. A configuration freshness or verification failure requires inspecting the change and rerunning, not changing the signed record.
 
+## Multiple checks (experimental, unqualified)
+
+A repository can report several independent local-validation checks, each with its own recipe, policy and commit-status context. This is implemented and tested against fakes only (#360). Friendly presentation on a real pull request and matching by a real ruleset have not been observed, and no release containing it has been cut, so treat it as experimental until it is qualified. Everything below describes the behavior in the repository source; an adopter's pinned release does not have it until a release that includes it is published and pinned.
+
+### `checks.json` and layout
+
+The config directory (`--config-dir`, default `.github/local-validation`) may hold an optional strict `checks.json`:
+
+```json
+{"schema_version":1,"checks":[{"name":"Unit tests","dir":"."},{"name":"Static","dir":"static"}]}
+```
+
+```text
+.github/local-validation/
+  checks.json
+  registry.json        shared by every check
+  policy.json          the "Unit tests" check (dir ".")
+  recipe.json
+  static/
+    policy.json        the "Static" check
+    recipe.json
+```
+
+Each entry reads `<dir>/policy.json` and `<dir>/recipe.json`; `registry.json` stays in the config directory. `name` is display text only. A check's identity comes from its policy alone: an optional `check_id` (`^[a-z0-9][a-z0-9-]{0,39}$`). Without `checks.json` the directory is exactly one legacy check with no name prefix, as before. The whole run fails closed with nothing written on: unknown fields, a `schema_version` other than 1, an empty list, more than 20 checks, an absolute `dir` or one containing `..`, duplicate identities, more than one policy without a `check_id`, a policy repository that differs from `--github-repo`, a symbolic link at `checks.json` (a dangling one is refused, not read as absent), `registry.json`, any component of `--config-dir` below `--repo` when a manifest is in use (components of `--repo` itself may be links), a check directory component, or a `policy.json` or `recipe.json`, a recipe whose digest differs from its policy, or a recipe with constituents under a policy without a `check_id`.
+
+A grouped `static` recipe maps recipe command ids to constituents (policy `{"check_id":"static", ...}`; recipe excerpt):
+
+```json
+{"commands":[{"id":"format","argv":["npm","run","format:check"]},
+             {"id":"md","argv":["npm","run","lint:md"]},
+             {"id":"lint","argv":["npm","run","lint"]},
+             {"id":"tsc","argv":["npm","run","typecheck"]},
+             {"id":"doctor","argv":["npm","run","react-doctor"]}],
+ "constituents":[{"id":"format","name":"Format","commands":["format"]},
+                 {"id":"markdown","name":"Markdown lint","commands":["md"]},
+                 {"id":"lint","name":"Lint","commands":["lint"]},
+                 {"id":"typescript","name":"TypeScript","commands":["tsc"]},
+                 {"id":"react-doctor","name":"React Doctor","commands":["doctor"]}]}
+```
+
+The independent unit recipe at the config root has an ordinary recipe with no `constituents`. The unit check keeps its policy with no `check_id` and the legacy context. Adopting a `check_id` for it later is a separate deliberate move: it is a new context with new evidence, the ruleset changes first, and it cannot roll back to an older binary while that policy is in place. A constituent needs a unique id (same charset as `check_id`), a name of 1 to 64 characters without control characters, and commands that are existing recipe command ids, each in at most one constituent. Commands in no constituent (setup, for example) are allowed. Constituents are part of the recipe digest, so they are bound through the policy into the signature.
+
+### Context naming
+
+| Context | Meaning |
+|---|---|
+| `agentscm/local-validation` | The legacy single check (policy without `check_id`). |
+| `agentscm/local-validation/<check_id>` | A check's aggregate: success only if everything holds. |
+| `agentscm/local-validation/<check_id>/<constituent_id>` | One constituent of that check. |
+
+Status descriptions are `<Check>: <reason>` for the aggregate and `<Check>: <Constituent>: <reason>` for a constituent, using the manifest's names; a legacy check without a manifest keeps the old description unchanged. Descriptions are one line, control characters removed, capped at 140 characters. When a comment decided the verdict, `target_url` is that comment's GitHub URL; otherwise it is the run URL.
+
+### Outcomes
+
+| Outcome | State | Description (reason) |
+|---|---|---|
+| passed | success | Aggregate: `validated`. A constituent reports `passed`. |
+| failed | failure | Aggregate, the first that applies: `command did not exit`, `command failed`, `capture incomplete`, `output truncated`, `required service missing`, `tree changed` (from the signed results), `incomplete run` (the commands differ from what the changed paths require), or `outcome not pass` (the signed payload outcome is not a pass). A constituent whose mapped command failed reports `failed`. |
+| missing | pending | `no attestation for this head` |
+| stale head | pending | `attestation is for a different head` (an attestation for this check exists, but not for this head) |
+| stale policy | pending | `attestation predates the current policy` |
+| expired | pending | `attestation expired` (older than the policy maximum age or no longer fresh; re-attesting helps) |
+| key expired | pending | `attestation signing key expired` (the issuer key's own validity ended; re-attesting with that key does not help) |
+| revoked | pending | `attestation signing key revoked`. A real revocation edits `registry.json`, which also changes the registry digest; the revocation is checked first and is the reason reported. |
+| registry stale | pending | `issuer registry changed since attestation` (a registry change that does not revoke the signing key) |
+| unverified coverage | failure | `coverage mismatch`: the signed coverage differs from the signed record |
+| exempt / not required | success | `not required: only exempt paths changed` for the aggregate and every constituent; a constituent none of whose commands the changed paths require is `not required` |
+| did not run | pending | `did not run: an earlier command failed` (a constituent whose required command never ran) |
+| error | error | `clock uncertain` and similar: the verifier could not decide |
+
+Evidence for another check never decides or colors this check's verdict or reason: it counts as missing. An unauthenticated comment cannot choose a reason either.
+
+### Constituents come from signed results
+
+A constituent's status is derived only from the signed per-command results in the record and the trusted recipe, never from labels or comment text. Each constituent is: not required when none of its commands is required by the changed paths; failed when a mapped result has a bad stop reason, a nonzero exit, truncated or incomplete output; passed when all its required commands are present and clean; did not run when a required command is absent from the results (the run stopped earlier). If the evidence has a structural problem (signature, identity, recipe or record mismatch, wrong `not_required` set, order departure, a tree that changed after the run, a required service missing, a coverage mismatch, or a payload outcome inconsistent with the results), no constituent is reported and every context inherits the check-level verdict. A signature proves that the holder of an enrolled key signed these bytes, not that the commands ran as recorded.
+
+### Why statuses, not check runs
+
+Commit statuses are written with `statuses: write`, the integration the existing required check already uses, and need no GitHub App. The reusable job needs exactly `contents: read`, `pull-requests: read` and `statuses: write`. A ruleset requires a status by context name, and may bind it to an integration: GitHub Actions, integration id `15368`. As already stated above, that binding is not cryptographic proof that the writer ran the verifier. `reconcile` sweeps the checks serially in manifest order in one process, because the job-level concurrency group keeps only the newest queued run and one caller per check would lose runs; API use (pull request, comment and fetch reads) therefore grows with the number of checks, up to 20.
+
+### Unsupported
+
+- Check runs (statuses only).
+- Restricting a check to particular issuers: any enrolled issuer may attest any check.
+- A separate workflow caller per check.
+- Stale tombstones for retired contexts: an old context stays on old heads, where it is harmless once it is not required. On open heads the invalidation step resets its `success` to `pending`, where it stays.
+- Replacing a context that a repository stops listing: nothing writes to it again.
+
+A change to the config directory requires every command of every check, as for a single check. The `Invalidate stale successes` step resets every `success` among the contexts that are exactly `agentscm/local-validation` or `agentscm/local-validation/<name>[/<name>]` (names of `[a-z0-9-]`) to `pending` on each open head, ignoring look-alike contexts such as `agentscm/local-validation-foo`. A head opted into one check shows `pending` on the others: `no attestation for this head`.
+
+Retired contexts: the step resets a retired context's `success` to `pending` on open heads, and it stays `pending` permanently. That is safe but yellow, because `reconcile` no longer owns a retired context and never writes it again. If the step cannot read or write the status, the old `success` lasts until the next run.
+
+Read-failure limit: when the step's status read fails, prefixed contexts cannot be enumerated, so it writes `pending` to the legacy context only. In a repository where every check has a `check_id`, that legacy `pending` is a status nothing owns, and it opts the head into the family. No false `success` results, but the head carries a legacy `pending` until the head moves. The workflow is not changed for this.
+
+Scale: invalidating first writes two statuses per context per head per sweep (the `pending` and then the verdict). With 7 contexts and 50 open heads that is about 700 writes. If GitHub rate limits the writes during invalidation, no verdict is written and the heads stay `pending` until a later run.
+
+Hub reporting: the Hub reports a failing `agentscm/local-validation/...` context by name shape, not by ruleset membership, so a new-family context that is still non-required during migration can appear as an action. It reports one action per failing context. A retired context left in `failure` on an open head stays reported until the head moves. The legacy context and the Hub's own checks keep the existing "Required check" wording; named local-validation contexts read "Local validation check <name> reports <state> on pull request #<number>; fix or rerun it."
+
+### Producing evidence for a check that failed
+
+`reconcile` can only judge a failure that was posted. Post the failed attestation (`local-validation post`, which accepts any retained attestation) for a failed or mixed outcome to reach GitHub. `tools/attest-pr.sh` exits nonzero and posts nothing when the recipe does not pass, so a failing check shows as missing (`no attestation for this head`), not failed, until the failed attestation is posted.
+
+### Migrating a single-check adopter
+
+Do these in order, and stop at any step that does not behave as described.
+
+1. Keep the existing policy and context unchanged, with no `check_id`, so outstanding evidence stays valid.
+2. Only after a release that includes this behavior exists, bump the pinned release and the reusable workflow commit SHA in the caller.
+3. Add `checks.json` with the existing check as `{"name":"Unit tests","dir":"."}` and the new `static` check in its own directory.
+4. Produce static evidence on real pull requests and observe the new contexts as non-required. From a clean checkout, sign and post it with the check's own recipe and policy and the shared registry:
+
+   ```sh
+   agentscm local-validation run --recipe <config>/static/recipe.json --policy <config>/static/policy.json --registry <config>/registry.json --key-file <abs-key-file> --issuer-id <issuer> --state-dir <abs-state-dir> --config-dir <config>
+   agentscm local-validation post --state-dir <abs-state-dir> --attestation <sha256> --github-repo OWNER/NAME --pr <n> --token-file <abs-token-file>
+   ```
+
+   `tools/attest-pr.sh` reads the root configuration only, so it cannot attest a subdirectory check and is left as it is.
+5. Only then does a repository operator add the new contexts to the ruleset, bound to integration `15368`.
+6. Only then remove the hosted checks that the new contexts replace.
+
+Rollback: the operator removes the new contexts from the ruleset first, then removes `checks.json` or pins back. Removing a required context from the configuration before the ruleset strands every pull request on a check that is never written. Older binaries ignore `checks.json` and read the root `policy.json`, and they refuse a policy that has a `check_id`. Nothing edits branch protection or a ruleset automatically. Whether retired contexts change depends on the route. Pinning back to an older workflow only touches the legacy context, so the named contexts keep their last status. Removing `checks.json` while still on the new workflow resets a retired `success` to `pending` on open heads, where it stays. Either is harmless, because rollback removes those contexts from the ruleset first.
+
 ## Hosted CI and required checks
 
 Routine formatting, host Clippy, release-metadata checks, Linux nextest/doctests with PostgreSQL/S3, dependency audit, offline workflow-security lint, UI checks, ShellCheck and Linux npm installer tests run locally by default. They do not execute on ordinary pull-request updates or pushes to `main`.
 
 - No label selects hosted runs. A same-repository contributor without a signing key dispatches a workflow on the branch with `gh workflow run ci.yml --ref <branch>` (or another workflow's file), then matches the run's `headSha` to the pull request head; the result is unsigned. Fork pull requests start no hosted diagnostics upstream beyond `Conventional PR title` and the `npm-windows` installer job. The fork guards on other workflows limit cost for an unmodified workflow file; isolation comes from ephemeral runners, read-only tokens and no secrets, and GitHub's approval policy applies to first-time contributors. A fork author may dispatch workflows in their own fork, and a maintainer may review and adopt trusted changes into a same-repository branch. Dispatch covers CI, dependency audit, workflow lint, UI, installer and documentation workflows; it does not publish a local-validation attestation or replace the enrolled-signature status, and fork authors do not run fork code on a signing host. Routine path-filtered workflows run only when their paths match. Inspect the admitted workflow runs rather than treating a skipped check as coverage.
-- Windows npm installer tests remain automatic for matching installer paths on pull requests and `main`. Windows build/tests, musl/macOS release-target builds and Hub end-to-end run nightly on `main` and manually, and release automation dispatches them once on the release branch. Hub end-to-end also starts automatically on a same-repository pull request that changes a PostgreSQL migration, `src/hub/store_pg.rs`, `src/hub/store_pg/` or its harness, not for a fork. `Container` still runs on every push to `main`, and `Execution live` on pushes to `main` that match its path filter. Platform jobs establish their own coverage; a local host pass does not qualify them.
+- Windows npm installer tests remain automatic for matching installer paths on pull requests and `main`. Windows build/tests and musl/macOS release-target builds run nightly on `main` and manually, and release automation dispatches them once on the release branch. Hub container end-to-end runs locally only for releases, outside the signed routine recipe; [candidate-bound evidence for both profiles](../releasing.md#local-hub-release-qualification) is required for release readiness. A successful PR attestation does not imply Hub end-to-end execution. `Container` still runs on every push to `main`, and `Execution live` on pushes to `main` that match its path filter. Platform jobs establish their own coverage; a local host pass does not qualify them.
 - Documentation publishing still builds and checks its artifact on matching `main` pushes. Its routine audit and pull-request build/check move to the local recipe, with a manual build/audit/check fallback; only `main` pushes publish. Release automation and tagged release qualification, PR-title validation and the local-validation verifier remain hosted.
 
 For a pull request without an enrolled key or required services, request maintainer help or dispatch a hosted workflow on a same-repository branch. Hosted fallback results remain separate from `agentscm/local-validation`; they never manufacture a signed local success or satisfy its required check. Without an accepted attestation the normal merge path remains blocked, even when hosted tests pass. A maintainer may deliberately review and adopt trusted changes into a same-repository branch and new pull request before signing. Moving code between branches alone establishes no trust; never automatically run unreviewed fork code on a signing host to clear the gate. There is no automatic weekly dependency audit: run the local audits periodically for new advisories even when no source changes select them.
@@ -154,7 +294,7 @@ Advancing the base branch tip does not invalidate it; only the merge-base is bou
 
 ## Coverage omissions
 
-A command skipped by `paths` is listed as `not required: <id>`. Missing PostgreSQL or S3 adds a service omission only when the policy requires that service. Comments preserve all signed omissions, including service omissions in historical attestations, regardless of current policy. Every attestation records these as not covered: ignored tests, Windows, container smoke, hub end-to-end and live execution. Hosted CI remains the way to get platform and runtime coverage; request it as described above.
+A command skipped by `paths` is listed as `not required: <id>`. Missing PostgreSQL or S3 adds a service omission only when the policy requires that service. Comments preserve all signed omissions, including service omissions in historical attestations, regardless of current policy. Every attestation records these as not covered: ignored tests, Windows, container smoke, hub end-to-end and live execution. Hosted CI provides the platform and runtime coverage described above. Hub end-to-end coverage is a separate local release-only gate: run `.github/hub-e2e.sh local-release EVIDENCE_DIR` on the clean committed candidate and retain both profile results as described in [releasing](../releasing.md#local-hub-release-qualification).
 
 ## Not done
 
@@ -283,34 +423,42 @@ jobs:
           fi
           count=0
           failed=0
+          # The legacy context and the family under agentscm/local-validation/<check>[/<constituent>]. Context
+          # names are API data: match them against this bound, quote them, and pass them only to gh -f.
+          family='^agentscm/local-validation(/[a-z0-9-]+){0,2}$'
           for sha in $(printf '%s\n' "$heads" | sort -u); do
-            # --paginate reads every page of the combined status, which has at most one entry for our context.
-            # Take the first non-empty line; no output means the head never opted in ("none"). A failed read
-            # is "unknown": invalidate anyway, because a stale success is worse than an extra pending.
-            if out=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --paginate --jq '.statuses[] | select(.context == "agentscm/local-validation") | .state' </dev/null); then
-              state=$(printf '%s\n' "$out" | grep -m1 . || true)
-              state=${state:-none}
+            # --paginate reads every page of the combined status, which has at most one entry per context.
+            # No matching success means the head never opted in or is already blocking. A failed read is
+            # "unknown": prefixed contexts cannot be enumerated, so write pending to the legacy context only
+            # (reconcile invalidates the prefixed ones once setup succeeds), because a stale success is worse
+            # than an extra pending.
+            targets=()
+            if out=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --paginate --jq '.statuses[] | select(.context == "agentscm/local-validation" or (.context | startswith("agentscm/local-validation/"))) | [.context, .state] | @tsv' </dev/null); then
+              while IFS=$'\t' read -r context state; do
+                # Only success can satisfy a required check. Writing to a context that is absent would opt
+                # the head in forever; pending, failure and error already block merging.
+                if [[ "$state" == success && "$context" =~ $family ]]; then
+                  targets+=("$context")
+                fi
+              done <<< "$out"
             else
-              echo "::warning::could not read the status of $sha; setting it to pending anyway"
-              state=unknown
+              echo "::warning::could not read the status of $sha; setting the legacy context to pending anyway"
+              targets=(agentscm/local-validation)
             fi
-            # Only success (or a failed read) can satisfy a required check. "none" means the head never opted
-            # in, and writing would opt it in forever. pending, failure and error already block merging.
-            if [[ "$state" != success && "$state" != unknown ]]; then
-              continue
-            fi
-            if ! reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context=agentscm/local-validation -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null); then
-              echo "::error::failed to set $sha to pending"
-              failed=$((failed + 1))
-              continue
-            fi
-            if [[ "$reply" != pending ]]; then
-              echo "::error::unexpected reply writing status for $sha: $reply"
-              failed=$((failed + 1))
-              continue
-            fi
-            echo "$sha: $state -> pending"
-            count=$((count + 1))
+            for context in ${targets[@]+"${targets[@]}"}; do
+              if ! reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context="$context" -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null); then
+                echo "::error::failed to set $sha $context to pending"
+                failed=$((failed + 1))
+                continue
+              fi
+              if [[ "$reply" != pending ]]; then
+                echo "::error::unexpected reply writing status for $sha $context: $reply"
+                failed=$((failed + 1))
+                continue
+              fi
+              echo "$sha $context: -> pending"
+              count=$((count + 1))
+            done
           done
           echo "set $count stale success(es) to pending; $failed failure(s)"
           # Exit 0 even after per-head failures so setup and reconcile still run; reconcile retries and reports its own errors.
@@ -361,3 +509,54 @@ jobs:
 Set `AUTHENTICATED_FETCH` to `true` only for the canonical private GitHub case described above. The fallback builds only the exact pinned AgentSCM source and reads only the caller's default-branch configuration; pull request code is fetched as inert Git data and is never checked out or run.
 
 The job-level concurrency placement is security-relevant. A workflow-level group is entered before the `if:` is evaluated, so an ignored comment run could supersede the pending eligible run and then do nothing. GitHub keeps only the newest pending run in a group even with `cancel-in-progress: false`; full sweeps prevent a run for one pull request from superseding another pull request's only reconciliation.
+
+## Selected tests and merge batches (staged, unqualified)
+
+The optional `test_selection` command field supports deterministic, forge-neutral test selection. It is implemented in Rust independently of GitHub queue orchestration. This repository's active recipe still runs the full Rust gate: it has no selection rules, and its published producer/verifier pin must be upgraded before a recipe uses the new field. The GitHub adapter workflows are committed preparation, not evidence that a merge queue is enabled or qualified. GitLab merge trains and Codeberg landing adapters are not implemented or qualified.
+
+The intended three tiers are:
+
+1. PR development: formatting, Clippy and selected nextest tests, plus the existing path-selected documentation, UI, audit and installer checks. Unmapped or shared changes run the full Rust suite. A Markdown-only change retains the existing documentation-only checks.
+2. Merge batch: one full Rust nextest suite and separate doctests on GitHub's exact combined `merge_group.head_sha`, with PostgreSQL and S3. Two individually passing PR heads can fail together; PR-head evidence never authorizes a different combined tree. GitHub owns queue retries, splitting and landing; AgentSCM does not merge branches or operate a local train.
+3. Release: the separate platform, artifact and local Hub qualification in [releasing](../releasing.md). Neither a filtered pass nor a batch Rust pass establishes Windows, container smoke, Hub end-to-end, UI runtime or live execution coverage.
+
+### Selection contract
+
+A reviewed recipe may add this field to its existing nextest command, keeping `argv` exactly `cargo nextest run --locked`:
+
+```json
+{
+  "id": "nextest",
+  "argv": ["cargo", "nextest", "run", "--locked"],
+  "timeout_secs": 3600,
+  "test_selection": {
+    "rules": [
+      {"path": "tests/integration/git_collisions.rs", "filter": "test(/^git_collisions::/)"},
+      {"path": "tests/integration/local_validation.rs", "filter": "test(/^local_validation::/)"}
+    ]
+  }
+}
+```
+
+This is an example, not the repository's active configuration. Rules use exact repository paths and reviewed nextest expressions. Start with individually modified integration modules after inspecting their callers and shared helpers; a matching filename alone does not establish sufficient coverage. The product accepts explicit reviewed mappings for other files, but does not infer a mapping from names.
+
+Existing command `paths` first decide whether a command is required. Selection changes only a required command's argv. When every changed path is a mapped modification, its filters are sorted, deduplicated and joined with OR, then passed as one `-E` argument. An empty change, an unmapped path, any added/deleted/renamed/type-changed path, a trust input or a built-in shared input retains the full command. Shared inputs include `Cargo.*`, `build.rs`, `.config/`, `tests/integration/common/` and the integration runner `main.rs`. Non-UTF-8 paths or observations beyond the bounded path budget fail observation explicitly; they never yield an accepted reduced run.
+
+The signed record's `selections` binds command ID, typed reason (`selected`, `unmapped_path`, `non_modified_path`, `trust_input`, `shared_input` or `empty_change`), sorted changed paths, filters and effective argv. A reduced run carries a coverage omission and its comment displays the selection. `verify` and `reconcile` independently derive the selection from observed Git source and the trusted recipe, then compare it with the record and command results. A signed worker claim does not become selection authority. Absent selection fields retain legacy serialized bytes; strict older binaries reject the new fields.
+
+### GitHub adapter and activation
+
+`merge-admission.yml` runs trusted workflow-source scripts only; it never checks out PR source or downloads PR artifacts. It creates a pending `Merge batch gate` check on each current PR head before inspecting prerequisites, and accepts only the latest legacy `agentscm/local-validation` status from the GitHub Actions bot and the Conventional PR title check from the GitHub Actions app. It also validates the current title with the existing trusted title validator, and re-reads head, base and title before publishing. Missing, untrusted or pending inputs stay pending; failures refuse admission. Starting either prerequisite workflow invalidates admission to pending; completion refreshes open default-branch PRs, with a fail-closed 500-record pagination bound. An out-of-order start event can leave a newer acceptance pending; rerun a prerequisite workflow to reconcile it. These identity checks preserve the existing GitHub Actions trust boundary; they do not prove which workflow wrote a status.
+
+`merge-batch.yml` reports the same check name, `Merge batch gate`, from a service-backed full-suite job on the exact group SHA. Its checkout does not persist credentials and its permissions are read-only. The PR admission check means the PR can enter the queue; only the group check qualifies combined source. The existing Hub-native single-entry queue feature is a separate experimental interface and is not used by this adapter.
+
+Activate in reviewed stages:
+
+1. Merge and publish a compatible AgentSCM binary. Follow [published acquisition and pin qualification](../releasing.md#activating-the-reusable-local-validation-workflow), then upgrade the producer/verifier pin together. Keep the current full-head recipe and required checks throughout bootstrap.
+2. Qualify admission and group checks on real PRs with the full-head recipe still active. Exercise late evidence, failed/pending/untrusted prerequisites, head/base/title movement, API errors, combined semantic failures and queue retry/splitting. Confirm the check identity and exact group SHA. API failure after pending creation leaves admission blocked; failure to create that pending check cannot guarantee invalidation of an older success and requires operator investigation.
+3. In an operator-controlled ruleset change, require GitHub's merge queue and the `Merge batch gate` check from GitHub Actions. Replace the legacy local-validation and title required contexts only once the admission gate is observed enforcing both: those legacy workflows are PR-head-only and requiring their contexts on group commits stalls the queue. Preserve reviews, signing, permissions and bypass restrictions. Do not require a batch gate while allowing direct PR merges to bypass the queue.
+4. Only after the full group gate is enforced, add reviewed test mappings to the recipe and update its policy's recipe digest. Qualify a real filtered PR and shared/unmapped full fallbacks, then verify the combined group receives a fresh full-suite result. Configuration changes invalidate prior attestations.
+
+Committing these workflows does not configure the ruleset, release a compatible binary or prove real queue execution. Until those stages complete, #369's deployment acceptance remains open and this repository retains its current full-head gate. To roll back, restore the full-head recipe and qualify its accepted attestations before reverting the ruleset to the legacy required contexts; never remove batch enforcement while relying only on filtered PR evidence.
+
+Contributors without a signing key retain the current [unsigned fallback](../contributor-testing.md#focused-iteration): report focused results during development, obtain maintainer attestation for the final head, or run the documented locked unsigned full gate and request adoption. Hosted diagnostics do not mint an accepted local attestation. No fork code may execute on a signing host.

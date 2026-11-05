@@ -45,6 +45,10 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/admin/devices", get(admin_devices))
         .route("/v1/hub/admin/repositories", get(admin_repositories))
         .route("/v1/hub/admin/sign-in-refusals", get(admin_refusals))
+        .route(
+            "/v1/hub/admin/capacity-refusals",
+            get(admin_capacity_refusals),
+        )
 }
 
 /// Why a mint was refused: a kind, or a role from [`super::missing_role`].
@@ -622,6 +626,7 @@ async fn repositories_for_owner(
     candidates.truncate(super::MAX_SIGN_IN_PROBES);
     let (readable, unchecked) = readable(&state, &owner, candidates, !include_work).await;
     let store = state.store.clone();
+    let setup = state.onboarding.clone();
     let mut rows = blocking(&state, move || {
         let now = unix_now();
         let revision_key = if include_work {
@@ -667,6 +672,7 @@ async fn repositories_for_owner(
             let status = super::super::viewer::shown(
                 super::super::work_http::actionable_status::read_person(
                     &*store,
+                    &setup,
                     &owner,
                     &repo.full_name,
                     repo.repository_id,
@@ -1206,6 +1212,28 @@ async fn admin_refusals(
     Ok(Json(json!({"refusals": refusals})))
 }
 
+/// Writes a store capacity limit refused in the last 30 days, with what to run for each.
+async fn admin_capacity_refusals(
+    State(state): State<HubState>,
+    human: super::HumanSession,
+) -> ApiResult<Json<Value>> {
+    human.admin()?;
+    let store = state.store.clone();
+    let now = unix_now();
+    let rows = blocking(&state, move || store.capacity_refusals(now)).await?;
+    let refusals: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({"limit": r.limit.as_str(), "what": r.limit.what(),
+                "provider": r.repository.provider, "host": r.repository.host,
+                "repository": r.repository.repository, "repository_id": r.repository.repository_id,
+                "at": r.at, "count": r.count, "remedy": r.remedy(),
+                "recent": r.at > now - crate::hub::capacity::RECENT_SECONDS})
+        })
+        .collect();
+    Ok(Json(json!({"refusals": refusals})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,7 +1352,8 @@ mod tests {
                 now,
             )
             .unwrap();
-        let read = || actionable_status::read(&*store, &who, now).unwrap();
+        let setup = crate::hub::onboarding::Observations::default();
+        let read = || actionable_status::read(&*store, &setup, &who, now).unwrap();
         let mut pull = json!({"number":1,"state":"open","head_sha":"first-head","files":["src/a.rs","src/b.rs"],"files_truncated":false});
         store
             .observe(&repo.id, "pull_request", "1", &pull.to_string(), 1000)

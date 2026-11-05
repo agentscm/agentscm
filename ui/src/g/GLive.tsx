@@ -10,7 +10,7 @@ import type { Derived } from '../derive.ts'
 import type { HubData } from '../useHub.ts'
 import type { Poll } from '../usePoll.ts'
 import type { WorkOverview } from '../standup.ts'
-import type { Need } from '../needs.ts'
+import { setupBadge, type Need } from '../needs.ts'
 import type { Handoff } from '../launchLink.ts'
 import type { Section } from '../App.tsx'
 import { gRoute, useHash, type GPage } from './layout.ts'
@@ -46,6 +46,7 @@ export function GLive({ live, section, sections, page, showAdmin, hubSignedOut, 
   const [drawer, setDrawer] = useState(false)
   const [palette, setPalette] = useState(false)
   const { data, overview, needs, inbox } = live
+  const setup = setupBadge(live.status?.kind === 'ready' ? live.status.value : null)
   const ov = overview.kind === 'ready' ? overview.value : null
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
@@ -103,7 +104,7 @@ export function GLive({ live, section, sections, page, showAdmin, hubSignedOut, 
   ]
   const utils: Group[] = [
     { label: 'Inbox', href: '#inbox', icon: 'inbox', hint: 'Overlaps and requests that need a conversation', badge: inbox.n, badgeTone: 'warn', on: s('inbox'), subs: [] },
-    { label: 'Setup', href: '#setup', icon: 'plug', dot: data.failing || data.health?.status === 'unavailable', on: s('setup', 'computers', 'workspace', 'health', 'admin', 'settings'), subs: setupSubs },
+    { label: 'Setup', href: '#setup', icon: 'plug', badge: setup.n, badgeTone: 'warn', dot: data.failing || data.health?.status === 'unavailable', on: s('setup', 'computers', 'workspace', 'health', 'admin', 'settings'), subs: setupSubs },
     { label: 'Contributions', href: '#contributions', icon: 'stars', hint: 'What the Hub has recorded', on: gp('contributions'), subs: [] },
     { label: 'Feature map', href: '#features', icon: 'compass', hint: 'What is built and what is only proposed', on: gp('features'), subs: [] },
     { label: 'All repositories', href: '#repositories', icon: 'collection', hint: 'Every repository you can read', on: s('repositories'), subs: [] },

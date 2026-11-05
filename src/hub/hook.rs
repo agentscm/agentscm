@@ -27,13 +27,11 @@ use super::coordination::{CoordinationInboxQuery, CoordinationRequest, Coordinat
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
-    SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for, others_for,
-    record_hook_ms,
+    SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
+    done_pausing_for, others_for, record_hook_ms,
 };
 use super::store::{Principal, Store, agent_token_digest, unix_now};
-use super::work::{
-    Briefing, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverview, WorkOverviewQuery, WorkState,
-};
+use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, LEASE_LAPSED};
 use super::{HubError, HubState};
 
@@ -370,7 +368,7 @@ fn root_header(headers: &HeaderMap) -> Option<&str> {
 fn reason(error: HubError) -> &'static str {
     match error {
         HubError::Busy => "hub busy",
-        HubError::WorkCapacity => "work storage capacity reached",
+        HubError::WorkCapacity(_) => "work storage capacity reached",
         HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
         HubError::WorkCoordinationRequired { .. } => {
             "work scope needs coordination; inspect the agent inbox"
@@ -696,13 +694,19 @@ impl Call {
                     format!("{}\n{listing}", advice.text)
                 };
                 let store = state.store.clone();
+                let setup = state.onboarding.clone();
                 let scope = principal.clone();
                 // Bound optional enrichment after the committed touch; a slow read cannot consume
                 // the native client's whole startup deadline or hide that touch's outcome.
                 let current_status = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
                     blocking(state, move || {
-                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
+                        super::work_http::actionable_status::read(
+                            &*store,
+                            &setup,
+                            &scope,
+                            unix_now(),
+                        )
                     }),
                 )
                 .await;
@@ -725,7 +729,11 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
-                if !principal.read_only {
+                // Only while a requested briefing waits for an agent.
+                if !principal.read_only
+                    && super::narrative::pending(state, &principal)
+                        .is_ok_and(|requests| !requests.is_empty())
+                {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
                 }
@@ -745,12 +753,23 @@ impl Call {
                     true,
                     onboarding_epoch,
                 );
-                done_for(state, &principal, self.session.clone())
-                    .await
-                    .map_err(reason)?;
-                if let Some(session) = self.session.clone() {
-                    pause_known_work(state, &principal, session, &self.via, completion_reporting)
-                        .await;
+                // A call that names no session pauses no Work, since the session it resolves to
+                // is not the call's own.
+                match self.session.clone() {
+                    Some(session) => {
+                        done_pausing_for(
+                            state,
+                            &principal,
+                            Some(session),
+                            &self.via,
+                            completion_reporting,
+                        )
+                        .await
+                        .map_err(reason)?;
+                    }
+                    None => {
+                        done_for(state, &principal, None).await.map_err(reason)?;
+                    }
                 }
                 Ok(Outcome::clean())
             }
@@ -1040,74 +1059,6 @@ fn render_catchup(page: Option<&CatchupPreview>) -> String {
 
 fn bounded_hook_text(text: &str, max: usize) -> String {
     super::advice::sanitize(text, max)
-}
-
-async fn pause_known_work(
-    state: &HubState,
-    principal: &Principal,
-    session: String,
-    via: &str,
-    completion_reporting: bool,
-) {
-    let store = state.store.clone();
-    let token = principal.token_id.clone();
-    let lookup_session = session.clone();
-    let (item, session) = match blocking(state, move || {
-        let now = unix_now();
-        let canonical = store.session_name_for(&token, Some(&lookup_session), now)?;
-        let item = store.work_for_session(&token, &canonical, now)?;
-        if completion_reporting
-            && let Some(item) = item.as_ref()
-            && super::insights::record_completion(store.as_ref(), &token, item, &canonical, now)
-                .is_err()
-        {
-            eprintln!("hub: completion report failed");
-        }
-        Ok((item, canonical))
-    })
-    .await
-    {
-        Ok((Some(item), canonical)) => (item, canonical),
-        Ok((None, _)) => return,
-        Err(error) => {
-            eprintln!("hub: work lookup at session end: {error}");
-            return;
-        }
-    };
-    if matches!(
-        item.state,
-        WorkState::Paused | WorkState::Blocked | WorkState::Handover | WorkState::Finished
-    ) {
-        return;
-    }
-    let checkpoint = WorkCheckpoint {
-        work_id: item.id,
-        operation_id: format!("{via}-done-{}-{}", item.generation, item.updated_seq),
-        generation: item.generation,
-        expected_updated_seq: Some(item.updated_seq),
-        session,
-        kind: CheckpointKind::Pause,
-        summary: super::work::AUTO_PAUSE_SUMMARY.into(),
-        next_action: item
-            .next_action
-            .or_else(|| Some("Resume or deliberately hand over this unfinished work.".into())),
-        scope: None,
-        branch: None,
-        worktree: None,
-        resolve_blocker: false,
-        source_refs: Vec::new(),
-        depends_on: item.depends_on,
-        related_work: item.related_work,
-    };
-    let store = state.store.clone();
-    let token = principal.token_id.clone();
-    if let Err(error) = blocking(state, move || {
-        store.work_checkpoint(&token, &checkpoint, unix_now())
-    })
-    .await
-    {
-        eprintln!("hub: pause checkpoint at session end: {error}");
-    }
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {

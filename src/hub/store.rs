@@ -15,6 +15,7 @@ use crate::hub::catchup::{
     CatchupRepositoryScope, CatchupSourceStatus, NewCatchupMerge,
 };
 
+use super::capacity::CapacityRefusal;
 use super::change_record::{SharedBodyAccess, SharedBodyRow, SharedBodyState};
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
@@ -35,7 +36,7 @@ use super::promise::{
     PromiseReceiptV1, PromiseViewV1,
 };
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
-use super::session::{SessionCall, Touched};
+use super::session::{SessionCall, SessionEnd, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
@@ -307,6 +308,12 @@ pub trait Store: Send + Sync {
     fn record_refusal(&self, refusal: &Refusal) -> Result<()>;
     /// Newest first, within `REFUSAL_SECONDS` of `now`.
     fn refusals(&self, now: i64) -> Result<Vec<Refusal>>;
+    /// Records a capacity refusal: one row per repository and limit; a repeat adds its count
+    /// and keeps the newest `at`. Prunes rows past `capacity::RETAIN_SECONDS` and beyond the
+    /// newest `capacity::MAX_REFUSALS`.
+    fn record_capacity_refusal(&self, refusal: &CapacityRefusal) -> Result<()>;
+    /// Newest first, within `capacity::RETAIN_SECONDS` of `now`.
+    fn capacity_refusals(&self, now: i64) -> Result<Vec<CapacityRefusal>>;
     /// Connected repositories with the computers and live agent tokens using each.
     fn repository_usage(&self, now: i64) -> Result<Vec<RepositoryUsage>>;
     /// A web-page sign-in for an enabled `owner`, until `expires_at`. Expired rows go, and a
@@ -360,6 +367,18 @@ pub trait Store: Send + Sync {
     /// Release the session's intent (if any) and delete the session row. `None` resolves like
     /// `SessionCall.session`. True if a session existed.
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool>;
+    /// `end_session`, and in the same transaction pause the active Work the session leads, with
+    /// the pause checkpoint a lead would write (`work_checkpoint`). Blocked Work stays blocked;
+    /// Work with no session row is still paused. If the pause fails nothing is written, so the
+    /// intent stays held and the call can be repeated. `via` (`mcp` or `hook:<agent>`) names the
+    /// pause's operation, which is fixed by the Work's generation and sequence.
+    fn end_session_pausing(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        via: &str,
+        now: i64,
+    ) -> Result<SessionEnd>;
     /// Asks the live session intent holding exactly the file `path` to hand it over to the
     /// requesting session (`session` resolves like `SessionCall.session`). `note` is filtered and
     /// cut to 200 chars. One request per file and session, at most 3 open per session.
@@ -837,6 +856,18 @@ pub trait Store: Send + Sync {
         select: &OperationalSelect<'_>,
         now: i64,
     ) -> Result<OperationalOverviewV1>;
+
+    /// What a recovery inspection or preview needs, in one snapshot: the page of the reader
+    /// owner's unfinished Work after the cursor (or the one `work_id`), the live holds over the
+    /// paths with their exact overlaps, the owner's unfinished Work whose scope overlaps them,
+    /// and for each listed Work its open coordination requests and unfinished dependents.
+    /// Never writes. A person reader must already have passed the repository role check.
+    fn work_recovery_read(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        read: &super::work_recovery::RecoveryRead,
+        now: i64,
+    ) -> Result<super::work_recovery::RecoveryFacts>;
 
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).

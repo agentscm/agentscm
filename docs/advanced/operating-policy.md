@@ -258,6 +258,32 @@ limit; exhaustion preserves evidence and refuses further reconciliation. A repea
 ordinary recovery replays the newly retained request. No reconciliation retries
 uncertain runtime actions.
 
+A release or reopen of the dispatch's Work raises its generation, and recovery then
+refuses with "Work authority changed": the local binding still names the old
+generation. Once the dispatch's own session leads the Work again (after a release,
+resume it with `agentscm work start`, its `work_id`, that session and the current
+`takeover_generation`; a reopen by that session already does), point the binding at
+the current generation, then recover:
+
+```sh
+agentscm --data-dir "$policy_data" operating-policy rebind DISPATCH_ID \
+  --expected-generation CLAIM_GENERATION --work-generation CURRENT_WORK_GENERATION
+agentscm --data-dir "$policy_data" operating-policy rebind DISPATCH_ID \
+  --expected-generation CLAIM_GENERATION --work-generation CURRENT_WORK_GENERATION --apply
+```
+
+Without `--apply` it prints the binding it would write and writes nothing. It needs
+the same live owner of the active policy, the same Hub identity commitment, the
+dispatch's claim generation, and the Work's current Hub generation as inspected; a
+newer generation refuses with the current one named. The Work must keep its id,
+scope and the dispatch's lead token and session, and be active or blocked (or
+finished for a completed dispatch); released Work is refused until it is resumed.
+The journal replaces only the exact binding it read. A retained recovery request
+names the old generation and can never apply again, so the rebind moves it into
+the reconciliation history with outcome `unknown`, within the same 16-entry bound;
+one the Hub rejected is dropped because it never committed. Repeating the rebind
+for the same generation changes nothing.
+
 A legacy refusal that predates Work binding can be requeued only when no workflow run exists.
 Recovery requires the same live Hub identity, Work generation/session/scope and
 active policy. It never creates replacement Work. A takeover or narrowed authority

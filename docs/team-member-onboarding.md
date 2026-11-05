@@ -273,6 +273,17 @@ session replaces them. The first command reads at most 64 KiB and sends only a b
 category, never raw diagnostics. Keep diagnostic files private and delete them afterward. The second
 reads observations and prints one line per session, latest first (`--json` prints the Hub's reply);
 it does not simulate MCP or hook proof. Both require a current checkout binding.
+
+The Hub's Setup tab (and the G layout's Setup item) shows a badge with the number of your own
+agents that need a setup step. That covers a reported login, trust, quota, unsupported or unknown
+blocker, and an agent that verified MCP while no edit hook has reached the Hub. It also covers the
+case where none of your agent tokens for the repository works any more: the newest one expired or
+was revoked within the last day, for example because the computer stopped renewing it. When that
+agent leads unfinished Work, the same row appears in Needs you and counts in the menu bar app;
+otherwise it only badges Setup. A session that merely started and never ran setup verification is
+not a problem. Other people's setup problems are never shown to you. The reported problems come
+from the Hub's 15-minute observations, so a Hub restart clears them until the agent verifies again.
+There is no Slack message.
 Run `client setup` again when that binding needs forge sign-in or token renewal.
 
 | Blocker | Guided next step |

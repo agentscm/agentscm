@@ -89,15 +89,16 @@ fn isolated_git(repo: &Path) -> PathBuf {
     let transport = common.join("synthetic-transport.json");
     if transport.exists() {
         let mapping: Value = serde_json::from_slice(&fs::read(transport).unwrap()).unwrap();
+        // A shell script, not Python: the product runs this wrapper thousands of times per test,
+        // and interpreter startup on every call made it the largest cost of the scenario.
+        let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+        let remote = mapping["remote"].as_str().unwrap();
+        let push_log = PathBuf::from(remote).with_extension("push-log");
         let script = format!(
-            "#!/usr/bin/python3\nimport os,sys\nif 'push' in sys.argv[1:]:\n with open({push_log},'a') as f: f.write('push\\n')\nos.environ['GIT_CONFIG_GLOBAL']='/dev/null'\nos.environ['GIT_CONFIG_NOSYSTEM']='1'\na=[{remote} if x=={endpoint} else ('protocol.file.allow=always' if x=='protocol.file.allow=never' else x) for x in sys.argv[1:]]\nos.execv({exe},[{exe},'-c','protocol.file.allow=always']+a)\n",
-            push_log = serde_json::to_string(
-                &PathBuf::from(mapping["remote"].as_str().unwrap()).with_extension("push-log")
-            )
-            .unwrap(),
-            remote = mapping["remote"],
-            endpoint = mapping["endpoint"],
-            exe = serde_json::to_string(&git_path()).unwrap()
+            "#!/bin/sh\nfor a in \"$@\"; do\n if [ \"$a\" = push ]; then echo push >> {push_log}; break; fi\ndone\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\nfor a in \"$@\"; do\n shift\n case \"$a\" in\n  {endpoint}) a={remote} ;;\n  protocol.file.allow=never) a=protocol.file.allow=always ;;\n esac\n set -- \"$@\" \"$a\"\ndone\nexec '{executable}' -c protocol.file.allow=always \"$@\"\n",
+            push_log = quote(&push_log.to_string_lossy()),
+            endpoint = quote(mapping["endpoint"].as_str().unwrap()),
+            remote = quote(remote),
         );
         write_wrapper(&wrapper, &script);
         return wrapper;

@@ -276,8 +276,14 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
     token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may
     release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or
-    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. There is no Hub page
-    action for it yet. See [stand-up](standup.md#work-transitions).
+    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. A task's page offers
+    these as **Release or end this task**, after a preview. See
+    [stand-up](standup.md#recover-stuck-work).
+  - `POST /v1/hub/session/work/recovery`, `POST /v1/hub/session/work/recovery/preview` and
+    `POST /v1/hub/session/work/transitions` are the agent recovery routes for a person, with
+    `repository` in the body and the same allow-list and role check. They read and apply through
+    the same service as `agentscm_work_recovery`: the owner's Work and, for a Hub administrator,
+    anyone's. A batch item another person may not apply is `refused` with code `unauthorized`.
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
   on the person's forge host that they can read now, for the web pages' All repositories list.
   Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,
@@ -376,7 +382,12 @@ status shown; clients show `message` as is.
   computer mints within 30 days, at most 200, one row per person and reason (`at`, `count`,
   `provider`, `host`, `login`, `forge_user_id`, `reason`, `via` `sign_in`, `device_mint` or
   `web_read_token`; a
-  repeat bumps `count`). No secret is stored, and still no user row, event or session for the
+  repeat bumps `count`), and `GET /v1/hub/admin/capacity-refusals`: agent writes a full store
+  limit refused within 30 days, at most 200, one row per repository and limit (`limit`
+  `work_storage`, `merge_observations`, `catchup_deliveries`, `change_records`,
+  `coordination_requests` or `coordination_updates`, plus `what`, `provider`, `host`,
+  `repository`, `repository_id`, `at`, `count`, `recent` for the last day, and `remedy`, the
+  command or step for that limit). No secret is stored, and still no user row, event or session for the
   refused person.
 - Events: `device_created`, `device_renamed`, `device_revoked` (`by` the acting user, or the
   computer that revoked another), `auto_connected`.
@@ -392,7 +403,7 @@ status shown; clients show `message` as is.
 
 ## Routes
 
-- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"version":"0.1.0-alpha.7","commit":"<40 hex>"|null}`. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older.
+- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"capacity":{"recent_limits":0,"last_refused_at":null},"version":"0.1.0-alpha.7","commit":"<40 hex>"|null}`. `capacity` counts the repository limits that refused an agent write in the last day and gives the newest refusal time, without naming a repository; it is `null` when the refusal record could not be read. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older.
   (warn-once counters, see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)), plus
   `"demo":true` on the throwaway hub of `agentscm demo`, or 503 if the database does not answer.
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
@@ -797,7 +808,7 @@ cannot write another repository's intents.
 
 An `agentscm_start` that creates new work (not a join, takeover or resumed start) compares its
 task with the titles of other agents' ongoing work (from the same
-overview `work.context` shows) and of the repository's open observed pull requests. Two titles
+overview `agentscm_work_overview` pages) and of the repository's open observed pull requests. Two titles
 match when they share at least two words of three or more letters, ignoring a few filler words
 ("fix", "add", "update", "work" ...), and those shared words are at least half of both together.
 On a match the reply lists them, with each work id, and tells the agent to decide from the titles
@@ -834,7 +845,7 @@ Tools:
 | `agentscm_start` | `task`, `paths?`, `session?` | Once at the start of a task: records the task, returns who else is working in the repository. In a hook-connected session it says that edits are checked automatically. |
 | `agentscm_check` | `paths` (1 to 50), `session?` | Before editing a file not yet edited in this session: who else is working on it, as a note. It never refuses. |
 | `agentscm_status` | `session?` | The other agents and the repository's open pull requests. |
-| `agentscm_done` | `session?` | Releases the session's files. |
+| `agentscm_done` | `session?` | Releases the session's files and, in the same step, pauses the active Work the session leads. |
 | `agentscm_ask` | `path`, `note?` (at most 200 characters), `session?` | Asks the agent that holds a file to hand it over to this session (see [Handoff](#handoff)). |
 | `agentscm_handoff` | `path`, `accept`, `reason?` (at most 200 characters, with `accept` false), `session?` | Answers a request for a file this session holds: `true` hands it over, `false` keeps it. |
 | `agentscm_workflow_status` | `run_id` | Reads a retained skill workflow from the operator-mapped native repository, with historical state and present applicability separate. |
@@ -1708,11 +1719,7 @@ restore a complete pre-upgrade backup into an empty database that is dedicated t
 binary. Test a restored copy before replacing the original; never run old and new binaries against
 the same database during recovery.
 
-[`.github/hub-e2e.sh`](../.github/hub-e2e.sh) runs both profiles in CI: two agents with different
-tokens on different machine names, the second one is warned about the first, the warning survives a
-hub restart, and (SQLite) a backup restored into a fresh volume still serves it. Tokens come from a
-test-only seeder (`examples/hub_seed.rs`, built only by the Dockerfile's `e2e-seed` stage), because
-the test has no forge to sign in with; the product image has no way around sign-in.
+[`.github/hub-e2e.sh local-release EVIDENCE_DIR`](../.github/hub-e2e.sh) runs both profiles as a local release-only gate on a clean committed candidate: two agents with different tokens on different machine names, the second one is warned about the first, the warning survives a hub restart, and (SQLite) a backup restored into a fresh volume still serves it. Retain both profile results as described in [releasing](releasing.md#local-hub-release-qualification); hosted PR checks do not establish this coverage. Tokens come from a test-only seeder (`examples/hub_seed.rs`, built only by the Dockerfile's `e2e-seed` stage), because the test has no forge to sign in with; the product image has no way around sign-in.
 
 The container test does not include a forge. Pull-request overlaps (webhook and poll intake, the
 `pr_notice` to the intent's agent, and the edited-in-place PR comment and status) are tested in

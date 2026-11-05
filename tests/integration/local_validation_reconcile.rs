@@ -58,6 +58,7 @@ impl Env {
                 id: "gate".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
                 timeout_secs: 30,
+                test_selection: None,
                 paths: None,
             }],
             None,
@@ -81,6 +82,7 @@ impl Env {
                 id: "gate".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
                 timeout_secs: 30,
+                test_selection: None,
                 paths: None,
             }],
             None,
@@ -98,6 +100,17 @@ impl Env {
         commands: Vec<RecipeCommand>,
         dependency_files: Option<Vec<String>>,
         exempt_paths: Option<Vec<String>>,
+    ) -> Self {
+        Self::build(files, commands, dependency_files, exempt_paths, |_| {}).await
+    }
+
+    /// `setup` may add or replace files in the config directory before it is committed.
+    async fn build(
+        files: Vec<(&str, &str)>,
+        commands: Vec<RecipeCommand>,
+        dependency_files: Option<Vec<String>>,
+        exempt_paths: Option<Vec<String>>,
+        setup: impl FnOnce(&Path),
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -136,6 +149,7 @@ impl Env {
             commands,
             dependency_files,
             toolchain_probes: None,
+            constituents: None,
         };
         let policy = ValidationPolicy {
             repository: REPOSITORY.into(),
@@ -147,6 +161,7 @@ impl Env {
             max_age_seconds: 3600,
             epoch: 1,
             exempt_paths,
+            check_id: None,
         };
         let config = root.join("config");
         fs::create_dir(&config).unwrap();
@@ -165,15 +180,14 @@ impl Env {
             serde_json::to_vec(&policy).unwrap(),
         )
         .unwrap();
+        setup(&config);
 
         git(&work, &["init", "-q", "-b", "main"]);
         fs::write(work.join("base.txt"), "base").unwrap();
         // The verifier configuration lives in the default branch, as in a real repository.
         let in_repo = work.join(".github/local-validation");
         fs::create_dir_all(&in_repo).unwrap();
-        for name in ["policy.json", "recipe.json", "registry.json"] {
-            fs::copy(config.join(name), in_repo.join(name)).unwrap();
-        }
+        copy_tree(&config, &in_repo);
         git(&work, &["add", "."]);
         git(&work, &["commit", "-q", "-m", "base"]);
         let base = git(&work, &["rev-parse", "HEAD"]);
@@ -320,6 +334,7 @@ impl Env {
                     author: "maintainer-login".into(),
                     author_association: association.into(),
                     updated_at: "2026-01-01T00:00:00Z".into(),
+                    html_url: None,
                 }],
             );
         });
@@ -399,8 +414,26 @@ impl Env {
     }
 }
 
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 fn cli(root: &Path, args: &[&str]) -> Output {
+    let path = std::env::join_paths(std::iter::once(root.join("bin")).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .env("PATH", path)
         .args(["--no-telemetry", "--data-dir"])
         .arg(root.join("data"))
         .arg("local-validation")
@@ -672,6 +705,7 @@ async fn unauthenticated_comments_cannot_override_authenticated_comments() {
                 author: "outside-author".into(),
                 author_association: "NONE".into(),
                 updated_at: "2026-02-02T00:00:00Z".into(),
+                html_url: None,
             });
     });
     let out = tokio::task::block_in_place(|| env.reconcile());
@@ -814,6 +848,7 @@ async fn unread_or_unreadable_listings_fail_closed_without_writes() {
                 author: "x".into(),
                 author_association: "NONE".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
+                html_url: None,
             });
         }
     });
@@ -924,6 +959,7 @@ async fn a_bun_shaped_recipe_without_services_produces_posts_and_reconciles() {
             id: "bun-test".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "test -f bun.lock".into()],
             timeout_secs: 30,
+            test_selection: None,
             paths: None,
         }],
         Some(vec!["bun.lock".into()]),
@@ -1176,6 +1212,7 @@ async fn a_failed_head_fetch_followed_by_an_auth_failure_on_the_recheck_stops_th
                     author: "maintainer-login".into(),
                     author_association: "OWNER".into(),
                     updated_at: "2026-01-01T00:00:00Z".into(),
+                    html_url: None,
                 }],
             );
         });
@@ -1239,6 +1276,7 @@ async fn a_configuration_change_stops_the_loop_so_every_head_stays_pending() {
                 author: "maintainer-login".into(),
                 author_association: "OWNER".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
+                html_url: None,
             }],
         );
     });
@@ -1357,6 +1395,7 @@ async fn an_attestation_listing_a_path_scoped_command_as_not_required_passes() {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
         timeout_secs: 30,
+        test_selection: None,
         paths,
     };
     let env = Env::with_recipe(
@@ -1402,6 +1441,7 @@ async fn an_opted_in_exempt_head_whose_comments_change_before_the_write_ends_pen
                         author: "maintainer-login".into(),
                         author_association: "OWNER".into(),
                         updated_at: "2026-01-01T00:00:00Z".into(),
+                        html_url: None,
                     }],
                 );
             })
@@ -1409,4 +1449,745 @@ async fn an_opted_in_exempt_head_whose_comments_change_before_the_write_ends_pen
         .await;
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(env.states(&env.head), ["success", "pending"]);
+}
+
+// ---- independent checks (checks.json) ----
+
+const UNIT: &str = "agentscm/local-validation/unit";
+const STATIC: &str = "agentscm/local-validation/static";
+const GATES: &str = "agentscm/local-validation/gates";
+
+fn sh(id: &str, script: &str) -> RecipeCommand {
+    RecipeCommand {
+        id: id.into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        timeout_secs: 30,
+        test_selection: None,
+        paths: None,
+    }
+}
+
+struct CheckSpec {
+    dir: &'static str,
+    name: &'static str,
+    id: Option<&'static str>,
+    commands: Vec<RecipeCommand>,
+    constituents: Option<Vec<agentscm::local_validation::Constituent>>,
+    exempt: Option<Vec<String>>,
+    repository: &'static str,
+}
+
+impl CheckSpec {
+    fn new(dir: &'static str, name: &'static str, id: &'static str, ok: bool) -> Self {
+        Self {
+            dir,
+            name,
+            id: Some(id),
+            commands: vec![sh("gate", if ok { "true" } else { "false" })],
+            constituents: None,
+            exempt: None,
+            repository: REPOSITORY,
+        }
+    }
+}
+
+fn write_check(config: &Path, spec: &CheckSpec) {
+    let recipe = ValidationRecipe {
+        recipe_id: "gate".into(),
+        commands: spec.commands.clone(),
+        dependency_files: None,
+        toolchain_probes: None,
+        constituents: spec.constituents.clone(),
+    };
+    let policy = ValidationPolicy {
+        repository: spec.repository.into(),
+        recipe_sha256: recipe.sha256().unwrap(),
+        required_services: Services {
+            postgres: false,
+            s3: false,
+        },
+        max_age_seconds: 3600,
+        epoch: 1,
+        exempt_paths: spec.exempt.clone(),
+        check_id: spec.id.map(str::to_owned),
+    };
+    let dir = config.join(spec.dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("policy.json"),
+        serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("recipe.json"),
+        serde_json::to_vec(&recipe).unwrap(),
+    )
+    .unwrap();
+}
+
+impl Env {
+    /// A repository whose config directory holds `checks.json` (generated from `specs` unless
+    /// `manifest` is given) and one policy and recipe per spec.
+    async fn multi(
+        files: Vec<(&str, &str)>,
+        specs: Vec<CheckSpec>,
+        manifest: Option<&str>,
+    ) -> Self {
+        Self::build(files, vec![sh("gate", "true")], None, None, |config| {
+            for spec in &specs {
+                write_check(config, spec);
+            }
+            let text = manifest.map_or_else(
+                || {
+                    let checks: Vec<_> = specs
+                        .iter()
+                        .map(|c| serde_json::json!({"name": c.name, "dir": c.dir}))
+                        .collect();
+                    serde_json::json!({"schema_version": 1, "checks": checks}).to_string()
+                },
+                str::to_owned,
+            );
+            fs::write(config.join("checks.json"), text).unwrap();
+        })
+        .await
+    }
+
+    async fn two(unit_ok: bool, static_ok: bool) -> Self {
+        Self::multi(
+            vec![
+                ("a.txt", "a"),
+                ("Cargo.lock", "# synthetic lock\n"),
+                ("rust-toolchain.toml", "[toolchain]\n"),
+            ],
+            vec![
+                CheckSpec::new(".", "Unit tests", "unit", unit_ok),
+                CheckSpec::new("static", "Static", "static", static_ok),
+            ],
+            None,
+        )
+        .await
+    }
+
+    /// The comment body of a run of the check in `dir` (a failing run still produces one).
+    fn attest_check(&self, dir: &str) -> String {
+        let root = self.root();
+        let p = |n: &str| root.join(n).to_str().unwrap().to_owned();
+        let config = |n: &str| {
+            root.join("config")
+                .join(dir)
+                .join(n)
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        let out = self.cli(&[
+            "run",
+            "--repo",
+            &p("work"),
+            "--recipe",
+            &config("recipe.json"),
+            "--policy",
+            &config("policy.json"),
+            "--registry",
+            &p("config/registry.json"),
+            "--key-file",
+            &p("key"),
+            "--issuer-id",
+            "maintainer",
+            "--state-dir",
+            &p(&format!("state-{dir}")),
+        ]);
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+        let shown = self.cli(&[
+            "show",
+            "--state-dir",
+            &p(&format!("state-{dir}")),
+            "--attestation",
+            json["envelope_sha256"].as_str().unwrap(),
+        ]);
+        assert!(shown.status.success());
+        String::from_utf8(shown.stdout).unwrap()
+    }
+
+    fn set_comments(&self, comments: Vec<(u64, &str, String, Option<&str>)>) {
+        self.fake.with(|s| {
+            s.repos.get_mut(&1).unwrap().comments.insert(
+                1,
+                comments
+                    .into_iter()
+                    .map(|(id, association, body, html_url)| Comment {
+                        id,
+                        body,
+                        author: "maintainer-login".into(),
+                        author_association: association.into(),
+                        updated_at: "2026-01-01T00:00:00Z".into(),
+                        html_url: html_url.map(str::to_owned),
+                    })
+                    .collect(),
+            );
+        });
+    }
+
+    /// `(state, description, target_url)` of the statuses of `context` on `sha`, oldest first.
+    fn ctx(&self, sha: &str, context: &str) -> Vec<(String, String, Option<String>)> {
+        self.fake.with(|s| {
+            s.repos[&1]
+                .statuses
+                .iter()
+                .filter(|(at, v)| at == sha && v["context"] == context)
+                .map(|(_, v)| {
+                    (
+                        v["state"].as_str().unwrap().to_owned(),
+                        v["description"].as_str().unwrap().to_owned(),
+                        v["target_url"].as_str().map(str::to_owned),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn ctx_states(&self, sha: &str, context: &str) -> Vec<String> {
+        self.ctx(sha, context).into_iter().map(|s| s.0).collect()
+    }
+
+    fn last(&self, context: &str) -> (String, String) {
+        let (state, description, _) = self.ctx(&self.head, context).pop().unwrap();
+        (state, description)
+    }
+
+    fn requests(&self) -> usize {
+        self.fake.with(|s| s.requests.len())
+    }
+}
+
+fn reconciled(env: &Env) -> Output {
+    tokio::task::block_in_place(|| env.reconcile())
+}
+
+fn ok(out: &Output) {
+    assert_eq!(code(out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_independent_checks_report_mixed_outcomes_without_overwriting_each_other() {
+    let env = Env::two(true, false).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "OWNER", unit, None), (11, "OWNER", stat, None)]);
+    ok(&reconciled(&env));
+    assert_eq!(env.ctx_states(&env.head, UNIT), ["pending", "success"]);
+    assert_eq!(env.ctx_states(&env.head, STATIC), ["pending", "failure"]);
+    assert!(env.last(UNIT).1.starts_with("Unit tests: "));
+    assert!(env.last(STATIC).1.starts_with("Static: "));
+    assert!(
+        env.ctx_states(&env.head, "agentscm/local-validation")
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_attestation_for_one_check_is_pending_while_the_other_succeeds() {
+    let env = Env::two(true, true).await;
+    let unit = tokio::task::block_in_place(|| env.attest_check("."));
+    env.set_comments(vec![(10, "OWNER", unit, None)]);
+    ok(&reconciled(&env));
+    assert_eq!(env.ctx_states(&env.head, UNIT), ["pending", "success"]);
+    let (state, description) = env.last(STATIC);
+    assert_eq!(state, "pending");
+    assert!(
+        description.contains("no attestation for this head"),
+        "{description}"
+    );
+    assert!(
+        !env.ctx_states(&env.head, STATIC)
+            .contains(&"success".to_owned())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_check_whose_policy_exempts_the_paths_passes_without_an_attestation() {
+    let mut unit = CheckSpec::new(".", "Unit tests", "unit", true);
+    unit.exempt = Some(vec!["*.md".into()]);
+    let env = Env::multi(
+        vec![("x.md", "docs")],
+        vec![unit, CheckSpec::new("static", "Static", "static", true)],
+        None,
+    )
+    .await;
+    ok(&reconciled(&env));
+    let (state, description) = env.last(UNIT);
+    assert_eq!(state, "success");
+    assert!(description.contains("not required: only exempt paths changed"));
+    assert!(
+        !env.ctx_states(&env.head, STATIC)
+            .contains(&"success".to_owned())
+    );
+    assert_eq!(env.last(STATIC).0, "pending");
+}
+
+fn grouped() -> CheckSpec {
+    let mut spec = CheckSpec::new(".", "Gates", "gates", true);
+    spec.commands = vec![sh("fmt", "true"), sh("lint", "false"), sh("tests", "true")];
+    let group = |id: &str, name: &str| agentscm::local_validation::Constituent {
+        id: id.into(),
+        name: name.into(),
+        commands: vec![id.into()],
+    };
+    spec.constituents = Some(vec![
+        group("fmt", "Format"),
+        group("lint", "Lint"),
+        group("tests", "Tests"),
+    ]);
+    spec
+}
+
+const FILES: [(&str, &str); 3] = [
+    ("a.txt", "a"),
+    ("Cargo.lock", "# synthetic lock\n"),
+    ("rust-toolchain.toml", "[toolchain]\n"),
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grouped_check_writes_constituents_to_their_own_contexts() {
+    let env = Env::multi(FILES.to_vec(), vec![grouped()], None).await;
+    let body = tokio::task::block_in_place(|| env.attest_check("."));
+    env.set_comments(vec![(10, "OWNER", body, None)]);
+    ok(&reconciled(&env));
+    let fmt = format!("{GATES}/fmt");
+    let lint = format!("{GATES}/lint");
+    let tests = format!("{GATES}/tests");
+    assert_eq!(env.last(GATES).0, "failure");
+    assert!(env.last(GATES).1.starts_with("Gates: "));
+    assert_eq!(env.last(&fmt).0, "success");
+    assert_eq!(env.last(&lint).0, "failure");
+    let (state, description) = env.last(&tests);
+    assert_eq!(state, "pending");
+    assert!(description.contains("did not run"), "{description}");
+    assert!(env.last(&lint).1.starts_with("Gates: Lint: "));
+    for context in [GATES, &fmt, &lint, &tests] {
+        assert_eq!(
+            env.ctx_states(&env.head, context)[0],
+            "pending",
+            "{context}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_change_to_one_check_stales_only_that_check() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "OWNER", unit, None), (11, "OWNER", stat, None)]);
+    let checkout = env.root().join("checkout");
+    let path = checkout.join(".github/local-validation/static/policy.json");
+    let mut policy: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    policy["max_age_seconds"] = 7200.into();
+    fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    git(&checkout, &["commit", "-qam", "change the static policy"]);
+    git(&checkout, &["push", "-q", "origin", "HEAD:main"]);
+    ok(&reconciled(&env));
+    assert_eq!(env.last(UNIT).0, "success");
+    let (state, description) = env.last(STATIC);
+    assert_eq!(state, "pending");
+    assert!(
+        description.contains("predates the current policy"),
+        "{description}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_or_editing_one_checks_comment_stales_only_that_check() {
+    for edit in [false, true] {
+        let env = Env::two(true, true).await;
+        let (unit, stat) =
+            tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+        env.set_comments(vec![
+            (10, "OWNER", unit.clone(), None),
+            (11, "OWNER", stat, None),
+        ]);
+        ok(&reconciled(&env));
+        assert_eq!(env.last(STATIC).0, "success");
+        let rest = if edit {
+            "edited, no attestation any more"
+        } else {
+            ""
+        };
+        let kept = vec![(10, "OWNER", unit, None)];
+        if edit {
+            env.set_comments([kept, vec![(11, "OWNER", rest.into(), None)]].concat());
+        } else {
+            env.set_comments(kept);
+        }
+        ok(&reconciled(&env));
+        assert_eq!(env.last(UNIT).0, "success", "edit={edit}");
+        let (state, description) = env.last(STATIC);
+        assert_eq!(state, "pending", "edit={edit}");
+        assert!(
+            description.contains("no attestation for this head"),
+            "{description}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_head_or_a_revoked_key_leaves_no_check_green() {
+    let mut env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![
+        (10, "OWNER", unit.clone(), None),
+        (11, "OWNER", stat.clone(), None),
+    ]);
+    env.push_head(&[("another.txt", "new head")]);
+    ok(&reconciled(&env));
+    for context in [UNIT, STATIC] {
+        let (state, description) = env.last(context);
+        assert_eq!(state, "pending", "{context}");
+        assert!(description.contains("different head"), "{description}");
+    }
+
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "OWNER", unit, None), (11, "OWNER", stat, None)]);
+    let checkout = env.root().join("checkout");
+    let path = checkout.join(".github/local-validation/registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry["issuers"][0]["keys"][0]["revoked_at_ms"] = 1.into();
+    fs::write(path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    git(&checkout, &["commit", "-qam", "revoke synthetic issuer"]);
+    git(&checkout, &["push", "-q", "origin", "HEAD:main"]);
+    ok(&reconciled(&env));
+    for context in [UNIT, STATIC] {
+        assert!(
+            !env.ctx_states(&env.head, context)
+                .contains(&"success".to_owned()),
+            "{context}"
+        );
+        let (state, description) = env.last(context);
+        assert_eq!(state, "pending", "{context}");
+        assert!(description.contains("signing key revoked"), "{description}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_authors_lifecycle_evidence_explains_pending_on_an_opted_in_head() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "NONE", unit, None), (11, "NONE", stat, None)]);
+    let checkout = env.root().join("checkout");
+    let path = checkout.join(".github/local-validation/registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry["issuers"][0]["keys"][0]["revoked_at_ms"] = 1.into();
+    fs::write(path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    git(&checkout, &["commit", "-qam", "revoke synthetic issuer"]);
+    git(&checkout, &["push", "-q", "origin", "HEAD:main"]);
+    // The comments alone do not opt the head in; an earlier status does.
+    env.fake.with(|s| {
+        let status = serde_json::json!({"state": "pending", "context": UNIT, "description": "old"});
+        s.repos
+            .get_mut(&1)
+            .unwrap()
+            .record_status(&env.head, status, "bot");
+    });
+    ok(&reconciled(&env));
+    for context in [UNIT, STATIC] {
+        let (state, description) = env.last(context);
+        assert_eq!(state, "pending", "{context}");
+        assert!(description.contains("signing key revoked"), "{description}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_authors_stale_evidence_alone_does_not_opt_a_head_in() {
+    let mut env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "NONE", unit, None), (11, "NONE", stat, None)]);
+    env.push_head(&[("another.txt", "new head")]);
+    ok(&reconciled(&env));
+    assert_eq!(env.posts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_authors_tampered_evidence_still_reads_as_missing() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    let tamper = |body: String| {
+        altered_attestation(&body, |e, _| {
+            let replacement = if e.signature_hex.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            };
+            e.signature_hex.replace_range(..1, replacement);
+        })
+    };
+    env.set_comments(vec![
+        (10, "NONE", tamper(unit), None),
+        (11, "NONE", tamper(stat), None),
+    ]);
+    env.fake.with(|s| {
+        let status = serde_json::json!({"state": "pending", "context": UNIT, "description": "old"});
+        s.repos
+            .get_mut(&1)
+            .unwrap()
+            .record_status(&env.head, status, "bot");
+    });
+    ok(&reconciled(&env));
+    for context in [UNIT, STATIC] {
+        let (state, description) = env.last(context);
+        assert_eq!(state, "pending", "{context}");
+        assert!(description.contains("no attestation"), "{description}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comment_added_during_the_run_leaves_that_check_pending_with_no_stale_success() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "OWNER", unit, None), (11, "OWNER", stat, None)]);
+    let out = env
+        .reconcile_stalled(&format!("/statuses/{}", env.head), |fake| {
+            fake.with(|s| {
+                s.repos
+                    .get_mut(&1)
+                    .unwrap()
+                    .comments
+                    .get_mut(&1)
+                    .unwrap()
+                    .push(Comment {
+                        id: 12,
+                        body: format!("{MARKED}late -->"),
+                        author: "maintainer-login".into(),
+                        author_association: "OWNER".into(),
+                        updated_at: "2026-03-03T00:00:00Z".into(),
+                        html_url: None,
+                    })
+            })
+        })
+        .await;
+    ok(&out);
+    // The first sweep re-read the comments after the addition and left its check pending.
+    assert_eq!(env.ctx_states(&env.head, UNIT), ["pending"]);
+    // The later sweep started after the addition and decides on its own fresh reads.
+    assert_eq!(
+        env.ctx_states(&env.head, STATIC).first().unwrap(),
+        "pending"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_that_moves_mid_run_leaves_every_check_without_a_verdict() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![
+        (10, "CONTRIBUTOR", unit, None),
+        (11, "CONTRIBUTOR", stat, None),
+    ]);
+    let moved = "c".repeat(40);
+    let out = env
+        .reconcile_stalled(&format!("/statuses/{}", env.head), |fake| {
+            fake.with(|s| {
+                s.repos
+                    .get_mut(&1)
+                    .unwrap()
+                    .pulls
+                    .get_mut(&1)
+                    .unwrap()
+                    .head_sha = moved.clone()
+            })
+        })
+        .await;
+    ok(&out);
+    assert_eq!(env.ctx_states(&env.head, UNIT), ["pending"]);
+    assert!(env.ctx_states(&env.head, STATIC).is_empty());
+    for context in [UNIT, STATIC] {
+        assert!(env.ctx_states(&moved, context).is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_invalidation_of_one_context_withholds_that_checks_verdict_only() {
+    let env = Env::multi(
+        FILES.to_vec(),
+        vec![
+            grouped(),
+            CheckSpec::new("unit", "Unit tests", "unit", true),
+        ],
+        None,
+    )
+    .await;
+    let (gates, unit) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("unit")));
+    env.set_comments(vec![(10, "OWNER", gates, None), (11, "OWNER", unit, None)]);
+    let lint = format!("{GATES}/lint");
+    env.fake.with(|s| {
+        s.reject_status_contexts.insert(lint.clone(), 422);
+    });
+    let out = reconciled(&env);
+    assert_eq!(code(&out), 1);
+    // The grouped check never reached a verdict on this head...
+    assert_eq!(env.ctx_states(&env.head, GATES), ["pending"]);
+    assert!(env.ctx_states(&env.head, &lint).is_empty());
+    // ...but the later independent check was still swept.
+    assert_eq!(env.ctx_states(&env.head, UNIT), ["pending", "success"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_auth_stop_in_one_sweep_does_not_stop_the_next_check_and_exits_one() {
+    let env = Env::two(true, true).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    env.set_comments(vec![(10, "OWNER", unit, None), (11, "OWNER", stat, None)]);
+    env.fake.with(|s| {
+        s.reject_status_contexts.insert(UNIT.into(), 401);
+    });
+    let out = reconciled(&env);
+    assert_eq!(code(&out), 1);
+    assert!(env.ctx_states(&env.head, UNIT).is_empty());
+    assert_eq!(env.ctx_states(&env.head, STATIC), ["pending", "success"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_manifests_write_nothing() {
+    let unit = || CheckSpec::new(".", "Unit tests", "unit", true);
+    let mut other_repo = CheckSpec::new("static", "Static", "static", true);
+    other_repo.repository = "github.com/o/other";
+    let mut legacy_a = CheckSpec::new(".", "A", "unit", true);
+    legacy_a.id = None;
+    let mut legacy_b = CheckSpec::new("static", "B", "static", true);
+    legacy_b.id = None;
+    let mut bare = grouped();
+    bare.id = None;
+    let cases: Vec<(&str, Vec<CheckSpec>, Option<&str>)> = vec![
+        (
+            "duplicate id",
+            vec![unit(), CheckSpec::new("static", "Static", "unit", true)],
+            None,
+        ),
+        ("two legacy policies", vec![legacy_a, legacy_b], None),
+        (
+            "traversal",
+            vec![unit()],
+            Some(r#"{"schema_version":1,"checks":[{"name":"A","dir":"../config"}]}"#),
+        ),
+        (
+            "unknown field",
+            vec![unit()],
+            Some(r#"{"schema_version":1,"extra":true,"checks":[{"name":"A","dir":"."}]}"#),
+        ),
+        ("constituents without check id", vec![bare], None),
+        ("repository mismatch", vec![unit(), other_repo], None),
+        ("malformed", vec![unit()], Some("{")),
+    ];
+    for (what, specs, manifest) in cases {
+        let env = Env::multi(FILES.to_vec(), specs, manifest).await;
+        let out = reconciled(&env);
+        assert_ne!(code(&out), 0, "{what}");
+        assert_eq!(env.posts(), 0, "{what}");
+        assert_eq!(env.requests(), 0, "{what}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decided_verdict_links_to_its_comment_otherwise_the_fallback() {
+    let env = Env::two(true, false).await;
+    let (unit, stat) =
+        tokio::task::block_in_place(|| (env.attest_check("."), env.attest_check("static")));
+    let link = "https://github.test/o/r/pull/1#issuecomment-10";
+    env.set_comments(vec![
+        (10, "OWNER", unit, Some(link)),
+        (11, "OWNER", stat, None),
+    ]);
+    let fallback = "https://ci.example.invalid/run/1";
+    let mut args = env.reconcile_args();
+    args.extend(["--target-url".into(), fallback.into()]);
+    let out = tokio::task::block_in_place(|| {
+        env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    ok(&out);
+    let target = |context: &str, at: usize| env.ctx(&env.head, context)[at].2.clone();
+    assert_eq!(target(UNIT, 0).as_deref(), Some(fallback));
+    assert_eq!(target(UNIT, 1).as_deref(), Some(link));
+    assert_eq!(target(STATIC, 1).as_deref(), Some(fallback));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_legacy_single_check_keeps_its_context_and_unprefixed_descriptions() {
+    let env = Env::new().await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    env.attest_comment(10, "OWNER", body);
+    ok(&reconciled(&env));
+    let statuses = env.statuses(&env.head);
+    assert_eq!(statuses[0].1, "re-verifying local validation");
+    assert_eq!(statuses[1].0, "success");
+    assert!(!statuses[1].1.contains(": "), "{}", statuses[1].1);
+    let contexts: std::collections::BTreeSet<String> = env.fake.with(|s| {
+        s.repos[&1]
+            .statuses
+            .iter()
+            .map(|(_, v)| v["context"].as_str().unwrap().to_owned())
+            .collect()
+    });
+    assert_eq!(contexts, ["agentscm/local-validation".to_owned()].into());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn selected_evidence_discovers_an_unassociated_author_and_rechecks_git() {
+    use agentscm::local_validation::{TestSelection, TestSelectionRule};
+    let env = Env::build(
+        vec![("a.txt", "changed")],
+        vec![RecipeCommand {
+            id: "nextest".into(),
+            argv: ["cargo", "nextest", "run", "--locked"]
+                .map(String::from)
+                .to_vec(),
+            timeout_secs: 30,
+            paths: None,
+            test_selection: Some(TestSelection {
+                rules: vec![TestSelectionRule {
+                    path: "a.txt".into(),
+                    filter: "test(/^synthetic::/)".into(),
+                }],
+            }),
+        }],
+        Some(vec!["a.txt".into()]),
+        None,
+        |config| {
+            let root = config.parent().unwrap();
+            fs::write(root.join("work/a.txt"), "base").unwrap();
+            fs::create_dir(root.join("bin")).unwrap();
+            let cargo = root.join("bin/cargo");
+            fs::write(&cargo, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(cargo, fs::Permissions::from_mode(0o700)).unwrap();
+        },
+    )
+    .await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    let (_, bytes) = agentscm::local_validation::comment::parse(&body).unwrap();
+    let record = ValidationRecord::from_slice(&bytes).unwrap();
+    assert_eq!(
+        record.selections[0].reason,
+        agentscm::local_validation::SelectionReason::Selected
+    );
+    env.attest_comment(10, "NONE", body.clone());
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending", "success"]);
+    let wrong = signed_record_change(&env, &body, |record| {
+        record.selections[0].paths = vec!["unrelated.txt".into()];
+    });
+    env.attest_comment(10, "NONE", wrong);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ne!(env.states(&env.head).last().unwrap(), "success");
 }

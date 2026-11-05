@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::hub::coordination::{CoordinationInbox, CoordinationListQuery, CoordinationStatus};
+use crate::hub::onboarding::Observations;
 use crate::hub::store::{Principal, Store};
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
@@ -355,9 +356,16 @@ pub fn project_work(
 
 /// Read through the caller's authenticated repository scope. Counts are lower bounds when any
 /// collection is truncated. Reservation holders are selected first, including legacy-hidden Work.
-pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<ActionableStatus> {
+/// `setup` is the Hub's onboarding observations, for the viewer's own agent setup problems.
+pub fn read(
+    store: &dyn Store,
+    setup: &Observations,
+    principal: &Principal,
+    now: i64,
+) -> Result<ActionableStatus> {
     read_scoped(
         store,
+        setup,
         principal,
         &WorkLifecycleReader::Token(&principal.token_id),
         now,
@@ -367,6 +375,7 @@ pub fn read(store: &dyn Store, principal: &Principal, now: i64) -> Result<Action
 /// Internal role-checked person read. Never infer person authority from an empty token.
 pub(crate) fn read_person(
     store: &dyn Store,
+    setup: &Observations,
     owner: &crate::hub::store::User,
     repository: &str,
     repository_id: i64,
@@ -386,6 +395,7 @@ pub(crate) fn read_person(
     };
     read_scoped(
         store,
+        setup,
         &principal,
         &WorkLifecycleReader::Person {
             owner,
@@ -398,6 +408,7 @@ pub(crate) fn read_person(
 
 fn read_scoped(
     store: &dyn Store,
+    setup: &Observations,
     principal: &Principal,
     reader: &WorkLifecycleReader<'_>,
     now: i64,
@@ -439,8 +450,19 @@ fn read_scoped(
     if requests.retention_gap {
         limits.insert("request_history_gap".to_owned());
     }
-    // This producer remains a separate issue slice, never inferred from Work checkpoint prose.
-    limits.insert("capacity_attention_not_integrated".to_owned());
+    // A recent capacity refusal here means some agent writes never landed. It is the
+    // operator's to fix (Health and admin pages), so it limits coverage and is no one's action.
+    for refusal in store.capacity_refusals(now)? {
+        let r = &refusal.repository;
+        if refusal.at > now - crate::hub::capacity::RECENT_SECONDS
+            && r.provider == principal.owner.identity.provider
+            && r.host == principal.owner.identity.host
+            && r.repository == principal.repository
+            && r.repository_id == principal.repository_id
+        {
+            limits.insert(format!("capacity_refused:{}", refusal.limit.as_str()));
+        }
+    }
 
     let mut selected: BTreeMap<String, Option<WorkItem>> = holders
         .work
@@ -562,6 +584,7 @@ fn read_scoped(
         checks::read(store, principal, &items, now)?;
     actions.extend(checks);
     limits.extend(check_limits);
+    actions.extend(setup_actions(store, setup, principal, &items, now)?);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -654,6 +677,51 @@ fn read_scoped(
     ))
     .expect("status serializes")]);
     Ok(result)
+}
+
+/// The viewer's own agent setup problems: always the viewer's (the Setup badge counts them),
+/// and needs-you only when the agent concerned leads unfinished Work.
+fn setup_actions(
+    store: &dyn Store,
+    setup: &Observations,
+    principal: &Principal,
+    items: &BTreeMap<String, WorkItem>,
+    now: i64,
+) -> Result<Vec<StatusAction>> {
+    let viewer = StatusRecipient {
+        kind: RecipientKind::Person,
+        owner: Some(principal.owner.id.clone()),
+        login: Some(principal.owner.login.clone()),
+        agent: None,
+    };
+    Ok(
+        crate::hub::setup_attention::problems(store, setup, principal, now)?
+            .into_iter()
+            .map(|problem| {
+                let work_ids = items
+                    .values()
+                    .filter(|i| problem.tokens.contains(&i.lead_token))
+                    .map(|i| i.id.clone())
+                    .collect::<Vec<_>>();
+                StatusAction {
+                    id: format!("setup:{}:{}", problem.reason.code(), problem.key),
+                    kind: "agent_setup".into(),
+                    needs_you: !work_ids.is_empty(),
+                    work_ids,
+                    recipients: vec![viewer.clone()],
+                    action: format!(
+                        "Your agent {} {}. {}",
+                        crate::hub::advice::sanitize(&problem.agent, 64),
+                        problem.reason.what(),
+                        problem.reason.next_action()
+                    ),
+                    updated_seq: 0,
+                    semantic_version: None,
+                    limits: vec![],
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Deterministic text used by agent-facing clients; generated prose is optional.
@@ -819,6 +887,27 @@ fn request_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reads without onboarding observations; setup tests pass their own.
+    fn read(store: &dyn Store, who: &Principal, now: i64) -> Result<ActionableStatus> {
+        super::read(store, &Observations::default(), who, now)
+    }
+    fn read_person(
+        store: &dyn Store,
+        owner: &crate::hub::store::User,
+        repository: &str,
+        repository_id: i64,
+        now: i64,
+    ) -> Result<ActionableStatus> {
+        super::read_person(
+            store,
+            &Observations::default(),
+            owner,
+            repository,
+            repository_id,
+            now,
+        )
+    }
     use crate::hub::store::{self, ForgeIdentity, agent_token_digest, mint_bound_agent_token};
     use crate::hub::work::{CheckpointKind, WorkCheckpoint, WorkStart};
     use crate::hub::work_lifecycle::{LEASE_SECONDS, Lease, RenewalCoverage};
@@ -856,6 +945,7 @@ mod tests {
             lease: held.then_some(Lease {
                 renewed_at: 100,
                 expires_at: 100 + LEASE_SECONDS,
+                grace_at: None,
             }),
             coverage: RenewalCoverage::ToolCalls,
             now: 100,
@@ -1152,7 +1242,7 @@ mod tests {
         assert!(!a.atomic_snapshot);
         assert!(
             !a.complete,
-            "unsupported producers cannot be presented as clear"
+            "missing provider and reconciliation coverage cannot be presented as clear"
         );
         assert!(!a.work[0].reconciliation.as_ref().unwrap().current);
         assert_eq!(
@@ -1349,7 +1439,18 @@ mod tests {
                     "success",
                     "2026-11-05T09:00:00Z"
                 ),
-                status("ci/unrelated", "failure", "2026-11-05T10:00:00Z")
+                status("ci/unrelated", "failure", "2026-11-05T10:00:00Z"),
+                // A named check's own context is required; a look-alike name is not.
+                status(
+                    "agentscm/local-validation/static",
+                    "failure",
+                    "2026-11-05T10:00:00Z"
+                ),
+                status(
+                    "agentscm/local-validation-foo",
+                    "failure",
+                    "2026-11-05T10:00:00Z"
+                )
             ]),
         );
         // Another person's failed Hub check counts for them, not the viewer.
@@ -1510,6 +1611,11 @@ mod tests {
                     vec![checked.id.clone()]
                 ),
                 (
+                    "failed_check",
+                    format!("check:{}:5:agentscm/local-validation/static", repo.id),
+                    vec![checked.id.clone()]
+                ),
+                (
                     "skill_gate",
                     format!(
                         "gate:{}:tests",
@@ -1596,6 +1702,224 @@ mod tests {
         );
     }
 
+    /// #292 from a real store: the viewer's own setup blockers and unverified edit hook, and a
+    /// person whose every agent token for the repository stopped working. Only an agent that
+    /// leads unfinished Work needs the person; other people's problems never show.
+    fn setup_contract(store: &dyn Store) {
+        use crate::hub::onboarding::{Agent, Blocker, Observations, SetupCall};
+        let now = crate::hub::store::unix_now();
+        let person = |user_id: i64, login: &str| {
+            store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap()
+        };
+        let token = |user: &crate::hub::store::User, name: &str, ttl: i64, read_only: bool| {
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, name, "acme/widgets", 101, ttl, read_only)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let start = |who: &Principal, title: &str| {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": title, "title": title, "session": format!("{title}-session"),
+                "scope": [format!("src/{title}.rs")]
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap().item
+        };
+        let viewer_user = person(501, "viewer");
+        let viewer = token(&viewer_user, "viewer-laptop", 3600, false);
+        let work = start(&viewer, "viewer-work");
+        let observations = Observations::default();
+        let setup = |session: &str, blocker: Option<Blocker>| {
+            observations.restart(
+                &viewer,
+                Some("root-a"),
+                "claude",
+                Some(session),
+                observations.epoch(),
+            );
+            observations
+                .verify_mcp(
+                    &viewer,
+                    Some("root-a"),
+                    SetupCall {
+                        agent: Agent::Claude,
+                        session: session.into(),
+                        blocker,
+                    },
+                    observations.epoch(),
+                )
+                .unwrap();
+        };
+        setup("blocked-session", Some(Blocker::Trust));
+        setup("verifying-session", None);
+        // A session that only started is the normal state, not a setup problem.
+        observations.restart(
+            &viewer,
+            Some("root-a"),
+            "claude",
+            Some("quiet-session"),
+            observations.epoch(),
+        );
+        let status = super::read(store, &observations, &viewer, now).unwrap();
+        let mut setup_rows = status
+            .actions
+            .iter()
+            .filter(|a| a.kind == "agent_setup")
+            .map(|a| {
+                (
+                    a.id.split(':').nth(1).unwrap().to_owned(),
+                    a.needs_you,
+                    a.work_ids.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        setup_rows.sort();
+        assert_eq!(
+            setup_rows,
+            [
+                (
+                    "agent_trust_required".to_owned(),
+                    true,
+                    vec![work.id.clone()]
+                ),
+                (
+                    "edit_hook_unverified".to_owned(),
+                    true,
+                    vec![work.id.clone()]
+                ),
+            ]
+        );
+        assert!(
+            status
+                .actions
+                .iter()
+                .filter(|a| a.kind == "agent_setup")
+                .all(|a| a.recipients[0].owner.as_deref() == Some(viewer_user.id.as_str()))
+        );
+
+        // Another person whose only agent token expired, while their Work still names it.
+        let other_user = person(502, "other");
+        let short = token(&other_user, "other-laptop", 60, false);
+        let other_work = start(&short, "other-work");
+        // A read-only web or menu-bar token never stands in for an agent token.
+        token(&other_user, "agentscm-tray-attention", 3600, true);
+        let later = now + 120;
+        let theirs = super::read_person(
+            store,
+            &observations,
+            &other_user,
+            "acme/widgets",
+            101,
+            later,
+        )
+        .unwrap();
+        let token_rows = theirs
+            .actions
+            .iter()
+            .filter(|a| a.kind == "agent_setup")
+            .map(|a| (a.id.clone(), a.needs_you, a.work_ids.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            token_rows,
+            [(
+                "setup:agent_token_expired:repository".to_owned(),
+                true,
+                vec![other_work.id.clone()]
+            )]
+        );
+        // The viewer sees neither the other person's token problem nor counts it.
+        assert!(
+            !super::read(store, &observations, &viewer, now)
+                .unwrap()
+                .actions
+                .iter()
+                .any(|a| a.id.contains("token"))
+        );
+        // A valid token the forge never gave an id to still counts for the repository.
+        let legacy_user = person(503, "legacy");
+        token(&legacy_user, "legacy-laptop", 60, false);
+        crate::hub::store::mint_agent_token(
+            store,
+            &legacy_user.id,
+            "legacy-client",
+            "acme/widgets",
+            3600,
+        )
+        .unwrap();
+        assert!(
+            !super::read_person(
+                store,
+                &observations,
+                &legacy_user,
+                "acme/widgets",
+                101,
+                later
+            )
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| a.kind == "agent_setup")
+        );
+        // A revoked newest token says so; a long-expired one is history.
+        store.revoke_agent_token(&short.token_id).unwrap();
+        assert!(
+            super::read_person(
+                store,
+                &observations,
+                &other_user,
+                "acme/widgets",
+                101,
+                later
+            )
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| a.id == "setup:agent_token_revoked:repository")
+        );
+        assert!(
+            !super::read_person(
+                store,
+                &observations,
+                &other_user,
+                "acme/widgets",
+                101,
+                later + crate::hub::setup_attention::RECENT_EXPIRY_SECONDS,
+            )
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| a.kind == "agent_setup")
+        );
+    }
+
+    #[test]
+    fn sqlite_setup_problems_reach_only_their_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        setup_contract(&*store);
+    }
+
+    #[test]
+    fn setup_problems_reach_only_their_owner_on_postgres() {
+        on_postgres(setup_contract);
+    }
+
     #[test]
     fn sqlite_failed_checks_and_stopped_gates_reach_their_owner() {
         let dir = tempfile::tempdir().unwrap();
@@ -1607,6 +1931,211 @@ mod tests {
         checks_contract(&*store);
     }
 
+    /// What every surface counts, without ids, digests or read times.
+    fn attention_signature(status: &ActionableStatus) -> Vec<String> {
+        let login = |r: &StatusRecipient| r.login.clone().unwrap_or_default();
+        let mut rows = status
+            .work
+            .iter()
+            .map(|w| {
+                format!(
+                    "work {} {:?} {:?} {} needs_you={}",
+                    w.title,
+                    w.state,
+                    w.recipient.kind,
+                    login(&w.recipient),
+                    w.needs_you
+                )
+            })
+            .chain(status.actions.iter().map(|a| {
+                let mut logins = a.recipients.iter().map(login).collect::<Vec<_>>();
+                logins.sort();
+                format!("{} {} needs_you={}", a.kind, logins.join(","), a.needs_you)
+            }))
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    /// The #290 cases from a real store: the viewer's paused Work with a stale claim, a request
+    /// to it, a request between two other people, and file and pull request crossings with and
+    /// without the viewer. The shared fixture the companion and Hub tests count must match.
+    fn needs_you_contract(store: &dyn Store) {
+        use crate::hub::connection::NewConnection;
+        use crate::hub::intent::NewIntent;
+        let now = crate::hub::store::unix_now();
+        let token = |user_id: i64, login: &str| {
+            let user = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap();
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, login, "acme/widgets", 101, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let viewer = token(301, "viewer");
+        let other = token(302, "other");
+        let third = token(303, "third");
+        let start = |who: &Principal, title: &str, path: &str| {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": format!("{title}-{}", who.owner.login),
+                "title": title, "session": format!("{}-session", who.owner.login), "scope": [path]
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap()
+        };
+        let paused = start(&viewer, "Paused own work", "src/paused.rs").item;
+        store
+            .work_checkpoint(
+                &viewer.token_id,
+                &WorkCheckpoint {
+                    work_id: paused.id.clone(),
+                    operation_id: "synthetic-pause".into(),
+                    generation: paused.generation,
+                    session: paused.lead_session.clone(),
+                    expected_updated_seq: Some(paused.updated_seq),
+                    kind: CheckpointKind::Pause,
+                    summary: "Synthetic pause".into(),
+                    next_action: None,
+                    scope: None,
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: vec![],
+                    depends_on: vec![],
+                    related_work: vec![],
+                },
+                now,
+            )
+            .unwrap();
+        let to_viewer = start(&other, "Other asks viewer", "src/paused.rs");
+        assert!(to_viewer.coordination_request.is_some());
+        start(&third, "Third's work", "src/third.rs");
+        let between_others = start(&other, "Other asks third", "src/third.rs");
+        assert!(between_others.coordination_request.is_some());
+        let intent = |who: &Principal, id: char, path: &str| {
+            store
+                .announce_intent(
+                    &who.token_id,
+                    &NewIntent {
+                        id: format!("int_{}", id.to_string().repeat(32)),
+                        task: "Synthetic edit".into(),
+                        branch: None,
+                        base: None,
+                        machine: None,
+                        paths: vec![path.into()],
+                        ttl_seconds: 3600,
+                    },
+                    now,
+                )
+                .unwrap();
+        };
+        intent(&viewer, 'a', "src/shared.rs");
+        intent(&other, 'b', "src/shared.rs");
+        intent(&other, 'c', "src/others.rs");
+        intent(&third, 'd', "src/others.rs");
+        let connection = store
+            .insert_connection(
+                &NewConnection {
+                    id: format!("con_{}", "e".repeat(32)),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("viewer".into()),
+                },
+                &viewer.owner.id,
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        for (number, file) in [(7, "src/shared.rs"), (8, "src/others.rs")] {
+            let pull = json!({"number":number,"state":"open","head_sha":"synthetic-head","files":[file],"files_truncated":false});
+            store
+                .observe(
+                    &repo.id,
+                    "pull_request",
+                    &number.to_string(),
+                    &pull.to_string(),
+                    now,
+                )
+                .unwrap();
+        }
+        // Every lead's claim is now stale; held reservations have not yet lapsed.
+        let later = now + crate::hub::work::CLAIM_STALE_SECONDS + 60;
+        let status = read(store, &viewer, later).unwrap();
+        let fixture: ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/needs-you-surfaces.json")).unwrap();
+        assert_eq!(attention_signature(&status), attention_signature(&fixture));
+        assert_eq!(status.counts.needs_you, 4);
+        assert_eq!(status.counts.needs_you, fixture.counts.needs_you);
+        let mut personal = status
+            .work
+            .iter()
+            .filter(|w| w.needs_you)
+            .map(|w| w.work_id.clone())
+            .chain(
+                status
+                    .actions
+                    .iter()
+                    .filter(|a| a.needs_you)
+                    .map(|a| a.id.clone()),
+            )
+            .collect::<Vec<_>>();
+        personal.sort();
+        let mut expected = vec![
+            paused.id.clone(),
+            format!(
+                "request:{}:{}",
+                to_viewer.coordination_request.unwrap().id,
+                paused.id
+            ),
+            "file:src/shared.rs".into(),
+            format!("pr:{}:7", repo.id),
+        ];
+        expected.sort();
+        assert_eq!(personal, expected);
+        assert_eq!(
+            read(store, &third, later).unwrap().counts.needs_you,
+            4,
+            "the third person's own Work, request, file and pull request count for them instead"
+        );
+    }
+
+    #[test]
+    fn sqlite_needs_you_counts_match_the_shared_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        needs_you_contract(&*store);
+    }
+
+    #[test]
+    fn needs_you_counts_match_the_shared_fixture_on_postgres() {
+        on_postgres(needs_you_contract);
+    }
     #[test]
     fn sqlite_status_reader_is_scoped_deterministic_and_reports_limits() {
         let dir = tempfile::tempdir().unwrap();

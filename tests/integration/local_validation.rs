@@ -9,6 +9,7 @@ use agentscm::policy::issuers::{
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
+use sha2::Digest as _;
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
 const TREE: &str = "2222222222222222222222222222222222222222";
@@ -65,10 +66,12 @@ fn recipe() -> ValidationRecipe {
             id: "test".into(),
             argv: vec!["cargo".into(), "test".into()],
             timeout_secs: 60,
+            test_selection: None,
             paths: None,
         }],
         dependency_files: None,
         toolchain_probes: None,
+        constituents: None,
     }
 }
 
@@ -101,6 +104,7 @@ fn record() -> ValidationRecord {
             incomplete: false,
         }],
         not_required: vec![],
+        selections: vec![],
         services: Services {
             postgres: true,
             s3: true,
@@ -122,6 +126,7 @@ fn policy() -> ValidationPolicy {
         max_age_seconds: 3600,
         epoch: 3,
         exempt_paths: None,
+        check_id: None,
     }
 }
 
@@ -138,6 +143,7 @@ struct Case {
     observed: [String; 5],
     /// Ids the changed paths require; every recipe command when unset.
     required: Option<Vec<String>>,
+    selections: Vec<CommandSelection>,
     clock: EvaluationClock,
     tamper_payload: Option<Tamper>,
     tamper_record: bool,
@@ -155,6 +161,7 @@ impl Case {
             assess_policy: None,
             observed: ["repo-1", COMMIT, TREE, "refs/heads/main", BASE].map(String::from),
             required: None,
+            selections: vec![],
             clock: EvaluationClock::Known { unix_ms: NOW },
             tamper_payload: None,
             tamper_record: false,
@@ -223,6 +230,7 @@ impl Case {
                 base_ref,
                 merge_base,
                 required: &required,
+                selections: &self.selections,
             },
             self.clock,
         );
@@ -713,6 +721,7 @@ fn select_all(bodies: &[&str], clock: EvaluationClock) -> Verdict {
             base_ref: "refs/heads/main",
             merge_base: BASE,
             required: &["test".to_owned()],
+            selections: &[],
         },
         clock,
     )
@@ -780,6 +789,7 @@ fn skipped_commands_are_never_a_pass() {
         id: "lint".into(),
         argv: vec!["cargo".into(), "clippy".into()],
         timeout_secs: 60,
+        test_selection: None,
         paths: None,
     });
     c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
@@ -841,8 +851,9 @@ fn nothing_applicable_is_pending_never_success() {
     expect(
         verdict.clone(),
         VerdictState::Pending,
-        "no attestation for this head",
+        "attestation is for a different head",
     );
+    assert_eq!(verdict.outcome, Outcome::StaleHead);
     assert!(!verdict.applies_to_head && verdict.detail.contains("stale attestation"));
 }
 
@@ -981,7 +992,7 @@ fn repository_policy_and_recipe_keep_their_canonical_bytes() {
     let policy = ValidationPolicy::from_slice(&policy_bytes).unwrap();
     assert_eq!(
         recipe.sha256().unwrap(),
-        "15bb5b011dd1abf9de64a277271d3f452589a0bf51bad556e7e1e6c7499eb83c"
+        "e0d6b6b2dfd0350c7a0b1a745d4901248a9a8441a09f3cc9335f81c4369657cc"
     );
     assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
     assert_eq!(
@@ -1151,12 +1162,179 @@ mod scoped {
         assert!(!exempt(d.path(), &b, &h, &["docs/**"]));
     }
 
+    #[test]
+    fn combined_git_batch_detects_a_semantic_failure_between_green_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("left.rs"), "pub const VALUE: u32 = 1;\n").unwrap();
+        std::fs::write(p.join("right.rs"), "pub const VALUE: u32 = 1;\n").unwrap();
+        std::fs::write(
+            p.join("check.rs"),
+            "mod left; mod right; #[test] fn capacity() { assert!(left::VALUE + right::VALUE <= 3); }\n",
+        ).unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        let base = git(p, &["rev-parse", "HEAD"]);
+        let output = tempfile::tempdir().unwrap();
+        let check = || {
+            let binary = output.path().join("capacity");
+            let compiled = Command::new("rustc")
+                .current_dir(p)
+                .args(["--test", "check.rs", "-o"])
+                .arg(&binary)
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            Command::new(binary).output().unwrap()
+        };
+        git(p, &["checkout", "-qb", "left"]);
+        std::fs::write(p.join("left.rs"), "pub const VALUE: u32 = 2;\n").unwrap();
+        git(p, &["commit", "-qam", "left"]);
+        assert!(check().status.success());
+        git(p, &["checkout", "-qb", "right", &base]);
+        std::fs::write(p.join("right.rs"), "pub const VALUE: u32 = 2;\n").unwrap();
+        git(p, &["commit", "-qam", "right"]);
+        assert!(check().status.success());
+        git(p, &["merge", "--no-ff", "-qm", "batch", "left"]);
+        let combined = check();
+        assert!(!combined.status.success());
+        assert!(String::from_utf8_lossy(&combined.stdout).contains("capacity ... FAILED"));
+        assert_eq!(
+            git(p, &["rev-list", "--parents", "-n", "1", "HEAD"])
+                .split_whitespace()
+                .count(),
+            3
+        );
+    }
+
+    fn selection_recipe() -> ValidationRecipe {
+        let mut r = recipe();
+        r.commands[0].argv = ["cargo", "nextest", "run", "--locked"]
+            .map(String::from)
+            .to_vec();
+        r.commands[0].test_selection = Some(TestSelection {
+            rules: vec![
+                TestSelectionRule {
+                    path: "src/a.rs".into(),
+                    filter: "test(/^a::/)".into(),
+                },
+                TestSelectionRule {
+                    path: "README.md".into(),
+                    filter: "test(/^b::/)".into(),
+                },
+            ],
+        });
+        r
+    }
+
+    #[test]
+    fn selected_tests_are_deterministic_and_fail_closed() {
+        use agentscm::local_validation::run::command_selections;
+        let r = selection_recipe();
+        let (d, b, h) = repo(|p| {
+            write(p, "src/a.rs");
+            write(p, "README.md");
+        });
+        let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
+        assert_eq!(selected[0].reason, SelectionReason::Selected);
+        assert_eq!(selected[0].paths, ["README.md", "src/a.rs"]);
+        assert_eq!(
+            selected[0].argv.last().unwrap(),
+            "(test(/^a::/)) | (test(/^b::/))"
+        );
+        for (path, reason) in [
+            ("unknown", SelectionReason::NonModifiedPath),
+            (
+                ".github/local-validation/recipe.json",
+                SelectionReason::TrustInput,
+            ),
+        ] {
+            let (d, b, h) = repo(|p| write(p, path));
+            let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
+            assert_eq!(selected[0].reason, reason);
+            assert_eq!(selected[0].argv, r.commands[0].argv);
+        }
+        let (d, b, h) = repo(|p| {
+            std::fs::remove_file(p.join("src/a.rs")).unwrap();
+        });
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::NonModifiedPath
+        );
+        let (d, b, h) = repo(|p| {
+            std::fs::rename(p.join("src/a.rs"), p.join("new.rs")).unwrap();
+        });
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::NonModifiedPath
+        );
+    }
+
+    #[test]
+    fn selected_tests_handle_unmapped_shared_empty_and_duplicate_filters() {
+        use agentscm::local_validation::run::command_selections;
+        let mut r = selection_recipe();
+        r.commands[0]
+            .test_selection
+            .as_mut()
+            .unwrap()
+            .rules
+            .remove(1);
+        let (d, b, h) = repo(|p| write(p, "README.md"));
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::UnmappedPath
+        );
+        let (d, b, h) = repo(|_| {});
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::EmptyChange
+        );
+        r.commands[0]
+            .test_selection
+            .as_mut()
+            .unwrap()
+            .rules
+            .push(TestSelectionRule {
+                path: "Cargo.toml".into(),
+                filter: "all()".into(),
+            });
+        let (d, b, h) = repo(|p| write(p, "Cargo.toml"));
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::SharedInput
+        );
+        r.commands[0]
+            .test_selection
+            .as_mut()
+            .unwrap()
+            .rules
+            .push(TestSelectionRule {
+                path: "README.md".into(),
+                filter: "test(/^a::/)".into(),
+            });
+        let (d, b, h) = repo(|p| {
+            write(p, "README.md");
+            write(p, "src/a.rs");
+        });
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].filters,
+            ["test(/^a::/)"]
+        );
+    }
+
     fn scoped_recipe() -> ValidationRecipe {
         let mut r = recipe();
         let command = |id: &str, paths: Option<&[&str]>| RecipeCommand {
             id: id.into(),
             argv: vec!["true".into()],
             timeout_secs: 1,
+            test_selection: None,
             paths: paths.map(|p| p.iter().map(|s| (*s).to_owned()).collect()),
         };
         r.commands = vec![
@@ -1222,7 +1400,14 @@ mod scoped {
                 &["install.sh"],
                 &[RUST, &["shellcheck", "npm-installer"]].concat(),
             ),
-            (&["docs/example.md"], &[RUST, DOCS].concat()),
+            (&["docs/example.md"], DOCS),
+            (&["docs/advanced/nested.md"], DOCS),
+            (&["docs-site/astro.config.mjs"], DOCS),
+            (&["docs/assets/agentscm-icon.png"], &[RUST, DOCS].concat()),
+            (&["docs/example.md", "src/a.rs"], &[RUST, DOCS].concat()),
+            (&["README.md", "AGENTS.md", ".agents/commands/pr.md"], &[]),
+            (&[".agents/bound-target.sh"], RUST),
+            (&[".github/pull_request_template.md"], &["workflow-lint"]),
             (
                 &[".github/workflows/zizmor.yml"],
                 &[RUST, &["workflow-lint"]].concat(),
@@ -1303,6 +1488,7 @@ fn scoped(required: &[&str], not_required: &[&str]) -> Case {
         id: "lint".into(),
         argv: vec!["cargo".into(), "clippy".into()],
         timeout_secs: 60,
+        test_selection: None,
         paths: Some(vec!["src".into()]),
     });
     c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
@@ -1435,4 +1621,689 @@ fn incomplete_capture_cannot_validate_a_successful_exit() {
     let mut c = Case::new();
     c.record.results[0].incomplete = true;
     fails(c, "capture incomplete");
+}
+
+// ---- independent checks (check_id) and constituents ----
+
+fn check(id: &str) -> Case {
+    let mut c = Case::new();
+    c.policy.check_id = Some(id.into());
+    c
+}
+
+fn select_with(
+    bodies: &[&str],
+    recipe: &ValidationRecipe,
+    registry: &IssuerRegistrySnapshot,
+    policy: &ValidationPolicy,
+    clock: EvaluationClock,
+) -> Verdict {
+    select(
+        bodies,
+        recipe,
+        registry,
+        policy,
+        Observed {
+            repository: "repo-1",
+            commit: COMMIT,
+            tree: TREE,
+            base_ref: "refs/heads/main",
+            merge_base: BASE,
+            required: &["test".to_owned()],
+            selections: &[],
+        },
+        clock,
+    )
+}
+
+fn known_for(bodies: &[&str], policy: &ValidationPolicy) -> Verdict {
+    select_with(
+        bodies,
+        &recipe(),
+        &registry(),
+        policy,
+        EvaluationClock::Known { unix_ms: NOW },
+    )
+}
+
+fn policy_for(id: Option<&str>) -> ValidationPolicy {
+    ValidationPolicy {
+        check_id: id.map(String::from),
+        ..policy()
+    }
+}
+
+fn envelope_json(body: &str) -> serde_json::Value {
+    serde_json::from_slice(&comment::parse(body).unwrap().0).unwrap()
+}
+
+#[test]
+fn policy_and_recipe_without_new_fields_keep_canonical_bytes_and_digests() {
+    let legacy_policy = format!(
+        r#"{{"repository":"repo-1","recipe_sha256":"{}","required_services":{{"postgres":true,"s3":true}},"max_age_seconds":3600,"epoch":3}}"#,
+        recipe_hash()
+    );
+    assert_eq!(serde_json::to_string(&policy()).unwrap(), legacy_policy);
+    assert_eq!(
+        ValidationPolicy::from_slice(legacy_policy.as_bytes()).unwrap(),
+        policy()
+    );
+    assert_eq!(
+        policy().digest().unwrap(),
+        format!("{:x}", sha2::Sha256::digest(legacy_policy.as_bytes()))
+    );
+    assert_eq!(policy().requirement_id(), REQUIREMENT_ID);
+    assert_eq!(policy().status_context(), "agentscm/local-validation");
+
+    let named = policy_for(Some("static"));
+    assert_ne!(named.digest().unwrap(), policy().digest().unwrap());
+    assert_eq!(named.requirement_id(), "local-validation/static");
+    assert_eq!(named.status_context(), "agentscm/local-validation/static");
+    assert_eq!(
+        named.constituent_status_context("lint"),
+        "agentscm/local-validation/static/lint"
+    );
+    let mut with_groups = recipe();
+    with_groups.constituents = Some(vec![Constituent {
+        id: "unit".into(),
+        name: "Unit".into(),
+        commands: vec!["test".into()],
+    }]);
+    assert_ne!(with_groups.sha256().unwrap(), recipe_hash());
+}
+
+#[test]
+fn legacy_shaped_evidence_still_verifies() {
+    let body = pass().body();
+    let envelope = envelope_json(&body);
+    assert_eq!(envelope["payload"]["requirement_id"], "local-validation");
+    expect(known(&[&body]), VerdictState::Success, "validated");
+    assert_eq!(known(&[&body]).outcome, Outcome::Passed);
+}
+
+#[test]
+fn check_ids_are_validated() {
+    for id in ["a", "unit-tests", "0x", &"a".repeat(40)] {
+        policy_for(Some(id)).validate().unwrap();
+    }
+    for id in ["", "Upper", "-x", "a_b", "a/b", "a b", &"a".repeat(41)] {
+        assert!(policy_for(Some(id)).validate().is_err(), "{id:?}");
+    }
+}
+
+#[test]
+fn two_independent_checks_never_satisfy_or_influence_each_other() {
+    let (a, b) = (policy_for(Some("alpha")), policy_for(Some("beta")));
+    let a_pass = check("alpha").body();
+    let b_pass = check("beta").body();
+    let mut a_fail = check("alpha");
+    a_fail.record.results[0].exit_code = Some(1);
+    let a_fail = a_fail.body();
+    let a_old = old_head(check("alpha")).body();
+    assert_eq!(
+        envelope_json(&a_pass)["payload"]["requirement_id"],
+        "local-validation/alpha"
+    );
+
+    // Direct assessment: another check's envelope is Unverified and never applies.
+    let mut c = check("alpha");
+    c.assess_policy = Some(b.clone());
+    let verdict = c.run();
+    assert_eq!(
+        (verdict.state, verdict.outcome, verdict.applies_to_head),
+        (VerdictState::Failure, Outcome::Unverified, false)
+    );
+
+    let nothing = known_for(&[], &b);
+    assert_eq!(nothing.outcome, Outcome::Missing);
+    for foreign in [&a_pass, &a_fail, &a_old] {
+        // B sees A's evidence exactly as if it were absent, including reason and detail.
+        assert_eq!(known_for(&[foreign], &b), nothing);
+        // A neighbouring failure or stale head never overrides B's own pass.
+        expect(
+            known_for(&[&b_pass, foreign], &b),
+            VerdictState::Success,
+            "validated",
+        );
+        expect(
+            known_for(&[foreign, &b_pass], &b),
+            VerdictState::Success,
+            "validated",
+        );
+    }
+    // And the other direction.
+    let nothing_a = known_for(&[], &a);
+    for foreign in [&b_pass, &check("beta").body()] {
+        assert_eq!(known_for(&[foreign], &a), nothing_a);
+    }
+    expect(
+        known_for(&[&a_pass, &b_pass], &a),
+        VerdictState::Success,
+        "validated",
+    );
+    expect(
+        known_for(&[&b_pass, &a_fail], &a),
+        VerdictState::Failure,
+        "command failed",
+    );
+    // Legacy and named checks are also independent.
+    let legacy = pass().body();
+    assert_eq!(known_for(&[&legacy], &a), nothing_a);
+    assert_eq!(
+        known_for(&[&a_pass], &policy_for(None)),
+        known_for(&[], &policy_for(None))
+    );
+}
+
+#[test]
+fn the_same_recipe_under_two_check_ids_yields_distinct_requirements() {
+    let (a, b) = (check("alpha"), check("beta"));
+    assert_eq!(a.recipe.sha256().unwrap(), b.recipe.sha256().unwrap());
+    assert_ne!(
+        a.policy.digest().unwrap(),
+        b.policy.digest().unwrap(),
+        "policy digest differs by check"
+    );
+    let (a_body, b_body) = (a.body(), b.body());
+    assert_ne!(
+        envelope_json(&a_body)["payload"]["requirement_id"],
+        envelope_json(&b_body)["payload"]["requirement_id"]
+    );
+    let (pa, pb) = (policy_for(Some("alpha")), policy_for(Some("beta")));
+    expect(
+        known_for(&[&a_body], &pa),
+        VerdictState::Success,
+        "validated",
+    );
+    expect(
+        known_for(&[&b_body], &pb),
+        VerdictState::Success,
+        "validated",
+    );
+    assert_eq!(known_for(&[&a_body], &pb).state, VerdictState::Pending);
+    assert_eq!(known_for(&[&b_body], &pa).state, VerdictState::Pending);
+}
+
+#[test]
+fn enrolled_key_forgery_fails_closed() {
+    // A signed requirement for another or unknown id never satisfies this check.
+    for requirement in ["local-validation/other", "local-validation", "unknown"] {
+        let mut c = check("alpha");
+        let requirement = requirement.to_owned();
+        c.tamper_payload = Some(Box::new(move |p| p.requirement_id = requirement));
+        let verdict = c.run();
+        assert_eq!(
+            (verdict.state, verdict.outcome, verdict.applies_to_head),
+            (VerdictState::Failure, Outcome::Unverified, false),
+            "{verdict:?}"
+        );
+    }
+    let coverage_fails = |tamper: Tamper, c: Case| {
+        let mut c = c;
+        c.tamper_payload = Some(tamper);
+        let verdict = c.run();
+        assert_eq!(
+            (verdict.state, verdict.reason, verdict.applies_to_head),
+            (VerdictState::Failure, "coverage mismatch", true),
+            "{verdict:?}"
+        );
+        assert_eq!(verdict.outcome, Outcome::Unverified);
+    };
+    coverage_fails(
+        Box::new(|p| p.coverage.scope = vec!["other".into()]),
+        check("alpha"),
+    );
+    coverage_fails(Box::new(|p| p.coverage.scope.clear()), check("alpha"));
+    coverage_fails(Box::new(|p| p.coverage.observed_count = 0), check("alpha"));
+    coverage_fails(Box::new(|p| p.coverage.expected_count = 2), check("alpha"));
+    coverage_fails(
+        Box::new(|p| p.coverage.omissions.retain(|o| o != "not required: lint")),
+        scoped(&["test"], &["lint"]),
+    );
+    // Scope is compared as a set, so the signed sort order cannot matter.
+    let mut c = scoped(&["test", "lint"], &[]);
+    let mut lint = c.record.results[0].clone();
+    lint.id = "lint".into();
+    lint.argv = vec!["cargo".into(), "clippy".into()];
+    c.record.results.push(lint);
+    c.tamper_payload = Some(Box::new(|p| p.coverage.scope.reverse()));
+    expect(c.run(), VerdictState::Success, "validated");
+}
+
+#[test]
+fn lifecycle_causes_are_distinct_non_success_and_chosen_only_by_authenticated_evidence() {
+    let p = policy_for(Some("alpha"));
+    let one = |c: Case, registry: &IssuerRegistrySnapshot, clock: EvaluationClock| {
+        let body = c.body();
+        select_with(&[&body], &recipe(), registry, &p, clock)
+    };
+    let known_now = EvaluationClock::Known { unix_ms: NOW };
+    let mut seen = std::collections::BTreeMap::new();
+    let mut expect_cause = |verdict: Verdict, outcome: Outcome| {
+        assert_eq!(
+            (verdict.state, verdict.outcome, verdict.applies_to_head),
+            (VerdictState::Pending, outcome, false),
+            "{verdict:?}"
+        );
+        assert_ne!(verdict.reason, "no attestation for this head");
+        seen.insert(outcome.as_str(), verdict.reason);
+    };
+
+    expect_cause(
+        one(old_head(check("alpha")), &registry(), known_now),
+        Outcome::StaleHead,
+    );
+
+    let mut policy_changed = check("alpha");
+    policy_changed.policy.epoch = 2;
+    expect_cause(
+        one(policy_changed, &registry(), known_now),
+        Outcome::StalePolicy,
+    );
+
+    // Signed longer than the clock allows.
+    expect_cause(
+        one(
+            check("alpha"),
+            &registry(),
+            EvaluationClock::Known {
+                unix_ms: ISSUED + 90_000_000,
+            },
+        ),
+        Outcome::Expired,
+    );
+    expect_cause(
+        one(
+            check("alpha"),
+            &registry(),
+            EvaluationClock::Known {
+                unix_ms: ISSUED + 3_601_000,
+            },
+        ),
+        Outcome::Expired,
+    );
+
+    let mut revoked = registry();
+    revoked.issuers[0].keys[0].revoked_at_ms = Some(ISSUED + 1);
+    let mut c = check("alpha");
+    c.registry = revoked.clone();
+    expect_cause(one(c, &revoked, known_now), Outcome::Revoked);
+
+    // The signing key's own validity ended: re-attesting with it cannot help.
+    let mut key_expired = registry();
+    key_expired.issuers[0].keys[0].not_after_ms = ISSUED + 1;
+    let key_expired_verdict = one(check("alpha"), &key_expired, known_now);
+    assert_eq!(
+        key_expired_verdict.reason,
+        "attestation signing key expired"
+    );
+    expect_cause(key_expired_verdict, Outcome::KeyExpired);
+    assert_eq!(Outcome::KeyExpired.as_str(), "key_expired");
+
+    // A real revocation edits the registry after signing, so the registry digest changed too.
+    // The revocation is still the cause reported; a change that revokes nothing stays stale.
+    let signed_before_revocation = one(check("alpha"), &revoked, known_now);
+    assert_eq!(signed_before_revocation.outcome, Outcome::Revoked);
+    assert_eq!(signed_before_revocation.state, VerdictState::Pending);
+    assert_eq!(
+        signed_before_revocation.reason,
+        "attestation signing key revoked"
+    );
+
+    let mut changed = registry();
+    changed.epoch = 2;
+    expect_cause(
+        one(check("alpha"), &changed, known_now),
+        Outcome::RegistryStale,
+    );
+
+    let unique: std::collections::HashSet<_> = seen.iter().collect();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "reasons must be distinct: {seen:?}"
+    );
+
+    // An unauthenticated comment cannot choose the reason, even when newer.
+    let stale = old_head(check("alpha")).body();
+    let mut forged = old_head(check("alpha"));
+    forged.issued_at_ms = ISSUED + 50;
+    forged.tamper_envelope = true;
+    let forged = forged.body();
+    let mut other_key = old_head(check("alpha"));
+    other_key.registry.issuers[0].keys.clear();
+    let mut revoked_key_body = check("alpha");
+    revoked_key_body.registry = revoked;
+    revoked_key_body.issued_at_ms = ISSUED + 60;
+    let foreign_expired = at(old_head(check("beta")), 70).body();
+    let verdict = known_for(
+        &[&stale, &forged, &other_key.body(), &foreign_expired, "junk"],
+        &p,
+    );
+    assert_eq!(verdict.outcome, Outcome::StaleHead, "{verdict:?}");
+    // Nothing authenticated: Missing, never a lifecycle reason.
+    let verdict = known_for(&[&forged, &foreign_expired, "junk"], &p);
+    assert_eq!(verdict.outcome, Outcome::Missing);
+    assert_eq!(verdict.reason, "no attestation for this head");
+    // A later applicable verdict still wins over any lifecycle cause.
+    let pass = check("alpha").body();
+    expect(
+        known_for(&[&stale, &pass], &p),
+        VerdictState::Success,
+        "validated",
+    );
+}
+
+fn cmd(id: &str, paths: Option<&[&str]>) -> RecipeCommand {
+    RecipeCommand {
+        id: id.into(),
+        argv: vec!["run".into(), id.into()],
+        timeout_secs: 60,
+        test_selection: None,
+        paths: paths.map(|p| p.iter().map(|s| (*s).to_owned()).collect()),
+    }
+}
+
+fn ok_result(id: &str) -> CommandResult {
+    CommandResult {
+        id: id.into(),
+        argv: vec!["run".into(), id.into()],
+        ..record().results[0].clone()
+    }
+}
+
+fn group(id: &str, name: &str, commands: &[&str]) -> Constituent {
+    Constituent {
+        id: id.into(),
+        name: name.into(),
+        commands: commands.iter().map(|c| (*c).to_owned()).collect(),
+    }
+}
+
+/// setup (in no constituent), unit, lint and a path-scoped docs command.
+fn grouped() -> Case {
+    let mut c = check("grouped");
+    c.recipe.commands = vec![
+        cmd("setup", None),
+        cmd("unit", None),
+        cmd("lint", None),
+        cmd("docs", Some(&["docs"])),
+    ];
+    c.recipe.constituents = Some(vec![
+        group("unit-tests", "Unit tests", &["unit"]),
+        group("static", "Static", &["lint"]),
+        group("documentation", "Documentation", &["docs"]),
+    ]);
+    c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
+    c.record.recipe_sha256 = c.policy.recipe_sha256.clone();
+    c.record.results = ["setup", "unit", "lint", "docs"].map(ok_result).to_vec();
+    c
+}
+
+fn outcomes(verdict: &Verdict) -> Vec<(&str, Outcome, VerdictState)> {
+    verdict
+        .constituents
+        .iter()
+        .map(|c| (c.id.as_str(), c.outcome, c.state))
+        .collect()
+}
+
+#[test]
+fn grouped_recipe_all_pass() {
+    let verdict = grouped().run();
+    expect(verdict.clone(), VerdictState::Success, "validated");
+    assert_eq!(verdict.constituents[0].name, "Unit tests");
+    assert_eq!(
+        outcomes(&verdict),
+        [
+            ("unit-tests", Outcome::Passed, VerdictState::Success),
+            ("static", Outcome::Passed, VerdictState::Success),
+            ("documentation", Outcome::Passed, VerdictState::Success),
+        ]
+    );
+    // Without constituents the verdict carries none.
+    assert!(check("alpha").run().constituents.is_empty());
+}
+
+#[test]
+fn grouped_failure_at_each_position_marks_earlier_passed_and_later_did_not_run() {
+    let expected = |k: usize| -> Vec<(&'static str, Outcome, VerdictState)> {
+        // Groups: unit-tests at result 1, static at 2, documentation at 3.
+        ["unit-tests", "static", "documentation"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let position = i + 1;
+                match position.cmp(&k) {
+                    std::cmp::Ordering::Less => (*id, Outcome::Passed, VerdictState::Success),
+                    std::cmp::Ordering::Equal => (*id, Outcome::Failed, VerdictState::Failure),
+                    std::cmp::Ordering::Greater => (*id, Outcome::DidNotRun, VerdictState::Pending),
+                }
+            })
+            .collect()
+    };
+    for k in 1..=3 {
+        let mut c = grouped();
+        c.record.results.truncate(k + 1);
+        c.record.results[k].exit_code = Some(1);
+        let verdict = c.run();
+        expect(verdict.clone(), VerdictState::Failure, "command failed");
+        assert_eq!(outcomes(&verdict), expected(k), "k={k}");
+        assert!(
+            verdict
+                .constituents
+                .iter()
+                .all(|c| c.state != VerdictState::Success || c.outcome == Outcome::Passed)
+        );
+    }
+}
+
+#[test]
+fn grouped_failing_setup_command_leaves_every_constituent_did_not_run() {
+    let mut c = grouped();
+    c.record.results.truncate(1);
+    c.record.results[0].exit_code = Some(2);
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Failure, "command failed");
+    assert!(
+        outcomes(&verdict)
+            .iter()
+            .all(|(_, o, s)| (*o, *s) == (Outcome::DidNotRun, VerdictState::Pending))
+    );
+}
+
+#[test]
+fn grouped_structural_problems_leave_constituents_empty() {
+    let mut c = grouped();
+    c.record.tree_unchanged_after = false;
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Failure, "tree changed");
+    assert!(verdict.constituents.is_empty());
+
+    let mut c = grouped();
+    c.record.services.s3 = false;
+    let verdict = c.run();
+    expect(
+        verdict.clone(),
+        VerdictState::Failure,
+        "required service missing",
+    );
+    assert!(verdict.constituents.is_empty());
+
+    // A signed pass over a failed record.
+    let mut c = grouped();
+    c.record.results[1].exit_code = Some(1);
+    c.tamper_payload = Some(Box::new(|p| {
+        p.outcome = agentscm::evidence::EvidenceOutcome::Pass;
+        p.terminal_state = agentscm::evidence::TerminalState::Success;
+    }));
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Failure, "command failed");
+    assert!(verdict.constituents.is_empty());
+
+    // A signed failure over a clean record.
+    let mut c = grouped();
+    c.tamper_payload = Some(Box::new(|p| {
+        p.outcome = agentscm::evidence::EvidenceOutcome::Fail;
+        p.terminal_state = agentscm::evidence::TerminalState::Failed;
+    }));
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Failure, "outcome not pass");
+    assert!(verdict.constituents.is_empty());
+
+    // Order departure and coverage mismatch.
+    let mut c = grouped();
+    c.record.results.swap(1, 2);
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Failure, "incomplete run");
+    assert!(verdict.constituents.is_empty());
+    let mut c = grouped();
+    c.tamper_payload = Some(Box::new(|p| p.coverage.observed_count = 1));
+    let verdict = c.run();
+    assert_eq!(verdict.reason, "coverage mismatch");
+    assert!(verdict.constituents.is_empty());
+}
+
+#[test]
+fn grouped_truncated_output_on_exit_zero_is_a_failed_constituent() {
+    let mut c = grouped();
+    c.record.results[2].truncated = true;
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Failure, "output truncated");
+    assert_eq!(
+        outcomes(&verdict),
+        [
+            ("unit-tests", Outcome::Passed, VerdictState::Success),
+            ("static", Outcome::Failed, VerdictState::Failure),
+            ("documentation", Outcome::Passed, VerdictState::Success),
+        ]
+    );
+}
+
+#[test]
+fn grouped_path_filtered_constituent_is_not_required() {
+    let mut c = grouped();
+    c.required = Some(["setup", "unit", "lint"].map(String::from).to_vec());
+    c.record.not_required = vec!["docs".into()];
+    c.record.results.truncate(3);
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Success, "validated");
+    assert_eq!(
+        outcomes(&verdict)[2],
+        ("documentation", Outcome::NotRequired, VerdictState::Success)
+    );
+    assert_eq!(verdict.constituents[2].reason, "not required");
+}
+
+#[test]
+fn constituent_declarations_are_validated() {
+    let with = |groups: Vec<Constituent>| {
+        let mut r = recipe();
+        r.commands.push(cmd("lint", None));
+        r.constituents = Some(groups);
+        r.validate()
+    };
+    with(vec![
+        group("unit", "Unit", &["test"]),
+        group("static", "Static", &["lint"]),
+    ])
+    .unwrap();
+    with(vec![group("unit", "Unit", &["test"])]).unwrap(); // lint is setup
+    let long = "n".repeat(65);
+    let bad: Vec<Vec<Constituent>> = vec![
+        vec![],
+        vec![group("unit", "Unit", &[])],
+        vec![group("unit", "Unit", &["missing"])],
+        vec![group("a", "A", &["test"]), group("b", "B", &["test"])],
+        vec![group("a", "A", &["test"]), group("a", "B", &["lint"])],
+        vec![group("Unit", "Unit", &["test"])],
+        vec![group("-a", "A", &["test"])],
+        vec![group("", "A", &["test"])],
+        vec![group("a", "", &["test"])],
+        vec![group("a", &long, &["test"])],
+        vec![group("a", "bad\nname", &["test"])],
+        vec![group("a", "bad\u{7}name", &["test"])],
+        vec![group("a", "A", &["test", "test"])],
+    ];
+    for groups in bad {
+        assert!(with(groups.clone()).is_err(), "{groups:?}");
+    }
+    with(vec![group("a", &"n".repeat(64), &["test"])]).unwrap();
+
+    let unknown = r#"{"id":"a","name":"A","commands":["test"],"extra":1}"#;
+    assert!(serde_json::from_str::<Constituent>(unknown).is_err());
+
+    // A recipe with constituents under a policy without a check id is not assessable.
+    let mut c = grouped();
+    c.policy.check_id = None;
+    c.assess_policy = Some(c.policy.clone());
+    let verdict = c.run();
+    assert_eq!(
+        (verdict.state, verdict.outcome, verdict.reason),
+        (VerdictState::Error, Outcome::Error, "policy invalid")
+    );
+}
+
+#[test]
+fn selected_evidence_requires_independent_selection_and_exact_argv() {
+    let selected_case = || {
+        let mut c = Case::new();
+        c.recipe.commands[0].argv = ["cargo", "nextest", "run", "--locked"]
+            .map(String::from)
+            .to_vec();
+        c.recipe.commands[0].test_selection = Some(TestSelection {
+            rules: vec![TestSelectionRule {
+                path: "tests/a.rs".into(),
+                filter: "test(/^a::/)".into(),
+            }],
+        });
+        c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
+        c.record.recipe_sha256 = c.policy.recipe_sha256.clone();
+        let mut argv = c.recipe.commands[0].argv.clone();
+        argv.extend(["-E".into(), "(test(/^a::/))".into()]);
+        c.record.results[0].argv = argv.clone();
+        c.record.selections = vec![CommandSelection {
+            command_id: "test".into(),
+            reason: SelectionReason::Selected,
+            paths: vec!["tests/a.rs".into()],
+            filters: vec!["test(/^a::/)".into()],
+            argv,
+        }];
+        c.selections = c.record.selections.clone();
+        c
+    };
+    assert_eq!(selected_case().run().state, VerdictState::Success);
+    let mut changed = selected_case();
+    changed.record.selections[0].reason = SelectionReason::UnmappedPath;
+    assert_eq!(changed.run().reason, "selection mismatch");
+    let mut changed = selected_case();
+    changed.record.results[0].argv = vec!["true".into()];
+    assert_ne!(changed.run().state, VerdictState::Success);
+    let mut changed = selected_case();
+    changed.record.selections[0].paths.push("forged.rs".into());
+    assert_eq!(changed.run().reason, "selection mismatch");
+
+    let mut c = Case::new();
+    c.record.selections = vec![CommandSelection {
+        command_id: "test".into(),
+        reason: SelectionReason::Selected,
+        paths: vec![],
+        filters: vec![],
+        argv: vec!["true".into()],
+    }];
+    assert_eq!(c.run().reason, "selection mismatch");
+}
+
+#[test]
+fn absent_selection_preserves_legacy_serialization() {
+    assert!(
+        !String::from_utf8(serde_json::to_vec(&recipe()).unwrap())
+            .unwrap()
+            .contains("test_selection")
+    );
+    assert!(
+        !String::from_utf8(record().to_bytes().unwrap())
+            .unwrap()
+            .contains("selections")
+    );
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { ApiError } from '../api.ts'
-import { deviceAuth, fetchAdmin, fetchDevices, revokeDevice, signOutBrowser, type AdminRepository, type BrowserSession, type Device, type DeviceAuth, type SignInRefusal } from '../devices.ts'
+import { deviceAuth, fetchAdmin, fetchDevices, revokeDevice, signOutBrowser, type AdminRepository, type BrowserSession, type CapacityRefusal, type Device, type DeviceAuth, type SignInRefusal } from '../devices.ts'
 import { reasonSentence } from '../refusal.ts'
 import { RefusalNotice } from '../Refusal.tsx'
 import { loginHref } from '../hubLogin.ts'
@@ -269,6 +269,28 @@ function Refusals({ rows }: { rows: SignInRefusal[] }) {
   )
 }
 
+/** Store capacity refusals by repository and limit, each with what to run. */
+function CapacityRefusals({ rows }: { rows: CapacityRefusal[] }) {
+  if (rows.length === 0) return <Empty icon="database-check" title="No capacity limit refused agents in the last 30 days" />
+  return (
+    <ul className="plain-list refusals">
+      {rows.map((r) => (
+        <li key={`${r.provider}:${r.host}:${r.repository}:${r.repositoryId ?? ''}:${r.limit}`} className="refusal-row">
+          <div>
+            <strong><code>{r.repository}</code></strong>
+            <span className="small muted d-block">{r.provider === 'gitlab' ? 'GitLab' : 'GitHub'}{r.host && !['github.com', 'gitlab.com'].includes(r.host) ? ` · ${r.host}` : ''}</span>
+            <p className="refusal-why">Refused because {r.what}.</p>
+            <p className="small"><code className="text-break">{r.remedy}</code></p>
+          </div>
+          <div className="refusal-when">
+            {r.recent && <Pill tone="bad">Last day</Pill>} {r.count > 1 && <Pill tone="warn">{r.count}×</Pill>} <Ago at={r.at} />
+          </div>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
 function Repositories({ rows }: { rows: AdminRepository[] }) {
   if (rows.length === 0) return <Empty icon="plug" title="No repositories are connected yet" />
   return (
@@ -335,6 +357,14 @@ export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; p
         <Failure error={data.error} what="the admin lists" />
       ) : v ? (
         <div className="stack">
+          {v.capacity?.some((r) => r.recent) && (
+            <Notice tone="bad" icon="database-exclamation" title="A capacity limit turned agents away">
+              Agent writes were refused in the last day and did not land. Each row below names the repository and what to run.
+            </Notice>
+          )}
+          <Box icon="database-exclamation" tone={v.capacity?.some((r) => r.recent) ? 'bad' : 'ok'} title="Capacity refusals" count={v.capacity?.length || undefined} explain="Agent writes a full store limit refused in the last 30 days, one row per repository and limit, with what to run. The refused agents were told; nobody else is.">
+            {v.capacity === null ? <Notice tone="muted" icon="info-circle" title="This Hub does not report capacity refusals">Update the Hub to see them here.</Notice> : <CapacityRefusals rows={v.capacity} />}
+          </Box>
           <Box icon="person-x" tone={v.refusals.length ? 'warn' : 'ok'} title="Turned away" count={v.refusals.length} explain="Sign-ins and agent connections the Hub refused in the last 30 days, one row per person and reason.">
             <Refusals rows={v.refusals} />
           </Box>

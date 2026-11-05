@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import type { ActionableStatus } from '../../src/actionableStatus.ts'
-import { inboxBadge, needsYou, needHideKey } from '../../src/needs.ts'
+import { inboxBadge, needsYou, needHideKey, setupBadge } from '../../src/needs.ts'
 import { decodeStatus, recipientLabel, statusLabel, statusProvenance } from '../../src/actionableStatus.ts'
 import { DashboardPage, dashboardStatus, SharedAnswer, SharedNeeds } from '../../src/pages/Dashboard.tsx'
 import type { WorkOverview } from '../../src/standup.ts'
@@ -13,6 +13,8 @@ import type { HubData } from '../../src/useHub.ts'
 
 // Load shared evidence only at test runtime; the UI Docker build copies only ui/.
 const fixture = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/actionable-status.json'), 'utf8')) as ActionableStatus
+// A real store's projection of #290's cases; the menu-bar companion counts the same file.
+const surfaces = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/needs-you-surfaces.json'), 'utf8')) as ActionableStatus
 
 describe('shared actionable status', () => {
   it('uses frozen counts and named recipients without reinterpreting reports', () => {
@@ -25,6 +27,17 @@ describe('shared actionable status', () => {
     expect(recipientLabel(status.work[2]!.recipient)).toBe('viewer')
     expect(statusLabel(status.work[2]!.state)).toBe('Awaiting a named party')
     expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs).toHaveLength(3)
+  })
+  it('badges the same needs the menu-bar companion counts', () => {
+    const status = decodeStatus(surfaces)
+    const rail = dashboardStatus(null, null, null, null, new Set(), undefined, status).needs
+    expect(rail.map((n) => n.key).sort()).toEqual([
+      'file:src/shared.rs',
+      'pr:rep_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:7',
+      'request:crq_cccccccccccccccccccccccccccccccc:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      'status:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    ])
+    expect(rail).toHaveLength(status.counts.needs_you)
   })
   it('uses semantic action versions for browser dismissals with legacy fixture compatibility', () => {
     const status = decodeStatus(fixture)
@@ -90,6 +103,24 @@ describe('shared actionable status', () => {
     render(createElement(SharedNeeds, { status: { kind: 'ready', value: status, fetchedAt: 0, refreshError: null, retry: () => undefined } }))
     expect(screen.getByRole('link', { name: 'Open changes' }).getAttribute('href')).toBe('#landed')
     expect(screen.getByRole('link', { name: 'Open Skills' }).getAttribute('href')).toBe('#skills')
+  })
+  it('badges the viewer’s own agent setup problems and lists only those with Work in Needs you', () => {
+    const status = decodeStatus(fixture)
+    const base = status.actions[0]!
+    const viewer = { kind: 'person' as const, owner: status.viewer_owner, login: 'viewer', agent: null }
+    const other = { ...viewer, owner: 'usr_synthetic_other', login: 'other' }
+    status.actions = [
+      { ...base, id: 'setup:agent_trust_required:aaaa', kind: 'agent_setup', recipients: [viewer], needs_you: true, work_ids: ['wrk_11111111111111111111111111111111'], action: 'Your agent laptop needs its AgentSCM hooks and MCP server approved.' },
+      { ...base, id: 'setup:edit_hook_unverified:bbbb', kind: 'agent_setup', recipients: [viewer], needs_you: false, work_ids: [], action: 'Your agent laptop reached the Hub over MCP, but no edit hook has.' },
+      { ...base, id: 'setup:agent_token_expired:repository', kind: 'agent_setup', recipients: [other], needs_you: false, work_ids: [], action: 'Their token expired.' },
+    ]
+    status.counts.needs_you = status.work.filter((w) => w.needs_you).length + 1
+    expect(setupBadge(status)).toEqual({ n: 2, tip: '2 of your agents have setup problems' })
+    expect(setupBadge(null).n).toBe(0)
+    expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs.filter((n) => n.key.startsWith('setup:'))).toHaveLength(1)
+    expect(inboxBadge(null, undefined, status).n).toBe(0)
+    render(createElement(SharedNeeds, { status: { kind: 'ready', value: status, fetchedAt: 0, refreshError: null, retry: () => undefined } }))
+    expect(screen.getByRole('link', { name: 'Open Agents' }).getAttribute('href')).toBe('#setup')
   })
   it('labels provider failure and retained refresh results separately from clear status', () => {
     const status = decodeStatus(fixture)

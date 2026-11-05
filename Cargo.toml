@@ -58,6 +58,12 @@ lto = "thin"
 [profile.dev]
 debug = "line-tables-only"
 
+# Optimize dependencies in dev and test builds; the workspace crate itself stays unoptimized.
+# Several slow tests were CPU-bound in unoptimized dependencies, such as SHA-256 over the
+# multi-megabyte CLI that every quickstart run hashes.
+[profile.dev.package."*"]
+opt-level = 2
+
 # Packaging integration tests copy the actual CLI. Omit DWARF and symbol metadata
 # from test executables so metadata does not consume the native bundle's 128 MiB limit.
 [profile.test]

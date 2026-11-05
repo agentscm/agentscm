@@ -843,6 +843,15 @@ impl LocalHub {
         }
     }
     fn cli(&self, f: &Fixture, args: &[&str], native: bool) -> std::process::Output {
+        self.cli_as(f, args, native, &self.token)
+    }
+    fn cli_as(
+        &self,
+        f: &Fixture,
+        args: &[&str],
+        native: bool,
+        token: &Path,
+    ) -> std::process::Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
         if !native {
             command
@@ -857,7 +866,7 @@ impl LocalHub {
             .arg("operating-policy")
             .args(args)
             .env("AGENTSCM_HUB_URL", &self.url)
-            .env("AGENTSCM_HUB_TOKEN_FILE", &self.token)
+            .env("AGENTSCM_HUB_TOKEN_FILE", token)
             .output()
             .unwrap()
     }
@@ -2176,6 +2185,251 @@ fn reopen_as_lead(
         .unwrap();
     assert!(result.conflict.is_none());
     result.item
+}
+
+/// A completed dispatch run through the actual Hub, with its claim generation.
+fn completed_dispatch(f: &Fixture, hub: &LocalHub, j: &mut RuleJournal) -> (String, String) {
+    activated(f, j);
+    let mut next = event(f);
+    next.proposal_number += 1;
+    let dispatch = j
+        .accept_operating_event(&f.rule.rule_id, &next, ACTOR)
+        .unwrap()
+        .remove(0);
+    let ran = hub.success(f, &["run", &dispatch.dispatch_id], false);
+    assert_eq!(ran["checkpoint_recorded"], true, "{ran}");
+    let claim = j.dispatch(&dispatch.dispatch_id).unwrap().claim_generation;
+    (dispatch.dispatch_id, claim.to_string())
+}
+
+fn output_json(out: std::process::Output) -> Value {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// The operator rebinds a dispatch after its Work was reopened, and after it was released and
+/// resumed, by the dispatch's own session. A stale generation is refused, a preview writes
+/// nothing, a retry changes nothing, and recovery then continues the dispatch.
+#[test]
+fn operator_rebinds_a_dispatch_after_reopen_or_release_and_recovery_continues() {
+    use agentscm::hub::work::{WorkRole, WorkStart, WorkState};
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let f = fixture();
+    let hub = LocalHub::start(&f);
+    let mut j = journal(&f);
+    let (id, claim) = completed_dispatch(&f, &hub, &mut j);
+    let binding = j.operating_work(&id).unwrap().unwrap();
+    let rebind = |generation: i64, apply: bool| {
+        let generation = generation.to_string();
+        let mut args = vec![
+            "rebind",
+            id.as_str(),
+            "--expected-generation",
+            claim.as_str(),
+            "--work-generation",
+            generation.as_str(),
+        ];
+        if apply {
+            args.push("--apply");
+        }
+        hub.cli(&f, &args, false)
+    };
+    let recover = || {
+        hub.cli(
+            &f,
+            &["recover", &id, "--expected-generation", &claim],
+            false,
+        )
+    };
+
+    // Reopened by its own session, the Work moved past the binding, so recovery refuses.
+    let reopened = reopen_as_lead(&hub, &binding.work, "rebind-reopen");
+    let refused = recover();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("Work authority changed"));
+    // A stale generation is refused with the current one named.
+    let stale = rebind(binding.work.generation, true);
+    assert!(!stale.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale.stderr)
+            .contains(&format!("--work-generation {}", reopened.generation)),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    // The preview says what it would write and writes nothing.
+    let preview = output_json(rebind(reopened.generation, false));
+    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["work"]["work"]["generation"], reopened.generation);
+    assert_eq!(j.operating_work(&id).unwrap().unwrap(), binding);
+    let applied = output_json(rebind(reopened.generation, true));
+    assert_eq!(applied["rebound"], true, "{applied}");
+    let rebound = j.operating_work(&id).unwrap().unwrap();
+    assert_eq!(rebound.work.generation, reopened.generation);
+    assert_eq!(rebound.identity_commitment, binding.identity_commitment);
+    // The same rebind again changes nothing.
+    let again = output_json(rebind(reopened.generation, true));
+    assert_eq!(again["replayed"], true);
+    assert_eq!(j.operating_work(&id).unwrap().unwrap(), rebound);
+
+    // Released, the Work holds nothing: the rebind waits until the dispatch's session resumes it.
+    let now = agentscm::hub::store::unix_now();
+    let current = hub
+        .store
+        .work_get(&hub.token_id, &reopened.id, now)
+        .unwrap()
+        .unwrap();
+    let released = hub
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent {
+                token: &hub.token_id,
+            },
+            &WorkTransitionRequest {
+                work_id: current.id.clone(),
+                operation_id: "rebind-release".into(),
+                generation: current.generation,
+                expected_updated_seq: current.updated_seq,
+                session: Some(current.lead_session.clone()),
+                transition: WorkTransitionKind::Release,
+                reason: "stage a release".into(),
+                superseded_by: None,
+            },
+            now,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(released.state, WorkState::Paused);
+    let waiting = rebind(released.generation, true);
+    assert!(!waiting.status.success());
+    assert!(
+        String::from_utf8_lossy(&waiting.stderr).contains("resume it as session"),
+        "{}",
+        String::from_utf8_lossy(&waiting.stderr)
+    );
+    assert_eq!(j.operating_work(&id).unwrap().unwrap(), rebound);
+    let resumed = hub
+        .store
+        .work_start(
+            &hub.token_id,
+            &WorkStart {
+                work_id: Some(released.id.clone()),
+                source: None,
+                request_key: None,
+                title: released.title.clone(),
+                session: released.lead_session.clone(),
+                role: WorkRole::Lead,
+                scope: released.scope.clone(),
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: Some(released.generation),
+                preflight: None,
+                issue_choice: None,
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert!(resumed.conflict.is_none(), "{resumed:?}");
+    assert_eq!(resumed.item.state, WorkState::Active);
+    output_json(rebind(resumed.item.generation, true));
+    assert_eq!(
+        j.operating_work(&id).unwrap().unwrap().work.generation,
+        resumed.item.generation
+    );
+    // Recovery continues: the completed dispatch records its finish on the resumed Work.
+    let recovered = output_json(recover());
+    let finished = j.operating_work(&id).unwrap().unwrap();
+    assert_eq!(finished.work.state, WorkState::Finished, "{recovered}");
+    let retained = finished
+        .recovery
+        .clone()
+        .expect("recovery keeps its request");
+
+    // Reopened once more, the rebind keeps that request as history: it names the old generation.
+    let reopened = reopen_as_lead(&hub, &finished.work, "rebind-reopen-2");
+    output_json(rebind(reopened.generation, true));
+    let history = j.operating_work(&id).unwrap().unwrap();
+    assert_eq!(history.recovery, None);
+    let entry = history.recovery_reconciliations.last().unwrap();
+    assert_eq!(entry.recovery, retained);
+    assert_eq!(entry.observed_seq, reopened.updated_seq);
+    assert_eq!(entry.outcome, RecoveryOutcome::Unknown);
+}
+
+/// Only the current owner of an active policy rebinds its dispatch; another person's token and a
+/// revoked policy are refused with the binding unchanged.
+#[test]
+fn only_the_active_policy_owner_can_rebind_a_dispatch() {
+    let f = fixture();
+    let hub = LocalHub::start(&f);
+    let mut j = journal(&f);
+    let (id, claim) = completed_dispatch(&f, &hub, &mut j);
+    let binding = j.operating_work(&id).unwrap().unwrap();
+    let reopened = reopen_as_lead(&hub, &binding.work, "rebind-reopen");
+    let generation = reopened.generation.to_string();
+    let args = [
+        "rebind",
+        id.as_str(),
+        "--expected-generation",
+        claim.as_str(),
+        "--work-generation",
+        generation.as_str(),
+        "--apply",
+    ];
+    let other = hub
+        .store
+        .upsert_user(
+            &agentscm::hub::store::ForgeIdentity {
+                provider: "github".into(),
+                host: f.rule.host.clone(),
+                user_id: 8,
+            },
+            "other",
+        )
+        .unwrap();
+    let (_, secret, _) = agentscm::hub::store::mint_bound_agent_token(
+        &*hub.store,
+        &other.id,
+        "other-agent",
+        &f.rule.repository,
+        f.rule.provider_repository_id,
+        3600,
+        false,
+    )
+    .unwrap();
+    let token = hub._directory.path().join("other.token");
+    fs::write(&token, secret.expose()).unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let stranger = hub.cli_as(&f, &args, false, &token);
+    assert!(!stranger.status.success());
+    assert!(
+        String::from_utf8_lossy(&stranger.stderr).contains("only the current owner"),
+        "{}",
+        String::from_utf8_lossy(&stranger.stderr)
+    );
+    assert_eq!(j.operating_work(&id).unwrap().unwrap(), binding);
+    // A revoked policy refuses its own owner too.
+    let policy = j.operating_policy(&f.rule.rule_id).unwrap();
+    j.set_operating_mode(
+        &f.rule.rule_id,
+        &policy.digest,
+        policy.generation,
+        "revoked",
+        None,
+        ACTOR,
+    )
+    .unwrap();
+    let revoked = hub.cli(&f, &args, false);
+    assert!(!revoked.status.success());
+    assert_eq!(j.operating_work(&id).unwrap().unwrap(), binding);
 }
 
 #[test]

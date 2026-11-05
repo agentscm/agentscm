@@ -1,7 +1,7 @@
 // The page of one task: `#work/<work-id>`.
 //
 // API for other packages:
-//   WorkDetail({ id, token, overview })   the task page; WorkPage renders it for a work-ID route
+//   WorkDetail({ id, token, overview, session })   the task page; WorkPage renders it for a work-ID route
 import type { ReactNode } from 'react'
 import { fetchWork } from '../api.ts'
 import { fetchChangeRecord } from '../changeRecord.ts'
@@ -23,6 +23,8 @@ import { onFrontDoor } from '../frontDoor.ts'
 import { IntentReviewPanel } from '../IntentReviewPanel.tsx'
 import { WorkReconciliation } from '../WorkReconciliation.tsx'
 import { WorkPrContext } from '../WorkPrContext.tsx'
+import { WorkRecovery } from '../WorkRecovery.tsx'
+import type { BrowserSession } from '../devices.ts'
 import { ClaimPill, lead, Source, StatePill, WorkLink } from './workParts.tsx'
 
 function Ref({ r, item }: { r: WorkSourceRef; item: WorkItem }) {
@@ -94,7 +96,7 @@ function needsFor(id: string, overview: WorkOverview | null): { steps: NextStep[
 }
 
 /** One task: where it is in its lifecycle, state, claim, people, declared scope, agent reports and technical details. */
-export function WorkDetail({ id, token, overview, handoff }: { id: string; token: string; overview: Poll<WorkOverview>; handoff?: Handoff }) {
+export function WorkDetail({ id, token, overview, handoff, session = null }: { id: string; token: string; overview: Poll<WorkOverview>; handoff?: Handoff; session?: BrowserSession | null }) {
   const load = usePoll((signal) => fetchStandupWork(id, token, signal), 0, id)
   return (
     <div className="page">
@@ -104,12 +106,12 @@ export function WorkDetail({ id, token, overview, handoff }: { id: string; token
           {load.message}
         </Notice>
       )}
-      {load.kind === 'ready' && <Task item={load.value} token={token} overview={overview.kind === 'ready' ? overview.value : null} handoff={handoff} refreshWork={load.retry} />}
+      {load.kind === 'ready' && <Task item={load.value} token={token} overview={overview.kind === 'ready' ? overview.value : null} handoff={handoff} session={session} refreshWork={load.retry} />}
     </div>
   )
 }
 
-function Task({ item, token, overview, handoff, refreshWork }: { item: WorkItem; token: string; overview: WorkOverview | null; handoff?: Handoff; refreshWork: () => void }) {
+function Task({ item, token, overview, handoff, session, refreshWork }: { item: WorkItem; token: string; overview: WorkOverview | null; handoff?: Handoff; session: BrowserSession | null; refreshWork: () => void }) {
   const l = lead(item)
   const branch = item.branch
   const record = usePoll((s) => fetchChangeRecord(item.repository, item.id, token, s), 0, item.id)
@@ -167,6 +169,7 @@ function Task({ item, token, overview, handoff, refreshWork }: { item: WorkItem;
         </Box>
       )}
       {quiet && needSteps.length === 0 && <Notice title={item.claim_status === 'stale' ? 'No recent check-in' : 'Check-in unknown'}>{STILL_ASSIGNED}</Notice>}
+      <WorkRecovery item={item} session={session} refreshWork={refreshWork} />
       <WorkReconciliation item={item} token={token} refreshWork={refreshWork} />
       <div className="action-grid is-two">
         <div>

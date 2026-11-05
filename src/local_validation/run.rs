@@ -154,6 +154,122 @@ pub fn required_commands(
     Ok(ids)
 }
 
+/// Recompute effective commands from exact Git changes, never candidate-supplied records.
+pub fn command_selections(
+    repo: &Path,
+    merge_base: &str,
+    head: &str,
+    recipe: &ValidationRecipe,
+    trust: &[String],
+) -> Result<Vec<super::CommandSelection>> {
+    use super::SelectionReason::*;
+    recipe.validate()?;
+    for revision in [merge_base, head] {
+        if revision.starts_with('-') || revision.contains('\0') {
+            return Err(Error::Invalid("invalid selection revision".into()));
+        }
+    }
+    if !recipe.commands.iter().any(|c| c.test_selection.is_some()) {
+        return Ok(Vec::new());
+    }
+    let bytes = git(
+        repo,
+        &[
+            "diff-tree",
+            "-r",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            merge_base,
+            head,
+            "--",
+        ],
+        GIT_OUTPUT,
+    )?;
+    let parts: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
+    if !parts.len().is_multiple_of(2) {
+        return Err(Error::Invalid("invalid Git path status output".into()));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let mut modified_only = true;
+    for pair in parts.chunks_exact(2) {
+        modified_only &= pair[0] == b"M";
+        let path = std::str::from_utf8(pair[1])
+            .map_err(|_| Error::Invalid("test selection cannot represent non-UTF8 paths".into()))?;
+        paths.insert(path.to_owned());
+    }
+    // Refuse unrepresentable evidence rather than silently omitting observed paths.
+    if paths.len() > 256 || paths.iter().map(String::len).sum::<usize>() > 8192 {
+        return Err(Error::Limit(
+            "test selection path evidence exceeds bounds".into(),
+        ));
+    }
+    let paths: Vec<String> = paths.into_iter().collect();
+    let trust_changed = changed(repo, merge_base, head, trust)? > 0;
+    let required = required_commands(repo, merge_base, head, recipe, trust)?;
+    let mut result = Vec::new();
+    for command in recipe.commands.iter().filter(|c| required.contains(&c.id)) {
+        let Some(selection) = &command.test_selection else {
+            continue;
+        };
+        let mut filters = std::collections::BTreeSet::new();
+        let shared = paths.iter().any(|p| {
+            p.starts_with("Cargo.")
+                || p == "build.rs"
+                || p.starts_with(".config/")
+                || p.starts_with("tests/integration/common/")
+                || p == "tests/integration/main.rs"
+        });
+        let mut reason = if trust_changed {
+            TrustInput
+        } else if shared {
+            SharedInput
+        } else if paths.is_empty() {
+            EmptyChange
+        } else if !modified_only {
+            NonModifiedPath
+        } else {
+            Selected
+        };
+        if reason == Selected {
+            for path in &paths {
+                match selection.rules.iter().find(|r| &r.path == path) {
+                    Some(rule) => {
+                        filters.insert(rule.filter.clone());
+                    }
+                    None => {
+                        reason = UnmappedPath;
+                        break;
+                    }
+                }
+            }
+        }
+        if reason != Selected {
+            filters.clear();
+        }
+        let filters: Vec<String> = filters.into_iter().collect();
+        let mut argv = command.argv.clone();
+        if reason == Selected {
+            argv.extend([
+                "-E".into(),
+                filters
+                    .iter()
+                    .map(|f| format!("({f})"))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            ]);
+        }
+        result.push(super::CommandSelection {
+            command_id: command.id.clone(),
+            reason,
+            paths: paths.clone(),
+            filters,
+            argv,
+        });
+    }
+    Ok(result)
+}
+
 /// True when the change is non-empty, touches no trust input and every path matches `exempt`.
 pub fn only_exempt(
     repo: &Path,
@@ -328,9 +444,16 @@ pub fn produce(
         .map(|path| file_digest(repo, &state.commit, &path).map(|digest| (path, digest)))
         .collect::<Result<Vec<_>>>()?;
     let required = required_commands(repo, &state.merge_base, &state.commit, recipe, trust)?;
+    let selections = command_selections(repo, &state.merge_base, &state.commit, recipe, trust)?;
     let (mut results, mut outputs) = (Vec::new(), Vec::new());
     for c in recipe.commands.iter().filter(|c| required.contains(&c.id)) {
-        let (result, output) = run_command(repo, &c.id, &c.argv, c.timeout_secs, cancel);
+        let (result, output) = run_command(
+            repo,
+            &c.id,
+            super::effective_argv(c, &selections),
+            c.timeout_secs,
+            cancel,
+        );
         let ok = result.stop == StopReason::Exited && result.exit_code == Some(0);
         results.push(result);
         outputs.push(output);
@@ -366,6 +489,7 @@ pub fn produce(
             base_tip: state.base_tip,
             recipe_sha256,
             results,
+            selections,
             not_required: recipe
                 .commands
                 .iter()

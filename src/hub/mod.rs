@@ -1,10 +1,12 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
 pub mod agent_rules;
+pub mod capacity;
 pub mod catchup;
 mod catchup_sync;
 pub mod change_record;
 pub mod change_record_http;
+mod compact;
 pub mod connection;
 pub mod continuity;
 pub mod coordination;
@@ -38,6 +40,7 @@ pub mod provider_context;
 pub mod publish;
 mod repository_summary;
 pub mod session;
+pub mod setup_attention;
 pub mod skill_workflow;
 pub mod skills;
 pub mod slack;
@@ -58,6 +61,7 @@ pub mod work_links;
 pub mod work_preflight;
 pub mod work_reconcile;
 pub mod work_reconciliation;
+pub mod work_recovery;
 pub mod work_transition;
 pub mod workspace;
 #[cfg(unix)]
@@ -93,8 +97,9 @@ pub enum HubError {
     Unauthorized,
     /// Too many concurrent store operations; the request is not queued.
     Busy,
-    /// The repository's retained work budget needs operator maintenance.
-    WorkCapacity,
+    /// A bounded store limit refused the write; which one, and for which repository, is
+    /// recorded for the operator (see [`capacity`]).
+    WorkCapacity(Box<capacity::Capacity>),
     /// The requested lead scope intersects durable unfinished work.
     WorkOverlap(Vec<work::WorkScopeOverlap>),
     /// A rejected scope mutation that durably created or reused a coordination request.
@@ -125,9 +130,10 @@ impl fmt::Display for HubError {
             Self::Invalid(message) => write!(f, "invalid: {message}"),
             Self::Unauthorized => write!(f, "authentication required"),
             Self::Busy => write!(f, "busy"),
-            Self::WorkCapacity => write!(
+            Self::WorkCapacity(capacity) => write!(
                 f,
-                "repository work storage capacity reached; operator compaction required"
+                "capacity reached: {}; operator action required",
+                capacity.limit.what()
             ),
             Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
             Self::WorkCoordinationRequired { .. } => {
