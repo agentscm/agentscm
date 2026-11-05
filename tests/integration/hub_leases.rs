@@ -154,6 +154,7 @@ fn another_token(store: &dyn Store, owner: &str, n: i64) -> Agent {
 
 fn start(key: &str, session: &str, scope: &str) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(key.into()),
@@ -173,6 +174,7 @@ fn start(key: &str, session: &str, scope: &str) -> WorkStart {
 
 fn joined(work_id: &str, session: &str, role: WorkRole) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: Some(work_id.into()),
         request_key: None,
         role,
@@ -182,6 +184,7 @@ fn joined(work_id: &str, session: &str, role: WorkRole) -> WorkStart {
 
 fn takeover(work_id: &str, session: &str, generation: i64) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: Some(work_id.into()),
         request_key: None,
         takeover_generation: Some(generation),

@@ -52,6 +52,7 @@ pub mod view_settings;
 pub mod viewer;
 pub mod work;
 pub mod work_http;
+pub mod work_issues;
 pub mod work_lifecycle;
 pub mod work_links;
 pub mod work_preflight;

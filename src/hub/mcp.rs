@@ -2586,6 +2586,7 @@ async fn work_preflight(
         let mut result = store.work_preflight(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id,
                 source,
                 request_key,
@@ -3116,6 +3117,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let title = task.clone();
     let work = blocking(state, move || {
         let start = WorkStart {
+            issue_choice: None,
             work_id,
             source,
             request_key,
