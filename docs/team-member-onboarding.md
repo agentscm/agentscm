@@ -270,7 +270,8 @@ Use the actual agent and session. Before a native session can start, omit `--ses
 a login or trust blocker. Pending setup reports can never become proof; a later verified native
 session replaces them. The first command reads at most 64 KiB and sends only a blocker
 category, never raw diagnostics. Keep diagnostic files private and delete them afterward. The second
-reads observations; it does not simulate MCP or hook proof. Both require a current checkout binding.
+reads observations and prints one line per session, latest first (`--json` prints the Hub's reply);
+it does not simulate MCP or hook proof. Both require a current checkout binding.
 Run `client setup` again when that binding needs forge sign-in or token renewal.
 
 | Blocker | Guided next step |

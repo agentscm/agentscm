@@ -173,6 +173,9 @@ pub(crate) struct DoctorArgs {
     /// Read up to 64 KiB of captured host diagnostics from stdin; only a blocker category leaves this machine.
     #[arg(long)]
     diagnostic_stdin: bool,
+    /// Print the Hub's onboarding reply as JSON instead of a summary.
+    #[arg(long)]
+    json: bool,
     #[command(flatten)]
     checkout: RootArgs,
 }
@@ -684,9 +687,15 @@ impl Verified {
     }
 }
 
-/// Only a token this client minted renews; one given to `client setup` is never renewed.
+/// Only a token this client minted through this computer's credential renews. A token file given
+/// to `client setup`, or one minted with a bare sign-in session (a Hub without computers), never does.
 fn renewal_note(connection: &Connection) -> &'static str {
-    if connection.owned_token_id.is_some() {
+    if connection.owned_token_id.is_some()
+        && crate::hub_cli::saved_device(&connection.hub)
+            .ok()
+            .flatten()
+            .is_some()
+    {
         " The token renews automatically before it ends; if renewal fails, run `agentscm client renew`."
     } else {
         ""
@@ -1399,10 +1408,11 @@ async fn connect_inner(
             }
             if !quiet {
                 println!(
-                    "Connection is already valid for {} at {} {} and permits coordination.",
+                    "Connection is already valid for {} at {} {} and permits coordination.{}",
                     corrected.repo,
                     corrected.hub,
-                    verified.as_who()
+                    verified.as_who(),
+                    renewal_note(&corrected)
                 );
             }
             return Ok(());
@@ -1745,7 +1755,8 @@ fn session_lines(reply: &Value) -> Vec<String> {
     statuses
         .into_iter()
         .map(|status| {
-            let text = |key: &str| status[key].as_str().unwrap_or("unknown");
+            // Hub text goes to a terminal, so control characters (escape sequences) are dropped.
+            let text = |key: &str| crate::hub_cli::clean(status[key].as_str().unwrap_or("unknown"));
             let seen = |key: &str| {
                 if status[key].as_bool() == Some(true) {
                     "seen"
@@ -1763,7 +1774,7 @@ fn session_lines(reply: &Value) -> Vec<String> {
             );
             if status["state"] != "ready" {
                 line.push(' ');
-                line.push_str(text("next_action"));
+                line.push_str(&text("next_action"));
             }
             line
         })
@@ -1844,6 +1855,10 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
             "Hub onboarding check failed; review the Hub binding and server version",
         ));
     }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
+        return Ok(());
+    }
     for line in session_lines(&reply) {
         println!("{line}");
     }
@@ -1875,7 +1890,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn only_a_managed_token_is_described_as_renewing() {
+    fn a_token_is_described_as_renewing_only_when_this_computer_can_renew_it() {
         let mut connection = Connection {
             root: PathBuf::from("/synthetic/checkout"),
             origin_host: "github.com".into(),
@@ -1888,8 +1903,11 @@ mod tests {
             agents: Vec::new(),
         };
         assert_eq!(renewal_note(&connection), "");
+        // A managed token still needs this computer's credential for its Hub; the synthetic
+        // Hub has none saved. `connecting_with_a_first_sign_in_mints_through_the_computer`
+        // covers a computer-minted token.
         connection.owned_token_id = Some("synthetic-id".into());
-        assert!(renewal_note(&connection).contains("`agentscm client renew`"));
+        assert_eq!(renewal_note(&connection), "");
     }
 
     #[test]
@@ -1911,6 +1929,10 @@ mod tests {
         assert_eq!(
             session_lines(&json!({"agent":"claude"})),
             ["claude session unknown: unknown (MCP not seen, native edit hook not seen). unknown"]
+        );
+        assert_eq!(
+            session_lines(&json!({"agent":"claude","session":"a\u{1b}[31mb","state":"ready"})),
+            ["claude session a[31mb: ready (MCP not seen, native edit hook not seen)."]
         );
     }
 
