@@ -1559,6 +1559,19 @@ fn last_page(link: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// `agentscm/workflow/{target}` for a conservative target spelling.
+pub fn status_context(target: &str) -> Result<String> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
+    if target.is_empty()
+        || target.len() > 100
+        || !target.chars().all(allowed)
+        || !valid_ref_name(target)
+    {
+        return Err(HubError::Invalid("invalid status target".into()));
+    }
+    Ok(format!("agentscm/workflow/{target}"))
+}
+
 /// Whether `name` could be a git branch name. Anything else is never put in a URL or looked up.
 pub fn valid_ref_name(name: &str) -> bool {
     !name.is_empty()
