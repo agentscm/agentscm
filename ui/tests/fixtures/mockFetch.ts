@@ -37,11 +37,11 @@ const handler = mockHandler()
 function answer(url: URL, init: RequestInit): Promise<Response> {
   return new Promise((resolve) => {
     const headers: Record<string, string> = {}
-    const req = { url: url.pathname.replace(/^\/v1\/hub/, '') + url.search, method: init.method ?? 'GET', headers: { authorization: new Headers(init.headers).get('authorization') ?? undefined } }
+    const req = { url: url.pathname.replace(/^\/v1\/hub/, '') + url.search, method: init.method ?? 'GET', headers: { authorization: new Headers(init.headers).get('authorization') ?? undefined, 'if-none-match': new Headers(init.headers).get('if-none-match') ?? undefined } }
     const res = {
       statusCode: 200,
       setHeader: (k: string, v: string) => void (headers[k] = v),
-      end: (body: string) => resolve(new Response(body, { status: res.statusCode, headers })),
+      end: (body?: string) => resolve(new Response(body ?? null, { status: res.statusCode, headers })),
     }
     handler(req as unknown as IncomingMessage, res as unknown as ServerResponse)
   })

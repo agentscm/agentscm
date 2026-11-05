@@ -722,6 +722,8 @@ fn announce_body(n: u128, paths: &[&str]) -> String {
 const INTENTS: &str = "/v1/hub/repos/acme%2Fwidgets/intents";
 const NOTICES: &str = "/v1/hub/repos/acme%2Fwidgets/notices";
 const ACTIVITY: &str = "/v1/hub/repos/acme%2Fwidgets/activity";
+const WORK: &str = "/v1/hub/repos/acme%2Fwidgets/work";
+const SNAPSHOT: &str = "/v1/hub/repos/acme%2Fwidgets/snapshot";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_poll_delivers_a_notice_and_overlap_is_not_a_denial() {
@@ -1040,6 +1042,61 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["agent"], session["agent"]);
     assert!(events[0]["data"].is_object() && events[0]["seq"].is_i64());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_serves_work_and_activity_and_answers_a_current_etag_with_304() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "a");
+    let get = reqwest::Method::GET;
+    assert_eq!(
+        hub.call(get.clone(), SNAPSHOT, None, None).await,
+        (401, json!({"error": "unauthorized"}))
+    );
+    assert_eq!(
+        hub.call(
+            get.clone(),
+            "/v1/hub/repos/acme%2Fother/snapshot",
+            Some(&alice),
+            None
+        )
+        .await,
+        (404, json!({"error": "not_found"}))
+    );
+    let fetch = |tag: Option<String>| {
+        let mut request = hub
+            .client
+            .get(format!("{}{SNAPSHOT}", hub.base))
+            .bearer_auth(&alice);
+        if let Some(tag) = tag {
+            request = request.header("if-none-match", tag);
+        }
+        async move { request.send().await.unwrap() }
+    };
+    let first = fetch(None).await;
+    assert_eq!(first.status(), 200);
+    let tag = first.headers()["etag"].to_str().unwrap().to_owned();
+    assert!(tag.starts_with('"') && tag.ends_with('"') && !tag.starts_with("W/"));
+    let body: Value = first.json().await.unwrap();
+    let (_, work) = hub.call(get.clone(), WORK, Some(&alice), None).await;
+    let (_, activity) = hub.call(get.clone(), ACTIVITY, Some(&alice), None).await;
+    assert_eq!(body, json!({"work": work, "activity": activity}));
+
+    let same = fetch(Some(format!("\"other\", {tag}"))).await;
+    assert_eq!(same.status(), 304);
+    assert_eq!(same.headers()["etag"], tag.as_str());
+    assert!(same.bytes().await.unwrap().is_empty());
+    assert_eq!(fetch(Some("\"stale\"".into())).await.status(), 200);
+
+    let post = reqwest::Method::POST;
+    let announce = announce_body(1, &["src/**"]);
+    let (status, _) = hub.call(post, INTENTS, Some(&alice), Some(&announce)).await;
+    assert_eq!(status, 200);
+    let changed = fetch(Some(tag.clone())).await;
+    assert_eq!(changed.status(), 200);
+    assert_ne!(changed.headers()["etag"], tag.as_str());
+    let changed: Value = changed.json().await.unwrap();
+    assert_eq!(changed["work"]["intents"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -32,7 +32,9 @@ use super::intent::{
     Intent, MAX_LIVE_INTENTS, NOTICES, key_of, live_intents_capped, overlaps, scope,
 };
 use super::login::{HumanSession, Table, forge_urls, optional_secret, random_hex};
-use super::store::{Store, lower_hex_of, new_connection_id, unix_now, validate_repository};
+use super::store::{
+    Principal, Store, lower_hex_of, new_connection_id, unix_now, validate_repository,
+};
 use super::{HubError, HubState, Result};
 use crate::hmac::{constant_time_eq, hmac_sha256};
 
@@ -2856,11 +2858,20 @@ async fn work(
     Reader(principal): Reader,
     Path(repo): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    scope(&principal, &repo)?;
+    work_view(&state, &principal, repo).await.map(Json)
+}
+
+/// Live intents plus the connected repository's retained pull requests and branches.
+pub(super) async fn work_view(
+    state: &HubState,
+    principal: &Principal,
+    repo: String,
+) -> ApiResult<Value> {
+    scope(principal, &repo)?;
     let host = principal.owner.identity.host.clone();
     let (name, name_for_intents) = (repo.clone(), repo);
     let repository_id = principal.repository_id;
-    let (intents, prs, branches, connected) = db(&state, move |store| {
+    let (intents, prs, branches, connected) = db(state, move |store| {
         // By the forge's id when the token has one: a renamed or re-created name never serves another repository.
         let intents = store.live_intents(&name_for_intents, unix_now(), MAX_LIVE_INTENTS + 1)?;
         Ok(match find_repository(store, &host, &name, repository_id)? {
@@ -2889,11 +2900,11 @@ async fn work(
         .take(MAX_LIVE_INTENTS)
         .map(|intent| intent.json_for(&principal.owner.id))
         .collect();
-    Ok(Json(
+    Ok(
         json!({"intents": intents, "intents_truncated": truncated_intents,
         "pull_requests": parsed(&prs), "branches": parsed(&branches),
         "connected": connected.is_some(), "truncated": if truncated.is_null() { json!({}) } else { truncated }}),
-    ))
+    )
 }
 
 #[cfg(test)]

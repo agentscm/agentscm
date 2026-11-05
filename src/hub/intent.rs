@@ -5,8 +5,11 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,7 +22,8 @@ use super::session::same_agent;
 use super::store::{
     Event, HubEvent, Principal, Store, User, new_id, unix_now, validate_repository,
 };
-use super::sync::overlapping_pulls;
+use super::sync::{overlapping_pulls, work_view};
+use super::ui::{tag, tag_is_current};
 use super::viewer::masked_label;
 use super::{HubError, HubState, Result};
 
@@ -526,6 +530,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/repos/{repo}/intents/{id}", delete(release))
         .route("/v1/hub/repos/{repo}/notices", get(notices))
         .route("/v1/hub/repos/{repo}/activity", get(activity))
+        .route("/v1/hub/repos/{repo}/snapshot", get(snapshot))
 }
 
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
@@ -681,7 +686,48 @@ async fn activity(
     if !(1..=MAX_ACTIVITY_EVENTS).contains(&limit) || query.before.is_some_and(|b| b <= 0) {
         return Err(ApiError::invalid());
     }
-    let before = query.before;
+    activity_view(&state, principal, limit, query.before)
+        .await
+        .map(Json)
+}
+
+/// The newest page of [`work_view`] and [`activity_view`] in one body, so a status page
+/// polls once. The strong `ETag` is the body's digest: a client that sends it back in
+/// `If-None-Match` gets `304` with no body while nothing it shows has changed. The body is
+/// still built for each request, so this saves transfer and client work, not store reads.
+async fn snapshot(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let work = work_view(&state, &principal, repo).await?;
+    let activity = activity_view(&state, principal, DEFAULT_ACTIVITY_EVENTS, None).await?;
+    let body = serde_json::to_vec(&json!({"work": work, "activity": activity}))
+        .map_err(|error| HubError::Unavailable(error.to_string()))?;
+    let etag = tag(&body);
+    let validators = [
+        (header::ETAG, etag.as_str()),
+        (header::CACHE_CONTROL, "no-cache"),
+    ];
+    Ok(if tag_is_current(&headers, &etag) {
+        (StatusCode::NOT_MODIFIED, validators, ()).into_response()
+    } else {
+        (
+            validators,
+            [(header::CONTENT_TYPE, "application/json")],
+            Body::from(body),
+        )
+            .into_response()
+    })
+}
+
+async fn activity_view(
+    state: &HubState,
+    principal: Principal,
+    limit: usize,
+    before: Option<i64>,
+) -> std::result::Result<Value, ApiError> {
     let (me, my_id) = (principal.owner.login.clone(), principal.owner.id.clone());
     // Rows name owners by login, which is one person within a repository's forge host.
     let label = |agent: &str, login: &str| {
@@ -692,7 +738,7 @@ async fn activity(
         }
     };
     let store = state.store.clone();
-    let (sessions, mut events) = blocking(&state, move || {
+    let (sessions, mut events) = blocking(state, move || {
         let sessions = store.live_sessions(&principal, unix_now(), MAX_ACTIVITY_SESSIONS)?;
         // One extra row says whether older events exist.
         Ok((
@@ -750,8 +796,8 @@ async fn activity(
             )
         })
         .collect::<Result<Vec<Value>>>()?;
-    Ok(Json(json!({"sessions": sessions, "events": events,
-        "next_before": next_before.flatten()})))
+    Ok(json!({"sessions": sessions, "events": events,
+        "next_before": next_before.flatten()}))
 }
 
 async fn renew(

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { AGENT_TOKEN_MESSAGE, ApiError, fetchActivity, fetchHealth, fetchWhoami, fetchWork } from './api.ts'
+import { AGENT_TOKEN_MESSAGE, ApiError, fetchHealth, fetchSnapshot, fetchWhoami } from './api.ts'
 import type { Activity, Health, Whoami, Work } from './types.ts'
 
 const MAX_BACKOFF_MS = 60_000
@@ -63,7 +63,7 @@ export interface HubData {
   health: Health | null
   /** Event ids that appeared since the previous poll (drives the entrance highlight). */
   fresh: ReadonlySet<string>
-  /** Unix ms of the last successful work+activity poll. */
+  /** Unix ms of the last successful snapshot poll, including a 304. */
   lastOk: number | null
   failing: boolean
 }
@@ -75,6 +75,7 @@ export function useHub(token: string, onUnauthorized: (message?: string) => void
   const data = tagged.token === token ? tagged.data : emptyHubData()
   const setData = (update: (data: HubData) => HubData) => setTagged((current) => ({ token, data: update(current.token === token ? current.data : emptyHubData()) }))
   const whoamiRef = useRef<{ token: string; value: Whoami | null }>({ token, value: null })
+  const snapshotTag = useRef<{ token: string; etag: string | null }>({ token, etag: null })
   const unauthorized = useRef(onUnauthorized)
   useEffect(() => {
     unauthorized.current = onUnauthorized
@@ -91,26 +92,22 @@ export function useHub(token: string, onUnauthorized: (message?: string) => void
       if (!current) setData((d) => ({ ...d, whoami }))
       whoamiRef.current = { token, value: whoami }
       const repo = whoami.token.repository
-      // If one of the pair fails, cancel the other instead of letting it run on.
-      const pair = new AbortController()
-      const cancel = () => pair.abort()
-      signal.addEventListener('abort', cancel, { once: true })
-      let work: Work, activity: Activity
-      try {
-        ;[work, activity] = await Promise.all([fetchWork(repo, token, pair.signal), fetchActivity(repo, token, pair.signal)])
-      } catch (e) {
-        pair.abort()
-        throw e
-      } finally {
-        signal.removeEventListener('abort', cancel)
+      const last = snapshotTag.current.token === token ? snapshotTag.current.etag : null
+      const snapshot = await fetchSnapshot(repo, token, signal, last)
+      // 304: nothing changed since the last snapshot, so keep what is shown and only note the poll.
+      if (!snapshot) {
+        setData((d) => ({ ...d, fresh: d.fresh.size ? new Set<string>() : d.fresh, lastOk: Date.now(), failing: false }))
+        return
       }
+      snapshotTag.current = { token, etag: snapshot.etag }
+      const { work, activity } = snapshot
       setData((d) => {
         const seen = new Set(d.activity?.events.map((e) => e.id))
         const fresh = d.activity ? new Set(activity.events.filter((e) => !seen.has(e.id)).map((e) => e.id)) : new Set<string>()
         return { ...d, whoami, work, activity, fresh, lastOk: Date.now(), failing: false }
       })
     },
-    5_000,
+    15_000,
     (e) => {
       if (e instanceof ApiError && e.status === 401) unauthorized.current(e.message === AGENT_TOKEN_MESSAGE ? e.message : undefined)
       else setData((d) => ({ ...d, failing: true }))

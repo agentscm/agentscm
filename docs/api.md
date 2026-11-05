@@ -58,6 +58,14 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
 | `GET /v1/hub/session/handoffs?repository=…` | The person's 50 newest file handoffs there, either side |
 
+## Hub status snapshot
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/snapshot` | Agent or read-only bearer token; `{work, activity}`, the bodies of `GET …/work` and the newest page of `GET …/activity` in one read |
+
+The reply carries a strong `ETag`, the digest of its body, and `Cache-Control: no-cache`. A client that sends it back in `If-None-Match` gets `304` with no body while neither part has changed; any other value gets `200`. The Hub still reads both parts to decide, so a `304` saves transfer and client work, not store reads. Older activity pages stay on `GET …/activity?before=…`. Long-polling for notices stays on `GET …/notices`.
+
 ## Hub PR context
 
 | Route | Token and effect |
