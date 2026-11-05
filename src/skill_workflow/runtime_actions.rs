@@ -305,24 +305,21 @@ pub(super) fn execute(
         if guard.is_some_and(|guard| guard().is_err()) {
             return true;
         }
-        for attempt in 0..5 {
-            match status(&data_dir, run_id) {
-                Ok(view) => {
-                    return view.state == RunState::Cancelled
-                        || view
-                            .steps
-                            .iter()
-                            .any(|view| view.id == step.id && view.state != StepState::Running);
-                }
-                Err(Error::Conflict(message))
-                    if message.starts_with("workflow journal is active:") && attempt < 4 =>
-                {
-                    std::thread::sleep(Duration::from_millis(2))
-                }
-                Err(_) => return true,
+        match status(&data_dir, run_id) {
+            Ok(view) => {
+                view.state == RunState::Cancelled
+                    || view
+                        .steps
+                        .iter()
+                        .any(|view| view.id == step.id && view.state != StepState::Running)
             }
+            // A concurrent journal writer is not a cancellation: killing the child here
+            // would retain a spurious Cancelled outcome. The next poll reads the state.
+            Err(Error::Conflict(message)) if message.starts_with("workflow journal is active:") => {
+                false
+            }
+            Err(_) => true,
         }
-        true
     };
     let result = executor.dispatch(action, &inputs, &profile_digest, &cancelled);
     journal = Journal::open_after_dispatch(&data_dir)?;
