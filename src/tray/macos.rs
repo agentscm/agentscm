@@ -2364,7 +2364,15 @@ fn companion_attention(
             .map(|signal| format!("{} ({})", signal.repository, signal.count))
             .collect::<Vec<_>>()
             .join(" · ");
-        let mut text = format!("{} Work / Inbox signals", total);
+        // The Hub rail badge's wording: both count the shared status projection's needs_you.
+        let mut text = format!(
+            "{total} {} you",
+            if total == 1 {
+                "thing needs"
+            } else {
+                "things need"
+            }
+        );
         if local > 0 {
             text.push_str(&format!(" · {local} local setup alerts"));
         }
@@ -2377,15 +2385,17 @@ fn companion_attention(
         return Some(text);
     }
     if hub_signals.len() < snapshot.connections.len() {
-        return Some("Checking Hub Work and Inbox…".into());
+        return Some("Checking what needs you in Hub…".into());
     }
     if hub_signals.iter().any(|signal| !signal.available) || catalog.unavailable_hubs > 0 {
         return Some("Some Hub work is unavailable. Open Hub to check.".into());
     }
     if hub_signals.iter().any(|signal| !signal.complete) || catalog.incomplete_hubs > 0 {
-        return Some("No signal in the partial Hub snapshot. Open Hub to check.".into());
+        return Some(
+            "No personal action observed in partial Hub coverage. Open Hub to check.".into(),
+        );
     }
-    Some("No Work or Inbox signals across the checked repositories.".into())
+    Some("Nothing needs you across the checked repositories.".into())
 }
 
 fn companion_status(
@@ -3882,7 +3892,7 @@ mod tests {
         assert!(
             companion_attention(&MenuExtras::default(), &[], &catalog, &snapshot)
                 .unwrap()
-                .contains("2 Work / Inbox signals")
+                .contains("2 things need you")
         );
     }
 

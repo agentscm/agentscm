@@ -65,6 +65,20 @@ export function decodeAdminRepository(raw: unknown): AdminRepository | null {
   return { fullName, provider: typeof r['provider'] === 'string' && PROVIDER.test(r['provider']) ? r['provider'] : 'github', host: text(r['host'], 200) ?? '', devices: count(r['devices']), agentTokens: count(r['agent_tokens']) }
 }
 
+/** A store capacity limit that refused agent writes, with what to run (GET /v1/hub/admin/capacity-refusals). */
+export interface CapacityRefusal { limit: string; what: string; provider: string; host: string; repository: string; repositoryId: number | null; at: number; count: number; remedy: string; recent: boolean }
+
+export function decodeCapacityRefusal(raw: unknown): CapacityRefusal | null {
+  const r = rec(raw)
+  const at = unix(r['at'])
+  const limit = typeof r['limit'] === 'string' && /^[a-z_]{1,40}$/.test(r['limit']) ? r['limit'] : null
+  const repository = typeof r['repository'] === 'string' && REPO.test(r['repository']) ? r['repository'] : null
+  const what = text(r['what'], 200)
+  const remedy = text(r['remedy'], 600)
+  if (at === null || !limit || !repository || !what || !remedy) return null
+  return { limit, what, provider: typeof r['provider'] === 'string' && PROVIDER.test(r['provider']) ? r['provider'] : 'github', host: text(r['host'], 255) ?? '', repository, repositoryId: unix(r['repository_id']), at, count: Math.max(1, count(r['count'])), remedy, recent: r['recent'] === true }
+}
+
 export function decodeRefusal(raw: unknown): SignInRefusal | null {
   const r = rec(raw)
   const at = unix(r['at'])
@@ -161,12 +175,14 @@ export async function revokeDevice(auth: DeviceAuth, id: string): Promise<'revok
 }
 
 export async function fetchAdmin(auth: DeviceAuth & { kind: 'browser' }, signal?: AbortSignal) {
-  const [repos, refusals, devices] = await Promise.all([
+  const [repos, refusals, devices, capacity] = await Promise.all([
     request('/v1/hub/admin/repositories', auth, signal).then((r) => r.json()),
     request('/v1/hub/admin/sign-in-refusals', auth, signal).then((r) => r.json()),
     request('/v1/hub/admin/devices', auth, signal).then((r) => r.json()),
+    // An older Hub has no capacity route; its admin lists still load.
+    request('/v1/hub/admin/capacity-refusals', auth, signal).then((r) => r.json(), (e) => (e instanceof ApiError && e.status === 404 ? null : Promise.reject(e))),
   ])
-  return { repositories: list(repos, 'repositories', decodeAdminRepository, 500), refusals: list(refusals, 'refusals', decodeRefusal, 200), devices: list(devices, 'devices', decodeDevice, 500) }
+  return { repositories: list(repos, 'repositories', decodeAdminRepository, 500), refusals: list(refusals, 'refusals', decodeRefusal, 200), devices: list(devices, 'devices', decodeDevice, 500), capacity: capacity === null ? null : list(capacity, 'refusals', decodeCapacityRefusal, 200) }
 }
 
 /** A read-only token the Hub hands its own pages for one repository. Kept in memory only, never stored. */

@@ -359,14 +359,17 @@ client exit is a process fact, not proof that its task completed. The panel sepa
 process from recent hook/MCP sightings, whose live task state is unknown. Existing checkout
 attention appears with an action to use its tray menu. When a saved Hub sign-in permits it, the
 tray checks connected checkouts about once a minute with short-lived read-only tokens and
-shows Hub Work and Inbox signals: blocked tasks, overlaps between live tasks and active
-coordination requests. Quiet, paused and handed-over tasks stay listed as unfinished work and are
-not counted as needing a person. It refreshes the cross-repository list about every two minutes.
-A newly observed signal opens a small attention notice, or marks **New attention** when the
-Now card is fully visible; a partial
-read may reveal an older signal later. The summary marks incomplete reads and does not include
-the Dashboard's live file or pull-request
-crossings; open Hub for those and for full context. The cross-repository list requires a Hub with
+counts what needs you from the same shared status projection as the Hub's **Needs you** badge:
+blockers and reassessments on Work your agent leads; handovers and still-held reservations on
+paused, quiet or merged Work you own; requests to your idle Work; live tasks whose declared
+scopes overlap yours; files you and another agent hold; open pull requests touching files you
+hold; required checks failing on your open pull requests; and `pr-gate` runs blocked at a gate
+after their agent stopped. Another person's
+blocker or request is listed but not counted. The Hub badge also leaves out needs hidden in that
+browser, which the tray cannot see. It refreshes the cross-repository list about every two
+minutes. A newly observed need opens a small attention notice, or marks **New attention** when
+the Now card is fully visible; a partial read may reveal an older one later. The summary marks
+incomplete reads; open Hub for full context. The cross-repository list requires a Hub with
 `GET /v1/hub/device/repositories`; older Hubs leave that portion unavailable. **Pin** keeps the same panel on top until
 dismissed or unpinned. **Start at Login** is off by default and can be changed from the menu. This
 alpha has no separate app install or updater; the binary is unsigned and unnotarized.

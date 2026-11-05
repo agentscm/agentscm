@@ -23,6 +23,7 @@ Options:
 - `--active-days <n>`: without `--refs`, skip branches whose tip was committed more than `n` days ago. Default 14; `0` checks every branch. The report counts them in `inactive_refs_excluded`.
 - `--include-merged`: also scan branches whose changes the base already has through a squash or rebase merge. By default they are skipped, because a branch that has already landed cannot collide with new work; the report counts them in `merged_refs_excluded`, and the text report says "N branches skipped: already merged". Branches merged by ancestry (plain merge or fast-forward) never appear, with or without this flag.
 - `--worktrees`: also check each worktree's uncommitted changes (staged, unstaged and untracked), found with `git worktree list`. This is the many-agents-on-one-machine case.
+- `--merge-order`: also check each branch tip against the base and suggest the merge order that needs the fewest new heads. See [merge order](#merge-order).
 - `--git <path>`: absolute Git executable. Default: the first `git` on `PATH`, then `/usr/bin/git`. Git 2.43 or newer is required; older Git is reported as an error, not guessed around.
 
 - `--json` / `--text`: choose the output. On a terminal the default is a short text report; when stdout is not a terminal (a pipe, a script, the container) the default is JSON, as before. `--json` always prints the JSON below; `--text` forces the text report.
@@ -88,6 +89,45 @@ One JSON value on stdout, `{"ok": true, "collisions": {...}}`. The exit status i
 - Items that could not be analysed (for example no merge base with `--base`) are listed in `skipped`, not dropped silently.
 - Items and collisions are sorted deterministically; `conflict` entries come first.
 - `truncated` is `null` when the scan finished. The CLI never truncates. The service's `GET /v1/collisions` stops after 60 seconds (`"deadline"`; items it had no time to list are in `skipped`) or before its JSON would exceed 4 MiB (`"output"`), and returns the collisions found so far, in scan order, so a cut can drop a `conflict` while keeping an earlier `same-file`. A truncated report is not "nothing more found"; run the CLI for the full one. If the deadline passes before the branch or worktree list is read, the request fails instead.
+
+## Merge order
+
+When every pull request must be validated at its exact head, a merge that makes another
+pull request conflict costs that one a new head and a new validation. `--merge-order`
+predicts which branches can merge first and which should wait:
+
+```text
+Merge order (1 branch needs a new head):
+  First, in any order: origin/feat-export, origin/feat-invoices, origin/fix-login
+  Then, one at a time, update from the base and merge:
+    origin/feat-rounding   conflicts with origin/feat-invoices, origin/fix-login
+```
+
+- A branch whose tip already conflicts with the base needs a new head whatever the order.
+- Among the other branches, it finds the fewest that must get a new head so that every
+  conflicting pair has one. If everything else merges first, each of them needs one new
+  head, made just before its own merge. Ties go to the branch whose name sorts later.
+- JSON adds `merge_order`: `complete`, `merge_first` (branch ids), and `new_head_first`
+  (each with `conflicts_with` and `base_conflicted_paths`). Without `--merge-order` there is
+  no `merge_order` key.
+- When the scan was cut short, a ref could not be checked, a merge check failed, or more
+  than 16 branches conflict with each other, `merge_order` is
+  `{"complete": false, "reason": "..."}` and no order is suggested.
+- It is a prediction from pairwise `git merge-tree` results. Three branches can conflict
+  together even when no two of them do, and a later push changes the answer. It sees only
+  textual conflicts: two branches that merge cleanly can still break each other's tests. Uncommitted
+  worktrees are not ordered. It costs one more `merge-tree` per branch.
+
+To check a repository's open pull requests, fetch first, then pass their branches. The
+recipe below selects pull requests from the same repository. A fork's head needs fetching
+first, for example `git fetch origin pull/42/head:refs/pr/42`, then add `refs/pr/42`.
+
+```bash
+git fetch origin
+gh pr list --json headRefName,isCrossRepository \
+  --jq '.[] | select(.isCrossRepository | not) | "origin/" + .headRefName' |
+  xargs agentscm collisions --merge-order --refs
+```
 
 ## Limits
 

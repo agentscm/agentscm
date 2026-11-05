@@ -80,6 +80,12 @@ export interface Health {
     fail_open: number
     hook_p95_ms: number
   }
+  /** Store capacity limits that refused agent writes; absent on older Hubs or when unread. */
+  capacity?: {
+    /** Repository limits that refused a write in the last day. */
+    recent_limits: number
+    last_refused_at: number | null
+  }
 }
 
 export type SkillWorkflowRunState = 'pending' | 'running' | 'succeeded' | 'completed_with_omissions' | 'failed' | 'blocked' | 'cancelled'

@@ -1,10 +1,12 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
 pub mod agent_rules;
+pub mod capacity;
 pub mod catchup;
 mod catchup_sync;
 pub mod change_record;
 pub mod change_record_http;
+mod compact;
 pub mod connection;
 pub mod continuity;
 pub mod coordination;
@@ -94,8 +96,9 @@ pub enum HubError {
     Unauthorized,
     /// Too many concurrent store operations; the request is not queued.
     Busy,
-    /// The repository's retained work budget needs operator maintenance.
-    WorkCapacity,
+    /// A bounded store limit refused the write; which one, and for which repository, is
+    /// recorded for the operator (see [`capacity`]).
+    WorkCapacity(Box<capacity::Capacity>),
     /// The requested lead scope intersects durable unfinished work.
     WorkOverlap(Vec<work::WorkScopeOverlap>),
     /// A rejected scope mutation that durably created or reused a coordination request.
@@ -126,9 +129,10 @@ impl fmt::Display for HubError {
             Self::Invalid(message) => write!(f, "invalid: {message}"),
             Self::Unauthorized => write!(f, "authentication required"),
             Self::Busy => write!(f, "busy"),
-            Self::WorkCapacity => write!(
+            Self::WorkCapacity(capacity) => write!(
                 f,
-                "repository work storage capacity reached; operator compaction required"
+                "capacity reached: {}; operator action required",
+                capacity.limit.what()
             ),
             Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
             Self::WorkCoordinationRequired { .. } => {
