@@ -115,12 +115,13 @@ error_codes! {
     Forbidden => ("forbidden", 403, false, AskOwner, "This operation is not allowed; ask the owner or Hub administrator for access."),
     Gone => ("gone", 410, false, InspectWork, "The retained resource is no longer available; refresh the current state."),
     Unauthorized => ("unauthorized", 401, false, SignIn, "The credential was not accepted; sign in again."),
+    WrongRepository => ("wrong_repository", 403, false, Reconnect, "This token is for another repository; connect this checkout again."),
     Busy => ("busy", 503, true, Retry, "The Hub is busy; retry later with the same idempotency key or operation id."),
     Unavailable => ("unavailable", 503, true, Retry, "The Hub is unavailable; retry later with the same idempotency key or operation id."),
     WorkStorageCapacity => ("work_storage_capacity", 503, false, ContactOperator, "Repository work storage capacity was reached; ask the Hub operator to compact retained Work."),
     WorkScopeOverlap => ("work_scope_overlap", 409, false, InspectWork, "Declared scope overlaps an existing assignment; split the scope, join or arrange a handover."),
     WorkCoordinationRequired => ("work_coordination_required", 409, false, InspectWork, "Scope was not changed; inspect the durable coordination request and coordinate with its leads."),
-    WorkOverlapIncomplete => ("work_overlap_incomplete", 503, true, Retry, "Overlap coverage is incomplete; retry the same request before relying on scope coverage."),
+    WorkOverlapIncomplete => ("work_overlap_incomplete", 503, true, Retry, "Overlap coverage is incomplete (more than 100 items to compare); no scope was claimed, so retry the same request before relying on scope coverage."),
     WorkPreflightRequired => ("work_preflight_required", 409, false, InspectWork, "Source preflight is changed, incomplete or conflicting; inspect it before claiming Work."),
     WorkCheckpointSequenceConflict => ("work_checkpoint_sequence_conflict", 409, false, InspectWork, "The Work sequence changed and the checkpoint was not committed; inspect current Work before preparing a new request."),
     SessionRequired => ("session_required", 400, false, StartSession, "A session is required; pass your own native session ID on every AgentSCM call."),
@@ -407,7 +408,10 @@ impl ReviewedRejection {
     pub(super) fn new(code: ErrorCode, message: String) -> Self {
         assert!(matches!(
             code,
-            ErrorCode::SessionRequired | ErrorCode::LeadSessionMismatch | ErrorCode::LeaseLapsed
+            ErrorCode::SessionRequired
+                | ErrorCode::LeadSessionMismatch
+                | ErrorCode::LeaseLapsed
+                | ErrorCode::InvalidOrChanged
         ));
         Self {
             code,
@@ -442,6 +446,12 @@ impl HubError {
 
     pub(super) fn lease_lapsed(message: String) -> Self {
         Self::Rejected(ReviewedRejection::new(ErrorCode::LeaseLapsed, message))
+    }
+
+    /// A Work-route refusal whose Hub-authored reason (a fence, a missing field, a current
+    /// sequence number) is what the agent needs to correct the next request.
+    pub(super) fn invalid_or_changed(message: String) -> Self {
+        Self::Rejected(ReviewedRejection::new(ErrorCode::InvalidOrChanged, message))
     }
 }
 
@@ -491,7 +501,7 @@ pub fn from_hub_error(error: &HubError) -> ErrorEnvelope {
     };
     let mut envelope = ErrorEnvelope::new(code);
     match error {
-        HubError::Rejected(rejection) => envelope.message = sanitize(&rejection.message),
+        HubError::Rejected(rejection) => envelope.message = server_message(&rejection.message),
         HubError::Input(fields) => {
             envelope.message = "Provide exactly one Work identity: work_id, source or request_key; do not use a title as identity.".into();
             envelope.fields = Some(fields.clone());
@@ -540,7 +550,10 @@ pub fn from_hub_error(error: &HubError) -> ErrorEnvelope {
 
 pub fn from_code(code: ErrorCode) -> ErrorEnvelope {
     let envelope = ErrorEnvelope::new(code);
-    diagnostic(&envelope, code.message());
+    // A 4xx names the caller's mistake and carries no server cause, so a probe does not fill the log.
+    if code.status() >= 500 {
+        diagnostic(&envelope, code.message());
+    }
     envelope
 }
 
@@ -654,9 +667,10 @@ fn sanitize_text(text: &str, redact_paths: bool) -> String {
                 .iter()
                 .any(|prefix| lower.contains(prefix))
                 || (redact_paths && (word.contains('/') || word.contains('\\')))
-                || word
-                    .trim_start_matches(['\'', '"', '(', '['])
-                    .starts_with(['/', '~', '\\'])
+                || (word.len() > 1
+                    && word
+                        .trim_start_matches(['\'', '"', '(', '['])
+                        .starts_with(['/', '~', '\\']))
                 || word.contains(":\\")
                 || word.contains("file://");
             let redacted = redact_next || sensitive_label || secret;
@@ -706,7 +720,7 @@ pub fn decode(status: u16, body: &Value) -> ErrorEnvelope {
         .recovery();
     }
     if let Some(message) = body["message"].as_str() {
-        let message = sanitize(message);
+        let message = server_message(message);
         if !message.is_empty() {
             envelope.message = message;
         }
@@ -762,7 +776,7 @@ pub fn decode(status: u16, body: &Value) -> ErrorEnvelope {
         if let Some(value) = body.get(key) {
             envelope
                 .details
-                .insert(key.into(), sanitized_value(value, sanitize));
+                .insert(key.into(), sanitized_value(value, server_message));
         }
     }
     envelope
@@ -819,6 +833,18 @@ fn sanitized_value(value: &Value, clean: fn(&str) -> String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_registered_code_is_documented_in_the_api_reference() {
+        let docs = include_str!("../../docs/api.md");
+        for code in ErrorCode::ALL {
+            assert!(
+                docs.contains(&format!("| `{}` |", code.as_str())),
+                "docs/api.md lacks the error code {}",
+                code.as_str()
+            );
+        }
+    }
+
     use std::collections::HashSet;
 
     use super::*;

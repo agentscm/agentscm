@@ -273,7 +273,11 @@ async fn a_read_only_token_reaches_only_the_read_routes_and_writes_nothing() {
                 let mut expected: Value = serde_json::from_str(&bogus_body).unwrap();
                 actual.as_object_mut().unwrap().remove("correlation_id");
                 expected.as_object_mut().unwrap().remove("correlation_id");
-                assert_eq!(actual, expected, "{label}");
+                assert_eq!(
+                    crate::hub_error_assert::blank_references(&actual.to_string()),
+                    crate::hub_error_assert::blank_references(&expected.to_string()),
+                    "{label}"
+                );
             }
             Status(expected) => assert_eq!(status, *expected, "{label}: {body}"),
         }

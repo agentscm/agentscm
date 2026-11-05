@@ -9,6 +9,7 @@
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::thread::sleep;
@@ -25,12 +26,12 @@ fn env(name: &str) -> Result<String, Box<dyn Error>> {
 }
 
 fn write_secret(path: &Path, secret: &str) -> Result<(), Box<dyn Error>> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // The seeder runs in the Linux test image; elsewhere the file keeps default permissions.
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
     writeln!(file, "{secret}")?;
     Ok(())
 }

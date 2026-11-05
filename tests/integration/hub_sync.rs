@@ -3479,7 +3479,12 @@ async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
         )
         .await;
     assert_eq!(foreign["result"]["isError"], true);
-    assert!(foreign["result"]["structuredContent"].is_null());
+    // A token for another repository learns nothing but the refusal itself.
+    assert_eq!(
+        foreign["result"]["structuredContent"]["error"]["code"],
+        "wrong_repository"
+    );
+    assert!(foreign["result"]["structuredContent"]["work"].is_null());
     assert!(
         foreign["result"]["content"][0]["text"]
             .as_str()

@@ -1048,7 +1048,10 @@ async fn encoded_repository_guards_are_judged_identically_to_raw_guards() {
             if accepted {
                 assert_eq!(live[0].paths, ["src/widget.rs"]);
             }
-            assert_eq!(*first.get_or_insert(reply.clone()), reply);
+            // Each failure carries its own reference; the rest of the answer must be identical.
+            let same =
+                |reply: &Value| crate::hub_error_assert::blank_references(&reply.to_string());
+            assert_eq!(same(first.get_or_insert(reply.clone())), same(&reply));
         }
     }
 }

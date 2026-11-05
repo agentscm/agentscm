@@ -1528,30 +1528,25 @@ mod tests {
 
     #[test]
     fn workspace_guard_keeps_authorization_outages_uncertain() {
-        for (error, code, retryable) in [
-            (HubError::Busy, "busy", true),
-            (HubError::Unavailable("store".into()), "unavailable", true),
-            (HubError::Unauthorized, "unauthorized", false),
-            (HubError::session_required(), "session_required", false),
+        for error in [
+            HubError::Busy,
+            HubError::Unavailable("store".into()),
+            HubError::WorkOverlapIncomplete,
         ] {
-            let crate::Error::Hub(envelope) = WorkspaceGuard::guard_error(error) else {
-                panic!("workspace guard discarded the envelope");
-            };
-            assert_eq!(envelope.code, code);
-            assert_eq!(envelope.retryable, retryable);
-            let expected = serde_json::to_value(&envelope).unwrap();
-            let recovered = task_error(crate::Error::Hub(envelope.clone()));
-            assert_eq!(
-                serde_json::to_value(super::super::error_envelope::from_hub_error(&recovered))
-                    .unwrap(),
-                expected
-            );
-            let recovered = native_action_error(crate::Error::Hub(envelope));
-            assert_eq!(
-                serde_json::to_value(super::super::error_envelope::from_hub_error(&recovered))
-                    .unwrap(),
-                expected
-            );
+            assert!(matches!(
+                WorkspaceGuard::guard_error(error),
+                crate::Error::Io(_)
+            ));
+        }
+        for error in [
+            HubError::Unauthorized,
+            HubError::session_required(),
+            HubError::Invalid("x".into()),
+        ] {
+            assert!(matches!(
+                WorkspaceGuard::guard_error(error),
+                crate::Error::Conflict(_)
+            ));
         }
     }
 }

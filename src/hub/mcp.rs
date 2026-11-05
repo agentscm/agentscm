@@ -26,7 +26,7 @@ use super::coordination::{
     CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResolve,
     CoordinationStatus, CoordinationWithdraw,
 };
-use super::error_envelope::{self, ErrorCode, InputProblem};
+use super::error_envelope::{self, ErrorCode, FieldProblem, InputProblem};
 use super::http::{ApiError, Reader, blocking};
 use super::insights::{InsightQuery, UsageRecord};
 use super::promise::{
@@ -409,7 +409,7 @@ async fn mcp(
                 .is_some_and(|repo| repo != principal.repository);
             if params.and_then(|p| p["name"].as_str()) == Some("agentscm_setup_status") {
                 if foreign {
-                    Ok(refused("unauthorized"))
+                    Ok(refused("wrong_repository"))
                 } else {
                     // Say which argument is wrong (e.g. "missing field `agent`"), as other tools do.
                     match try_args::<super::onboarding::SetupCall>(
@@ -1260,9 +1260,24 @@ fn safe_detail(error: &str) -> String {
 }
 
 /// A malformed call is the caller's mistake, not a coordination outage.
-pub(super) fn invalid_args(_tool: &str, detail: &str) -> Value {
+pub(super) fn invalid_args(tool: &str, detail: &str) -> Value {
     let mut error = error_envelope::from_code(ErrorCode::InvalidRequest);
-    error.fields = InputProblem::from_json_error(detail).map(|field| vec![field]);
+    // Name the field that is wrong, as the caller needs, but only when it passes the field-name
+    // check: the serde text can carry caller-chosen characters, which are never echoed.
+    let field = InputProblem::from_json_error(detail);
+    let reason = match &field {
+        Some(field) => match field.problem {
+            FieldProblem::Missing => format!("missing field `{}`", field.name),
+            FieldProblem::Unknown => format!("unknown field `{}`", field.name),
+            _ => format!("field `{}` has the wrong type or value", field.name),
+        },
+        None => "the arguments do not match the tool's input schema".to_owned(),
+    };
+    error.message = format!(
+        "invalid arguments for {}: {reason}",
+        error_envelope::server_message(tool)
+    );
+    error.fields = field.map(|field| vec![field]);
     error.mcp()
 }
 
@@ -1283,6 +1298,14 @@ fn result(text: &str, is_error: bool) -> Value {
         return error_envelope::from_code(ErrorCode::InvalidRequest).mcp();
     }
     json!({"content": [{"type": "text", "text": text}], "isError": false})
+}
+
+/// A refusal whose reason carries numbers or a command the registry text cannot hold.
+fn refused_with(code: &str, message: String) -> Value {
+    let mut envelope =
+        error_envelope::from_code(ErrorCode::parse(code).unwrap_or(ErrorCode::Unavailable));
+    envelope.message = message;
+    envelope.mcp()
 }
 
 fn refused(code: &str) -> Value {
@@ -1847,7 +1870,7 @@ async fn call_inner(
         return Err(INVALID_PARAMS);
     }
     if foreign {
-        return Ok(refused("unauthorized"));
+        return Ok(refused("wrong_repository"));
     }
     let arguments = params.and_then(|params| params.get("arguments"));
     if name == "agentscm_value_metrics" {
@@ -1860,7 +1883,7 @@ async fn call_inner(
             .as_ref()
             .is_some_and(|repository| repository != &principal.repository)
         {
-            return Ok(refused("unauthorized"));
+            return Ok(refused("wrong_repository"));
         }
         let scope = json!({"work_id":query.work_id,"since":query.since,"until":query.until});
         let store = state.store.clone();
@@ -2385,7 +2408,10 @@ async fn call_inner(
         return Ok(if name == "agentscm_briefing_prepare" {
             match super::narrative::claim(state, principal, query).await {
                 Ok(value) => structured(&value),
-                Err(HubError::Busy) => refused("busy"),
+                Err(HubError::Busy) => refused_with(
+                    "busy",
+                    "briefing temporarily busy; retry the same prepare request at most twice after a short delay; do not generate without a lease".into(),
+                ),
                 Err(error) => hub_failure(&error),
             }
         } else {
@@ -2403,7 +2429,10 @@ async fn call_inner(
         return Ok(
             match super::narrative::submit(state, principal, submission).await {
                 Ok(value) => narrative_result(&value),
-                Err(HubError::Busy) => refused("busy"),
+                Err(HubError::Busy) => refused_with(
+                    "busy",
+                    "briefing temporarily busy; retry this same id, digest, lease and output at most twice after a short delay while the lease remains valid; do not regenerate".into(),
+                ),
                 Err(error) => hub_failure(&error),
             },
         );
@@ -2966,7 +2995,24 @@ async fn shared_conversation(
         cursor,
         digest,
     } = args;
-    let refusal = |error: super::http::ApiError| error.envelope().mcp();
+    let refusal = |error: super::http::ApiError| {
+        let mut envelope = error.envelope().clone();
+        let specific = match envelope.code.as_str() {
+            "forbidden" => {
+                Some("only the person who shared this conversation and Hub admins can read it")
+            }
+            "not_found" => Some("shared conversation not found"),
+            "gone" => Some("this conversation body has expired or been deleted"),
+            "integrity_failure" => {
+                Some("the stored body is missing or failed verification (integrity_failure)")
+            }
+            _ => None,
+        };
+        if let Some(message) = specific {
+            envelope.message = message.into();
+        }
+        envelope.mcp()
+    };
     let Some(digest) = digest else {
         return match super::change_record_http::conversation_page(state, principal, work_id, cursor)
             .await
@@ -2993,7 +3039,13 @@ async fn shared_conversation(
         Err(error) => return refusal(error),
     };
     if bytes.len() > MAX_CHANGE_RECORD_RESPONSE_BYTES {
-        return refused("source_body_too_large");
+        return refused_with(
+            "source_body_too_large",
+            format!(
+                "this body is {} bytes, over the {MAX_CHANGE_RECORD_RESPONSE_BYTES}-byte limit for this tool; it is not truncated. Read it with `agentscm change-capture conversation --digest` or the Hub UI",
+                bytes.len()
+            ),
+        );
     }
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(content) => structured(&json!({
@@ -3031,8 +3083,8 @@ fn change_record_result(response: ChangeRecordResponseV1) -> Value {
 }
 
 fn work_failure(error: &HubError) -> Value {
-    if matches!(error, HubError::Invalid(_)) {
-        hub_failure(&HubError::reviewed(ErrorCode::InvalidOrChanged))
+    if let HubError::Invalid(message) = error {
+        hub_failure(&HubError::invalid_or_changed(message.clone()))
     } else {
         hub_failure(error)
     }

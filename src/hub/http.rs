@@ -243,13 +243,15 @@ impl ApiError {
     }
 
     pub fn new(status: StatusCode, code: &'static str) -> Self {
+        let registered = ErrorCode::parse(code);
+        // A forgotten registry entry fails tests, but never panics a request handler in production.
+        debug_assert!(registered.is_some(), "unregistered Hub error code {code}");
+        let registered = registered.unwrap_or_else(|| ErrorCode::for_status(status.as_u16()));
         Self {
             status,
-            code,
+            code: registered.as_str(),
             detail: serde_json::Map::new(),
-            envelope: Box::new(error_envelope::from_code(
-                ErrorCode::parse(code).expect("registered Hub error code"),
-            )),
+            envelope: Box::new(error_envelope::from_code(registered)),
         }
     }
 
