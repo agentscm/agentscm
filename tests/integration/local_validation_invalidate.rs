@@ -16,12 +16,12 @@ const FILES: [&str; 2] = [
 const OURS: &str = "agentscm/local-validation";
 const FAKE_GH: &str = r#"#!/bin/bash
 echo "$*" >> "$FIX/calls"
-method=GET; jqx=.; path=
+method=GET; jqx=.; path=; ctx=
 while (($#)); do
   case $1 in
     -X) method=$2; shift ;;
     --jq) jqx=$2; shift ;;
-    -f) shift ;;
+    -f) case $2 in context=*) ctx=${2#context=} ;; esac; shift ;;
     api | --paginate) ;;
     *) path=$1 ;;
   esac
@@ -33,7 +33,9 @@ case "$method $path" in
   "GET repos/o/r/commits/"*"/status") [ "${STATUS_FAIL:-}" != "$sha" ] || exit 1
     jq -r "$jqx" "$FIX/status-$sha.json" ;;
   "POST repos/o/r/statuses/"*) [ "${POST_FAIL:-}" != "${path##*/}" ] || exit 1
+    [ "${POST_FAIL:-}" != "${path##*/} $ctx" ] || exit 1
     echo "${path##*/}" >> "$FIX/posts"
+    echo "${path##*/} $ctx" >> "$FIX/writes"
     echo "{\"state\":\"${POST_REPLY:-pending}\"}" | jq -r "$jqx" ;;
   *) echo "unexpected call: $method $path" >&2; exit 1 ;;
 esac
@@ -86,6 +88,8 @@ fn status(statuses: &[(&str, &str)]) -> String {
 struct Outcome {
     ok: bool,
     posts: Vec<String>,
+    /// `<sha> <context>` per accepted write.
+    writes: Vec<String>,
     calls: Vec<String>,
     stdout: String,
 }
@@ -124,6 +128,7 @@ fn run(pulls: &str, statuses: &[(String, String)], envs: &[(&str, &str)]) -> Out
     Outcome {
         ok: out.status.success(),
         posts: read("posts").lines().map(str::to_owned).collect(),
+        writes: read("writes").lines().map(str::to_owned).collect(),
         calls: read("calls").lines().map(str::to_owned).collect(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
     }
@@ -262,4 +267,107 @@ fn unexpected_write_reply_is_reported_without_failing_the_step() {
     );
     assert!(o.ok);
     assert!(o.stdout.contains("::error::unexpected reply"));
+}
+
+fn family(name: &str) -> String {
+    format!("{OURS}/{name}")
+}
+
+#[test]
+fn every_success_context_of_the_family_is_written_with_its_own_name() {
+    let (aggregate, static_check, constituent) =
+        (OURS.to_owned(), family("static"), family("static/lint"));
+    let body = status(&[
+        (&aggregate, "success"),
+        (&static_check, "success"),
+        (&constituent, "success"),
+        (&family("unit"), "pending"),
+        (&family("unit/tests"), "failure"),
+        (&family("docs"), "error"),
+        // Look-alikes and unrelated contexts are never written, even when they succeed.
+        ("agentscm/local-validation-foo", "success"),
+        ("agentscm/workflow/x", "success"),
+        ("agentscm/local-validation/UPPER", "success"),
+        ("agentscm/local-validation/a/b/c", "success"),
+        ("agentscm/local-validation/", "success"),
+    ]);
+    let o = run(&pulls(&[quoted('a')]), &[(sha('a'), body)], &[]);
+    assert!(o.ok);
+    let mut want: Vec<String> = [aggregate, static_check, constituent]
+        .iter()
+        .map(|c| format!("{} {c}", sha('a')))
+        .collect();
+    want.sort();
+    let mut got = o.writes.clone();
+    got.sort();
+    assert_eq!(got, want);
+    let post = o.calls.iter().find(|c| c.contains("-X POST")).unwrap();
+    assert!(post.contains("state=pending") && post.contains(&format!("target_url={RUN_URL}")));
+}
+
+#[test]
+fn prefixed_success_alone_opts_in_nothing_else() {
+    let body = status(&[(&family("static"), "success")]);
+    let o = run(&pulls(&[quoted('a')]), &[(sha('a'), body)], &[]);
+    assert_eq!(o.writes, [format!("{} {}", sha('a'), family("static"))]);
+}
+
+#[test]
+fn prefixed_contexts_are_found_across_pages() {
+    let pages = format!(
+        "{}\n{}",
+        status(&[(&family("static/lint"), "success")]),
+        status(&[("other", "success"), (&family("unit"), "success")])
+    );
+    let o = run(&pulls(&[quoted('a')]), &[(sha('a'), pages)], &[]);
+    assert!(o.ok);
+    assert_eq!(
+        o.writes,
+        [
+            format!("{} {}", sha('a'), family("static/lint")),
+            format!("{} {}", sha('a'), family("unit"))
+        ]
+    );
+    for read in o.calls.iter().filter(|c| !c.contains("-X POST")) {
+        assert!(read.contains("--paginate"), "{read}");
+    }
+}
+
+#[test]
+fn a_failed_write_to_one_context_does_not_stop_the_others() {
+    let body = status(&[
+        (OURS, "success"),
+        (&family("static"), "success"),
+        (&family("unit"), "success"),
+    ]);
+    let o = run(
+        &pulls(&[quoted('a'), quoted('b')]),
+        &[(sha('a'), body), success_for('b')],
+        &[("POST_FAIL", &format!("{} {}", sha('a'), family("static")))],
+    );
+    assert!(o.ok);
+    assert_eq!(
+        o.writes,
+        [
+            format!("{} {OURS}", sha('a')),
+            format!("{} {}", sha('a'), family("unit")),
+            format!("{} {OURS}", sha('b')),
+        ]
+    );
+    assert!(o.stdout.contains(&format!(
+        "::error::failed to set {} {}",
+        sha('a'),
+        family("static")
+    )));
+}
+
+#[test]
+fn a_failed_read_writes_the_legacy_context_only() {
+    let o = run(
+        &pulls(&[quoted('a')]),
+        &[(sha('a'), status(&[(&family("static"), "success")]))],
+        &[("STATUS_FAIL", &sha('a'))],
+    );
+    assert!(o.ok);
+    assert_eq!(o.writes, [format!("{} {OURS}", sha('a'))]);
 }

@@ -22,9 +22,26 @@ const PULLS: usize = 100;
 const RUNS: usize = 100;
 const SESSIONS: usize = 100;
 
-/// Exactly the two required contexts, in the Hub's own spelling, so ids and text stay plain.
+/// The required contexts, in the Hub's own spelling, so ids and text stay plain: the legacy
+/// local-validation context, `agentscm/local-validation/<id>` and
+/// `agentscm/local-validation/<id>/<constituent>` (ids of `[a-z0-9-]`), and the Hub's own checks.
+/// Anything else, including look-alikes such as `agentscm/local-validation-foo`, is not reported.
 fn required(name: &str) -> bool {
+    let id = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 40
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
     name == LOCAL_VALIDATION
+        || name
+            .strip_prefix(LOCAL_VALIDATION)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|rest| {
+                let mut parts = rest.split('/');
+                let (check, constituent, extra) = (parts.next(), parts.next(), parts.next());
+                extra.is_none() && check.is_some_and(id) && constituent.is_none_or(id)
+            })
         || name.strip_prefix(HUB_CHECK_PREFIX).is_some_and(|target| {
             crate::hub::forge_check::status_context(target).is_ok_and(|c| c == name)
         })
@@ -407,4 +424,34 @@ pub(super) fn read(
         limits.insert("check_recipient_unknown".into());
     }
     Ok((actions, limits, lower_hex_of(&evidence.finalize())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required;
+
+    #[test]
+    fn named_local_validation_contexts_are_required_and_look_alikes_are_not() {
+        for yes in [
+            "agentscm/local-validation",
+            "agentscm/local-validation/static",
+            "agentscm/local-validation/static/react-doctor",
+            "agentscm/workflow/main",
+        ] {
+            assert!(required(yes), "{yes}");
+        }
+        for no in [
+            "agentscm/local-validation-foo",
+            "agentscm/local-validation/",
+            "agentscm/local-validation//x",
+            "agentscm/local-validation/Static",
+            "agentscm/local-validation/a/b/c",
+            "agentscm/local-validation/a b",
+            "agentscm/local-validation/a/",
+            "agentscm/workflow/",
+            "ci/unrelated",
+        ] {
+            assert!(!required(no), "{no}");
+        }
+    }
 }
