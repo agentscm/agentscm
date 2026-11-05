@@ -1,24 +1,17 @@
 name: Status page
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-    paths:
-      - "ui/**"
-      - "THIRD_PARTY_NOTICES.md"
-      - ".github/workflows/ui.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ui-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ui-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   ui:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:

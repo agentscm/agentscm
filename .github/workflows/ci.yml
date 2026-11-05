@@ -1,10 +1,8 @@
 name: CI
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
-  # Replaces the push to main; the release PR also runs this workflow through ci-extended.
+  # Nightly and manual only; the release PR dispatches it.
   schedule:
     - cron: '23 7 * * *'
 
@@ -12,17 +10,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   # Routine checks run locally; this is the explicit hosted fallback. Platform checks below keep
-  # their nightly coverage. Fork code runs only after a maintainer applies ci-extended.
+  # their nightly coverage.
   static:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -43,7 +41,7 @@ jobs:
 
   # The local recipe requires PostgreSQL and S3; keep the same hosted service-backed fallback.
   tests:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -100,10 +98,8 @@ jobs:
   # Clippy and release builds for the musl and macOS targets, so a target-specific lint (for example a libc
   # item deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the
   # pull request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
-  # needs the UI build. Same gate as the `windows` job in windows.yml: with the `ci-extended` label, a
-  # fork PR once per labelling, and always on scheduled and manual runs.
+  # needs the UI build. Runs on scheduled and manual runs, like the `windows` job in windows.yml.
   release-targets:
-    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')) }}
     strategy:
       fail-fast: false
       matrix:
