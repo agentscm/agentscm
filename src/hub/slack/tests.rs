@@ -486,8 +486,25 @@ async fn a_repeater_is_not_told_about_its_own_mcp_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_holder_sessions_of_one_token_message_their_person_once() {
     let f = Fixture::new().await;
+    // A REST intent with the lowest id holds the file too, and no session could answer for it.
+    let rest = crate::hub::intent::NewIntent {
+        id: format!("int_{:032x}", 0),
+        task: "rest".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec![PATH.into()],
+        ttl_seconds: 3600,
+    };
+    tokio::task::block_in_place(|| f.store().announce_intent(&f.alice, &rest, unix_now())).unwrap();
     f.edit(&f.alice, "a");
     f.edit(&f.alice, "c");
+    // Settle c's own request, so bob's is the only one the button can answer.
+    tokio::task::block_in_place(|| {
+        f.store()
+            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
+            .unwrap()
+    });
     f.edit(&f.alice, "c");
     f.run().await;
     let before = f.sent().len();
@@ -500,6 +517,35 @@ async fn two_holder_sessions_of_one_token_message_their_person_once() {
         .filter(|(user, text)| user == "U1" && text.contains("which your"))
         .collect();
     assert_eq!(holder.len(), 1, "{sent:?}");
+    // The one button answers for the session the request was filed against.
+    assert_eq!(f.click("U1", YES).await, StatusCode::OK);
+    assert_eq!(
+        f.update().await["blocks"][3]["elements"][0]["text"],
+        "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decline_under_one_token_names_the_requesters_session() {
+    let f = Fixture::new().await;
+    f.edit(&f.alice, "a");
+    assert!(!f.edit(&f.alice, "b").denied.is_empty());
+    tokio::task::block_in_place(|| {
+        f.store()
+            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
+            .unwrap()
+    });
+    f.run().await;
+    let key = &crate::hub::store::session_key(&f.alice, "b")[..8];
+    assert_eq!(
+        f.sent(),
+        [(
+            "U1".to_owned(),
+            format!(
+                "Another agent kept a file your agent asked for | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code session {key} | Their agent: alice’s Claude Code | Agree with them who goes first."
+            )
+        )]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

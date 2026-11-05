@@ -878,9 +878,16 @@ impl Slack {
                         i.session.as_deref() == Some(own) || session_kind(&i.via).is_none()
                     })
             };
-            // Oldest first, as `judge` asks: that session's button has a request to answer.
+            // Whom `judge` would ask first: a connected session on the exact file, oldest first.
+            // That session's button has a request to answer.
+            let asked = |i: &Intent| {
+                !i.via.is_empty()
+                    && i.paths
+                        .iter()
+                        .any(|spec| paths.iter().any(|path| path == spec))
+            };
             let mut holding: Vec<&Intent> = intents.iter().filter(|i| !skipped(i)).collect();
-            holding.sort_by_key(|i| (i.created_at, i.id.as_str()));
+            holding.sort_by_key(|i| (!asked(i), i.created_at, i.id.as_str()));
             let mut told = BTreeSet::new();
             for intent in holding {
                 let held: Vec<String> = paths

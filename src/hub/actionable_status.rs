@@ -655,7 +655,10 @@ pub fn recipient_label(recipient: &StatusRecipient) -> String {
         (Some(login), RecipientKind::Person) => login.clone(),
         (Some(login), RecipientKind::LeadAgent) => format!(
             "{login}’s {}",
-            recipient.agent.as_deref().unwrap_or("agent")
+            recipient
+                .agent
+                .as_deref()
+                .map_or("agent".into(), crate::hub::advice::agent_name)
         ),
         (_, RecipientKind::None) => "No action assigned".into(),
         _ => "Recipient unknown".into(),

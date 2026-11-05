@@ -61,8 +61,9 @@ the forge did not accept the code. What signing in gives you:
   `machine-id` file next to `hub-session.json` (never derived from the host name). To choose a name
   instead, write one line to `machine-name` in the same directory; labels then read `<name>-<hex>`
   (ASCII letters, digits, `-` and `_`, at most 50). Tokens already stored keep their old label until
-  the token is replaced. Hook, MCP, CLI, Slack and pull-request text mask it; `agent.name` in the
-  Hub's JSON and the Hub page's `title` attribute still carry it.
+  the token is replaced, and Work records that already copied it keep it. Hook, MCP, `agentscm
+  intent`, Slack and pull-request text mask it; `agent.name` in the Hub's JSON, the Hub page's
+  `title` attribute and your own `agentscm hub tokens` listing still show it.
 - **Access is re-checked every time.** Each mint and renewal checks that you are still enabled
   and allowed on the Hub and still have the repository role (on a public repository Triage or
   more, on a private one read; on GitLab Reporter for private, Developer otherwise). The Hub asks
