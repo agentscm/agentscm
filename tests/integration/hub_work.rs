@@ -1,6 +1,7 @@
 //! Durable work coordination store conformance. Every case runs on SQLite and,
 //! when configured, PostgreSQL.
 use crate::hub_pg;
+use agentscm::hub::capacity::CapacityLimit;
 
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
@@ -2050,7 +2051,7 @@ fn concurrent_delivery_reservations_enforce_capacity_and_roll_back(db: &Db) {
     for (token, result) in results {
         match result {
             Ok(page) => winner = Some((token, page)),
-            Err(HubError::WorkCapacity) => {
+            Err(HubError::WorkCapacity(c)) if c.limit == CapacityLimit::WorkStorage => {
                 loser = Some(token);
             }
             other => panic!("unexpected capacity result: {other:?}"),
@@ -4686,7 +4687,7 @@ fn release_succeeds_at_payload_quota_and_retain_refuses(db: &Db) {
             &transition_request(&item, "ret", Retain, Some("s-a")),
             now + 1
         ),
-        Err(HubError::WorkCapacity)
+        Err(HubError::WorkCapacity(c)) if c.limit == CapacityLimit::WorkStorage
     ));
     assert_eq!(store.latest_event_seq().unwrap(), seq);
     assert_eq!(db.reservation(&item.id), (None, Some("admitted".into())));
@@ -5452,7 +5453,7 @@ fn finish_at_payload_quota_succeeds_in_its_cleanup(db: &Db) {
                 finished = Some(result);
                 break;
             }
-            Err(HubError::WorkCapacity) => {}
+            Err(HubError::WorkCapacity(c)) if c.limit == CapacityLimit::WorkStorage => {}
             Err(other) => panic!("unexpected {other:?}"),
         }
     }

@@ -436,9 +436,21 @@ fn read_scoped(
     if requests.retention_gap {
         limits.insert("request_history_gap".to_owned());
     }
-    // These producers remain separate issue slices, never inferred from Work checkpoint prose.
+    // This producer remains a separate issue slice, never inferred from Work checkpoint prose.
     limits.insert("failed_check_attention_not_integrated".to_owned());
-    limits.insert("capacity_attention_not_integrated".to_owned());
+    // A recent capacity refusal here means some agent writes never landed. It is the
+    // operator's to fix (Health and admin pages), so it limits coverage and is no one's action.
+    for refusal in store.capacity_refusals(now)? {
+        let r = &refusal.repository;
+        if refusal.at > now - crate::hub::capacity::RECENT_SECONDS
+            && r.provider == principal.owner.identity.provider
+            && r.host == principal.owner.identity.host
+            && r.repository == principal.repository
+            && r.repository_id == principal.repository_id
+        {
+            limits.insert(format!("capacity_refused:{}", refusal.limit.as_str()));
+        }
+    }
 
     let mut selected: BTreeMap<String, Option<WorkItem>> = holders
         .work

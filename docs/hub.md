@@ -359,7 +359,12 @@ status shown; clients show `message` as is.
   computer mints within 30 days, at most 200, one row per person and reason (`at`, `count`,
   `provider`, `host`, `login`, `forge_user_id`, `reason`, `via` `sign_in`, `device_mint` or
   `web_read_token`; a
-  repeat bumps `count`). No secret is stored, and still no user row, event or session for the
+  repeat bumps `count`), and `GET /v1/hub/admin/capacity-refusals`: agent writes a full store
+  limit refused within 30 days, at most 200, one row per repository and limit (`limit`
+  `work_storage`, `merge_observations`, `catchup_deliveries`, `change_records`,
+  `coordination_requests` or `coordination_updates`, plus `what`, `provider`, `host`,
+  `repository`, `repository_id`, `at`, `count`, `recent` for the last day, and `remedy`, the
+  command or step for that limit). No secret is stored, and still no user row, event or session for the
   refused person.
 - Events: `device_created`, `device_renamed`, `device_revoked` (`by` the acting user, or the
   computer that revoked another), `auto_connected`.
@@ -375,7 +380,7 @@ status shown; clients show `message` as is.
 
 ## Routes
 
-- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"version":"0.1.0-alpha.7","commit":"<40 hex>"|null}`. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older.
+- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"capacity":{"recent_limits":0,"last_refused_at":null},"version":"0.1.0-alpha.7","commit":"<40 hex>"|null}`. `capacity` counts the repository limits that refused an agent write in the last day and gives the newest refusal time, without naming a repository; it is `null` when the refusal record could not be read. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older.
   (warn-once counters, see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)), plus
   `"demo":true` on the throwaway hub of `agentscm demo`, or 503 if the database does not answer.
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the

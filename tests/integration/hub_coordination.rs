@@ -1,5 +1,6 @@
 //! Public coordination response bounds that must stay below the Hub JSON limit.
 use crate::hub_pg;
+use agentscm::hub::capacity::CapacityLimit;
 
 use std::sync::Arc;
 
@@ -780,7 +781,7 @@ fn quotas_and_unavailable_requester_cleanup_are_enforced(db: &Db) {
             &start("quota-request-8", "requester-session"),
             now + 9,
         ),
-        Err(HubError::WorkCapacity)
+        Err(HubError::WorkCapacity(c)) if c.limit == CapacityLimit::CoordinationRequests
     ));
 
     let cleanup = CoordinationWithdraw {
@@ -990,7 +991,7 @@ fn quotas_and_unavailable_requester_cleanup_are_enforced(db: &Db) {
             &start("owner-request-25", "owner-session-3"),
             now + 75,
         ),
-        Err(HubError::WorkCapacity)
+        Err(HubError::WorkCapacity(c)) if c.limit == CapacityLimit::CoordinationRequests
     ));
 }
 

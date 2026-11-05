@@ -1,6 +1,7 @@
 //! Durable person-level catch-up storage contracts.
 
 use crate::hub_pg;
+use agentscm::hub::capacity::CapacityLimit;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -1146,7 +1147,7 @@ fn agent_delivery_budget_reserves_human_capacity(fixture: &Fixture) {
             },
             now + 20
         ),
-        Err(HubError::WorkCapacity)
+        Err(HubError::WorkCapacity(c)) if c.limit == CapacityLimit::CatchupDeliveries
     ));
     let human = fixture
         .store
@@ -1207,7 +1208,7 @@ fn human_and_agent_delivery_row_budgets_are_independent(fixture: &Fixture) {
             },
             now
         ),
-        Err(HubError::WorkCapacity)
+        Err(HubError::WorkCapacity(c)) if c.limit == CapacityLimit::CatchupDeliveries
     ));
 }
 

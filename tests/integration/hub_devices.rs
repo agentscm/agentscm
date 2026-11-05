@@ -3181,3 +3181,113 @@ async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
     assert_eq!(revoked_status, 404);
     assert_eq!(revoked, unknown);
 }
+
+/// #293: a refused agent write reaches the operator, with what to run, and no one else's badge.
+#[tokio::test]
+async fn a_capacity_refusal_reaches_the_operator_with_what_to_run() {
+    use agentscm::hub::coordination::MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN;
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (lead, lead_secret) = agent_for(&env, &alice.id, "claude-code", false);
+    let (_, asker) = agent_for(&env, &bob.id, "codex", false);
+    env.store
+        .work_start(&lead, &work("billing", "alice-session"), unix_now())
+        .unwrap();
+    let (_, health) = env
+        .call(&env.hub, Method::GET, "/v1/hub/health", None, None)
+        .await;
+    assert_eq!(health["capacity"]["recent_limits"], json!(0), "{health}");
+    // Each overlapping start opens a request, until the per-token cap refuses one.
+    let start = |n: i64| {
+        json!({"request_key": format!("rounding-{n}"), "title": format!("Rounding {n}"),
+            "session": "bob-session", "scope": ["src/billing.rs"]})
+    };
+    for n in 0..MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN {
+        let (status, reply) = env
+            .call(
+                &env.hub,
+                Method::POST,
+                "/v1/hub/standup/start",
+                Some(&asker),
+                Some(start(n)),
+            )
+            .await;
+        assert_ne!(status, 503, "{reply}");
+    }
+    let (status, refused) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/standup/start",
+            Some(&asker),
+            Some(start(MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN)),
+        )
+        .await;
+    assert_eq!(
+        (status, refused),
+        (
+            503,
+            json!({"error": "work_storage_capacity", "limit": "coordination_requests"})
+        )
+    );
+
+    // The admin sees which repository and limit, counted, with the remedy.
+    let (admin, _, _) = env.sign_in(ADMIN, "admin's laptop").await;
+    let (status, list) = env.get("/v1/hub/admin/capacity-refusals", &admin).await;
+    assert_eq!(status, 200, "{list}");
+    let rows = list["refusals"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{list}");
+    assert_eq!(
+        (
+            &rows[0]["repository"],
+            &rows[0]["repository_id"],
+            &rows[0]["limit"],
+            &rows[0]["count"],
+            &rows[0]["recent"]
+        ),
+        (
+            &json!(REPO),
+            &json!(REPO_ID),
+            &json!("coordination_requests"),
+            &json!(1),
+            &json!(true)
+        )
+    );
+    assert!(
+        rows[0]["remedy"]
+            .as_str()
+            .unwrap()
+            .starts_with("Resolve or withdraw open coordination requests"),
+        "{list}"
+    );
+    // Not for anyone else, nor for a computer credential or an agent.
+    let (person, device, _) = env.sign_in(ALICE, "alice's laptop").await;
+    for credential in [&person, &device, &asker] {
+        assert_ne!(
+            env.get("/v1/hub/admin/capacity-refusals", credential)
+                .await
+                .0,
+            200
+        );
+    }
+    // The public health counts it without naming the repository.
+    let (_, health) = env
+        .call(&env.hub, Method::GET, "/v1/hub/health", None, None)
+        .await;
+    assert_eq!(health["capacity"]["recent_limits"], json!(1), "{health}");
+    assert!(health["capacity"]["last_refused_at"].is_i64(), "{health}");
+    assert!(!health.to_string().contains(REPO));
+    // Shared status marks coverage incomplete for the repository; it is nobody's action.
+    for token in [&asker, &lead_secret] {
+        let (status, facts) = env.get("/v1/hub/standup/status", token).await;
+        assert_eq!(status, 200, "{facts}");
+        assert!(
+            facts["limits"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("capacity_refused:coordination_requests")),
+            "{facts}"
+        );
+        assert_eq!(facts["complete"], json!(false));
+    }
+}

@@ -580,6 +580,21 @@ pub(super) struct WorkWho {
     pub owner: User,
 }
 
+impl WorkWho {
+    /// `limit` refused a write to this caller's repository.
+    pub(super) fn capacity(&self, limit: super::capacity::CapacityLimit) -> HubError {
+        HubError::capacity(
+            limit,
+            Some(super::capacity::CapacityRepository {
+                provider: self.owner.identity.provider.clone(),
+                host: self.owner.identity.host.clone(),
+                repository: self.repository.clone(),
+                repository_id: self.repository_id,
+            }),
+        )
+    }
+}
+
 /// Whose view a work read is: an agent token's, or a person's on one connected repository whose
 /// role the caller has just checked (the web pages' repository list, which holds no token).
 pub(super) enum WorkReader<'a> {
@@ -1020,9 +1035,13 @@ pub(super) fn invalid(message: &str) -> HubError {
     HubError::Invalid(message.to_owned())
 }
 
+/// The caller attaches its repository; see `WorkWho::capacity`.
 pub(super) fn check_work_payload_capacity(used: i64, delta: i64, limit: i64) -> Result<()> {
     if used.checked_add(delta).is_none_or(|total| total > limit) {
-        return Err(HubError::WorkCapacity);
+        return Err(HubError::capacity(
+            super::capacity::CapacityLimit::WorkStorage,
+            None,
+        ));
     }
     Ok(())
 }
