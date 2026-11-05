@@ -290,7 +290,7 @@ async fn default_start_and_overview_replies_fit_the_budget_on_a_busy_repository(
     // Recent outcomes page newest first on their own; a continuation lists nothing else.
     let mut seqs = Vec::new();
     let mut before = Value::Null;
-    let mut listed = 0;
+    let mut listed;
     loop {
         let page: Value = serde_json::from_str(
             &hub.result(
