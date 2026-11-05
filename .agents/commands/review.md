@@ -30,7 +30,7 @@ If you helped author the changes in the current session, delegate the review to 
    - bounded process runtime, output, and resources where applicable;
    - Rust ownership, error propagation, panic safety, public API design, and narrow lint exceptions;
    - synthetic and reproducible tests for observable success and failure modes;
-   - documentation that matches implemented interfaces, behavior, and limitations, with `docs/roadmap.md` never describing proposed work as implemented;
+   - documentation that matches implemented interfaces, behavior, and limitations; `docs/roadmap.md` is edited only by the release roadmap update in `docs/releasing.md`, so for a feature change check the PR body's `Roadmap:` lines instead and flag an edit to the roadmap; in any change, flag a roadmap row that would describe proposed work as implemented;
    - dependency provenance, licenses, notices, confidential data, and machine-specific paths.
 
 6. Run the focused checks:
