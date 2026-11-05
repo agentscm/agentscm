@@ -104,6 +104,7 @@ impl Fixture {
             commands,
             dependency_files,
             toolchain_probes,
+            constituents: None,
         };
         let policy = ValidationPolicy {
             repository: "repo-1".into(),
@@ -115,6 +116,7 @@ impl Fixture {
             max_age_seconds: 3600,
             epoch: 1,
             exempt_paths: None,
+            check_id: None,
         };
         fs::write(
             root.join("registry.json"),
@@ -293,9 +295,10 @@ fn success_flow_then_stale_after_new_commit() {
     let (code, verdict) = f.verify(&body, "repo-1");
     assert_eq!(
         (code, verdict["reason"].as_str()),
-        (3, Some("no attestation for this head")),
+        (3, Some("attestation is for a different head")),
         "{verdict}"
     );
+    assert_eq!(verdict["outcome"], "stale_head");
 }
 
 #[test]
