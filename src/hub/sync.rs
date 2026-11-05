@@ -2833,7 +2833,7 @@ async fn work(
     let intents: Vec<Value> = intents
         .iter()
         .take(MAX_LIVE_INTENTS)
-        .map(Intent::to_json)
+        .map(|intent| intent.json_for(&principal.owner.id))
         .collect();
     Ok(Json(
         json!({"intents": intents, "intents_truncated": truncated_intents,

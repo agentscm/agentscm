@@ -513,14 +513,16 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
             continue;
         }
         summarized_observations += 1;
+        // Completion reports record the token label, and the readers are the whole repository.
+        let agent = super::viewer::masked_label(&r.agent);
         let key = (
-            r.agent.clone(),
+            agent.clone(),
             r.provider.clone(),
             r.model.clone(),
             r.usage_basis,
         );
         let group = tokens.entry(key).or_insert_with(|| TokenGroup {
-            agent: r.agent.clone(),
+            agent: agent.clone(),
             provider: r.provider.clone(),
             model: r.model.clone(),
             usage_basis: r.usage_basis,
@@ -546,7 +548,7 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
         failed += usize::from(r.outcome == AttemptOutcome::Failed);
         if let Some(cost) = &r.cost {
             let key = (
-                r.agent.clone(),
+                agent.clone(),
                 r.provider.clone(),
                 r.model.clone(),
                 r.usage_basis,
@@ -555,7 +557,7 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
                 cost.basis.clone(),
             );
             let group = costs.entry(key).or_insert_with(|| CostGroup {
-                agent: r.agent.clone(),
+                agent: agent.clone(),
                 provider: r.provider.clone(),
                 model: r.model.clone(),
                 usage_basis: r.usage_basis,

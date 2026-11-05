@@ -10306,7 +10306,13 @@ impl Store for PgStore {
                 _ => None,
             };
             tx.commit()?;
-            Ok(operational_page(rows, forge_window_from, more, now))
+            Ok(operational_page(
+            rows,
+            forge_window_from,
+            more,
+            now,
+            super::viewer::Viewer(&who.owner.id),
+        ))
         })
     }
 
@@ -10831,14 +10837,18 @@ impl Store for PgStore {
             let after_at = after.as_ref().map(|a| a.0);
             let after_id = after.as_ref().map(|a| a.1.clone());
             let rows = tx.query(
-                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
+                // Another owner's generated `client-…` label, which can hold a host name, is neither
+                // matched nor shown as stored.
+                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at,
+                        COALESCE(lt.owner = $10, false)
                  FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
+                 LEFT JOIN hub_agent_tokens lt ON lt.id = w.lead_token
                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                    AND w.repository_id IS NOT DISTINCT FROM $4
                    AND ($5::bigint IS NULL OR (w.created_at, w.id) < ($5::bigint, $6::text))
                    AND ($7::text IS NULL OR w.source_issue = $8::text
                      OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
-                     OR w.lead_agent ILIKE $7 ESCAPE '\\' OR u.login ILIKE $7 ESCAPE '\\'
+                     OR ((lt.owner = $10 OR w.lead_agent NOT LIKE 'client-%') AND w.lead_agent ILIKE $7 ESCAPE '\\') OR u.login ILIKE $7 ESCAPE '\\'
                      OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
                  ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
                 &[
@@ -10851,6 +10861,7 @@ impl Store for PgStore {
                     &pattern,
                     &number,
                     &(limit as i64 + 1),
+                    &who.owner.id,
                 ],
             )?;
             let items = rows
@@ -10859,7 +10870,7 @@ impl Store for PgStore {
                     id: row.get(0),
                     title: row.get(1),
                     state: row.get(2),
-                    lead_agent: row.get(3),
+                    lead_agent: super::viewer::shown_label(row.get(3), row.get(9)),
                     owner: row.get(4),
                     branch: row.get(5),
                     source_issue: row.get(6),
@@ -11499,7 +11510,7 @@ impl Store for PgStore {
                 SELECT start_request,finish_request,source_id FROM ranked
                 WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2)})}).transpose()?;
             let decision=tx.query_opt("SELECT event_seq,snapshot::text FROM hub_work_versions WHERE work=$1 AND snapshot::jsonb #>> '{current,kind}'='decision' ORDER BY event_seq DESC LIMIT 1",&[&work_id])?.map(|r| -> Result<StoredDecisionV1> {let retained:WorkItem=json_value(&r.get::<_,String>(1))?;Ok(StoredDecisionV1{event_seq:r.get(0),checkpoint:retained.current.ok_or_else(||HubError::Unavailable("retained decision checkpoint is missing".into()))?})}).transpose()?;
-            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now);tx.commit()?;Ok(Some(summary))})
+            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now,super::viewer::Viewer(&who.owner.id));tx.commit()?;Ok(Some(summary))})
     }
 
     fn receipt_mode_get(&self, token: &str, session: &str, now: i64) -> Result<Option<String>> {
