@@ -17,7 +17,7 @@ function fixture() {
         get: async () => ({data: {...pull, head: {sha: ++reads === 2 && f.moved ? 'b'.repeat(40) : pull.head.sha}}}),
         list: async () => ({data: [pull]}),
       },
-      repos: {listCommitStatuses: async () => {
+      repos: {listCommitStatusesForRef: async () => {
         if (f.apiError) throw Error('unavailable');
         return {data: statuses};
       }},
@@ -109,7 +109,7 @@ test('one PR API failure cannot preserve another PR old acceptance', async () =>
   const other = {...f.pull, number: 8, head: {sha: 'c'.repeat(40)}};
   f.args.github.rest.pulls.list = async () => ({data: [f.pull, other]});
   f.args.github.rest.pulls.get = async ({pull_number}) => ({data: pull_number === 7 ? f.pull : other});
-  f.args.github.rest.repos.listCommitStatuses = async ({ref}) => {
+  f.args.github.rest.repos.listCommitStatusesForRef = async ({ref}) => {
     assert.equal(f.writes.filter(w => w.status === 'in_progress').length, 2);
     if (ref === f.pull.head.sha) throw Error('first PR unavailable');
     return {data: f.statuses};
