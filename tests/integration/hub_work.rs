@@ -4663,6 +4663,8 @@ fn responded_request_stays_responded_after_release(db: &Db) {
                 operation_id: "withdraw".into(),
                 session: "s-b".into(),
                 expected_updated_seq: mine.updated_seq,
+                target: None,
+                via_hub: false,
             },
             now + 7,
         )
@@ -4752,6 +4754,8 @@ fn compaction_runs_after_transition_events_exist(db: &Db) {
                 operation_id: "withdraw".into(),
                 session: "s-b".into(),
                 expected_updated_seq: mine.updated_seq,
+                target: None,
+                via_hub: false,
             },
             old + 5,
         )

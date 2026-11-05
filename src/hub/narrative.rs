@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use super::catchup::{CatchupCoverageState, CatchupPreview, CatchupPreviewQuery, HUMAN_SUBSCRIBER};
 use super::http::blocking;
 use super::store::{Principal, lower_hex_of, new_id, unix_now};
+use super::viewer::masked_label;
 use super::work::{WorkItem, WorkOverview, WorkOverviewQuery, normalized_scope};
 use super::work_http::actionable_status::{self, ActionableStatus};
 use super::{HubError, HubState, Result};
@@ -1204,7 +1205,7 @@ fn attention_sections(status: &ActionableStatus, shortened: &mut bool) -> FactSe
                 "state": row.state, "needs_you": row.needs_you,
                 "recipient_kind": row.recipient.kind, "recipient_owner": row.recipient.owner,
                 "recipient_login": row.recipient.login.as_deref().map(|v| safe(v, 255, shortened)),
-                "recipient_agent": row.recipient.agent.as_deref().map(|v| safe(v, 255, shortened)),
+                "recipient_agent": row.recipient.agent.as_deref().map(|v| safe(&masked_label(v), 255, shortened)),
                 "action": row.action, "freshness": row.freshness,
                 "reported_next_action": row.reported_next_action.as_deref().map(|v| safe(v, 500, shortened)),
                 "report": row.operational.report, "outcome": row.operational.outcome,
@@ -1278,7 +1279,7 @@ fn compact_work(item: &WorkItem, shortened: &mut bool) -> Value {
         "state": item.state,
         "claim_status": item.claim_status,
         "lead_owner": safe(&item.owner_login, 160, shortened),
-        "lead_agent": safe(&item.lead_agent, 160, shortened),
+        "lead_agent": safe(&masked_label(&item.lead_agent), 160, shortened),
         "generation": item.generation,
         "updated_seq": item.updated_seq,
         "summary": item.current.as_ref().map(|checkpoint| safe(&checkpoint.summary, 600, shortened)),

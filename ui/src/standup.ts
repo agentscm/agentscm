@@ -217,6 +217,8 @@ export interface CoordinationRequest {
   updated_at: number
   created_seq: number
   updated_seq: number
+  /** The requesting agent's token can no longer act (revoked, expired, owner disabled, or repository renamed), so it cannot resolve or withdraw the request and a lead (or the person who owns it) may withdraw it. */
+  requester_unavailable: boolean
 }
 
 export interface CoordinationBriefing {
@@ -681,6 +683,7 @@ function coordinationRequest(value: unknown): CoordinationRequest {
     updated_at: updatedAt,
     created_seq: createdSeq,
     updated_seq: updatedSeq,
+    requester_unavailable: item['requester_unavailable'] === true,
   }
 }
 

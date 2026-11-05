@@ -77,9 +77,14 @@ the forge did not accept the code. What signing in gives you:
 
 `agentscm hub whoami` shows, for each saved Hub, who this computer is signed in as, the
 computer's name, whether auto-connect is on and the checkouts connected to it; the menu bar app
-shows the same at the top of its menu. `agentscm client doctor` checks a checkout's connection
-through this computer's credential, the way the next renewal would, so it reports a verified
-connection even when no agent is running.
+shows the same at the top of its menu. Until you choose, `whoami` says what auto-connect does and
+prints the command that chooses it (`agentscm hub auto-connect on|off --hub URL`). `agentscm client
+doctor` checks a checkout's connection through this computer's credential, the way the next renewal
+would, so it reports a verified connection even when no agent is running. It also prints one line
+for each session that has reported to the Hub, latest first, and `--json` prints the Hub's reply
+instead. `client setup` and `client check` print when the agent token ends and, for a token minted
+through this computer, that it renews automatically; `agentscm client renew` renews it by hand if
+renewal fails. A token file given to `client setup` is never renewed.
 
 Your computers: `agentscm hub devices list` shows each one with its name, last use and the
 repositories connected through it, live ones first; `agentscm hub devices rename NAME` renames

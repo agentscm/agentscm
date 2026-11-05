@@ -6,6 +6,7 @@
 //   MyHandoff, HandoffSide       a file handoff the person's own agent is part of, from GET /v1/hub/session/handoffs
 //   fetchMyHandoffs(session, repository, signal)    those, newest first
 //   replyToRequest(session, body)                   answer a coordination request for the agent that leads the target Work; resolves to the updated request
+//   withdrawRequest(session, body)                  close a request whose requesting agent is gone, for the agent that leads the target Work; resolves to the updated request
 //   answerHandoff(session, body) / askHandoff(session, body)   hand a file over (or keep it) / ask its holder; resolve to the Hub's outcome
 //   operationId()                                    a fresh replay key; reuse it when retrying the same answer
 //   sendError(e)                                     a failed send in words a person can act on
@@ -135,6 +136,20 @@ export interface ReplyBody {
 }
 export async function replyToRequest(session: BrowserSession, body: ReplyBody): Promise<CoordinationRequest> {
   return decodeCoordinationRequest(await call('/v1/hub/session/coordination/reply', session, 'POST', body))
+}
+
+export interface WithdrawBody {
+  /** The agent token that leads the target Work (from the request's target lead). */
+  token: string
+  request_id: string
+  operation_id: string
+  session: string
+  expected_updated_seq: number
+  target_work_id: string
+  target_generation: number
+}
+export async function withdrawRequest(session: BrowserSession, body: WithdrawBody): Promise<CoordinationRequest> {
+  return decodeCoordinationRequest(await call('/v1/hub/session/coordination/withdraw', session, 'POST', body))
 }
 
 export type AnswerOutcome = 'granted' | 'declined' | 'no_open_request' | 'not_held'

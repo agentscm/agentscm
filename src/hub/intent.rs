@@ -20,6 +20,7 @@ use super::store::{
     Event, HubEvent, Principal, Store, User, new_id, unix_now, validate_repository,
 };
 use super::sync::overlapping_pulls;
+use super::viewer::masked_label;
 use super::{HubError, HubState, Result};
 
 pub const MAX_INTENT_TTL_SECONDS: i64 = 86_400;
@@ -497,6 +498,15 @@ impl Intent {
         })
     }
 
+    /// `to_json` as the owner `viewer` may see it: another owner's token label is masked.
+    pub(super) fn json_for(&self, viewer: &str) -> Value {
+        let mut json = self.to_json();
+        if self.owner.id != viewer {
+            json["agent"]["name"] = json!(masked_label(&self.agent));
+        }
+        json
+    }
+
     pub(super) fn to_json(&self) -> Value {
         json!({"id": self.id, "repository": self.repository, "task": self.task,
             "branch": self.branch, "base": self.base, "machine": self.machine,
@@ -617,12 +627,12 @@ async fn announce(
         .overlaps
         .iter()
         .map(|o| {
-            json!({"intent": o.intent.to_json(), "their_paths": o.their_paths,
+            json!({"intent": o.intent.json_for(&principal.owner.id), "their_paths": o.their_paths,
                 "your_paths": o.your_paths})
         })
         .collect();
     Ok(Json(
-        json!({"intent": announced.intent.to_json(), "overlaps": overlaps,
+        json!({"intent": announced.intent.json_for(&principal.owner.id), "overlaps": overlaps,
             "pull_requests": pull_requests}),
     ))
 }
@@ -651,7 +661,10 @@ async fn list(
         live_intents_capped(&*store, &repo, unix_now())
     })
     .await?;
-    let intents: Vec<Value> = intents.iter().map(Intent::to_json).collect();
+    let intents: Vec<Value> = intents
+        .iter()
+        .map(|intent| intent.json_for(&principal.owner.id))
+        .collect();
     Ok(Json(json!({"intents": intents, "truncated": truncated})))
 }
 
@@ -669,6 +682,15 @@ async fn activity(
         return Err(ApiError::invalid());
     }
     let before = query.before;
+    let (me, my_id) = (principal.owner.login.clone(), principal.owner.id.clone());
+    // Rows name owners by login, which is one person within a repository's forge host.
+    let label = |agent: &str, login: &str| {
+        if login == me {
+            agent.to_owned()
+        } else {
+            masked_label(agent)
+        }
+    };
     let store = state.store.clone();
     let (sessions, mut events) = blocking(&state, move || {
         let sessions = store.live_sessions(&principal, unix_now(), MAX_ACTIVITY_SESSIONS)?;
@@ -691,7 +713,7 @@ async fn activity(
         .iter()
         .map(|s| {
             Ok(
-                json!({"key": s.key, "agent": {"token": s.token, "name": s.agent},
+                json!({"key": s.key, "agent": {"token": s.token, "name": label(&s.agent, &s.owner)},
                 "owner": {"login": s.owner}, "intent": s.intent, "task": s.task,
                 "via": parse(&s.via)?, "created_at": s.created_at, "updated_at": s.updated_at}),
             )
@@ -705,9 +727,25 @@ async fn activity(
             if let Some(fields) = data.as_object_mut() {
                 fields.remove("session");
             }
+            // An announce or a notice names its agent with the owner's id or `{login}`.
+            if data["owner"] != my_id.as_str()
+                && data["owner"]["login"] != me.as_str()
+                && let Some(masked) = data["agent"].as_str().map(masked_label)
+            {
+                data["agent"] = json!(masked);
+            }
+            // A hand-off names its other side by label and login.
+            for side in ["to", "from"] {
+                if let (Some(agent), Some(login)) =
+                    (data[side]["agent"].as_str(), data[side]["login"].as_str())
+                {
+                    let shown = label(agent, login);
+                    data[side]["agent"] = json!(shown);
+                }
+            }
             Ok(
                 json!({"seq": e.event.seq, "id": e.event.id, "at": e.event.at,
-                "kind": e.event.kind, "agent": {"token": e.token, "name": e.agent},
+                "kind": e.event.kind, "agent": {"token": e.token, "name": label(&e.agent, &e.owner)},
                 "owner": {"login": e.owner}, "data": data}),
             )
         })
@@ -729,7 +767,9 @@ async fn renew(
     })
     .await?
     .ok_or_else(ApiError::not_found)?;
-    Ok(Json(json!({"intent": intent.to_json()})))
+    Ok(Json(
+        json!({"intent": intent.json_for(&principal.owner.id)}),
+    ))
 }
 
 async fn release(
@@ -788,8 +828,13 @@ async fn notices(
     let notices = events
         .iter()
         .map(|event| {
-            let notice: Value = serde_json::from_str(&event.data)
+            let mut notice: Value = serde_json::from_str(&event.data)
                 .map_err(|error| HubError::Unavailable(error.to_string()))?;
+            if notice["owner"]["id"] != principal.owner.id.as_str()
+                && let Some(masked) = notice["agent"].as_str().map(masked_label)
+            {
+                notice["agent"] = json!(masked);
+            }
             Ok(
                 json!({"seq": event.seq, "id": event.id, "at": event.at, "kind": event.kind,
                 "intent": event.subject, "notice": notice}),

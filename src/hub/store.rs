@@ -833,9 +833,10 @@ pub trait Store: Send + Sync {
 
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
-    /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, lead agent,
-    /// owner login, id or scope contains it, or whose source issue number it names. An unknown
-    /// cursor is `Invalid`.
+    /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, owner login,
+    /// id or scope contains it, whose source issue number it names, or whose lead agent label
+    /// contains it, except another owner's generated `client-…` label, which is masked.
+    /// An unknown cursor is `Invalid`.
     fn work_search(
         &self,
         token: &str,
@@ -1033,6 +1034,9 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
+    /// Whether this token's unnamed `default` session is bound to one native hook session, so
+    /// edit hooks link Work led by `default` to that one conversation's edits only.
+    fn default_session_bound(&self, token: &str) -> Result<bool>;
     /// A tool call a hook reported that is not an edit check: a touch of the session, which
     /// renews its leases, and for a shell call the start or end that keeps them live while it
     /// runs, up to the in-flight cap.

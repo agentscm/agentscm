@@ -23,6 +23,9 @@ pub(super) const RENEW_INTERVAL_SECONDS: i64 = 60;
 pub const IN_FLIGHT_CAP_SECONDS: i64 = 3600;
 /// The start of the refusal a lead meets after its reservation lapsed; every surface shows it.
 pub const LEASE_LAPSED: &str = "LEASE_LAPSED";
+/// The start of the refusal of an edit not linked to a current assignment of its session. Like
+/// `LEASE_LAPSED`, it holds for every repeat until a start or checkpoint links the edit.
+pub const EDIT_UNLINKED: &str = "EDIT_UNLINKED";
 /// Participants from owners other than the Work's own. The rest of the 100 participants stay for
 /// the owner's sessions, so other owners cannot block a resume or slow cleanup without bound.
 pub const MAX_OTHER_OWNER_PARTICIPANTS: usize = 25;
@@ -747,17 +750,20 @@ pub(super) fn merge_status(
     }
 }
 
-/// Builds the overview from rows ordered or not. `more` says the reader found more rows than it
-/// returned. `forge_window_from` is the start of the last complete forge pull-request read, if any.
+/// Builds the overview from rows ordered or not, as `viewer` may see their holders. `more` says
+/// the reader found more rows than it returned. `forge_window_from` is the start of the last
+/// complete forge pull-request read, if any.
 pub(super) fn operational_page(
     rows: Vec<OperationalRow>,
     forge_window_from: Option<i64>,
     more: bool,
     now: i64,
+    viewer: super::viewer::Viewer<'_>,
 ) -> OperationalOverviewV1 {
     let work = rows
-        .iter()
-        .map(|row| {
+        .into_iter()
+        .map(|mut row| {
+            viewer.work(&mut row.item);
             work_operational(&OperationalFacts {
                 item: &row.item,
                 outcome: row.outcome,

@@ -557,14 +557,10 @@ fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result
     work_who_in(tx, token, now, true)
 }
 
-/// `work_who`, optionally without the refusal of a token whose repository was renamed. Only the
-/// plain intent announce skips it, as it always has.
-fn work_who_in(
-    tx: &mut postgres::Transaction<'_>,
-    token: &str,
-    now: i64,
-    refuse_renamed: bool,
-) -> Result<WorkWho> {
+/// Over `hub_agent_tokens t` joined to `hub_users u`, binding the token as `$1` and the time as
+/// `$2`: the token is not revoked or expired and its owner is enabled, and, when `refuse_renamed`,
+/// its repository has not been renamed since it was minted.
+fn live_agent_token(refuse_renamed: bool) -> String {
     let renamed = if refuse_renamed {
         "AND NOT EXISTS (
                  SELECT 1 FROM hub_repositories r JOIN hub_connections c ON c.id = r.connection
@@ -574,14 +570,26 @@ fn work_who_in(
     } else {
         ""
     };
+    format!("t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled {renamed}")
+}
+
+/// `work_who`, optionally without the refusal of a token whose repository was renamed. Only the
+/// plain intent announce skips it, as it always has.
+fn work_who_in(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    now: i64,
+    refuse_renamed: bool,
+) -> Result<WorkWho> {
     let row = tx
         .query_opt(
             &format!(
                 "SELECT t.repository, t.repository_id, t.name, t.read_only,
                     u.id, u.provider, u.host, u.forge_user_id, u.login
              FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
-             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled {renamed}
-             FOR SHARE"
+             WHERE {}
+             FOR SHARE",
+                live_agent_token(refuse_renamed)
             ),
             &[&token, &now],
         )?
@@ -604,6 +612,20 @@ fn work_who_in(
             disabled: false,
         },
     })
+}
+
+/// Whether `token` still passes the check every agent call makes, read without the row lock
+/// `work_who` takes so that listing requests does not hold other people's tokens.
+fn agent_can_act(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<bool> {
+    Ok(tx
+        .query_opt(
+            &format!(
+                "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner WHERE {}",
+                live_agent_token(true)
+            ),
+            &[&token, &now],
+        )?
+        .is_some())
 }
 
 const SHARED_BODY_COLUMNS: &str = "work,digest,size_bytes,session_id,generation,event_id,sequence,
@@ -3317,6 +3339,7 @@ fn coordination_request_at(
     }
     let stored_status: String = row.get(13);
     let status = parse_status(&stored_status)?;
+    let requester_unavailable = !agent_can_act(tx, &requester_token, now)?;
     Ok(Some(CoordinationRequest {
         id: request.to_owned(),
         requester: CoordinationAgent {
@@ -3343,6 +3366,7 @@ fn coordination_request_at(
         updated_at: row.get(15),
         created_seq: row.get(16),
         updated_seq: row.get(17),
+        requester_unavailable,
     }))
 }
 
@@ -4098,13 +4122,23 @@ fn start_in(
         let held = work_holds_reservation(tx, &item.id)?;
         // A held reservation is open to takeover only once its lease lapsed: a revoked lead token
         // may still be carried to its successor (#337), and a stale progress report alone never
-        // opens it. Work that holds nothing keeps the claim-age rule.
-        let open = if held {
-            lease_lapsed(tx, &item.id, now)?
-        } else {
-            item.claim_status == ClaimStatus::Stale
-        };
-        if start.takeover_generation != Some(item.generation) {
+        // opens it. Work that holds nothing keeps the claim-age rule. Active Work this token
+        // started without naming a session passes to the same token's first named session that
+        // asks, so an unnamed start can be linked to the conversation whose hooks check its edits.
+        let adopting_default = named
+            && item.lead_token == who.token
+            && item.lead_session == DEFAULT_SESSION
+            && start.session != DEFAULT_SESSION
+            && matches!(item.state, WorkState::Active | WorkState::Blocked);
+        let open = adopting_default
+            || if held {
+                lease_lapsed(tx, &item.id, now)?
+            } else {
+                item.claim_status == ClaimStatus::Stale
+            };
+        let fenced = start.takeover_generation == Some(item.generation)
+            || (adopting_default && start.takeover_generation.is_none());
+        if !fenced {
             let kind = if start.takeover_generation.is_some() {
                 WorkConflictKind::GenerationChanged
             } else if open {
@@ -5296,6 +5330,9 @@ fn session_name(
     }
 }
 
+/// The session a hook's native session ID stands for. The first new native session after an
+/// unnamed start adopts that `default` Work (an alias); every later one is its own session, so
+/// one adoption never refuses the token's other conversations.
 fn alias_hook_session(
     tx: &mut postgres::Transaction<'_>,
     token: &str,
@@ -5323,15 +5360,16 @@ fn alias_hook_session(
         )?
         .is_some()
     {
-        return Err(HubError::Invalid(
-            "durable default work is already bound to another hook session".into(),
-        ));
+        // Another conversation already adopted the unnamed Work; this one is its own session.
+        return Ok(observed.to_owned());
     }
     let eligible = tx
         .query_opt(
+            // Only unfinished Work is worth adopting; finished Work binds nobody.
             "SELECT 1 WHERE EXISTS (
                  SELECT 1 FROM hub_work_participants p
-                 WHERE p.token=$1 AND p.session=$2)",
+                 JOIN hub_work_items w ON w.id = p.work
+                 WHERE p.token=$1 AND p.session=$2 AND w.state <> 'finished')",
             &[&token, &DEFAULT_SESSION],
         )?
         .is_some();
@@ -5345,9 +5383,8 @@ fn alias_hook_session(
         &[&token, &observed, &DEFAULT_SESSION, &now],
     )?;
     if changed == 0 {
-        return Err(HubError::Invalid(
-            "durable default work is already bound to another hook session".into(),
-        ));
+        // A concurrent first touch adopted it first.
+        return Ok(observed.to_owned());
     }
     Ok(DEFAULT_SESSION.to_owned())
 }
@@ -10194,7 +10231,13 @@ impl Store for PgStore {
                 _ => None,
             };
             tx.commit()?;
-            Ok(operational_page(rows, forge_window_from, more, now))
+            Ok(operational_page(
+            rows,
+            forge_window_from,
+            more,
+            now,
+            super::viewer::Viewer(&who.owner.id),
+        ))
         })
     }
 
@@ -10719,14 +10762,18 @@ impl Store for PgStore {
             let after_at = after.as_ref().map(|a| a.0);
             let after_id = after.as_ref().map(|a| a.1.clone());
             let rows = tx.query(
-                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
+                // Another owner's generated `client-…` label, which can hold a host name, is neither
+                // matched nor shown as stored.
+                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at,
+                        COALESCE(lt.owner = $10, false)
                  FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
+                 LEFT JOIN hub_agent_tokens lt ON lt.id = w.lead_token
                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                    AND w.repository_id IS NOT DISTINCT FROM $4
                    AND ($5::bigint IS NULL OR (w.created_at, w.id) < ($5::bigint, $6::text))
                    AND ($7::text IS NULL OR w.source_issue = $8::text
                      OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
-                     OR w.lead_agent ILIKE $7 ESCAPE '\\' OR u.login ILIKE $7 ESCAPE '\\'
+                     OR ((lt.owner = $10 OR w.lead_agent NOT LIKE 'client-%') AND w.lead_agent ILIKE $7 ESCAPE '\\') OR u.login ILIKE $7 ESCAPE '\\'
                      OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
                  ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
                 &[
@@ -10739,6 +10786,7 @@ impl Store for PgStore {
                     &pattern,
                     &number,
                     &(limit as i64 + 1),
+                    &who.owner.id,
                 ],
             )?;
             let items = rows
@@ -10747,7 +10795,7 @@ impl Store for PgStore {
                     id: row.get(0),
                     title: row.get(1),
                     state: row.get(2),
-                    lead_agent: row.get(3),
+                    lead_agent: super::viewer::shown_label(row.get(3), row.get(9)),
                     owner: row.get(4),
                     branch: row.get(5),
                     source_issue: row.get(6),
@@ -11387,7 +11435,7 @@ impl Store for PgStore {
                 SELECT start_request,finish_request,source_id FROM ranked
                 WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2)})}).transpose()?;
             let decision=tx.query_opt("SELECT event_seq,snapshot::text FROM hub_work_versions WHERE work=$1 AND snapshot::jsonb #>> '{current,kind}'='decision' ORDER BY event_seq DESC LIMIT 1",&[&work_id])?.map(|r| -> Result<StoredDecisionV1> {let retained:WorkItem=json_value(&r.get::<_,String>(1))?;Ok(StoredDecisionV1{event_seq:r.get(0),checkpoint:retained.current.ok_or_else(||HubError::Unavailable("retained decision checkpoint is missing".into()))?})}).transpose()?;
-            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now);tx.commit()?;Ok(Some(summary))})
+            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now,super::viewer::Viewer(&who.owner.id));tx.commit()?;Ok(Some(summary))})
     }
 
     fn receipt_mode_get(&self, token: &str, session: &str, now: i64) -> Result<Option<String>> {
@@ -11686,6 +11734,18 @@ impl Store for PgStore {
             let name = session_name(&mut tx, token, session, now)?;
             tx.commit()?;
             Ok(name)
+        })
+    }
+
+    fn default_session_bound(&self, token: &str) -> Result<bool> {
+        self.run(true, |client| {
+            Ok(client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM hub_session_aliases
+                     WHERE token=$1 AND canonical_session=$2)",
+                    &[&token, &DEFAULT_SESSION],
+                )?
+                .get(0))
         })
     }
 
@@ -13402,16 +13462,13 @@ impl Store for PgStore {
                 coordination_request_at(&mut tx, &who, &withdraw.request_id, i64::MAX, now)?
                     .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
             let requester = coordination_is_requester(&request, &who, &withdraw.session);
-            let requester_available = match work_who(&mut tx, &request.requester.token, now) {
-                Ok(_) => true,
-                Err(HubError::Unauthorized) => false,
-                Err(error) => return Err(error),
-            };
-            let current_target_lead = request.targets.iter().any(|target| {
+            let leads = |target: &CoordinationTarget| {
                 target.lead.token == who.token && target.lead.session == withdraw.session
-            });
-            let cleanup = !requester && !requester_available && current_target_lead;
-            if !requester && !cleanup {
+            };
+            let cleanup =
+                !requester && request.requester_unavailable && request.targets.iter().any(leads);
+            // A person closes a request only as the lead cleaning up one whose requester is gone.
+            if !cleanup && (!requester || withdraw.via_hub) {
                 return Err(HubError::Unauthorized);
             }
             let reason = if cleanup {
@@ -13442,11 +13499,25 @@ impl Store for PgStore {
                     request.updated_seq
                 )));
             }
+            if let Some(fence) = &withdraw.target
+                && !request.targets.iter().any(|target| {
+                    leads(target)
+                        && target.work_id == fence.work_id
+                        && target.generation == fence.generation
+                })
+            {
+                return Err(HubError::Invalid(
+                    "coordination target changed; reload to see its current generation".into(),
+                ));
+            }
             let event = coordination_event(
                 "coordination_withdrawn",
                 &request.id,
                 now,
-                json!({"by": who.token, "session": withdraw.session, "reason": reason}),
+                with_hub_via(
+                    json!({"by": who.token, "session": withdraw.session, "reason": reason}),
+                    withdraw.via_hub,
+                ),
             )?;
             let seq = append(&mut tx, &event)?;
             tx.execute(

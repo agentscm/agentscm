@@ -483,6 +483,16 @@ fn work_who(tx: &Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
     })
 }
 
+/// Whether `token` still passes the check every agent call makes: not revoked or expired, and its
+/// owner enabled.
+fn agent_can_act(tx: &Transaction<'_>, token: &str, now: i64) -> Result<bool> {
+    match work_who(tx, token, now) {
+        Ok(_) => Ok(true),
+        Err(HubError::Unauthorized) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 const SHARED_BODY_COLUMNS: &str = "work,digest,size_bytes,session_id,generation,event_id,sequence,
     declared_token,declared_at,state,uploaded_at,expires_at,deleted_at,deleted_by,physical_deleted_at,
     author,delete_attempts";
@@ -3462,6 +3472,7 @@ fn coordination_request_at(
         });
     }
     let status = parse_status(&stored_status)?;
+    let requester_unavailable = !agent_can_act(tx, &requester_token, now)?;
     Ok(Some(CoordinationRequest {
         id: request.to_owned(),
         requester: CoordinationAgent {
@@ -3488,6 +3499,7 @@ fn coordination_request_at(
         updated_at,
         created_seq,
         updated_seq,
+        requester_unavailable,
     }))
 }
 
@@ -4240,13 +4252,23 @@ fn start_in(
         let held = work_holds_reservation(tx, &item.id)?;
         // A held reservation is open to takeover only once its lease lapsed: a revoked lead token
         // may still be carried to its successor (#337), and a stale progress report alone never
-        // opens it. Work that holds nothing keeps the claim-age rule.
-        let open = if held {
-            lease_lapsed(tx, &item.id, now)?
-        } else {
-            item.claim_status == ClaimStatus::Stale
-        };
-        if start.takeover_generation != Some(item.generation) {
+        // opens it. Work that holds nothing keeps the claim-age rule. Active Work this token
+        // started without naming a session passes to the same token's first named session that
+        // asks, so an unnamed start can be linked to the conversation whose hooks check its edits.
+        let adopting_default = named
+            && item.lead_token == who.token
+            && item.lead_session == DEFAULT_SESSION
+            && start.session != DEFAULT_SESSION
+            && matches!(item.state, WorkState::Active | WorkState::Blocked);
+        let open = adopting_default
+            || if held {
+                lease_lapsed(tx, &item.id, now)?
+            } else {
+                item.claim_status == ClaimStatus::Stale
+            };
+        let fenced = start.takeover_generation == Some(item.generation)
+            || (adopting_default && start.takeover_generation.is_none());
+        if !fenced {
             let kind = if start.takeover_generation.is_some() {
                 WorkConflictKind::GenerationChanged
             } else if open {
@@ -5443,6 +5465,9 @@ fn session_name(
     }
 }
 
+/// The session a hook's native session ID stands for. The first new native session after an
+/// unnamed start adopts that `default` Work (an alias); every later one is its own session, so
+/// one adoption never refuses the token's other conversations.
 fn alias_hook_session(
     tx: &Transaction<'_>,
     token: &str,
@@ -5476,15 +5501,16 @@ fn alias_hook_session(
         .optional()?
         .is_some()
     {
-        return Err(HubError::Invalid(
-            "durable default work is already bound to another hook session".into(),
-        ));
+        // Another conversation already adopted the unnamed Work; this one is its own session.
+        return Ok(observed.to_owned());
     }
     let eligible = tx
         .query_row(
+            // Only unfinished Work is worth adopting; finished Work binds nobody.
             "SELECT 1 WHERE EXISTS (
                  SELECT 1 FROM hub_work_participants p
-                 WHERE p.token=?1 AND p.session=?2)",
+                 JOIN hub_work_items w ON w.id = p.work
+                 WHERE p.token=?1 AND p.session=?2 AND w.state <> 'finished')",
             params![token, DEFAULT_SESSION],
             |_| Ok(()),
         )
@@ -5499,9 +5525,8 @@ fn alias_hook_session(
         params![token, observed, DEFAULT_SESSION, now],
     )?;
     if changed == 0 {
-        return Err(HubError::Invalid(
-            "durable default work is already bound to another hook session".into(),
-        ));
+        // A concurrent first touch adopted it first.
+        return Ok(observed.to_owned());
     }
     Ok(DEFAULT_SESSION.to_owned())
 }
@@ -10273,7 +10298,13 @@ impl Store for SqliteStore {
             _ => None,
         };
         tx.commit()?;
-        Ok(operational_page(rows, forge_window_from, more, now))
+        Ok(operational_page(
+            rows,
+            forge_window_from,
+            more,
+            now,
+            super::viewer::Viewer(&who.owner.id),
+        ))
     }
 
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
@@ -10770,13 +10801,17 @@ impl Store for SqliteStore {
         let pattern = search.map(like_pattern);
         let number = search.and_then(search_number).map(|n| n.to_string());
         let mut statement = tx.prepare(
-            "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
+            // Another owner's generated `client-…` label, which can hold a host name, is neither
+            // matched nor shown as stored.
+            "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at,
+                    COALESCE(lt.owner = ?10, 0)
              FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
+             LEFT JOIN hub_agent_tokens lt ON lt.id = w.lead_token
              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
                AND (?5 IS NULL OR (w.created_at, w.id) < (?5, ?6))
                AND (?7 IS NULL OR w.source_issue = ?8
                  OR lower(w.title) LIKE ?7 ESCAPE '\\' OR lower(w.branch) LIKE ?7 ESCAPE '\\'
-                 OR lower(w.lead_agent) LIKE ?7 ESCAPE '\\' OR lower(u.login) LIKE ?7 ESCAPE '\\'
+                 OR ((lt.owner = ?10 OR w.lead_agent NOT LIKE 'client-%') AND lower(w.lead_agent) LIKE ?7 ESCAPE '\\') OR lower(u.login) LIKE ?7 ESCAPE '\\'
                  OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\')
              ORDER BY w.created_at DESC, w.id DESC LIMIT ?9",
         )?;
@@ -10791,14 +10826,15 @@ impl Store for SqliteStore {
                     after.as_ref().map(|a| a.1.as_str()),
                     pattern,
                     number,
-                    limit as i64 + 1
+                    limit as i64 + 1,
+                    who.owner.id
                 ],
                 |row| {
                     Ok(WorkSearchItem {
                         id: row.get(0)?,
                         title: row.get(1)?,
                         state: row.get(2)?,
-                        lead_agent: row.get(3)?,
+                        lead_agent: super::viewer::shown_label(row.get(3)?, row.get(9)?),
                         owner: row.get(4)?,
                         branch: row.get(5)?,
                         source_issue: row.get(6)?,
@@ -11885,6 +11921,7 @@ impl Store for SqliteStore {
             action,
             decision,
             now,
+            super::viewer::Viewer(&who.owner.id),
         );
         tx.commit()?;
         Ok(Some(summary))
@@ -12629,6 +12666,15 @@ impl Store for SqliteStore {
         let name = session_name(&tx, token, session, now)?;
         tx.commit()?;
         Ok(name)
+    }
+
+    fn default_session_bound(&self, token: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_session_aliases
+             WHERE token=?1 AND canonical_session=?2)",
+            params![token, DEFAULT_SESSION],
+            |row| row.get(0),
+        )?)
     }
 
     fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing> {
@@ -14674,16 +14720,13 @@ impl Store for SqliteStore {
         let request = coordination_request_at(&tx, &who, &withdraw.request_id, i64::MAX, now)?
             .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
         let requester = coordination_is_requester(&request, &who, &withdraw.session);
-        let requester_available = match work_who(&tx, &request.requester.token, now) {
-            Ok(_) => true,
-            Err(HubError::Unauthorized) => false,
-            Err(error) => return Err(error),
-        };
-        let current_target_lead = request.targets.iter().any(|target| {
+        let leads = |target: &CoordinationTarget| {
             target.lead.token == who.token && target.lead.session == withdraw.session
-        });
-        let cleanup = !requester && !requester_available && current_target_lead;
-        if !requester && !cleanup {
+        };
+        let cleanup =
+            !requester && request.requester_unavailable && request.targets.iter().any(leads);
+        // A person closes a request only as the lead cleaning up one whose requester is gone.
+        if !cleanup && (!requester || withdraw.via_hub) {
             return Err(HubError::Unauthorized);
         }
         let reason = if cleanup {
@@ -14714,11 +14757,25 @@ impl Store for SqliteStore {
                 request.updated_seq
             )));
         }
+        if let Some(fence) = &withdraw.target
+            && !request.targets.iter().any(|target| {
+                leads(target)
+                    && target.work_id == fence.work_id
+                    && target.generation == fence.generation
+            })
+        {
+            return Err(HubError::Invalid(
+                "coordination target changed; reload to see its current generation".into(),
+            ));
+        }
         let event = coordination_event(
             "coordination_withdrawn",
             &request.id,
             now,
-            json!({"by": who.token, "session": withdraw.session, "reason": reason}),
+            with_hub_via(
+                json!({"by": who.token, "session": withdraw.session, "reason": reason}),
+                withdraw.via_hub,
+            ),
         )?;
         let seq = append(&tx, &event)?;
         tx.execute(

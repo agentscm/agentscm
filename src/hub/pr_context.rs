@@ -79,11 +79,14 @@ pub async fn read(
             return Ok(json!({"version": 1, "availability": "not_connected"}));
         };
         let rows = store.observations(&repo.id, "pull_request")?;
-        let overview = store.work_overview(
-            &principal.token_id,
-            &WorkOverviewQuery::default(),
-            unix_now(),
-        )?;
+        let overview = super::viewer::shown(
+            store.work_overview(
+                &principal.token_id,
+                &WorkOverviewQuery::default(),
+                unix_now(),
+            )?,
+            &principal.owner.id,
+        );
         // Reuse supported-skill evaluation. The scan is deliberately bounded and never
         // described as exhaustive, including when an unknown catalog entry was skipped.
         let runs = super::skills::views(&*store, &principal.repository, None, None, RUN_SCAN)?;
@@ -161,7 +164,9 @@ fn files(value: &Value) -> BTreeSet<&str> {
         .collect()
 }
 
-fn provider_evidence(
+/// The retained provider snapshot for `context.pull_request`'s exact head and base, after the
+/// repository's grant observation; shared with the actionable-status check producer.
+pub(super) fn provider_evidence(
     context: &Value,
     repository_id: i64,
     rows: &[Observation],

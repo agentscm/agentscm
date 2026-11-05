@@ -2435,6 +2435,8 @@ async fn directed_request_reminder_resolves_only_on_exact_retained_withdrawal() 
                 operation_id: "synthetic-withdraw".into(),
                 session: "requesting".into(),
                 expected_updated_seq: request.updated_seq,
+                target: None,
+                via_hub: false,
             },
             unix_now(),
         )

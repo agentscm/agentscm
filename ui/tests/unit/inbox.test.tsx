@@ -348,3 +348,77 @@ describe('Inbox lists', () => {
     expect(within(list()).queryByRole('button', { name: /Move tax/ })).toBeNull()
   })
 })
+
+describe('Inbox when the requesting agent is gone', () => {
+  const replied = (over: Record<string, unknown> = {}) =>
+    request(5, DEV, MARIA, wid('a'), 'Move tax out of invoice totals', {
+      status: 'responded', updated_seq: 53, requester_unavailable: true,
+      responses: [{ id: `crs_${'3'.repeat(32)}`, operation_id: 'op-3', target_work_id: wid('a'), responder: MARIA, target_generation: 1, kind: 'propose_split', note: null, via: null, created_at: now - 300, seq: 52 }],
+      ...over,
+    })
+
+  it('says so on the thread and closes it as the person’s own agent that leads the target', async () => {
+    const gone = replied()
+    hub([gone], [], () => json({ ...gone, status: 'withdrawn', updated_seq: 54 }))
+    render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} session={session} />)
+    await screen.findAllByText('Move tax out of invoice totals')
+    // It is still under "Waiting on others", now saying why nothing will happen.
+    const waiting = within(within(list()).getByRole('heading', { name: 'Waiting on others' }).closest('.in-group') as HTMLElement)
+    expect(waiting.getByRole('button', { name: /Move tax out of invoice totals/ }).textContent).toContain('The requesting agent is gone')
+    expect(screen.getAllByText('The requesting agent is gone').length).toBeGreaterThan(1)
+    const rows = within(timeline()).getAllByRole('listitem').map((r) => r.textContent ?? '')
+    expect(rows.some((r) => r.includes('cannot act any more'))).toBe(true)
+    // The gone agent cannot see anything next, so the page does not promise that it will.
+    expect(rows.some((r) => r.includes('sees it at its next edit'))).toBe(false)
+
+    await userEvent.click(screen.getByRole('button', { name: 'Close the request' }))
+    await waitFor(() => expect(calls.filter((c) => c.method === 'POST')).toHaveLength(1))
+    const sent = calls.find((c) => c.method === 'POST')!
+    expect(sent.url).toBe('/v1/hub/session/coordination/withdraw')
+    expect(sent.csrf).toBe(session.csrf)
+    // The agent that leads the Work, the exact request version, the target generation it saw and a replay key.
+    expect(sent.body).toMatchObject({ token: 'tok_maria', request_id: gone.id, session: 'claude-code-session', expected_updated_seq: 53, target_work_id: wid('a'), target_generation: 1 })
+    expect(String(sent.body!['operation_id'])).toMatch(/^web-/)
+    expect((await screen.findByRole('status', { name: '' })).textContent).toContain('Closed as your Claude Code. No work was released or changed.')
+    expect(screen.queryByRole('button', { name: 'Close the request' })).toBeNull()
+  })
+
+  it('shows why closing failed and replays the same key on a retry', async () => {
+    hub([replied()], [], () => json({ error: 'invalid_request', message: 'coordination target changed; reload to see its current generation' }, 400))
+    render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} session={session} />)
+    await screen.findAllByText('Move tax out of invoice totals')
+    await userEvent.click(screen.getByRole('button', { name: 'Close the request' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('coordination target changed')
+    await userEvent.click(screen.getByRole('button', { name: 'Close the request' }))
+    await waitFor(() => expect(calls.filter((c) => c.method === 'POST')).toHaveLength(2))
+    const [first, second] = calls.filter((c) => c.method === 'POST')
+    expect(second!.body!['operation_id']).toBe(first!.body!['operation_id'])
+  })
+
+  it('offers nothing for another person’s agent, a requester that can act, or a closed request', async () => {
+    hub([
+      request(6, MARIA, DEV, wid('b'), 'Dev leads this one', { status: 'responded', requester_unavailable: true }),
+      request(7, DEV, MARIA, wid('a'), 'Requester still active', { status: 'responded' }),
+      replied({ id: `crq_${(8).toString(16).padStart(32, '0')}`, status: 'withdrawn', updated_seq: 83, proposal: { work_id: null, source: null, request_key: null, title: 'Already closed', scope: ['src/a.rs'] } }),
+    ])
+    render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} session={session} />)
+    await screen.findAllByText('Dev leads this one')
+    for (const title of ['Dev leads this one', 'Requester still active']) {
+      await userEvent.click(within(list()).getByRole('button', { name: new RegExp(title) }))
+      expect(screen.queryByRole('button', { name: 'Close the request' })).toBeNull()
+    }
+    // The gone requester is still named for the other person's thread, without an action.
+    await userEvent.click(within(list()).getByRole('button', { name: /Dev leads this one/ }))
+    expect(screen.getAllByText('The requesting agent is gone').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/Sign in on the web to close it/)).toBeNull()
+  })
+
+  it('points to a prompt, not a button, without a web sign-in', async () => {
+    hub([replied()])
+    render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} />)
+    await screen.findAllByText('Move tax out of invoice totals')
+    expect(screen.queryByRole('button', { name: 'Close the request' })).toBeNull()
+    expect(screen.getByText(/Sign in on the web to close it from here/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copy prompt for maria’s Claude Code' })).toBeTruthy()
+  })
+})
