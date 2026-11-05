@@ -1221,7 +1221,7 @@ fn refused(reason: &str) -> Value {
 pub(super) fn hub_failure(error: &HubError) -> Value {
     refused(match error {
         HubError::Busy => "hub busy",
-        HubError::WorkCapacity => "work storage capacity reached",
+        HubError::WorkCapacity(_) => "work storage capacity reached",
         HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
         HubError::WorkCoordinationRequired { .. } => {
             "work scope needs coordination; inspect the agent inbox"
@@ -2957,7 +2957,7 @@ fn work_failure(error: &HubError) -> Value {
             "hub busy",
             &["Retry the same idempotent request later."],
         ),
-        HubError::WorkCapacity => (
+        HubError::WorkCapacity(_) => (
             "work_storage_capacity",
             "work storage capacity reached",
             &[

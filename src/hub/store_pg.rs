@@ -15,6 +15,7 @@ use crate::change_record::{
     SessionSetupV1, parse_conversation_cursor,
 };
 
+use super::capacity::{self, CapacityLimit, CapacityRefusal, CapacityRepository};
 use super::catchup::{
     CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES, CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES,
     CATCHUP_DELIVERY_CAPACITY_BYTES, CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult,
@@ -812,7 +813,7 @@ fn pg_check_catchup_delivery_capacity(
         .saturating_add(new_bytes)
         > CATCHUP_DELIVERY_CAPACITY_BYTES
     {
-        return Err(HubError::WorkCapacity);
+        return Err(who.capacity(CapacityLimit::CatchupDeliveries));
     }
     if let Some(token) = subscriber_token {
         let agents: i64 = tx
@@ -853,7 +854,7 @@ fn pg_check_catchup_delivery_capacity(
                 .saturating_add(new_bytes)
                 > CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES
         {
-            return Err(HubError::WorkCapacity);
+            return Err(who.capacity(CapacityLimit::CatchupDeliveries));
         }
     }
     Ok(())
@@ -991,7 +992,7 @@ fn pg_record_catchup_merge(
     if retained_rows >= MAX_CATCHUP_MERGE_ROWS
         || retained_bytes.saturating_add(payload_bytes) > MAX_CATCHUP_MERGE_BYTES
     {
-        return Err(HubError::WorkCapacity);
+        return Err(scope.capacity(CapacityLimit::MergeObservations));
     }
     tx.execute(
         "INSERT INTO hub_catchup_merges
@@ -2809,7 +2810,8 @@ fn charge_work_payload(
         .map(|row| row.get(0));
     let used = used.unwrap_or(0);
     if enforce {
-        check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+        check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)
+            .map_err(|_| who.capacity(CapacityLimit::WorkStorage))?;
     }
     let charged = used
         .checked_add(delta)
@@ -3520,7 +3522,7 @@ fn create_coordination_request(
         || owner_active >= MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER
         || token_active >= MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN
     {
-        return Err(HubError::WorkCapacity);
+        return Err(who.capacity(CapacityLimit::CoordinationRequests));
     }
     let id = new_id("crq")?;
     // Automatic requests are built from work scopes that are already in their
@@ -3782,7 +3784,7 @@ fn retarget_coordination_requests(
         &[&work],
     )?;
     if rows.len() > MAX_ACTIVE_COORDINATION_REQUESTS as usize {
-        return Err(HubError::WorkCapacity);
+        return Err(who.capacity(CapacityLimit::CoordinationRequests));
     }
     for row in rows {
         let request: String = row.get(0);
@@ -7313,6 +7315,74 @@ impl Store for PgStore {
         })
     }
 
+    fn record_capacity_refusal(&self, refusal: &CapacityRefusal) -> Result<()> {
+        let r = &refusal.repository;
+        let key = r.repository_id.unwrap_or(-1);
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            tx.execute(
+                "INSERT INTO hub_capacity_refusals
+                     (provider, host, repository, repository_key, limit_kind, at, count)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (provider, host, repository, repository_key, limit_kind) DO UPDATE SET
+                     at = GREATEST(hub_capacity_refusals.at, excluded.at),
+                     count = hub_capacity_refusals.count + excluded.count",
+                &[
+                    &r.provider,
+                    &r.host,
+                    &r.repository,
+                    &key,
+                    &refusal.limit.as_str(),
+                    &refusal.at,
+                    &refusal.count,
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_capacity_refusals WHERE at <= $1",
+                &[&(refusal.at - capacity::RETAIN_SECONDS)],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_capacity_refusals
+                 WHERE (provider, host, repository, repository_key, limit_kind) NOT IN
+                     (SELECT provider, host, repository, repository_key, limit_kind
+                      FROM hub_capacity_refusals
+                      ORDER BY at DESC, provider, host, repository, repository_key, limit_kind
+                      LIMIT $1)",
+                &[&capacity::MAX_REFUSALS],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn capacity_refusals(&self, now: i64) -> Result<Vec<CapacityRefusal>> {
+        self.run(true, |client| {
+            let rows = client.query(
+                "SELECT provider, host, repository, repository_key, limit_kind, at, count
+                 FROM hub_capacity_refusals WHERE at > $1
+                 ORDER BY at DESC, provider, host, repository, repository_key, limit_kind
+                 LIMIT $2",
+                &[&(now - capacity::RETAIN_SECONDS), &capacity::MAX_REFUSALS],
+            )?;
+            // A limit this binary does not know (a newer Hub wrote it) is left out.
+            Ok(rows
+                .iter()
+                .filter_map(|row| {
+                    Some(CapacityRefusal {
+                        limit: CapacityLimit::parse(row.get::<_, &str>(4))?,
+                        repository: CapacityRepository {
+                            provider: row.get(0),
+                            host: row.get(1),
+                            repository: row.get(2),
+                            repository_id: Some(row.get::<_, i64>(3)).filter(|id| *id >= 0),
+                        },
+                        at: row.get(5),
+                        count: row.get(6),
+                    })
+                })
+                .collect())
+        })
+    }
     fn repository_usage(&self, now: i64) -> Result<Vec<RepositoryUsage>> {
         self.run(true, |client| {
             let rows = client.query(
@@ -10984,7 +11054,7 @@ impl Store for PgStore {
             let lifecycle_valid=start_sequence==Some(1)&&end_sequence==Some(retained_watermark)&&retained_watermark>1;let gaps_i64=gap_count as i64;
             tx.execute("UPDATE hub_change_sessions SET watermark=$4,event_count=$5,gap_count=gap_count+$6,started=$7,ended=$8,start_sequence=$9,end_sequence=$10,lifecycle_valid=$11,last_observed_at=GREATEST(last_observed_at,$12),updated_at=$13,start_count=$14,end_count=$15 WHERE work=$1 AND generation=$2 AND session_id=$3",&[&batch.work_id,&batch.generation,&batch.session.session_id,&retained_watermark,&retained_events,&gaps_i64,&start_sequence.is_some(),&end_sequence.is_some(),&start_sequence,&end_sequence,&lifecycle_valid,&last_observed,&now,&start_count,&end_count])?;
             let retained_operations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&batch.work_id])?.get(0);
-            if retained_events>MAX_CHANGE_EVENTS_PER_SESSION||retained_operations>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}
+            if retained_events>MAX_CHANGE_EVENTS_PER_SESSION||retained_operations>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(who.capacity(CapacityLimit::ChangeRecords));}
             let capture_bytes=work_payload_row_bytes(request.len())?.checked_add(new_event_bytes).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;
             adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
             let receipt=IngestReceiptV1{work_id:batch.work_id.clone(),operation_id:batch.operation_id.clone(),accepted,duplicate,watermark:retained_watermark as u64,replayed:false};
@@ -11315,7 +11385,7 @@ impl Store for PgStore {
             if start.source.repository()!=who.repository{return Err(HubError::Invalid("action source belongs to another repository".into()));}
             if tx.query_opt("SELECT 1 FROM hub_work_participants WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",&[&start.work_id,&token,&start.session_id,&start.generation])?.is_none(){return Err(HubError::Invalid("action session is not a current work participant".into()));}
             if tx.query_opt("SELECT 1 FROM hub_change_actions WHERE work=$1 AND action_id=$2",&[&start.work_id,&start.action_id])?.is_some(){return Err(HubError::Invalid("action_id is already used".into()));}
-            let action_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_actions WHERE work=$1",&[&start.work_id])?.get(0);let operation_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&start.work_id])?.get(0);if action_count>=MAX_CHANGE_ACTIONS_PER_WORK||operation_count>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}
+            let action_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_actions WHERE work=$1",&[&start.work_id])?.get(0);let operation_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&start.work_id])?.get(0);if action_count>=MAX_CHANGE_ACTIONS_PER_WORK||operation_count>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(who.capacity(CapacityLimit::ChangeRecords));}
             let capture_bytes=work_payload_row_bytes(request.len())?.checked_mul(2).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
             let received_order:i64=tx.query_one("SELECT COALESCE(MAX(received_order),0)+1 FROM hub_change_actions WHERE work=$1",&[&start.work_id])?.get(0);
             let source_id=start.source.stable_id()?;let source_kind=enum_name(&start.source.kind())?;
@@ -11348,7 +11418,7 @@ impl Store for PgStore {
             if retained_start.kind==crate::change_record::ActionKindV1::Verification&&retained_start.recipe_provenance!=crate::change_record::RecipeProvenanceV1::ConfiguredExactMatch&&matches!(finish.result,crate::change_record::CheckResultV1::Passed|crate::change_record::CheckResultV1::Failed){return Err(HubError::Invalid("verification result requires an exact configured recipe".into()));}
             if already.is_some(){return Err(HubError::Invalid("action is already finished".into()));}
             if finish.finished_at<started_at{return Err(HubError::Invalid("action finish precedes its start".into()));}
-            let operation_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&finish.work_id])?.get(0);if operation_count>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}let capture_bytes=work_payload_row_bytes(request.len())?.checked_mul(2).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
+            let operation_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&finish.work_id])?.get(0);if operation_count>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(who.capacity(CapacityLimit::ChangeRecords));}let capture_bytes=work_payload_row_bytes(request.len())?.checked_mul(2).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
             tx.execute("UPDATE hub_change_actions SET finish_request=$3,finished_at=$4,updated_at=$5 WHERE work=$1 AND action_id=$2",&[&finish.work_id,&finish.action_id,&request,&finish.finished_at,&now])?;let receipt=ActionMutationReceiptV1{work_id:finish.work_id.clone(),operation_id:finish.operation_id.clone(),action_id:finish.action_id.clone(),replayed:false};tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES ($1,$2,$3,'action_finish',$4,$5,$6)",&[&finish.work_id,&finish.operation_id,&token,&request,&json_string(&receipt)?,&now])?;tx.commit()?;Ok(receipt)})
     }
 
@@ -12379,7 +12449,7 @@ impl Store for PgStore {
                     &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.get(0);
                 (token_count,MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,agent_count,MAX_ACTIVE_AGENT_DELIVERIES)
             };
-            if active_class>=class_limit||active_group>=group_limit||active_total>=MAX_ACTIVE_CATCHUP_DELIVERIES{return Err(HubError::WorkCapacity);}
+            if active_class>=class_limit||active_group>=group_limit||active_total>=MAX_ACTIVE_CATCHUP_DELIVERIES{return Err(who.capacity(CapacityLimit::CatchupDeliveries));}
             let et=catchup_event_high_water(&mut tx,&who,cursors.0)?;
             let mt=tx.query_opt("SELECT next_merge_seq-1 FROM hub_catchup_repositories WHERE provider=$1
                 AND host=$2 AND repository=$3 AND repository_key=$4",
@@ -13227,7 +13297,7 @@ impl Store for PgStore {
                 )?
                 .get(0);
             if updates >= MAX_COORDINATION_UPDATES {
-                return Err(HubError::WorkCapacity);
+                return Err(who.capacity(CapacityLimit::CoordinationUpdates));
             }
             let event = coordination_event(
                 "coordination_acknowledged",
@@ -13329,7 +13399,7 @@ impl Store for PgStore {
                 )?
                 .get(0);
             if updates >= MAX_COORDINATION_UPDATES {
-                return Err(HubError::WorkCapacity);
+                return Err(who.capacity(CapacityLimit::CoordinationUpdates));
             }
             let response_id = new_id("crs")?;
             let event = coordination_event(

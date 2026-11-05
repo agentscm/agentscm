@@ -632,6 +632,27 @@ mod tests {
         assert!(result.text.contains("partial"));
     }
     #[test]
+    fn counts_the_same_needs_as_the_hub_rail_badge() {
+        // The Hub's rail badge counts this file in ui/tests/unit/actionable-status.test.ts, and
+        // src/hub/actionable_status.rs checks it against a real store's projection.
+        let value =
+            serde_json::from_str(include_str!("../hub/fixtures/needs-you-surfaces.json")).unwrap();
+        let result = summarize(std::path::Path::new("/synthetic"), "acme/widgets", &value);
+        assert!(result.available);
+        assert_eq!(result.count, 4);
+        assert_eq!(
+            result.keys,
+            [
+                "file:src/shared.rs",
+                "pr:rep_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:7",
+                "request:crq_cccccccccccccccccccccccccccccccc:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "work:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ]
+        );
+        assert_eq!(result.work.iter().filter(|w| w.needs_you).count(), 4);
+        assert_eq!(result.text, "acme/widgets · 4 actions need you (partial)");
+    }
+    #[test]
     fn older_hub_response_stays_unavailable() {
         let result = summarize(
             std::path::Path::new("/synthetic"),

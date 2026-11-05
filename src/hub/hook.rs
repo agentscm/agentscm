@@ -370,7 +370,7 @@ fn root_header(headers: &HeaderMap) -> Option<&str> {
 fn reason(error: HubError) -> &'static str {
     match error {
         HubError::Busy => "hub busy",
-        HubError::WorkCapacity => "work storage capacity reached",
+        HubError::WorkCapacity(_) => "work storage capacity reached",
         HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
         HubError::WorkCoordinationRequired { .. } => {
             "work scope needs coordination; inspect the agent inbox"
