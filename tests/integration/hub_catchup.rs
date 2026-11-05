@@ -614,6 +614,7 @@ fn compaction_delivery_guard(fixture: &Fixture) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("catchup-compaction".into()),
@@ -794,6 +795,7 @@ fn non_lead_cannot_use_explicit_lead_retry_bypass(fixture: &Fixture) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("preflight-role-gate".into()),
@@ -816,6 +818,7 @@ fn non_lead_cannot_use_explicit_lead_retry_bypass(fixture: &Fixture) {
         let refused = fixture.store.work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(started.item.id.clone()),
                 source: None,
                 request_key: None,
@@ -907,6 +910,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
         .work_start(
             &old_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("rename-active".into()),
@@ -955,6 +959,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
         .work_preflight(
             &new_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("rename-next".into()),
@@ -990,6 +995,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
         .work_preflight(
             &new_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("rename-disjoint".into()),
@@ -1049,6 +1055,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
         .work_preflight(
             &new_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("rename-active".into()),
@@ -1226,6 +1233,7 @@ fn large_work_history_pages_without_skipping(fixture: &Fixture) {
             .work_start(
                 &token,
                 &WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: Some(format!("large-{n}")),
@@ -2045,6 +2053,7 @@ fn sqlite_legacy_start_survives_optional_projection_storage_failure() {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("legacy-no-preflight".into()),
@@ -2117,6 +2126,7 @@ fn sqlite_backfills_historical_publication_without_loading_manifest() {
         .work_preflight(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("historical-preflight".into()),
@@ -2391,6 +2401,7 @@ fn postgres_merge_ingest_and_work_admission_share_a_repository_lock() {
         )
         .unwrap();
     let start = WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some("atomic-preflight".into()),
@@ -2477,6 +2488,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
     let old_token = fixture.token_for_repository(&owner, "before", old, 845, false);
     let new_token = fixture.token_for_repository(&owner, "after", new, 845, false);
     let start = |key: &str, path: &str| WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(key.into()),
@@ -2839,6 +2851,7 @@ fn begin(
         .work_start(
             token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some(key.into()),
@@ -3143,6 +3156,7 @@ fn an_automatic_pause_after_the_merge_settles_until_resumed(fixture: &Fixture) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(auto.id.clone()),
                 source: None,
                 request_key: None,
@@ -3206,6 +3220,7 @@ fn a_hidden_item_still_conflicts_with_a_new_start(fixture: &Fixture) {
         .work_start(
             &other,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("adm-other".into()),

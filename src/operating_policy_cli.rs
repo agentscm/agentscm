@@ -427,6 +427,7 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
             } else {
                 managed
                     .start(&WorkStart {
+                        issue_choice: None,
                         work_id: None,
                         source: None,
                         request_key: Some(retained.dispatch.run_id.clone()),

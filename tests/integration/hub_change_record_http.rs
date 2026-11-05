@@ -228,6 +228,7 @@ async fn session_setups_reach_the_projection_and_are_trimmed_first() {
         mint_bound_agent_token(&*hub.store, &owner.id, "writer", REPOSITORY, 78, 600, false)
             .unwrap();
     let start = |scope: Vec<String>| WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some("http-setups".into()),
@@ -292,6 +293,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
         .work_start(
             &writer_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("http-change-record".into()),
@@ -517,6 +519,7 @@ async fn minimum_configured_spool_completes_one_managed_recipe() {
         .work_start(
             &writer_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("minimum-managed-spool".into()),
@@ -862,6 +865,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
         .work_start(
             &writer_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("hook-cli-alias".into()),
@@ -1728,6 +1732,7 @@ mod shared_bodies {
                 .work_start(
                     &owner_token,
                     &WorkStart {
+                        issue_choice: None,
                         work_id: None,
                         source: None,
                         request_key: Some("shared-body".into()),
@@ -1751,6 +1756,7 @@ mod shared_bodies {
                 .work_start(
                     &helper_token,
                     &WorkStart {
+                        issue_choice: None,
                         work_id: Some(work.id.clone()),
                         source: None,
                         request_key: None,
@@ -3659,6 +3665,7 @@ async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("capture-after-pause".into()),

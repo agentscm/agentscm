@@ -197,6 +197,7 @@ fn start_scope(
     scope: &[&str],
 ) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: work_id.map(str::to_owned),
         source: None,
         request_key: work_id.is_none().then(|| key.into()),

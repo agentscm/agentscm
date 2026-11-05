@@ -1824,6 +1824,7 @@ fn hook_call(session: &str, paths: &[&str]) -> agentscm::hub::session::SessionCa
 
 fn work(key: &str, session: &str) -> agentscm::hub::work::WorkStart {
     agentscm::hub::work::WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(key.into()),
@@ -3281,6 +3282,7 @@ async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
             .work_start(
                 &token,
                 &WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: Some(key.into()),

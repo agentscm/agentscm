@@ -697,6 +697,8 @@ mod tests {
 
     fn item(state: WorkState, depends_on: &[&str], blocked: bool) -> WorkItem {
         WorkItem {
+            initial_issue_choice: Default::default(),
+            issue_link: None,
             id: "work-1".to_owned(),
             repository: "example/repo".to_owned(),
             owner: "user-1".to_owned(),
