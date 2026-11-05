@@ -405,8 +405,9 @@ pub(super) struct Decision {
     pub rate_limited: bool,
 }
 
-/// `first` are the call's files no refusing call has checked yet, `contested` those of them another
-/// agent holds that were not refused before (the others are repeats).
+/// `first` are the call's files no refusing call has checked yet, `denied` the files refused before,
+/// `contested` those of `first` held by a hold this session was not refused for (the others are
+/// repeats).
 pub(super) fn decide(
     denied: &[String],
     times: &[i64],
@@ -448,14 +449,25 @@ pub(super) struct Guarded {
     pub unchecked_json: String,
 }
 
+/// A remembered refusal: the file and the hold (intent) it was refused for. A repeat passes only
+/// while that hold keeps the file, so a new holder or a fresh hold is refused once again.
+fn refusal(key: &str, hold: &str) -> String {
+    format!("{key}\n{hold}")
+}
+
+/// The file of a remembered refusal; one stored before holds were recorded is the bare file.
+fn refused_file(entry: &str) -> &str {
+    entry.split('\n').next().unwrap_or(entry)
+}
+
 fn list<T: DeserializeOwned>(json: &str) -> Result<Vec<T>> {
     serde_json::from_str(json).map_err(|error| HubError::Unavailable(error.to_string()))
 }
 
-/// Warn-once for a deny-capable call: a contested file's first attempt is refused (the call then
-/// only heartbeats the held intent), a repeat of a refused file passes. A file the session already
-/// holds through a call that cannot refuse (MCP, a hook after the edit) counts as a first attempt
-/// until a refusing call has checked it. `load` returns the live intents of other holders
+/// Warn-once for a deny-capable call: a contested file's first attempt under each hold is refused
+/// (the call then only heartbeats the held intent), a repeat passes while the same hold keeps it.
+/// A file the session already holds through a call that cannot refuse (MCP, a hook after the
+/// edit) counts as a first attempt until a refusing call has checked it. `load` returns the live intents of other holders
 /// overlapping the keys it is given.
 pub(super) fn guard(
     token: &str,
@@ -494,22 +506,28 @@ pub(super) fn guard(
             }
         }
     } else if !first.is_empty() {
-        let fresh: Vec<String> = first
-            .iter()
-            .filter(|key| !denied.contains(key))
-            .cloned()
+        // Only holds this session was not refused for count; the others are repeats.
+        let found: Vec<Overlap> = contested(token, &out.step.via, &first, load(&first)?)
+            .into_iter()
+            .filter_map(|mut overlap| {
+                let hold = overlap.intent.id.clone();
+                overlap
+                    .your_paths
+                    .retain(|key| !denied.contains(&refusal(key, &hold)));
+                overlap.their_paths.clone_from(&overlap.your_paths);
+                (!overlap.your_paths.is_empty()).then_some(overlap)
+            })
             .collect();
-        let found = if fresh.is_empty() {
-            Vec::new()
-        } else {
-            contested(token, &out.step.via, &fresh, load(&fresh)?)
-        };
         let keys: BTreeSet<String> = found
             .iter()
             .flat_map(|overlap| overlap.your_paths.clone())
             .collect();
         let keys: Vec<String> = keys.into_iter().collect();
-        let decision = decide(&denied, &times, &first, &keys, now);
+        let earlier: Vec<String> = denied
+            .iter()
+            .map(|entry| refused_file(entry).to_owned())
+            .collect();
+        let decision = decide(&earlier, &times, &first, &keys, now);
         if decision.deny.is_empty() {
             out.repeated = decision.repeat;
             out.rate_limited = decision.rate_limited;
@@ -524,8 +542,13 @@ pub(super) fn guard(
                 },
                 now,
             )?;
+            denied.extend(found.iter().flat_map(|overlap| {
+                overlap
+                    .your_paths
+                    .iter()
+                    .map(|key| refusal(key, &overlap.intent.id))
+            }));
             out.denied = found;
-            denied.extend(decision.deny);
             if denied.len() > MAX_DENIED {
                 denied.drain(..denied.len() - MAX_DENIED);
             }

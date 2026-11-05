@@ -23,16 +23,9 @@ pub(super) const RENEW_INTERVAL_SECONDS: i64 = 60;
 pub const IN_FLIGHT_CAP_SECONDS: i64 = 3600;
 /// The start of the refusal a lead meets after its reservation lapsed; every surface shows it.
 pub const LEASE_LAPSED: &str = "LEASE_LAPSED";
-/// The start of the refusal of an edit not linked to a current assignment of its session.
+/// The start of the refusal of an edit not linked to a current assignment of its session. Like
+/// `LEASE_LAPSED`, it holds for every repeat until a start or checkpoint links the edit.
 pub const EDIT_UNLINKED: &str = "EDIT_UNLINKED";
-
-/// Whether a hook's refusal holds for a repeat of the same edit. A lapsed hold or an unlinked
-/// edit changes only through a start or checkpoint, never by trying again, so the hook client
-/// keeps these refusals where it lets other repeated edits through.
-pub fn refusal_holds(reason: &str) -> bool {
-    let code = reason.strip_prefix("AgentSCM: ").unwrap_or(reason);
-    code.starts_with(LEASE_LAPSED) || code.starts_with(EDIT_UNLINKED)
-}
 /// Participants from owners other than the Work's own. The rest of the 100 participants stay for
 /// the owner's sessions, so other owners cannot block a resume or slow cleanup without bound.
 pub const MAX_OTHER_OWNER_PARTICIPANTS: usize = 25;
@@ -1102,19 +1095,6 @@ mod tests {
         let notice = reclaimed_hold(&held, 3600).notice;
         assert!(notice.contains("Its lead agent Agent abcd may"), "{notice}");
         assert!(!notice.contains("synthetic-host"), "{notice}");
-    }
-
-    #[test]
-    fn only_lapsed_and_unlinked_refusals_hold_for_a_repeat() {
-        assert!(refusal_holds("AgentSCM: LEASE_LAPSED: the hold lapsed."));
-        assert!(refusal_holds(
-            "AgentSCM: EDIT_UNLINKED: this edit was not applied."
-        ));
-        assert!(refusal_holds("EDIT_UNLINKED: bare"));
-        assert!(!refusal_holds(
-            "AgentSCM: src/a.rs is being edited by another agent."
-        ));
-        assert!(!refusal_holds("AgentSCM: see EDIT_UNLINKED later"));
     }
 
     #[test]

@@ -544,6 +544,35 @@ fn a_refused_file_stays_acknowledged_after_its_hold_lapses(db: &Db) {
     assert_eq!(event_data(&*store, "edit_denied").len(), 1);
 }
 
+/// The repeat allowance belongs to the hold that was refused: once another session holds the
+/// file, the first attempt is refused again and names the new holder.
+fn a_repeat_passes_only_while_the_same_hold_keeps_the_file(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1, "a");
+    let bob = agent(&*store, 2, "b");
+    let carol = agent(&*store, 3, "c");
+    touch(&*store, &alice, &["a.rs"], T0);
+    assert_eq!(
+        hook_touch(&*store, &bob, "s", &["a.rs"], T0 + 1)
+            .denied
+            .len(),
+        1
+    );
+    // Alice's hold lapses unrenewed and carol takes the file.
+    touch(&*store, &carol, &["a.rs"], T0 + 1300);
+    let again = hook_touch(&*store, &bob, "s", &["a.rs"], T0 + 1301);
+    assert_eq!(again.denied.len(), 1, "{again:?}");
+    assert_eq!(again.denied[0].intent.token, carol.token);
+    assert!(again.repeated.is_empty());
+    // Under carol's hold the repeat passes once refused.
+    let repeat = hook_touch(&*store, &bob, "s", &["a.rs"], T0 + 1302);
+    assert!(
+        repeat.denied.is_empty() && repeat.repeated == ["a.rs"],
+        "{repeat:?}"
+    );
+    assert_eq!(event_data(&*store, "edit_denied").len(), 2);
+}
+
 fn every_touch_keeps_last_active_fresh(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1, "a");
@@ -1034,6 +1063,7 @@ conformance!(
     the_first_contested_edit_is_refused_and_a_repeat_passes,
     a_file_held_through_mcp_is_still_refused_on_the_first_hook_edit,
     a_refused_file_stays_acknowledged_after_its_hold_lapses,
+    a_repeat_passes_only_while_the_same_hold_keeps_the_file,
     every_touch_keeps_last_active_fresh,
     only_session_intents_refuse,
     no_notice_to_ones_own_other_connection,

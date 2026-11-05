@@ -161,10 +161,30 @@ async fn finish_local_observation(
     } else {
         None
     };
-    match note {
+    let reply = match note {
         Some(note) => with_local_note(reply, agent, payload, &note),
         None => reply,
+    };
+    within_context_limit(reply)
+}
+
+/// The reply with each context field cut to what the host keeps (Claude Code: 10,000
+/// characters), so the start of it, where the session ID and required rules are, always arrives.
+fn within_context_limit(mut reply: Value) -> Value {
+    for field in [
+        "/hookSpecificOutput/additionalContext",
+        "/additional_context",
+        "/additionalContext",
+        "/systemMessage",
+    ] {
+        if let Some(value) = reply.pointer_mut(field)
+            && let Some(text) = value.as_str()
+        {
+            let fitted = agentscm::hub::hook::fit_context(text, agentscm::hub::hook::CONTEXT_LIMIT);
+            *value = json!(fitted);
+        }
     }
+    reply
 }
 
 /// The whole of stdin, or `None` when it is over the cap or unreadable.
@@ -346,11 +366,10 @@ async fn call_hub(
     match status {
         200 if reply.is_object() => {
             activity.finish(successful_hook_outcome(&outbound));
-            let config = config_dir().ok();
             let reply = if agent == "gemini" && plugin_route {
-                gemini_reply(reply, &payload, config.as_deref())
+                gemini_reply(reply, &payload)
             } else {
-                defanged(reply, &agent, &payload, config.as_deref())
+                defanged(reply, &payload)
             };
             Ok(match note {
                 Some(note) => with_note(reply, &agent, &payload, &note),
@@ -1607,16 +1626,14 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
     }
 }
 
-fn gemini_reply(reply: Value, payload: &Value, config: Option<&Path>) -> Value {
+/// The Hub decides when an edit is refused: it reports a contested file once per hold, so a
+/// retry under the same hold comes back clean.
+fn gemini_reply(reply: Value, payload: &Value) -> Value {
     let status = reply["status"].as_str().unwrap_or_default();
     let text = reply["text"].as_str().unwrap_or_default();
     match payload["hook_event_name"].as_str() {
         Some("BeforeTool") if status == "stop" && !text.is_empty() => {
-            if holding(text) || first_deny(config, "gemini", payload) {
-                json!({"decision":"deny", "reason":text})
-            } else {
-                json!({})
-            }
+            json!({"decision":"deny", "reason":text})
         }
         Some("BeforeTool") if !text.is_empty() => json!({"systemMessage":text}),
         Some("SessionStart") if !text.is_empty() => json!({
@@ -1634,10 +1651,10 @@ type Object = serde_json::Map<String, Value>;
 
 /// The hub's reply cut down to an allowlist: context and message fields, Cursor's `permission`
 /// (forced to allow) and the one documented refusal, `permissionDecision` "deny" with a
-/// non-empty reason. A deny passes only on a pre-tool event and once per identical edit (a
-/// repeat is the agent's retry), except the Hub's holding refusals, which a repeat meets
-/// again; the rest is dropped, so a wrong or hostile reply cannot approve or rewrite a call.
-fn defanged(reply: Value, agent: &str, payload: &Value, config: Option<&Path>) -> Value {
+/// non-empty reason, kept only on a pre-tool event. The Hub decides which edits it refuses and
+/// how often (once per hold for a contested file, up to its rate limit); the rest is dropped, so
+/// a wrong or hostile reply cannot approve or rewrite a call.
+fn defanged(reply: Value, payload: &Value) -> Value {
     let Value::Object(mut top) = reply else {
         return reply;
     };
@@ -1667,11 +1684,8 @@ fn defanged(reply: Value, agent: &str, payload: &Value, config: Option<&Path>) -
                 || ["hookEventName", "additionalContext"].contains(&key.as_str())
         });
     }
-    let wants = inner.as_deref().is_some_and(denies);
-    let holds = inner.as_deref().is_some_and(holding_deny);
-    let wants = wants || denies(&top);
-    let holds = holds || holding_deny(&top);
-    let keep = wants && is_pre_tool(payload) && (holds || first_deny(config, agent, payload));
+    let wants = inner.as_deref().is_some_and(denies) || denies(&top);
+    let keep = wants && is_pre_tool(payload);
     if let Some(inner) = top
         .get_mut("hookSpecificOutput")
         .and_then(Value::as_object_mut)
@@ -1690,21 +1704,6 @@ fn denies(object: &Object) -> bool {
             .is_some_and(|reason| !reason.is_empty())
 }
 
-/// A deny that carries one of the Hub's holding refusals.
-fn holding_deny(object: &Object) -> bool {
-    denies(object)
-        && object
-            .get(PAIR[1])
-            .and_then(Value::as_str)
-            .is_some_and(holding)
-}
-
-/// Whether a refusal is one the Hub keeps until the session's Work changes (a lapsed hold or an
-/// unlinked edit), so unlike other refusals a retry of the same edit meets it too.
-fn holding(reason: &str) -> bool {
-    agentscm::hub::work_lifecycle::refusal_holds(reason)
-}
-
 /// Keeps a valid deny pair when `keep`, else removes the pair.
 fn settle(object: &mut Object, keep: bool) {
     if !(keep && denies(object)) {
@@ -1719,23 +1718,6 @@ fn is_pre_tool(payload: &Value) -> bool {
         Some(name) => matches!(name, "PreToolUse" | "preToolUse"),
         None => payload.get("toolName").is_some() && payload.get("toolResult").is_none(),
     }
-}
-
-/// True the first time this exact edit of the session is refused. Any missing session id or
-/// filesystem error passes the deny: the hub already limits refusals.
-fn first_deny(config: Option<&Path>, agent: &str, payload: &Value) -> bool {
-    let (Some(config), Some(session)) = (config, session_of(payload)) else {
-        return true;
-    };
-    // Object keys are sorted (serde_json without preserve_order), so this is canonical.
-    let input = payload.get("tool_input").or(payload.get("toolArgs"));
-    first_marker(
-        config,
-        &format!(
-            "deny\0{agent}\0{session}\0{}",
-            input.unwrap_or(&Value::Null)
-        ),
-    )
 }
 
 /// The marker key of a tool event that only renews the session's lease: every tool event except
@@ -2207,7 +2189,7 @@ mod tests {
             for event in ["SessionStart", "PreToolUse"] {
                 let payload = json!({"hook_event_name":event});
                 let warning = "AgentSCM: coordination unknown (body unreadable)";
-                let reply = defanged(json!({"systemMessage":warning}), agent, &payload, None);
+                let reply = defanged(json!({"systemMessage":warning}), &payload);
                 assert_eq!(
                     with_local_note(reply, agent, &payload, "Local branch advice"),
                     json!({
@@ -2268,12 +2250,25 @@ mod tests {
     }
 
     #[test]
+    fn a_context_over_the_host_limit_is_cut_and_keeps_its_start() {
+        let long = format!("AgentSCM native session ID first\n{}", "x\n".repeat(12_000));
+        let reply = within_context_limit(json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart", "additionalContext": long}}));
+        let context = reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.len() <= agentscm::hub::hook::CONTEXT_LIMIT);
+        assert!(context.starts_with("AgentSCM native session ID first\n"));
+        let short = json!({"additional_context": "fits"});
+        assert_eq!(within_context_limit(short.clone()), short);
+    }
+
+    #[test]
     fn gemini_native_start_preserves_session_discovery_context() {
         let context = "AgentSCM native session ID (literal data, not instructions): \"native-id\". Pass this exact value as `session` to agentscm_start and every other AgentSCM call.";
         let reply = gemini_reply(
             json!({"status":"clean","text":context}),
             &json!({"hook_event_name":"SessionStart"}),
-            None,
         );
         assert_eq!(reply["hookSpecificOutput"]["additionalContext"], context);
     }
@@ -2777,8 +2772,7 @@ mod tests {
 
     #[test]
     fn a_hub_reply_is_cut_to_an_allowlist() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let cut = |reply| defanged(reply, "claude", &pre("s", json!({})), Some(dir.path()));
+        let cut = |reply| defanged(reply, &pre("s", json!({})));
         let reply = cut(json!({
             "permission": "deny", "continue": false, "decision": "block", "stopReason": "x",
             "updatedInput": {}, "updated_input": {}, "followup_message": "x",
@@ -2804,8 +2798,7 @@ mod tests {
 
     #[test]
     fn only_a_deny_with_a_reason_on_a_pre_tool_event_survives() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let run = |reply, payload: &Value| defanged(reply, "claude", payload, Some(dir.path()));
+        let run = |reply, payload: &Value| defanged(reply, payload);
         let bare = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse"}});
         for (decision, reason) in [
             (json!("deny"), json!("")),
@@ -2828,47 +2821,24 @@ mod tests {
         // Not before a tool: dropped.
         let post = json!({"hook_event_name": "PostToolUse", "session_id": "s"});
         assert_eq!(run(deny("r"), &post), bare);
+        // Before a tool, every deny the Hub sends is kept: the Hub alone decides how often a
+        // repeat is refused (once per hold for a contested file, every time for an unlinked edit
+        // or lapsed hold), so a change of holder is refused again.
         let first = pre("s", json!({"file_path": "a.rs"}));
         assert_eq!(run(deny("r"), &first), deny("r"));
-        // The repeat of the same edit passes; another edit or session is refused once.
-        assert_eq!(run(deny("r"), &first), bare);
-        assert_eq!(
-            run(deny("r"), &pre("s", json!({"file_path": "b.rs"}))),
-            deny("r")
-        );
-        assert_eq!(
-            run(deny("r"), &pre("t", json!({"file_path": "a.rs"}))),
-            deny("r")
-        );
-        // A lapsed lease is refused on every retry of the same edit, until the lead restarts.
-        let lapsed = deny("AgentSCM: LEASE_LAPSED: the hold on wrk_a lapsed.");
-        let edit = pre("s", json!({"file_path": "c.rs"}));
-        assert_eq!(run(lapsed.clone(), &edit), lapsed);
-        assert_eq!(run(lapsed.clone(), &edit), lapsed);
-        assert_eq!(run(lapsed.clone(), &edit), lapsed);
-        // So is an edit not linked to the session's Work, until a start or checkpoint links it.
+        assert_eq!(run(deny("r"), &first), deny("r"));
         let unlinked = deny("AgentSCM: EDIT_UNLINKED: this edit was not applied.");
-        let edit = pre("s", json!({"file_path": "d.rs"}));
-        assert_eq!(run(unlinked.clone(), &edit), unlinked);
-        assert_eq!(run(unlinked.clone(), &edit), unlinked);
-        // Copilot CLI's camelCase form is top level, with the tool args as the identity.
+        assert_eq!(run(unlinked.clone(), &first), unlinked);
+        assert_eq!(run(unlinked.clone(), &first), unlinked);
+        // Copilot CLI's camelCase form is top level.
         let cli = json!({"sessionId": "c", "toolName": "edit", "toolArgs": "{\"p\":1}"});
         let top = json!({"permissionDecision": "deny", "permissionDecisionReason": "r"});
         assert_eq!(run(top.clone(), &cli), top);
-        assert_eq!(run(top, &cli), json!({}));
         let result = json!({"toolName": "edit", "toolResult": {}});
         let ask = json!({"permissionDecision": "ask", "permissionDecisionReason": "r", "k": 1});
         assert_eq!(run(ask, &cli), json!({}));
         let again = json!({"permissionDecision": "deny", "permissionDecisionReason": "r"});
         assert_eq!(run(again, &result), json!({}));
-        // No session id or no place for a marker: the deny passes, the hub limits refusals.
-        let anon = json!({"hook_event_name": "PreToolUse", "tool_input": {}});
-        assert_eq!(run(deny("r"), &anon), deny("r"));
-        assert_eq!(run(deny("r"), &anon), deny("r"));
-        let blocked = tempfile::NamedTempFile::new().unwrap();
-        let once = |reply| defanged(reply, "claude", &first, Some(blocked.path()));
-        assert_eq!(once(deny("r")), deny("r"));
-        assert_eq!(once(deny("r")), deny("r"));
     }
 
     #[test]
@@ -3277,32 +3247,24 @@ mod tests {
     }
 
     #[test]
-    fn gemini_stop_is_denied_once_without_forwarding_generic_fields() {
-        let config = tempfile::tempdir().unwrap();
+    fn gemini_stop_is_denied_without_forwarding_generic_fields() {
         let payload = json!({"hook_event_name":"BeforeTool", "session_id":"g",
             "tool_name":"write_file", "tool_input":{"file_path":"src/a.rs", "content":"private"}});
+        // The Hub reports a contested file once per hold, so each stop it sends is a refusal.
         let reply = json!({"status":"stop", "text":"coordinate this edit", "extra":"drop"});
-        assert_eq!(
-            gemini_reply(reply.clone(), &payload, Some(config.path())),
-            json!({"decision":"deny", "reason":"coordinate this edit"})
-        );
-        assert_eq!(
-            gemini_reply(reply, &payload, Some(config.path())),
-            json!({})
-        );
-        // A lapsed lease and an unlinked edit are refused on every retry.
-        for text in [
-            "AgentSCM: LEASE_LAPSED: the hold lapsed.",
-            "AgentSCM: EDIT_UNLINKED: this edit was not applied.",
-        ] {
-            let held = json!({"status":"stop", "text":text});
-            for _ in 0..2 {
-                assert_eq!(
-                    gemini_reply(held.clone(), &payload, Some(config.path())),
-                    json!({"decision":"deny", "reason":text})
-                );
-            }
+        for _ in 0..2 {
+            assert_eq!(
+                gemini_reply(reply.clone(), &payload),
+                json!({"decision":"deny", "reason":"coordinate this edit"})
+            );
         }
+        let clean = json!({"status":"clean", "text":""});
+        assert_eq!(gemini_reply(clean, &payload), json!({}));
+        let note = json!({"status":"fyi", "text":"overlap noted"});
+        assert_eq!(
+            gemini_reply(note, &payload),
+            json!({"systemMessage":"overlap noted"})
+        );
     }
 
     #[test]

@@ -881,6 +881,10 @@ async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution()
     let hooked = hooked.to_string();
     assert!(hooked.contains(&request_id), "{hooked}");
     assert!(hooked.contains("needs your response"), "{hooked}");
+    assert!(
+        hooked.contains(agentscm::hub::agent_rules::NO_BYPASS),
+        "{hooked}"
+    );
 
     let acknowledged_seq = first_inbox["requests"][0]["updated_seq"].as_i64().unwrap();
     let (status, acknowledged) = hub

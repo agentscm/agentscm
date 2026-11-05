@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
 use super::advice::{agent_name, unknown};
+use super::agent_rules::NO_BYPASS;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
 use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
@@ -38,6 +39,11 @@ use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
 const HOOK_BODY_BYTES: usize = 1024 * 1024;
+/// Claude Code keeps at most this many characters (UTF-16 units) of a hook's added context.
+pub const CONTEXT_LIMIT: usize = 10_000;
+/// The Hub's own start context stays within this, leaving room for the hook client's local note.
+pub const START_CONTEXT: usize = 9_000;
+const SHORTENED: &str = "\nAgentSCM: the rest of this context was cut to fit the agent's context limit; read agentscm_work_status, agentscm_work_briefing and agentscm_work_overview for it.";
 /// For the whole request, body included.
 const BUDGET: Duration = Duration::from_secs(5);
 const MAX_TASK_BYTES: usize = 500;
@@ -311,7 +317,7 @@ async fn hook(
                         outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
-                                "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline.",
+                                "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline. {NO_BYPASS}",
                                 request.id
                             ));
                             outcome.status = "stop";
@@ -608,7 +614,9 @@ impl Call {
                             } else {
                                 ""
                             };
-                            format!("AgentSCM: {detail}{child} No new file intent was announced.")
+                            format!(
+                                "AgentSCM: {detail}{child} {NO_BYPASS} No new file intent was announced."
+                            )
                         } else {
                             self.unlinked_refusal(None)
                         };
@@ -687,6 +695,23 @@ impl Call {
                 } else {
                     format!("{}\n{listing}", advice.text)
                 };
+                let store = state.store.clone();
+                let scope = principal.clone();
+                // Bound optional enrichment after the committed touch; a slow read cannot consume
+                // the native client's whole startup deadline or hide that touch's outcome.
+                let current_status = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    blocking(state, move || {
+                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
+                    }),
+                )
+                .await;
+                // Most useful first: a host's context limit cuts the end (see `START_CONTEXT`).
+                text.push('\n');
+                match current_status {
+                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
+                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
+                }
                 text.push('\n');
                 text.push_str(&match briefing {
                     Ok((briefing, overview, catchup)) => format!(
@@ -700,22 +725,6 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
-                let store = state.store.clone();
-                let scope = principal.clone();
-                // Bound optional enrichment after the committed touch; a slow read cannot consume
-                // the native client's whole startup deadline or hide that touch's outcome.
-                let current_status = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    blocking(state, move || {
-                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
-                    }),
-                )
-                .await;
-                text.push('\n');
-                match current_status {
-                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
-                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
-                }
                 if !principal.read_only {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
@@ -781,8 +790,15 @@ impl Call {
                 "{id} is finished. Start new Work: call agentscm_start with session {named}, your task and paths {paths}, then make the edit again.",
                 id = item.id,
             ),
+            // Live Work led elsewhere: its lead widens the scope; a takeover would conflict.
+            Some((item, false)) if matches!(item.state, WorkState::Active | WorkState::Blocked) => {
+                format!(
+                    "These files are outside the scope of {id}, which another session leads. Ask its lead to checkpoint {paths} into its scope; if this session is no longer a current helper, rejoin with agentscm_start with work_id {id}, session {named} and role helper first.",
+                    id = item.id,
+                )
+            }
             Some((item, _)) => format!(
-                "This session takes part in {id}, but it is not a current assignment of this session for these files. To lead it, call agentscm_start with work_id {id}, session {named} and takeover_generation {generation}; to help, call agentscm_start with work_id {id}, session {named} and role helper, and ask its lead to add {paths} to its scope.",
+                "{id} is paused or handed over. To resume it, call agentscm_start with work_id {id}, session {named} and takeover_generation {generation}; to help instead, call agentscm_start with work_id {id}, session {named} and role helper.",
                 id = item.id,
                 generation = item.generation,
             ),
@@ -791,7 +807,7 @@ impl Call {
             ),
         };
         format!(
-            "AgentSCM: {EDIT_UNLINKED}: this edit was not applied because it is not linked to a current assignment of this session. {recovery} Repeating the edit unchanged meets this refusal again, and making the same change through another tool, such as a shell command or script, bypasses coordination: do not. No new file intent was announced."
+            "AgentSCM: {EDIT_UNLINKED}: this edit was not applied because it is not linked to a current assignment of this session. {recovery} Repeating the edit unchanged meets this refusal again. {NO_BYPASS} No new file intent was announced."
         )
     }
 
@@ -813,6 +829,7 @@ impl Call {
                 (false, true) => format!("{context}\n{head}"),
                 (false, false) => format!("{head}\n{context}"),
             };
+            context = fit_context(&context, START_CONTEXT);
         }
         let text = context.as_str();
         if let Some(reason) = &outcome.deny {
@@ -853,6 +870,29 @@ impl Call {
             (Shape::Silent | Shape::Pre | Shape::Unreadable, _) => json!({}),
         }
     }
+}
+
+/// `text` within `limit` UTF-16 units (how hosts such as Claude Code count): unchanged when it
+/// fits, else cut at the last line that fits and ended with a pointer to the tools for the rest.
+pub fn fit_context(text: &str, limit: usize) -> String {
+    let units = |text: &str| text.chars().map(char::len_utf16).sum::<usize>();
+    if units(text) <= limit {
+        return text.to_owned();
+    }
+    let room = limit.saturating_sub(units(SHORTENED));
+    let mut end = 0;
+    let mut used = 0;
+    for (at, c) in text.char_indices() {
+        used += c.len_utf16();
+        if used > room {
+            break;
+        }
+        end = at + c.len_utf8();
+    }
+    let kept = &text[..end];
+    // A whole line reads better than half of one, unless no line break fits at all.
+    let kept = kept.rfind('\n').map_or(kept, |line| &kept[..line]);
+    format!("{kept}{SHORTENED}")
 }
 
 fn render_briefing(briefing: &Briefing) -> String {
@@ -1500,7 +1540,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("another tool"), "{text}");
-        assert!(super::super::work_lifecycle::refusal_holds(&text));
         // A subagent is sent back to its parent rather than told to start Work itself.
         let child =
             edit(json!({"agent_id":"sub","agent_type":"general-purpose"})).unlinked_refusal(None);
@@ -1519,6 +1558,52 @@ mod tests {
         assert!(
             unnamed.contains("session set to your native session ID"),
             "{unnamed}"
+        );
+    }
+
+    #[test]
+    fn context_is_cut_at_a_line_within_the_limit() {
+        let units = |text: &str| text.chars().map(char::len_utf16).sum::<usize>();
+        assert_eq!(fit_context("short\ntext", 100), "short\ntext");
+        let long = (0..2000)
+            .map(|line| format!("line {line} of the start context"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cut = fit_context(&long, START_CONTEXT);
+        assert!(units(&cut) <= START_CONTEXT, "{}", units(&cut));
+        assert!(cut.starts_with("line 0 of"));
+        assert!(cut.ends_with(SHORTENED.trim_start()));
+        let kept = cut.strip_suffix(SHORTENED).unwrap();
+        assert!(long.starts_with(kept) && long[kept.len()..].starts_with('\n'));
+        // Characters outside the basic plane count twice, as the host counts them.
+        let wide = "\u{1F600}".repeat(CONTEXT_LIMIT);
+        assert!(units(&fit_context(&wide, CONTEXT_LIMIT)) <= CONTEXT_LIMIT);
+    }
+
+    #[test]
+    fn a_long_start_context_keeps_the_session_and_rules_within_budget() {
+        let call = Call::parse(
+            Agent::Claude,
+            br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
+            None,
+        );
+        let briefing = (0..400)
+            .map(|item| format!("- wrk_{item:04}: a long synthetic briefing line for the budget"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reply = call.render(&Outcome::advice(briefing, false));
+        let context = reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.chars().map(char::len_utf16).sum::<usize>() <= START_CONTEXT);
+        assert!(
+            context.starts_with("AgentSCM native session ID"),
+            "{context}"
+        );
+        assert!(super::super::agent_rules::carries_all(context));
+        assert!(
+            context.ends_with("agentscm_work_overview for it."),
+            "{context}"
         );
     }
 
