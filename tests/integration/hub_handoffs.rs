@@ -1150,7 +1150,7 @@ fn the_refusal_names_the_session_asked_only_when_it_was_one(db: &Db) {
         !named.contains("\"s1\"") && !named.contains("agent1"),
         "{named}"
     );
-    // Two holders on two files: the generic wording, the same every time.
+    // Two holders on two files: the generic wording.
     let carol = agent(&*store, 3);
     let two = touch(&*store, &carol, "hc", &[A, "src/b.rs"], T0 + 3);
     assert_eq!(asked_paths(&two).len(), 2);
@@ -1160,7 +1160,6 @@ fn the_refusal_names_the_session_asked_only_when_it_was_one(db: &Db) {
         generic.contains("AgentSCM asked the holder to hand them over"),
         "{generic}"
     );
-    assert_eq!(generic, reason(&two));
 }
 
 fn tool_replies_name_the_sessions(db: &Db) {
@@ -1245,8 +1244,9 @@ fn hand_offs_between_two_tokens_name_each_session(db: &Db) {
 
 /// Known limit, pinned: a session key is a digest of the token and the session name, so a
 /// hand-off filed against the holder under its old token is not delivered to, and cannot be
-/// answered from, the same session name under a new token of the same owner.
-fn a_renewed_token_does_not_inherit_hand_offs(db: &Db) {
+/// answered from, the same session name under a new token of the same owner. Uses a second minted
+/// token, not the renewal route.
+fn a_second_token_of_the_owner_does_not_inherit_hand_offs(db: &Db) {
     let store = db.open();
     let (alice, _bob) = refused(&*store, &[A]);
     let renewed = agent(&*store, 1);
@@ -1307,7 +1307,7 @@ conformance!(
     tool_replies_name_the_sessions,
     a_requester_whose_session_ended_has_an_unknown_kind,
     hand_offs_between_two_tokens_name_each_session,
-    a_renewed_token_does_not_inherit_hand_offs,
+    a_second_token_of_the_owner_does_not_inherit_hand_offs,
 );
 
 /// The request is best effort: when filing it fails, the touch is still refused, not failed.

@@ -60,8 +60,9 @@ the forge did not accept the code. What signing in gives you:
 - **Agent labels carry no host name.** The token's label is `client-<id>-<hex>`, where `<id>` is a random machine id kept in a private
   `machine-id` file next to `hub-session.json` (never derived from the host name). To choose a name
   instead, write one line to `machine-name` in the same directory; labels then read `<name>-<hex>`
-  (ASCII letters, digits, `-` and `_`, at most 50). Tokens already stored keep their old label, and
-  surfaces mask it on display until the token is replaced.
+  (ASCII letters, digits, `-` and `_`, at most 50). Tokens already stored keep their old label until
+  the token is replaced. Hook, MCP, CLI, Slack and pull-request text mask it; `agent.name` in the
+  Hub's JSON and the Hub page's `title` attribute still carry it.
 - **Access is re-checked every time.** Each mint and renewal checks that you are still enabled
   and allowed on the Hub and still have the repository role (on a public repository Triage or
   more, on a private one read; on GitLab Reporter for private, Developer otherwise). The Hub asks

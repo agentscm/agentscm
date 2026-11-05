@@ -459,6 +459,50 @@ async fn a_repeat_between_two_sessions_of_one_token_messages_the_person_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeater_is_not_told_about_its_own_mcp_session() {
+    let f = Fixture::new().await;
+    f.edit(&f.bob, "b");
+    let mcp = SessionCall {
+        session: Some("m".into()),
+        via: "mcp".into(),
+        task: None,
+        paths: vec![PATH.into()],
+        deny: false,
+        report: false,
+    };
+    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now())).unwrap();
+    assert!(!f.edit(&f.alice, "a").denied.is_empty());
+    assert!(!f.edit(&f.alice, "a").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    let told: Vec<_> = sent.iter().filter(|(user, _)| user == "U1").collect();
+    assert_eq!(told.len(), 1, "{sent:?}");
+    assert!(
+        !told[0].1.contains("other agents") && !told[0].1.contains("session"),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_holder_sessions_of_one_token_message_their_person_once() {
+    let f = Fixture::new().await;
+    f.edit(&f.alice, "a");
+    f.edit(&f.alice, "c");
+    f.edit(&f.alice, "c");
+    f.run().await;
+    let before = f.sent().len();
+    assert!(!f.edit(&f.bob, "b").denied.is_empty());
+    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    let holder: Vec<_> = sent[before..]
+        .iter()
+        .filter(|(user, text)| user == "U1" && text.contains("which your"))
+        .collect();
+    assert_eq!(holder.len(), 1, "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_button() {
     let f = Fixture::new().await;
     f.contest();

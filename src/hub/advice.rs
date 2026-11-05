@@ -92,10 +92,10 @@ pub(super) fn session_kind(via: &[String]) -> Option<String> {
 }
 
 /// `Claude Code session 3f2a1b9c`, or `agent session 3f2a1b9c` when no hook is connected.
-fn session_label(kind: Option<&str>, key: &str, clean: fn(&str) -> String) -> Option<String> {
+fn session_label(kind: Option<&str>, key: &str) -> Option<String> {
     Some(format!(
         "{} session {}",
-        kind.map_or("agent".into(), clean),
+        kind.map_or("agent".into(), ascii_name),
         short_key(key)?
     ))
 }
@@ -108,7 +108,7 @@ fn agent_of(owner: &Value, agent: &Value, machine: &Value, session: &Value) -> S
     });
     let who = session["key"]
         .as_str()
-        .and_then(|key| session_label(session["kind"].as_str(), key, |k| sanitize(k, NAME_CHARS)))
+        .and_then(|key| session_label(session["kind"].as_str(), key))
         .unwrap_or_else(|| {
             agent
                 .as_str()
@@ -122,9 +122,7 @@ fn agent_of(owner: &Value, agent: &Value, machine: &Value, session: &Value) -> S
 pub(super) fn holder_who(intent: &Intent) -> String {
     let session = intent.session.as_deref().and_then(|session| {
         let key = super::store::session_key(&intent.token, session);
-        session_label(session_kind(&intent.via).as_deref(), &key, |k| {
-            ascii_name(k)
-        })
+        session_label(session_kind(&intent.via).as_deref(), &key)
     });
     let who = session.unwrap_or_else(|| ascii_name(&agent_name(&intent.agent)));
     format!("{}'s {who}", ascii_name(&intent.owner.login))
@@ -144,7 +142,7 @@ pub(super) fn holder_name(intent: &Intent, now: i64) -> String {
 /// The other side of a hand-off: `bob's Claude Code session 3f2a1b9c`, `bob's agent session
 /// 3f2a1b9c` when the kind is unknown, `bob's Claude Code` when the key is not usable.
 fn party_name(login: &str, agent: &str, session: &SessionRef) -> String {
-    let who = session_label(session.kind.as_deref(), &session.key, ascii_name)
+    let who = session_label(session.kind.as_deref(), &session.key)
         .unwrap_or_else(|| ascii_name(&agent_name(agent)));
     format!("{}'s {who}", ascii_name(login))
 }
@@ -388,11 +386,11 @@ pub fn ascii_task(text: &str) -> String {
     }
 }
 
-/// How people say an agent, as the Hub's pages do (`agentName` in `ui/src/inboxThreads.ts`), shared by advice, Slack and the publish footer: a
-/// known tool by its brand, a generated `client-<id>-<hex>` token as `Agent 6a36`, anything
-/// else as named, filtered like advice text. A
-/// stored legacy label that carries a host name shows as `Agent <hex>`.
-pub(super) fn agent_name(agent: &str) -> String {
+/// How people say an agent, as the Hub's pages do (`agentName` in `ui/src/inboxThreads.ts`): a
+/// known tool by its brand, a generated `client-<id>-<hex>` token as `Agent 6a36`, anything else
+/// as named, filtered like advice text. A stored legacy label that carries a host name shows as
+/// `Agent <hex>`.
+pub fn agent_name(agent: &str) -> String {
     let brand = match agent.to_ascii_lowercase().as_str() {
         "claude" | "claude-code" => Some("Claude Code"),
         "codex" => Some("Codex"),
@@ -1252,7 +1250,7 @@ mod tests {
         assert!(!reason.contains('\n'));
         let line = overlap_line(&hostile.to_json(), &json!(["a.rs"]), 200);
         assert!(
-            !line.contains('\n') && line.matches('"').count() == 2,
+            !line.contains(['\n', '`']) && line.matches('"').count() == 2,
             "{line}"
         );
     }
@@ -1310,13 +1308,16 @@ mod tests {
         let one = overlap_of(held_by(Some("raw-id-1"), &["hook:claude"]), &["src/a.rs"]);
         let two = overlap_of(held_by(Some("raw-id-2"), &["hook:claude"]), &["src/a.rs"]);
         let a = deny_reason(&[one.clone(), two.clone()], (None, false, None), 200);
-        assert_eq!(
-            a,
-            deny_reason(&[one.clone(), two.clone()], (None, false, None), 200)
-        );
-        assert_ne!(
-            deny_reason(&[one], (None, false, None), 200),
-            deny_reason(&[two], (None, false, None), 200)
+        let key = |id: &str| crate::hub::store::session_key("tok_1", id)[..8].to_owned();
+        let (first, second) = (key("raw-id-1"), key("raw-id-2"));
+        assert_ne!(first, second);
+        // Both holders, in the order given.
+        let (at_first, at_second) = (a.find(&first).unwrap(), a.find(&second).unwrap());
+        assert!(at_first < at_second, "{a}");
+        let only_one = deny_reason(&[one], (None, false, None), 200);
+        assert!(
+            only_one.contains(&first) && !only_one.contains(&second),
+            "{only_one}"
         );
         assert!(
             !a.contains("raw-id") && !a.contains("label-for-the-token"),

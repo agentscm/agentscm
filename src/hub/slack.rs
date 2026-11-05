@@ -869,13 +869,20 @@ impl Slack {
             // Opens the header, which is not a name to keep lower case.
             let opening = named.unwrap_or_else(|| "Another agent".into());
             let mut holders = Vec::new();
-            // The repeater's own session is skipped, not its other sessions under one token;
-            // an event without a session id skips the whole token.
+            // Under the repeater's token only its other hook sessions are other agents, as in
+            // `same_agent`; an event without a session id skips the whole token.
             let own = data["session"].as_str();
             let skipped = |i: &Intent| {
-                i.token == token && own.is_none_or(|own| i.session.as_deref() == Some(own))
+                i.token == token
+                    && own.is_none_or(|own| {
+                        i.session.as_deref() == Some(own) || session_kind(&i.via).is_none()
+                    })
             };
-            for intent in intents.iter().filter(|i| !skipped(i)) {
+            // Oldest first, as `judge` asks: that session's button has a request to answer.
+            let mut holding: Vec<&Intent> = intents.iter().filter(|i| !skipped(i)).collect();
+            holding.sort_by_key(|i| (i.created_at, i.id.as_str()));
+            let mut told = BTreeSet::new();
+            for intent in holding {
                 let held: Vec<String> = paths
                     .iter()
                     .filter(|path| intent.paths.iter().any(|spec| overlaps(path, key_of(spec))))
@@ -897,8 +904,9 @@ impl Slack {
                 }
                 if let Some(person) = Self::bound(people, &repository, &intent.token)
                     && repeater.is_none_or(|r| r.slack_user != person.slack_user)
+                    && told.insert(intent.token.as_str())
                 {
-                    // One message per holder and event; buttons answer one file only.
+                    // One message per holder token and event; buttons answer one file only.
                     let mine = person.agent(&intent.token);
                     let (headline, guidance) = match held.as_slice() {
                         [path] => (
@@ -935,10 +943,7 @@ impl Slack {
                     };
                     out.push((
                         person.slack_user.clone(),
-                        match &intent.session {
-                            Some(session) => format!("holder\n{}\n{session}", intent.token),
-                            None => format!("holder\n{}", intent.token),
-                        },
+                        format!("holder\n{}", intent.token),
                         message(&headline, &fields, &guidance, handoff, &link),
                     ));
                 }
@@ -1035,7 +1040,19 @@ impl Slack {
                 .unwrap_or_else(|| "the holder".into());
             let requester_person = Self::bound(people, &repository, requester);
             if let Some(person) = requester_person {
-                let fields = fields(&repository, agent_name(agent), holder_label);
+                // Under one token both sides read alike; the requester's session tells them apart.
+                let mine = from["session"]["key"]
+                    .as_str()
+                    .and_then(|key| key.get(..8))
+                    .filter(|_| requester == holder)
+                    .map_or_else(
+                        || agent_name(agent),
+                        |key| {
+                            let kind = from["session"]["kind"].as_str().unwrap_or("agent");
+                            format!("{} session {key}", sanitize(kind, NAME_CHARS))
+                        },
+                    );
+                let fields = fields(&repository, mine, holder_label);
                 out.push((
                     person.slack_user.clone(),
                     "requester".into(),

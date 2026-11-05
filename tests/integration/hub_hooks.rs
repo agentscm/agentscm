@@ -436,6 +436,67 @@ fn reason_of(answer: &Value, pointer: &str, key: &str) -> String {
     reason
 }
 
+/// #120's acceptance, through the real route: three sessions on ONE token. The refusal and the
+/// hand-off name the specific session, and the request reaches only the holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_sharing_one_token_name_the_holder_and_only_it_hears() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let edit = |session: &str, file: &str| {
+        let mut payload = fixture("claude-PreToolUse-Edit");
+        payload["session_id"] = json!(session);
+        payload["tool_input"]["file_path"] = json!(format!("/work/acme-widgets/{file}"));
+        payload
+    };
+    let asks = "asks to take over src/widget.rs";
+
+    hub.hook("claude", &secret, &edit("holder-s", "src/widget.rs"));
+    let token = hub.store.live_intents(REPO, unix_now(), 10).unwrap()[0]
+        .token
+        .clone();
+    let key = |session: &str| {
+        lower_hex_of(format!("agentscm.hub.session-view.v1\0{token}\0{session}").as_bytes())[..8]
+            .to_owned()
+    };
+
+    let refused = hub.hook_raw("claude", &secret, &edit("requester-s", "src/widget.rs"));
+    let reason = text_at(&refused, "/hookSpecificOutput/permissionDecisionReason");
+    assert!(
+        reason.contains(&format!(
+            "src/widget.rs: user1's Claude Code session {}, started",
+            key("holder-s")
+        )) && reason.contains(&format!(
+            "AgentSCM asked user1's Claude Code session {} to hand it over",
+            key("holder-s")
+        )),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("holder-s") && !reason.contains("agent,"),
+        "{reason}"
+    );
+
+    // A bystander on the same token, on another file, hears nothing of it.
+    let bystander = hub.hook("claude", &secret, &edit("bystander-s", "src/other.rs"));
+    assert!(!bystander.to_string().contains(asks), "{bystander}");
+
+    // The holder hears it once, from the named requester session.
+    let holder = hub.hook("claude", &secret, &edit("holder-s", "src/widget.rs"));
+    let told = text_at(&holder, CLAUDE_CONTEXT);
+    assert!(
+        told.contains(&format!(
+            "user1's Claude Code session {} {asks}",
+            key("requester-s")
+        )),
+        "{told}"
+    );
+    assert!(!told.contains("requester-s"), "{told}");
+    let again = hub.hook("claude", &secret, &edit("holder-s", "src/widget.rs"));
+    assert!(!again.to_string().contains(asks), "{again}");
+    let bystander = hub.hook("claude", &secret, &edit("bystander-s", "src/other.rs"));
+    assert!(!bystander.to_string().contains(asks), "{bystander}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_agent_on_the_same_file_is_refused_once() {
     let mut hub = Hub::start().await;
@@ -481,11 +542,11 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
         json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
             "permissionDecision": "deny", "permissionDecisionReason": reason}})
     );
-    // The same edit again goes through, quietly.
     assert!(
         !reason.contains(&raw_session) && !reason.contains("agent,"),
         "{reason}"
     );
+    // The same edit again goes through, quietly.
     let retry = hub.hook("claude", &second, &fixture("claude-PreToolUse-Edit"));
     assert_eq!(retry, json!({}));
     assert_eq!(

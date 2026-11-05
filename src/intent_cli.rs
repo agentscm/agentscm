@@ -595,9 +595,11 @@ pub(crate) fn repo_root(cwd: &Path) -> Option<PathBuf> {
 
 /// Only an explicit `AGENTSCM_MACHINE`; the host name is never sent by default.
 fn machine() -> Option<String> {
-    std::env::var("AGENTSCM_MACHINE")
-        .ok()
-        .and_then(|m| bound(&m, MAX_LABEL_BYTES))
+    machine_label(std::env::var("AGENTSCM_MACHINE").ok())
+}
+
+fn machine_label(explicit: Option<String>) -> Option<String> {
+    explicit.and_then(|m| bound(&m, MAX_LABEL_BYTES))
 }
 
 // ---- path normalisation ----
@@ -703,7 +705,10 @@ fn agent_of(owner: &Value, agent: &Value, machine: &Value) -> String {
     format!(
         "{}'s agent ({}){on}",
         text(&owner["login"], NAME_CHARS),
-        text(agent, NAME_CHARS)
+        text(
+            &Value::from(agent.as_str().map(agentscm::hub::advice::agent_name)),
+            NAME_CHARS
+        )
     )
 }
 
@@ -1177,6 +1182,11 @@ mod tests {
             "bob's agent (claude-2) on laptop-b is already working on src/billing.rs \
              for \"Fix invoice[31m rounding\", started 12 min ago."
         );
+        assert_eq!(machine_label(None), None);
+        assert_eq!(machine_label(Some("laptop-b".into())).unwrap(), "laptop-b");
+        let mut legacy = overlap.clone();
+        legacy["intent"]["agent"]["name"] = json!("client-synthetic-host-6a36b2c1");
+        assert!(overlap_line(&legacy, 1000).starts_with("bob's agent (Agent 6a36) on laptop-b"));
         let mut no_machine = overlap.clone();
         no_machine["intent"]["machine"] = Value::Null;
         assert!(overlap_line(&no_machine, 1000).starts_with("bob's agent (claude-2) is already"));

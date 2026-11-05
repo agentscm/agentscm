@@ -771,34 +771,23 @@ fn inferred_provider(host: &str) -> Option<Provider> {
 }
 
 fn token_name() -> Result<String> {
-    Ok(label_in(
+    label_in(
         crate::hub_cli::config_dir()
             .ok()
             .map(|dir| dir.join("agentscm"))
             .as_deref(),
-    ))
+    )
 }
 
 /// `client-<machine id>-<hex>`, or `<machine-name>-<hex>` when the user wrote a `machine-name` file
 /// in `dir`. The machine id is random, kept in `dir/machine-id` and never derived from the host
-/// name. Unreadable or unwritable files only cost a fresh random id.
-fn label_in(dir: Option<&Path>) -> String {
-    let hex = |count: usize| {
+/// name. Unreadable or unwritable files only cost a fresh random id; an unavailable random source
+/// is an error.
+fn label_in(dir: Option<&Path>) -> Result<String> {
+    let hex = |count: usize| -> Result<String> {
         let mut bytes = vec![0_u8; count];
-        // The OS random source failing is not recoverable; a time-based label still validates.
-        if getrandom::fill(&mut bytes).is_err() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            bytes
-                .iter_mut()
-                .enumerate()
-                .for_each(|(i, b)| *b = (now >> (i * 8)) as u8);
-        }
-        bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+        getrandom::fill(&mut bytes).map_err(|_| invalid("random source unavailable"))?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     };
     let name = dir
         .and_then(|dir| std::fs::read_to_string(dir.join("machine-name")).ok())
@@ -810,41 +799,30 @@ fn label_in(dir: Option<&Path>) -> String {
                 .collect::<String>()
         })
         .filter(|name| !name.is_empty());
-    let suffix = hex(4);
+    let suffix = hex(4)?;
     if let Some(name) = name {
-        return format!("{name}-{suffix}");
+        return Ok(format!("{name}-{suffix}"));
     }
-    let valid =
-        |id: &str| id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| {
+                id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    };
+    let fresh = hex(8)?;
+    // ponytail: last writer wins a first-run race; one label may carry the loser's id, harmless.
     let id = dir
-        .and_then(|dir| {
-            let path = dir.join("machine-id");
-            let read = |path: &Path| {
-                std::fs::read_to_string(path)
-                    .ok()
-                    .map(|id| id.trim().to_owned())
-                    .filter(|id| valid(id))
-            };
-            if let Some(id) = read(&path) {
-                return Some(id);
-            }
-            // Create-new, so a concurrent creator's value wins and is re-read.
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            std::fs::create_dir_all(dir).ok()?;
-            let fresh = hex(8);
-            match options.open(&path) {
-                Ok(mut file) => {
-                    std::io::Write::write_all(&mut file, fresh.as_bytes()).ok()?;
-                    Some(fresh)
-                }
-                Err(_) => read(&path),
-            }
+        .map(|dir| dir.join("machine-id"))
+        .and_then(|path| {
+            read(&path).or_else(|| {
+                crate::hub_cli::write_private(&path, &fresh).ok()?;
+                read(&path)
+            })
         })
-        .unwrap_or_else(|| hex(8));
-    format!("client-{id}-{suffix}")
+        .unwrap_or(fresh);
+    Ok(format!("client-{id}-{suffix}"))
 }
 
 async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Value)> {
@@ -1857,7 +1835,10 @@ mod tests {
     #[test]
     fn default_label_uses_a_stable_random_machine_id() {
         let dir = tempfile::tempdir().unwrap();
-        let (a, b) = (label_in(Some(dir.path())), label_in(Some(dir.path())));
+        let (a, b) = (
+            label_in(Some(dir.path())).unwrap(),
+            label_in(Some(dir.path())).unwrap(),
+        );
         let id = |label: &str| label[7..label.len() - 9].to_owned();
         assert!(a.starts_with("client-") && id(&a).len() == 16, "{a}");
         assert_eq!(id(&a), id(&b));
@@ -1880,10 +1861,22 @@ mod tests {
         let blocked = dir.path().join("file");
         std::fs::write(&blocked, "x").unwrap();
         for target in [Some(dir.path()), Some(blocked.join("sub").as_path()), None] {
-            let label = label_in(target);
+            let label = label_in(target).unwrap();
             assert!(label.starts_with("client-"), "{label}");
             valid_name(&label);
         }
+    }
+
+    #[test]
+    fn a_corrupt_machine_id_is_repaired_and_stays_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("machine-id");
+        std::fs::write(&file, "not an id\n").unwrap();
+        let label = label_in(Some(dir.path())).unwrap();
+        let repaired = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(repaired.len(), 16, "{repaired}");
+        assert!(label.contains(&repaired), "{label}");
+        assert!(label_in(Some(dir.path())).unwrap().contains(&repaired));
     }
 
     #[test]
@@ -1891,17 +1884,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("machine-name");
         std::fs::write(&file, "  work laptop!\n").unwrap();
-        let label = label_in(Some(dir.path()));
+        let label = label_in(Some(dir.path())).unwrap();
         assert!(
             label.starts_with("worklaptop-") && label.len() == 19,
             "{label}"
         );
         std::fs::write(&file, format!("\"; rm -rf /\n{}", "n".repeat(500))).unwrap();
-        let label = label_in(Some(dir.path()));
+        let label = label_in(Some(dir.path())).unwrap();
         valid_name(&label);
         assert!(label.starts_with("rm-rfnnnn"), "{label}");
         std::fs::write(&file, " !! \n").unwrap();
-        assert!(label_in(Some(dir.path())).starts_with("client-"));
+        assert!(label_in(Some(dir.path())).unwrap().starts_with("client-"));
     }
 
     #[cfg(target_os = "macos")]
