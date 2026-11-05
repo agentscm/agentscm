@@ -98,6 +98,12 @@ pub enum WorkCommand {
         #[arg(long, default_value = "-")]
         request: PathBuf,
     },
+    /// Set or remove a native Work issue link as the current lead.
+    IssueLinkSet {
+        /// Strict WorkIssueLinkUpdate JSON; link:null removes the caller assertion.
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
     /// Explicitly set or remove a PR relationship as the current Work lead.
     PrLinkSet {
         /// Strict WorkPrLinkUpdate JSON; link:null removes. Use - for standard input.
@@ -302,6 +308,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Start { .. }
         | WorkCommand::Usage { .. }
         | WorkCommand::PrLinkSet { .. }
+        | WorkCommand::IssueLinkSet { .. }
         | WorkCommand::DeclarationsSet { .. }
         | WorkCommand::ReconcileApply { .. }
         | WorkCommand::Checkpoint { .. }
@@ -513,6 +520,18 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 .strip_prefix("http://hub")
                 .ok_or_else(|| invalid("cannot construct reconciliation URL"))?;
             (hub.call(Method::GET, path, None).await?, false)
+        }
+        WorkCommand::IssueLinkSet { request } => {
+            let request: agentscm::hub::work_issues::WorkIssueLinkUpdate = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/issue-link",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
         }
         WorkCommand::PrLinkSet { request } => {
             let request: WorkPrLinkUpdate = read_request(&request)?;

@@ -12,6 +12,7 @@ use super::catchup::{CatchupAck, CatchupAckResult, CatchupPage, CatchupQuery};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::store::{search_text, unix_now};
+use super::viewer::{Shown, Viewer, shown};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, DEFAULT_WORK_SEARCH, MAX_WORK_SEARCH,
     WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkOverviewQuery, WorkScopeOverlap,
@@ -57,6 +58,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
         .route("/v1/hub/standup/work/{id}/pr-link", get(pr_link))
         .route("/v1/hub/standup/pr-link", post(set_pr_link))
+        .route("/v1/hub/standup/issue-link", post(set_issue_link))
         .route("/v1/hub/standup/work/{id}/declarations", get(declarations))
         .route("/v1/hub/standup/declarations", post(set_declarations))
         .route(
@@ -131,7 +133,9 @@ async fn pr_link(
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
     let store = state.store.clone();
     blocking(&state, move || {
-        store.work_pr_link_get(&principal.token_id, &id, &query, unix_now())
+        store
+            .work_pr_link_get(&principal.token_id, &id, &query, unix_now())
+            .map(|view| view.map(|view| shown(view, &principal.owner.id)))
     })
     .await?
     .map(Json)
@@ -146,7 +150,25 @@ async fn set_pr_link(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            store.work_pr_link_set(&principal.token_id, &request, unix_now())
+            store
+                .work_pr_link_set(&principal.token_id, &request, unix_now())
+                .map(|result| shown(result, &principal.owner.id))
+        })
+        .await?,
+    ))
+}
+
+async fn set_issue_link(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_issues::WorkIssueLinkUpdate>,
+) -> Result<Json<WorkCheckpointResult>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store
+                .work_issue_link_set(&principal.token_id, &request, unix_now())
+                .map(|result| shown(result, &principal.owner.id))
         })
         .await?,
     ))
@@ -166,6 +188,7 @@ async fn preflight(
         blocking(&state, move || {
             let now = unix_now();
             let mut result = store.work_preflight(&principal.token_id, &request, now)?;
+            result.show(Viewer(&principal.owner.id));
             if operational {
                 result.operational = operational_for_overlaps(
                     &*store,
@@ -319,6 +342,7 @@ async fn work_transition(
         if !reclaimed {
             result.reclaimed.clear();
         }
+        result.show(Viewer(&principal.owner.id));
         Ok(result)
     })
     .await?;
@@ -347,7 +371,9 @@ async fn catchup(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            store.work_catchup(&principal.token_id, &query, unix_now())
+            let mut page = store.work_catchup(&principal.token_id, &query, unix_now())?;
+            page.show(Viewer(&principal.owner.id));
+            Ok(page)
         })
         .await?,
     ))
@@ -488,7 +514,8 @@ async fn overview(
     Ok(Json(
         blocking(&state, move || {
             let now = unix_now();
-            let overview = store.work_overview(&token, &query, now)?;
+            let mut overview = store.work_overview(&token, &query, now)?;
+            overview.show(Viewer(&principal.owner.id));
             if !operational {
                 return Ok(serde_json::to_value(&overview).unwrap_or(Value::Null));
             }
@@ -522,7 +549,9 @@ async fn briefing(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            store.work_briefing(&principal.token_id, &query, unix_now())
+            let mut briefing = store.work_briefing(&principal.token_id, &query, unix_now())?;
+            briefing.show(Viewer(&principal.owner.id));
+            Ok(briefing)
         })
         .await?,
     ))
@@ -535,7 +564,9 @@ async fn work(
 ) -> Result<Json<WorkItem>, ApiError> {
     let store = state.store.clone();
     let item = blocking(&state, move || {
-        store.work_get(&principal.token_id, &id, unix_now())
+        let mut item = store.work_get(&principal.token_id, &id, unix_now())?;
+        item.show(Viewer(&principal.owner.id));
+        Ok(item)
     })
     .await?
     .ok_or_else(ApiError::not_found)?;
@@ -561,30 +592,30 @@ async fn start(
         Err(error) => return error.into_response(),
     };
     let store = state.store.clone();
+    let viewer = principal.owner.id.clone();
     match blocking(&state, move || {
-            let now = unix_now();
-            let context =
-                store.work_overview(&principal.token_id, &WorkOverviewQuery::default(), now)?;
-            let mut result = store.work_start(&principal.token_id, &request, now)?;
-            super::coordination_http::CHANGED.notify_waiters();
-            result.context = Some(context);
-            if !reclaimed {
-                result.reclaimed.clear();
-            }
-            if operational && let Some(conflict) = &mut result.conflict {
-                conflict.operational = operational_for_overlaps(
-                    &*store,
-                    &principal.token_id,
-                    &conflict.overlaps,
-                    now,
-                )?;
-            }
-            Ok(result)
-        })
-        .await
+        let now = unix_now();
+        let context =
+            store.work_overview(&principal.token_id, &WorkOverviewQuery::default(), now)?;
+        let mut result = store.work_start(&principal.token_id, &request, now)?;
+        super::coordination_http::CHANGED.notify_waiters();
+        result.context = Some(context);
+        if !reclaimed {
+            result.reclaimed.clear();
+        }
+        if operational && let Some(conflict) = &mut result.conflict {
+            conflict.operational =
+                operational_for_overlaps(&*store, &principal.token_id, &conflict.overlaps, now)?;
+        }
+        result.show(Viewer(&principal.owner.id));
+        Ok(result)
+    })
+    .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(HubError::WorkPreflight(preflight)) => (
+        Err(HubError::WorkPreflight(mut preflight)) => {
+            preflight.show(Viewer(&viewer));
+            (
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "work_preflight_required",
@@ -592,7 +623,8 @@ async fn start(
                 "preflight": preflight,
             })),
         )
-            .into_response(),
+            .into_response()
+        }
         Err(error) => ApiError::from(error).into_response(),
     }
 }
@@ -606,6 +638,7 @@ async fn checkpoint(
 ) -> Result<Json<WorkCheckpointResult>, Response> {
     let reclaimed = ReclaimedFlag::requested(reclaimed).map_err(IntoResponse::into_response)?;
     let store = state.store.clone();
+    let viewer = principal.owner.id.clone();
     let completion =
         super::insights::completion_enabled(&headers) && request.kind == CheckpointKind::Finish;
     let result = blocking(&state, move || {
@@ -628,10 +661,14 @@ async fn checkpoint(
         {
             eprintln!("hub: completion report failed");
         }
+        result.show(Viewer(&principal.owner.id));
         Ok(result)
     })
     .await
-    .map_err(work_error)?;
+    .map_err(|mut error| {
+        error.show(Viewer(&viewer));
+        work_error(error)
+    })?;
     super::coordination_http::CHANGED.notify_waiters();
     Ok(Json(result))
 }
@@ -674,7 +711,9 @@ async fn actionable_status(
     let store = state.store.clone();
     Ok(Json(
         blocking(&state, move || {
-            actionable_status::read(&*store, &principal, unix_now())
+            let mut status = actionable_status::read(&*store, &principal, unix_now())?;
+            status.show(Viewer(&principal.owner.id));
+            Ok(status)
         })
         .await?,
     ))

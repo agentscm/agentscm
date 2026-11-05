@@ -340,8 +340,9 @@ status shown; clients show `message` as is.
   minutes (the current client labels it `client-<random machine id>-<hex>`, or `<machine-name>-<hex>`
   when the user wrote a `machine-name` file, never the host name; the Hub only validates the name, so
   an older client can still send one. Stored labels stay, masked in hook and MCP text, `agentscm
-  intent`, Slack and pull-request text, but not in structured JSON fields such as `agent.name` and
-  `lead_agent`, the Hub page's `title` attribute or the owner's own `agentscm hub tokens` listing),
+  intent`, Slack and pull-request text, and, for other owners, in structured JSON such as `agent.name`
+  and `lead_agent` (see [other owners' agents](standup.md#other-owners-agents)); the owner's own
+  replies, the Hub page's `title` attribute and `agentscm hub tokens` show them as stored),
   and re-checks at every call: the owner is enabled (else 403 `user_disabled`), on
   `AGENTSCM_ALLOWED_USERS` when set (else 403 `not_allowed`; administrators pass), the repository
   is connected on the owner's host (else 403 `not_connected`), and the owner has the role
@@ -1695,11 +1696,7 @@ restore a complete pre-upgrade backup into an empty database that is dedicated t
 binary. Test a restored copy before replacing the original; never run old and new binaries against
 the same database during recovery.
 
-[`.github/hub-e2e.sh`](../.github/hub-e2e.sh) runs both profiles in CI: two agents with different
-tokens on different machine names, the second one is warned about the first, the warning survives a
-hub restart, and (SQLite) a backup restored into a fresh volume still serves it. Tokens come from a
-test-only seeder (`examples/hub_seed.rs`, built only by the Dockerfile's `e2e-seed` stage), because
-the test has no forge to sign in with; the product image has no way around sign-in.
+[`.github/hub-e2e.sh local-release EVIDENCE_DIR`](../.github/hub-e2e.sh) runs both profiles as a local release-only gate on a clean committed candidate: two agents with different tokens on different machine names, the second one is warned about the first, the warning survives a hub restart, and (SQLite) a backup restored into a fresh volume still serves it. Retain both profile results as described in [releasing](releasing.md#local-hub-release-qualification); hosted PR checks do not establish this coverage. Tokens come from a test-only seeder (`examples/hub_seed.rs`, built only by the Dockerfile's `e2e-seed` stage), because the test has no forge to sign in with; the product image has no way around sign-in.
 
 The container test does not include a forge. Pull-request overlaps (webhook and poll intake, the
 `pr_notice` to the intent's agent, and the edited-in-place PR comment and status) are tested in

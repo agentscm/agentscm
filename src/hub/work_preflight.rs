@@ -72,6 +72,10 @@ pub enum WorkPreflightReason {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkPreflightResult {
+    /// Advice only; it never changes admission status.
+    #[serde(default)]
+    pub issue_advice: super::planned_issues::IssueCandidateAdvice,
+
     pub status: WorkPreflightStatus,
     pub source_revision: Option<String>,
     pub merge_after: Option<i64>,

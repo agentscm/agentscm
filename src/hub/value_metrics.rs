@@ -1709,6 +1709,8 @@ mod tests {
             Checkpoint, CheckpointKind, ClaimStatus, SourceRef, WorkSource, WorkState,
         };
         WorkItem {
+            initial_issue_choice: Default::default(),
+            issue_link: None,
             id: "wrk_00000000000000000000000000000001".into(),
             repository: "example/repo".into(),
             owner: "owner".into(),

@@ -24,6 +24,14 @@ describe('explicit Work PR relationship', () => {
     expect(screen.queryByText(/Prior checkpoint text/)).toBeNull()
     expect(screen.getByText('PR evidence or prerequisites changed').closest('li')?.className).not.toContain('tone-ok')
   })
+  it('renders issue links as metadata without repeating a completion report', () => {
+    const changed = { ...item, state: 'finished', lead_agent: 'codex', title: 'Fixture Work', current: { summary: 'Prior checkpoint text' } } as WorkItem
+    render(<WorkUpdate event={{ seq: 16, at: 1_793_387_000, kind: 'work_issue_link', work_id: item.id, item: changed }} />)
+    expect(screen.getByText('Issue link changed')).toBeTruthy()
+    expect(screen.queryByText(/Prior checkpoint text/)).toBeNull()
+    expect(screen.getByText('Issue link changed').closest('li')?.className).not.toContain('tone-ok')
+    expect(screen.getByText(/does not report progress or completion/)).toBeTruthy()
+  })
   it('fetches the exact Work sequence, linked number and caller-asserted head', async () => {
     const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response(relationship())).mockResolvedValueOnce(response(linkedContext(42)))
     const data = await fetchWorkPrContext(item, 'synthetic', new AbortController().signal)

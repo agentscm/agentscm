@@ -72,6 +72,7 @@ fn setup(db: &Db) -> (Arc<dyn Store>, String, String, i64) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some(format!("change-record-test-{setup_id}")),
@@ -297,6 +298,7 @@ fn action_capture_receipt(db: &Db) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -423,6 +425,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
         .work_start(
             &helper,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -583,6 +586,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -795,6 +799,7 @@ fn capture_survives_pause_and_stops_at_end_of_claim(fresh: &dyn Fn() -> Db) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -921,6 +926,7 @@ fn join_session(store: &dyn Store, token: &str, work_id: &str, session: &str) {
         .work_start(
             token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.into()),
                 source: None,
                 request_key: None,
@@ -1066,10 +1072,70 @@ fn session_setups_are_bounded_and_ordered(db: &Db) {
     assert_eq!(record.session_setups_omitted, 3);
 }
 
+/// Another owner reads captured sessions by their digests; a child's parent by the same agent's.
+fn session_setups_name_another_owners_sessions_by_digest(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    join_session(&*store, &token, &work_id, "session-2");
+    for (session, parent) in [("session-1", None), ("session-2", Some("session-1"))] {
+        let batch = setup_batch(
+            &work_id,
+            generation,
+            session,
+            parent,
+            vec![Some(setup_observation(Some("model-a"), None, None))],
+        );
+        store.change_ingest(&token, &batch, 501).unwrap();
+    }
+    let other = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 43,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (reader, _) = mint_agent_token(&*store, &other.id, "reader", REPO, 3600).unwrap();
+    let record = store
+        .change_record(&reader, &work_id, 502)
+        .unwrap()
+        .unwrap();
+    let ids: Vec<_> = record
+        .session_setups
+        .iter()
+        .map(|setup| setup.session_id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(
+        ids.iter()
+            .all(|id| id.len() == 16 && !id.starts_with("session")),
+        "{ids:?}"
+    );
+    let find = |child: bool| {
+        record
+            .session_setups
+            .iter()
+            .find(|setup| setup.parent_session_id.is_some() == child)
+            .unwrap()
+    };
+    assert_eq!(
+        find(true).parent_session_id.as_deref(),
+        Some(find(false).session_id.as_str())
+    );
+    let own = store.change_record(&token, &work_id, 503).unwrap().unwrap();
+    assert!(
+        own.session_setups
+            .iter()
+            .any(|setup| setup.session_id == "session-1")
+    );
+}
+
 #[test]
 fn sqlite_session_setups() {
     session_setups_project_latest_per_session(&Db::sqlite());
     session_setups_are_bounded_and_ordered(&Db::sqlite());
+    session_setups_name_another_owners_sessions_by_digest(&Db::sqlite());
 }
 
 #[test]
@@ -1077,6 +1143,7 @@ fn postgres_session_setups() {
     if Db::postgres().is_some() {
         session_setups_project_latest_per_session(&Db::postgres().unwrap());
         session_setups_are_bounded_and_ordered(&Db::postgres().unwrap());
+        session_setups_name_another_owners_sessions_by_digest(&Db::postgres().unwrap());
     }
 }
 
@@ -1106,6 +1173,7 @@ fn capture_target_prefers_active_then_lead(fresh: &dyn Fn() -> Db) {
             .work_start(
                 &other,
                 &WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: Some(format!("ambiguity-{session}")),
