@@ -205,9 +205,18 @@ async fn default_start_and_overview_replies_fit_the_budget_on_a_busy_repository(
         ("agentscm_work_overview limit 20", overview_20.len()),
         ("agentscm_work_checkpoint", checkpoint.len()),
     ];
-    let structured: Value = serde_json::from_str(&start).unwrap();
-    for (part, value) in structured["structuredContent"].as_object().unwrap() {
-        eprintln!("start part {part}: {}", value.to_string().len());
+    for (name, reply) in [("start", &start), ("overview", &overview)] {
+        let reply: Value = serde_json::from_str(reply).unwrap();
+        for (part, value) in reply["structuredContent"].as_object().unwrap() {
+            eprintln!("{name} part {part}: {}", value.to_string().len());
+        }
+        let text: usize = reply["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.to_string().len())
+            .sum();
+        eprintln!("{name} content: {text}");
     }
     for (name, size) in sizes {
         eprintln!("reply size {name}: {size}");

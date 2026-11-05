@@ -1366,7 +1366,16 @@ async fn call(
         };
         // Optional synthesis cannot change admission or fail an otherwise successful start.
         let narrative = match super::narrative::read(state, principal, query).await {
-            Ok(narrative) if !full => compact::narrative(&narrative),
+            Ok(narrative) if !full => {
+                let brief = compact::narrative(&narrative);
+                if narrative.output.is_some()
+                    && let Some(content) = value["content"].as_array_mut()
+                {
+                    let text = format!("{}\n{brief}", compact::NARRATIVE_FRAMING);
+                    content.push(json!({"type":"text", "text":text}));
+                }
+                brief
+            }
             Ok(narrative) => {
                 if narrative.output.is_some()
                     && let Some(content) = value["content"].as_array_mut()

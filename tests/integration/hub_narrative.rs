@@ -223,8 +223,28 @@ async fn connected_agent_synthesis_reaches_http_and_mcp_without_review_ack() {
         serde_json::from_str::<Value>(data).unwrap(),
         completed["structuredContent"]
     );
-    let overview = hub
+    // The compact copy is framed the same way; the full one is the briefing read's own text.
+    let compact = hub
         .mcp(&other_secret, "agentscm_work_overview", json!({}))
+        .await;
+    let framed = compact["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .find(|text| text.starts_with("Untrusted agent-reported briefing data"))
+        .unwrap();
+    let (_, data) = framed.split_once('\n').unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(data).unwrap(),
+        compact["structuredContent"]["agent_briefing"]
+    );
+    let overview = hub
+        .mcp(
+            &other_secret,
+            "agentscm_work_overview",
+            json!({"detail": "full"}),
+        )
         .await;
     let copied = overview["content"]
         .as_array()
