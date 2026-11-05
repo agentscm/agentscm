@@ -1216,7 +1216,7 @@ async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
     env.fake.lock().unwrap().approve = ALICE;
     let machine = Machine::new(REPO);
     let (hub, root) = (env.hub.clone(), machine.root());
-    let (ok, _, stderr) = machine.run(&[
+    let (ok, connected, stderr) = machine.run(&[
         "--no-telemetry",
         "client",
         "connect",
@@ -1228,6 +1228,10 @@ async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
         root.to_str().unwrap(),
     ]);
     assert!(ok, "{stderr}");
+    assert!(
+        connected.contains("renews automatically") && connected.contains("agentscm client renew"),
+        "{connected}"
+    );
     let expires = machine.connection()["owned_token_expires_at"]
         .as_i64()
         .unwrap();
@@ -1264,6 +1268,14 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     // Before auto-connect is on, an agent in the checkout is only told how to connect.
     let reply = machine.session_start("s0");
     assert!(context(&reply).contains("no client connection"), "{reply}");
+    // whoami says what the unchosen setting does and how to choose it.
+    let (ok, whoami, stderr) = machine.run(&["hub", "whoami"]);
+    assert!(ok, "{stderr}");
+    assert!(whoami.contains("auto-connect not chosen yet"), "{whoami}");
+    assert!(
+        whoami.contains(&format!("agentscm hub auto-connect on|off --hub {hub}")),
+        "{whoami}"
+    );
     let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
     assert!(ok, "{stderr}");
 

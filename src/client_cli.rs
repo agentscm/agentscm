@@ -173,6 +173,9 @@ pub(crate) struct DoctorArgs {
     /// Read up to 64 KiB of captured host diagnostics from stdin; only a blocker category leaves this machine.
     #[arg(long)]
     diagnostic_stdin: bool,
+    /// Print the Hub's onboarding reply as JSON instead of a summary.
+    #[arg(long)]
+    json: bool,
     #[command(flatten)]
     checkout: RootArgs,
 }
@@ -681,6 +684,21 @@ impl Verified {
             "as {who}; token expires {}",
             crate::hub_cli::when(self.expires_at, unix_now())
         )
+    }
+}
+
+/// Only a token this client minted through this computer's credential renews. A token file given
+/// to `client setup`, or one minted with a bare sign-in session (a Hub without computers), never does.
+fn renewal_note(connection: &Connection) -> &'static str {
+    if connection.owned_token_id.is_some()
+        && crate::hub_cli::saved_device(&connection.hub)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        " The token renews automatically before it ends; if renewal fails, run `agentscm client renew`."
+    } else {
+        ""
     }
 }
 
@@ -1370,10 +1388,11 @@ async fn connect_inner(
             }
             if !quiet {
                 println!(
-                    "Connection is already valid for {} at {} {} and permits coordination.",
+                    "Connection is already valid for {} at {} {} and permits coordination.{}",
                     saved.repo,
                     saved.hub,
-                    verified.as_who()
+                    verified.as_who(),
+                    renewal_note(saved)
                 );
             }
             return Ok(());
@@ -1389,10 +1408,11 @@ async fn connect_inner(
             }
             if !quiet {
                 println!(
-                    "Connection is already valid for {} at {} {} and permits coordination.",
+                    "Connection is already valid for {} at {} {} and permits coordination.{}",
                     corrected.repo,
                     corrected.hub,
-                    verified.as_who()
+                    verified.as_who(),
+                    renewal_note(&corrected)
                 );
             }
             return Ok(());
@@ -1540,11 +1560,12 @@ async fn connect_inner(
         return Ok(());
     }
     println!(
-        "Connected {} to {} for {} {} and permits coordination.",
+        "Connected {} to {} for {} {} and permits coordination.{}",
         connection.root.display(),
         connection.hub,
         connection.repo,
-        verified.as_who()
+        verified.as_who(),
+        renewal_note(&connection)
     );
     Ok(())
 }
@@ -1712,15 +1733,52 @@ async fn check(args: RootArgs) -> Result<()> {
     }
     let verified = verify(&connection).await?;
     println!(
-        "Connection is valid for {} at {} {} and permits coordination.",
+        "Connection is valid for {} at {} {} and permits coordination.{}",
         connection.repo,
         connection.hub,
-        verified.as_who()
+        verified.as_who(),
+        renewal_note(&connection)
     );
     println!(
         "This checks only the Hub binding. Use client doctor and agentscm_setup_status in your native MCP client to verify hooks and MCP."
     );
     Ok(())
+}
+
+/// One readable line per session in an onboarding reply (a list, or one status), newest first.
+fn session_lines(reply: &Value) -> Vec<String> {
+    let mut statuses: Vec<&Value> = match reply {
+        Value::Array(list) => list.iter().collect(),
+        one => vec![one],
+    };
+    statuses.sort_by_key(|status| std::cmp::Reverse(status["expires_at"].as_i64()));
+    statuses
+        .into_iter()
+        .map(|status| {
+            // Hub text goes to a terminal, so control characters (escape sequences) are dropped.
+            let text = |key: &str| crate::hub_cli::clean(status[key].as_str().unwrap_or("unknown"));
+            let seen = |key: &str| {
+                if status[key].as_bool() == Some(true) {
+                    "seen"
+                } else {
+                    "not seen"
+                }
+            };
+            let mut line = format!(
+                "{} session {}: {} (MCP {}, native edit hook {}).",
+                text("agent"),
+                text("session"),
+                text("state"),
+                seen("mcp_verified"),
+                seen("native_verified")
+            );
+            if status["state"] != "ready" {
+                line.push(' ');
+                line.push_str(&text("next_action"));
+            }
+            line
+        })
+        .collect()
 }
 
 async fn doctor(args: DoctorArgs) -> Result<()> {
@@ -1797,7 +1855,13 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
             "Hub onboarding check failed; review the Hub binding and server version",
         ));
     }
-    println!("{}", serde_json::to_string_pretty(&reply)?);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
+        return Ok(());
+    }
+    for line in session_lines(&reply) {
+        println!("{line}");
+    }
     let checked = computer::check(&connection).await;
     match &checked {
         Some(Ok(verified)) => println!("{verified}"),
@@ -1824,6 +1888,53 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn a_token_is_described_as_renewing_only_when_this_computer_can_renew_it() {
+        let mut connection = Connection {
+            root: PathBuf::from("/synthetic/checkout"),
+            origin_host: "github.com".into(),
+            hub: "https://hub.example.test".into(),
+            repo: "acme/widgets".into(),
+            token_file: PathBuf::from("/synthetic/token"),
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: Vec::new(),
+        };
+        assert_eq!(renewal_note(&connection), "");
+        // A managed token still needs this computer's credential for its Hub; the synthetic
+        // Hub has none saved. `connecting_with_a_first_sign_in_mints_through_the_computer`
+        // covers a computer-minted token.
+        connection.owned_token_id = Some("synthetic-id".into());
+        assert_eq!(renewal_note(&connection), "");
+    }
+
+    #[test]
+    fn doctor_summarizes_onboarding_sessions_newest_first() {
+        let reply = json!([
+            {"agent":"claude","session":"old","state":"unverified","mcp_verified":true,
+             "native_verified":false,"expires_at":10,"next_action":"Edit a file."},
+            {"agent":"claude","session":"new","state":"ready","mcp_verified":true,
+             "native_verified":true,"expires_at":20,"next_action":"Continue."},
+        ]);
+        assert_eq!(
+            session_lines(&reply),
+            [
+                "claude session new: ready (MCP seen, native edit hook seen).",
+                "claude session old: unverified (MCP seen, native edit hook not seen). Edit a file."
+            ]
+        );
+        assert!(session_lines(&json!([])).is_empty());
+        assert_eq!(
+            session_lines(&json!({"agent":"claude"})),
+            ["claude session unknown: unknown (MCP not seen, native edit hook not seen). unknown"]
+        );
+        assert_eq!(
+            session_lines(&json!({"agent":"claude","session":"a\u{1b}[31mb","state":"ready"})),
+            ["claude session a[31mb: ready (MCP not seen, native edit hook not seen)."]
+        );
+    }
 
     /// The Hub's agent-name rule: 1-64 bytes of `[A-Za-z0-9._-]`.
     fn valid_name(name: &str) {
