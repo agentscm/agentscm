@@ -1241,7 +1241,7 @@ mod tests {
         assert!(!a.atomic_snapshot);
         assert!(
             !a.complete,
-            "unsupported producers cannot be presented as clear"
+            "missing provider and reconciliation coverage cannot be presented as clear"
         );
         assert!(!a.work[0].reconciliation.as_ref().unwrap().current);
         assert_eq!(
