@@ -225,6 +225,7 @@ fn merge_conflicts(
         include_merged: true,
         deadline: Some(Instant::now() + Duration::from_secs(30)),
         max_bytes: None,
+        merge_order: false,
     })
     .map_err(|error| error.to_string())?;
     if let Some(reason) = report["truncated"].as_str() {
