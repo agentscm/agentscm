@@ -1622,10 +1622,11 @@ async fn entry_obsolete_state_and_generation_never_send() {
         }
         if change == "generation" {
             let offered = status_checkpoint(&f, &f.alice, &blocked, "handover");
-            let claimed = tokio::task::block_in_place(|| f.store().work_start(&f.bob, &serde_json::from_value(json!({
+            let claimed = tokio::task::block_in_place(|| f.store().work_start(&f.alice, &serde_json::from_value(json!({
                 "work_id":offered.id,"takeover_generation":offered.generation,"title":offered.title,"session":"entry-takeover","role":"lead"
             })).unwrap(), unix_now())).unwrap().item;
-            status_checkpoint(&f, &f.bob, &claimed, "blocker");
+            assert!(claimed.generation > blocked.generation);
+            status_checkpoint(&f, &f.alice, &claimed, "blocker");
         } else {
             status_checkpoint(
                 &f,
@@ -1656,6 +1657,12 @@ async fn entry_rechecks_cycle_episode_opt_in_user_and_shared_recipient() {
         scan_status(&f, unix_now());
         let mut slack = Slack::from_file(&f.dir.path().join("config")).unwrap();
         slack.api = f.slack().api.clone();
+        if fence == "opt-in" {
+            slack.bindings[0].config.reminders.enabled = false;
+        }
+        if fence == "recipient" {
+            slack.bindings[1].config.reminders.enabled = true;
+        }
         let db = slack.database().unwrap();
         match fence {
             "cycle" => {
@@ -1666,14 +1673,11 @@ async fn entry_rechecks_cycle_episode_opt_in_user_and_shared_recipient() {
                 db.execute("UPDATE status_episodes SET state='resolved'", [])
                     .unwrap();
             }
-            "opt-in" => {
-                slack.bindings[0].config.reminders.enabled = false;
-            }
+            "opt-in" => {}
             "user" => {
                 db.execute("UPDATE status_jobs SET user='U2'", []).unwrap();
             }
             "recipient" => {
-                slack.bindings[1].config.reminders.enabled = true;
                 let key = status::binding_key(&slack.bindings[1]);
                 db.execute("UPDATE status_jobs SET binding=?1,user='U2'", [&key])
                     .unwrap();
