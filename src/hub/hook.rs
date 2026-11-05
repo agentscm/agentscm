@@ -876,7 +876,7 @@ fn render_overview(overview: &WorkOverview) -> String {
     {
         lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
     }
-    lines.push("Only declared work is visible; empty scope is unknown coverage. Give each agent a separate token for independent catch-up. Reported finish does not prove tests, review or merge.".into());
+    lines.push("Only declared work is visible; empty scope is unknown coverage. Reported finish does not prove tests, review or merge.".into());
     lines.join("\n")
 }
 

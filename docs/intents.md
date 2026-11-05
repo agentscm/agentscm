@@ -56,7 +56,7 @@ Setting this up for a whole team, or for agents other than Claude Code (Codex, C
 [`agentscm init-repo`](agents.md): it commits shared instructions for each agent, and each developer then runs
 `agentscm client setup` to add that machine's hooks and MCP server.
 
-Optional: `AGENTSCM_MACHINE` names the computer in warnings (default: its hostname),
+Optional: `AGENTSCM_MACHINE` names the computer in warnings (default: none; the host name is never sent),
 and `AGENTSCM_TASK` sets the task text (default: `work on <branch>`).
 
 ## Without installing anything: MCP and hook endpoints

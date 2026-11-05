@@ -321,7 +321,9 @@ status shown; clients show `message` as is.
   human-session route, administrator routes included, and on every agent route; sessions and
   agent tokens are refused on these.
 - `POST /v1/hub/device/tokens` mints an agent token for 24 hours or a read-only one for 30
-  minutes, and re-checks at every call: the owner is enabled (else 403 `user_disabled`), on
+  minutes (labelled `client-<random machine id>-<hex>`, or `<machine-name>-<hex>` when the user wrote a
+  `machine-name` file; never the host name; labels stored before this stay and are masked on display),
+  and re-checks at every call: the owner is enabled (else 403 `user_disabled`), on
   `AGENTSCM_ALLOWED_USERS` when set (else 403 `not_allowed`; administrators pass), the repository
   is connected on the owner's host (else 403 `not_connected`), and the owner has the role
   sign-in and `POST /v1/hub/tokens` require, asked with that repository's connection credential:

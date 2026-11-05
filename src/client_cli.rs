@@ -771,22 +771,80 @@ fn inferred_provider(host: &str) -> Option<Provider> {
 }
 
 fn token_name() -> Result<String> {
-    let host: String = crate::intent_cli::hostname()
-        .unwrap_or_else(|| "host".into())
-        .split('.')
-        .next()
-        .unwrap_or("host")
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || "-_".contains(*character))
-        .take(40)
-        .collect();
-    let mut random = [0_u8; 4];
-    getrandom::fill(&mut random).map_err(|_| invalid("random source unavailable"))?;
-    let random: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!(
-        "client-{}-{random}",
-        if host.is_empty() { "host" } else { &host }
+    Ok(label_in(
+        crate::hub_cli::config_dir()
+            .ok()
+            .map(|dir| dir.join("agentscm"))
+            .as_deref(),
     ))
+}
+
+/// `client-<machine id>-<hex>`, or `<machine-name>-<hex>` when the user wrote a `machine-name` file
+/// in `dir`. The machine id is random, kept in `dir/machine-id` and never derived from the host
+/// name. Unreadable or unwritable files only cost a fresh random id.
+fn label_in(dir: Option<&Path>) -> String {
+    let hex = |count: usize| {
+        let mut bytes = vec![0_u8; count];
+        // The OS random source failing is not recoverable; a time-based label still validates.
+        if getrandom::fill(&mut bytes).is_err() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            bytes
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, b)| *b = (now >> (i * 8)) as u8);
+        }
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let name = dir
+        .and_then(|dir| std::fs::read_to_string(dir.join("machine-name")).ok())
+        .map(|name| {
+            name.trim()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c))
+                .take(50)
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty());
+    let suffix = hex(4);
+    if let Some(name) = name {
+        return format!("{name}-{suffix}");
+    }
+    let valid =
+        |id: &str| id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let id = dir
+        .and_then(|dir| {
+            let path = dir.join("machine-id");
+            let read = |path: &Path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .map(|id| id.trim().to_owned())
+                    .filter(|id| valid(id))
+            };
+            if let Some(id) = read(&path) {
+                return Some(id);
+            }
+            // Create-new, so a concurrent creator's value wins and is re-read.
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            std::fs::create_dir_all(dir).ok()?;
+            let fresh = hex(8);
+            match options.open(&path) {
+                Ok(mut file) => {
+                    std::io::Write::write_all(&mut file, fresh.as_bytes()).ok()?;
+                    Some(fresh)
+                }
+                Err(_) => read(&path),
+            }
+        })
+        .unwrap_or_else(|| hex(8));
+    format!("client-{id}-{suffix}")
 }
 
 async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Value)> {
@@ -1784,6 +1842,67 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// The Hub's agent-name rule: 1-64 bytes of `[A-Za-z0-9._-]`.
+    fn valid_name(name: &str) {
+        assert!(
+            (1..=64).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn default_label_uses_a_stable_random_machine_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (label_in(Some(dir.path())), label_in(Some(dir.path())));
+        let id = |label: &str| label[7..label.len() - 9].to_owned();
+        assert!(a.starts_with("client-") && id(&a).len() == 16, "{a}");
+        assert_eq!(id(&a), id(&b));
+        assert_ne!(a, b);
+        let file = dir.path().join("machine-id");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), id(&a));
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&file).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn label_survives_an_unusable_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("machine-id"), "not an id\n").unwrap();
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, "x").unwrap();
+        for target in [Some(dir.path()), Some(blocked.join("sub").as_path()), None] {
+            let label = label_in(target);
+            assert!(label.starts_with("client-"), "{label}");
+            valid_name(&label);
+        }
+    }
+
+    #[test]
+    fn machine_name_replaces_the_generated_prefix_and_stays_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("machine-name");
+        std::fs::write(&file, "  work laptop!\n").unwrap();
+        let label = label_in(Some(dir.path()));
+        assert!(
+            label.starts_with("worklaptop-") && label.len() == 19,
+            "{label}"
+        );
+        std::fs::write(&file, format!("\"; rm -rf /\n{}", "n".repeat(500))).unwrap();
+        let label = label_in(Some(dir.path()));
+        valid_name(&label);
+        assert!(label.starts_with("rm-rfnnnn"), "{label}");
+        std::fs::write(&file, " !! \n").unwrap();
+        assert!(label_in(Some(dir.path())).starts_with("client-"));
+    }
 
     #[cfg(target_os = "macos")]
     fn integration_connection(agents: Vec<String>) -> Connection {

@@ -593,28 +593,11 @@ pub(crate) fn repo_root(cwd: &Path) -> Option<PathBuf> {
     find_root(&cwd.canonicalize().ok()?)
 }
 
+/// Only an explicit `AGENTSCM_MACHINE`; the host name is never sent by default.
 fn machine() -> Option<String> {
     std::env::var("AGENTSCM_MACHINE")
         .ok()
-        .or_else(hostname)
         .and_then(|m| bound(&m, MAX_LABEL_BYTES))
-        .or_else(|| Some("unknown".into()))
-}
-
-#[cfg(unix)]
-pub(crate) fn hostname() -> Option<String> {
-    let mut buffer = [0_u8; 256];
-    // SAFETY: the pointer and length describe `buffer`, which outlives the call.
-    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
-        return None;
-    }
-    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
-    String::from_utf8(buffer[..end].to_vec()).ok()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn hostname() -> Option<String> {
-    None
 }
 
 // ---- path normalisation ----

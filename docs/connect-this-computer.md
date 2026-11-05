@@ -57,6 +57,11 @@ the forge did not accept the code. What signing in gives you:
   hours are left, the next hook call renews it in the background: the Hub re-checks your access, a
   new token is saved, and the old one is revoked. A running MCP server switches to the new token.
   A laptop that slept for days renews at the first hook call after waking.
+- **Agent labels carry no host name.** The token's label is `client-<id>-<hex>`, where `<id>` is a random machine id kept in a private
+  `machine-id` file next to `hub-session.json` (never derived from the host name). To choose a name
+  instead, write one line to `machine-name` in the same directory; labels then read `<name>-<hex>`
+  (ASCII letters, digits, `-` and `_`, at most 50). Tokens already stored keep their old label, and
+  surfaces mask it on display until the token is replaced.
 - **Access is re-checked every time.** Each mint and renewal checks that you are still enabled
   and allowed on the Hub and still have the repository role (on a public repository Triage or
   more, on a private one read; on GitLab Reporter for private, Developer otherwise). The Hub asks

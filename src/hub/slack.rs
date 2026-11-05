@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::advice::sanitize;
+use super::advice::{agent_name, sanitize};
 use super::handoff::{Answered, Via};
 use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
@@ -308,36 +308,6 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
         bot,
         digests: binding_digests,
     })
-}
-
-/// How people say an agent, as the Hub's pages do (`agentName` in `ui/src/inboxThreads.ts`): a
-/// known tool by its brand, a generated `client-<host>-<hex id>` token as `Agent 6a36`, anything
-/// else as named, filtered like advice text.
-fn agent_name(agent: &str) -> String {
-    let brand = match agent.to_ascii_lowercase().as_str() {
-        "claude" | "claude-code" => Some("Claude Code"),
-        "codex" => Some("Codex"),
-        "cursor" => Some("Cursor"),
-        "copilot" => Some("Copilot"),
-        "gemini" => Some("Gemini"),
-        "grok" => Some("Grok"),
-        _ => None,
-    };
-    if let Some(brand) = brand {
-        return brand.into();
-    }
-    if let Some(rest) = agent
-        .get(..7)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("client-"))
-        .and_then(|_| agent.get(7..))
-        && let Some((host, id)) = rest.rsplit_once('-')
-        && !host.is_empty()
-        && id.len() >= 6
-        && id.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return format!("Agent {}", &id[..4]);
-    }
-    sanitize(agent, NAME_CHARS)
 }
 
 /// `bob’s Claude Code`, the way the Hub names someone else's agent.
