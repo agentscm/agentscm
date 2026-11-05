@@ -474,6 +474,13 @@ fn verify_inputs(args: VerifyArgs) -> Result<i32> {
             return Ok(verdict_exit(&verdict, ""));
         }
     };
+    let selections = agentscm::local_validation::run::command_selections(
+        &args.repo,
+        &git.merge_base,
+        &git.commit,
+        &recipe,
+        &trust,
+    )?;
     let clock = now_ms().map_or(EvaluationClock::Uncertain, |unix_ms| {
         EvaluationClock::Known { unix_ms }
     });
@@ -484,6 +491,7 @@ fn verify_inputs(args: VerifyArgs) -> Result<i32> {
         base_ref: &args.base_ref,
         merge_base: &git.merge_base,
         required: &required,
+        selections: &selections,
     };
     let verdict = match pair {
         Some((envelope, record)) => assess(

@@ -91,6 +91,17 @@ pub struct Touched {
     pub lead_notes: Vec<String>,
 }
 
+/// What ending a session did, all in one transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionEnd {
+    /// The session had a row: its intent is released and the row removed.
+    pub ended: bool,
+    /// The active or blocked Work the session led, as it was before the end.
+    pub work: Option<WorkItem>,
+    /// `work` was active, and the end paused it in the same transaction.
+    pub paused: bool,
+}
+
 pub struct Advice {
     pub touched: Touched,
     /// Hub-rendered warning text; empty when nothing overlaps.
@@ -967,6 +978,45 @@ pub async fn done_for(
         store.end_session(&token, session.as_deref(), unix_now())
     })
     .await
+}
+
+/// `done_for`, and the active Work the session leads is paused in the same transaction, so a
+/// failed pause leaves the intent held. `via` is `mcp` or `hook:<agent>`. With
+/// `completion_reporting`, the Work the session led gets one best-effort completion observation
+/// after the end commits.
+pub async fn done_pausing_for(
+    state: &HubState,
+    principal: &Principal,
+    session: Option<String>,
+    via: &str,
+    completion_reporting: bool,
+) -> Result<SessionEnd> {
+    let store = state.store.clone();
+    let token = principal.token_id.clone();
+    let via = via.to_owned();
+    let end = blocking(state, move || {
+        store.end_session_pausing(&token, session.as_deref(), &via, unix_now())
+    })
+    .await?;
+    if completion_reporting && let Some(item) = end.work.clone() {
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        if blocking(state, move || {
+            super::insights::record_completion(
+                store.as_ref(),
+                &token,
+                &item,
+                &item.lead_session,
+                unix_now(),
+            )
+        })
+        .await
+        .is_err()
+        {
+            eprintln!("hub: completion report failed");
+        }
+    }
+    Ok(end)
 }
 
 #[cfg(test)]

@@ -1564,6 +1564,42 @@ async fn done_pauses_retained_work_without_dropping_the_retained_reservation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_leaves_blocked_work_blocked_and_says_so() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    let item = started["structuredContent"]["work"]["item"].clone();
+    let blocked = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({"work_id": item["id"], "operation_id": "wait",
+                "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+                "session": item["lead_session"], "kind": "blocker", "summary": "waiting"}),
+        )
+        .await;
+    assert_eq!(blocked["isError"], false, "{blocked}");
+    let (done, _) = hub.tool(&alice, "/mcp", "agentscm_done", json!({})).await;
+    assert_eq!(
+        done,
+        "AgentSCM: released; durable work remains blocked and its blocker was not resolved."
+    );
+    let overview = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
+        .await;
+    assert_eq!(
+        overview["structuredContent"]["operational"]["work"][0]["state"], "blocked",
+        "{overview}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "alice-agent");

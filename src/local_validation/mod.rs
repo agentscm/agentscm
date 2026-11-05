@@ -84,6 +84,8 @@ pub struct RecipeCommand {
     pub id: String,
     pub argv: Vec<String>,
     pub timeout_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_selection: Option<TestSelection>,
     /// Git pathspecs; the command is required only when the change touches one. Absent means
     /// always required. Declaring them changes the recipe digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +109,52 @@ pub struct ValidationRecipe {
     /// aggregate result. Declaring them changes the recipe digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constituents: Option<Vec<Constituent>>,
+}
+
+/// Exact paths and reviewed nextest expressions, independent of forge scheduling.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestSelection {
+    pub rules: Vec<TestSelectionRule>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestSelectionRule {
+    pub path: String,
+    pub filter: String,
+}
+
+/// Why a selection used a subset or retained the full command.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionReason {
+    Selected,
+    UnmappedPath,
+    NonModifiedPath,
+    TrustInput,
+    SharedInput,
+    EmptyChange,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommandSelection {
+    pub command_id: String,
+    pub reason: SelectionReason,
+    pub paths: Vec<String>,
+    pub filters: Vec<String>,
+    pub argv: Vec<String>,
+}
+
+fn effective_argv<'a>(
+    command: &'a RecipeCommand,
+    selections: &'a [CommandSelection],
+) -> &'a [String] {
+    selections
+        .iter()
+        .find(|s| s.command_id == command.id)
+        .map_or(&command.argv, |s| &s.argv)
 }
 
 /// A named group of recipe commands reported on its own. Commands in no constituent are setup
@@ -164,6 +212,8 @@ pub struct ValidationRecord {
     pub base_tip: String,
     pub recipe_sha256: String,
     pub results: Vec<CommandResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selections: Vec<CommandSelection>,
     /// Recipe commands not run because the changed paths did not require them, in recipe order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_required: Vec<String>,
@@ -330,6 +380,25 @@ impl ValidationRecipe {
                 return Err(Error::Invalid("invalid or duplicate recipe command".into()));
             }
             pathspecs("command paths", &command.paths)?;
+            if let Some(selection) = &command.test_selection {
+                if command.argv != ["cargo", "nextest", "run", "--locked"]
+                    || selection.rules.is_empty()
+                    || selection.rules.len() > MAX_PATHSPECS
+                {
+                    return Err(Error::Invalid(
+                        "test selection needs unfiltered cargo nextest run and bounded rules"
+                            .into(),
+                    ));
+                }
+                let mut paths = HashSet::new();
+                for rule in &selection.rules {
+                    validate_dependency_path(&rule.path)?;
+                    text("test filter", &rule.filter)?;
+                    if !paths.insert(&rule.path) {
+                        return Err(Error::Invalid("duplicate test selection path".into()));
+                    }
+                }
+            }
         }
         if let Some(files) = &self.dependency_files {
             if files.is_empty() || files.len() > MAX_DEPENDENCY_FILES {
@@ -425,7 +494,12 @@ impl ValidationRecipe {
 
     /// The first position where `results` departs from this recipe's `required` commands (ids and
     /// argv, in order), as a detail. A missing command is reported by id.
-    fn first_departure(&self, results: &[CommandResult], required: &[String]) -> Option<String> {
+    fn first_departure(
+        &self,
+        results: &[CommandResult],
+        required: &[String],
+        selections: &[CommandSelection],
+    ) -> Option<String> {
         let commands: Vec<&RecipeCommand> = self
             .commands
             .iter()
@@ -434,7 +508,7 @@ impl ValidationRecipe {
         for (index, command) in commands.iter().enumerate() {
             match results.get(index) {
                 None => return Some(format!("{} did not run", command.id)),
-                Some(r) if r.id != command.id || r.argv != command.argv => {
+                Some(r) if r.id != command.id || r.argv != effective_argv(command, selections) => {
                     return Some(format!("{} differs from the recipe", r.id));
                 }
                 Some(_) => {}
@@ -471,7 +545,11 @@ impl ValidationRecord {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        Ok(serde_json::to_vec(self)?)
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(Error::Limit("validation record exceeds byte limit".into()));
+        }
+        Ok(bytes)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -485,6 +563,28 @@ impl ValidationRecord {
             return Err(Error::Limit(format!(
                 "record must have at most {MAX_COMMANDS} results and at least one result or not-required command"
             )));
+        }
+        if self.selections.len() > MAX_COMMANDS {
+            return Err(Error::Limit("too many command selections".into()));
+        }
+        let mut selected_ids = HashSet::new();
+        for selection in &self.selections {
+            validate_identifier("selected command", &selection.command_id)?;
+            validate_argv(&selection.argv)?;
+            if !selected_ids.insert(&selection.command_id)
+                || selection.paths.len() > 256
+                || selection.filters.len() > MAX_PATHSPECS
+            {
+                return Err(Error::Limit("duplicate or oversized selection".into()));
+            }
+            selection
+                .paths
+                .iter()
+                .try_for_each(|p| text("selected path", p))?;
+            selection
+                .filters
+                .iter()
+                .try_for_each(|f| text("selected filter", f))?;
         }
         let mut skipped = HashSet::new();
         for id in &self.not_required {
@@ -689,8 +789,17 @@ pub fn evidence_payload(
         .map(|c| c.id.clone())
         .collect();
     let pass = record.shortfall(policy.required_services).is_none()
-        && recipe.first_departure(&record.results, &required).is_none();
+        && recipe
+            .first_departure(&record.results, &required, &record.selections)
+            .is_none();
     let mut omissions: Vec<String> = FIXED_OMISSIONS.iter().map(|s| (*s).to_owned()).collect();
+    omissions.extend(
+        record
+            .selections
+            .iter()
+            .filter(|s| s.reason == SelectionReason::Selected)
+            .map(|s| format!("reduced test selection: {}", s.command_id)),
+    );
     omissions.extend(
         required
             .iter()
@@ -940,6 +1049,7 @@ pub struct Observed<'a> {
     pub merge_base: &'a str,
     /// Recipe command ids the changed paths require, in recipe order, computed from Git.
     pub required: &'a [String],
+    pub selections: &'a [CommandSelection],
 }
 
 /// How far an envelope got before its verdict, which decides what it may influence.
@@ -1133,7 +1243,7 @@ fn constituent_verdicts(
             .results
             .iter()
             .zip(&commands)
-            .all(|(r, c)| r.id == c.id && r.argv == c.argv);
+            .all(|(r, c)| r.id == c.id && r.argv == effective_argv(c, observed.selections));
     let commands_clean =
         record.results.len() == commands.len() && record.results.iter().all(result_is_clean);
     if !record.tree_unchanged_after
@@ -1382,6 +1492,14 @@ fn assess_envelope(
         )
         .applied();
     }
+    if record.selections != observed.selections {
+        return Verdict::failure(
+            Outcome::Unverified,
+            "selection mismatch",
+            "signed selection differs from independently observed paths",
+        )
+        .applied();
+    }
     let not_required: Vec<&String> = recipe
         .commands
         .iter()
@@ -1412,7 +1530,16 @@ fn assess_envelope(
     let coverage = &payload.coverage;
     let scope: BTreeSet<&str> = coverage.scope.iter().map(String::as_str).collect();
     let ran: BTreeSet<&str> = record.results.iter().map(|r| r.id.as_str()).collect();
-    if scope != ran
+    if !record
+        .selections
+        .iter()
+        .filter(|s| s.reason == SelectionReason::Selected)
+        .all(|s| {
+            coverage
+                .omissions
+                .contains(&format!("reduced test selection: {}", s.command_id))
+        })
+        || scope != ran
         || coverage.scope.len() != record.results.len()
         || coverage.observed_count as usize != record.results.len()
         || coverage.expected_count as usize != observed.required.len()
@@ -1429,7 +1556,7 @@ fn assess_envelope(
         .applied();
     }
     // Departures inside the recipe order come first; a stopped run is a prefix, reported below.
-    let departure = recipe.first_departure(&record.results, observed.required);
+    let departure = recipe.first_departure(&record.results, observed.required, observed.selections);
     if let Some(detail) = departure
         .as_ref()
         .filter(|_| record.results.len() >= observed.required.len())
