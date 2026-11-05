@@ -1502,7 +1502,7 @@ async fn entry_blocked_is_once_per_episode_even_after_restart_and_job_expiry() {
         assert!(visible.contains("Claude Code session "));
         assert_eq!(
             message["blocks"][2]["elements"][0]["url"],
-            format!("https://hub.example.test/#work/{}", repeated.id)
+            format!("https://hub.example.test/ui/#work/{}", repeated.id)
         );
         assert_eq!(
             message["blocks"][2]["elements"].as_array().unwrap().len(),
@@ -1572,7 +1572,7 @@ async fn entry_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
     assert!(rendered(body).contains("Pick an agent to take it over"));
     assert_eq!(
         body["blocks"][2]["elements"][0]["url"],
-        format!("https://hub.example.test/#work/{}", offered.id)
+        format!("https://hub.example.test/ui/#work/{}", offered.id)
     );
 }
 
@@ -1801,17 +1801,37 @@ async fn entry_new_state_and_confirmed_reentry_start_new_cycles() {
     let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
     let now = unix_now();
     scan_status(&f, now);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0 WHERE state='queued'", [])
+        .unwrap();
     f.slack().deliver_status(&f.state).await.unwrap();
     let active = status_checkpoint(&f, &f.alice, &blocked, "progress");
     scan_status(&f, now + 1);
     let blocked = status_checkpoint(&f, &f.alice, &active, "blocker");
     scan_status(&f, now + 2);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0 WHERE state='queued'", [])
+        .unwrap();
     f.slack().deliver_status(&f.state).await.unwrap();
     let offered = status_checkpoint(&f, &f.alice, &blocked, "handover");
     scan_status(&f, now + 3);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0 WHERE state='queued'", [])
+        .unwrap();
     f.slack().deliver_status(&f.state).await.unwrap();
     status_checkpoint(&f, &f.alice, &offered, "handover");
     scan_status(&f, now + 4);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0 WHERE state='queued'", [])
+        .unwrap();
     assert!(!f.slack().deliver_status(&f.state).await.unwrap());
     assert_eq!(status_text(&f).len(), 3);
     assert_eq!(entry_states(&f), ["done", "done", "done"]);
@@ -1819,10 +1839,13 @@ async fn entry_new_state_and_confirmed_reentry_start_new_cycles() {
         f.slack()
             .database()
             .unwrap()
-            .query_row::<i64, _, _>("SELECT max(cycle) FROM status_episodes", [], |row| row
-                .get(0))
+            .query_row::<(i64, i64), _, _>(
+                "SELECT count(*),max(cycle) FROM status_episodes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            )
             .unwrap(),
-        2
+        (2, 2)
     );
 }
 
@@ -2312,7 +2335,11 @@ async fn reminders_are_off_by_default_and_failed_retry_does_not_outlive_its_acti
         f.slack()
             .database()
             .unwrap()
-            .query_row::<String, _, _>("SELECT state FROM status_jobs", [], |r| r.get(0))
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_jobs WHERE kind='reminder'",
+                [],
+                |r| r.get(0)
+            )
             .unwrap(),
         "suppressed"
     );
