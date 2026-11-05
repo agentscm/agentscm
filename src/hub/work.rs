@@ -45,6 +45,9 @@ pub enum WorkRole {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkStart {
+    /// Explicit caller choice; omission remains unassessed compatibility advice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_choice: Option<super::work_issues::WorkIssueChoice>,
     pub work_id: Option<String>,
     pub source: Option<ForgeWorkRef>,
     pub request_key: Option<String>,
@@ -207,6 +210,12 @@ pub struct CheckpointReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkItem {
+    /// Immutable initial caller choice, independent of subsequent issue links.
+    #[serde(default)]
+    pub initial_issue_choice: super::work_issues::WorkIssueChoice,
+    /// Current caller assertion, never provider-confirmed assignment.
+    #[serde(default)]
+    pub issue_link: Option<super::planned_issues::IssueIdentity>,
     pub id: String,
     pub repository: String,
     pub owner: String,
@@ -478,6 +487,9 @@ pub(super) const AUTO_PAUSE_SUMMARY: &str = "Session ended without a reported fi
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkOverview {
+    #[serde(default)]
+    pub planned_issues: super::planned_issues::PlannedIssuesView,
+
     pub recent_since: i64,
     pub until: i64,
     pub current: Vec<WorkItem>,
@@ -548,6 +560,9 @@ pub struct WorkEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Briefing {
+    #[serde(default)]
+    pub planned_issues: super::planned_issues::PlannedIssuesView,
+
     /// The explicit subscriber identity, or `None` for the token-level compatibility cursor.
     #[serde(default)]
     pub subscriber: Option<String>,
@@ -652,6 +667,12 @@ impl WorkStart {
             .is_some_and(|generation| generation < 1)
         {
             return Err(invalid("takeover_generation must be positive"));
+        }
+        if let Some(choice) = &self.issue_choice {
+            choice.validate(who)?;
+            if self.source.is_some() {
+                return Err(invalid("issue_choice applies only to native Work"));
+            }
         }
         if let Some(preflight) = &self.preflight {
             preflight.validate()?;

@@ -121,6 +121,7 @@ fn direct_start(
     preflight: Option<WorkPreflightRequest>,
 ) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(request_key.into()),

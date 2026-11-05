@@ -160,6 +160,7 @@ fn setup(fixture: &StoreFixture) -> Ctx {
 
 fn start(key: &str, scope: &str, depends_on: &[&WorkItem]) -> WorkStart {
     WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(key.into()),

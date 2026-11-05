@@ -163,6 +163,7 @@ fn seed_representative_work(db: &Db) -> Fixture {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("representative-pre-change-work".into()),
@@ -660,6 +661,7 @@ fn lifecycle_counters_match_the_retained_aggregate(db: &Db) {
             .work_start(
                 &fixture.token,
                 &WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: Some(format!("lifecycle-{index}")),
