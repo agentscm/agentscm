@@ -55,9 +55,9 @@ use super::external_runs::{
     EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
 };
 use super::handoff::{
-    Answered, Asked, HandoffNote, HandoffParty, HandoffView, MAX_OPEN, PER_TOUCH, Request, Verdict,
-    Via, answer_kind, clean_note, cutoff, file_key, grant_call, judge, remaining, still_holds,
-    view_state,
+    Answered, Asked, HandoffNote, HandoffParty, HandoffView, MAX_OPEN, PER_TOUCH, Request,
+    SessionRef, Verdict, Via, answer_kind, clean_note, cutoff, file_key, grant_call, judge,
+    remaining, still_holds, view_state,
 };
 use super::insights::{
     CostGroup, HistoryPoint, InsightCursor, InsightInput, InsightPage, InsightQuery, MAX_HISTORY,
@@ -5030,6 +5030,7 @@ fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Intent, String, Opti
             },
             via: Vec::new(),
             session: row.get(18)?,
+            started_at: row.get(19)?,
         },
         row.get(16)?,
         row.get(17)?,
@@ -5102,7 +5103,7 @@ fn announce_in(
     who: &Who,
     intent: &NewIntent,
     keys: &[String],
-    via: &[String],
+    (session, via): (Option<&str>, &[String]),
     now: i64,
 ) -> Result<Announced> {
     let paths = display_all(keys);
@@ -5199,7 +5200,7 @@ fn announce_in(
     let ids: Vec<String> = ids.into_iter().collect();
     let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
     if let Plan::Write { previous } = &plan {
-        for event in notice_events(who, intent, via, previous, &announced)? {
+        for event in notice_events(who, intent, (session, via), previous, &announced)? {
             append(tx, &event)?;
         }
     }
@@ -5780,7 +5781,14 @@ fn touch_in(
         _ => Vec::new(),
     };
     let announced = match &step.new {
-        Some(new) => Some(announce_in(tx, who, new, &step.keys, &step.via, now)?),
+        Some(new) => Some(announce_in(
+            tx,
+            who,
+            new,
+            &step.keys,
+            (Some(&name), &step.via),
+            now,
+        )?),
         None => None,
     };
     if let Some(new) = &step.new {
@@ -5940,7 +5948,13 @@ fn ask_in(
 /// A refused call asks the holder of each contested file to hand it over, as `agentscm_ask`
 /// would. Best effort: a failure is logged and rolled back to its savepoint, and the touch and
 /// its refusal stand. Returns the files a request was filed for.
-fn auto_ask(tx: &Transaction<'_>, who: &Who, name: &str, keys: &[String], now: i64) -> Vec<String> {
+fn auto_ask(
+    tx: &Transaction<'_>,
+    who: &Who,
+    name: &str,
+    keys: &[String],
+    now: i64,
+) -> Vec<(String, Intent)> {
     let mut requested = Vec::new();
     for key in keys.iter().take(MAX_OPEN) {
         let ask = || -> Result<Asked> {
@@ -5962,7 +5976,7 @@ fn auto_ask(tx: &Transaction<'_>, who: &Who, name: &str, keys: &[String], now: i
             Ok(asked)
         };
         match ask() {
-            Ok(Asked::Requested { .. }) => requested.push(key.clone()),
+            Ok(Asked::Requested { holder }) => requested.push((key.clone(), holder)),
             Ok(_) => {}
             Err(error) => {
                 eprintln!("hub: handoff request for a refused edit: {error}");
@@ -5982,9 +5996,12 @@ fn handoffs_in(
 ) -> Result<Vec<HandoffNote>> {
     let requests = tx
         .prepare_cached(
-            "SELECT h.id, h.path, h.note, t.name, u.login, h.asked_via_hub
+            "SELECT h.id, h.path, h.note, t.name, u.login, h.asked_via_hub,
+                    h.requester_token, h.requester_session, rs.via
              FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.requester_token
              JOIN hub_users u ON u.id = t.owner
+             LEFT JOIN hub_sessions rs
+               ON rs.token = h.requester_token AND rs.session = h.requester_session
              WHERE h.holder_token = ?1 AND h.holder_session = ?2 AND h.state = 'pending'
                AND h.holder_told = 0 AND h.created_at > ?3
              ORDER BY h.created_at, h.id LIMIT ?4",
@@ -6000,6 +6017,11 @@ fn handoffs_in(
                     agent: row.get(3)?,
                     login: row.get(4)?,
                     session: session.to_owned(),
+                    other: SessionRef::stored(
+                        &row.get::<_, String>(6)?,
+                        &row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?.as_deref(),
+                    ),
                     via: Via::stored(row.get(5)?, false),
                 },
             ))
@@ -6008,9 +6030,11 @@ fn handoffs_in(
     let answers = tx
         .prepare_cached(
             "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
-                    h.answered_via_slack
+                    h.answered_via_slack, h.holder_token, h.holder_session, hs.via
              FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
              JOIN hub_users u ON u.id = t.owner
+             LEFT JOIN hub_sessions hs
+               ON hs.token = h.holder_token AND hs.session = h.holder_session
              WHERE h.requester_token = ?1 AND h.requester_session = ?2
                AND h.state IN ('granted', 'declined') AND h.requester_told = 0
              ORDER BY h.decided_at, h.id LIMIT ?3",
@@ -6026,6 +6050,11 @@ fn handoffs_in(
                     agent: row.get(3)?,
                     login: row.get(4)?,
                     session: session.to_owned(),
+                    other: SessionRef::stored(
+                        &row.get::<_, String>(8)?,
+                        &row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?.as_deref(),
+                    ),
                     via: Via::stored(row.get(6)?, row.get(7)?),
                 },
             ))
@@ -7472,7 +7501,7 @@ impl Store for SqliteStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
         guard_announce(&tx, &who, &keys)?;
-        let announced = announce_in(&tx, &who, intent, &keys, &[], now)?;
+        let announced = announce_in(&tx, &who, intent, &keys, (None, &[]), now)?;
         tx.commit()?;
         Ok(announced)
     }
@@ -7630,19 +7659,36 @@ impl Store for SqliteStore {
         let found = tx
             .query_row(
                 "SELECT h.id, h.requester_token, h.requester_session, h.holder_session,
-                        t.name, u.login
+                        t.name, u.login, rs.via
                  FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.requester_token
                  JOIN hub_users u ON u.id = t.owner
+                 LEFT JOIN hub_sessions rs
+                   ON rs.token = h.requester_token AND rs.session = h.requester_session
                  WHERE h.repository = ?1 AND h.path = ?2 AND h.holder_token = ?3
                    AND h.state = 'pending' AND h.created_at > ?4
                    AND h.holder_session = ?5
-                 ORDER BY h.created_at, h.id LIMIT 1",
-                params![who.repository, key, token, cutoff(now), name],
+                 ORDER BY CASE WHEN ?6 AND h.requester_token = h.holder_token THEN 1 ELSE 0 END,
+                          h.created_at, h.id LIMIT 1",
+                params![
+                    who.repository,
+                    key,
+                    token,
+                    cutoff(now),
+                    name,
+                    matches!(via, Via::Slack)
+                ],
                 |row| {
+                    let (requester_token, requester_session): (String, String) =
+                        (row.get(1)?, row.get(2)?);
                     Ok(Request {
                         id: row.get(0)?,
-                        requester_token: row.get(1)?,
-                        requester_session: row.get(2)?,
+                        requester: SessionRef::stored(
+                            &requester_token,
+                            &requester_session,
+                            row.get::<_, Option<String>>(6)?.as_deref(),
+                        ),
+                        requester_token,
+                        requester_session,
                         holder_session: row.get(3)?,
                         agent: row.get(4)?,
                         login: row.get(5)?,
@@ -7654,6 +7700,7 @@ impl Store for SqliteStore {
             return Ok(Answered::NoRequest);
         };
         let requester = (request.agent.clone(), request.login.clone());
+        let session = request.requester.clone();
         // The holder session's intent now: a hold cap may have renewed it since the request.
         let holder_intent = session_row(&tx, token, &request.holder_session)?
             .and_then(|row| row.intent)
@@ -7749,9 +7796,9 @@ impl Store for SqliteStore {
         append(&tx, &event)?;
         tx.commit()?;
         Ok(if accept {
-            Answered::Granted { requester }
+            Answered::Granted { requester, session }
         } else {
-            Answered::Declined { requester }
+            Answered::Declined { requester, session }
         })
     }
 
@@ -7768,12 +7815,16 @@ impl Store for SqliteStore {
                     h.holder_told, h.requester_told, h.asked_via_hub, h.answered_via_hub,
                     h.requester_token, h.requester_session, rt.name, rt.owner, ru.login,
                     h.holder_token, h.holder_session, ht.name, ht.owner, hu.login,
-                    h.answered_via_slack
+                    h.answered_via_slack, rs.via, hs.via
              FROM hub_handoffs h
              JOIN hub_agent_tokens rt ON rt.id = h.requester_token
              JOIN hub_users ru ON ru.id = rt.owner
              JOIN hub_agent_tokens ht ON ht.id = h.holder_token
              JOIN hub_users hu ON hu.id = ht.owner
+             LEFT JOIN hub_sessions rs
+               ON rs.token = h.requester_token AND rs.session = h.requester_session
+             LEFT JOIN hub_sessions hs
+               ON hs.token = h.holder_token AND hs.session = h.holder_session
              WHERE h.repository = ?1 AND (rt.owner = ?2 OR ht.owner = ?2)
              ORDER BY h.created_at DESC, h.id LIMIT ?3",
         )?;
@@ -7795,20 +7846,22 @@ impl Store for SqliteStore {
                         asked_via_hub: row.get(9)?,
                         answered_via_hub: row.get(10)?,
                         answered_via_slack: row.get(21)?,
-                        requester: HandoffParty {
-                            token: row.get(11)?,
-                            session: row.get(12)?,
-                            agent: row.get(13)?,
-                            owner: row.get(14)?,
-                            login: row.get(15)?,
-                        },
-                        holder: HandoffParty {
-                            token: row.get(16)?,
-                            session: row.get(17)?,
-                            agent: row.get(18)?,
-                            owner: row.get(19)?,
-                            login: row.get(20)?,
-                        },
+                        requester: HandoffParty::stored(
+                            (
+                                row.get(11)?,
+                                row.get(12)?,
+                                row.get::<_, Option<String>>(22)?,
+                            ),
+                            (row.get(13)?, row.get(14)?, row.get(15)?),
+                        ),
+                        holder: HandoffParty::stored(
+                            (
+                                row.get(16)?,
+                                row.get(17)?,
+                                row.get::<_, Option<String>>(23)?,
+                            ),
+                            (row.get(18)?, row.get(19)?, row.get(20)?),
+                        ),
                     })
                 },
             )?

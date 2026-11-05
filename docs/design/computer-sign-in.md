@@ -49,7 +49,12 @@ renewal. Its cost is a second, equivalent permission check (below), which must f
 - **Issue.** A sign-in started by the client names the computer (`device.name`, at most 64
   printable characters). The default is the macOS computer name (Sharing settings), else
   "<login>'s computer", never the raw host name (#120). `agentscm hub devices rename NAME`
-  changes it. After the existing checks pass (allow list, enabled user,
+  changes it. Agent token labels likewise never contain the host name (#120): `client-<random
+  machine id>-<hex>` from a private `machine-id` file, or `<name>-<hex>` from an optional user-written
+  `machine-name` file in the same config directory. Old labels stay stored until the token is
+  replaced, and Work records keep what they copied; agent-facing text masks them, while structured
+  JSON fields such as `agent.name` and `lead_agent`, the page `title` attribute and the owner's
+  `agentscm hub tokens` listing do not. After the existing checks pass (allow list, enabled user,
   can read a connected repository), the Hub creates a computer record and returns its secret once,
   next to the session. A person with a live session can also enroll one with
   `POST /v1/hub/devices` (used to upgrade existing sign-ins, see Migration).

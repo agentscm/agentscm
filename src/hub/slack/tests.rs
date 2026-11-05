@@ -433,6 +433,215 @@ async fn ingress_checks_signature_workspace_app_and_request_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_between_two_sessions_of_one_token_messages_the_person_once() {
+    let f = Fixture::new().await;
+    f.edit(&f.alice, "a");
+    assert!(!f.edit(&f.alice, "b").denied.is_empty());
+    assert!(!f.edit(&f.alice, "b").repeated.is_empty());
+    f.run().await;
+    let key = &crate::hub::store::session_key(&f.alice, "a")[..8];
+    // Never a message about the repeater's own session, and not one to the holder as well.
+    assert_eq!(
+        f.sent(),
+        [(
+            "U1".to_owned(),
+            format!(
+                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+            )
+        )]
+    );
+    // A session repeating on its own file alone says nothing.
+    let quiet = Fixture::new().await;
+    quiet.edit(&quiet.alice, "a");
+    quiet.edit(&quiet.alice, "a");
+    quiet.run().await;
+    assert!(quiet.sent().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeater_is_not_told_about_its_own_mcp_session() {
+    let f = Fixture::new().await;
+    f.edit(&f.bob, "b");
+    let mcp = SessionCall {
+        session: Some("m".into()),
+        via: "mcp".into(),
+        task: None,
+        paths: vec![PATH.into()],
+        deny: false,
+        report: false,
+    };
+    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now())).unwrap();
+    assert!(!f.edit(&f.alice, "a").denied.is_empty());
+    assert!(!f.edit(&f.alice, "a").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    let told: Vec<_> = sent.iter().filter(|(user, _)| user == "U1").collect();
+    assert_eq!(told.len(), 1, "{sent:?}");
+    assert!(
+        !told[0].1.contains("other agents") && !told[0].1.contains("session"),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_holder_sessions_of_one_token_message_their_person_once() {
+    let f = Fixture::new().await;
+    // A REST intent with the lowest id holds the file too, and no session could answer for it.
+    let rest = crate::hub::intent::NewIntent {
+        id: format!("int_{:032x}", 0),
+        task: "rest".into(),
+        branch: None,
+        base: None,
+        machine: None,
+        paths: vec![PATH.into()],
+        ttl_seconds: 3600,
+    };
+    tokio::task::block_in_place(|| f.store().announce_intent(&f.alice, &rest, unix_now())).unwrap();
+    f.edit(&f.alice, "a");
+    // c's refusal leaves its own request open on a: the button still answers bob, who it names.
+    f.edit(&f.alice, "c");
+    f.edit(&f.alice, "c");
+    f.run().await;
+    let before = f.sent().len();
+    let refused = f.edit(&f.bob, "b");
+    assert!(!refused.denied.is_empty());
+    let asked = refused.requested[0].1.session.clone().unwrap();
+    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    let holder: Vec<_> = sent[before..]
+        .iter()
+        .filter(|(user, text)| user == "U1" && text.contains("which your"))
+        .collect();
+    assert_eq!(holder.len(), 1, "{sent:?}");
+    // Two sessions of one token read alike by label, so each side names them.
+    let key = |session: &str| crate::hub::store::session_key(&f.alice, session)[..8].to_owned();
+    let other = if asked == "a" { "c" } else { "a" };
+    assert!(
+        holder[0]
+            .1
+            .contains(&format!("Your agent: Claude Code session {}", key(&asked)))
+            && !holder[0].1.contains(&key(other)),
+        "{sent:?}"
+    );
+    let repeater = sent[before..]
+        .iter()
+        .find(|(user, _)| user == "U2")
+        .map(|(_, text)| text.as_str())
+        .unwrap();
+    assert!(
+        repeater.contains(&key("a")) && repeater.contains(&key("c")),
+        "{sent:?}"
+    );
+    // The one button answers for the session the request was filed against.
+    assert_eq!(f.click("U1", YES).await, StatusCode::OK);
+    assert_eq!(
+        f.update().await["blocks"][3]["elements"][0]["text"],
+        "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+    );
+}
+
+/// An MCP-only session may be the same agent as a hook session of its token: one agent, one name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holders_hook_and_mcp_sessions_keep_the_single_agent_wording() {
+    let f = Fixture::new().await;
+    let mcp = SessionCall {
+        session: Some("m".into()),
+        via: "mcp".into(),
+        task: None,
+        paths: vec![PATH.into()],
+        deny: false,
+        report: false,
+    };
+    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now())).unwrap();
+    f.edit(&f.alice, "a");
+    f.run().await;
+    let before = f.sent().len();
+    assert!(!f.edit(&f.bob, "b").denied.is_empty());
+    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    assert!(
+        sent[before..]
+            .iter()
+            .any(|(user, text)| user == "U1" && text.contains("which your Claude Code holds")),
+        "{sent:?}"
+    );
+    assert!(
+        sent[before..]
+            .iter()
+            .all(|(_, text)| !text.contains(" session ")),
+        "{sent:?}"
+    );
+    assert!(
+        sent[before..].iter().any(|(user, text)| user == "U2"
+            && text.contains("which alice’s Claude Code holds")
+            && text.contains("Their agent: alice’s Claude Code |")),
+        "{sent:?}"
+    );
+}
+
+/// Hook a and hook c are distinct, whichever session is oldest: an older MCP session of the token
+/// must not hide that from the holder's message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_mcp_session_does_not_hide_two_hook_holders() {
+    let f = Fixture::new().await;
+    let mcp = SessionCall {
+        session: Some("m".into()),
+        via: "mcp".into(),
+        task: None,
+        paths: vec![PATH.into()],
+        deny: false,
+        report: false,
+    };
+    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now() - 100))
+        .unwrap();
+    f.edit(&f.alice, "a");
+    f.edit(&f.alice, "c");
+    tokio::task::block_in_place(|| {
+        f.store()
+            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
+            .unwrap()
+    });
+    f.edit(&f.alice, "c");
+    f.run().await;
+    let before = f.sent().len();
+    assert!(!f.edit(&f.bob, "b").denied.is_empty());
+    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    let holder: Vec<_> = sent[before..]
+        .iter()
+        .filter(|(user, text)| user == "U1" && text.contains("which your"))
+        .collect();
+    assert_eq!(holder.len(), 1, "{sent:?}");
+    assert!(holder[0].1.contains(" session "), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decline_under_one_token_names_the_requesters_session() {
+    let f = Fixture::new().await;
+    f.edit(&f.alice, "a");
+    assert!(!f.edit(&f.alice, "b").denied.is_empty());
+    tokio::task::block_in_place(|| {
+        f.store()
+            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
+            .unwrap()
+    });
+    f.run().await;
+    let key = &crate::hub::store::session_key(&f.alice, "b")[..8];
+    assert_eq!(
+        f.sent(),
+        [(
+            "U1".to_owned(),
+            format!(
+                "Another agent kept a file your agent asked for | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code session {key} | Their agent: alice’s Claude Code | Agree with them who goes first."
+            )
+        )]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_button() {
     let f = Fixture::new().await;
     f.contest();

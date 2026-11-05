@@ -78,7 +78,10 @@ pub(super) fn lapsed_refusal_text(
         |branch| format!("Branch {branch}"),
     );
     let holder = match holder_agent {
-        Some(agent) => format!("{holder} (led by agent {agent} when this was refused)"),
+        Some(agent) => format!(
+            "{holder} (led by agent {} when this was refused)",
+            super::advice::agent_name(agent)
+        ),
         None => holder.to_owned(),
     };
     format!(
@@ -102,7 +105,7 @@ pub(super) fn reclaimed_hold(item: &WorkItem, expired: i64) -> ReclaimedHold {
         notice: format!(
             "AgentSCM: this admission took the scope of {id}, whose hold lapsed at Unix {expired}. Its lead agent {agent} may have edits on {branch} that it never pushed: check with that agent or its owner before you change the same files.",
             id = item.id,
-            agent = item.lead_agent,
+            agent = super::advice::agent_name(&item.lead_agent),
         ),
     }
 }
@@ -1080,6 +1083,15 @@ mod tests {
         );
         assert_eq!(lease_seconds("retained"), RETAIN_CAP_SECONDS);
         assert_eq!(lease_seconds("legacy_implicit"), LEASE_SECONDS);
+    }
+
+    #[test]
+    fn the_reclaimed_hold_notice_masks_a_stored_host_label() {
+        let mut held = item(WorkState::Active);
+        held.lead_agent = "client-synthetic-host-abcdef12".into();
+        let notice = reclaimed_hold(&held, 3600).notice;
+        assert!(notice.contains("Its lead agent Agent abcd may"), "{notice}");
+        assert!(!notice.contains("synthetic-host"), "{notice}");
     }
 
     #[test]

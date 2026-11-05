@@ -368,8 +368,8 @@ async fn person_answer(
     .await
     .map_err(person_error)?;
     let (outcome, requester) = match answered {
-        Answered::Granted { requester } => ("granted", Some(requester)),
-        Answered::Declined { requester } => ("declined", Some(requester)),
+        Answered::Granted { requester, .. } => ("granted", Some(requester)),
+        Answered::Declined { requester, .. } => ("declined", Some(requester)),
         Answered::NoRequest => ("no_open_request", None),
         Answered::NotHeld => ("not_held", None),
     };
@@ -431,9 +431,10 @@ struct HandoffQuery {
 const PERSON_HANDOFFS: usize = 50;
 
 /// One side of a handoff. The token and session, which the page needs to answer, are given only
-/// for the person's own agent.
+/// for the person's own agent; every reader gets the session's key and kind, never its id.
 fn party_json(party: &HandoffParty, me: &str) -> Value {
-    let mut out = json!({"agent": party.agent, "login": party.login, "mine": party.owner == me});
+    let mut out = json!({"agent": party.agent, "login": party.login, "mine": party.owner == me,
+        "session_key": party.key, "session_kind": party.kind});
     if party.owner == me {
         out["token"] = json!(party.token);
         out["session"] = json!(party.session);

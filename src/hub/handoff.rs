@@ -2,10 +2,10 @@
 //! the holder answers once. The backends run the SQL; the shared decisions are here.
 use serde_json::json;
 
-use super::advice::ascii;
+use super::advice::{ascii, session_kind};
 use super::intent::{Intent, display_all, spec_key};
 use super::session::{HOLD_CAP_SECONDS, Held, SessionCall, never_hold, same_agent};
-use super::store::Event;
+use super::store::{Event, session_key};
 use super::{HubError, Result};
 
 const MAX_NOTE_CHARS: usize = 200;
@@ -53,6 +53,36 @@ impl Via {
     }
 }
 
+/// A session named without its id: `key` is `store::session_key` and `kind` the brand of the
+/// agent connected through a hook, `None` when that is not known (no hook, or the session's row
+/// has ended).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRef {
+    pub key: String,
+    pub kind: Option<String>,
+}
+
+impl SessionRef {
+    pub(super) fn new(token: &str, session: &str, via: &[String]) -> Self {
+        Self {
+            key: session_key(token, session),
+            kind: session_kind(via),
+        }
+    }
+
+    /// `via` is the stored JSON array of the session's row, `None` when no row is left.
+    pub(super) fn stored(token: &str, session: &str, via: Option<&str>) -> Self {
+        let via: Vec<String> = via
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        Self::new(token, session, &via)
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({"key": self.key, "kind": self.kind})
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Asked {
     Requested {
@@ -68,14 +98,16 @@ pub enum Asked {
     TooMany,
 }
 
-/// The requester is `(agent, login)`.
+/// The requester is `(agent, login)`, with its session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Answered {
     Granted {
         requester: (String, String),
+        session: SessionRef,
     },
     Declined {
         requester: (String, String),
+        session: SessionRef,
     },
     NoRequest,
     /// The holder no longer holds the file; the request lapsed.
@@ -95,6 +127,8 @@ pub struct HandoffNote {
     pub reason: Option<String>,
     /// The touched session's name.
     pub session: String,
+    /// The other side's session.
+    pub other: SessionRef,
     /// Whether the other side's person asked or answered from the Hub's web pages or Slack, not
     /// their agent.
     pub via: Via,
@@ -127,9 +161,31 @@ pub struct HandoffView {
 pub struct HandoffParty {
     pub token: String,
     pub session: String,
+    pub key: String,
+    /// The session's agent brand, `None` when not known.
+    pub kind: Option<String>,
     pub agent: String,
     pub owner: String,
     pub login: String,
+}
+
+impl HandoffParty {
+    /// From `(token, session, the session row's via)` and `(agent, owner, login)`.
+    pub(super) fn stored(
+        (token, session, via): (String, String, Option<String>),
+        (agent, owner, login): (String, String, String),
+    ) -> Self {
+        let SessionRef { key, kind } = SessionRef::stored(&token, &session, via.as_deref());
+        Self {
+            token,
+            session,
+            key,
+            kind,
+            agent,
+            owner,
+            login,
+        }
+    }
 }
 
 /// A stored request's state, with a pending one past the hold cap shown as lapsed.
@@ -147,6 +203,7 @@ pub(super) struct Request {
     pub id: String,
     pub requester_token: String,
     pub requester_session: String,
+    pub requester: SessionRef,
     pub holder_session: String,
     /// The requester's token name and owner login.
     pub agent: String,
@@ -263,8 +320,13 @@ impl Event {
         holder: &Intent,
         (auto, via): (bool, Via),
     ) -> Result<Self> {
+        let to_session = holder
+            .session
+            .as_deref()
+            .map(|session| SessionRef::new(&holder.token, session, &holder.via).json());
         let mut data = json!({"request": request, "paths": [path], "note": note, "session": session,
-            "auto": auto, "to": {"agent": holder.agent, "login": holder.owner.login}});
+            "auto": auto,
+            "to": {"agent": holder.agent, "login": holder.owner.login, "session": to_session}});
         if let Some(via) = via.tag() {
             data["via"] = json!(via);
         }
@@ -282,7 +344,8 @@ impl Event {
         via: Via,
     ) -> Result<Self> {
         let mut data = json!({"request": request.id, "paths": [path], "session": session,
-            "from": {"agent": request.agent, "login": request.login, "token": request.requester_token},
+            "from": {"agent": request.agent, "login": request.login, "token": request.requester_token,
+                "session": request.requester.json()},
             "reason": reason});
         if let Some(via) = via.tag() {
             data["via"] = json!(via);

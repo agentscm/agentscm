@@ -50,7 +50,7 @@ fn mismatch_message(item: &WorkItem, owner_id: &str) -> String {
     }
     format!(
         "{LEAD_SESSION_MISMATCH}: recorded lead agent {agent}, session {session}. Take over with agentscm_start work_id {id} takeover_generation {generation}.",
-        agent = item.lead_agent,
+        agent = super::advice::agent_name(&item.lead_agent),
         session = item.lead_session,
         id = item.id,
         generation = item.generation,
@@ -62,7 +62,7 @@ pub(super) fn carry_notice(item: &WorkItem) -> String {
         "AgentSCM: session {session} leads {id} under recorded agent {agent}, and the lead credential did not match this caller. This call keeps the lead and records the new agent. Generation stays {generation}.",
         session = item.lead_session,
         id = item.id,
-        agent = item.lead_agent,
+        agent = super::advice::agent_name(&item.lead_agent),
         generation = item.generation,
     )
 }

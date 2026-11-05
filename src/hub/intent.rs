@@ -76,6 +76,9 @@ pub struct Intent {
     pub via: Vec<String>,
     /// The session holding this intent; `None` when it was announced through the REST API.
     pub session: Option<String>,
+    /// When the hub first saw that session (`hub_sessions.created_at`), not when the agent
+    /// started; `None` when announced through the REST API.
+    pub started_at: Option<i64>,
 }
 
 /// A live intent of someone else that overlaps an announce; paths are display specs.
@@ -325,6 +328,11 @@ struct NoticeData<'a> {
     machine: &'a Option<String>,
     owner: OwnerData<'a>,
     repository: &'a str,
+    /// Keys and kind of the announcer's session (`session_key`, never its id); absent in old rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_kind: Option<String>,
     task: &'a str,
     their_paths: &'a [String],
     token: &'a str,
@@ -362,7 +370,12 @@ impl Event {
     }
 
     /// Serialized without a `Value` tree: a broad announce writes one per overlapped intent.
-    fn intent_notice(who: &Who, new: &NewIntent, overlap: &Overlap) -> Result<Self> {
+    fn intent_notice(
+        who: &Who,
+        new: &NewIntent,
+        (session, via): (Option<&str>, &[String]),
+        overlap: &Overlap,
+    ) -> Result<Self> {
         let owner = &who.owner;
         let data = NoticeData {
             about: &new.id,
@@ -377,6 +390,8 @@ impl Event {
                 user_id: owner.identity.user_id,
             },
             repository: &who.repository,
+            session_key: session.map(|session| super::store::session_key(&who.token, session)),
+            session_kind: session.and_then(|_| super::advice::session_kind(via)),
             task: &new.task,
             // The recipient's view: "their" is the announcer.
             their_paths: &overlap.your_paths,
@@ -398,7 +413,7 @@ impl Event {
 pub(super) fn notice_events(
     who: &Who,
     new: &NewIntent,
-    via: &[String],
+    (session, via): (Option<&str>, &[String]),
     previous: &BTreeSet<String>,
     announced: &Announced,
 ) -> Result<Vec<Event>> {
@@ -413,7 +428,7 @@ pub(super) fn notice_events(
                 .iter()
                 .any(|spec| !previous.contains(key_of(spec)))
         })
-        .map(|overlap| Event::intent_notice(who, new, overlap))
+        .map(|overlap| Event::intent_notice(who, new, (session, via), overlap))
         .collect()
 }
 
@@ -431,10 +446,10 @@ pub(super) fn finish(rows: Vec<(Intent, String, Option<String>)>) -> Result<Vec<
         .collect()
 }
 
-/// Column order read by both backends' row mappers; `paths`, `via` and `session` are last.
+/// Column order read by both backends' row mappers; `paths`, `via`, `session` and the session's `created_at` are last.
 pub(super) const INTENT_SELECT: &str = "SELECT i.id, i.repository, i.task, i.branch, i.base,
         i.machine, i.expires_at, i.token, t.name, u.id, u.provider, u.host, u.forge_user_id,
-        u.login, i.created_at, i.updated_at, i.paths, s.via, s.session
+        u.login, i.created_at, i.updated_at, i.paths, s.via, s.session, s.created_at
     FROM hub_intents i JOIN hub_agent_tokens t ON t.id = i.token JOIN hub_users u ON u.id = t.owner
     LEFT JOIN hub_sessions s ON s.intent = i.id";
 
@@ -474,10 +489,18 @@ pub(super) fn announced(own: &str, keys: &[String], intents: Vec<Intent>) -> Res
 }
 
 impl Intent {
+    /// `{key, kind, started_at}` naming the holding session, never its id; null for REST.
+    fn session_json(&self) -> Value {
+        self.session.as_deref().map_or(Value::Null, |session| {
+            json!({"key": super::store::session_key(&self.token, session),
+                "kind": super::advice::session_kind(&self.via), "started_at": self.started_at})
+        })
+    }
+
     pub(super) fn to_json(&self) -> Value {
         json!({"id": self.id, "repository": self.repository, "task": self.task,
             "branch": self.branch, "base": self.base, "machine": self.machine,
-            "paths": self.paths, "via": self.via, "expires_at": self.expires_at,
+            "paths": self.paths, "via": self.via, "session": self.session_json(), "expires_at": self.expires_at,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "agent": {"token": self.token, "name": self.agent},
             "owner": {"id": self.owner.id, "provider": self.owner.identity.provider,

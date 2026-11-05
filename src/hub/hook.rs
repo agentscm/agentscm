@@ -19,7 +19,7 @@ use axum::routing::post;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
-use super::advice::unknown;
+use super::advice::{agent_name, unknown};
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
 use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
@@ -800,7 +800,7 @@ fn render_briefing(briefing: &Briefing) -> String {
         lines.push(format!(
             "- {} by {} [{:?}, claim {:?}]: {} (third-party text)",
             item.id,
-            bounded_hook_text(&item.lead_agent, 64),
+            bounded_hook_text(&agent_name(&item.lead_agent), 64),
             item.state,
             item.claim_status,
             bounded_hook_text(&item.title, 120)
@@ -853,7 +853,7 @@ fn render_overview(overview: &WorkOverview) -> String {
             "- {:?}: {} by {} — {} (third-party text)",
             outcome.kind,
             bounded_hook_text(&outcome.item.title, 100),
-            bounded_hook_text(&outcome.item.lead_agent, 64),
+            bounded_hook_text(&agent_name(&outcome.item.lead_agent), 64),
             bounded_hook_text(summary, 160)
         ));
     }
@@ -865,8 +865,8 @@ fn render_overview(overview: &WorkOverview) -> String {
         .collect();
     for overlap in live_overlaps.iter().take(5) {
         lines.push(format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
-            bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&overlap.left.lead_agent, 64),
-            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&overlap.right.lead_agent, 64)));
+            bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&agent_name(&overlap.left.lead_agent), 64),
+            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)));
     }
     if !overview.current_complete
         || !overview.recent_complete
@@ -876,7 +876,7 @@ fn render_overview(overview: &WorkOverview) -> String {
     {
         lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
     }
-    lines.push("Only declared work is visible; empty scope is unknown coverage. Give each agent a separate token for independent catch-up. Reported finish does not prove tests, review or merge.".into());
+    lines.push("Only declared work is visible; empty scope is unknown coverage. Reported finish does not prove tests, review or merge.".into());
     lines.join("\n")
 }
 

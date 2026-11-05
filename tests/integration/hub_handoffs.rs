@@ -5,9 +5,11 @@ use crate::hub_pg;
 use std::sync::{Arc, Barrier};
 
 use agentscm::hub::HubError;
-use agentscm::hub::handoff::{Answered, Asked, HandoffView, Via};
+use agentscm::hub::handoff::{Answered, Asked, HandoffView, SessionRef, Via};
 use agentscm::hub::intent::Intent;
-use agentscm::hub::session::{HOLD_CAP_SECONDS, SESSION_REQUIRED, SessionCall, Touched};
+use agentscm::hub::session::{
+    HOLD_CAP_SECONDS, SESSION_REQUIRED, SessionCall, Touched, asked_holder,
+};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, agent_token_digest, mint_agent_token, unix_now,
 };
@@ -115,6 +117,17 @@ fn events(store: &dyn Store, kind: &str) -> Vec<(String, Value)> {
         .collect()
 }
 
+/// The files a touch asked the holder for.
+fn asked_paths(touched: &Touched) -> Vec<&str> {
+    touched.requested.iter().map(|(p, _)| p.as_str()).collect()
+}
+
+/// The 16-hex key of session `session` of `who`, from the documented digest.
+fn full_key(who: &Agent, session: &str) -> String {
+    let input = format!("agentscm.hub.session-view.v1\0{}\0{session}", who.token);
+    store::lower_hex_of(input.as_bytes())[..16].to_owned()
+}
+
 fn live(store: &dyn Store, now: i64) -> Vec<Intent> {
     store.live_intents(REPO, now, 10).unwrap()
 }
@@ -156,10 +169,7 @@ fn a_grant_moves_the_file_and_is_told_once(db: &Db) {
         ..touch_call("hb", &[A])
     };
     assert_eq!(
-        store
-            .touch_session(&bob.token, &call, T0 + 1)
-            .unwrap()
-            .requested,
+        asked_paths(&store.touch_session(&bob.token, &call, T0 + 1).unwrap()),
         [A]
     );
     let asked = ask(&*store, &bob, "hb", A, T0 + 2);
@@ -176,7 +186,9 @@ fn a_grant_moves_the_file_and_is_told_once(db: &Db) {
     assert_eq!(
         requests[0].1,
         json!({"request": requests[0].1["request"], "paths": [A], "note": "need it now",
-            "session": "hb", "auto": true, "to": {"agent": "agent1", "login": "user1"}})
+            "session": "hb", "auto": true,
+            "to": {"agent": "agent1", "login": "user1",
+                "session": {"key": full_key(&alice, "ha"), "kind": "Claude Code"}}})
     );
     assert!(
         requests[0].1["request"]
@@ -214,7 +226,11 @@ fn a_grant_moves_the_file_and_is_told_once(db: &Db) {
     assert_eq!(
         granted,
         Answered::Granted {
-            requester: ("agent2".into(), "user2".into())
+            requester: ("agent2".into(), "user2".into()),
+            session: SessionRef {
+                key: full_key(&bob, "hb"),
+                kind: Some("Claude Code".into())
+            }
         }
     );
     assert_eq!(held_by(&*store, &alice, T0 + 6), ["src/b.rs"]);
@@ -246,7 +262,8 @@ fn a_grant_moves_the_file_and_is_told_once(db: &Db) {
     assert_eq!(
         grants[0].1,
         json!({"request": grants[0].1["request"], "paths": [A], "session": "ha",
-            "from": {"agent": "agent2", "login": "user2", "token": bob.token}, "reason": null})
+            "from": {"agent": "agent2", "login": "user2", "token": bob.token,
+                "session": {"key": full_key(&bob, "hb"), "kind": "Claude Code"}}, "reason": null})
     );
     assert!(events(&*store, "handoff_decline").is_empty());
 
@@ -269,7 +286,11 @@ fn a_decline_is_told_once_and_the_retry_passes(db: &Db) {
     assert_eq!(
         declined,
         Answered::Declined {
-            requester: ("agent2".into(), "user2".into())
+            requester: ("agent2".into(), "user2".into()),
+            session: SessionRef {
+                key: full_key(&bob, "hb"),
+                kind: Some("Claude Code".into())
+            }
         }
     );
     assert_eq!(held_by(&*store, &alice, T0 + 3), [A]);
@@ -294,7 +315,8 @@ fn a_decline_is_told_once_and_the_retry_passes(db: &Db) {
     assert_eq!(declines[0].0, alice.token);
     assert_eq!(
         declines[0].1["from"],
-        json!({"agent": "agent2", "login": "user2", "token": bob.token})
+        json!({"agent": "agent2", "login": "user2", "token": bob.token,
+            "session": {"key": full_key(&bob, "hb"), "kind": "Claude Code"}})
     );
     assert_eq!(declines[0].1["session"], "ha");
     assert!(events(&*store, "handoff_grant").is_empty());
@@ -768,10 +790,7 @@ fn a_refusal_asks_the_holder_once(db: &Db) {
     let bob = agent(&*store, 2);
     touch(&*store, &alice, "ha", &[A], T0);
     let denied = touch(&*store, &bob, "hb", &[A], T0 + 1);
-    assert_eq!(
-        (denied.denied.len(), &denied.requested[..]),
-        (1, [A.into()].as_slice())
-    );
+    assert_eq!((denied.denied.len(), asked_paths(&denied)), (1, vec![A]));
     // No task, so no note; the event says the hub asked.
     let requests = events(&*store, "handoff_request");
     assert_eq!(requests.len(), 1);
@@ -801,7 +820,7 @@ fn a_refused_call_asks_for_three_files_at_most(db: &Db) {
     touch(&*store, &alice, "ha", &files, T0);
     let denied = touch(&*store, &bob, "hb", &files, T0 + 1);
     assert_eq!(denied.denied.len(), 1);
-    assert_eq!(denied.requested, ["f0.rs", "f1.rs", "f2.rs"]);
+    assert_eq!(asked_paths(&denied), ["f0.rs", "f1.rs", "f2.rs"]);
     assert_eq!(events(&*store, "handoff_request").len(), 3);
     assert_eq!(touch(&*store, &alice, "ha", &[], T0 + 2).handoffs.len(), 3);
 }
@@ -955,6 +974,297 @@ fn a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told(db: 
     );
 }
 
+/// The 8 hex the refusal shows for session `session` of `who`, derived here from the documented digest.
+fn shown_key(who: &Agent, session: &str) -> String {
+    full_key(who, session)[..8].to_owned()
+}
+
+fn two_sessions_of_one_token_are_told_apart_in_the_refusal(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    // Sessions ha and hb of one token hold different files; hc and hd each want the other's.
+    touch(&*store, &alice, "ha-secret", &[A], T0);
+    touch(&*store, &alice, "hb-secret", &["src/b.rs"], T0 + 600);
+    let reason = |session: &str, path: &str| {
+        let denied = touch(&*store, &alice, session, &[path], T0 + 700);
+        assert_eq!(denied.denied.len(), 1, "{session} {path}");
+        agentscm::hub::advice::deny_reason(&denied.denied, (Some(session), true, None), T0 + 700)
+    };
+    let first = reason("hc", A);
+    let second = reason("hd", "src/b.rs");
+    assert!(
+        first.contains(&format!(
+            "user1's Claude Code session {}, started 11 min ago",
+            shown_key(&alice, "ha-secret")
+        )),
+        "{first}"
+    );
+    assert!(
+        second.contains(&format!(
+            "user1's Claude Code session {}, started 1 min ago",
+            shown_key(&alice, "hb-secret")
+        )),
+        "{second}"
+    );
+    for text in [&first, &second] {
+        assert!(
+            !text.contains("-secret") && !text.contains("agent1"),
+            "{text}"
+        );
+    }
+    assert_ne!(
+        shown_key(&alice, "ha-secret"),
+        shown_key(&alice, "hb-secret")
+    );
+    // The same session alone, with nobody contesting, is not told anything.
+    let alone = touch(&*store, &alice, "ha-secret", &[A], T0 + 701);
+    assert!(alone.denied.is_empty() && alone.overlaps.is_empty());
+    // Every live session intent has the hub's first sight of its session.
+    let held = live(&*store, T0 + 701);
+    assert!(held.iter().all(|intent| intent.started_at.is_some()));
+}
+
+fn claude(key: String) -> SessionRef {
+    SessionRef {
+        key,
+        kind: Some("Claude Code".into()),
+    }
+}
+
+/// The warning text a touch's hand-off notes render to.
+fn told(touched: &Touched, now: i64) -> String {
+    agentscm::hub::advice::warn(touched, &[], now).0
+}
+
+fn a_hand_off_reaches_only_the_session_it_names(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    // One token, three sessions: s1 holds the file, s2 is refused, s3 is a bystander.
+    touch(&*store, &alice, "s1", &[A], T0);
+    let denied = touch(&*store, &alice, "s2", &[A], T0 + 1);
+    assert_eq!(asked_paths(&denied), [A]);
+    assert_eq!(denied.requested[0].1.session.as_deref(), Some("s1"));
+    assert!(
+        touch(&*store, &alice, "s3", &[], T0 + 2)
+            .handoffs
+            .is_empty()
+    );
+    // The bystander cannot answer without naming itself, and has nothing to answer.
+    assert!(matches!(
+        store.answer_handoff(&alice.token, None, A, true, None, T0 + 3),
+        Err(HubError::Invalid(message)) if message == SESSION_REQUIRED
+    ));
+    assert_eq!(
+        answer(&*store, &alice, Some("s3"), A, true, T0 + 3),
+        Answered::NoRequest
+    );
+
+    let held = touch(&*store, &alice, "s1", &[], T0 + 4);
+    assert_eq!(held.handoffs.len(), 1);
+    let note = &held.handoffs[0];
+    assert_eq!((note.kind, note.session.as_str()), ("request", "s1"));
+    assert_eq!(note.other, claude(full_key(&alice, "s2")));
+    let (s1, s2) = (shown_key(&alice, "s1"), shown_key(&alice, "s2"));
+    let text = told(&held, T0 + 4);
+    assert!(
+        text.contains(&format!(
+            "user1's Claude Code session {s2} asks to take over src/a.rs"
+        )),
+        "{text}"
+    );
+    assert!(
+        touch(&*store, &alice, "s1", &[], T0 + 5)
+            .handoffs
+            .is_empty()
+    );
+    assert!(
+        touch(&*store, &alice, "s3", &[], T0 + 5)
+            .handoffs
+            .is_empty()
+    );
+
+    let granted = answer(&*store, &alice, Some("s1"), A, true, T0 + 6);
+    assert_eq!(
+        granted,
+        Answered::Granted {
+            requester: ("agent1".into(), "user1".into()),
+            session: claude(full_key(&alice, "s2"))
+        }
+    );
+    assert!(
+        touch(&*store, &alice, "s3", &[], T0 + 7)
+            .handoffs
+            .is_empty()
+    );
+    assert!(
+        touch(&*store, &alice, "s1", &[], T0 + 7)
+            .handoffs
+            .is_empty()
+    );
+    let heard = touch(&*store, &alice, "s2", &[], T0 + 7);
+    assert_eq!(heard.handoffs.len(), 1);
+    assert_eq!(heard.handoffs[0].kind, "grant");
+    assert_eq!(heard.handoffs[0].other, claude(full_key(&alice, "s1")));
+    let text = told(&heard, T0 + 7);
+    assert!(
+        text.contains(&format!(
+            "user1's Claude Code session {s1} handed src/a.rs to this session"
+        )),
+        "{text}"
+    );
+    assert!(
+        touch(&*store, &alice, "s2", &[], T0 + 8)
+            .handoffs
+            .is_empty()
+    );
+    assert!(
+        touch(&*store, &alice, "s3", &[], T0 + 8)
+            .handoffs
+            .is_empty()
+    );
+}
+
+fn the_refusal_names_the_session_asked_only_when_it_was_one(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let bob = agent(&*store, 2);
+    touch(&*store, &alice, "s1", &[A], T0);
+    touch(&*store, &alice, "s4", &["src/b.rs"], T0 + 1);
+    // One holder: named.
+    let one = touch(&*store, &bob, "hb", &[A], T0 + 2);
+    let holder = asked_holder(&one.requested).expect("one holder asked");
+    let reason = |denied: &Touched| {
+        let named = asked_holder(&denied.requested);
+        agentscm::hub::advice::deny_reason(&denied.denied, (Some("hb"), true, named), T0 + 9)
+    };
+    let named = reason(&one);
+    assert!(
+        named.contains(&format!(
+            "AgentSCM asked user1's Claude Code session {} to hand it over",
+            shown_key(&alice, "s1")
+        )),
+        "{named}"
+    );
+    assert_eq!(holder.session.as_deref(), Some("s1"));
+    assert!(
+        !named.contains("\"s1\"") && !named.contains("agent1"),
+        "{named}"
+    );
+    // Two holders on two files: the generic wording.
+    let carol = agent(&*store, 3);
+    let two = touch(&*store, &carol, "hc", &[A, "src/b.rs"], T0 + 3);
+    assert_eq!(asked_paths(&two).len(), 2);
+    assert!(asked_holder(&two.requested).is_none());
+    let generic = reason(&two);
+    assert!(
+        generic.contains("AgentSCM asked the holder to hand them over"),
+        "{generic}"
+    );
+}
+
+fn tool_replies_name_the_sessions(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    touch(&*store, &alice, "s1", &[A], T0);
+    touch_silent(&*store, &alice, "s2", T0 + 1);
+    let requested = ask(&*store, &alice, "s2", A, T0 + 2);
+    let reply = agentscm::hub::advice::asked(&requested, A);
+    assert!(
+        reply.contains(&format!(
+            "asked user1's Claude Code session {} for src/a.rs",
+            shown_key(&alice, "s1")
+        )),
+        "{reply}"
+    );
+    let answered = answer(&*store, &alice, Some("s1"), A, true, T0 + 3);
+    let reply = agentscm::hub::advice::answered(&answered, A);
+    assert_eq!(
+        reply,
+        format!(
+            "AgentSCM: handed src/a.rs to user1's Claude Code session {}.",
+            shown_key(&alice, "s2")
+        )
+    );
+}
+
+fn a_requester_whose_session_ended_has_an_unknown_kind(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    store.end_session(&bob.token, Some("hb"), T0 + 3).unwrap();
+    let declined = answer(&*store, &alice, Some("ha"), A, false, T0 + 4);
+    let session = SessionRef {
+        key: full_key(&bob, "hb"),
+        kind: None,
+    };
+    assert_eq!(
+        declined,
+        Answered::Declined {
+            requester: ("agent2".into(), "user2".into()),
+            session
+        }
+    );
+    let reply = agentscm::hub::advice::answered(&declined, A);
+    assert_eq!(
+        reply,
+        format!(
+            "AgentSCM: kept src/a.rs; user2's agent session {} is told.",
+            shown_key(&bob, "hb")
+        )
+    );
+}
+
+fn hand_offs_between_two_tokens_name_each_session(db: &Db) {
+    let store = db.open();
+    let (alice, bob) = refused(&*store, &[A]);
+    let held = touch(&*store, &alice, "ha", &[], T0 + 2);
+    assert_eq!(held.handoffs[0].other, claude(full_key(&bob, "hb")));
+    let text = told(&held, T0 + 2);
+    assert!(
+        text.contains(&format!(
+            "user2's Claude Code session {} asks to take over",
+            shown_key(&bob, "hb")
+        )),
+        "{text}"
+    );
+    // The owner's page: either side's key and kind, whoever reads.
+    let views = store
+        .handoffs_of_owner(&owner_of(&*store, 2), REPO, T0 + 3, 10)
+        .unwrap();
+    assert_eq!(views[0].requester.key, full_key(&bob, "hb"));
+    assert_eq!(views[0].holder.key, full_key(&alice, "ha"));
+    assert_eq!(views[0].holder.kind.as_deref(), Some("Claude Code"));
+    answer(&*store, &alice, Some("ha"), A, true, T0 + 4);
+    let heard = touch(&*store, &bob, "hb", &[], T0 + 5);
+    assert_eq!(heard.handoffs[0].other, claude(full_key(&alice, "ha")));
+    assert!(told(&heard, T0 + 5).contains(&format!(
+        "user1's Claude Code session {} handed src/a.rs",
+        shown_key(&alice, "ha")
+    )));
+}
+
+/// Known limit, pinned: a session key is a digest of the token and the session name, so a
+/// hand-off filed against the holder under its old token is not delivered to, and cannot be
+/// answered from, the same session name under a new token of the same owner. Uses a second minted
+/// token, not the renewal route.
+fn a_second_token_of_the_owner_does_not_inherit_hand_offs(db: &Db) {
+    let store = db.open();
+    let (alice, _bob) = refused(&*store, &[A]);
+    let renewed = agent(&*store, 1);
+    assert_ne!(alice.token, renewed.token);
+    assert_ne!(full_key(&alice, "ha"), full_key(&renewed, "ha"));
+    assert!(
+        touch(&*store, &renewed, "ha", &[], T0 + 2)
+            .handoffs
+            .is_empty()
+    );
+    assert_eq!(
+        answer(&*store, &renewed, Some("ha"), A, true, T0 + 3),
+        Answered::NoRequest
+    );
+    // The request still waits for the session under the old token.
+    assert_eq!(touch(&*store, &alice, "ha", &[], T0 + 4).handoffs.len(), 1);
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -969,6 +1279,7 @@ macro_rules! conformance {
 }
 
 conformance!(
+    two_sessions_of_one_token_are_told_apart_in_the_refusal,
     a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told,
     a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told,
     a_grant_moves_the_file_and_is_told_once,
@@ -991,6 +1302,12 @@ conformance!(
     a_renewed_holder_intent_can_still_grant,
     a_refusal_asks_the_holder_once,
     a_refused_call_asks_for_three_files_at_most,
+    a_hand_off_reaches_only_the_session_it_names,
+    the_refusal_names_the_session_asked_only_when_it_was_one,
+    tool_replies_name_the_sessions,
+    a_requester_whose_session_ended_has_an_unknown_kind,
+    hand_offs_between_two_tokens_name_each_session,
+    a_second_token_of_the_owner_does_not_inherit_hand_offs,
 );
 
 /// The request is best effort: when filing it fails, the touch is still refused, not failed.

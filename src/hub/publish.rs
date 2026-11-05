@@ -1542,7 +1542,9 @@ async fn push(
         None => {
             let footer = format!(
                 "Published by AgentSCM for {}'s agent ({}) from revision {}.",
-                publication.owner_login, publication.agent, manifest.revision
+                publication.owner_login,
+                super::advice::agent_name(&publication.agent),
+                manifest.revision
             );
             let body = match manifest.body.trim() {
                 "" => footer,

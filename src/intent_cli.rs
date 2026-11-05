@@ -593,28 +593,13 @@ pub(crate) fn repo_root(cwd: &Path) -> Option<PathBuf> {
     find_root(&cwd.canonicalize().ok()?)
 }
 
+/// Only an explicit `AGENTSCM_MACHINE`; the host name is never sent by default.
 fn machine() -> Option<String> {
-    std::env::var("AGENTSCM_MACHINE")
-        .ok()
-        .or_else(hostname)
-        .and_then(|m| bound(&m, MAX_LABEL_BYTES))
-        .or_else(|| Some("unknown".into()))
+    machine_label(std::env::var("AGENTSCM_MACHINE").ok())
 }
 
-#[cfg(unix)]
-pub(crate) fn hostname() -> Option<String> {
-    let mut buffer = [0_u8; 256];
-    // SAFETY: the pointer and length describe `buffer`, which outlives the call.
-    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
-        return None;
-    }
-    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
-    String::from_utf8(buffer[..end].to_vec()).ok()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn hostname() -> Option<String> {
-    None
+fn machine_label(explicit: Option<String>) -> Option<String> {
+    explicit.and_then(|m| bound(&m, MAX_LABEL_BYTES))
 }
 
 // ---- path normalisation ----
@@ -720,7 +705,10 @@ fn agent_of(owner: &Value, agent: &Value, machine: &Value) -> String {
     format!(
         "{}'s agent ({}){on}",
         text(&owner["login"], NAME_CHARS),
-        text(agent, NAME_CHARS)
+        text(
+            &Value::from(agent.as_str().map(agentscm::hub::advice::agent_name)),
+            NAME_CHARS
+        )
     )
 }
 
@@ -1194,6 +1182,11 @@ mod tests {
             "bob's agent (claude-2) on laptop-b is already working on src/billing.rs \
              for \"Fix invoice[31m rounding\", started 12 min ago."
         );
+        assert_eq!(machine_label(None), None);
+        assert_eq!(machine_label(Some("laptop-b".into())).unwrap(), "laptop-b");
+        let mut legacy = overlap.clone();
+        legacy["intent"]["agent"]["name"] = json!("client-synthetic-host-6a36b2c1");
+        assert!(overlap_line(&legacy, 1000).starts_with("bob's agent (Agent 6a36) on laptop-b"));
         let mut no_machine = overlap.clone();
         no_machine["intent"]["machine"] = Value::Null;
         assert!(overlap_line(&no_machine, 1000).starts_with("bob's agent (claude-2) is already"));

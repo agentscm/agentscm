@@ -57,9 +57,9 @@ use super::external_runs::{
     EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
 };
 use super::handoff::{
-    Answered, Asked, HandoffNote, HandoffParty, HandoffView, MAX_OPEN, PER_TOUCH, Request, Verdict,
-    Via, answer_kind, clean_note, cutoff, file_key, grant_call, judge, remaining, still_holds,
-    view_state,
+    Answered, Asked, HandoffNote, HandoffParty, HandoffView, MAX_OPEN, PER_TOUCH, Request,
+    SessionRef, Verdict, Via, answer_kind, clean_note, cutoff, file_key, grant_call, judge,
+    remaining, still_holds, view_state,
 };
 use super::insights::{
     CostGroup, HistoryPoint, InsightCursor, InsightInput, InsightPage, InsightQuery, MAX_HISTORY,
@@ -4861,6 +4861,7 @@ fn intent_row(row: &postgres::Row) -> (Intent, String, Option<String>) {
             },
             via: Vec::new(),
             session: row.get(18),
+            started_at: row.get(19),
         },
         row.get(16),
         row.get(17),
@@ -4971,7 +4972,7 @@ fn announce_in(
     who: &Who,
     intent: &NewIntent,
     keys: &[String],
-    via: &[String],
+    (session, via): (Option<&str>, &[String]),
     now: i64,
 ) -> Result<Announced> {
     let token = who.token.as_str();
@@ -5068,7 +5069,10 @@ fn announce_in(
     let ids: Vec<String> = ids.into_iter().collect();
     let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
     if let Plan::Write { previous } = &plan {
-        append_all(tx, &notice_events(who, intent, via, previous, &announced)?)?;
+        append_all(
+            tx,
+            &notice_events(who, intent, (session, via), previous, &announced)?,
+        )?;
     }
     Ok(announced)
 }
@@ -5620,7 +5624,14 @@ fn touch_in(
         _ => Vec::new(),
     };
     let announced = match &step.new {
-        Some(new) => Some(announce_in(tx, who, new, &step.keys, &step.via, now)?),
+        Some(new) => Some(announce_in(
+            tx,
+            who,
+            new,
+            &step.keys,
+            (Some(&name), &step.via),
+            now,
+        )?),
         None => None,
     };
     if let Some(new) = &step.new {
@@ -5795,7 +5806,7 @@ fn auto_ask(
     name: &str,
     keys: &[String],
     now: i64,
-) -> Vec<String> {
+) -> Vec<(String, Intent)> {
     let mut requested = Vec::new();
     for key in keys.iter().take(MAX_OPEN) {
         let mut ask = || -> Result<Asked> {
@@ -5817,7 +5828,7 @@ fn auto_ask(
             Ok(asked)
         };
         match ask() {
-            Ok(Asked::Requested { .. }) => requested.push(key.clone()),
+            Ok(Asked::Requested { holder }) => requested.push((key.clone(), holder)),
             Ok(_) => {}
             Err(error) => {
                 eprintln!("hub: handoff request for a refused edit: {error}");
@@ -5836,9 +5847,12 @@ fn handoffs_in(
     now: i64,
 ) -> Result<Vec<HandoffNote>> {
     let requests = tx.query(
-        "SELECT h.id, h.path, h.note, t.name, u.login, h.asked_via_hub
+        "SELECT h.id, h.path, h.note, t.name, u.login, h.asked_via_hub,
+                h.requester_token, h.requester_session, rs.via
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.requester_token
          JOIN hub_users u ON u.id = t.owner
+         LEFT JOIN hub_sessions rs
+           ON rs.token = h.requester_token AND rs.session = h.requester_session
          WHERE h.holder_token = $1 AND h.holder_session = $2 AND h.state = 'pending'
            AND NOT h.holder_told AND h.created_at > $3
          ORDER BY h.created_at, h.id LIMIT $4",
@@ -5846,9 +5860,11 @@ fn handoffs_in(
     )?;
     let answers = tx.query(
         "SELECT h.id, h.state, h.path, t.name, u.login, h.reply, h.answered_via_hub,
-                h.answered_via_slack
+                h.answered_via_slack, h.holder_token, h.holder_session, hs.via
          FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.holder_token
          JOIN hub_users u ON u.id = t.owner
+         LEFT JOIN hub_sessions hs
+           ON hs.token = h.holder_token AND hs.session = h.holder_session
          WHERE h.requester_token = $1 AND h.requester_session = $2
            AND h.state IN ('granted', 'declined') AND NOT h.requester_told
          ORDER BY h.decided_at, h.id LIMIT $3",
@@ -5863,7 +5879,7 @@ fn handoffs_in(
     };
     told(tx, "holder_told", &requests)?;
     told(tx, "requester_told", &answers)?;
-    let note = |kind, path, note, reason, agent, login, via| HandoffNote {
+    let note = |kind, path, note, reason, agent, login, other, via| HandoffNote {
         kind,
         path,
         note,
@@ -5871,7 +5887,16 @@ fn handoffs_in(
         agent,
         login,
         session: session.to_owned(),
+        other,
         via,
+    };
+    // The other side's `(token, session, via)` from three columns on.
+    let other = |row: &postgres::Row, at: usize| {
+        SessionRef::stored(
+            &row.get::<_, String>(at),
+            &row.get::<_, String>(at + 1),
+            row.get::<_, Option<String>>(at + 2).as_deref(),
+        )
     };
     Ok(requests
         .iter()
@@ -5883,6 +5908,7 @@ fn handoffs_in(
                 None,
                 row.get(3),
                 row.get(4),
+                other(row, 6),
                 Via::stored(row.get(5), false),
             )
         })
@@ -5895,6 +5921,7 @@ fn handoffs_in(
                 row.get(5),
                 row.get(3),
                 row.get(4),
+                other(row, 8),
                 Via::stored(row.get(6), row.get(7)),
             )
         }))
@@ -7321,7 +7348,7 @@ impl Store for PgStore {
                 work.repository_id,
             )?;
             guard_announce(&mut tx, &work, &keys)?;
-            let announced = announce_in(&mut tx, &who, intent, &keys, &[], now)?;
+            let announced = announce_in(&mut tx, &who, intent, &keys, (None, &[]), now)?;
             tx.commit()?;
             Ok(announced)
         })
@@ -7486,17 +7513,33 @@ impl Store for PgStore {
             let name = session_name(&mut tx, token, session, now)?;
             let found = tx.query_opt(
                 "SELECT h.id, h.requester_token, h.requester_session, h.holder_session,
-                        t.name, u.login
+                        t.name, u.login, rs.via
                  FROM hub_handoffs h JOIN hub_agent_tokens t ON t.id = h.requester_token
                  JOIN hub_users u ON u.id = t.owner
+                 LEFT JOIN hub_sessions rs
+                   ON rs.token = h.requester_token AND rs.session = h.requester_session
                  WHERE h.repository = $1 AND h.path = $2 AND h.holder_token = $3
                    AND h.state = 'pending' AND h.created_at > $4
                    AND h.holder_session = $5
-                 ORDER BY h.created_at, h.id LIMIT 1",
-                &[&who.repository, &key, &token, &cutoff(now), &name],
+                 ORDER BY CASE WHEN $6::boolean AND h.requester_token = h.holder_token
+                               THEN 1 ELSE 0 END,
+                          h.created_at, h.id LIMIT 1",
+                &[
+                    &who.repository,
+                    &key,
+                    &token,
+                    &cutoff(now),
+                    &name,
+                    &matches!(via, Via::Slack),
+                ],
             )?;
             let Some(request) = found.map(|row| Request {
                 id: row.get(0),
+                requester: SessionRef::stored(
+                    &row.get::<_, String>(1),
+                    &row.get::<_, String>(2),
+                    row.get::<_, Option<String>>(6).as_deref(),
+                ),
                 requester_token: row.get(1),
                 requester_session: row.get(2),
                 holder_session: row.get(3),
@@ -7545,6 +7588,7 @@ impl Store for PgStore {
                 return Ok(Answered::NoRequest);
             }
             let requester = (request.agent.clone(), request.login.clone());
+            let session = request.requester.clone();
             // The holder session's intent now: a hold cap may have renewed it since the request.
             let holder_intent = session_row(&mut tx, token, &request.holder_session)?
                 .and_then(|row| row.intent)
@@ -7638,9 +7682,9 @@ impl Store for PgStore {
             append(&mut tx, &event)?;
             tx.commit()?;
             Ok(if accept {
-                Answered::Granted { requester }
+                Answered::Granted { requester, session }
             } else {
-                Answered::Declined { requester }
+                Answered::Declined { requester, session }
             })
         })
     }
@@ -7658,12 +7702,16 @@ impl Store for PgStore {
                         h.holder_told, h.requester_told, h.asked_via_hub, h.answered_via_hub,
                         h.requester_token, h.requester_session, rt.name, rt.owner, ru.login,
                         h.holder_token, h.holder_session, ht.name, ht.owner, hu.login,
-                        h.answered_via_slack
+                        h.answered_via_slack, rs.via, hs.via
                  FROM hub_handoffs h
                  JOIN hub_agent_tokens rt ON rt.id = h.requester_token
                  JOIN hub_users ru ON ru.id = rt.owner
                  JOIN hub_agent_tokens ht ON ht.id = h.holder_token
                  JOIN hub_users hu ON hu.id = ht.owner
+                 LEFT JOIN hub_sessions rs
+                   ON rs.token = h.requester_token AND rs.session = h.requester_session
+                 LEFT JOIN hub_sessions hs
+                   ON hs.token = h.holder_token AND hs.session = h.holder_session
                  WHERE h.repository = $1 AND (rt.owner = $2 OR ht.owner = $2)
                  ORDER BY h.created_at DESC, h.id LIMIT $3",
                 &[&repository, &owner, &(limit as i64)],
@@ -7685,20 +7733,14 @@ impl Store for PgStore {
                         asked_via_hub: row.get(9),
                         answered_via_hub: row.get(10),
                         answered_via_slack: row.get(21),
-                        requester: HandoffParty {
-                            token: row.get(11),
-                            session: row.get(12),
-                            agent: row.get(13),
-                            owner: row.get(14),
-                            login: row.get(15),
-                        },
-                        holder: HandoffParty {
-                            token: row.get(16),
-                            session: row.get(17),
-                            agent: row.get(18),
-                            owner: row.get(19),
-                            login: row.get(20),
-                        },
+                        requester: HandoffParty::stored(
+                            (row.get(11), row.get(12), row.get::<_, Option<String>>(22)),
+                            (row.get(13), row.get(14), row.get(15)),
+                        ),
+                        holder: HandoffParty::stored(
+                            (row.get(16), row.get(17), row.get::<_, Option<String>>(23)),
+                            (row.get(18), row.get(19), row.get(20)),
+                        ),
                     }
                 })
                 .collect())

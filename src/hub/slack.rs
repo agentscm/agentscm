@@ -23,10 +23,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::advice::sanitize;
+use super::advice::{agent_name, sanitize, session_kind};
 use super::handoff::{Answered, Via};
 use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
+use super::store::session_key;
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
 use super::{HubError, HubState, Result};
 
@@ -308,36 +309,6 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
         bot,
         digests: binding_digests,
     })
-}
-
-/// How people say an agent, as the Hub's pages do (`agentName` in `ui/src/inboxThreads.ts`): a
-/// known tool by its brand, a generated `client-<host>-<hex id>` token as `Agent 6a36`, anything
-/// else as named, filtered like advice text.
-fn agent_name(agent: &str) -> String {
-    let brand = match agent.to_ascii_lowercase().as_str() {
-        "claude" | "claude-code" => Some("Claude Code"),
-        "codex" => Some("Codex"),
-        "cursor" => Some("Cursor"),
-        "copilot" => Some("Copilot"),
-        "gemini" => Some("Gemini"),
-        "grok" => Some("Grok"),
-        _ => None,
-    };
-    if let Some(brand) = brand {
-        return brand.into();
-    }
-    if let Some(rest) = agent
-        .get(..7)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("client-"))
-        .and_then(|_| agent.get(7..))
-        && let Some((host, id)) = rest.rsplit_once('-')
-        && !host.is_empty()
-        && id.len() >= 6
-        && id.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return format!("Agent {}", &id[..4]);
-    }
-    sanitize(agent, NAME_CHARS)
 }
 
 /// `bob’s Claude Code`, the way the Hub names someone else's agent.
@@ -898,7 +869,28 @@ impl Slack {
             // Opens the header, which is not a name to keep lower case.
             let opening = named.unwrap_or_else(|| "Another agent".into());
             let mut holders = Vec::new();
-            for intent in intents.iter().filter(|i| i.token != token) {
+            // Under the repeater's token only its other hook sessions are other agents, as in
+            // `same_agent`; an event without a session id skips the whole token.
+            let own = data["session"].as_str();
+            let skipped = |i: &Intent| {
+                i.token == token
+                    && own.is_none_or(|own| {
+                        i.session.as_deref() == Some(own) || session_kind(&i.via).is_none()
+                    })
+            };
+            // Whom `judge` would ask first: a connected session on the exact file, oldest first.
+            // That session's button has a request to answer.
+            let asked = |i: &Intent| {
+                !i.via.is_empty()
+                    && i.paths
+                        .iter()
+                        .any(|spec| paths.iter().any(|path| path == spec))
+            };
+            let mut holding: Vec<&Intent> = intents.iter().filter(|i| !skipped(i)).collect();
+            holding.sort_by_key(|i| (!asked(i), i.created_at, i.id.as_str()));
+            let mut told = BTreeSet::new();
+            let mut listed_holders = BTreeSet::new();
+            for &intent in &holding {
                 let held: Vec<String> = paths
                     .iter()
                     .filter(|path| intent.paths.iter().any(|spec| overlaps(path, key_of(spec))))
@@ -907,12 +899,48 @@ impl Slack {
                 if held.is_empty() {
                     continue;
                 }
-                let holder = label(&intent.owner.login, &intent.agent);
+                // The label alone cannot say which session: another of the repeater's own token
+                // would read as itself, and distinct agents of one token would read alike.
+                use crate::hub::session::same_agent;
+                let sessions: Vec<&Intent> = holding
+                    .iter()
+                    .copied()
+                    .filter(|other| {
+                        other.token == intent.token
+                            && other.session.is_some()
+                            && paths.iter().any(|path| {
+                                other.paths.iter().any(|spec| overlaps(path, key_of(spec)))
+                            })
+                    })
+                    .collect();
+                // Per token, since `same_agent` is not transitive: hook a and hook c are distinct
+                // although each may be the same agent as one MCP session.
+                let several = sessions.iter().enumerate().any(|(index, one)| {
+                    sessions[index + 1..]
+                        .iter()
+                        .any(|other| !same_agent(&intent.token, &one.via, other))
+                });
+                let session_name = intent
+                    .session
+                    .as_deref()
+                    .filter(|_| several || intent.token == token)
+                    .map(|session| {
+                        let kind = session_kind(&intent.via).unwrap_or_else(|| "agent".into());
+                        let key = session_key(&intent.token, session);
+                        format!("{kind} session {}", &key[..8])
+                    });
+                let holder = session_name.as_ref().map_or_else(
+                    || label(&intent.owner.login, &intent.agent),
+                    |name| format!("{}’s {name}", sanitize(&intent.owner.login, NAME_CHARS)),
+                );
                 if let Some(person) = Self::bound(people, &repository, &intent.token)
                     && repeater.is_none_or(|r| r.slack_user != person.slack_user)
+                    && told.insert(intent.token.as_str())
                 {
-                    // One message per holder and event; buttons answer one file only.
-                    let mine = person.agent(&intent.token);
+                    // One message per holder token and event; buttons answer one file only.
+                    let mine = session_name
+                        .filter(|_| several)
+                        .unwrap_or_else(|| person.agent(&intent.token));
                     let (headline, guidance) = match held.as_slice() {
                         [path] => (
                             format!(
@@ -952,7 +980,11 @@ impl Slack {
                         message(&headline, &fields, &guidance, handoff, &link),
                     ));
                 }
-                holders.push(holder);
+                // One agent's hook and MCP sessions read alike: one holder, not two. Two tokens
+                // with one display name stay two.
+                if listed_holders.insert((intent.token.as_str(), holder.clone())) {
+                    holders.push(holder);
+                }
             }
             if let Some(person) = repeater
                 && !holders.is_empty()
@@ -1045,7 +1077,19 @@ impl Slack {
                 .unwrap_or_else(|| "the holder".into());
             let requester_person = Self::bound(people, &repository, requester);
             if let Some(person) = requester_person {
-                let fields = fields(&repository, agent_name(agent), holder_label);
+                // Under one token both sides read alike; the requester's session tells them apart.
+                let mine = from["session"]["key"]
+                    .as_str()
+                    .and_then(|key| key.get(..8))
+                    .filter(|_| requester == holder)
+                    .map_or_else(
+                        || agent_name(agent),
+                        |key| {
+                            let kind = from["session"]["kind"].as_str().unwrap_or("agent");
+                            format!("{} session {key}", sanitize(kind, NAME_CHARS))
+                        },
+                    );
+                let fields = fields(&repository, mine, holder_label);
                 out.push((
                     person.slack_user.clone(),
                     "requester".into(),
@@ -1398,11 +1442,11 @@ impl Slack {
             unix_now(),
         )?;
         Ok(match answered {
-            Answered::Granted { requester } => format!(
+            Answered::Granted { requester, .. } => format!(
                 "Handed {file} to {}. They see it on their next edit.",
                 label(&requester.1, &requester.0)
             ),
-            Answered::Declined { requester } => format!(
+            Answered::Declined { requester, .. } => format!(
                 "Kept {file} for now. {} sees that on their next edit.",
                 label(&requester.1, &requester.0)
             ),

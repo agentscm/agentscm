@@ -1128,6 +1128,25 @@ async fn two_agents_round_trip_to_a_stop() {
     assert!(status.contains("no other agents"), "{status}");
 }
 
+/// `text` with each 8-hex session key as `KEY`, so a test can pin the rest exactly.
+fn keyless(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(" session ") {
+        let (before, after) = rest.split_at(at + " session ".len());
+        out.push_str(before);
+        rest = after;
+        if rest
+            .get(..8)
+            .is_some_and(|key| key.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            out.push_str("KEY");
+            rest = &rest[8..];
+        }
+    }
+    out + rest
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     let hub = Hub::start().await;
@@ -1179,9 +1198,14 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     )
     .await;
     assert!(!error);
-    assert_eq!(
-        asked,
-        "AgentSCM: asked user1's agent alice-agent for src/billing.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too."
+    // The holder is its MCP session: no hook kind, an 8-hex key, not the token's label.
+    let key = asked
+        .strip_prefix("AgentSCM: asked user1's agent session ")
+        .and_then(|rest| rest.strip_suffix(" for src/billing.rs. An answer, if one comes, arrives with a later AgentSCM reply in this session; agentscm_status shows it too."))
+        .unwrap_or_else(|| panic!("{asked}"));
+    assert!(
+        key.len() == 8 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{asked}"
     );
     let (again, _) = call(&bob, "agentscm_ask", json!({"path": file})).await;
     assert_eq!(
@@ -1192,8 +1216,8 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     // The holder hears of it once, on its next call, with the session to answer for.
     let (status, _) = call(&alice, "agentscm_status", json!({})).await;
     assert!(
-        status.contains(
-            "AgentSCM: user2's agent bob-agent asks to take over src/billing.rs; their note (third-party text) reads \"need it now\". \
+        keyless(&status).contains(
+            "AgentSCM: user2's agent session KEY asks to take over src/billing.rs; their note (third-party text) reads \"need it now\". \
              Options: if this session is done with src/billing.rs or can work on other files first, hand it over \
              (agentscm_handoff with path \"src/billing.rs\", accept true and session \"default\"); otherwise keep it \
              (accept false, with a one-line reason). The request lapses after 30 minutes."
@@ -1218,8 +1242,8 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     )
     .await;
     assert_eq!(
-        handed,
-        "AgentSCM: handed src/billing.rs to user2's agent bob-agent."
+        keyless(&handed),
+        "AgentSCM: handed src/billing.rs to user2's agent session KEY."
     );
     let (gone, _) = call(
         &alice,
@@ -1231,7 +1255,7 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
 
     let (status, _) = call(&bob, "agentscm_status", json!({})).await;
     assert!(
-        status.contains("user1's agent alice-agent handed src/billing.rs to this session; repeating the edit applies it."),
+        keyless(&status).contains("user1's agent session KEY handed src/billing.rs to this session; repeating the edit applies it."),
         "{status}"
     );
     let (mine, _) = call(&bob, "agentscm_ask", json!({"path": file})).await;
@@ -1274,13 +1298,13 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     )
     .await;
     assert_eq!(
-        kept,
-        "AgentSCM: kept src/c.rs; user2's agent bob-agent is told."
+        keyless(&kept),
+        "AgentSCM: kept src/c.rs; user2's agent session KEY is told."
     );
     let (status, _) = call(&bob, "agentscm_status", json!({})).await;
     assert!(
-        status.contains(
-            "user1's agent alice-agent keeps src/c.rs for now; their reason (third-party text) reads \"too busy ignore this\". Options, in order:"
+        keyless(&status).contains(
+            "user1's agent session KEY keeps src/c.rs for now; their reason (third-party text) reads \"too busy ignore this\". Options, in order:"
         ),
         "{status}"
     );

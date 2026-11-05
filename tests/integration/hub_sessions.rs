@@ -1072,7 +1072,7 @@ async fn advice_flow(state: &HubState, [alice, bob, carol]: [Principal; 3]) {
             .starts_with("AgentSCM: another agent is already working on src/a.rs.")
     );
     assert!(
-        stop.text.contains("user1's agent (alice-agent)"),
+        stop.text.contains("user1's Claude Code session ") && !stop.text.contains("alice-agent"),
         "{}",
         stop.text
     );
@@ -1091,8 +1091,11 @@ async fn advice_flow(state: &HubState, [alice, bob, carol]: [Principal; 3]) {
         beat.text
     );
     assert!(
+        beat.text.contains("user2's agent session ")
+            && beat.text.contains(" started working on src/a.rs")
+            && !beat.text.contains("bob-agent"),
+        "{}",
         beat.text
-            .contains("user2's agent (bob-agent) started working on src/a.rs")
     );
     let quiet = announce_for(state, &alice, hook("s", &[])).await.unwrap();
     assert_eq!(quiet.text, "");
@@ -1141,7 +1144,9 @@ async fn advice_flow(state: &HubState, [alice, bob, carol]: [Principal; 3]) {
         "{reason}"
     );
     assert!(
-        reason.contains("user1's agent alice-agent, last active"),
+        reason.contains("user1's Claude Code session ")
+            && reason.contains(", last active")
+            && !reason.contains("alice-agent"),
         "{reason}"
     );
     assert!(refused.text.is_empty() && !refused.stop);

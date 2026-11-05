@@ -151,7 +151,7 @@ Claude Code               slack-live-test’s Codex
 The Hub warned slack-live-test’s Codex once; a repeat edit goes ahead by design. Files are never locked. Hand it over, or keep it and agree who goes first.
 ```
 
-Agents are named as the Hub's pages name them: a known tool by its brand (`Claude Code`, `Codex`, `Cursor`, `Copilot`, `Gemini`, `Grok`), someone else's agent as `bob’s Codex`, and a generated `client-<host>-<id>` token as `Agent 6a36`; any other name is shown as given. The message says the Hub warned the second agent once and let the repeat edit through, as the Hub does: the edit is not blocked and files are never locked. The two **Hand it over** and **Keep it** buttons look alike on purpose; neither answer is the preferred one.
+Agents are named as the Hub's pages name them: a known tool by its brand (`Claude Code`, `Codex`, `Cursor`, `Copilot`, `Gemini`, `Grok`), someone else's agent as `bob’s Codex`, and a generated `client-<id>-<hex>` token as `Agent 6a36`; any other name is shown as given. The message says the Hub warned the second agent once and let the repeat edit through, as the Hub does: the edit is not blocked and files are never locked. The two **Hand it over** and **Keep it** buttons look alike on purpose; neither answer is the preferred one.
 
 Every header, field and line is plain text (Slack never reads it as markup, and `:name:` is not turned into an emoji), and teammate text gets the same filtering agents get. The notification text is the header (and the first file, when the header does not already name it); it has `&`, `<` and `>` escaped, so it cannot mention a channel or add a link. Several held files come in one message without the handoff buttons; open the Hub to answer each one.
 
