@@ -1132,3 +1132,65 @@ fn work_transition_route_on_postgres() {
     runtime
         .block_on(async { agent_transition_route(Hub::start(Some(pg.url.clone())).await).await });
 }
+
+#[tokio::test]
+async fn issue_choices_and_link_mutations_cross_http_and_mcp() {
+    let hub = Hub::start(None).await;
+    let (_, secret) = hub.token(101, "acme/widgets", false).await;
+    let rpc = |name: &str, args: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}});
+    let args = json!({"task":"Synthetic native issue task #7","session":"issue-surface","request_key":"surface-choice","issue_choice":{"kind":"new_issue","title":"Explicit new issue intention"}});
+    let (status, preview) = hub
+        .call(
+            Method::POST,
+            "/mcp",
+            &secret,
+            Some(rpc("agentscm_work_preflight", args.clone())),
+        )
+        .await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["result"]["isError"], false, "{preview}");
+    assert_eq!(
+        preview["result"]["structuredContent"]["issue_advice"]["choice_provided"],
+        true
+    );
+    let (status, started) = hub
+        .call(
+            Method::POST,
+            "/mcp",
+            &secret,
+            Some(rpc("agentscm_start", args)),
+        )
+        .await;
+    assert_eq!(status, 200, "{started}");
+    assert_eq!(started["result"]["isError"], false, "{started}");
+    let content = &started["result"]["structuredContent"]["work"];
+    let item = &content["item"];
+    assert_eq!(
+        item["initial_issue_choice"]["kind"], "new_issue",
+        "{started}"
+    );
+    let request = json!({"work_id":item["id"],"generation":item["generation"],"session":"issue-surface","expected_updated_seq":item["updated_seq"],"operation_id":"surface-link","link":{"provider":"github","host":"github.com","repository_id":101,"number":7}});
+    let (status, linked) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/issue-link",
+            &secret,
+            Some(request),
+        )
+        .await;
+    assert_eq!(status, 200, "{linked}");
+    assert_eq!(linked["item"]["issue_link"]["number"], 7);
+    assert_eq!(linked["item"]["source"], item["source"]);
+    let remove = json!({"work_id":item["id"],"generation":item["generation"],"session":"issue-surface","expected_updated_seq":linked["item"]["updated_seq"],"operation_id":"surface-remove","link":null});
+    let (status, removed) = hub
+        .call(
+            Method::POST,
+            "/mcp",
+            &secret,
+            Some(rpc("agentscm_work_issue_link_set", remove)),
+        )
+        .await;
+    assert_eq!(status, 200, "{removed}");
+    assert_eq!(removed["result"]["isError"], false, "{removed}");
+    assert!(removed["result"]["structuredContent"]["item"]["issue_link"].is_null());
+}

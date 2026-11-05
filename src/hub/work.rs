@@ -487,6 +487,9 @@ pub(super) const AUTO_PAUSE_SUMMARY: &str = "Session ended without a reported fi
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkOverview {
+    #[serde(default)]
+    pub planned_issues: super::planned_issues::PlannedIssuesView,
+
     pub recent_since: i64,
     pub until: i64,
     pub current: Vec<WorkItem>,
@@ -557,6 +560,9 @@ pub struct WorkEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Briefing {
+    #[serde(default)]
+    pub planned_issues: super::planned_issues::PlannedIssuesView,
+
     /// The explicit subscriber identity, or `None` for the token-level compatibility cursor.
     #[serde(default)]
     pub subscriber: Option<String>,

@@ -1433,6 +1433,7 @@ mod tests {
             reasons_complete: true,
         };
         let overview = WorkOverview {
+            planned_issues: Default::default(),
             recent_since: 0,
             until: 100,
             current: vec![],

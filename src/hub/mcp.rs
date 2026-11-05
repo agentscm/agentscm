@@ -128,6 +128,7 @@ struct McpQuery {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartArgs {
+    issue_choice: Option<super::work_issues::WorkIssueChoice>,
     task: String,
     #[serde(default)]
     paths: Vec<String>,
@@ -700,9 +701,16 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
                 "facts":{"type":"array","minItems":1,"maxItems":6,"items":statement_schema.clone()},
                 "implications":{"type":"array","maxItems":4,"items":statement_schema}},
                 "required":["headline","headline_references","facts","implications"]}}), &["id","digest","lease","output"])});
+    let issue_identity_schema = json!({"type":"object","additionalProperties":false,"required":["provider","host","repository_id","number"],"properties":{"provider":{"type":"string"},"host":{"type":"string"},"repository_id":{"type":"integer","minimum":1},"number":{"type":"integer","minimum":1}}});
+    let issue_choice_schema = json!({"description":"Explicit caller choice after inspecting issue_advice. Advice never assigns ownership or refuses Work. new_issue records an intention, without creating a forge issue.","oneOf":[
+        {"type":"object","additionalProperties":false,"required":["kind","issue"],"properties":{"kind":{"const":"link"},"issue":issue_identity_schema.clone()}},
+        {"type":"object","additionalProperties":false,"required":["kind","title"],"properties":{"kind":{"const":"new_issue"},"title":{"type":"string","minLength":1,"maxLength":500}}},
+        {"type":"object","additionalProperties":false,"required":["kind","reason"],"properties":{"kind":{"const":"none_applies"},"reason":{"type":"string","minLength":1,"maxLength":500}}},
+        {"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"not_provided"}}}
+    ]});
     let work_preflight = json!(
         {"name": "agentscm_work_preflight",
-         "description": "Pure read before admission. Resolves only an exact work_id, canonical forge source or stable request_key; checks its declared scope against current claims and a fixed durable merge high-water. It never creates, claims, resumes, closes or acknowledges work. Missing source facts, scope or merge coverage return unknown rather than safe.",
+         "description": "Pure read before admission. Resolves only an exact work_id, canonical forge source or stable request_key; checks its declared scope against current claims and a fixed durable merge high-water. It never creates, claims, resumes, closes or acknowledges work. Missing source facts, scope or merge coverage return unknown rather than safe. Native caller text receives exact-reference issue_advice; inspect it and record issue_choice on start. Issue advice never changes admission status.",
          "annotations": {"readOnlyHint": true},
          "inputSchema": schema(json!({
              "task": {"type": "string", "description": "The intended work title; third-party titles are never used for identity."},
@@ -721,6 +729,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "depends_on": {"type": "array", "items": {"type": "string"}},
              "related_work": {"type": "array", "items": {"type": "string"}},
              "takeover_generation": {"type": "integer", "minimum": 1},
+             "issue_choice": issue_choice_schema.clone(),
              "preflight": source_preflight_schema.clone()
          }), &["task"])}
     );
@@ -800,6 +809,9 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
     let work_declarations_set = json!({"name":"agentscm_work_declarations_set","description":"Replace durable caller declarations as the current lead. Requires generation, session, updated_seq and retry-stable operation_id. Empty arrays explicitly clear; legacy PR-link updates do not erase this set.","inputSchema":schema(declaration_fields, &["work_id","operation_id","generation","session","expected_updated_seq","declarations"])});
     reconciliation_fields["declaration_seq"] = json!({"type":"integer","minimum":1});
     let work_reconciliation_apply = json!({"name":"agentscm_work_reconciliation_apply","description":"Explicitly reconcile retained server evidence against current Work and declarations. Current lead only, version fenced and replay safe. Never completes Work, releases reservations or rewrites reports. Use a new fenced apply after synchronization; retry identical operation_id after an uncertain response.","inputSchema":schema(reconciliation_fields, &["work_id","operation_id","generation","session","expected_updated_seq","declaration_seq"])});
+    let work_issue_link_set = json!({"name":"agentscm_work_issue_link_set",
+        "description":"Current native Work lead sets or removes a caller-asserted issue link, preserving Work identity. Requires generation, session, expected_updated_seq and retry-stable operation_id; link:null removes. No provider write, assignment or execution evidence.",
+        "inputSchema":schema(json!({"work_id":{"type":"string"},"operation_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"session":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"link":{"oneOf":[issue_identity_schema,{"type":"null"}]}}), &["work_id","operation_id","generation","session","expected_updated_seq","link"])});
     let work_pr_link_set = json!({"name":"agentscm_work_pr_link_set",
         "description":"Current Work lead explicitly sets or removes its PR relationship using stable repository identity and a source head SHA. Reuse operation_id on retry. Requires current generation, session and updated_seq; link:null removes. Does not verify, publish or approve source.",
         "inputSchema":schema(json!({"work_id":{"type":"string"},"operation_id":{"type":"string"},"generation":{"type":"integer","minimum":1},"session":{"type":"string"},"expected_updated_seq":{"type":"integer","minimum":1},"link":{"oneOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["repository_id","number","head_sha"],"properties":{"repository_id":{"type":"integer","minimum":1},"number":{"type":"integer","minimum":1},"head_sha":{"type":"string","pattern":"^([a-f0-9]{40}|[a-f0-9]{64})$"}}}]}}), &["work_id","operation_id","generation","session","expected_updated_seq","link"])});
@@ -991,7 +1003,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "blocker": {"type":"string", "enum":["login","trust","quota","unsupported","unknown"]}
          }), &["agent", "session"])},
         {"name": "agentscm_start",
-         "description": "Call before editing. Reads a durable catch-up delivery, then atomically rechecks an explicitly supplied source relation, fixed merge high-water and declared scope before claiming or joining the task. A changed or incomplete explicit preflight refuses a new claim with structured evidence. Missing preflight stays compatibility-only and returns unknown/not ready. Exact already-owned work_id retries and generation-checked resumes remain available. Titles are never used as identity.",
+         "description": "Call before editing. Reads a durable catch-up delivery, then atomically rechecks an explicitly supplied source relation, fixed merge high-water and declared scope before claiming or joining the task. A changed or incomplete explicit preflight refuses a new claim with structured evidence. Missing preflight stays compatibility-only and returns unknown/not ready. Exact already-owned work_id retries and generation-checked resumes remain available. Titles are never used as identity. For native Work inspect issue_advice first and supply issue_choice; exact references only are candidates, never ownership decisions. Missing planning coverage remains unknown.",
          "inputSchema": schema(json!({
              "task": {"type": "string", "description": "What you are about to do, in one line."},
              "paths": paths("Repo-relative files you expect to edit."),
@@ -1009,6 +1021,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "depends_on": {"type": "array", "items": {"type": "string"}},
              "related_work": {"type": "array", "items": {"type": "string"}},
              "takeover_generation": {"type": "integer", "minimum": 1},
+             "issue_choice": issue_choice_schema,
              "preflight": source_preflight_schema
          }), &["task"])},
         {"name": "agentscm_check",
@@ -1052,6 +1065,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         pr_context,
         work_pr_link,
         work_pr_link_set,
+        work_issue_link_set,
         work_declarations,
         work_declarations_set,
         work_reconciliation,
@@ -1712,6 +1726,7 @@ async fn call_inner(
             | "agentscm_pr_context"
             | "agentscm_work_pr_link"
             | "agentscm_work_pr_link_set"
+            | "agentscm_work_issue_link_set"
             | "agentscm_work_declarations"
             | "agentscm_work_declarations_set"
             | "agentscm_work_reconciliation"
@@ -2082,6 +2097,24 @@ async fn call_inner(
             {
                 Ok(Some(value)) => structured(&shown(value, &principal.owner.id)),
                 Ok(None) => refused("work not found"),
+                Err(error) => work_failure(&error),
+            },
+        );
+    }
+    if name == "agentscm_work_issue_link_set" {
+        let request = match try_args::<super::work_issues::WorkIssueLinkUpdate>(arguments) {
+            Ok(request) => request,
+            Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        return Ok(
+            match blocking(state, move || {
+                store.work_issue_link_set(&token, &request, unix_now())
+            })
+            .await
+            {
+                Ok(value) => structured(&shown(value, &principal.owner.id)),
                 Err(error) => work_failure(&error),
             },
         );
@@ -2558,6 +2591,7 @@ async fn work_preflight(
     arguments: StartArgs,
 ) -> Result<WorkPreflightResult> {
     let StartArgs {
+        issue_choice,
         task,
         paths,
         session,
@@ -2586,7 +2620,7 @@ async fn work_preflight(
         let mut result = store.work_preflight(
             &token,
             &WorkStart {
-                issue_choice: None,
+                issue_choice,
                 work_id,
                 source,
                 request_key,
@@ -3043,6 +3077,7 @@ async fn done(
 
 async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) -> Result<Value> {
     let StartArgs {
+        issue_choice,
         task,
         paths,
         session,
@@ -3117,7 +3152,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let title = task.clone();
     let work = blocking(state, move || {
         let start = WorkStart {
-            issue_choice: None,
+            issue_choice,
             work_id,
             source,
             request_key,

@@ -85,8 +85,36 @@ impl PlannedIssueSnapshot {
         let snapshot = retained
             .filter(|row| row.data.len() <= MAX_SNAPSHOT_BYTES)
             .and_then(|row| serde_json::from_str::<Self>(&row.data).ok())
-            .filter(|snapshot| snapshot.matches(conn, repo) && snapshot.issues.len() <= MAX_ISSUES);
-        Ok(snapshot.unwrap_or_else(|| Self::unavailable(conn, repo, now_ms, None)))
+            .filter(|snapshot| snapshot.matches(conn, repo) && snapshot.valid_retained());
+        // A local cache miss is not a provider attempt. Zero means no retained attempt.
+        let _ = now_ms;
+        Ok(snapshot.unwrap_or_else(|| Self::unavailable(conn, repo, 0, None)))
+    }
+
+    fn valid_retained(&self) -> bool {
+        self.issues.len() <= MAX_ISSUES
+            && self
+                .issues
+                .windows(2)
+                .all(|w| w[0].identity.number < w[1].identity.number)
+            && self.issues.iter().all(|i| {
+                i.identity.provider == self.provider
+                    && i.identity.host == self.host
+                    && i.identity.repository_id == self.repository_id
+                    && i.identity.number > 0
+                    && safe_label(&i.title)
+                    && i.milestone.as_ref().is_none_or(|m| {
+                        m.number > 0
+                            && safe_label(&m.title)
+                            && matches!(m.state.as_str(), "open" | "closed")
+                            && m.due_on.as_ref().is_none_or(|d| {
+                                d.len() <= 64
+                                    && !d
+                                        .chars()
+                                        .any(|c| c.is_control() || super::advice::invisible(c))
+                            })
+                    })
+            })
     }
 
     pub fn freshness(&self, now_ms: i64) -> IssueFreshness {
@@ -211,6 +239,229 @@ impl PlannedIssueSnapshot {
             issues,
         })
     }
+}
+
+/// A durable link is caller metadata, including links on finished Work. It does not prove
+/// ongoing ownership or execution. Issues appear in exactly one planning bucket.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkedPlannedIssue {
+    pub issue: PlannedIssue,
+    pub work_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedIssuesView {
+    /// Freshness and completeness were evaluated at this read/capture time. Frozen briefing
+    /// replays preserve this value rather than claiming a new provider observation.
+    pub evaluated_at_ms: i64,
+    pub coverage: IssueCoverage,
+    pub freshness: IssueFreshness,
+    pub attempted_at_ms: Option<i64>,
+    pub facts_observed_at_ms: Option<i64>,
+    pub unread_pages: u32,
+    pub linkage_complete: bool,
+    pub complete: bool,
+    pub unclaimed: Vec<PlannedIssue>,
+    pub linked: Vec<LinkedPlannedIssue>,
+    /// No link was seen, but the bounded linkage inventory cannot prove absence.
+    pub linkage_unknown: Vec<PlannedIssue>,
+}
+
+impl Default for PlannedIssuesView {
+    fn default() -> Self {
+        Self {
+            evaluated_at_ms: 0,
+            coverage: IssueCoverage::Unavailable,
+            freshness: IssueFreshness::Unknown,
+            attempted_at_ms: None,
+            facts_observed_at_ms: None,
+            unread_pages: 0,
+            linkage_complete: false,
+            complete: false,
+            unclaimed: Vec::new(),
+            linked: Vec::new(),
+            linkage_unknown: Vec::new(),
+        }
+    }
+}
+
+pub(super) const MAX_LINKAGE_WORK: usize = 1000;
+pub const MAX_CANDIDATES: usize = 20;
+
+/// Build one projection from transaction-local provider and caller facts. The inventory is
+/// independent of overview pagination and reservation/heartbeat state.
+pub(super) fn project(
+    who: &super::work::WorkWho,
+    snapshot: Option<&str>,
+    rows: Vec<(String, Option<String>, Option<String>)>,
+    now: i64,
+) -> PlannedIssuesView {
+    let mut linkage_complete = rows.len() <= MAX_LINKAGE_WORK;
+    let mut links = std::collections::BTreeMap::<i64, Vec<String>>::new();
+    for (id, source_issue, link) in rows.into_iter().take(MAX_LINKAGE_WORK) {
+        let decoded = link
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<IssueIdentity>(s).ok())
+            .filter(|issue| {
+                issue.provider == who.owner.identity.provider
+                    && issue.host == who.owner.identity.host
+                    && Some(issue.repository_id) == who.repository_id
+                    && issue.number > 0
+            });
+        if link.is_some() && decoded.is_none() {
+            linkage_complete = false;
+        }
+        let number = decoded
+            .map(|issue| issue.number)
+            .or_else(|| source_issue.and_then(|n| n.parse::<i64>().ok()));
+        if let Some(number) = number.filter(|n| *n > 0) {
+            links.entry(number).or_default().push(id);
+        }
+    }
+    if who.owner.identity.provider != "github" {
+        return PlannedIssuesView {
+            evaluated_at_ms: now.saturating_mul(1000),
+            coverage: IssueCoverage::Unsupported,
+            linkage_complete,
+            ..Default::default()
+        };
+    }
+    let snapshot = snapshot
+        .filter(|s| s.len() <= MAX_SNAPSHOT_BYTES)
+        .and_then(|s| serde_json::from_str::<PlannedIssueSnapshot>(s).ok())
+        .filter(|s| {
+            s.provider == who.owner.identity.provider
+                && s.host == who.owner.identity.host
+                && Some(s.repository_id) == who.repository_id
+                && s.valid_retained()
+        });
+    let Some(snapshot) = snapshot else {
+        return PlannedIssuesView {
+            evaluated_at_ms: now.saturating_mul(1000),
+            linkage_complete,
+            ..Default::default()
+        };
+    };
+    let now_ms = now.saturating_mul(1000);
+    let mut view = PlannedIssuesView {
+        evaluated_at_ms: now_ms,
+        coverage: snapshot.coverage,
+        freshness: snapshot.freshness(now_ms),
+        attempted_at_ms: (snapshot.attempted_at_ms > 0).then_some(snapshot.attempted_at_ms),
+        facts_observed_at_ms: snapshot.facts_observed_at_ms,
+        unread_pages: snapshot.unread_pages,
+        linkage_complete,
+        complete: snapshot.complete(now_ms) && linkage_complete,
+        ..Default::default()
+    };
+    for issue in snapshot.issues {
+        if let Some(work_ids) = links.remove(&issue.identity.number) {
+            view.linked.push(LinkedPlannedIssue { issue, work_ids });
+        } else if linkage_complete {
+            view.unclaimed.push(issue);
+        } else {
+            view.linkage_unknown.push(issue);
+        }
+    }
+    view
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IssueCandidateAdvice {
+    pub planning: PlannedIssuesView,
+    pub candidates: Vec<PlannedIssue>,
+    pub references_complete: bool,
+    pub choice_provided: bool,
+}
+
+impl PlannedIssuesView {
+    /// Exact references only. Each whitespace token is parsed once so a foreign URL or
+    /// qualified reference cannot fall back to its embedded local #number.
+    pub(super) fn candidates(
+        self,
+        start: &super::work::WorkStart,
+        who: &super::work::WorkWho,
+    ) -> IssueCandidateAdvice {
+        let mut numbers = BTreeSet::new();
+        if start.source.is_none() {
+            for token in start.title.split_whitespace().chain(
+                start
+                    .next_action
+                    .as_deref()
+                    .unwrap_or("")
+                    .split_whitespace(),
+            ) {
+                let token = token.trim_matches(|c: char| {
+                    matches!(
+                        c,
+                        '(' | ')' | '[' | ']' | ',' | '.' | ';' | ':' | '"' | '\'' | '`'
+                    )
+                });
+                let raw = if let Some(n) = token.strip_prefix('#') {
+                    Some(n)
+                } else if let Some((repository, n)) = token.split_once('#') {
+                    repository
+                        .eq_ignore_ascii_case(&who.repository)
+                        .then_some(n)
+                } else if let Ok(url) = reqwest::Url::parse(token) {
+                    let prefix = format!("/{}/issues/", who.repository);
+                    if url.scheme() == "https"
+                        && url.host_str() == Some(who.owner.identity.host.as_str())
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.port().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                    {
+                        url.path()
+                            .strip_prefix(&prefix)
+                            .and_then(|n| n.parse::<i64>().ok())
+                            .filter(|n| *n > 0)
+                            .map(|n| {
+                                numbers.insert(n);
+                            });
+                    }
+                    None
+                } else {
+                    None
+                };
+                if let Some(n) = raw
+                    .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .filter(|n| *n > 0)
+                {
+                    numbers.insert(n);
+                }
+            }
+        }
+        let references_complete = numbers.len() <= MAX_CANDIDATES;
+        let candidates = self
+            .unclaimed
+            .iter()
+            .chain(self.linked.iter().map(|l| &l.issue))
+            .chain(&self.linkage_unknown)
+            .filter(|i| numbers.contains(&i.identity.number))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut candidates = candidates;
+        candidates.sort_by_key(|i| i.identity.number);
+        candidates.truncate(MAX_CANDIDATES);
+        IssueCandidateAdvice {
+            planning: self,
+            candidates,
+            references_complete,
+            choice_provided: start.issue_choice.as_ref().is_some_and(|choice| {
+                !matches!(choice, super::work_issues::WorkIssueChoice::NotProvided {})
+            }),
+        }
+    }
+}
+
+fn safe_label(value: &str) -> bool {
+    !value.is_empty() && super::advice::sanitize(value, 200) == value
 }
 
 fn invalid() -> GhError {
@@ -378,5 +629,80 @@ mod tests {
             event["snapshot_digest"],
             super::super::store::lower_hex_of(data.as_bytes())
         );
+    }
+    fn who() -> super::super::work::WorkWho {
+        super::super::work::WorkWho {
+            token: "token".into(),
+            repository: "acme/widgets".into(),
+            repository_id: Some(42),
+            agent: "fixture".into(),
+            read_only: false,
+            owner: super::super::store::User {
+                id: "owner".into(),
+                identity: super::super::store::ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                login: "fixture".into(),
+                name: None,
+                disabled: false,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_candidates_never_reinterpret_foreign_references() {
+        let (conn, repo) = identity();
+        let snapshot = PlannedIssueSnapshot::from_github(
+            &conn,
+            &repo,
+            1000,
+            page((1..=5).map(issue).collect(), 0),
+        )
+        .unwrap();
+        let raw = serde_json::to_string(&snapshot).unwrap();
+        let view = project(&who(), Some(&raw), Vec::new(), 1);
+        let start: super::super::work::WorkStart = serde_json::from_value(json!({"title":"#1 acme/widgets#2 https://github.com/acme/widgets/issues/3 other/repo#4 https://evil.example/acme/widgets/issues/5 https://evil.example/x#5", "session":"fixture", "request_key":"candidate"})).unwrap();
+        let advice = view.candidates(&start, &who());
+        assert_eq!(
+            advice
+                .candidates
+                .iter()
+                .map(|i| i.identity.number)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(advice.references_complete);
+        assert!(!advice.choice_provided);
+    }
+
+    #[test]
+    fn missing_linkage_rows_and_corrupt_snapshots_never_prove_unclaimed() {
+        let (conn, repo) = identity();
+        let mut snapshot =
+            PlannedIssueSnapshot::from_github(&conn, &repo, 1000, page(vec![issue(1)], 0)).unwrap();
+        let rows = (0..=MAX_LINKAGE_WORK)
+            .map(|n| (format!("work{n}"), None, None))
+            .collect();
+        let view = project(
+            &who(),
+            Some(&serde_json::to_string(&snapshot).unwrap()),
+            rows,
+            1,
+        );
+        assert!(!view.complete);
+        assert!(view.unclaimed.is_empty());
+        assert_eq!(view.linkage_unknown.len(), 1);
+        snapshot.issues[0].identity.repository_id = 99;
+        let corrupt = project(
+            &who(),
+            Some(&serde_json::to_string(&snapshot).unwrap()),
+            Vec::new(),
+            1,
+        );
+        assert!(!corrupt.complete);
+        assert!(corrupt.unclaimed.is_empty());
+        assert_eq!(corrupt.attempted_at_ms, None);
     }
 }

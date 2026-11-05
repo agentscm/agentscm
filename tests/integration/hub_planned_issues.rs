@@ -386,10 +386,235 @@ fn rename(f: Fixture) {
     assert_eq!(item.initial_issue_choice, initial.initial_issue_choice);
     assert_eq!(item.source, initial.source);
 }
+
+fn planned_projection(f: Fixture) {
+    use agentscm::hub::planned_issues::{
+        IssueCoverage, PlannedIssue, PlannedIssueSnapshot, PlannedMilestone,
+    };
+    use agentscm::hub::work::{BriefingQuery, WorkOverviewQuery};
+    let token = f.token(1, false);
+    let now = unix_now();
+    let request = start("planned");
+    let missing = f.store.work_preflight(&token, &request, now).unwrap();
+    assert!(!missing.issue_advice.planning.complete);
+    assert_eq!(missing.issue_advice.planning.attempted_at_ms, None);
+    let connection = f
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: new_connection_id().unwrap(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("fixture".into()),
+            },
+            "operator",
+        )
+        .unwrap();
+    let repo = f
+        .store
+        .upsert_repository(&connection.id, "github.com", REPO_ID, REPO, None, None)
+        .unwrap();
+    let mut snapshot = PlannedIssueSnapshot {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository_id: REPO_ID,
+        coverage: IssueCoverage::Complete,
+        attempted_at_ms: now * 1000,
+        facts_observed_at_ms: Some(now * 1000),
+        unread_pages: 0,
+        issues: vec![7, 8]
+            .into_iter()
+            .map(|n| PlannedIssue {
+                identity: issue(n),
+                title: format!("Untrusted issue {n}"),
+                milestone: Some(PlannedMilestone {
+                    number: 2,
+                    title: "Fixture milestone".into(),
+                    state: "open".into(),
+                    due_on: None,
+                }),
+            })
+            .collect(),
+    };
+    let observe = |snapshot: &PlannedIssueSnapshot, stamp| {
+        f.store
+            .observe(
+                &repo.id,
+                "planned_issues",
+                "_snapshot",
+                &serde_json::to_string(snapshot).unwrap(),
+                stamp,
+            )
+            .unwrap()
+    };
+    observe(&snapshot, now * 1000);
+    let before = f.store.work_preflight(&token, &request, now).unwrap();
+    assert_eq!(
+        before
+            .issue_advice
+            .candidates
+            .iter()
+            .map(|i| i.identity.number)
+            .collect::<Vec<_>>(),
+        [7]
+    );
+    assert!(before.issue_advice.planning.complete);
+    assert!(
+        f.store
+            .work_overview(&token, &WorkOverviewQuery::default(), now)
+            .unwrap()
+            .current
+            .is_empty()
+    );
+    let mut chosen = request.clone();
+    chosen.issue_choice = Some(WorkIssueChoice::Link { issue: issue(7) });
+    let created = f.store.work_start(&token, &chosen, now).unwrap();
+    assert_eq!(created.preflight.unwrap().issue_advice.candidates.len(), 1);
+    f.store.work_start(&token, &start("other"), now).unwrap();
+    let view = f
+        .store
+        .work_overview(
+            &token,
+            &WorkOverviewQuery {
+                limit: 1,
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    assert!(!view.current_complete);
+    assert_eq!(
+        view.planned_issues
+            .unclaimed
+            .iter()
+            .map(|i| i.identity.number)
+            .collect::<Vec<_>>(),
+        [8]
+    );
+    assert_eq!(view.planned_issues.linked.len(), 1);
+    assert_eq!(view.planned_issues.linked[0].work_ids, [created.item.id]);
+    let frozen = f
+        .store
+        .work_briefing(
+            &token,
+            &BriefingQuery {
+                subscriber: Some("planned-reader".into()),
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(frozen.planned_issues.evaluated_at_ms, now * 1000);
+    snapshot.coverage = IssueCoverage::Unavailable;
+    snapshot.attempted_at_ms = now * 1000 + 1;
+    observe(&snapshot, now * 1000 + 1);
+    let outage = f.store.work_preflight(&token, &request, now + 1).unwrap();
+    assert!(!outage.issue_advice.planning.complete);
+    assert_eq!(
+        outage.issue_advice.planning.coverage,
+        IssueCoverage::Unavailable
+    );
+    assert_eq!(
+        outage.issue_advice.planning.facts_observed_at_ms,
+        Some(now * 1000)
+    );
+    assert_eq!(outage.issue_advice.candidates.len(), 1);
+    let replay = f
+        .store
+        .work_briefing(
+            &token,
+            &BriefingQuery {
+                subscriber: Some("planned-reader".into()),
+                delivery: frozen.delivery.clone(),
+                after: Some(frozen.after),
+                through: Some(frozen.through),
+                work_after: frozen.work_after.clone(),
+                ..Default::default()
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(replay.planned_issues, frozen.planned_issues);
+    f.store
+        .forget(
+            &repo.id,
+            "planned_issues",
+            "_snapshot",
+            now * 1000 + 2,
+            "{}",
+            "planned_issues_removed",
+        )
+        .unwrap();
+    let missing = f
+        .store
+        .work_overview(&token, &WorkOverviewQuery::default(), now + 2)
+        .unwrap();
+    assert!(!missing.planned_issues.complete);
+    assert_eq!(missing.planned_issues.attempted_at_ms, None);
+    assert!(missing.planned_issues.unclaimed.is_empty());
+    // A new name has no current-page Work until namespace repair, but stable-ID linkage
+    // remains visible and cannot turn the old native Work into an unclaimed issue.
+    snapshot.coverage = IssueCoverage::Complete;
+    snapshot.attempted_at_ms = now * 1000 + 3;
+    observe(&snapshot, now * 1000 + 3);
+    f.store
+        .upsert_repository(
+            &connection.id,
+            "github.com",
+            REPO_ID,
+            "acme/renamed",
+            None,
+            None,
+        )
+        .unwrap();
+    let owner = f
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 1,
+            },
+            "user1",
+        )
+        .unwrap();
+    let (renamed, _, _) = mint_bound_agent_token(
+        &*f.store,
+        &owner.id,
+        "renamed",
+        "acme/renamed",
+        REPO_ID,
+        3600,
+        false,
+    )
+    .unwrap();
+    let renamed = f
+        .store
+        .work_overview(&renamed, &WorkOverviewQuery::default(), now + 3)
+        .unwrap();
+    assert!(renamed.current.is_empty());
+    assert_eq!(renamed.planned_issues.linked[0].issue.identity.number, 7);
+    assert!(
+        renamed
+            .planned_issues
+            .unclaimed
+            .iter()
+            .all(|i| i.identity.number != 7)
+    );
+}
 macro_rules! cases {
     ($module:ident, $factory:expr) => {
         mod $module {
             use super::*;
+            #[test]
+            fn planned_issue_projection() {
+                if let Some(f) = $factory {
+                    planned_projection(f);
+                }
+            }
             #[test]
             fn choices_and_replay() {
                 if let Some(f) = $factory {

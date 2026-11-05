@@ -553,6 +553,31 @@ fn append_all(tx: &mut postgres::Transaction<'_>, events: &[Event]) -> Result<()
     Ok(())
 }
 
+fn planning_for(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    now: i64,
+) -> Result<super::planned_issues::PlannedIssuesView> {
+    let snapshot: Option<String> = tx.query_opt(
+        "SELECT o.data FROM hub_repositories r JOIN hub_connections c ON c.id=r.connection
+         JOIN hub_observations o ON o.repository=r.id AND o.kind='planned_issues' AND o.key='_snapshot' AND o.deleted=FALSE
+         WHERE c.provider=$1 AND r.host=$2 AND r.repository_id IS NOT DISTINCT FROM $3 LIMIT 1",
+        &[&who.owner.identity.provider, &who.owner.identity.host, &who.repository_id])?.map(|row| row.get(0));
+    let rows = tx.query(
+        "SELECT id, CASE WHEN source_provider=provider AND source_host=host AND source_repository=repository THEN source_issue ELSE NULL END,
+         snapshot::jsonb ->> 'issue_link' FROM hub_work_items
+         WHERE provider=$1 AND host=$2 AND repository_id IS NOT DISTINCT FROM $3 AND ($3::BIGINT IS NOT NULL OR repository=$4)
+         ORDER BY id LIMIT 1001",
+        &[&who.owner.identity.provider,&who.owner.identity.host,&who.repository_id,&who.repository])?
+        .into_iter().map(|row| (row.get(0),row.get(1),row.get(2))).collect();
+    Ok(super::planned_issues::project(
+        who,
+        snapshot.as_deref(),
+        rows,
+        now,
+    ))
+}
+
 fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
     work_who_in(tx, token, now, true)
 }
@@ -4691,6 +4716,7 @@ fn briefing_page(
     let retention_gap =
         from < event_floor || minimum.is_some_and(|minimum| from < minimum.saturating_sub(1));
     Ok(Briefing {
+        planned_issues: planning_for(tx, who, now)?,
         subscriber,
         delivery,
         from,
@@ -6601,8 +6627,10 @@ impl PgStore {
             if fit_json_budget(&mut overlaps, overview_part_budget)? {
                 overlaps_complete = false;
             }
+            let planned_issues = planning_for(&mut tx, &who, now)?;
             tx.commit()?;
             Ok(WorkOverview {
+                planned_issues,
                 recent_since,
                 until: now,
                 current,
