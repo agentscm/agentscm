@@ -13,6 +13,7 @@ use crate::change_record::{
     SessionSetupV1, parse_conversation_cursor,
 };
 
+use super::capacity::{self, CapacityLimit, CapacityRefusal, CapacityRepository};
 use super::catchup::{
     CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES, CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES,
     CATCHUP_DELIVERY_CAPACITY_BYTES, CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult,
@@ -684,7 +685,7 @@ fn sqlite_check_catchup_delivery_capacity(
         .saturating_add(new_bytes)
         > CATCHUP_DELIVERY_CAPACITY_BYTES
     {
-        return Err(HubError::WorkCapacity);
+        return Err(who.capacity(CapacityLimit::CatchupDeliveries));
     }
     if let Some(token) = subscriber_token {
         let agents: i64 = tx.query_row(
@@ -723,7 +724,7 @@ fn sqlite_check_catchup_delivery_capacity(
                 .saturating_add(new_bytes)
                 > CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES
         {
-            return Err(HubError::WorkCapacity);
+            return Err(who.capacity(CapacityLimit::CatchupDeliveries));
         }
     }
     Ok(())
@@ -1190,7 +1191,7 @@ fn sqlite_record_catchup_merge(
     if retained_rows >= MAX_CATCHUP_MERGE_ROWS
         || retained_bytes.saturating_add(payload_bytes) > MAX_CATCHUP_MERGE_BYTES
     {
-        return Err(HubError::WorkCapacity);
+        return Err(scope.capacity(CapacityLimit::MergeObservations));
     }
     tx.execute(
         "INSERT INTO hub_catchup_merges
@@ -2996,7 +2997,8 @@ fn charge_work_payload(
         .optional()?;
     let used = used.unwrap_or(0);
     if enforce {
-        check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+        check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)
+            .map_err(|_| who.capacity(CapacityLimit::WorkStorage))?;
     }
     let charged = used
         .checked_add(delta)
@@ -3838,7 +3840,7 @@ fn create_coordination_request(
         || owner_active >= MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER
         || token_active >= MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN
     {
-        return Err(HubError::WorkCapacity);
+        return Err(who.capacity(CapacityLimit::CoordinationRequests));
     }
     let id = new_id("crq")?;
     // Automatic requests are built from work scopes that are already in their
@@ -4112,7 +4114,7 @@ fn retarget_coordination_requests(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if rows.len() > MAX_ACTIVE_COORDINATION_REQUESTS as usize {
-        return Err(HubError::WorkCapacity);
+        return Err(who.capacity(CapacityLimit::CoordinationRequests));
     }
     for (request, proposed_work) in rows {
         let event = coordination_event(
@@ -7651,6 +7653,82 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn record_capacity_refusal(&self, refusal: &CapacityRefusal) -> Result<()> {
+        let r = &refusal.repository;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO hub_capacity_refusals
+                 (provider, host, repository, repository_key, limit_kind, at, count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (provider, host, repository, repository_key, limit_kind) DO UPDATE SET
+                 at = MAX(hub_capacity_refusals.at, excluded.at),
+                 count = hub_capacity_refusals.count + excluded.count",
+            params![
+                r.provider,
+                r.host,
+                r.repository,
+                r.repository_id.unwrap_or(-1),
+                refusal.limit.as_str(),
+                refusal.at,
+                refusal.count
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_capacity_refusals WHERE at <= ?1",
+            [refusal.at - capacity::RETAIN_SECONDS],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_capacity_refusals
+             WHERE (provider, host, repository, repository_key, limit_kind) NOT IN
+                 (SELECT provider, host, repository, repository_key, limit_kind
+                  FROM hub_capacity_refusals
+                  ORDER BY at DESC, provider, host, repository, repository_key, limit_kind
+                  LIMIT ?1)",
+            [capacity::MAX_REFUSALS],
+        )?;
+        Ok(tx.commit()?)
+    }
+
+    fn capacity_refusals(&self, now: i64) -> Result<Vec<CapacityRefusal>> {
+        let conn = self.conn();
+        let rows = conn
+            .prepare(
+                "SELECT provider, host, repository, repository_key, limit_kind, at, count
+                 FROM hub_capacity_refusals WHERE at > ?1
+                 ORDER BY at DESC, provider, host, repository, repository_key, limit_kind
+                 LIMIT ?2",
+            )?
+            .query_map(
+                params![now - capacity::RETAIN_SECONDS, capacity::MAX_REFUSALS],
+                |row| {
+                    Ok((
+                        CapacityRepository {
+                            provider: row.get(0)?,
+                            host: row.get(1)?,
+                            repository: row.get(2)?,
+                            repository_id: Some(row.get::<_, i64>(3)?).filter(|id| *id >= 0),
+                        },
+                        row.get::<_, String>(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A limit this binary does not know (a newer Hub wrote it) is left out.
+        Ok(rows
+            .into_iter()
+            .filter_map(|(repository, limit, at, count)| {
+                Some(CapacityRefusal {
+                    limit: CapacityLimit::parse(&limit)?,
+                    repository,
+                    at,
+                    count,
+                })
+            })
+            .collect())
+    }
     fn repository_usage(&self, now: i64) -> Result<Vec<RepositoryUsage>> {
         let conn = self.conn();
         let rows = conn
@@ -11477,7 +11555,7 @@ impl Store for SqliteStore {
         if retained_events > MAX_CHANGE_EVENTS_PER_SESSION
             || retained_operations >= MAX_CHANGE_OPERATIONS_PER_WORK
         {
-            return Err(HubError::WorkCapacity);
+            return Err(who.capacity(CapacityLimit::ChangeRecords));
         }
         let capture_bytes = work_payload_row_bytes(request.len())?
             .checked_add(new_event_bytes)
@@ -11868,7 +11946,7 @@ impl Store for SqliteStore {
         if action_count >= MAX_CHANGE_ACTIONS_PER_WORK
             || operation_count >= MAX_CHANGE_OPERATIONS_PER_WORK
         {
-            return Err(HubError::WorkCapacity);
+            return Err(who.capacity(CapacityLimit::ChangeRecords));
         }
         adjust_work_payload_capacity(
             &tx,
@@ -11994,7 +12072,7 @@ impl Store for SqliteStore {
             |row| row.get(0),
         )?;
         if operation_count >= MAX_CHANGE_OPERATIONS_PER_WORK {
-            return Err(HubError::WorkCapacity);
+            return Err(who.capacity(CapacityLimit::ChangeRecords));
         }
         adjust_work_payload_capacity(
             &tx,
@@ -13738,7 +13816,7 @@ impl Store for SqliteStore {
                     || active_group >= group_limit
                     || active_total >= MAX_ACTIVE_CATCHUP_DELIVERIES
                 {
-                    return Err(HubError::WorkCapacity);
+                    return Err(who.capacity(CapacityLimit::CatchupDeliveries));
                 }
                 let event_through = catchup_event_high_water(&tx, &who, cursor.0)?;
                 let merge_through = tx
@@ -14754,7 +14832,7 @@ impl Store for SqliteStore {
             |row| row.get(0),
         )?;
         if updates >= MAX_COORDINATION_UPDATES {
-            return Err(HubError::WorkCapacity);
+            return Err(who.capacity(CapacityLimit::CoordinationUpdates));
         }
         let event = coordination_event(
             "coordination_acknowledged",
@@ -14846,7 +14924,7 @@ impl Store for SqliteStore {
             |row| row.get(0),
         )?;
         if updates >= MAX_COORDINATION_UPDATES {
-            return Err(HubError::WorkCapacity);
+            return Err(who.capacity(CapacityLimit::CoordinationUpdates));
         }
         let response_id = new_id("crs")?;
         let event = coordination_event(

@@ -110,6 +110,8 @@ mod hosted_laptop_workflow;
 #[cfg(unix)]
 mod http;
 #[cfg(unix)]
+mod hub_capacity;
+#[cfg(unix)]
 mod hub_catchup;
 #[cfg(unix)]
 mod hub_catchup_preflight;
@@ -161,6 +163,7 @@ mod hub_publish;
 #[cfg(unix)]
 mod hub_read_only;
 mod hub_recovery;
+mod hub_reply_budget;
 mod hub_session_privacy;
 mod hub_sessions;
 #[cfg(unix)]

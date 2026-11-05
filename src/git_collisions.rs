@@ -51,6 +51,9 @@ pub struct Request {
     /// Stop adding collisions before the compact JSON report exceeds this many
     /// bytes, and mark it `truncated: "output"`.
     pub max_bytes: Option<usize>,
+    /// Also check each branch tip against the base and add `merge_order`. Costs one more
+    /// `merge-tree` per branch.
+    pub merge_order: bool,
 }
 
 struct Item {
@@ -375,6 +378,10 @@ fn merge_verdict(git: &Git, a: &Item, b: &Item) -> Value {
         return json!({"result": "not-evaluated",
             "reason": "uncommitted changes have no commit to merge"});
     }
+    merge_tree(git, &a.commit, &b.commit)
+}
+
+fn merge_tree(git: &Git, a: &str, b: &str) -> Value {
     let args = [
         "merge-tree",
         "--write-tree",
@@ -382,8 +389,8 @@ fn merge_verdict(git: &Git, a: &Item, b: &Item) -> Value {
         "-z",
         "--no-messages",
         "--end-of-options",
-        &a.commit,
-        &b.commit,
+        a,
+        b,
     ];
     match git.run_code(&args, None, OUTPUT, true) {
         Ok((0, _)) => json!({"result": "clean"}),
@@ -395,6 +402,79 @@ fn merge_verdict(git: &Git, a: &Item, b: &Item) -> Value {
         }
         Err(error) => json!({"result": "error", "reason": error.to_string()}),
     }
+}
+
+/// Past this many mutually conflicting branches the exhaustive search is not attempted.
+const MAX_ORDER_BRANCHES: usize = 16;
+
+/// Which branches can merge first and which need a new head before they merge: tips that
+/// already conflict with the base, plus a minimum vertex cover of the pairwise conflicts
+/// among the rest. If everything else merges first, each of those needs one new head,
+/// made just before its own merge. `conflicts` are index pairs into `items`, which is
+/// sorted by id. Pairwise merges are a prediction: three branches can conflict together
+/// although no two of them do.
+fn merge_order(git: &Git, base: &str, items: &[Item], conflicts: &[(usize, usize)]) -> Value {
+    let refs: Vec<usize> = (0..items.len())
+        .filter(|&i| items[i].kind == "ref")
+        .collect();
+    let mut base_paths = BTreeMap::new();
+    for &i in &refs {
+        let verdict = merge_tree(git, base, &items[i].commit);
+        match verdict["result"].as_str() {
+            Some("clean") => {}
+            Some("conflict") => {
+                base_paths.insert(i, verdict["conflicted_paths"].clone());
+            }
+            _ => {
+                return json!({"complete": false,
+                    "reason": "a merge check against the base failed"});
+            }
+        }
+    }
+    // A branch that already conflicts with the base needs a new head in any order.
+    let edges: Vec<_> = conflicts
+        .iter()
+        .filter(|(a, b)| !base_paths.contains_key(a) && !base_paths.contains_key(b))
+        .collect();
+    let nodes: Vec<usize> = edges
+        .iter()
+        .flat_map(|&&(a, b)| [a, b])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if nodes.len() > MAX_ORDER_BRANCHES {
+        return json!({"complete": false, "reason":
+            format!("more than {MAX_ORDER_BRANCHES} branches conflict with each other")});
+    }
+    let bit = |item: usize| nodes.binary_search(&item).map_or(0, |n| 1u32 << n);
+    let masks: Vec<u32> = edges.iter().map(|&&(a, b)| bit(a) | bit(b)).collect();
+    // Ties give the new head to the branch whose name sorts later.
+    let cover = (0..1u32 << nodes.len())
+        .filter(|set| masks.iter().all(|edge| set & edge != 0))
+        .min_by_key(|set| (set.count_ones(), std::cmp::Reverse(*set)))
+        .unwrap_or(0);
+    let (mut first, mut later) = (Vec::new(), Vec::new());
+    for i in refs {
+        if !base_paths.contains_key(&i) && cover & bit(i) == 0 {
+            first.push(&items[i].id);
+            continue;
+        }
+        let with: Vec<_> = conflicts
+            .iter()
+            .filter_map(|&(a, b)| {
+                if a == i {
+                    Some(&items[b].id)
+                } else if b == i {
+                    Some(&items[a].id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        later.push(json!({"id": items[i].id, "conflicts_with": with,
+            "base_conflicted_paths": base_paths.get(&i).cloned().unwrap_or_else(|| json!([]))}));
+    }
+    json!({"complete": true, "merge_first": first, "new_head_first": later})
 }
 
 /// A failed check counts as "not an ancestor", which only costs a possible extra warning.
@@ -581,8 +661,9 @@ pub fn collisions(request: &Request) -> Result<Value> {
     let mut bytes = json!(items_json).to_string().len() + json!(skipped).to_string().len();
     let mut truncated = None;
     let mut found = Vec::new();
+    let (mut conflicts, mut failed) = (Vec::new(), false);
     'pairs: for (i, a) in items.iter().enumerate() {
-        for b in &items[i + 1..] {
+        for (j, b) in items.iter().enumerate().skip(i + 1) {
             if past() {
                 break 'pairs;
             }
@@ -605,8 +686,10 @@ pub fn collisions(request: &Request) -> Result<Value> {
             }
             let verdict = merge_verdict(&git, a, b);
             let level = if verdict["result"] == "conflict" {
+                conflicts.push((i, j));
                 "conflict"
             } else {
+                failed |= verdict["result"] == "error";
                 "same-file"
             };
             let entry = json!({
@@ -634,8 +717,20 @@ pub fn collisions(request: &Request) -> Result<Value> {
             std::cmp::Reverse(c["shared_paths_total"].as_u64()),
         )
     });
+    let order = request.merge_order.then(|| {
+        let reason = if truncated.is_some() {
+            "the scan stopped early"
+        } else if !skipped.is_empty() {
+            "some refs or worktrees could not be checked"
+        } else if failed {
+            "a merge check between two branches failed"
+        } else {
+            return merge_order(&git, &base, &items, &conflicts);
+        };
+        json!({"complete": false, "reason": reason})
+    });
 
-    Ok(json!({
+    let mut report = json!({
         "profile": PROFILE,
         "git_version": version,
         "base": {"name": base_name, "commit": base},
@@ -651,7 +746,11 @@ pub fn collisions(request: &Request) -> Result<Value> {
             "conflict means git merge-tree reported a conflict between two branch tips; uncommitted changes are never evaluated for conflicts.",
             "Only branches and worktrees visible to this repository are checked; clones, branches or uncommitted work elsewhere are invisible.",
         ],
-    }))
+    });
+    if let Some(order) = order {
+        report["merge_order"] = order;
+    }
+    Ok(report)
 }
 
 /// A deliberately incomplete, path-only observation for command hooks. It never runs

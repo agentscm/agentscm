@@ -370,7 +370,7 @@ fn root_header(headers: &HeaderMap) -> Option<&str> {
 fn reason(error: HubError) -> &'static str {
     match error {
         HubError::Busy => "hub busy",
-        HubError::WorkCapacity => "work storage capacity reached",
+        HubError::WorkCapacity(_) => "work storage capacity reached",
         HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
         HubError::WorkCoordinationRequired { .. } => {
             "work scope needs coordination; inspect the agent inbox"
@@ -725,7 +725,11 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
-                if !principal.read_only {
+                // Only while a requested briefing waits for an agent.
+                if !principal.read_only
+                    && super::narrative::pending(state, &principal)
+                        .is_ok_and(|requests| !requests.is_empty())
+                {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
                 }

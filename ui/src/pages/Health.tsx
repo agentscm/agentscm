@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import type { Health } from '../types.ts'
 import { SectionTabs } from '../TopNav.tsx'
-import { Box, Explain, Icon, Notice, PageHead, Skeleton } from '../ui.tsx'
+import { Ago, Box, Explain, Icon, Notice, PageHead, Skeleton } from '../ui.tsx'
 
 const BUDGET_MS = 250
 const STORAGE: Record<string, string> = { sqlite: 'SQLite', postgres: 'PostgreSQL' }
@@ -21,10 +21,20 @@ export function healthAnswer(health: Health | null): ReactNode {
   if (health.status !== 'ok') return 'The Hub is not answering, so edits go ahead unchecked.'
   const c = health.coordination
   const notes: ReactNode[] = []
+  if (health.capacity && health.capacity.recent_limits > 0) notes.push(<>a capacity limit <b>turned agents away</b> in the last day</>)
   if (c && c.fail_open > 0) notes.push(<><b>{plural(c.fail_open, 'edit')}</b> went ahead because it could not decide</>)
   if (c && c.hook_p95_ms >= BUDGET_MS * 0.85) notes.push(<>its hook is slow, <b>{Math.round(c.hook_p95_ms)} ms</b> at p95</>)
   if (!notes.length) return 'The Hub is healthy. Nothing needs a look.'
   return <>The Hub is answering, but {notes[0]}{notes[1] ? <> and {notes[1]}</> : null}.</>
+}
+
+/** A store limit refused agent writes recently: the operator's to fix, so this says what to run. */
+export function CapacityBanner({ capacity }: { capacity: NonNullable<Health['capacity']> }) {
+  return (
+    <Notice tone="bad" icon="database-exclamation" title="A capacity limit turned agents away">
+      {plural(capacity.recent_limits, 'repository limit')} refused agent writes in the last day{capacity.last_refused_at ? <>, most recently <Ago at={capacity.last_refused_at} /></> : null}. Those writes did not land. A Hub admin opens <a href="#admin">Admin</a> for the repository and the exact command. Full stand-up storage or merge history: run <code>agentscm work compact</code> for that repository, inspect the dry run, then repeat it with <code>--apply</code>. Too many open coordination requests: resolve or withdraw them from the Inbox.
+    </Notice>
+  )
 }
 
 export function HealthPage({ health }: { health: Health | null }) {
@@ -46,6 +56,7 @@ export function HealthPage({ health }: { health: Health | null }) {
         <Notice tone="bad" icon="heartbreak" title="Hub unavailable">The database did not answer the last health check. This page checks again every 15 seconds.</Notice>
       ) : (
         <div className="stack">
+          {health.capacity && health.capacity.recent_limits > 0 && <CapacityBanner capacity={health.capacity} />}
           {!c && <Notice tone="muted" icon="info-circle" title="No coordination counters reported yet">They appear once agents start editing through the hook.</Notice>}
           {c && (
             <>

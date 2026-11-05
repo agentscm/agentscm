@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "repository": "acme/widgets",
+  "repository_id": 101,
+  "provider": "github",
+  "host": "github.com",
+  "viewer_owner": "usr_synthetic_viewer",
+  "work": [
+    {
+      "work_id": "wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "title": "Paused own work",
+      "generation": 1,
+      "updated_seq": 8,
+      "state": "reassessment_needed",
+      "recipient": {
+        "kind": "person",
+        "owner": "usr_synthetic_viewer",
+        "login": "viewer",
+        "agent": null
+      },
+      "needs_you": true,
+      "action": "Review the unfinished Work; a quiet claim does not prove failure or completion.",
+      "reported_next_action": null,
+      "freshness": "stale",
+      "operational": {
+        "outcome": {
+          "value": "none",
+          "provenance": "unknown"
+        },
+        "report": {
+          "at": 1700000000,
+          "kind": "pause"
+        },
+        "reservation": {
+          "status": "held",
+          "basis": "implicit",
+          "holder_agent": "viewer",
+          "scope_count": 1
+        },
+        "merge": {
+          "hidden_by_merged_pr": false,
+          "status": "unknown"
+        },
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "reconciliation": {
+        "current": false,
+        "declaration_seq": 7,
+        "current_evidence_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "current_source_coverage": [],
+        "stale_reasons": [
+          "not_reconciled"
+        ],
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "limits": [
+        "provider_coverage_unknown",
+        "reconciliation:not_reconciled"
+      ]
+    },
+    {
+      "work_id": "wrk_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "title": "Third's work",
+      "generation": 1,
+      "updated_seq": 10,
+      "state": "reassessment_needed",
+      "recipient": {
+        "kind": "person",
+        "owner": "usr_synthetic_third",
+        "login": "third",
+        "agent": null
+      },
+      "needs_you": false,
+      "action": "Review the unfinished Work; a quiet claim does not prove failure or completion.",
+      "reported_next_action": null,
+      "freshness": "stale",
+      "operational": {
+        "outcome": {
+          "value": "none",
+          "provenance": "unknown"
+        },
+        "report": null,
+        "reservation": {
+          "status": "held",
+          "basis": "admitted",
+          "holder_agent": "third",
+          "scope_count": 1
+        },
+        "merge": {
+          "hidden_by_merged_pr": false,
+          "status": "unknown"
+        },
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "reconciliation": {
+        "current": false,
+        "declaration_seq": 10,
+        "current_evidence_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "current_source_coverage": [],
+        "stale_reasons": [
+          "not_reconciled"
+        ],
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "limits": [
+        "provider_coverage_unknown",
+        "reconciliation:not_reconciled"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "file:src/others.rs",
+      "kind": "file_conflict",
+      "work_ids": [],
+      "recipients": [
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_other",
+          "login": "other",
+          "agent": "other"
+        },
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_third",
+          "login": "third",
+          "agent": "third"
+        }
+      ],
+      "needs_you": false,
+      "action": "Agree who keeps the overlapping file src/others.rs.",
+      "updated_seq": 16,
+      "limits": []
+    },
+    {
+      "id": "file:src/shared.rs",
+      "kind": "file_conflict",
+      "work_ids": [],
+      "recipients": [
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_other",
+          "login": "other",
+          "agent": "other"
+        },
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_viewer",
+          "login": "viewer",
+          "agent": "viewer"
+        }
+      ],
+      "needs_you": true,
+      "action": "Agree who keeps the overlapping file src/shared.rs.",
+      "updated_seq": 13,
+      "limits": []
+    },
+    {
+      "id": "pr:rep_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:7",
+      "kind": "pr_overlap",
+      "work_ids": [],
+      "recipients": [
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_other",
+          "login": "other",
+          "agent": "other"
+        },
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_viewer",
+          "login": "viewer",
+          "agent": "viewer"
+        }
+      ],
+      "needs_you": true,
+      "action": "Review pull request #7 against the named holders' files.",
+      "updated_seq": 0,
+      "semantic_version": "3333333333333333333333333333333333333333333333333333333333333333",
+      "limits": []
+    },
+    {
+      "id": "pr:rep_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:8",
+      "kind": "pr_overlap",
+      "work_ids": [],
+      "recipients": [
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_other",
+          "login": "other",
+          "agent": "other"
+        },
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_third",
+          "login": "third",
+          "agent": "third"
+        }
+      ],
+      "needs_you": false,
+      "action": "Review pull request #8 against the named holders' files.",
+      "updated_seq": 0,
+      "semantic_version": "4444444444444444444444444444444444444444444444444444444444444444",
+      "limits": []
+    },
+    {
+      "id": "request:crq_cccccccccccccccccccccccccccccccc:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": "directed_request",
+      "work_ids": [
+        "wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "recipients": [
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_viewer",
+          "login": "viewer",
+          "agent": null
+        }
+      ],
+      "needs_you": true,
+      "action": "Answer the outstanding directed coordination request.",
+      "updated_seq": 9,
+      "limits": []
+    },
+    {
+      "id": "request:crq_dddddddddddddddddddddddddddddddd:wrk_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "directed_request",
+      "work_ids": [
+        "wrk_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "recipients": [
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_third",
+          "login": "third",
+          "agent": null
+        }
+      ],
+      "needs_you": false,
+      "action": "Answer the outstanding directed coordination request.",
+      "updated_seq": 11,
+      "limits": []
+    }
+  ],
+  "counts": {
+    "active": 0,
+    "awaiting_party": 0,
+    "blocked": 0,
+    "reassessment_needed": 2,
+    "retired": 0,
+    "held_reservations": 2,
+    "needs_you": 4
+  },
+  "observed_at": 1700000960,
+  "complete": false,
+  "atomic_snapshot": false,
+  "limits": [
+    "check_evidence_unavailable"
+  ],
+  "digest": "2222222222222222222222222222222222222222222222222222222222222222"
+}

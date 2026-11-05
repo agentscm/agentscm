@@ -1404,9 +1404,9 @@ async fn work_transition_releases_replays_and_fences_the_old_session() {
     let item = started["structuredContent"]["work"]["item"].clone();
     let work_id = item["id"].as_str().unwrap().to_owned();
 
-    // The overview and a conflicting start carry the operational projection.
+    // The full overview and a conflicting start carry the operational projection.
     let overview = hub
-        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
         .await;
     let held = &overview["structuredContent"]["operational"];
     assert_eq!(held["schema_version"], 2);
@@ -1502,7 +1502,7 @@ async fn work_transition_releases_replays_and_fences_the_old_session() {
         .await;
     assert_eq!(late["isError"], true, "{late}");
     let after = hub
-        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
         .await;
     assert!(
         after["structuredContent"]["operational"]["work"]
@@ -1555,7 +1555,7 @@ async fn done_pauses_retained_work_without_dropping_the_retained_reservation() {
     let (done, _) = hub.tool(&alice, "/mcp", "agentscm_done", json!({})).await;
     assert!(done.contains("paused"), "{done}");
     let overview = hub
-        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
         .await;
     let held = &overview["structuredContent"]["operational"]["work"][0];
     assert_eq!(held["state"], "paused", "{overview}");
@@ -3412,7 +3412,7 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
     assert!(text.contains(&format!("work_id {work_id}")), "{text}");
     assert!(text.contains("new_work true"), "{text}");
     let overview = hub
-        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
         .await;
     assert_eq!(
         overview["structuredContent"]["current"]
