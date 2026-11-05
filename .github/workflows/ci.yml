@@ -97,8 +97,8 @@ jobs:
 
   # Clippy and release builds for the musl and macOS targets, so a target-specific lint (for example a libc
   # item deprecated only on musl, which the crate-level `warnings = "deny"` turns into an error) fails the
-  # pull request instead of release.yml. windows.yml builds the Windows target. Without `--features ui`, which
-  # needs the UI build. Runs on scheduled and manual runs, like the `windows` job in windows.yml.
+  # nightly, manual and release-branch dispatch runs before release.yml. windows.yml builds the Windows target.
+  # Without `--features ui`, which needs the UI build. Runs on scheduled and manual runs, like the `windows` job in windows.yml.
   release-targets:
     strategy:
       fail-fast: false

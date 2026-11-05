@@ -7,6 +7,7 @@ on:
       - "src/hub/migrations/*.pg.sql"
       - "src/hub/migrations/named/*.pg.sql"
       - "src/hub/store_pg.rs"
+      - "src/hub/store_pg/**"
       - "examples/hub_seed.rs"
       - "Dockerfile"
       - "compose.hub.yaml"
@@ -27,7 +28,9 @@ concurrency:
 
 jobs:
   hub-e2e:
-    # Fork code never starts automatically: skip pull requests from other repositories.
+    # A cost control, not isolation: fork code can run on any hosted runner, which is ephemeral with a read-only
+    # token and no secrets, and a fork pull request takes its workflow file from the merge commit, so this `if`
+    # skips forks only for an unmodified workflow.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 40

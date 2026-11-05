@@ -6,7 +6,7 @@
 
 <!-- Commands run and results. State anything you did not run. -->
 
-<!-- Same-repository PRs: local validation attestation envelope SHA-256 and the agentscm/local-validation status. If none is available, say so and name the `gh workflow run` dispatch fallback for hosted coverage. -->
+<!-- Same-repository PRs: local validation attestation envelope SHA-256 and the agentscm/local-validation status. If none is available, say so and name the `gh workflow run` dispatch fallback for hosted coverage (a same-repository branch; a fork author dispatches in their own fork or asks for maintainer adoption). -->
 
 ## Limits
 
