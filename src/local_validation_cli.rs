@@ -12,7 +12,7 @@ use agentscm::execution::Cancellation;
 use agentscm::local_validation::comment::{self, envelope_sha256};
 use agentscm::local_validation::run::{observe, produce, required_commands, trust_paths};
 use agentscm::local_validation::{
-    DEFAULT_VERIFIER_WORKFLOW, Issuance, MAX_RECORD_BYTES, Observed, ValidationPolicy,
+    DEFAULT_VERIFIER_WORKFLOW, Issuance, MAX_RECORD_BYTES, Observed, Outcome, ValidationPolicy,
     ValidationRecipe, ValidationRecord, Verdict, VerdictState, assess, evidence_payload, select,
 };
 use agentscm::policy::issuers::{IssuerRegistrySnapshot, issuer_key_id};
@@ -389,15 +389,25 @@ fn read_retained(state_dir: &Path, sha: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 fn verdict_exit(verdict: &Verdict, commit: &str) -> i32 {
-    let (name, code) = match verdict.state {
-        VerdictState::Success => ("success", 0),
-        VerdictState::Failure => ("failure", 1),
-        VerdictState::Error => ("error", 2),
-        VerdictState::Pending => ("pending", 3),
+    let code = match verdict.state {
+        VerdictState::Success => 0,
+        VerdictState::Failure => 1,
+        VerdictState::Error => 2,
+        VerdictState::Pending => 3,
     };
+    let constituents: Vec<_> = verdict
+        .constituents
+        .iter()
+        .map(|c| {
+            json!({"id": c.id, "name": c.name, "state": c.state.as_str(),
+                   "outcome": c.outcome.as_str(), "reason": c.reason})
+        })
+        .collect();
     println!(
         "{}",
-        json!({"state": name, "reason": verdict.reason, "detail": verdict.detail,
+        json!({"state": verdict.state.as_str(), "outcome": verdict.outcome.as_str(),
+               "reason": verdict.reason, "detail": verdict.detail,
+               "constituents": constituents,
                "envelope_sha256": verdict.envelope_sha256, "commit": commit})
     );
     code
@@ -408,10 +418,12 @@ fn verify(args: VerifyArgs) -> Result<i32> {
     verify_inputs(args).or_else(|error| {
         let verdict = Verdict {
             state: VerdictState::Error,
+            outcome: Outcome::Error,
             reason: "input error",
             detail: error.to_string(),
             applies_to_head: false,
             envelope_sha256: String::new(),
+            constituents: Vec::new(),
         };
         Ok(verdict_exit(&verdict, ""))
     })
@@ -452,10 +464,12 @@ fn verify_inputs(args: VerifyArgs) -> Result<i32> {
         Err(error) => {
             let verdict = Verdict {
                 state: VerdictState::Error,
+                outcome: Outcome::Error,
                 reason: "git unavailable",
                 detail: error.to_string(),
                 applies_to_head: false,
                 envelope_sha256: String::new(),
+                constituents: Vec::new(),
             };
             return Ok(verdict_exit(&verdict, ""));
         }

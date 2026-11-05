@@ -136,6 +136,7 @@ impl Env {
             commands,
             dependency_files,
             toolchain_probes: None,
+            constituents: None,
         };
         let policy = ValidationPolicy {
             repository: REPOSITORY.into(),
@@ -147,6 +148,7 @@ impl Env {
             max_age_seconds: 3600,
             epoch: 1,
             exempt_paths,
+            check_id: None,
         };
         let config = root.join("config");
         fs::create_dir(&config).unwrap();

@@ -6,7 +6,7 @@
 //! Git and never defaults to success. A signature proves only that a registered
 //! key holder signed these bytes, not that the commands ran as recorded.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub mod comment;
 #[cfg(unix)]
@@ -47,6 +47,10 @@ const DEFAULT_TOOLCHAIN_PROBES: [&[&str]; 3] = [
 const MAX_MAX_AGE_SECONDS: u64 = 366 * 24 * 3600;
 pub const CHECK_KIND: &str = "command/v1";
 pub const REQUIREMENT_ID: &str = "local-validation";
+/// Commit-status context of a policy without a `check_id`.
+pub const STATUS_CONTEXT: &str = "agentscm/local-validation";
+const MAX_CHECK_ID: usize = 40;
+const MAX_CONSTITUENT_NAME: usize = 64;
 pub const DEFAULT_VERIFIER_WORKFLOW: &str = ".github/workflows/local-validation.yml";
 /// Surfaces the local gate never covers, recorded as coverage omissions.
 const FIXED_OMISSIONS: [&str; 5] = [
@@ -98,6 +102,21 @@ pub struct ValidationRecipe {
     /// Absent means the Rust defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain_probes: Option<Vec<Vec<String>>>,
+    /// Groups of recipe commands that report as separate results (statuses). Absent means one
+    /// aggregate result. Declaring them changes the recipe digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constituents: Option<Vec<Constituent>>,
+}
+
+/// A named group of recipe commands reported on its own. Commands in no constituent are setup
+/// and affect only the aggregate result.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Constituent {
+    pub id: String,
+    pub name: String,
+    /// Recipe command ids; each belongs to at most one constituent.
+    pub commands: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +184,10 @@ pub struct ValidationPolicy {
     /// needs no attestation. Absent means nothing is exempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exempt_paths: Option<Vec<String>>,
+    /// Names this check among several in one repository (`^[a-z0-9][a-z0-9-]{0,39}$`). Absent is
+    /// the legacy single check. Declaring it changes the policy digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_id: Option<String>,
 }
 
 fn text(kind: &str, value: &str) -> Result<()> {
@@ -263,6 +286,23 @@ fn pathspec(spec: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_check_id(kind: &str, id: &str) -> Result<()> {
+    let mut bytes = id.bytes();
+    let ok = id.len() <= MAX_CHECK_ID
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "{kind} must match ^[a-z0-9][a-z0-9-]{{0,{}}}$",
+            MAX_CHECK_ID - 1
+        )))
+    }
+}
+
 fn pathspecs(kind: &str, specs: &Option<Vec<String>>) -> Result<()> {
     let Some(specs) = specs else { return Ok(()) };
     if specs.is_empty() || specs.len() > MAX_PATHSPECS {
@@ -313,6 +353,43 @@ impl ValidationRecipe {
                 )));
             }
             probes.iter().try_for_each(|argv| validate_argv(argv))?;
+        }
+        if let Some(groups) = &self.constituents {
+            self.validate_constituents(groups)?;
+        }
+        Ok(())
+    }
+
+    fn validate_constituents(&self, groups: &[Constituent]) -> Result<()> {
+        if groups.is_empty() || groups.len() > MAX_COMMANDS {
+            return Err(Error::Limit(format!(
+                "constituents must have 1 to {MAX_COMMANDS} entries"
+            )));
+        }
+        let command_ids: HashSet<&str> = self.commands.iter().map(|c| c.id.as_str()).collect();
+        let (mut ids, mut mapped) = (HashSet::new(), HashSet::new());
+        for group in groups {
+            validate_check_id("constituent ID", &group.id)?;
+            let name_len = group.name.chars().count();
+            if !(1..=MAX_CONSTITUENT_NAME).contains(&name_len)
+                || group.name.chars().any(char::is_control)
+            {
+                return Err(Error::Invalid(format!(
+                    "constituent name must be 1 to {MAX_CONSTITUENT_NAME} characters without control characters"
+                )));
+            }
+            if group.commands.is_empty() || !ids.insert(group.id.as_str()) {
+                return Err(Error::Invalid(
+                    "constituent needs commands and a unique ID".into(),
+                ));
+            }
+            for command in &group.commands {
+                if !command_ids.contains(command.as_str()) || !mapped.insert(command.as_str()) {
+                    return Err(Error::Invalid(format!(
+                        "constituent command is unknown or in more than one constituent: {command}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -503,7 +580,31 @@ impl ValidationPolicy {
             return Err(Error::Limit("max age out of range".into()));
         }
         pathspecs("exempt paths", &self.exempt_paths)?;
+        if let Some(id) = &self.check_id {
+            validate_check_id("check ID", id)?;
+        }
         Ok(())
+    }
+
+    /// The requirement this policy's evidence is signed for.
+    pub fn requirement_id(&self) -> String {
+        self.check_id.as_ref().map_or_else(
+            || REQUIREMENT_ID.to_owned(),
+            |id| format!("{REQUIREMENT_ID}/{id}"),
+        )
+    }
+
+    /// The commit-status context of this check's aggregate result.
+    pub fn status_context(&self) -> String {
+        self.check_id.as_ref().map_or_else(
+            || STATUS_CONTEXT.to_owned(),
+            |id| format!("{STATUS_CONTEXT}/{id}"),
+        )
+    }
+
+    /// The commit-status context of one constituent of this check.
+    pub fn constituent_status_context(&self, constituent_id: &str) -> String {
+        format!("{}/{constituent_id}", self.status_context())
     }
 
     pub fn digest(&self) -> Result<String> {
@@ -616,7 +717,7 @@ pub fn evidence_payload(
     let empty = format!("{:x}", Sha256::digest(b""));
     let payload = EvidencePayload {
         version: 1,
-        requirement_id: REQUIREMENT_ID.into(),
+        requirement_id: policy.requirement_id(),
         check_kind: CHECK_KIND.into(),
         subject: CheckSubject {
             repository: record.subject.repository.clone(),
@@ -699,9 +800,86 @@ pub enum VerdictState {
     Pending,
 }
 
+/// What a verdict means, independent of its display reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Passed,
+    Failed,
+    /// No authenticated attestation for this check was found.
+    Missing,
+    StaleHead,
+    StalePolicy,
+    Expired,
+    Revoked,
+    RegistryStale,
+    /// Evidence that does not authenticate or does not bind to this check, head or recipe.
+    Unverified,
+    Error,
+    /// Used by reconcile: only exempt paths changed.
+    Exempt,
+    /// No command of a constituent is required by the changed paths.
+    NotRequired,
+    /// A constituent whose required commands did not all run.
+    DidNotRun,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Missing => "missing",
+            Self::StaleHead => "stale_head",
+            Self::StalePolicy => "stale_policy",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+            Self::RegistryStale => "registry_stale",
+            Self::Unverified => "unverified",
+            Self::Error => "error",
+            Self::Exempt => "exempt",
+            Self::NotRequired => "not_required",
+            Self::DidNotRun => "did_not_run",
+        }
+    }
+
+    /// The pending reason for a lifecycle cause of a once-valid attestation.
+    fn lifecycle_reason(self) -> Option<&'static str> {
+        Some(match self {
+            Self::StaleHead => "attestation is for a different head",
+            Self::StalePolicy => "attestation predates the current policy",
+            Self::Expired => "attestation expired",
+            Self::Revoked => "attestation signing key revoked",
+            Self::RegistryStale => "issuer registry changed since attestation",
+            _ => return None,
+        })
+    }
+}
+
+impl VerdictState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Error => "error",
+            Self::Pending => "pending",
+        }
+    }
+}
+
+/// The result of one constituent, derived only from the signed record and the trusted recipe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstituentVerdict {
+    pub id: String,
+    pub name: String,
+    pub state: VerdictState,
+    pub outcome: Outcome,
+    pub reason: &'static str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub state: VerdictState,
+    pub outcome: Outcome,
     pub reason: &'static str,
     pub detail: String,
     /// True only once the signature verified against the registry and the signed record names
@@ -709,16 +887,26 @@ pub struct Verdict {
     pub applies_to_head: bool,
     /// Digest of the assessed envelope; empty when none was assessed.
     pub envelope_sha256: String,
+    /// Per-constituent results; empty without constituents or when the run has a structural
+    /// problem, in which case every context inherits this verdict.
+    pub constituents: Vec<ConstituentVerdict>,
 }
 
 impl Verdict {
-    fn new(state: VerdictState, reason: &'static str, detail: impl Into<String>) -> Self {
+    fn new(
+        state: VerdictState,
+        outcome: Outcome,
+        reason: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             state,
+            outcome,
             reason,
             detail: detail.into(),
             applies_to_head: false,
             envelope_sha256: String::new(),
+            constituents: Vec::new(),
         }
     }
 
@@ -727,8 +915,13 @@ impl Verdict {
         self
     }
 
-    fn failure(reason: &'static str, detail: impl Into<String>) -> Self {
-        Self::new(VerdictState::Failure, reason, detail)
+    fn with_constituents(mut self, constituents: &[ConstituentVerdict]) -> Self {
+        self.constituents = constituents.to_vec();
+        self
+    }
+
+    fn failure(outcome: Outcome, reason: &'static str, detail: impl Into<String>) -> Self {
+        Self::new(VerdictState::Failure, outcome, reason, detail)
     }
 }
 
@@ -744,6 +937,17 @@ pub struct Observed<'a> {
     pub required: &'a [String],
 }
 
+/// How far an envelope got before its verdict, which decides what it may influence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// Did not authenticate, or has not been examined yet.
+    Unauthenticated,
+    /// Authentic but signed for another check or kind: invisible to this check.
+    Foreign,
+    /// Authentic and signed for this check.
+    ThisCheck,
+}
+
 /// Decides whether an attestation satisfies the observed head. Anything other
 /// than every check holding is a `Failure` or `Error`, never `Success`.
 pub fn assess(
@@ -755,6 +959,28 @@ pub fn assess(
     observed: Observed<'_>,
     clock: EvaluationClock,
 ) -> Verdict {
+    assess_standing(
+        envelope_bytes,
+        record_bytes,
+        recipe,
+        registry,
+        policy,
+        observed,
+        clock,
+    )
+    .0
+}
+
+fn assess_standing(
+    envelope_bytes: &[u8],
+    record_bytes: &[u8],
+    recipe: &ValidationRecipe,
+    registry: &IssuerRegistrySnapshot,
+    policy: &ValidationPolicy,
+    observed: Observed<'_>,
+    clock: EvaluationClock,
+) -> (Verdict, Standing) {
+    let mut standing = Standing::Unauthenticated;
     let mut verdict = assess_envelope(
         envelope_bytes,
         record_bytes,
@@ -763,16 +989,20 @@ pub fn assess(
         policy,
         observed,
         clock,
+        &mut standing,
     );
     verdict.envelope_sha256 = comment::envelope_sha256(envelope_bytes);
-    verdict
+    (verdict, standing)
 }
 
 /// Assesses every comment body and returns the verdict that applies to the observed head with
 /// the greatest signed `issued_at_ms` (ties: greatest envelope digest), so neither comment order
 /// nor reposting an older attestation changes the result. Bodies that do not parse, or that are
 /// stale, tampered or signed by an unregistered key, never decide. Without an applicable one, an
-/// environmental `Error` (uncertain clock, invalid policy) surfaces; otherwise `Pending`.
+/// environmental `Error` (uncertain clock, invalid policy) surfaces; otherwise `Pending`, whose
+/// reason names the newest authenticated lifecycle cause for this check (stale head or policy,
+/// expiry, revoked key, changed registry) and is otherwise "no attestation for this head".
+/// Another check's evidence is invisible, and unauthenticated bodies never choose the reason.
 pub fn select(
     bodies: &[&str],
     recipe: &ValidationRecipe,
@@ -781,45 +1011,145 @@ pub fn select(
     observed: Observed<'_>,
     clock: EvaluationClock,
 ) -> Verdict {
-    let (mut decided, mut error, mut ignored) = (None, None, None);
+    let (mut decided, mut error, mut ignored, mut lifecycle) = (None, None, None, None);
     let mut decided_key = (0_u64, String::new());
+    let mut lifecycle_key = (0_u64, String::new());
     for body in bodies {
         let Ok((envelope, record)) = comment::parse(body) else {
             continue;
         };
-        let verdict = assess(
+        let (verdict, standing) = assess_standing(
             &envelope, &record, recipe, registry, policy, observed, clock,
         );
-        if verdict.applies_to_head {
-            // Only a verified envelope applies to the head, so its issue time is the signed one.
-            let issued = serde_json::from_slice::<serde_json::Value>(&envelope)
+        if standing == Standing::Foreign {
+            continue;
+        }
+        // Only a verified envelope has a trustworthy signed issue time.
+        let issued = || {
+            serde_json::from_slice::<serde_json::Value>(&envelope)
                 .ok()
                 .and_then(|v| v["payload"]["issued_at_ms"].as_u64())
-                .unwrap_or(0);
-            let key = (issued, verdict.envelope_sha256.clone());
+                .unwrap_or(0)
+        };
+        if verdict.applies_to_head {
+            let key = (issued(), verdict.envelope_sha256.clone());
             if decided.is_none() || key > decided_key {
                 decided_key = key;
                 decided = Some(verdict);
             }
         } else {
             ignored = Some(format!("{}: {}", verdict.reason, verdict.detail));
+            if standing == Standing::ThisCheck && verdict.outcome.lifecycle_reason().is_some() {
+                let key = (issued(), verdict.envelope_sha256.clone());
+                if lifecycle.is_none() || key > lifecycle_key {
+                    lifecycle_key = key;
+                    lifecycle = Some(verdict.outcome);
+                }
+            }
             if verdict.state == VerdictState::Error {
                 error = Some(verdict);
             }
         }
     }
     decided.or(error).unwrap_or_else(|| {
-        Verdict::new(
-            VerdictState::Pending,
-            "no attestation for this head",
-            ignored.map_or_else(
-                || "no attestation found".into(),
-                |i| format!("last ignored: {i}"),
+        let detail = ignored.map_or_else(
+            || "no attestation found".into(),
+            |i| format!("last ignored: {i}"),
+        );
+        match lifecycle {
+            Some(outcome) => Verdict::new(
+                VerdictState::Pending,
+                outcome,
+                outcome.lifecycle_reason().unwrap_or_default(),
+                detail,
             ),
-        )
+            None => Verdict::new(
+                VerdictState::Pending,
+                Outcome::Missing,
+                "no attestation for this head",
+                detail,
+            ),
+        }
     })
 }
 
+fn result_is_clean(r: &CommandResult) -> bool {
+    r.stop == StopReason::Exited && r.exit_code == Some(0) && !r.incomplete && !r.truncated
+}
+
+/// Per-constituent results from the signed record and trusted recipe. Empty without constituents
+/// and for any structural problem (tree changed, missing service, order departure, payload
+/// outcome inconsistent with the results), so every context then inherits the check verdict.
+fn constituent_verdicts(
+    recipe: &ValidationRecipe,
+    record: &ValidationRecord,
+    policy: &ValidationPolicy,
+    observed: Observed<'_>,
+    payload_pass: bool,
+) -> Vec<ConstituentVerdict> {
+    let Some(groups) = &recipe.constituents else {
+        return Vec::new();
+    };
+    let required = policy.required_services;
+    let service_missing =
+        (required.postgres && !record.services.postgres) || (required.s3 && !record.services.s3);
+    let commands: Vec<&RecipeCommand> = recipe
+        .commands
+        .iter()
+        .filter(|c| observed.required.contains(&c.id))
+        .collect();
+    let in_order = record.results.len() <= commands.len()
+        && record
+            .results
+            .iter()
+            .zip(&commands)
+            .all(|(r, c)| r.id == c.id && r.argv == c.argv);
+    let commands_clean =
+        record.results.len() == commands.len() && record.results.iter().all(result_is_clean);
+    if !record.tree_unchanged_after
+        || service_missing
+        || !in_order
+        || payload_pass != commands_clean
+    {
+        return Vec::new();
+    }
+    groups
+        .iter()
+        .map(|group| {
+            let mapped: Vec<&String> = group
+                .commands
+                .iter()
+                .filter(|id| observed.required.contains(id))
+                .collect();
+            let ran = |id: &String| record.results.iter().find(|r| &r.id == id);
+            let (state, outcome, reason) = if mapped.is_empty() {
+                (VerdictState::Success, Outcome::NotRequired, "not required")
+            } else if mapped
+                .iter()
+                .any(|id| ran(id).is_some_and(|r| !result_is_clean(r)))
+            {
+                (VerdictState::Failure, Outcome::Failed, "failed")
+            } else if mapped.iter().all(|id| ran(id).is_some()) {
+                (VerdictState::Success, Outcome::Passed, "passed")
+            } else {
+                (
+                    VerdictState::Pending,
+                    Outcome::DidNotRun,
+                    "did not run: an earlier command failed",
+                )
+            };
+            ConstituentVerdict {
+                id: group.id.clone(),
+                name: group.name.clone(),
+                state,
+                outcome,
+                reason,
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn assess_envelope(
     envelope_bytes: &[u8],
     record_bytes: &[u8],
@@ -828,14 +1158,24 @@ fn assess_envelope(
     policy: &ValidationPolicy,
     observed: Observed<'_>,
     clock: EvaluationClock,
+    standing: &mut Standing,
 ) -> Verdict {
     use VerdictState::Error as Err_;
     if let Err(error) = policy.validate() {
-        return Verdict::new(Err_, "policy invalid", error.to_string());
+        return Verdict::new(Err_, Outcome::Error, "policy invalid", error.to_string());
+    }
+    if recipe.constituents.is_some() && policy.check_id.is_none() {
+        return Verdict::new(
+            Err_,
+            Outcome::Error,
+            "policy invalid",
+            "a recipe with constituents needs a policy with a check ID",
+        );
     }
     if recipe.sha256().ok().as_ref() != Some(&policy.recipe_sha256) {
         return Verdict::new(
             Err_,
+            Outcome::Error,
             "recipe does not match policy",
             "the trusted recipe differs from the policy digest",
         );
@@ -846,49 +1186,100 @@ fn assess_envelope(
     }];
     let report = match verify_evidence(envelope_bytes, registry, clock, &inputs) {
         Ok(report) => report,
-        Err(error) => return Verdict::failure("evidence rejected", error.to_string()),
+        Err(error) => {
+            return Verdict::failure(Outcome::Unverified, "evidence rejected", error.to_string());
+        }
     };
     if report.integrity() != IntegrityStatus::Verified {
         return Verdict::failure(
+            Outcome::Unverified,
             "signature not verified",
             format!("{:?}", report.integrity()),
         );
     }
     let Some(receipt) = report.verified_receipt() else {
-        return Verdict::failure("signature not verified", "no verified receipt");
+        return Verdict::failure(
+            Outcome::Unverified,
+            "signature not verified",
+            "no verified receipt",
+        );
     };
     let payload = receipt.payload();
+    // Another check's evidence never decides or influences this one, so identity comes first.
+    if payload.check_kind != CHECK_KIND || payload.requirement_id != policy.requirement_id() {
+        *standing = Standing::Foreign;
+        return Verdict::failure(
+            Outcome::Unverified,
+            "unexpected evidence kind",
+            "not a local validation attestation for this check",
+        );
+    }
+    *standing = Standing::ThisCheck;
     if report.registry_binding() != RegistryBindingStatus::Current {
-        return Verdict::failure("issuer registry stale", "registry changed since signing");
+        return Verdict::failure(
+            Outcome::RegistryStale,
+            "issuer registry stale",
+            "registry changed since signing",
+        );
     }
     match report.current_issuer_trust() {
         CurrentIssuerTrust::Trusted => {}
         CurrentIssuerTrust::ClockUncertain => {
-            return Verdict::new(Err_, "clock uncertain", "cannot judge issuer trust");
+            return Verdict::new(
+                Err_,
+                Outcome::Error,
+                "clock uncertain",
+                "cannot judge issuer trust",
+            );
         }
-        other => return Verdict::failure("issuer not trusted", format!("{other:?}")),
+        other => {
+            let outcome = match other {
+                CurrentIssuerTrust::Revoked => Outcome::Revoked,
+                CurrentIssuerTrust::Expired => Outcome::Expired,
+                _ => Outcome::Unverified,
+            };
+            return Verdict::failure(outcome, "issuer not trusted", format!("{other:?}"));
+        }
     }
     match report.freshness() {
         Freshness::Fresh => {}
         Freshness::ClockUncertain => {
-            return Verdict::new(Err_, "clock uncertain", "cannot judge freshness");
+            return Verdict::new(
+                Err_,
+                Outcome::Error,
+                "clock uncertain",
+                "cannot judge freshness",
+            );
         }
-        other => return Verdict::failure("attestation not fresh", format!("{other:?}")),
+        other => {
+            let outcome = if other == Freshness::Expired {
+                Outcome::Expired
+            } else {
+                Outcome::Unverified
+            };
+            return Verdict::failure(outcome, "attestation not fresh", format!("{other:?}"));
+        }
     }
     let EvaluationClock::Known { unix_ms } = clock else {
-        return Verdict::new(Err_, "clock uncertain", "cannot judge age");
+        return Verdict::new(Err_, Outcome::Error, "clock uncertain", "cannot judge age");
     };
     let Some(age_ms) = unix_ms.checked_sub(payload.issued_at_ms) else {
-        return Verdict::failure("attestation from the future", "issued after the clock");
+        return Verdict::failure(
+            Outcome::Unverified,
+            "attestation from the future",
+            "issued after the clock",
+        );
     };
     if age_ms > policy.max_age_seconds.saturating_mul(1000) {
-        return Verdict::failure("attestation too old", "older than policy max age");
-    }
-    if report.execution_claim() != ExecutionClaimStatus::WorkerAssertion
-        || payload.check_kind != CHECK_KIND
-        || payload.requirement_id != REQUIREMENT_ID
-    {
         return Verdict::failure(
+            Outcome::Expired,
+            "attestation too old",
+            "older than policy max age",
+        );
+    }
+    if report.execution_claim() != ExecutionClaimStatus::WorkerAssertion {
+        return Verdict::failure(
+            Outcome::Unverified,
             "unexpected evidence kind",
             "not a local validation attestation",
         );
@@ -896,20 +1287,27 @@ fn assess_envelope(
     if payload.installed_policy_epoch != policy.epoch
         || policy.digest().ok().as_ref() != Some(&payload.installed_policy_sha256)
     {
-        return Verdict::failure("policy mismatch", "attestation bound to a different policy");
+        return Verdict::failure(
+            Outcome::StalePolicy,
+            "policy mismatch",
+            "attestation bound to a different policy",
+        );
     }
     let committed = report.artifacts().iter().any(|a| {
         a.artifact_id == "record" && a.status == ArtifactStatus::Full && a.commitment_matches
     });
     if !committed {
         return Verdict::failure(
+            Outcome::Unverified,
             "record not committed",
             "record bytes do not match commitment",
         );
     }
     let record = match ValidationRecord::from_slice(record_bytes) {
         Ok(record) => record,
-        Err(error) => return Verdict::failure("record invalid", error.to_string()),
+        Err(error) => {
+            return Verdict::failure(Outcome::Unverified, "record invalid", error.to_string());
+        }
     };
     let subject = &payload.subject;
     if subject.repository != record.subject.repository
@@ -920,12 +1318,20 @@ fn assess_envelope(
         || subject.toolchain_sha256 != toolchain_digest(&record)
         || subject.environment_sha256 != environment_digest(&record)
     {
-        return Verdict::failure("record does not match payload", "tampered or mixed record");
+        return Verdict::failure(
+            Outcome::Unverified,
+            "record does not match payload",
+            "tampered or mixed record",
+        );
     }
     if record.subject.repository != policy.repository
         || record.subject.repository != observed.repository
     {
-        return Verdict::failure("wrong repository", record.subject.repository.clone());
+        return Verdict::failure(
+            Outcome::Unverified,
+            "wrong repository",
+            record.subject.repository.clone(),
+        );
     }
     if record.subject.commit != observed.commit
         || record.subject.tree != observed.tree
@@ -933,12 +1339,18 @@ fn assess_envelope(
         || record.context.merge_base != observed.merge_base
     {
         return Verdict::failure(
+            Outcome::StaleHead,
             "stale attestation",
             "head, tree or base differs from the record",
         );
     }
     if record.recipe_sha256 != policy.recipe_sha256 {
-        return Verdict::failure("recipe mismatch", "recipe differs from policy").applied();
+        return Verdict::failure(
+            Outcome::Unverified,
+            "recipe mismatch",
+            "recipe differs from policy",
+        )
+        .applied();
     }
     let not_required: Vec<&String> = recipe
         .commands
@@ -952,6 +1364,7 @@ fn assess_envelope(
         .find(|id| observed.required.contains(id))
     {
         return Verdict::failure(
+            Outcome::Failed,
             "incomplete run",
             format!("{id} is required by the changed paths"),
         )
@@ -959,8 +1372,29 @@ fn assess_envelope(
     }
     if !record.not_required.iter().eq(not_required.iter().copied()) {
         return Verdict::failure(
+            Outcome::Failed,
             "incomplete run",
             "not-required commands differ from the changed paths",
+        )
+        .applied();
+    }
+    // The signed coverage must describe exactly this record; inventory_complete is never trusted.
+    let coverage = &payload.coverage;
+    let scope: BTreeSet<&str> = coverage.scope.iter().map(String::as_str).collect();
+    let ran: BTreeSet<&str> = record.results.iter().map(|r| r.id.as_str()).collect();
+    if scope != ran
+        || coverage.scope.len() != record.results.len()
+        || coverage.observed_count as usize != record.results.len()
+        || coverage.expected_count as usize != observed.required.len()
+        || !record
+            .not_required
+            .iter()
+            .all(|id| coverage.omissions.contains(&format!("not required: {id}")))
+    {
+        return Verdict::failure(
+            Outcome::Unverified,
+            "coverage mismatch",
+            "signed coverage differs from the record",
         )
         .applied();
     }
@@ -970,24 +1404,37 @@ fn assess_envelope(
         .as_ref()
         .filter(|_| record.results.len() >= observed.required.len())
     {
-        return Verdict::failure("incomplete run", detail.clone()).applied();
+        return Verdict::failure(Outcome::Failed, "incomplete run", detail.clone()).applied();
     }
+    let payload_pass = payload.outcome == EvidenceOutcome::Pass
+        && payload.terminal_state == TerminalState::Success;
+    let constituents = constituent_verdicts(recipe, &record, policy, observed, payload_pass);
     if let Some((reason, detail)) = record.shortfall(policy.required_services) {
-        return Verdict::failure(reason, detail).applied();
+        return Verdict::failure(Outcome::Failed, reason, detail)
+            .applied()
+            .with_constituents(&constituents);
     }
     if let Some(detail) = departure {
-        return Verdict::failure("incomplete run", detail).applied();
+        return Verdict::failure(Outcome::Failed, "incomplete run", detail)
+            .applied()
+            .with_constituents(&constituents);
     }
-    if payload.outcome != EvidenceOutcome::Pass || payload.terminal_state != TerminalState::Success
-    {
-        return Verdict::failure("outcome not pass", format!("{:?}", payload.outcome)).applied();
+    if !payload_pass {
+        return Verdict::failure(
+            Outcome::Failed,
+            "outcome not pass",
+            format!("{:?}", payload.outcome),
+        )
+        .applied();
     }
     Verdict::new(
         VerdictState::Success,
+        Outcome::Passed,
         "validated",
         "attestation satisfies the exact head",
     )
     .applied()
+    .with_constituents(&constituents)
 }
 
 #[cfg(test)]
