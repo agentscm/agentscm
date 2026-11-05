@@ -357,6 +357,13 @@ pub struct ReconciliationView {
     pub retained: Option<DurableReconciliation>,
     pub current: Option<DurableReconciliation>,
     pub stale_reasons: Vec<String>,
+    /// Digest of the freshly read evidence, even when retained evaluation is stale.
+    /// This identifies facts, not provider success or a current evaluation.
+    #[serde(default)]
+    pub current_evidence_digest: Option<String>,
+    /// Fresh source coverage, independent of a retained evaluation and its stale reasons.
+    #[serde(default)]
+    pub current_source_coverage: Vec<SourceEvidence>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -693,6 +700,8 @@ pub(super) fn reconciliation_view(
         },
         retained,
         stale_reasons: stale,
+        current_evidence_digest: Some(evidence.digest()),
+        current_source_coverage: evidence.sources.clone(),
     }
 }
 

@@ -690,6 +690,22 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
+                let store = state.store.clone();
+                let scope = principal.clone();
+                // Bound optional enrichment after the committed touch; a slow read cannot consume
+                // the native client's whole startup deadline or hide that touch's outcome.
+                let current_status = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    blocking(state, move || {
+                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
+                    }),
+                )
+                .await;
+                text.push('\n');
+                match current_status {
+                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
+                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
+                }
                 if !principal.read_only {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);

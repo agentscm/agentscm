@@ -178,6 +178,7 @@ fn binding(
         repository: repo.into(),
         repository_id: repository.unwrap(),
         agent_token_file: token_file,
+        reminders: Default::default(),
     })
 }
 

@@ -542,6 +542,7 @@ async fn protocol_basics() {
             "agentscm_done",
             "agentscm_ask",
             "agentscm_handoff",
+            "agentscm_work_status",
             "agentscm_work_overview",
             "agentscm_work_briefing",
             "agentscm_work_catchup",
@@ -652,6 +653,10 @@ async fn protocol_basics() {
             .unwrap()
             .contains("agentscm_promises_list")
     );
+    let status_read = hub
+        .tool_result(reader.expose(), "agentscm_work_status", json!({}))
+        .await;
+    assert_eq!(status_read["isError"], false, "{status_read}");
     let read_only = hub.rpc(reader.expose(), &list).await.json();
     let read_only_names: Vec<&str> = read_only["result"]["tools"]
         .as_array()
@@ -727,6 +732,7 @@ async fn protocol_basics() {
     );
     for name in [
         "agentscm_workflow_status",
+        "agentscm_work_status",
         "agentscm_pr_context",
         "agentscm_work_overview",
         "agentscm_work_briefing",
@@ -2573,7 +2579,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (44, 47, 52));
+    assert_eq!((before.len(), listed.len(), all.len()), (45, 48, 53));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
@@ -3246,4 +3252,65 @@ async fn durable_reconciliation_mcp_http_reads_share_state_and_never_apply() {
             .iter()
             .any(|v| v["name"] == "agentscm_work_reconciliation_apply")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actionable_status_agrees_across_explicit_read_overview_start_and_catchup() {
+    let hub = Hub::start().await;
+    let key = hub.secret(7701, "synthetic-status");
+    let started = hub.tool_result(&key, "agentscm_start", json!({"task":"Synthetic status work", "session":"status-session", "request_key":"status-work", "paths":["src/synthetic.rs"]})).await;
+    assert_ne!(started["isError"], true, "{started}");
+    assert_eq!(
+        started["structuredContent"]["actionable_status"]["counts"]["active"],
+        1
+    );
+    let status = hub
+        .tool_result(&key, "agentscm_work_status", json!({}))
+        .await;
+    assert_eq!(status["isError"], false, "{status}");
+    assert!(
+        status["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Provider source")
+    );
+    let overview = hub
+        .tool_result(&key, "agentscm_work_overview", json!({}))
+        .await;
+    assert_eq!(
+        overview["structuredContent"]["actionable_status"]["digest"],
+        status["structuredContent"]["digest"]
+    );
+    let briefing = hub
+        .tool_result(
+            &key,
+            "agentscm_work_briefing",
+            json!({"subscriber":"status-session"}),
+        )
+        .await;
+    assert_eq!(
+        briefing["structuredContent"]["actionable_status"]["counts"],
+        status["structuredContent"]["counts"]
+    );
+    let catchup = hub
+        .tool_result(
+            &key,
+            "agentscm_work_catchup",
+            json!({"subscriber":"agent:status-session"}),
+        )
+        .await;
+    assert_eq!(
+        catchup["structuredContent"]["actionable_status"]["counts"],
+        status["structuredContent"]["counts"],
+        "{catchup}"
+    );
+    let http = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/standup/status",
+            Some(&key),
+            "",
+        )
+        .await;
+    assert_eq!(http.json()["digest"], status["structuredContent"]["digest"]);
 }

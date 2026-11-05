@@ -3,7 +3,7 @@
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import { Ago, Avatar, Box, Empty, Icon, Notice, PageHead, Reveal, Skeleton } from '../ui.tsx'
 import { useNow } from '../useHub.ts'
-import { AWAKE_SECONDS, needView } from '../pages/Dashboard.tsx'
+import { AWAKE_SECONDS, needView, SharedAnswer, SharedNeeds } from '../pages/Dashboard.tsx'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
 import { who } from '../nextStep.ts'
 import { lead, plural } from '../pages/workParts.tsx'
@@ -39,7 +39,7 @@ export function LiveNow({ live }: { live: LiveProps }) {
   const loading = overview.kind === 'loading' || !d
   return (
     <>
-      <PageHead
+      {live.status !== undefined ? <SharedAnswer question="What needs me?" status={live.status} /> : <PageHead
         question="What needs me?"
         live
         answer={loading
@@ -55,13 +55,14 @@ export function LiveNow({ live }: { live: LiveProps }) {
             {data.health?.coordination && <span><Icon name="shield-check" /> {plural(data.health.coordination.denied, 'edit')} refused once</span>}
           </a>
         </span>}
-      />
+      />}
       {overview.kind === 'error' && <Notice tone="bad" title="Could not load the work overview" action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>{overview.message}</Notice>}
       {ov && !ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
       <div className="g-now">
         <section className="g-needs" aria-label="Needs you">
-          {ov && d && needs.map((need, i) => <LiveNeedCard key={need.key} n={need} i={i} ov={ov} d={d} live={live} />)}
-          {ov && d && needs.length === 0 && <article className="g-need is-done"><span className="g-ring tone-ok"><Icon name="check2" /></span><div className="g-need-body"><span className="g-need-title small">Nothing is waiting on you</span><span className="g-need-outcome">Blocked work, requests your idle agent can’t answer, contested files and overlaps show up here first.</span></div></article>}
+          {live.status !== undefined && <SharedNeeds status={live.status} legacy={ov && d ? { ov, d, me: live.handoff.me, handoff: live.handoff } : undefined} />}
+          {live.status === undefined && ov && d && needs.map((need, i) => <LiveNeedCard key={need.key} n={need} i={i} ov={ov} d={d} live={live} />)}
+          {live.status === undefined && ov && d && needs.length === 0 && <article className="g-need is-done"><span className="g-ring tone-ok"><Icon name="check2" /></span><div className="g-need-body"><span className="g-need-title small">Nothing is waiting on you</span><span className="g-need-outcome">Blocked work, requests your idle agent can’t answer, contested files and overlaps show up here first.</span></div></article>}
           {loading && <Skeleton rows={3} />}
         </section>
         <aside className="g-col g-side" aria-label="Around you">

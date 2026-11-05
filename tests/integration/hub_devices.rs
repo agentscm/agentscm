@@ -2629,7 +2629,10 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         json!({"total": 0, "moving": 0, "stuck": 0})
     );
     assert!(widgets["last_activity_at"].as_i64().is_some());
-    assert_eq!(widgets["complete"], true);
+    assert_eq!(
+        widgets["complete"], false,
+        "unsupported attention producers remain unknown"
+    );
     assert_eq!(body["repositories"][1]["last_activity_at"], Value::Null);
     assert_eq!(
         (&body["unchecked"], &body["complete"]),
@@ -2643,11 +2646,14 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         [
             "agents",
             "complete",
+            "coverage",
             "last_activity_at",
             "needs_you",
             "provider",
             "repository",
             "repository_id",
+            "status_counts",
+            "status_digest",
             "unfinished"
         ]
     );
@@ -2699,9 +2705,14 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     );
     assert_eq!(
         device_list["repositories"][0]["work"][0]["next_action"],
-        "Check the diff"
+        "Continue the reported work; activity is not independently observed."
     );
-    assert_eq!(device_list["repositories"][0]["work_complete"], true);
+    assert_eq!(
+        device_list["repositories"][0]["work"][0]["needs_you"],
+        false
+    );
+    assert_eq!(device_list["repositories"][0]["status_counts"]["active"], 1);
+    assert_eq!(device_list["repositories"][0]["work_complete"], false);
     assert_eq!(device_list["repositories"][0]["live_complete"], true);
     assert_eq!(
         device_list["repositories"][0]["attention_revision"],
@@ -2731,6 +2742,76 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         )
         .await;
     assert_eq!(status, 401);
+
+    // Catalog counts, recipient and next action are exactly the shared person/token projection.
+    let mut work = started["item"].clone();
+    let mut previous_marker = Value::Null;
+    for (operation, summary) in [
+        ("catalog-handover-1", "Synthetic handover"),
+        ("catalog-handover-2", "Synthetic updated handover"),
+    ] {
+        let (code, checkpoint) = env.call(&env.hub, Method::POST, "/v1/hub/standup/checkpoint", minted["token"].as_str(), Some(json!({
+            "work_id":work["id"],"operation_id":operation,"generation":work["generation"],"session":"tray-test-session", "expected_updated_seq":work["updated_seq"],"kind":"handover","summary":summary
+        }))).await;
+        assert_eq!(code, 200, "{checkpoint}");
+        work = checkpoint["item"].clone();
+        let (code, catalog) = env
+            .call(
+                &env.hub,
+                Method::GET,
+                "/v1/hub/device/repositories",
+                Some(&device),
+                None,
+            )
+            .await;
+        assert_eq!(code, 200, "{catalog}");
+        let (_, status) = env
+            .call(
+                &env.hub,
+                Method::GET,
+                "/v1/hub/standup/status",
+                minted["token"].as_str(),
+                None,
+            )
+            .await;
+        let row = catalog["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["repository"] == REPO)
+            .unwrap();
+        assert_eq!(row["status_counts"], status["counts"]);
+        assert_eq!(row["status_digest"], status["digest"]);
+        assert_eq!(row["work"][0]["state"], "awaiting_party");
+        assert_eq!(row["work"][0]["recipient"], status["work"][0]["recipient"]);
+        assert_eq!(row["work"][0]["next_action"], status["work"][0]["action"]);
+        assert_eq!(row["work"][0]["needs_you"], true);
+        assert!(row["attention_revision"].as_str().is_some());
+        assert_ne!(
+            row["attention_revision"], previous_marker,
+            "same count with changed action evidence changes attention identity"
+        );
+        previous_marker = row["attention_revision"].clone();
+        let (_, again) = env
+            .call(
+                &env.hub,
+                Method::GET,
+                "/v1/hub/device/repositories",
+                Some(&device),
+                None,
+            )
+            .await;
+        let again = again["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["repository"] == REPO)
+            .unwrap();
+        assert_eq!(
+            again["attention_revision"], previous_marker,
+            "poll time does not create new attention"
+        );
+    }
 
     // Only the web sign-in asks.
     let (status, refused) = env

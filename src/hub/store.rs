@@ -756,6 +756,13 @@ pub trait Store: Send + Sync {
         checkpoint: &WorkCheckpoint,
         now: i64,
     ) -> Result<WorkCheckpointResult>;
+    /// Scoped read. Person callers must first check the current repository role; no token is minted.
+    fn work_get_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
     /// Read the single explicit PR relationship; comparison statuses confer no approval.
     fn work_pr_link_get(
@@ -773,6 +780,13 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkPrLinkResult>;
     /// Read retained reconciliation and expose it as current only while its facts still match.
+    /// Scoped read. Person callers must first check the current repository role; no token is minted.
+    fn work_reconciliation_get_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_reconciliation::ReconciliationView>>;
     fn work_reconciliation_get(
         &self,
         token: &str,
@@ -1071,6 +1085,13 @@ pub trait Store: Send + Sync {
         &self,
         token: &str,
         query: &CoordinationInboxQuery,
+        now: i64,
+    ) -> Result<CoordinationInbox>;
+    /// Scoped read. Person callers must first check the current repository role; no token is minted.
+    fn coordination_list_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        query: &CoordinationListQuery,
         now: i64,
     ) -> Result<CoordinationInbox>;
     fn coordination_list(

@@ -1,3 +1,4 @@
+import type { ActionableStatus } from '../actionableStatus.ts'
 // The G layout over live Hub data. Its rail groups every Hub page under Now · Work · Workflows · Repository and the
 // utilities; G-only pages (Now, Changes, a change, Process, Code map, Contributions, Feature map) render here, and
 // every other route renders the Hub's own page, unchanged, inside this frame.
@@ -28,6 +29,7 @@ export interface LiveProps {
   data: HubData
   d: Derived | null
   overview: Poll<WorkOverview>
+  status?: Poll<ActionableStatus>
   needs: Need[]
   /** The Inbox badge: overlaps and requests waiting on the viewer. */
   inbox: { n: number; tip: string }

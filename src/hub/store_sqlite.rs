@@ -10224,9 +10224,30 @@ impl Store for SqliteStore {
     }
 
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
+        self.work_get_scoped(&WorkLifecycleReader::Token(token), id, now)
+    }
+
+    fn work_get_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let who = work_who(&tx, token, now)?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => {
+                if owner.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(owner, repository, *repository_id)
+            }
+        };
         let item = scoped_work(&tx, &who, id, now)?;
         tx.commit()?;
         Ok(item)
@@ -10238,13 +10259,34 @@ impl Store for SqliteStore {
         id: &str,
         now: i64,
     ) -> Result<Option<declarations::ReconciliationView>> {
+        self.work_reconciliation_get_scoped(&WorkLifecycleReader::Token(token), id, now)
+    }
+
+    fn work_reconciliation_get_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<declarations::ReconciliationView>> {
         super::work::validate_id("work", id, "wrk")?;
 
         let mut conn = self.conn();
 
         let tx = conn.transaction()?;
 
-        let who = work_who(&tx, token, now)?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => {
+                if owner.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(owner, repository, *repository_id)
+            }
+        };
 
         let Some(item) = scoped_work(&tx, &who, id, now)? else {
             return Ok(None);
@@ -14161,10 +14203,31 @@ impl Store for SqliteStore {
         query: &CoordinationListQuery,
         now: i64,
     ) -> Result<CoordinationInbox> {
+        self.coordination_list_scoped(&WorkLifecycleReader::Token(token), query, now)
+    }
+
+    fn coordination_list_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        query: &CoordinationListQuery,
+        now: i64,
+    ) -> Result<CoordinationInbox> {
         query.validate()?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let who = work_who(&tx, token, now)?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => {
+                if owner.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(owner, repository, *repository_id)
+            }
+        };
         let page = coordination_page(
             &tx,
             &who,

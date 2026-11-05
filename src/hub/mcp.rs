@@ -482,7 +482,8 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
         && matches!(
             params.and_then(|params| params["name"].as_str()),
             Some(
-                "agentscm_work_briefing"
+                "agentscm_work_status"
+                    | "agentscm_work_briefing"
                     | "agentscm_work_catchup"
                     | "agentscm_work_catchup_ack"
                     | "agentscm_briefing_read"
@@ -627,6 +628,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "run_id": {"type": "string", "minLength": 1, "maxLength": 64,
                  "description": "Retained native workflow run ID."}}), &["run_id"])}
     );
+    let status = json!({"name":"agentscm_work_status", "annotations":{"readOnlyHint":true}, "description":"Read shared deterministic status: current states, named recipients, personal actions, held reservations and evidence coverage. Missing prose never prevents this answer; read time is not provider freshness.", "inputSchema":schema(json!({}), &[])});
     let briefing = json!(
         {"name": "agentscm_work_briefing",
          "description": "Reads a bounded snapshot of unfinished shared work, except Work whose branch has a merged pull request, plus changes after this agent token's acknowledged cursor. Writer tokens receive a durable delivery to page and deliberately acknowledge; read-only tokens perform a pure read. Different tokens have independent catch-up; sessions sharing a token share the cursor.",
@@ -873,6 +875,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
     ]);
     if read_only {
         return json!([
+            status,
             overview,
             briefing,
             catchup,
@@ -1030,6 +1033,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "accept": {"type": "boolean"},
              "reason": {"type": "string", "maxLength": 200, "description": "With accept false: why, in one line."},
              "session": session}), &["path", "accept"])},
+        status,
         overview,
         briefing,
         catchup,
@@ -1205,6 +1209,23 @@ pub(super) fn hub_failure(error: &HubError) -> Value {
     })
 }
 
+/// Optional read enrichment never replaces a committed mutation or delivery receipt.
+fn append_actionable_status(
+    value: &mut Value,
+    status: Option<&super::work_http::actionable_status::ActionableStatus>,
+) {
+    let (facts, text) = match status {
+        Some(status) => (json!(status), super::work_http::actionable_status::render_compact_text(status)),
+        None => (json!({"available":false}), "Current actionable status unavailable; do not interpret this as clear coverage. Retry agentscm_work_status.".into()),
+    };
+    if let Some(object) = value["structuredContent"].as_object_mut() {
+        object.insert("actionable_status".into(), facts);
+    }
+    if let Some(content) = value["content"].as_array_mut() {
+        content.push(json!({"type":"text","text":text}));
+    }
+}
+
 /// Argument problems are tool errors, not protocol errors; only a malformed call is -32602.
 async fn call(
     state: &HubState,
@@ -1227,6 +1248,25 @@ async fn call(
         return Ok(value);
     }
     let name = params.and_then(|p| p["name"].as_str()).unwrap_or("");
+    if value["isError"] != true
+        && matches!(
+            name,
+            "agentscm_start"
+                | "agentscm_work_overview"
+                | "agentscm_work_briefing"
+                | "agentscm_work_catchup"
+                | "agentscm_briefing_read"
+        )
+    {
+        let store = state.store.clone();
+        let scope = principal.clone();
+        let status = blocking(state, move || {
+            super::work_http::actionable_status::read(&*store, &scope, unix_now())
+        })
+        .await
+        .ok();
+        append_actionable_status(&mut value, status.as_ref());
+    }
     contribution_receipt::append(
         state,
         principal,
@@ -1624,6 +1664,10 @@ async fn promise_call(
     Some(result)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyArgs {}
+
 async fn call_inner(
     state: &HubState,
     principal: &Principal,
@@ -1643,6 +1687,7 @@ async fn call_inner(
             | "agentscm_done"
             | "agentscm_ask"
             | "agentscm_handoff"
+            | "agentscm_work_status"
             | "agentscm_work_briefing"
             | "agentscm_work_catchup"
             | "agentscm_work_catchup_ack"
@@ -1850,6 +1895,25 @@ async fn call_inner(
             .await
             {
                 Ok(report) => structured(&report),
+                Err(error) => work_failure(&error),
+            },
+        );
+    }
+    if name == "agentscm_work_status" {
+        if let Err(error) = try_args::<EmptyArgs>(arguments) {
+            return Ok(invalid_args(name, &error));
+        }
+        let store = state.store.clone();
+        let scope = principal.clone();
+        return Ok(
+            match blocking(state, move || {
+                super::work_http::actionable_status::read(&*store, &scope, unix_now())
+            })
+            .await
+            {
+                Ok(status) => {
+                    json!({"isError":false,"structuredContent":status,"content":[{"type":"text","text":super::work_http::actionable_status::render_compact_text(&status)}]})
+                }
                 Err(error) => work_failure(&error),
             },
         );
@@ -3396,6 +3460,35 @@ async fn check(state: &HubState, principal: &Principal, call: SessionCall) -> Re
 #[cfg(test)]
 mod tests {
     use super::{safe_detail, work_reconciliation_summary};
+
+    #[test]
+    fn status_enrichment_keeps_committed_receipts_when_the_optional_read_fails() {
+        let mut result = serde_json::json!({"isError":false,"structuredContent":{"claim_acquired":true,"work":{"item":{"id":"wrk_synthetic"}},"delivery":"synthetic-delivery"},"content":[{"type":"text","text":"Claim acquired"}]});
+        super::append_actionable_status(&mut result, None);
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["claim_acquired"], true);
+        assert_eq!(
+            result["structuredContent"]["delivery"],
+            "synthetic-delivery"
+        );
+        assert_eq!(
+            result["structuredContent"]["actionable_status"]["available"],
+            false
+        );
+        let fixture =
+            serde_json::from_str(include_str!("fixtures/actionable-status.json")).unwrap();
+        super::append_actionable_status(&mut result, Some(&fixture));
+        assert_eq!(
+            result["structuredContent"]["actionable_status"]["counts"]["needs_you"],
+            3
+        );
+        assert!(
+            result["content"][2]["text"]
+                .as_str()
+                .unwrap()
+                .contains("awaiting a named party")
+        );
+    }
 
     #[test]
     fn reconciliation_summaries_bound_content_and_expose_omissions() {

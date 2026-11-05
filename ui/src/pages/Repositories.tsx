@@ -73,8 +73,8 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
   const newHere = !!v && v.rows.length > 0 && !v.rows.some((r) => r.agents > 0)
   const needing = active.filter((r) => r.needsYou > 0)
   const focus = !newHere ? needing[0] : undefined
-  const stuck = active.filter((r) => r.needsYou === 0 && r.unfinished.stuck > 0)
-  const rest = active.filter((r) => r.needsYou === 0 && r.unfinished.stuck === 0)
+  const stuck = active.filter((r) => r.needsYou === 0 && (r.statusCounts?.blocked ?? 0) + (r.statusCounts?.reassessment_needed ?? 0) + (r.statusCounts?.awaiting_party ?? 0) > 0)
+  const rest = active.filter((r) => r.needsYou === 0 && (r.statusCounts?.blocked ?? 0) + (r.statusCounts?.reassessment_needed ?? 0) + (r.statusCounts?.awaiting_party ?? 0) === 0)
   const working = active.filter((r) => r.agents > 0)
   const rowProps = { current, onOpen: web ? open : undefined, opening: refused ? null : opening }
   const link = (repo: string, label: string) => (rowProps.onOpen ? <button type="button" className="rp-link" onClick={() => open(repo)}>{label}</button> : <span className="rp-link">{label}</span>)
@@ -82,7 +82,7 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
   const headline = !v ? 'Every repository you can read on this Hub, with what needs you first.'
     : v.rows.length === 0 ? 'No connected repository you can read yet.'
     : newHere ? 'No agent is working in any of these yet.'
-    : needing.length === 0 ? 'Nothing needs you.'
+    : needing.length === 0 ? v.complete && v.unchecked === 0 && v.rows.every((r) => r.complete && r.statusCounts) ? 'Nothing needs you.' : 'No personal action observed in partial coverage.'
     : needing.length > 3 ? <><b className="answer-trouble">{needing.length}</b> repositories need you.</>
     : <>{joinNodes(needing.map((r, i) => link(r.repository, needLabels[i]!)))} {needing.length === 1 ? 'needs' : 'need'} you.</>
   const workingLabels = labelsOf(working.slice(0, 3).map((r) => r.repository))
@@ -99,7 +99,7 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
             <h1 className="page-question">Which of my repositories need me?</h1>
             <p className="answer-text" aria-live="polite">{headline}</p>
             {sub && <p className="answer-fact">{sub}</p>}
-            {v && v.rows.length > 0 && !newHere && <p className="rp-checked"><i className="rp-dot ok" aria-hidden="true" />Counts only, checked against your role on the forge.</p>}
+            {v && v.rows.length > 0 && !newHere && <p className="rp-checked"><i className={`rp-dot ${v.rows.every((r) => r.complete && r.statusCounts) ? 'ok' : 'warn'}`} aria-hidden="true" />{v.rows.every((r) => r.complete && r.statusCounts) ? 'Counts only, checked against your role on the forge.' : 'Counts are partial; repository access was checked on the forge.'}</p>}
           </div>
           <SectionTabs />
           {refused && <RefusalNotice refusal={refused} />}
@@ -124,7 +124,7 @@ export function RepositoriesPage({ auth, web, current, overview = null, token = 
               ) : (
                 <>
                   <Group title="Also needs you" icon="exclamation-circle" tone="bad" rows={needing.slice(1)} {...rowProps} />
-                  <Group title="Stuck" icon="pause-circle" tone="warn" rows={stuck} {...rowProps} />
+                  <Group title="Awaiting action" icon="pause-circle" tone="warn" rows={stuck} {...rowProps} />
                   <Group title={needing.length === 0 ? 'Moving on their own' : 'Moving'} icon="arrow-right-circle" tone="brand" rows={rest} {...rowProps} />
                 </>
               )}
@@ -168,12 +168,15 @@ const Agents = ({ n, label }: { n: number; label?: string }) => (
   </span>
 )
 
-/** The status line under a name: only what is there. Coral for waiting on the person, amber for stuck. */
+/** The status line under a name: only what is there. Coral for waiting on the person, amber for blocked or awaiting actions. */
 function Say({ row: r }: { row: RepositoryRow }) {
   const bits: ReactNode[] = []
   if (r.needsYou > 0) bits.push(<span className="rp-bad">{r.needsYou} waiting on you</span>)
-  if (r.unfinished.stuck > 0) bits.push(<span className="rp-warn">{r.unfinished.stuck} stuck</span>)
-  if (r.unfinished.moving > 0) bits.push(`${r.unfinished.moving} moving`)
+  if (!r.statusCounts) return <>Shared status unavailable; open the repository to check.</>
+  if (r.statusCounts.blocked > 0) bits.push(<span className="rp-warn">{r.statusCounts.blocked} blocked</span>)
+  if (r.statusCounts.awaiting_party > 0) bits.push(`${r.statusCounts.awaiting_party} awaiting a named party`)
+  if (r.statusCounts.reassessment_needed > 0) bits.push(`${r.statusCounts.reassessment_needed} reassessment needed`)
+  if (r.statusCounts.active > 0) bits.push(`${r.statusCounts.active} active`)
   if (bits.length === 0 && r.unfinished.total > 0) bits.push(`${r.unfinished.total} unfinished`)
   if (bits.length === 0) return <>{r.agents > 0 ? 'Connected, nothing in progress' : 'No agent connected'}</>
   return <>{!r.complete && 'at least '}{bits.map((b, i) => <Fragment key={i}>{i > 0 && ', '}{b}</Fragment>)}</>
@@ -193,8 +196,10 @@ function Focus({ row: r, stacked, current, onOpen, opening }: { row: RepositoryR
           <span className="rp-focus-name"><span>{owner}/</span><b>{rest.join('/')}</b>{r.repository === current && ' · open now'}</span>
           <h2><em>{atLeast(r, r.needsYou)} {r.needsYou === 1 ? 'thing is' : 'things are'}</em> waiting on you.</h2>
           <div className="rp-facts">
-            <span><i className="rp-dot warn" aria-hidden="true" />{atLeast(r, r.unfinished.stuck)} stuck</span>
-            <span><i className="rp-dot brand" aria-hidden="true" />{atLeast(r, r.unfinished.moving)} moving</span>
+            <span><i className="rp-dot warn" aria-hidden="true" />{atLeast(r, r.statusCounts?.blocked ?? 0)} blocked</span>
+            <span><i className="rp-dot brand" aria-hidden="true" />{atLeast(r, r.statusCounts?.active ?? 0)} active</span>
+            {!!r.statusCounts?.awaiting_party && <span>{r.statusCounts.awaiting_party} awaiting a named party</span>}
+            {!!r.statusCounts?.reassessment_needed && <span>{r.statusCounts.reassessment_needed} reassessment needed</span>}
             <span>{atLeast(r, r.agents)} {r.agents === 1 ? 'agent' : 'agents'} connected</span>
             {r.lastActivityAt && <span>active {lastActive(r)}</span>}
           </div>
@@ -454,4 +459,4 @@ function Rail({ current, overview, rows }: { current: string | null; overview: W
 }
 
 const summary = (r: RepositoryRow) =>
-  `${r.needsYou ? `${atLeast(r, r.needsYou)} need you` : 'Nothing needs you'}; ${atLeast(r, r.unfinished.total)} unfinished, ${r.unfinished.stuck} stuck; ${plural(r.agents, 'agent')} connected.`
+  `${r.needsYou ? `${atLeast(r, r.needsYou)} need you` : r.complete && r.statusCounts ? 'Nothing needs you' : 'No personal action observed in partial coverage'}; ${atLeast(r, r.unfinished.total)} unfinished, ${r.statusCounts?.blocked ?? 0} blocked, ${r.statusCounts?.awaiting_party ?? 0} awaiting a named party, ${r.statusCounts?.reassessment_needed ?? 0} reassessment needed; ${plural(r.agents, 'agent')} connected.`

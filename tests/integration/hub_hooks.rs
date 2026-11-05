@@ -284,6 +284,13 @@ async fn session_end_pauses_known_work_without_claiming_completion() {
     let secret = hub.agent();
     let session = "11111111-2222-3333-4444-555555555555";
     let start_answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
+    assert!(start_answer.to_string().contains("actions need you"));
+    assert!(start_answer.to_string().contains("Coverage incomplete"));
+    assert!(
+        start_answer
+            .to_string()
+            .contains("provider times shown separately")
+    );
     let start_context = text_at(&start_answer, CLAUDE_CONTEXT);
     assert!(
         start_context.contains("AgentSCM shared work"),

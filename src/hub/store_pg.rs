@@ -10157,9 +10157,30 @@ impl Store for PgStore {
     }
 
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
+        self.work_get_scoped(&WorkLifecycleReader::Token(token), id, now)
+    }
+
+    fn work_get_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
         self.run(true, |client| {
             let mut tx = client.transaction()?;
-            let who = work_who(&mut tx, token, now)?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
             let item = scoped_work(&mut tx, &who, id, now, false)?;
             tx.commit()?;
             Ok(item)
@@ -10172,6 +10193,15 @@ impl Store for PgStore {
         id: &str,
         now: i64,
     ) -> Result<Option<declarations::ReconciliationView>> {
+        self.work_reconciliation_get_scoped(&WorkLifecycleReader::Token(token), id, now)
+    }
+
+    fn work_reconciliation_get_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<declarations::ReconciliationView>> {
         super::work::validate_id("work", id, "wrk")?;
 
         self.run(true, |client| {
@@ -10180,7 +10210,19 @@ impl Store for PgStore {
                 .isolation_level(IsolationLevel::RepeatableRead)
                 .start()?;
 
-            let who = work_who(&mut tx, token, now)?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
 
             let Some(item) = scoped_work(&mut tx, &who, id, now, false)? else {
                 return Ok(None);
@@ -12878,10 +12920,31 @@ impl Store for PgStore {
         query: &CoordinationListQuery,
         now: i64,
     ) -> Result<CoordinationInbox> {
+        self.coordination_list_scoped(&WorkLifecycleReader::Token(token), query, now)
+    }
+
+    fn coordination_list_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        query: &CoordinationListQuery,
+        now: i64,
+    ) -> Result<CoordinationInbox> {
         query.validate()?;
         self.run(true, |client| {
             let mut tx = client.transaction()?;
-            let who = work_who(&mut tx, token, now)?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
             let page = coordination_page(
                 &mut tx,
                 &who,

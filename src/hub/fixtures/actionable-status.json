@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "repository": "acme/widgets",
+  "repository_id": 101,
+  "provider": "github",
+  "host": "github.com",
+  "viewer_owner": "usr_synthetic_viewer",
+  "work": [
+    {
+      "work_id": "wrk_11111111111111111111111111111111",
+      "title": "Own blocker",
+      "generation": 1,
+      "updated_seq": 1,
+      "state": "blocked",
+      "recipient": {
+        "kind": "lead_agent",
+        "owner": "usr_synthetic_viewer",
+        "login": "viewer",
+        "agent": "codex"
+      },
+      "needs_you": true,
+      "action": "Review the reported blocker and identify its next action.",
+      "reported_next_action": null,
+      "freshness": "active",
+      "operational": {
+        "outcome": {
+          "value": "none",
+          "provenance": "unknown"
+        },
+        "report": null,
+        "reservation": {
+          "status": "held",
+          "basis": "admitted",
+          "holder_agent": "codex",
+          "scope_count": 1
+        },
+        "merge": {
+          "hidden_by_merged_pr": false,
+          "status": "unknown"
+        },
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "reconciliation": null,
+      "limits": [
+        "provider_coverage_unknown"
+      ]
+    },
+    {
+      "work_id": "wrk_22222222222222222222222222222222",
+      "title": "Other blocker",
+      "generation": 1,
+      "updated_seq": 2,
+      "state": "blocked",
+      "recipient": {
+        "kind": "lead_agent",
+        "owner": "usr_synthetic_other",
+        "login": "other",
+        "agent": "codex"
+      },
+      "needs_you": false,
+      "action": "Review the reported blocker and identify its next action.",
+      "reported_next_action": null,
+      "freshness": "active",
+      "operational": {
+        "outcome": {
+          "value": "none",
+          "provenance": "unknown"
+        },
+        "report": null,
+        "reservation": {
+          "status": "held",
+          "basis": "admitted",
+          "holder_agent": "codex",
+          "scope_count": 1
+        },
+        "merge": {
+          "hidden_by_merged_pr": false,
+          "status": "unknown"
+        },
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "reconciliation": null,
+      "limits": [
+        "provider_coverage_unknown"
+      ]
+    },
+    {
+      "work_id": "wrk_33333333333333333333333333333333",
+      "title": "Review handover",
+      "generation": 1,
+      "updated_seq": 3,
+      "state": "awaiting_party",
+      "recipient": {
+        "kind": "person",
+        "owner": "usr_synthetic_viewer",
+        "login": "viewer",
+        "agent": null
+      },
+      "needs_you": true,
+      "action": "Review the handover and choose the next responsible party.",
+      "reported_next_action": null,
+      "freshness": "active",
+      "operational": {
+        "outcome": {
+          "value": "none",
+          "provenance": "unknown"
+        },
+        "report": null,
+        "reservation": {
+          "status": "held",
+          "basis": "admitted",
+          "holder_agent": "codex",
+          "scope_count": 1
+        },
+        "merge": {
+          "hidden_by_merged_pr": false,
+          "status": "unknown"
+        },
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "reconciliation": null,
+      "limits": [
+        "provider_coverage_unknown"
+      ]
+    },
+    {
+      "work_id": "wrk_44444444444444444444444444444444",
+      "title": "Current work",
+      "generation": 1,
+      "updated_seq": 4,
+      "state": "active",
+      "recipient": {
+        "kind": "lead_agent",
+        "owner": "usr_synthetic_viewer",
+        "login": "viewer",
+        "agent": "codex"
+      },
+      "needs_you": false,
+      "action": "Continue the reported work; activity is not independently observed.",
+      "reported_next_action": null,
+      "freshness": "active",
+      "operational": {
+        "outcome": {
+          "value": "none",
+          "provenance": "unknown"
+        },
+        "report": null,
+        "reservation": {
+          "status": "held",
+          "basis": "admitted",
+          "holder_agent": "codex",
+          "scope_count": 1
+        },
+        "merge": {
+          "hidden_by_merged_pr": false,
+          "status": "unknown"
+        },
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "reconciliation": null,
+      "limits": [
+        "provider_coverage_unknown"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "request:synthetic",
+      "kind": "directed_request",
+      "work_ids": [
+        "wrk_33333333333333333333333333333333"
+      ],
+      "recipients": [
+        {
+          "kind": "person",
+          "owner": "usr_synthetic_viewer",
+          "login": "viewer",
+          "agent": null
+        }
+      ],
+      "needs_you": true,
+      "action": "Answer the outstanding directed coordination request.",
+      "updated_seq": 5,
+      "limits": []
+    }
+  ],
+  "counts": {
+    "active": 1,
+    "awaiting_party": 1,
+    "blocked": 2,
+    "reassessment_needed": 0,
+    "retired": 0,
+    "held_reservations": 4,
+    "needs_you": 3
+  },
+  "observed_at": 1700000000,
+  "complete": false,
+  "atomic_snapshot": false,
+  "limits": [
+    "failed_check_attention_not_integrated",
+    "capacity_attention_not_integrated"
+  ],
+  "digest": "2222222222222222222222222222222222222222222222222222222222222222"
+}
