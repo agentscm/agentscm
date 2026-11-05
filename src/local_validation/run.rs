@@ -187,7 +187,7 @@ pub fn command_selections(
         GIT_OUTPUT,
     )?;
     let parts: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
-    if parts.len() % 2 != 0 {
+    if !parts.len().is_multiple_of(2) {
         return Err(Error::Invalid("invalid Git path status output".into()));
     }
     let mut paths = std::collections::BTreeSet::new();
