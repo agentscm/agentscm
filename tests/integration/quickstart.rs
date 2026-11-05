@@ -3990,7 +3990,11 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
     let said = doctor(&[]);
     assert_eq!(
         said.lines().collect::<Vec<_>>(),
-        ["claude session quickstart-session: ready (MCP seen, native edit hook seen)."],
+        [
+            "claude session quickstart-session: ready (MCP seen, native edit hook seen).",
+            "Agent instructions are not current: CLAUDE.md is missing; AGENTS.md is missing. \
+             Run `agentscm init-repo` to preview and write them.",
+        ],
         "{said}"
     );
     let rows: Value = serde_json::from_str(&doctor(&["--json"])).unwrap();
