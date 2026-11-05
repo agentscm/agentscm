@@ -94,6 +94,21 @@ pub struct CatchupRepositoryScope {
     pub repository_id: Option<i64>,
 }
 
+impl CatchupRepositoryScope {
+    /// `limit` refused a write to this repository.
+    pub fn capacity(&self, limit: super::capacity::CapacityLimit) -> super::HubError {
+        super::HubError::capacity(
+            limit,
+            Some(super::capacity::CapacityRepository {
+                provider: self.provider.clone(),
+                host: self.host.clone(),
+                repository: self.repository.clone(),
+                repository_id: self.repository_id,
+            }),
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewCatchupMerge {
     pub source: CatchupMergeSource,

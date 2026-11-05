@@ -395,9 +395,7 @@ pub(crate) fn map_hub_error(error: HubError) -> Error {
         )),
         HubError::Unauthorized => Error::Invalid("hub authentication required".into()),
         HubError::Busy => Error::Invalid("hub busy".into()),
-        HubError::WorkCapacity => Error::Invalid(
-            "repository work storage capacity reached; operator compaction required".into(),
-        ),
+        error @ HubError::WorkCapacity(_) => Error::Invalid(error.to_string()),
         HubError::WorkOverlap(_) => {
             Error::Invalid("declared work scope overlaps another assignment".into())
         }

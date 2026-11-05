@@ -61,9 +61,16 @@ pub async fn blocking<T: Send + 'static>(
         .clone()
         .try_acquire_owned()
         .map_err(|_| HubError::Busy)?;
+    let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        work()
+        let result = work();
+        // Every Hub path reaches the store through here, so each capacity refusal is recorded
+        // once for the operator. The refused write already rolled back.
+        if let Err(HubError::WorkCapacity(capacity)) = &result {
+            super::capacity::record(&*store, capacity, unix_now());
+        }
+        result
     })
     .await
     .map_err(|_| HubError::Unavailable("blocking task failed".into()))?
@@ -338,10 +345,13 @@ impl From<HubError> for ApiError {
                 code: "busy",
                 detail: serde_json::Map::new(),
             },
-            HubError::WorkCapacity => Self {
+            HubError::WorkCapacity(capacity) => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "work_storage_capacity",
-                detail: serde_json::Map::new(),
+                detail: serde_json::Map::from_iter([(
+                    "limit".to_owned(),
+                    json!(capacity.limit.as_str()),
+                )]),
             },
             HubError::WorkOverlap(_) => Self {
                 status: StatusCode::CONFLICT,
@@ -466,10 +476,24 @@ pub(super) fn bearer(parts: &Parts) -> std::result::Result<&str, ApiError> {
 
 async fn health(State(state): State<HubState>) -> Response {
     let store = state.store.clone();
-    match blocking(&state, move || store.ping()).await {
-        Ok(()) => {
+    let now = unix_now();
+    match blocking(&state, move || {
+        store.ping()?;
+        // A failed refusal read is reported as unknown, not as an unhealthy store.
+        Ok(store.capacity_refusals(now).ok())
+    })
+    .await
+    {
+        Ok(refusals) => {
+            // Public, so a count and a time only: repositories and remedies need the admin route.
+            let capacity = refusals.map(|rows| {
+                json!({"recent_limits": rows.iter()
+                        .filter(|r| r.at > now - super::capacity::RECENT_SECONDS).count(),
+                    "last_refused_at": rows.first().map(|r| r.at)})
+            });
             let mut body = json!({"status": "ok", "storage": state.store.backend(),
                 "coordination": super::session::coordination(),
+                "capacity": capacity,
                 "version": env!("CARGO_PKG_VERSION"),
                 "commit": (!crate::BUILD_COMMIT.is_empty()).then_some(crate::BUILD_COMMIT)});
             if state.demo {
@@ -642,14 +666,18 @@ mod tests {
 
     #[tokio::test]
     async fn work_capacity_has_an_actionable_public_error_code() {
-        let response = ApiError::from(HubError::WorkCapacity).into_response();
+        let refused = HubError::capacity(
+            super::super::capacity::CapacityLimit::CoordinationRequests,
+            None,
+        );
+        let response = ApiError::from(refused).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            json!({"error": "work_storage_capacity"})
+            json!({"error": "work_storage_capacity", "limit": "coordination_requests"})
         );
     }
 }

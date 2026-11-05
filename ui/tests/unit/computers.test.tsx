@@ -169,6 +169,24 @@ describe('AdminPage', () => {
     expect(screen.getByText('maria')).toBeTruthy()
   })
 
+  it('names the repository and what to run when a capacity limit turned agents away', async () => {
+    const remedy = 'Resolve or withdraw open coordination requests from the Inbox; at most 100 are open per repository, 25 per person and 8 per agent token.'
+    stubFetch({
+      'GET /v1/hub/session': () => ({ status: 200, body: SESSION }),
+      'GET /v1/hub/admin/repositories': () => ({ status: 200, body: { repositories: [] } }),
+      'GET /v1/hub/admin/sign-in-refusals': () => ({ status: 200, body: { refusals: [] } }),
+      'GET /v1/hub/admin/devices': () => ({ status: 200, body: { devices: [] } }),
+      'GET /v1/hub/admin/capacity-refusals': () => ({ status: 200, body: { refusals: [{ limit: 'coordination_requests', what: 'too many coordination requests are open', provider: 'github', host: 'github.com', repository: 'counterbranch/agentscm', repository_id: 101, at: 1_790_000_000, count: 2, remedy, recent: true }, { limit: 'work_storage', what: 'bad\u0000', provider: 'github', host: 'github.com', repository: 'not a repository', at: 1, count: 1, remedy: 'x', recent: false }] } }),
+    })
+    render(<Admin token="read-only-token" />)
+    expect(await screen.findByText('A capacity limit turned agents away')).toBeTruthy()
+    expect(screen.getByText('counterbranch/agentscm')).toBeTruthy()
+    expect(screen.getByText('Refused because too many coordination requests are open.')).toBeTruthy()
+    expect(screen.getByText(remedy)).toBeTruthy()
+    expect(screen.getByText('Last day')).toBeTruthy()
+    expect(screen.queryByText('not a repository')).toBeNull()
+  })
+
   it('stays closed to people who aren’t Hub admins', async () => {
     const calls = stubFetch({ 'GET /v1/hub/session': () => ({ status: 200, body: { ...SESSION, admin: false } }) })
     render(<Admin token="read-only-token" />)

@@ -15,6 +15,7 @@ use crate::hub::catchup::{
     CatchupRepositoryScope, CatchupSourceStatus, NewCatchupMerge,
 };
 
+use super::capacity::CapacityRefusal;
 use super::change_record::{SharedBodyAccess, SharedBodyRow, SharedBodyState};
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
@@ -307,6 +308,12 @@ pub trait Store: Send + Sync {
     fn record_refusal(&self, refusal: &Refusal) -> Result<()>;
     /// Newest first, within `REFUSAL_SECONDS` of `now`.
     fn refusals(&self, now: i64) -> Result<Vec<Refusal>>;
+    /// Records a capacity refusal: one row per repository and limit; a repeat adds its count
+    /// and keeps the newest `at`. Prunes rows past `capacity::RETAIN_SECONDS` and beyond the
+    /// newest `capacity::MAX_REFUSALS`.
+    fn record_capacity_refusal(&self, refusal: &CapacityRefusal) -> Result<()>;
+    /// Newest first, within `capacity::RETAIN_SECONDS` of `now`.
+    fn capacity_refusals(&self, now: i64) -> Result<Vec<CapacityRefusal>>;
     /// Connected repositories with the computers and live agent tokens using each.
     fn repository_usage(&self, now: i64) -> Result<Vec<RepositoryUsage>>;
     /// A web-page sign-in for an enabled `owner`, until `expires_at`. Expired rows go, and a

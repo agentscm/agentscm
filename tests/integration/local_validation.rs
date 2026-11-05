@@ -981,7 +981,7 @@ fn repository_policy_and_recipe_keep_their_canonical_bytes() {
     let policy = ValidationPolicy::from_slice(&policy_bytes).unwrap();
     assert_eq!(
         recipe.sha256().unwrap(),
-        "15bb5b011dd1abf9de64a277271d3f452589a0bf51bad556e7e1e6c7499eb83c"
+        "e0d6b6b2dfd0350c7a0b1a745d4901248a9a8441a09f3cc9335f81c4369657cc"
     );
     assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
     assert_eq!(
@@ -1222,7 +1222,14 @@ mod scoped {
                 &["install.sh"],
                 &[RUST, &["shellcheck", "npm-installer"]].concat(),
             ),
-            (&["docs/example.md"], &[RUST, DOCS].concat()),
+            (&["docs/example.md"], DOCS),
+            (&["docs/advanced/nested.md"], DOCS),
+            (&["docs-site/astro.config.mjs"], DOCS),
+            (&["docs/assets/agentscm-icon.png"], &[RUST, DOCS].concat()),
+            (&["docs/example.md", "src/a.rs"], &[RUST, DOCS].concat()),
+            (&["README.md", "AGENTS.md", ".agents/commands/pr.md"], &[]),
+            (&[".agents/bound-target.sh"], RUST),
+            (&[".github/pull_request_template.md"], &["workflow-lint"]),
             (
                 &[".github/workflows/zizmor.yml"],
                 &[RUST, &["workflow-lint"]].concat(),
