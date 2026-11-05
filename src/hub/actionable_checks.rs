@@ -47,6 +47,24 @@ fn required(name: &str) -> bool {
         })
 }
 
+/// The legacy context and the Hub's own checks keep the "Required check" wording. Named
+/// local-validation contexts are reported by name shape, and may be non-required while a
+/// repository migrates, so their text makes no claim about merge requirements.
+fn failed_check_text(name: &str, state: &str, number: impl std::fmt::Display) -> String {
+    if name
+        .strip_prefix(LOCAL_VALIDATION)
+        .is_some_and(|rest| rest.starts_with('/'))
+    {
+        format!(
+            "Local validation check {name} reports {state} on pull request #{number}; fix or rerun it."
+        )
+    } else {
+        format!(
+            "Required check {name} reports {state} on pull request #{number}; fix or rerun it before merging."
+        )
+    }
+}
+
 fn person(owner: &str, login: &str) -> StatusRecipient {
     StatusRecipient {
         kind: RecipientKind::Person,
@@ -329,9 +347,7 @@ pub(super) fn read(
                         id,
                         "failed_check",
                         people.of(Some(&pr), None)?,
-                        format!(
-                            "Required check {name} reports {state} on pull request #{number}; fix or rerun it before merging."
-                        ),
+                        failed_check_text(name, state, number),
                         semantic,
                         viewer,
                     ));
@@ -428,7 +444,23 @@ pub(super) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::required;
+    use super::{failed_check_text, required};
+
+    #[test]
+    fn failed_check_text_is_unchanged_for_legacy_and_hub_and_plain_for_named_contexts() {
+        for name in ["agentscm/local-validation", "agentscm/workflow/main"] {
+            assert_eq!(
+                failed_check_text(name, "failure", 5),
+                format!(
+                    "Required check {name} reports failure on pull request #5; fix or rerun it before merging."
+                )
+            );
+        }
+        assert_eq!(
+            failed_check_text("agentscm/local-validation/static", "error", 7),
+            "Local validation check agentscm/local-validation/static reports error on pull request #7; fix or rerun it."
+        );
+    }
 
     #[test]
     fn named_local_validation_contexts_are_required_and_look_alikes_are_not() {

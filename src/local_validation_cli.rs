@@ -582,12 +582,13 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
             MAX_INPUT_BYTES,
         )
     };
-    let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")?)?;
-    // Any load failure writes nothing, like the other configuration errors.
+    // Any load failure writes nothing, like the other configuration errors. The load also
+    // refuses a symbolic-link `registry.json` when a manifest is in use, so it runs first.
     let loaded =
         agentscm::local_validation::checks::load(&args.repo.join(&args.config_dir), &|path| {
             read_bounded(path, MAX_INPUT_BYTES)
         })?;
+    let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")?)?;
     for check in &loaded {
         if check.policy.repository != format!("github.com/{}", args.github_repo) {
             eprintln!("policy repository does not match --github-repo; nothing written");

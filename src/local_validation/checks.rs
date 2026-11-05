@@ -64,15 +64,55 @@ fn check_policy_recipe(policy: &ValidationPolicy, recipe: &ValidationRecipe) -> 
     Ok(())
 }
 
+/// With a manifest, no path the load depends on may be a symbolic link: `registry.json`, each
+/// component of a check directory under `root`, and its `policy.json` and `recipe.json`.
+fn refuse_symlinks(root: &Path, dir: &Path) -> Result<()> {
+    let refuse_link = |path: PathBuf| -> Result<()> {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(invalid(format!(
+                "{} must not be a symbolic link",
+                path.strip_prefix(root).unwrap_or(&path).display()
+            ))),
+            Ok(_) => Ok(()),
+            // A missing file is reported by the read that follows.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    };
+    if dir.as_os_str().is_empty() {
+        return refuse_link(root.join("registry.json"));
+    }
+    let mut path = root.to_path_buf();
+    for component in dir.components() {
+        path.push(component);
+        refuse_link(path.clone())?;
+    }
+    refuse_link(path.join("policy.json"))?;
+    refuse_link(path.join("recipe.json"))
+}
+
 /// Loads every check under `root`. `read` returns a file's bytes, bounded; a missing manifest is
 /// the only read failure that is not an error. Any problem fails the whole load.
 pub fn load(root: &Path, read: &dyn Fn(&Path) -> Result<Vec<u8>>) -> Result<Vec<LoadedCheck>> {
+    // A dangling `checks.json` link reads as absent, so it is refused before any read.
+    match std::fs::symlink_metadata(root.join(MANIFEST_FILE)) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(invalid("checks.json must not be a symbolic link"));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     let manifest = match read(&root.join(MANIFEST_FILE)) {
         Ok(bytes) => Some(bytes),
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
+    let manifest_in_use = manifest.is_some();
     let load_one = |dir: &Path| -> Result<(ValidationPolicy, ValidationRecipe)> {
+        if manifest_in_use {
+            refuse_symlinks(root, dir)?;
+        }
         let policy = ValidationPolicy::from_slice(&read(&root.join(dir).join("policy.json"))?)?;
         let recipe = ValidationRecipe::from_slice(&read(&root.join(dir).join("recipe.json"))?)?;
         check_policy_recipe(&policy, &recipe)?;
@@ -86,6 +126,7 @@ pub fn load(root: &Path, read: &dyn Fn(&Path) -> Result<Vec<u8>>) -> Result<Vec<
             recipe,
         }]);
     };
+    refuse_symlinks(root, Path::new(""))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
     if manifest.schema_version != 1 {
         return Err(invalid("checks.json schema_version must be 1"));
@@ -193,6 +234,54 @@ mod tests {
     }
 
     const TWO: &str = r#"{"schema_version":1,"checks":[{"name":"Unit","dir":"."},{"name":"Static","dir":"static"}]}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_refuses_symbolic_links() {
+        use std::os::unix::fs::symlink;
+        let fresh = || {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), ".", Some("unit"), false);
+            write(dir.path(), "static", Some("static"), true);
+            fs::write(dir.path().join("registry.json"), "{}").unwrap();
+            manifest(dir.path(), TWO);
+            dir
+        };
+        let refused = |dir: &tempfile::TempDir, what: &str| {
+            let error = load_dir(dir.path()).unwrap_err().to_string();
+            assert!(error.contains("symbolic link"), "{what}: {error}");
+        };
+        assert!(load_dir(fresh().path()).is_ok());
+
+        let dir = fresh();
+        fs::remove_file(dir.path().join(MANIFEST_FILE)).unwrap();
+        symlink("missing.json", dir.path().join(MANIFEST_FILE)).unwrap();
+        refused(&dir, "dangling checks.json");
+
+        let dir = fresh();
+        fs::rename(dir.path().join(MANIFEST_FILE), dir.path().join("real.json")).unwrap();
+        symlink("real.json", dir.path().join(MANIFEST_FILE)).unwrap();
+        refused(&dir, "checks.json");
+
+        let dir = fresh();
+        fs::rename(dir.path().join("static"), dir.path().join("elsewhere")).unwrap();
+        symlink("elsewhere", dir.path().join("static")).unwrap();
+        refused(&dir, "check directory");
+
+        for file in ["policy.json", "recipe.json"] {
+            let dir = fresh();
+            let path = dir.path().join("static").join(file);
+            fs::rename(&path, dir.path().join("static").join("real")).unwrap();
+            symlink("real", &path).unwrap();
+            refused(&dir, file);
+        }
+
+        let dir = fresh();
+        let path = dir.path().join("registry.json");
+        fs::rename(&path, dir.path().join("real-registry")).unwrap();
+        symlink("real-registry", &path).unwrap();
+        refused(&dir, "registry.json");
+    }
 
     #[test]
     fn absent_manifest_is_one_legacy_check() {

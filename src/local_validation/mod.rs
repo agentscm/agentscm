@@ -1216,13 +1216,6 @@ fn assess_envelope(
         );
     }
     *standing = Standing::ThisCheck;
-    if report.registry_binding() != RegistryBindingStatus::Current {
-        return Verdict::failure(
-            Outcome::RegistryStale,
-            "issuer registry stale",
-            "registry changed since signing",
-        );
-    }
     match report.current_issuer_trust() {
         CurrentIssuerTrust::Trusted => {}
         CurrentIssuerTrust::ClockUncertain => {
@@ -1241,6 +1234,13 @@ fn assess_envelope(
             };
             return Verdict::failure(outcome, "issuer not trusted", format!("{other:?}"));
         }
+    }
+    if report.registry_binding() != RegistryBindingStatus::Current {
+        return Verdict::failure(
+            Outcome::RegistryStale,
+            "issuer registry stale",
+            "registry changed since signing",
+        );
     }
     match report.freshness() {
         Freshness::Fresh => {}

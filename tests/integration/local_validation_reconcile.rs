@@ -1857,7 +1857,9 @@ async fn a_new_head_or_a_revoked_key_leaves_no_check_green() {
                 .contains(&"success".to_owned()),
             "{context}"
         );
-        assert_eq!(env.last(context).0, "pending", "{context}");
+        let (state, description) = env.last(context);
+        assert_eq!(state, "pending", "{context}");
+        assert!(description.contains("signing key revoked"), "{description}");
     }
 }
 

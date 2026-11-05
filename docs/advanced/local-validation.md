@@ -142,7 +142,7 @@ The config directory (`--config-dir`, default `.github/local-validation`) may ho
     recipe.json
 ```
 
-Each entry reads `<dir>/policy.json` and `<dir>/recipe.json`; `registry.json` stays in the config directory. `name` is display text only. A check's identity comes from its policy alone: an optional `check_id` (`^[a-z0-9][a-z0-9-]{0,39}$`). Without `checks.json` the directory is exactly one legacy check with no name prefix, as before. The whole run fails closed with nothing written on: unknown fields, a `schema_version` other than 1, an empty list, more than 20 checks, an absolute `dir` or one containing `..`, duplicate identities, more than one policy without a `check_id`, a policy repository that differs from `--github-repo`, a recipe whose digest differs from its policy, or a recipe with constituents under a policy without a `check_id`.
+Each entry reads `<dir>/policy.json` and `<dir>/recipe.json`; `registry.json` stays in the config directory. `name` is display text only. A check's identity comes from its policy alone: an optional `check_id` (`^[a-z0-9][a-z0-9-]{0,39}$`). Without `checks.json` the directory is exactly one legacy check with no name prefix, as before. The whole run fails closed with nothing written on: unknown fields, a `schema_version` other than 1, an empty list, more than 20 checks, an absolute `dir` or one containing `..`, duplicate identities, more than one policy without a `check_id`, a policy repository that differs from `--github-repo`, a symbolic link at `checks.json` (a dangling one is refused, not read as absent), `registry.json`, a check directory component, or a `policy.json` or `recipe.json`, a recipe whose digest differs from its policy, or a recipe with constituents under a policy without a `check_id`.
 
 A grouped `static` recipe maps recipe command ids to constituents (policy `{"check_id":"static", ...}`; recipe excerpt):
 
@@ -159,7 +159,7 @@ A grouped `static` recipe maps recipe command ids to constituents (policy `{"che
                  {"id":"react-doctor","name":"React Doctor","commands":["doctor"]}]}
 ```
 
-The independent unit recipe at the config root has an ordinary recipe with no `constituents`, and its policy sets `"check_id":"unit"` once it is migrated (see below). A constituent needs a unique id (same charset as `check_id`), a name of 1 to 64 characters without control characters, and commands that are existing recipe command ids, each in at most one constituent. Commands in no constituent (setup, for example) are allowed. Constituents are part of the recipe digest, so they are bound through the policy into the signature.
+The independent unit recipe at the config root has an ordinary recipe with no `constituents`. The unit check keeps its policy with no `check_id` and the legacy context. Adopting a `check_id` for it later is a separate deliberate move: it is a new context with new evidence, the ruleset changes first, and it cannot roll back to an older binary while that policy is in place. A constituent needs a unique id (same charset as `check_id`), a name of 1 to 64 characters without control characters, and commands that are existing recipe command ids, each in at most one constituent. Commands in no constituent (setup, for example) are allowed. Constituents are part of the recipe digest, so they are bound through the policy into the signature.
 
 ### Context naming
 
@@ -175,14 +175,14 @@ Status descriptions are `<Check>: <reason>` for the aggregate and `<Check>: <Con
 
 | Outcome | State | Description (reason) |
 |---|---|---|
-| passed | success | `validated` |
-| failed | failure | `outcome not pass`, or `incomplete run` when the commands differ from what the changed paths require |
+| passed | success | Aggregate: `validated`. A constituent reports `passed`. |
+| failed | failure | Aggregate, the first that applies: `command did not exit`, `command failed`, `capture incomplete`, `output truncated`, `required service missing`, `tree changed` (from the signed results), `incomplete run` (the commands differ from what the changed paths require), or `outcome not pass` (the signed payload outcome is not a pass). A constituent whose mapped command failed reports `failed`. |
 | missing | pending | `no attestation for this head` |
 | stale head | pending | `attestation is for a different head` (an attestation for this check exists, but not for this head) |
 | stale policy | pending | `attestation predates the current policy` |
 | expired | pending | `attestation expired` (older than the policy maximum age) |
-| revoked | pending | `attestation signing key revoked` |
-| registry stale | pending | `issuer registry changed since attestation` |
+| revoked | pending | `attestation signing key revoked`. A real revocation edits `registry.json`, which also changes the registry digest; the revocation is checked first and is the reason reported. |
+| registry stale | pending | `issuer registry changed since attestation` (a registry change that does not revoke the signing key) |
 | unverified coverage | failure | `coverage mismatch`: the signed coverage differs from the signed record |
 | exempt / not required | success | `not required: only exempt paths changed` for the aggregate and every constituent; a constituent none of whose commands the changed paths require is `not required` |
 | did not run | pending | `did not run: an earlier command failed` (a constituent whose required command never ran) |
@@ -203,10 +203,18 @@ Commit statuses are written with `statuses: write`, the integration the existing
 - Check runs (statuses only).
 - Restricting a check to particular issuers: any enrolled issuer may attest any check.
 - A separate workflow caller per check.
-- Stale tombstones for retired contexts: an old context stays on old heads, where it is harmless once it is not required.
+- Stale tombstones for retired contexts: an old context stays on old heads, where it is harmless once it is not required. On open heads the invalidation step resets its `success` to `pending`, where it stays.
 - Replacing a context that a repository stops listing: nothing writes to it again.
 
-A change to the config directory requires every command of every check, as for a single check. The `Invalidate stale successes` step resets every `success` among the contexts that are exactly `agentscm/local-validation` or `agentscm/local-validation/<name>[/<name>]` (names of `[a-z0-9-]`) to `pending` on each open head, ignoring look-alike contexts such as `agentscm/local-validation-foo`. When its status read fails, prefixed contexts cannot be enumerated, so it resets only the legacy context; `reconcile` invalidates the prefixed ones once setup succeeds. A head opted into one check shows `pending` on the others: `no attestation for this head`.
+A change to the config directory requires every command of every check, as for a single check. The `Invalidate stale successes` step resets every `success` among the contexts that are exactly `agentscm/local-validation` or `agentscm/local-validation/<name>[/<name>]` (names of `[a-z0-9-]`) to `pending` on each open head, ignoring look-alike contexts such as `agentscm/local-validation-foo`. A head opted into one check shows `pending` on the others: `no attestation for this head`.
+
+Retired contexts: the step resets a retired context's `success` to `pending` on open heads, and it stays `pending` permanently. That is safe but yellow, because `reconcile` no longer owns a retired context and never writes it again. If the step cannot read or write the status, the old `success` lasts until the next run.
+
+Read-failure limit: when the step's status read fails, prefixed contexts cannot be enumerated, so it writes `pending` to the legacy context only. In a repository where every check has a `check_id`, that legacy `pending` is a status nothing owns, and it opts the head into the family. No false `success` results, but the head carries a legacy `pending` until the head moves. The workflow is not changed for this.
+
+Scale: invalidating first writes two statuses per context per head per sweep (the `pending` and then the verdict). With 7 contexts and 50 open heads that is about 700 writes. If GitHub rate limits the writes during invalidation, no verdict is written and the heads stay `pending` until a later run.
+
+Hub reporting: the Hub reports a failing `agentscm/local-validation/...` context by name shape, not by ruleset membership, so a new-family context that is still non-required during migration can appear as an action. It reports one action per failing context. A retired context left in `failure` on an open head stays reported until the head moves. The legacy context and the Hub's own checks keep the existing "Required check" wording; named local-validation contexts read "Local validation check <name> reports <state> on pull request #<number>; fix or rerun it."
 
 ### Producing evidence for a check that failed
 
@@ -219,11 +227,18 @@ Do these in order, and stop at any step that does not behave as described.
 1. Keep the existing policy and context unchanged, with no `check_id`, so outstanding evidence stays valid.
 2. Only after a release that includes this behavior exists, bump the pinned release and the reusable workflow commit SHA in the caller.
 3. Add `checks.json` with the existing check as `{"name":"Unit tests","dir":"."}` and the new `static` check in its own directory.
-4. Produce static evidence on real pull requests and observe the new contexts as non-required.
+4. Produce static evidence on real pull requests and observe the new contexts as non-required. From a clean checkout, sign and post it with the check's own recipe and policy and the shared registry:
+
+   ```sh
+   agentscm local-validation run --recipe <config>/static/recipe.json --policy <config>/static/policy.json --registry <config>/registry.json --key-file <abs-key-file> --issuer-id <issuer> --state-dir <abs-state-dir> --config-dir <config>
+   agentscm local-validation post --state-dir <abs-state-dir> --attestation <sha256> --github-repo OWNER/NAME --pr <n> --token-file <abs-token-file>
+   ```
+
+   `tools/attest-pr.sh` reads the root configuration only, so it cannot attest a subdirectory check and is left as it is.
 5. Only then does a repository operator add the new contexts to the ruleset, bound to integration `15368`.
 6. Only then remove the hosted checks that the new contexts replace.
 
-Rollback: the operator removes the new contexts from the ruleset first, then removes `checks.json` or pins back. Removing a required context from the configuration before the ruleset strands every pull request on a check that is never written. Older binaries ignore `checks.json` and read the root `policy.json`, and they refuse a policy that has a `check_id`. Nothing edits branch protection or a ruleset automatically. Stale successes for retired contexts stay on old heads and are harmless once those contexts are not required.
+Rollback: the operator removes the new contexts from the ruleset first, then removes `checks.json` or pins back. Removing a required context from the configuration before the ruleset strands every pull request on a check that is never written. Older binaries ignore `checks.json` and read the root `policy.json`, and they refuse a policy that has a `check_id`. Nothing edits branch protection or a ruleset automatically. Retired contexts are reset to `pending` on open heads and stay `pending`; they are harmless once those contexts are not required.
 
 ## Hosted CI and required checks
 

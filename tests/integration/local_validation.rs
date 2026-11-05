@@ -1746,6 +1746,16 @@ fn lifecycle_causes_are_distinct_non_success_and_chosen_only_by_authenticated_ev
     c.registry = revoked.clone();
     expect_cause(one(c, &revoked, known_now), Outcome::Revoked);
 
+    // A real revocation edits the registry after signing, so the registry digest changed too.
+    // The revocation is still the cause reported; a change that revokes nothing stays stale.
+    let signed_before_revocation = one(check("alpha"), &revoked, known_now);
+    assert_eq!(signed_before_revocation.outcome, Outcome::Revoked);
+    assert_eq!(signed_before_revocation.state, VerdictState::Pending);
+    assert_eq!(
+        signed_before_revocation.reason,
+        "attestation signing key revoked"
+    );
+
     let mut changed = registry();
     changed.epoch = 2;
     expect_cause(

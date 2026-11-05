@@ -56,6 +56,45 @@ pub struct IssueComment {
     pub html_url: Option<String>,
 }
 
+/// GitHub's limit on a status description, in characters.
+const DESCRIPTION_CHARS: usize = 140;
+
+/// A single-line status description. The reason is the useful part, so it stays whole (up to the
+/// limit) and the check and constituent labels give way to it, truncated by characters.
+fn describe(check: Option<&str>, constituent: Option<&str>, reason: &str) -> String {
+    let single_line = |text: &str, limit: usize| -> String {
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(limit)
+            .collect()
+    };
+    let reason = single_line(reason, DESCRIPTION_CHARS);
+    let labelled = [check, constituent]
+        .into_iter()
+        .flatten()
+        .fold(String::new(), |text, name| format!("{text}{name}: "));
+    let room = DESCRIPTION_CHARS - reason.chars().count();
+    format!("{}{reason}", single_line(&labelled, room))
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::describe;
+
+    #[test]
+    fn long_names_never_cut_off_the_reason() {
+        let (check, constituent) = ("é".repeat(64), "ü".repeat(64));
+        let reason = "issuer not trusted: Revoked";
+        let text = describe(Some(&check), Some(&constituent), reason);
+        assert!(text.ends_with(reason), "{text}");
+        assert!(text.chars().count() <= 140, "{text}");
+        assert_eq!(describe(Some("Unit"), None, "ok"), "Unit: ok");
+        assert_eq!(describe(None, None, "a\nb"), "a b");
+        let long = "r".repeat(300);
+        assert_eq!(describe(Some("Unit"), None, &long), "r".repeat(140));
+    }
+}
+
 impl IssueComment {
     fn parse(value: &Value) -> Option<Self> {
         let text = |key: &str| value[key].as_str().map(str::to_owned);
@@ -352,18 +391,11 @@ impl Context<'_> {
     ) -> bool {
         // The names come from trusted configuration; the reason can derive from untrusted text.
         // Single line, bounded.
-        let labelled = [
+        let description = describe(
             self.check_name,
             slot.constituent.as_ref().map(|(_, name)| name.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(String::new(), |text, name| format!("{text}{name}: "));
-        let description: String = format!("{labelled}{reason}")
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .take(140)
-            .collect();
+            reason,
+        );
         let status = CommitStatus::new(head, state, &slot.context, &description).and_then(|s| {
             // An unusable API-supplied link falls back to the configured one.
             link.and_then(|u| s.clone().with_target_url(u).ok())
