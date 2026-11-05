@@ -50,9 +50,10 @@ elif args[:2] == ['image', 'inspect']:
     elif mode != 'missing-platform': print('linux/arm64')
 elif args[0] == 'compose':
     profile = args[args.index('--profile') + 1]
-    assert '--env-file' in args and args[args.index('--env-file') + 1] == '/dev/null'
-    assert not any(k.startswith('AGENTSCM_GITHUB') or k.startswith('AGENTSCM_GITLAB') for k in os.environ)
-    if 'build' in args: raise AssertionError('profile rebuilt image')
+    if mode != 'legacy':
+        assert '--env-file' in args and args[args.index('--env-file') + 1] == '/dev/null'
+        assert not any(k.startswith('AGENTSCM_GITHUB') or k.startswith('AGENTSCM_GITLAB') for k in os.environ)
+        if 'build' in args: raise AssertionError('profile rebuilt image')
     if 'up' in args and mode == profile + '-fail': sys.exit(1)
     if 'down' in args and mode == profile + '-cleanup-fail': sys.exit(1)
     if 'port' in args:
@@ -69,7 +70,8 @@ elif args[0] == 'compose':
     curl.write_text('''#!/usr/bin/env python3
 import pathlib, sys
 root = pathlib.Path(__file__).resolve().parent.parent
-assert 'http://127.0.0.1:' + (root / 'port').read_text() + '/v1/hub/health' in sys.argv
+port = '7332' if (root / 'mode').read_text() == 'legacy' else (root / 'port').read_text()
+assert 'http://127.0.0.1:' + port + '/v1/hub/health' in sys.argv
 print('{"status":"ok"}')
 ''')
     curl.chmod(0o755)
@@ -86,6 +88,14 @@ print('{"status":"ok"}')
         assert (result.returncode == 0) == expected, (mode, result.stdout)
         calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
         return evidence, calls
+    for profile in ['default', 'postgres']:
+        prepare('legacy')
+        legacy = subprocess.run(['bash', str(repo / '.github/hub-e2e.sh'), profile],
+                                env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert legacy.returncode == 0, legacy.stdout
+        calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
+        assert len([c for c in calls if c[0] == 'compose' and 'build' in c]) == 1
+        assert not any(c[0] == 'compose' and 'port' in c for c in calls)
     evidence, calls = run('success', True)
     assert (evidence / 'result').read_text() == 'pass\n'
     assert (evidence / 'source').read_text() == f'qualification=locally-built-only\ncommit={git("rev-parse", "HEAD")}\ntree={git("rev-parse", "HEAD^{tree}")}\n'
@@ -136,5 +146,5 @@ print('{"status":"ok"}')
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
-    print('PASS synthetic Hub release orchestration (12 scenarios)')
+    print('PASS synthetic Hub release orchestration (14 scenarios)')
 PY
