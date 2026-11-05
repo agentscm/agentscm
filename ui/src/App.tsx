@@ -8,7 +8,7 @@ import { fragmentLinkRefused, LINK_REFUSED } from './fragmentToken.ts'
 import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, signInAfterRefusal, type Density, type ThemePref } from './storage.ts'
 import { useHub } from './useHub.ts'
 import { useHidden } from './dismiss.tsx'
-import { inboxBadge, type Asked } from './needs.ts'
+import { inboxBadge, setupBadge, type Asked } from './needs.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
@@ -180,6 +180,8 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
   if (dash.needs.length > 0) badges.home = { n: dash.needs.length, tone: dash.needs.some((n) => n.tone === 'bad') ? 'bad' : 'warn', tip: `${dash.needs.length} thing${dash.needs.length === 1 ? ' needs' : 's need'} you` }
   const inbox = inboxBadge(ov, asked, sharedStatus.kind === 'ready' ? sharedStatus.value : null)
   if (inbox.n > 0) badges.inbox = { n: inbox.n, tone: 'warn', tip: inbox.tip }
+  const setup = setupBadge(sharedStatus.kind === 'ready' ? sharedStatus.value : null)
+  if (setup.n > 0) badges.setup = { n: setup.n, tone: 'warn', tip: setup.tip }
   const finished = ov?.recent.filter((o) => o.kind === 'completion').length
   const statuses: TabStatuses = {
     home: dash.home,
@@ -195,7 +197,7 @@ function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailab
     workflows: { text: 'Recorded runs', tone: 'muted' },
     landed: { text: 'CI and deploys', tone: 'muted' },
     templates: { text: 'From this computer', tone: 'muted' },
-    setup: { text: 'Hooks and tokens', tone: 'muted' },
+    setup: setup.n ? { text: setup.n === 1 ? '1 agent needs setup' : `${setup.n} agents need setup`, tone: 'warn' } : { text: 'Hooks and tokens', tone: 'muted' },
     health: data.failing ? { text: 'Not answering', tone: 'bad' } : data.health ? { text: data.health.status === 'ok' ? 'Answering' : 'Degraded', tone: data.health.status === 'ok' ? 'ok' : 'warn' } : undefined,
     workspace: { text: 'Members and runs', tone: 'muted' },
     // Computers and Admin read the browser sign-in this shell already loaded, so their tabs say what that sign-in allows.

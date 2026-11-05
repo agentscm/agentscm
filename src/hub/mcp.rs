@@ -1348,9 +1348,10 @@ async fn call(
         )
     {
         let store = state.store.clone();
+        let setup = state.onboarding.clone();
         let scope = principal.clone();
         let status = blocking(state, move || {
-            super::work_http::actionable_status::read(&*store, &scope, unix_now())
+            super::work_http::actionable_status::read(&*store, &setup, &scope, unix_now())
         })
         .await
         .ok()
@@ -2021,10 +2022,11 @@ async fn call_inner(
             return Ok(invalid_args(name, &error));
         }
         let store = state.store.clone();
+        let setup = state.onboarding.clone();
         let scope = principal.clone();
         return Ok(
             match blocking(state, move || {
-                super::work_http::actionable_status::read(&*store, &scope, unix_now())
+                super::work_http::actionable_status::read(&*store, &setup, &scope, unix_now())
             })
             .await
             {

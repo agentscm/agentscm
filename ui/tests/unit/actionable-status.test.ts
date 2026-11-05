@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import type { ActionableStatus } from '../../src/actionableStatus.ts'
-import { inboxBadge, needsYou, needHideKey } from '../../src/needs.ts'
+import { inboxBadge, needsYou, needHideKey, setupBadge } from '../../src/needs.ts'
 import { decodeStatus, recipientLabel, statusLabel, statusProvenance } from '../../src/actionableStatus.ts'
 import { DashboardPage, dashboardStatus, SharedAnswer, SharedNeeds } from '../../src/pages/Dashboard.tsx'
 import type { WorkOverview } from '../../src/standup.ts'
@@ -103,6 +103,24 @@ describe('shared actionable status', () => {
     render(createElement(SharedNeeds, { status: { kind: 'ready', value: status, fetchedAt: 0, refreshError: null, retry: () => undefined } }))
     expect(screen.getByRole('link', { name: 'Open changes' }).getAttribute('href')).toBe('#landed')
     expect(screen.getByRole('link', { name: 'Open Skills' }).getAttribute('href')).toBe('#skills')
+  })
+  it('badges the viewer’s own agent setup problems and lists only those with Work in Needs you', () => {
+    const status = decodeStatus(fixture)
+    const base = status.actions[0]!
+    const viewer = { kind: 'person' as const, owner: status.viewer_owner, login: 'viewer', agent: null }
+    const other = { ...viewer, owner: 'usr_synthetic_other', login: 'other' }
+    status.actions = [
+      { ...base, id: 'setup:agent_trust_required:aaaa', kind: 'agent_setup', recipients: [viewer], needs_you: true, work_ids: ['wrk_11111111111111111111111111111111'], action: 'Your agent laptop needs its AgentSCM hooks and MCP server approved.' },
+      { ...base, id: 'setup:edit_hook_unverified:bbbb', kind: 'agent_setup', recipients: [viewer], needs_you: false, work_ids: [], action: 'Your agent laptop reached the Hub over MCP, but no edit hook has.' },
+      { ...base, id: 'setup:agent_token_expired:repository', kind: 'agent_setup', recipients: [other], needs_you: false, work_ids: [], action: 'Their token expired.' },
+    ]
+    status.counts.needs_you = status.work.filter((w) => w.needs_you).length + 1
+    expect(setupBadge(status)).toEqual({ n: 2, tip: '2 of your agents have setup problems' })
+    expect(setupBadge(null).n).toBe(0)
+    expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs.filter((n) => n.key.startsWith('setup:'))).toHaveLength(1)
+    expect(inboxBadge(null, undefined, status).n).toBe(0)
+    render(createElement(SharedNeeds, { status: { kind: 'ready', value: status, fetchedAt: 0, refreshError: null, retry: () => undefined } }))
+    expect(screen.getByRole('link', { name: 'Open Agents' }).getAttribute('href')).toBe('#setup')
   })
   it('labels provider failure and retained refresh results separately from clear status', () => {
     const status = decodeStatus(fixture)
