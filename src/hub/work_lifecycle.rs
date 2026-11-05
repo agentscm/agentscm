@@ -1086,6 +1086,15 @@ mod tests {
     }
 
     #[test]
+    fn the_reclaimed_hold_notice_masks_a_stored_host_label() {
+        let mut held = item(WorkState::Active);
+        held.lead_agent = "client-synthetic-host-abcdef12".into();
+        let notice = reclaimed_hold(&held, 3600).notice;
+        assert!(notice.contains("Its lead agent Agent abcd may"), "{notice}");
+        assert!(!notice.contains("synthetic-host"), "{notice}");
+    }
+
+    #[test]
     fn the_lapse_refusal_says_when_who_and_how_to_resume() {
         // A shell call kept this hold for an hour, so the text gives that, not the idle lease.
         let data = serde_json::json!({"renewed_at": 0, "expires_at": 3600, "branch": "feature/a"});

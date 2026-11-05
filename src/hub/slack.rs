@@ -901,14 +901,23 @@ impl Slack {
                 // The label alone cannot say which session: another of the repeater's own token
                 // would read as itself, and distinct agents of one token would read alike.
                 use crate::hub::session::same_agent;
-                let several = holding.iter().any(|other| {
-                    other.id != intent.id
-                        && other.token == intent.token
-                        && other.session.is_some()
-                        && !same_agent(&intent.token, &intent.via, other)
-                        && paths
-                            .iter()
-                            .any(|path| other.paths.iter().any(|spec| overlaps(path, key_of(spec))))
+                let sessions: Vec<&Intent> = holding
+                    .iter()
+                    .copied()
+                    .filter(|other| {
+                        other.token == intent.token
+                            && other.session.is_some()
+                            && paths.iter().any(|path| {
+                                other.paths.iter().any(|spec| overlaps(path, key_of(spec)))
+                            })
+                    })
+                    .collect();
+                // Per token, since `same_agent` is not transitive: hook a and hook c are distinct
+                // although each may be the same agent as one MCP session.
+                let several = sessions.iter().enumerate().any(|(index, one)| {
+                    sessions[index + 1..]
+                        .iter()
+                        .any(|other| !same_agent(&intent.token, &one.via, other))
                 });
                 let session_name = intent
                     .session
@@ -970,7 +979,10 @@ impl Slack {
                         message(&headline, &fields, &guidance, handoff, &link),
                     ));
                 }
-                holders.push(holder);
+                // One agent's hook and MCP sessions read alike: one holder, not two.
+                if !holders.contains(&holder) {
+                    holders.push(holder);
+                }
             }
             if let Some(person) = repeater
                 && !holders.is_empty()

@@ -578,6 +578,49 @@ async fn a_holders_hook_and_mcp_sessions_keep_the_single_agent_wording() {
             .all(|(_, text)| !text.contains(" session ")),
         "{sent:?}"
     );
+    assert!(
+        sent[before..].iter().any(|(user, text)| user == "U2"
+            && text.contains("which alice’s Claude Code holds")
+            && text.contains("Their agent: alice’s Claude Code |")),
+        "{sent:?}"
+    );
+}
+
+/// Hook a and hook c are distinct, whichever session is oldest: an older MCP session of the token
+/// must not hide that from the holder's message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_mcp_session_does_not_hide_two_hook_holders() {
+    let f = Fixture::new().await;
+    let mcp = SessionCall {
+        session: Some("m".into()),
+        via: "mcp".into(),
+        task: None,
+        paths: vec![PATH.into()],
+        deny: false,
+        report: false,
+    };
+    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now() - 100))
+        .unwrap();
+    f.edit(&f.alice, "a");
+    f.edit(&f.alice, "c");
+    tokio::task::block_in_place(|| {
+        f.store()
+            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
+            .unwrap()
+    });
+    f.edit(&f.alice, "c");
+    f.run().await;
+    let before = f.sent().len();
+    assert!(!f.edit(&f.bob, "b").denied.is_empty());
+    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    let holder: Vec<_> = sent[before..]
+        .iter()
+        .filter(|(user, text)| user == "U1" && text.contains("which your"))
+        .collect();
+    assert_eq!(holder.len(), 1, "{sent:?}");
+    assert!(holder[0].1.contains(" session "), "{sent:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
