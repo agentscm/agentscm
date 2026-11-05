@@ -71,34 +71,42 @@ jobs:
           fi
           count=0
           failed=0
+          # The legacy context and the family under agentscm/local-validation/<check>[/<constituent>]. Context
+          # names are API data: match them against this bound, quote them, and pass them only to gh -f.
+          family='^agentscm/local-validation(/[a-z0-9-]+){0,2}$'
           for sha in $(printf '%s\n' "$heads" | sort -u); do
-            # --paginate reads every page of the combined status, which has at most one entry for our context.
-            # Take the first non-empty line; no output means the head never opted in ("none"). A failed read
-            # is "unknown": invalidate anyway, because a stale success is worse than an extra pending.
-            if out=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --paginate --jq '.statuses[] | select(.context == "agentscm/local-validation") | .state' </dev/null); then
-              state=$(printf '%s\n' "$out" | grep -m1 . || true)
-              state=${state:-none}
+            # --paginate reads every page of the combined status, which has at most one entry per context.
+            # No matching success means the head never opted in or is already blocking. A failed read is
+            # "unknown": prefixed contexts cannot be enumerated, so write pending to the legacy context only
+            # (reconcile invalidates the prefixed ones once setup succeeds), because a stale success is worse
+            # than an extra pending.
+            targets=()
+            if out=$(gh api -X GET "repos/$REPO/commits/$sha/status" -f per_page=100 --paginate --jq '.statuses[] | select(.context == "agentscm/local-validation" or (.context | startswith("agentscm/local-validation/"))) | [.context, .state] | @tsv' </dev/null); then
+              while IFS=$'\t' read -r context state; do
+                # Only success can satisfy a required check. Writing to a context that is absent would opt
+                # the head in forever; pending, failure and error already block merging.
+                if [[ "$state" == success && "$context" =~ $family ]]; then
+                  targets+=("$context")
+                fi
+              done <<< "$out"
             else
-              echo "::warning::could not read the status of $sha; setting it to pending anyway"
-              state=unknown
+              echo "::warning::could not read the status of $sha; setting the legacy context to pending anyway"
+              targets=(agentscm/local-validation)
             fi
-            # Only success (or a failed read) can satisfy a required check. "none" means the head never opted
-            # in, and writing would opt it in forever. pending, failure and error already block merging.
-            if [[ "$state" != success && "$state" != unknown ]]; then
-              continue
-            fi
-            if ! reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context=agentscm/local-validation -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null); then
-              echo "::error::failed to set $sha to pending"
-              failed=$((failed + 1))
-              continue
-            fi
-            if [[ "$reply" != pending ]]; then
-              echo "::error::unexpected reply writing status for $sha: $reply"
-              failed=$((failed + 1))
-              continue
-            fi
-            echo "$sha: $state -> pending"
-            count=$((count + 1))
+            for context in ${targets[@]+"${targets[@]}"}; do
+              if ! reply=$(gh api -X POST "repos/$REPO/statuses/$sha" -f state=pending -f context="$context" -f description='setup started; re-verifying local validation' -f target_url="$RUN_URL" --jq .state </dev/null); then
+                echo "::error::failed to set $sha $context to pending"
+                failed=$((failed + 1))
+                continue
+              fi
+              if [[ "$reply" != pending ]]; then
+                echo "::error::unexpected reply writing status for $sha $context: $reply"
+                failed=$((failed + 1))
+                continue
+              fi
+              echo "$sha $context: -> pending"
+              count=$((count + 1))
+            done
           done
           echo "set $count stale success(es) to pending; $failed failure(s)"
           # Exit 0 even after per-head failures so setup and reconcile still run; reconcile retries and reports its own errors.

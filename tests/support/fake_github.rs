@@ -179,6 +179,8 @@ pub struct Comment {
     /// `OWNER`, `NONE`, ... as GitHub reports it.
     pub author_association: String,
     pub updated_at: String,
+    /// Reported as `html_url` when set.
+    pub html_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +368,8 @@ pub struct FakeState {
     pub lose_next_ref_reply: bool,
     /// Record the next commit status, then answer 502 with no body.
     pub lose_next_status_reply: bool,
+    /// Commit-status contexts whose writes are refused with this HTTP status (kept, not consumed).
+    pub reject_status_contexts: HashMap<String, u16>,
     /// After recording the next commit status, move the first branch's tip to this sha.
     pub advance_base_after_status: Option<String>,
     /// Leave `head.repo` and `base.repo` out of pull request JSON.
@@ -1329,7 +1333,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .parse::<u64>()
                         .ok()
                         .and_then(|n| state.repos[&id].comments.get(&n))
-                        .map(|cs| cs.iter().map(|c| json!({"id": c.id, "body": c.body, "user": {"login": c.author}, "author_association": c.author_association, "updated_at": c.updated_at})).collect())
+                        .map(|cs| cs.iter().map(|c| json!({"id": c.id, "body": c.body, "user": {"login": c.author}, "author_association": c.author_association, "updated_at": c.updated_at, "html_url": c.html_url})).collect())
                         .unwrap_or_default();
                     let (page, link) = paginate(ctx, uri, &query, comments);
                     reply(200, &link, Some(Value::Array(page)))
@@ -1477,7 +1481,16 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     {
                         return json_reply(422, json!({"message": "Validation Failed"}));
                     }
-                    let status = json!({"state": b["state"], "context": b["context"], "description": b["description"]});
+                    if let Some(code) = b["context"]
+                        .as_str()
+                        .and_then(|c| state.reject_status_contexts.get(c))
+                    {
+                        return json_reply(*code, json!({"message": "refused"}));
+                    }
+                    let mut status = json!({"state": b["state"], "context": b["context"], "description": b["description"]});
+                    if !b["target_url"].is_null() {
+                        status["target_url"] = b["target_url"].clone();
+                    }
                     let creator = state.status_creator.clone().unwrap_or_else(|| match &who {
                         Who::Reader(login, ..) => login.clone(),
                         Who::Installation(_) => format!("{APP_SLUG}[bot]"),

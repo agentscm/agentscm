@@ -70,7 +70,7 @@ Permissions: the App needs `statuses: write`, `pull_requests` read, `contents` r
 
 - Combined multi-entry groups (pending, see above).
 - GitLab merged-result pipelines and merge trains. The Hub does not post the status on their commits, see [the GitLab paragraph in the Hub guide](../hub.md#gitlab-merge-requests). GitLab behavior is unchanged.
-- The experimental [local validation attestations](local-validation.md) post `agentscm/local-validation`, a separate, worker-asserted status. It does not use this path, and a green local-validation status satisfies nothing here.
+- The experimental [local validation attestations](local-validation.md) post `agentscm/local-validation` (or its per-check variants), a separate, worker-asserted status. It does not use this path, and a green local-validation status satisfies nothing here.
 - Approvals and review requests stay GitHub actions. This lane does not request reviewers, approve, enqueue, merge or bypass a failed check. Provider account identity is not decision authority: an agent can act through a human-named account, so no login, account id or signature is promoted to a proven human decision (see the contract below).
 - Automatic review bots: a draft pull request does not guarantee a third-party reviewer stays idle; some integrations review drafts. The Hub cannot read other integrations' configuration, so their behavior is `unknown` to it, and it never changes them. To qualify an installation: open a synthetic draft pull request, record which bots comment, mark it ready, and record again.
 
