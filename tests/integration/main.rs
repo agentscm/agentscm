@@ -12,6 +12,8 @@ mod fake_docker;
 mod fake_github;
 #[path = "../support/fake_gitlab.rs"]
 mod fake_gitlab;
+#[path = "common/hub_error_assert.rs"]
+mod hub_error_assert;
 #[path = "common/hub_pg.rs"]
 mod hub_pg;
 #[cfg(unix)]

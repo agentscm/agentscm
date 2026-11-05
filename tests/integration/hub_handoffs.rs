@@ -734,7 +734,7 @@ fn an_omitted_answer_session_resolves_like_the_other_tools(db: &Db) {
     touch(&*store, &alice, "hz", &[], T0 + 3);
     assert!(matches!(
         store.answer_handoff(&alice.token, None, A, true, None, T0 + 4),
-        Err(HubError::Invalid(message)) if message == SESSION_REQUIRED
+        Err(HubError::Rejected(rejection)) if rejection.message() == SESSION_REQUIRED
     ));
     assert!(matches!(
         answer(&*store, &alice, Some("ha"), A, true, T0 + 4),
@@ -1052,7 +1052,7 @@ fn a_hand_off_reaches_only_the_session_it_names(db: &Db) {
     // The bystander cannot answer without naming itself, and has nothing to answer.
     assert!(matches!(
         store.answer_handoff(&alice.token, None, A, true, None, T0 + 3),
-        Err(HubError::Invalid(message)) if message == SESSION_REQUIRED
+        Err(HubError::Rejected(rejection)) if rejection.message() == SESSION_REQUIRED
     ));
     assert_eq!(
         answer(&*store, &alice, Some("s3"), A, true, T0 + 3),

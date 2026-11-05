@@ -485,7 +485,7 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
         )
         .await;
     assert_eq!(status, 403);
-    assert_eq!(denied, json!({"error": "read_only"}));
+    crate::assert_hub_error!(denied, json!({"error": "read_only"}));
     assert_eq!(hub.store.events_after(0, 1000).unwrap().len(), events);
     assert!(
         hub.store
@@ -563,7 +563,7 @@ async fn malformed_http_and_mcp_requests_are_bounded_errors() {
     ] {
         let (status, body) = hub.get(path, &token).await;
         assert_eq!(status, 400, "{body}");
-        assert_eq!(body, json!({"error": "invalid_request"}));
+        crate::assert_hub_error!(body, json!({"error": "invalid_request"}));
     }
     for arguments in [
         json!({}),

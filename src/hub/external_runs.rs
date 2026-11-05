@@ -343,7 +343,7 @@ pub(super) async fn reconcile_repo(
     // headers; a 401 stays a failed credential.
     match pass(state, conn, repo, token).await {
         Err(GhError::Auth(detail)) if detail.starts_with("403") => {
-            eprintln!("hub: external runs for {}: {detail}", repo.full_name);
+            crate::hub::error_envelope::log_internal(&detail);
             Ok(())
         }
         other => other,
@@ -387,10 +387,10 @@ async fn pass(
             Ok(None) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                eprintln!(
+                crate::hub::error_envelope::log_internal(&format!(
                     "hub: external runs for {}#{number}: {detail}",
                     repo.full_name
-                );
+                ));
             }
         }
     }
@@ -428,7 +428,7 @@ async fn pass(
             }
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                eprintln!("hub: external runs for {} {sha}: {detail}", repo.full_name);
+                crate::hub::error_envelope::log_internal(&detail);
             }
         }
     }
