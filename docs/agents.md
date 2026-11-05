@@ -95,6 +95,10 @@ every agent obeyed it. Hooks still handle coordination only.
 
 If the binary or the hub is missing, the hooks do nothing visible (see below).
 
+The stdio MCP proxy hosts a local hook relay that keeps its own HTTPS pool, without another
+daemon. See [hook transport](hub.md#agent-sessions-mcp-and-hook-endpoints) for matching rules,
+direct fallback, deadlines and fail-open limits.
+
 ### Optional Claude Code change capture
 
 The experimental [change-capture adapter](change-capture.md) is separate from the coordination

@@ -16,6 +16,11 @@ AgentSCM is a native Rust source-control system for concurrent human and agent w
 - Required retention roots and publication/backup leases precede collection. Missing, expired or incomplete evidence never becomes successful verification.
 - Rust is required for first-party engine/server/CLI/sync/policy/verifier/review orchestration. Established databases and external model runtimes remain dependencies.
 
+## Hook transport
+`agentscm client mcp` hosts the local command-hook relay for its stdio lifetime; the relay
+keeps its own hardened HTTPS pool. See [Agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints)
+for transport security, matching rules, deadlines and fail-open limits.
+
 ## Alpha status
 The native engine is a local alpha: immutable blobs, persistent manifest trie, incremental revisions, selective reads/diff, a SQLite integration authority, bound local human approvals, durable journal/idempotency, CLI, read-only source HTTP API and container packaging. The local owner is trusted; no multi-tenant or production network-security claim is made. No native source garbage collector runs yet, so source objects persist until the operator removes the store. The current object encoding and API are experimental; a stable interoperable protocol requires conformance and migration work that is not yet done (see the [roadmap](roadmap.md)).
 

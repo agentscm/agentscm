@@ -306,6 +306,10 @@ async fn serve(
     mut current_token: impl FnMut() -> Result<String>,
 ) -> Result<()> {
     let client = forge_http::client().map_err(map_hub_error)?;
+    let _relay = crate::hub_cli::config_dir()
+        .ok()
+        .and_then(|dir| agentscm::hook_relay::Address::new(&dir, &connection.hub).ok())
+        .map(agentscm::hook_relay::Relay::spawn);
     let url = endpoint(connection)?;
     let mut token = token.to_owned();
     let mut activity_binding = crate::client_activity::activity_binding(connection, &token);

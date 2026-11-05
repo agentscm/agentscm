@@ -105,6 +105,7 @@ mod guided_service;
 mod history;
 mod hook_cli;
 mod hook_end_to_end;
+mod hook_relay;
 #[cfg(unix)]
 mod hosted_laptop_workflow;
 #[cfg(unix)]

@@ -770,6 +770,37 @@ const UNREADABLE: [(&str, &str); 5] = [
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_repository_guards_are_judged_identically_to_raw_guards() {
+    for (raw, encoded, accepted) in [
+        (REPO, "acme%2Fwidgets", true),
+        ("other/widgets", "other%2Fwidgets", false),
+    ] {
+        let mut first = None;
+        for guard in [raw, encoded] {
+            let mut hub = Hub::start().await;
+            let secret = hub.agent();
+            let (status, reply) = hub.post(
+                &format!("/v1/hub/hook/claude?repo={guard}"),
+                Some(&secret),
+                fixture("claude-PreToolUse-Edit").to_string().as_bytes(),
+            );
+            assert_eq!(status, 200);
+            assert_eq!(
+                reply.to_string().contains("coordination unknown ("),
+                !accepted,
+                "{guard}: {reply}"
+            );
+            let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+            assert_eq!(live.len(), usize::from(accepted), "{guard}");
+            if accepted {
+                assert_eq!(live[0].paths, ["src/widget.rs"]);
+            }
+            assert_eq!(*first.get_or_insert(reply.clone()), reply);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failures_are_200s_that_say_coordination_is_unknown() {
     let mut hub = Hub::start().await;
     let secret = hub.agent();
