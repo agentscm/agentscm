@@ -42,6 +42,9 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/start", post(start))
         .route("/v1/hub/standup/checkpoint", post(checkpoint))
         .route("/v1/hub/standup/work-transition", post(work_transition))
+        .route("/v1/hub/standup/work-transitions", post(work_transitions))
+        .route("/v1/hub/standup/recovery", post(recovery))
+        .route("/v1/hub/standup/recovery/preview", post(recovery_preview))
         .route("/v1/hub/standup/operational", get(operational_overview))
         .route(
             "/v1/hub/standup/work/{id}/operational",
@@ -347,6 +350,78 @@ async fn work_transition(
     })
     .await?;
     super::coordination_http::CHANGED.notify_waiters();
+    Ok(Json(result))
+}
+
+/// What the token's owner can recover: a pure read that read-only tokens may make. Every
+/// remedy it lists for a read-only token is refused as `read_only`.
+async fn recovery(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    JsonBody(query): JsonBody<super::work_recovery::RecoveryQuery>,
+) -> Result<Json<super::work_recovery::WorkRecoveryV1>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            super::work_recovery::inspect(
+                &*store,
+                &super::work_recovery::RecoveryCaller::Agent {
+                    token: &principal.token_id,
+                    session: query.session.as_deref(),
+                },
+                &query,
+                unix_now(),
+            )
+        })
+        .await?,
+    ))
+}
+
+/// What one remedy would change and the exact call that applies it. Never writes.
+async fn recovery_preview(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    JsonBody(request): JsonBody<super::work_recovery::RemedyPreviewRequest>,
+) -> Result<Json<super::work_recovery::RemedyPreviewV1>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            super::work_recovery::preview(
+                &*store,
+                &super::work_recovery::RecoveryCaller::Agent {
+                    token: &principal.token_id,
+                    session: request.session.as_deref(),
+                },
+                &request,
+                unix_now(),
+            )
+        })
+        .await?,
+    ))
+}
+
+/// Up to 25 transitions, each applied in its own transaction with its own outcome.
+async fn work_transitions(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(batch): JsonBody<super::work_recovery::WorkTransitionBatch>,
+) -> Result<Json<super::work_recovery::WorkTransitionBatchV1>, ApiError> {
+    let store = state.store.clone();
+    let result = blocking(&state, move || {
+        super::work_recovery::apply_batch(
+            &*store,
+            &WorkTransitionActor::Agent {
+                token: &principal.token_id,
+            },
+            &batch,
+            unix_now(),
+        )
+        .map(|result| shown(result, &principal.owner.id))
+    })
+    .await?;
+    if result.applied > 0 {
+        super::coordination_http::CHANGED.notify_waiters();
+    }
     Ok(Json(result))
 }
 

@@ -3606,8 +3606,8 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
         Err(HubError::Invalid(_))
     ));
 
-    // No token identifier appears, and only `freshness` and the lease `activity` depend on the
-    // request time.
+    // No token identifier appears, and only `freshness`, the lease `activity` and, once the lease
+    // lapsed, the reservation status and who is named depend on the request time.
     let early = serde_json::to_value(&holders).unwrap();
     let text = early.to_string();
     assert!(!text.contains(&token) && !text.contains(&reader), "{text}");
@@ -3618,9 +3618,16 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
     assert_ne!(early, later, "a revoked lead changes freshness");
     for value in [&mut early, &mut later] {
         for work in value["work"].as_array_mut().unwrap() {
+            if work["activity"]["status"] == "lapsed" {
+                // A lapsed hold blocks nobody: it reads lapsed, never held, and names nobody.
+                assert_eq!(work["reservation"]["status"], "lapsed", "{work}");
+                assert_eq!(work["actionable"]["recipient"], "none", "{work}");
+            }
             let work = work.as_object_mut().unwrap();
             work.remove("freshness");
             work.remove("activity");
+            work["reservation"]["status"] = serde_json::json!("held");
+            work.remove("actionable");
         }
     }
     assert_eq!(early, later);

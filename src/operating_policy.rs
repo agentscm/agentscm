@@ -155,10 +155,16 @@ pub struct RecoveryReconciliation {
     pub outcome: RecoveryOutcome,
 }
 
-fn valid_recovery_request(binding: &OperatingWork, r: &OperatingRecovery) -> bool {
+/// A retained recovery request for this binding. The current one names the bound generation; a
+/// reconciled one in the history may name an earlier generation the binding was rebound from.
+fn valid_recovery_request(binding: &OperatingWork, r: &OperatingRecovery, history: bool) -> bool {
     r.dispatch_generation > 0
         && r.request.work_id == binding.work.id
-        && r.request.generation == binding.work.generation
+        && if history {
+            r.request.generation >= 1 && r.request.generation <= binding.work.generation
+        } else {
+            r.request.generation == binding.work.generation
+        }
         && r.request.session == binding.work.lead_session
         && bounded(&r.request.operation_id, 255)
         && matches!(
@@ -175,7 +181,7 @@ fn valid_recovery(binding: &OperatingWork) -> bool {
     let mut previous_sequence = 0;
     binding.recovery_reconciliations.len() <= MAX_RECOVERY_RECONCILIATIONS
         && binding.recovery_reconciliations.iter().all(|entry| {
-            let valid = valid_recovery_request(binding, &entry.recovery)
+            let valid = valid_recovery_request(binding, &entry.recovery, true)
                 && entry.recovery.rejected_at_seq.is_none()
                 && entry
                     .recovery
@@ -189,7 +195,7 @@ fn valid_recovery(binding: &OperatingWork) -> bool {
             valid
         })
         && binding.recovery.as_ref().is_none_or(|r| {
-            valid_recovery_request(binding, r)
+            valid_recovery_request(binding, r, false)
                 && operations.insert(&r.request.operation_id)
                 && r.rejected_at_seq.is_none_or(|s| {
                     s > 0
@@ -211,6 +217,55 @@ struct Observation {
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.into())
+}
+
+/// The binding a rebind writes: the same Work and Hub identity at the newer `current`
+/// generation, still led by the dispatch's own token and session over the same scope. A retained
+/// recovery request names the old generation and can never apply again, so it moves to the
+/// reconciliation history with an unknown outcome; one the Hub rejected never committed and is
+/// dropped.
+pub fn rebound_operating_work(
+    expected: &OperatingWork,
+    current: &WorkItem,
+) -> Result<OperatingWork> {
+    let old = &expected.work;
+    if current.id != old.id
+        || current.lead_token != old.lead_token
+        || current.lead_session != old.lead_session
+        || current.scope != old.scope
+    {
+        return Err(Error::Conflict(
+            "the dispatch's own session no longer leads this Work over its scope; resume it as that session before rebinding".into(),
+        ));
+    }
+    if current.generation <= old.generation || current.updated_seq <= old.updated_seq {
+        return Err(Error::Conflict(
+            "Work has no newer generation to rebind to".into(),
+        ));
+    }
+    let mut recovery_reconciliations = expected.recovery_reconciliations.clone();
+    if let Some(recovery) = expected
+        .recovery
+        .as_ref()
+        .filter(|r| r.rejected_at_seq.is_none())
+    {
+        if recovery_reconciliations.len() >= MAX_RECOVERY_RECONCILIATIONS {
+            return Err(Error::Limit(
+                "recovery reconciliation history is full; retained evidence preserved".into(),
+            ));
+        }
+        recovery_reconciliations.push(RecoveryReconciliation {
+            recovery: recovery.clone(),
+            observed_seq: current.updated_seq,
+            outcome: RecoveryOutcome::Unknown,
+        });
+    }
+    Ok(OperatingWork {
+        identity_commitment: expected.identity_commitment.clone(),
+        work: current.clone(),
+        recovery: None,
+        recovery_reconciliations,
+    })
 }
 
 fn bounded(value: &str, max: usize) -> bool {
@@ -469,17 +524,7 @@ impl RuleJournal {
         expected: Option<&OperatingWork>,
         next: &OperatingWork,
     ) -> Result<()> {
-        let retained = self.dispatch(dispatch)?;
-        let request_matches = matches!(&next.work.source, WorkSource::Native { request_key } if request_key == &retained.dispatch.run_id);
-        if !request_matches
-            || next.work.repository != retained.dispatch.rule.repository
-            || next.identity_commitment.len() != 64
-            || next.work.generation < 1
-            || !bounded(&next.work.id, 255)
-            || !bounded(&next.work.lead_token, 255)
-            || !bounded(&next.work.lead_session, 255)
-            || !valid_recovery(next)
-            || expected.is_none() && next.work.state != WorkState::Active
+        if expected.is_none() && next.work.state != WorkState::Active
             || expected.is_some_and(|old| {
                 old.identity_commitment != next.identity_commitment
                     || old.work.id != next.work.id
@@ -498,6 +543,46 @@ impl RuleJournal {
                                 || entry.observed_seq != next.work.updated_seq
                         }))
             })
+        {
+            return Err(Error::Conflict(
+                "operating Work identity or responsibility changed".into(),
+            ));
+        }
+        self.write_operating_work(dispatch, expected, next)
+    }
+
+    /// Points the dispatch's binding at the newer generation of its Work after a release and
+    /// resume, or a reopen, moved it on while the dispatch's own session still leads it. Only an
+    /// exact `expected` binding is replaced, so a concurrent change refuses this with nothing
+    /// written.
+    pub fn rebind_operating_work(
+        &mut self,
+        dispatch: &str,
+        expected: &OperatingWork,
+        current: &WorkItem,
+    ) -> Result<OperatingWork> {
+        let next = rebound_operating_work(expected, current)?;
+        self.write_operating_work(dispatch, Some(expected), &next)?;
+        Ok(next)
+    }
+
+    /// Checks what every binding must hold, then replaces `expected` with `next`.
+    fn write_operating_work(
+        &mut self,
+        dispatch: &str,
+        expected: Option<&OperatingWork>,
+        next: &OperatingWork,
+    ) -> Result<()> {
+        let retained = self.dispatch(dispatch)?;
+        let request_matches = matches!(&next.work.source, WorkSource::Native { request_key } if request_key == &retained.dispatch.run_id);
+        if !request_matches
+            || next.work.repository != retained.dispatch.rule.repository
+            || next.identity_commitment.len() != 64
+            || next.work.generation < 1
+            || !bounded(&next.work.id, 255)
+            || !bounded(&next.work.lead_token, 255)
+            || !bounded(&next.work.lead_session, 255)
+            || !valid_recovery(next)
         {
             return Err(Error::Conflict(
                 "operating Work identity or responsibility changed".into(),

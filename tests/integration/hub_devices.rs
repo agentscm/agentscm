@@ -3377,6 +3377,92 @@ async fn web_value_metrics_resolves_work_only_within_readable_repositories() {
     assert_eq!(revoked, unknown);
 }
 
+const RECOVERY: &str = "/v1/hub/session/work/recovery";
+const RECOVERY_PREVIEW: &str = "/v1/hub/session/work/recovery/preview";
+const TRANSITIONS: &str = "/v1/hub/session/work/transitions";
+
+#[tokio::test]
+async fn an_owner_recovers_a_dead_sessions_work_from_the_hub_through_the_shared_service() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let now = unix_now();
+    let (lead, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let mut start = work("dead", "dead-session");
+    start.scope = vec!["src/dead.rs".into()];
+    let item = env.store.work_start(&lead, &start, now).unwrap().item;
+    // The agent and its token are gone.
+    env.store.revoke_agent_token(&lead).unwrap();
+
+    let query = json!({"repository": REPO, "work_id": item.id});
+    let (status, _) = page_post(&env, &alice, false, RECOVERY, query.clone()).await;
+    assert_eq!(status, 403);
+    let (status, page) = page_post(&env, &alice, true, RECOVERY, query.clone()).await;
+    assert_eq!(status, 200, "{page}");
+    let entry = &page["work"][0];
+    assert_eq!(entry["standing"], "owner");
+    let permitted: Vec<&str> = entry["remedies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|remedy| remedy["permitted"] == true)
+        .map(|remedy| remedy["remedy"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        permitted,
+        ["abandon", "complete", "release", "retain", "supersede"]
+    );
+    // A person never leads, so a resume is refused with what to do instead.
+    let resume = entry["remedies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|remedy| remedy["remedy"] == "resume")
+        .unwrap();
+    assert_eq!(resume["refusal"]["code"], "needs_session");
+
+    let (status, preview) = page_post(
+        &env,
+        &alice,
+        true,
+        RECOVERY_PREVIEW,
+        json!({"repository": REPO, "work_id": item.id, "remedy": "release"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["apply"]["route"], "/v1/hub/session/work/transition");
+    assert!(preview["apply"]["tool"].is_null());
+    assert_eq!(preview["effects"]["freed_paths"], json!(["src/dead.rs"]));
+    let batch = json!({"repository": REPO, "items": [{"work_id": item.id,
+        "operation_id": "hub-release", "generation": preview["generation"],
+        "expected_updated_seq": preview["expected_updated_seq"], "transition": "release",
+        "reason": "its agent is gone"}]});
+
+    // Another signed-in person sees no remedy and cannot apply one.
+    let (status, theirs) = page_post(&env, &bob, true, RECOVERY, query).await;
+    assert_eq!(status, 200, "{theirs}");
+    assert_eq!(theirs["work"][0]["standing"], "other");
+    assert!(
+        theirs["work"][0]["remedies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|remedy| remedy["permitted"] == false)
+    );
+    let (status, refused) = page_post(&env, &bob, true, TRANSITIONS, batch.clone()).await;
+    assert_eq!(status, 200, "{refused}");
+    assert_eq!(refused["items"][0]["outcome"], "refused");
+    assert_eq!(refused["items"][0]["code"], "unauthorized");
+
+    let (status, _) = page_post(&env, &alice, false, TRANSITIONS, batch.clone()).await;
+    assert_eq!(status, 403);
+    let (status, applied) = page_post(&env, &alice, true, TRANSITIONS, batch.clone()).await;
+    assert_eq!(status, 200, "{applied}");
+    assert_eq!(applied["items"][0]["outcome"], "applied");
+    assert_eq!(applied["items"][0]["result"]["item"]["state"], "paused");
+    let (_, again) = page_post(&env, &alice, true, TRANSITIONS, batch).await;
+    assert_eq!(again["items"][0]["outcome"], "replayed");
+}
+
 /// #293: a refused agent write reaches the operator, with what to run, and no one else's badge.
 #[tokio::test]
 async fn a_capacity_refusal_reaches_the_operator_with_what_to_run() {

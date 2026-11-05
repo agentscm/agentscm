@@ -87,6 +87,32 @@ body. A prior-Work version can explicitly identify the checkpoint being correcte
 The Hub requires that exact same-Work version to exist when first recording the checkpoint, while
 an exact operation replay continues to return its original receipt. See [stand-up and handover](../standup.md).
 
+`agentscm work recovery` shows what you can recover: your owner's unfinished Work page by page
+(active, needs you, can resume, finished), why each item still exists, the open requests and
+dependent Work that ending it would reach, and every remedy marked permitted or refused for you
+with the exact call that applies it. `--path` (repeat it, at most 32) also lists the live holds over
+those paths with the exact overlapping paths, and your owner's resumable Work there. `--work-id`
+reads one Work item of the repository, whoever owns it. `--session` tells your lead session from
+your owner's other sessions; without it you act as your owner's agent. Page with `--after` set to
+the previous `next_after` and `--limit` (1 to 50, default 20). `--json` prints the versioned
+response.
+
+```sh
+agentscm work recovery --session "$SESSION" --path src/billing.rs
+agentscm work recovery-preview --work-id wrk_… --remedy release --session "$SESSION"
+agentscm work transitions --request batch.json
+```
+
+`agentscm work recovery-preview` says what one remedy would change and prints the call and fences
+(`generation`, `expected_updated_seq`) to apply it; it changes nothing. Remedies are `release`,
+`retain`, `complete`, `abandon`, `supersede` and `reopen` (applied as transitions), `resume` (a
+start with `takeover_generation`) and `handover` (the lead's checkpoint; `--scope` keeps only those
+paths for the next lead and frees the rest). `agentscm work transitions` applies a strict
+`{"session": …, "items": [...]}` batch of up to 25 transitions in order, each in its own transaction,
+and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (with a `code` and a
+`retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
+items stay applied, and sending the same batch again is safe.
+
 ### `change-capture` (experimental, Unix)
 
 After `agentscm client connect` has saved a write-capable connection for a checkout, configure its
@@ -575,7 +601,7 @@ post-merge events reserve bounded artifact workflows; the operator runs the reta
 Pause and revoke prevent subsequent managed effects and preserve history. See
 [operating policy](../advanced/operating-policy.md) for inspection, activation, dispatch and recovery.
 
-`operating-policy recover` accepts paired `--reconcile-operation OPERATION_ID` and `--observed-seq N` for explicit owner reconciliation of a retained ambiguous administrative request. It preserves that request with an unknown outcome; see the [operating-policy recovery guide](../advanced/operating-policy.md#pause-revoke-and-recover).
+`operating-policy recover` accepts paired `--reconcile-operation OPERATION_ID` and `--observed-seq N` for explicit owner reconciliation of a retained ambiguous administrative request. It preserves that request with an unknown outcome; see the [operating-policy recovery guide](../advanced/operating-policy.md#pause-revoke-and-recover). `operating-policy rebind DISPATCH_ID --expected-generation N --work-generation M` points the dispatch's Work binding at the Work's current generation after a release and resume, or a reopen, by the dispatch's own session; it previews unless `--apply`.
 
 Neither command grants forge merge permission or controls unrestricted tools in unrelated agents.
 
