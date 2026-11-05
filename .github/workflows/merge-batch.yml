@@ -74,4 +74,3 @@ jobs:
       - name: Run doctests
         if: ${{ !cancelled() }}
         run: cargo test --locked --doc
-

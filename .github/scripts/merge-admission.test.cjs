@@ -71,7 +71,7 @@ test('head movement leaves initial pending check; API failure invalidates first'
   await admit(f.args);
   assert.equal(f.writes.length, 1);
   const g = fixture(); g.apiError = true;
-  await assert.rejects(admit(g.args), /unavailable/);
+  await assert.rejects(admit(g.args), /Admission refresh failed/);
   assert.equal(g.writes.length, 1);
   assert.equal(g.writes[0].status, 'in_progress');
 });
@@ -101,4 +101,28 @@ test('prerequisite start invalidates prior green without reading old success', a
     assert.equal(f.writes.length, 1);
     assert.equal(f.writes[0].status, 'in_progress');
   }
+});
+
+
+test('one PR API failure cannot preserve another PR old acceptance', async () => {
+  const f = fixture(); delete f.args.context.payload.pull_request;
+  const other = {...f.pull, number: 8, head: {sha: 'c'.repeat(40)}};
+  f.args.github.rest.pulls.list = async () => ({data: [f.pull, other]});
+  f.args.github.rest.pulls.get = async ({pull_number}) => ({data: pull_number === 7 ? f.pull : other});
+  f.args.github.rest.repos.listCommitStatuses = async ({ref}) => {
+    assert.equal(f.writes.filter(w => w.status === 'in_progress').length, 2);
+    if (ref === f.pull.head.sha) throw Error('first PR unavailable');
+    return {data: f.statuses};
+  };
+  await assert.rejects(admit(f.args), /Admission refresh failed/);
+  assert.deepEqual(f.writes.slice(0, 2).map(w => w.head_sha), [f.pull.head.sha, other.head.sha]);
+  assert.equal(f.writes[2].conclusion, 'success');
+});
+
+test('observed pages are invalidated before pagination overflow', async () => {
+  const f = fixture(); delete f.args.context.payload.pull_request;
+  f.args.github.rest.pulls.list = async () => ({data: Array(100).fill(f.pull)});
+  await assert.rejects(admit(f.args), /500/);
+  assert.equal(f.writes.length, 500);
+  assert.ok(f.writes.every(w => w.status === 'in_progress'));
 });
