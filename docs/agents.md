@@ -95,6 +95,14 @@ every agent obeyed it. Hooks still handle coordination only.
 
 If the binary or the hub is missing, the hooks do nothing visible (see below).
 
+The stdio MCP proxy also owns a local hook relay, reusing its HTTPS pool without a daemon.
+Hooks use it only when the Hub, config directory, binary and proxy environment match; otherwise
+they call the Hub directly. This works over same-user Unix sockets on macOS/Linux and named
+pipes on Windows. Tokens remain per-request and are never persisted by the relay. An accepted
+call is never resent; a connection lost silently within the pool's 30 s freshness window
+fails that one call open with coordination unknown. See [hook transport](hub.md#agent-sessions-mcp-and-hook-endpoints)
+for deadlines and lifecycle.
+
 ### Optional Claude Code change capture
 
 The experimental [change-capture adapter](change-capture.md) is separate from the coordination

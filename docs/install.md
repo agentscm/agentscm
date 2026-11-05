@@ -15,6 +15,13 @@ These docs describe the branch or tag you are viewing. A command present on `mai
 a published binary yet. Use the documentation at the matching release tag, or
 [build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
 
+The installed `agentscm client mcp` proxy keeps a same-user local relay for command hooks,
+without another daemon or setup step. Hooks and the host must agree on Hub, config directory,
+binary and proxy environment; otherwise hooks use direct HTTPS. Restart agent MCP sessions
+after upgrading to regain pooling. The relay persists no secrets. A silently lost connection
+inside its 30 s freshness window fails one hook open and is never resent. See
+[hook transport](hub.md#agent-sessions-mcp-and-hook-endpoints) for supported transports and budgets.
+
 Want to try AgentSCM before configuring an agent or Hub? From a Git repository, follow the
 [scripted demo](scripted-demo.md). It needs no account, Docker or forge and writes nothing to the
 repository.
