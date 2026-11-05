@@ -30,6 +30,7 @@ Prepare and create a pull request for the current branch. Invoking `/pr` is the 
    - **What and why**: describe the behavior and why it changed.
    - **How it was tested**: list exact commands and results, and state what did not run.
    - **Limits**: known gaps, unsupported cases, evidence not obtained, and follow-ups.
+   - **Roadmap**: one `Roadmap:` line per affected `docs/roadmap.md` row (the row and its new status), or `Roadmap: none`. Unless this is the release roadmap update in `docs/releasing.md`, a branch that edits `docs/roadmap.md` restores it from `main` in a new commit and carries the change here instead.
    - **AI assistance**: check the option that applies and name the tool and what the author verified.
    - **Checklist**: retain it and check only items actually verified. The validation item covers the pre-push checks and the attestation, so leave it unchecked until step 11 updates the body.
    - Add an issue-closing line only when the PR genuinely resolves that issue.
