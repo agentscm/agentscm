@@ -409,7 +409,13 @@ async fn serve(
                     crate::client_activity::ActivityOutcome::Acknowledged,
                 );
                 let mut reply = reply;
-                if reply["result"]["isError"] == true {
+                // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
+                // start's conflict, coordination and recovery payload, reach the agent unchanged.
+                let bare_error = &reply["result"]["structuredContent"]["error"];
+                if reply["result"]["isError"] == true
+                    && bare_error.is_object()
+                    && bare_error["recovery"].is_null()
+                {
                     reply["result"] =
                         agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
                 } else if reply["error"].is_object() {

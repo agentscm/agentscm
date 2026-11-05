@@ -422,8 +422,15 @@ pub(crate) async fn call(
         ))
     })?;
     if status >= 400 {
-        let envelope = agentscm::hub::error_envelope::decode(status, &body);
-        return Ok((status, serde_json::to_value(envelope)?));
+        let envelope = serde_json::to_value(agentscm::hub::error_envelope::decode(status, &body))?;
+        // Keep every field the Hub sent (conflicts, remedies); add the envelope fields it lacks.
+        let (Value::Object(mut kept), Value::Object(fields)) = (body, envelope.clone()) else {
+            return Ok((status, envelope));
+        };
+        for (key, value) in fields {
+            kept.entry(key).or_insert(value);
+        }
+        return Ok((status, Value::Object(kept)));
     }
     Ok((status, body))
 }
@@ -2171,6 +2178,12 @@ async fn token(command: TokenCommand) -> Result<()> {
             "connect the repository first: install the GitHub App on it, then run \
              `agentscm hub connections refresh <id>` (for a PAT or GitLab token connection: \
              `agentscm hub connections add-repo <id> <owner/name>`)",
+        )),
+        // A bare `forbidden` has no reason of its own; every other refusal speaks for itself.
+        (403, _) if reply["error"] == "forbidden" => Err(refusal_with_message(
+            status,
+            &reply,
+            "your forge account can't see that repository, or it was renamed or moved; check the name and your access",
         )),
         (403, _) => Err(refusal_error(status, &reply)),
         (404, TokenCommand::Revoke { .. }) => Err(refusal_with_message(

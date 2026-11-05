@@ -49,3 +49,19 @@ macro_rules! assert_hub_error {
         )
     };
 }
+
+/// The text with every `cor_<32 hex>` error reference blanked, so two answers to the same
+/// refused request can be compared apart from the reference each carries.
+pub fn blank_references(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("cor_") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 4..];
+        let hex = tail.bytes().take_while(u8::is_ascii_hexdigit).count();
+        out.push_str("cor_<ref>");
+        rest = &tail[hex..];
+    }
+    out.push_str(rest);
+    out
+}

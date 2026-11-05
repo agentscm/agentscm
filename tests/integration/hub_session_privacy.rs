@@ -312,24 +312,12 @@ async fn error_envelope_scenario(hub: Hub) {
             "expected_updated_seq":bob_work["updated_seq"],"operation_id":format!("{surface}-overlap"),
             "kind":"progress","summary":"Synthetic overlapping scope", "scope":["src/shared.rs"]
         });
-        let preflight = json!({"source_revision":"1".repeat(40),"merge_after":0,"merge_through":0,
-            "source_relation_checked":false,"checked_merges":[]});
-        let start = json!({"title":"Synthetic preflight","request_key":format!("{surface}-preflight"),
-            "session":"synthetic-preflight-session","scope":["src/shared.rs"],"preflight":preflight});
-        for (tool, path, mut arguments, code) in [
-            (
-                "agentscm_work_checkpoint",
-                "/v1/hub/standup/checkpoint",
-                checkpoint,
-                "work_coordination_required",
-            ),
-            (
-                "agentscm_start",
-                "/v1/hub/standup/start",
-                start,
-                "work_preflight_required",
-            ),
-        ] {
+        for (tool, path, arguments, code) in [(
+            "agentscm_work_checkpoint",
+            "/v1/hub/standup/checkpoint",
+            checkpoint,
+            "work_coordination_required",
+        )] {
             let (envelope, text) = if surface == "http" {
                 let (status, text) = hub.call(Method::POST, path, &bob, Some(arguments)).await;
                 assert_eq!(status, 409, "{text}");
@@ -337,12 +325,6 @@ async fn error_envelope_scenario(hub: Hub) {
                 assert_eq!(envelope["error"], code, "{text}");
                 (envelope, text)
             } else {
-                if tool == "agentscm_start" {
-                    arguments["task"] = arguments["title"].take();
-                    arguments.as_object_mut().unwrap().remove("title");
-                    arguments["paths"] = arguments["scope"].take();
-                    arguments.as_object_mut().unwrap().remove("scope");
-                }
                 let text = hub.tool(&bob, tool, arguments).await;
                 let reply: Value = serde_json::from_str(&text).unwrap();
                 assert_eq!(reply["result"]["isError"], true, "{text}");

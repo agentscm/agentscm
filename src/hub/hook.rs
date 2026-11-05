@@ -442,7 +442,7 @@ async fn authenticate(
         .filter(|principal| !principal.read_only) // a read-only token is as good as an unknown one
         .ok_or_else(|| error_envelope::from_code(ErrorCode::Unauthorized))?;
     if repo.is_some_and(|repo| repo != principal.repository) {
-        return Err(error_envelope::from_code(ErrorCode::Unauthorized));
+        return Err(error_envelope::from_code(ErrorCode::WrongRepository));
     }
     Ok(principal)
 }

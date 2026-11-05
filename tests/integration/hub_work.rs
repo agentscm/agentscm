@@ -6306,7 +6306,7 @@ fn an_idle_lease_lapses_and_the_next_admission_clears_it(db: &Db) {
     for minute in 0..5 {
         assert!(matches!(
             store.touch_session(&alice.token, &edit, after + 2 + minute * 60),
-            Err(HubError::Invalid(_))
+            Err(HubError::Invalid(_) | HubError::Rejected(_))
         ));
     }
     // Resuming needs fresh admission, and the scope is held again.

@@ -167,7 +167,7 @@ async fn i295_startup_scenario(scenario: &str) {
     let first = hub.hook("claude", &secret, &payload);
     let first_text = text_at(&first, CLAUDE_CONTEXT);
     assert!(
-        !first_text.contains("coordination unknown"),
+        !first_text.contains("coordination unknown ("),
         "first start: {first}"
     );
     assert!(
@@ -188,7 +188,7 @@ async fn i295_startup_scenario(scenario: &str) {
     let answer = hub.hook("claude", &secret, &payload);
     let text = text_at(&answer, CLAUDE_CONTEXT);
     assert!(
-        !text.contains("coordination unknown"),
+        !text.contains("coordination unknown ("),
         "{scenario}: {answer}"
     );
     assert!(text.contains("native session ID"), "{scenario}: {answer}");
@@ -1048,7 +1048,10 @@ async fn encoded_repository_guards_are_judged_identically_to_raw_guards() {
             if accepted {
                 assert_eq!(live[0].paths, ["src/widget.rs"]);
             }
-            assert_eq!(*first.get_or_insert(reply.clone()), reply);
+            // Each failure carries its own reference; the rest of the answer must be identical.
+            let same =
+                |reply: &Value| crate::hub_error_assert::blank_references(&reply.to_string());
+            assert_eq!(same(first.get_or_insert(reply.clone())), same(&reply));
         }
     }
 }

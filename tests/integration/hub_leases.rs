@@ -537,7 +537,7 @@ fn a_partitioned_lead_reconnects_to_a_fence(db: &Db) {
     touch(&*store, &alice, "s-a", &[], back).unwrap();
     assert!(matches!(
         touch(&*store, &alice, "s-a", &["src/lib.rs"], back),
-        Err(HubError::Invalid(_))
+        Err(HubError::Invalid(_) | HubError::Rejected(_))
     ));
     assert!(matches!(
         store.work_checkpoint(

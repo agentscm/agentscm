@@ -1179,7 +1179,9 @@ async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["error", "message", "refused_paths"]);
+    for key in ["error", "message", "refused_paths", "retryable", "recovery"] {
+        assert!(keys.contains(&key), "{key}: {keys:?}");
+    }
     assert_eq!(reply["error"], "invalid_request");
     assert!(reply["message"].as_str().unwrap().contains(&started.id));
     assert_eq!(
