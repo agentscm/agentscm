@@ -95,6 +95,8 @@ enum Subject {
         work_id: String,
         generation: i64,
     },
+    /// A failed required check or stopped skill gate that blocks a merge after its agent stopped.
+    Check { id: String },
 }
 impl Subject {
     fn key(&self) -> String {
@@ -136,6 +138,15 @@ fn outstanding(status: &ActionableStatus) -> Vec<Outstanding> {
         }
     }
     for action in &status.actions {
+        if action.needs_you && actionable_status::merge_blocked_after_stop(status, action) {
+            out.push(Outstanding {
+                subject: Subject::Check {
+                    id: action.id.clone(),
+                },
+                text: action.action.clone(),
+            });
+            continue;
+        }
         if !action.needs_you || action.kind != "directed_request" {
             continue;
         }
@@ -388,7 +399,7 @@ impl Slack {
             if pending.iter().any(|a| a.subject == subject) {
                 continue;
             }
-            if confirmed_cleared(state, &principal, &subject, now)? {
+            if confirmed_cleared(state, &principal, &status, &subject, now)? {
                 let mut db = self.database()?;
                 let tx = db.transaction()?;
                 tx.execute(
@@ -607,7 +618,7 @@ impl Slack {
                 if !binding.config.reminders.send_resolution
                     || user != binding.config.slack_user
                     || episode_state != "resolved"
-                    || !confirmed_cleared(state, &principal, &subject, now)?
+                    || !confirmed_cleared(state, &principal, &status, &subject, now)?
                 {
                     self.obsolete_status_job(&id)?;
                     return Ok(None);
@@ -713,10 +724,12 @@ fn queue(
 fn confirmed_cleared(
     state: &HubState,
     principal: &Principal,
+    status: &ActionableStatus,
     subject: &Subject,
     now: i64,
 ) -> Result<bool> {
     match subject {
+        Subject::Check { id } => Ok(actionable_status::check_cleared(status, id)),
         Subject::Work { id, generation, .. } => {
             let Some(item) = state.store.work_get(&principal.token_id, id, now)? else {
                 return Ok(false);
@@ -838,6 +851,38 @@ mod tests {
         assert!(visible.contains(&format!("Evidence revision {}", status.digest)));
         assert!(visible.contains("Provider evidence is unavailable"));
         assert!(visible.contains("shortens details"));
+    }
+
+    #[test]
+    fn failed_checks_remind_only_after_their_agent_stopped() {
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("../fixtures/actionable-status.json")).unwrap();
+        let mut check = status.actions[0].clone();
+        check.id = "check:rep_synthetic:5:agentscm/local-validation".into();
+        check.kind = "failed_check".into();
+        // wrk_1111… is the viewer's blocked Work with an active claim: its agent is working.
+        check.work_ids = vec![status.work[0].work_id.clone()];
+        let mut gate = check.clone();
+        gate.id = "gate:run_synthetic:tests".into();
+        gate.kind = "skill_gate".into();
+        status.actions = vec![check.clone(), gate];
+        let subjects = |status: &ActionableStatus| {
+            outstanding(status)
+                .into_iter()
+                .filter_map(|o| match o.subject {
+                    Subject::Check { id } => Some(id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(subjects(&status), ["gate:run_synthetic:tests"]);
+        status.work[0].freshness = crate::hub::work::ClaimStatus::Stale;
+        assert_eq!(
+            subjects(&status),
+            [check.id.as_str(), "gate:run_synthetic:tests"]
+        );
+        status.actions.iter_mut().for_each(|a| a.needs_you = false);
+        assert!(subjects(&status).is_empty(), "another person's failure");
     }
 
     #[test]
