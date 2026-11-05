@@ -116,7 +116,7 @@ jobs:
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title 'chore: Prepare release' --body-file "$RUNNER_TEMP/release-pr.md"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
-  # An App-created PR starts only path-selected workflows, so dispatch the release qualification once.
+  # The candidate's files select none of these workflows' pull request triggers, so dispatch them once.
   qualify:
     needs: prepare
     if: ${{ needs.prepare.outputs.branch != '' }}
