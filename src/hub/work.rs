@@ -247,6 +247,9 @@ pub struct WorkCheckpointResult {
     pub item: WorkItem,
     /// The immutable commit identity for the requested operation.
     pub receipt: CheckpointReceipt,
+    /// Lapsed holds a scope change took the scope of.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reclaimed: Vec<ReclaimedHold>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -291,6 +294,18 @@ pub struct WorkCompaction {
     pub merge_retention_floor: i64,
 }
 
+/// A lapsed hold whose scope an admission took. Its lead's branch may hold edits it never pushed;
+/// the Hub cannot see them.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReclaimedHold {
+    pub work_id: String,
+    pub lead_agent: String,
+    pub branch: Option<String>,
+    pub lapsed_at: i64,
+    pub notice: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkStartResult {
@@ -305,6 +320,9 @@ pub struct WorkStartResult {
     pub coordination_request: Option<CoordinationRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight: Option<WorkPreflightResult>,
+    /// Lapsed holds this admission took the scope of.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reclaimed: Vec<ReclaimedHold>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

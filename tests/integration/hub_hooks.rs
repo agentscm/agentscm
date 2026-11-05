@@ -807,3 +807,69 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
     assert!(context.contains("wait for your lead session"), "{answer}");
     assert!(!context.contains(&request), "{answer}");
 }
+
+/// A tool call that edits nothing still renews the lead session's lease, silently, so a busy
+/// agent that only reads and runs commands keeps its hold. Another session renews nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_tool_call_renews_only_its_own_sessions_lease() {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    use agentscm::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
+    let mut hub = Hub::start().await;
+    let lead = hub.agent();
+    let token = hub
+        .store
+        .authenticate(&agent_token_digest(&lead).unwrap(), unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    let session = "11111111-2222-3333-4444-555555555555";
+    // Started ten minutes ago, so its lease ends ten minutes from now.
+    let started = unix_now() - 600;
+    let item = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: Some("busy".into()),
+                title: "busy".into(),
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/widget.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            started,
+        )
+        .unwrap()
+        .item;
+    let expiry = |hub: &Hub| {
+        hub.store
+            .work_operational(
+                &WorkLifecycleReader::Token(&token),
+                &OperationalSelect::One(&item.id),
+                unix_now(),
+            )
+            .unwrap()
+            .work[0]
+            .activity
+            .lease_expires_at
+            .unwrap()
+    };
+    assert_eq!(expiry(&hub), started + LEASE_SECONDS);
+    let other = json!({"hook_event_name":"PostToolUse", "session_id":"another-session",
+        "tool_name":"Bash", "cwd":"/work/acme-widgets"});
+    assert_eq!(hub.hook("claude", &lead, &other), json!({}));
+    assert_eq!(expiry(&hub), started + LEASE_SECONDS);
+    let before = unix_now();
+    let bash = json!({"hook_event_name":"PreToolUse", "session_id":session,
+        "tool_name":"Bash", "tool_input":{"command":"cargo test"}, "cwd":"/work/acme-widgets"});
+    assert_eq!(hub.hook("claude", &lead, &bash), json!({}));
+    assert!(expiry(&hub) >= before + LEASE_SECONDS);
+}

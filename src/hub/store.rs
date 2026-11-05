@@ -344,7 +344,19 @@ pub trait Store: Send + Sync {
     /// Upsert the session, add `call.paths` to its intent (creating a fresh intent when it has none,
     /// or it was released), renew the intent to now + `SESSION_TTL_SECONDS`, and collect new
     /// overlaps and notices.
-    fn touch_session(&self, token: &str, call: &SessionCall, now: i64) -> Result<Touched>;
+    fn touch_session(&self, token: &str, call: &SessionCall, now: i64) -> Result<Touched> {
+        self.touch_session_named(token, call, call.session.is_some(), now)
+    }
+    /// `touch_session`, where `named` is false when the caller named no session and
+    /// `call.session` is the one the Hub resolved for it. Such a touch renews no lease and carries
+    /// no lead credential, since that session is not the call's own.
+    fn touch_session_named(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        named: bool,
+        now: i64,
+    ) -> Result<Touched>;
     /// Release the session's intent (if any) and delete the session row. `None` resolves like
     /// `SessionCall.session`. True if a session existed.
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool>;
@@ -723,7 +735,19 @@ pub trait Store: Send + Sync {
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>>;
     /// The highest event `seq`, or 0 with no events.
     fn latest_event_seq(&self) -> Result<i64>;
-    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
+    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        self.work_start_named(token, start, true, now)
+    }
+    /// `work_start`, where `named` is false when the caller named no session and `start.session`
+    /// is the one the Hub resolved for it. That session is not the call's own, so such a start
+    /// never holds its lapsed scope again.
+    fn work_start_named(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        named: bool,
+        now: i64,
+    ) -> Result<WorkStartResult>;
     /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
     fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
     fn work_checkpoint(
@@ -1009,6 +1033,19 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
+    /// A tool call a hook reported that is not an edit check: a touch of the session, which
+    /// renews its leases, and for a shell call the start or end that keeps them live while it
+    /// runs, up to the in-flight cap.
+    fn session_activity(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        phase: super::work_lifecycle::CallPhase,
+        now: i64,
+    ) -> Result<()>;
+    /// Records that the Hub's clock reads `now`. After a gap longer than a lease since the last
+    /// observation, every reservation that was live then gets one lease of grace.
+    fn observe_lease_clock(&self, now: i64) -> Result<()>;
     fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing>;
     /// Side-effect-free current page for hooks and implicit contexts; never ackable, with an
     /// isolated explicit subscriber/session cursor.

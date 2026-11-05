@@ -21,6 +21,7 @@ use agentscm::hub::work::{
     SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint,
     WorkConflictKind, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
+use agentscm::hub::work_lifecycle::LEASE_SECONDS as LEASE;
 use agentscm::hub::work_links::{
     WorkPrHeadStatus, WorkPrLinkQuery, WorkPrLinkTarget, WorkPrLinkUpdate, WorkPrSnapshotStatus,
 };
@@ -67,6 +68,7 @@ impl Db {
 
     fn assert_event_delete_boundary(&self) {
         const GUARDED: &[&str] = &[
+            "reservation_lapsed",
             "session_started",
             "intent_created",
             "workflow_started",
@@ -745,8 +747,18 @@ fn authorization_and_claim_projection_keep_old_claims_visible(db: &Db) {
             .claim_status,
         ClaimStatus::Stale
     );
+    // A stale report alone does not open takeover while the lead's lease is live.
     let contested = store
         .work_start(&viewer.token, &takeover(&id, "viewer", None), stale_at)
+        .unwrap();
+    assert_eq!(
+        contested.conflict.unwrap().kind,
+        WorkConflictKind::ClaimHeld
+    );
+    let lapsed_at = now + LEASE + 1;
+    tick(&*store, now, lapsed_at);
+    let contested = store
+        .work_start(&viewer.token, &takeover(&id, "viewer", None), lapsed_at)
         .unwrap();
     assert_eq!(
         contested.conflict.unwrap().kind,
@@ -2427,6 +2439,11 @@ conformance!(
     requests_that_propose_ended_work_are_marked_released_too,
     read_only_transition_on_an_unknown_id_is_unauthorized_in_both_stores,
     a_paused_item_frees_its_session_for_another_goal,
+    an_idle_lease_lapses_and_the_next_admission_clears_it,
+    lead_activity_renews_the_lease_without_reviving_it,
+    every_basis_lapses_and_retain_is_capped,
+    a_gap_in_the_clock_grants_one_lease_of_grace,
+    lease_migration_starts_existing_reservations_now,
 );
 
 fn pr_link_update(item: &agentscm::hub::work::WorkItem, operation_id: &str) -> WorkPrLinkUpdate {
@@ -2645,11 +2662,12 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
             .is_some()
     );
     let successor = agent(&*store, 6);
+    tick(&*store, now, now + LEASE + 2);
     let taken = store
         .work_start(
             &successor.token,
             &takeover(&item.id, "successor", Some(1)),
-            now + CLAIM_STALE_SECONDS + 2,
+            now + LEASE + 2,
         )
         .unwrap();
     assert!(taken.took_over);
@@ -2658,7 +2676,7 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
             &successor.token,
             &item.id,
             &WorkPrLinkQuery::default(),
-            now + CLAIM_STALE_SECONDS + 3,
+            now + LEASE + 3,
         )
         .unwrap()
         .unwrap();
@@ -2672,7 +2690,7 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
     assert_eq!(original_link.linked_at, now + 1);
     assert_eq!(original_link.event_seq, first.receipt.event_seq);
     let replayed = store
-        .work_pr_link_set(&lead.token, &update, now + CLAIM_STALE_SECONDS + 3)
+        .work_pr_link_set(&lead.token, &update, now + LEASE + 3)
         .unwrap();
     assert!(replayed.receipt.replayed);
     assert_eq!(replayed.receipt.generation, 1);
@@ -2681,17 +2699,13 @@ fn pr_links_require_trusted_repository_and_current_lead(db: &Db) {
     let mut old_lead_new_operation = update.clone();
     old_lead_new_operation.operation_id = "old-lead-new-operation".into();
     assert_invalid(
-        store.work_pr_link_set(
-            &lead.token,
-            &old_lead_new_operation,
-            now + CLAIM_STALE_SECONDS + 3,
-        ),
+        store.work_pr_link_set(&lead.token, &old_lead_new_operation, now + LEASE + 3),
         "PR link generation is fenced",
     );
     let mut removal = pr_link_update(&taken.item, "successor-remove");
     removal.link = None;
     let removed = store
-        .work_pr_link_set(&successor.token, &removal, now + CLAIM_STALE_SECONDS + 3)
+        .work_pr_link_set(&successor.token, &removal, now + LEASE + 3)
         .unwrap();
     assert!(removed.view.link.is_none());
     assert!(removed.view.updated_seq > first.view.updated_seq);
@@ -3031,7 +3045,8 @@ fn pr_link_receipts_replay_after_takeover_changes_and_removal(db: &Db) {
         .work_pr_link_set(&lead.token, &original_request, now + 1)
         .unwrap();
     let successor = agent(&*store, 2);
-    let takeover_at = now + CLAIM_STALE_SECONDS + 2;
+    let takeover_at = now + LEASE + 2;
+    tick(&*store, now, takeover_at);
     let taken = store
         .work_start(
             &successor.token,
@@ -3515,8 +3530,9 @@ fn announce_intent_refuses_fenced_sessions_but_not_finished_or_unlinked_ones(db:
         .announce_intent(&alice.token, &intent(1, "src/a.rs"), now + 1)
         .unwrap();
 
-    // Bob takes over after the claim went stale; alice's session is now fenced.
-    let later = now + CLAIM_STALE_SECONDS + 10;
+    // Bob takes over after alice's lease lapsed; alice's session is now fenced.
+    let later = now + LEASE + 10;
+    tick(&*store, now, later);
     assert!(
         store
             .work_start(
@@ -4545,8 +4561,9 @@ fn reopen_conflicts_on_overlap_and_fences_the_old_session(db: &Db) {
         Err(HubError::Invalid(_))
     ));
 
-    // The reopened Work is ordinary: once stale, another agent takes it over.
-    let later = now + CLAIM_STALE_SECONDS + 10;
+    // The reopened Work is ordinary: once its lease lapsed, another agent takes it over.
+    let later = now + LEASE + 20;
+    tick(&*store, now, later);
     let taken = store
         .work_start(&bob.token, &takeover(&item.id, "s-bob", Some(2)), later)
         .unwrap();
@@ -4960,10 +4977,11 @@ fn plain_announce_follows_the_token_sessions_after_release_abandon_and_takeover(
     ));
     announce_plain(&alice, 3, &["src/c.rs"], now + 7).unwrap();
 
-    // A stale takeover fences the previous holder's named session.
+    // A takeover after the lease lapsed fences the previous holder's named session.
     let other = start_in(&*store, &bob, "b", "abc", "lib/**", now + 8);
     announce_plain(&bob, 6, &["lib/a.rs"], now + 9).unwrap();
-    let later = now + 8 + CLAIM_STALE_SECONDS + 10;
+    let later = now + 8 + LEASE + 10;
+    tick(&*store, now, later);
     assert!(
         store
             .work_start(&carol.token, &takeover(&other.id, "abc", Some(1)), later)
@@ -6121,4 +6139,389 @@ fn a_paused_item_frees_its_session_for_another_goal(db: &Db) {
         .unwrap();
     assert!(resumed.took_over && resumed.conflict.is_none());
     assert_eq!(resumed.item.state, WorkState::Active);
+}
+
+/// The Hub's clock heartbeat once a minute from `from` through `to`, as `serve` runs it.
+fn tick(store: &dyn Store, from: i64, to: i64) {
+    let mut at = from;
+    while at < to {
+        store.observe_lease_clock(at).unwrap();
+        at += 60;
+    }
+    store.observe_lease_clock(to).unwrap();
+}
+
+/// The stored lease: last renewal and expiry, empty when no reservation is held.
+fn lease_of(db: &Db, id: &str) -> (String, String) {
+    let rows = db.rows(&format!(
+        "SELECT reservation_renewed_at, reservation_expires_at FROM hub_work_items
+         WHERE id = '{id}'"
+    ));
+    (rows[0][0].clone(), rows[0][1].clone())
+}
+
+fn activity(
+    store: &dyn Store,
+    who: &Agent,
+    id: &str,
+    now: i64,
+) -> agentscm::hub::work_lifecycle::ActivityV1 {
+    let page = store
+        .work_operational(
+            &agentscm::hub::work_transition::WorkLifecycleReader::Token(&who.token),
+            &OperationalSelect::One(id),
+            now,
+        )
+        .unwrap();
+    assert_eq!(page.schema_version, 2);
+    page.work.into_iter().next().unwrap().activity
+}
+
+/// An agent whose token outlives the hours these lease tests move the clock through.
+fn lasting_agent(store: &dyn Store, user_id: i64) -> Agent {
+    agent_with(
+        store,
+        AgentSpec {
+            provider: "github",
+            host: "github.com",
+            user_id,
+            repository: REPO,
+            repository_id: Some(REPOSITORY_ID),
+            read_only: false,
+            ttl: 3 * 86_400,
+        },
+    )
+}
+
+fn scoped(key: &str, session: &str, scope: &str) -> WorkStart {
+    let mut start = native_start(key, key, session);
+    start.scope = vec![scope.into()];
+    start
+}
+
+fn an_idle_lease_lapses_and_the_next_admission_clears_it(db: &Db) {
+    use agentscm::hub::work_lifecycle::{ActivityStatus, LEASE_SECONDS};
+    let store = db.open();
+    let alice = lasting_agent(&*store, 1);
+    let bob = lasting_agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    announce(&*store, &alice, "s-a", "src/lib.rs", now);
+    assert_eq!(
+        activity(&*store, &alice, &held.id, now).status,
+        ActivityStatus::Live
+    );
+
+    // Within the lease the reservation blocks.
+    let edge = now + LEASE_SECONDS - 1;
+    tick(&*store, now, edge);
+    assert_scope_overlap(
+        &store
+            .work_start(&bob.token, &scoped("b1", "s-b", "src/**"), edge)
+            .unwrap(),
+    );
+    let after = now + LEASE_SECONDS + 1;
+    tick(&*store, edge, after);
+    assert_eq!(
+        activity(&*store, &alice, &held.id, after).status,
+        ActivityStatus::Lapsed
+    );
+    // A lapsed reservation is advice: it stays until an admission over it.
+    assert_eq!(db.reservation(&held.id), (None, Some("admitted".into())));
+    let admitted = store
+        .work_start(&bob.token, &scoped("b2", "s-b2", "src/**"), after)
+        .unwrap();
+    assert!(admitted.created && admitted.conflict.is_none());
+
+    // The same transaction cleared it, fenced the old lead and recorded what the Hub saw.
+    assert_eq!(db.reservation(&held.id), (None, None));
+    assert_eq!(lease_of(db, &held.id), (String::new(), String::new()));
+    let lapsed = current_item(&*store, &alice, &held.id, after);
+    assert_eq!(
+        (lapsed.state, lapsed.generation),
+        (WorkState::Paused, held.generation + 1)
+    );
+    let events: Vec<serde_json::Value> = store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == "reservation_lapsed")
+        .map(|event| serde_json::from_str(&event.data).unwrap())
+        .collect();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["lead"]["session"], "s-a");
+    assert_eq!(event["renewed_at"], now);
+    assert_eq!(event["expires_at"], now + LEASE_SECONDS);
+    assert_eq!(event["branch"], "feature/work");
+    assert_eq!(event["scope"], serde_json::json!(held.scope));
+    assert_eq!(event["seen_paths"], serde_json::json!(["src/lib.rs"]));
+    assert_eq!(event["push_state"], "unknown");
+    assert_eq!(event["admitted_by"], admitted.item.id.as_str());
+    assert_eq!(event["generation"], held.generation + 1);
+
+    // A late checkpoint at the old generation is fenced.
+    assert!(matches!(
+        store.work_checkpoint(
+            &alice.token,
+            &checkpoint(
+                &held.id,
+                "late",
+                held.generation,
+                "s-a",
+                CheckpointKind::Progress,
+                "late"
+            ),
+            after + 1,
+        ),
+        Err(HubError::Invalid(_))
+    ));
+    // The woken lead's edits are refused every time: lapse refusals never pass the refusal limit.
+    let edit = agentscm::hub::session::SessionCall {
+        session: Some("s-a".into()),
+        via: "hook:claude".into(),
+        task: None,
+        paths: vec!["src/lib.rs".into()],
+        deny: true,
+        report: true,
+    };
+    for minute in 0..5 {
+        assert!(matches!(
+            store.touch_session(&alice.token, &edit, after + 2 + minute * 60),
+            Err(HubError::Invalid(_))
+        ));
+    }
+    // Resuming needs fresh admission, and the scope is held again.
+    assert_scope_overlap(
+        &store
+            .work_start(
+                &alice.token,
+                &takeover(&held.id, "s-a", Some(held.generation + 1)),
+                after + 400,
+            )
+            .unwrap(),
+    );
+}
+
+fn lead_activity_renews_the_lease_without_reviving_it(db: &Db) {
+    use agentscm::hub::work_lifecycle::{ActivityStatus, LEASE_SECONDS};
+    let store = db.open();
+    let alice = lasting_agent(&*store, 1);
+    let bob = lasting_agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    // The lead session works for 50 minutes, past the 30-minute intent cap; no absolute cap
+    // applies to the lease.
+    let mut at = now;
+    for step in 1..=5 {
+        let next = now + step * 600;
+        tick(&*store, at, next);
+        at = next;
+        announce(&*store, &alice, "s-a", "src/x.rs", at);
+        assert_scope_overlap(
+            &store
+                .work_start(
+                    &bob.token,
+                    &scoped(&format!("b{step}"), "s-b", "src/**"),
+                    at,
+                )
+                .unwrap(),
+        );
+    }
+    let renewed = at;
+    let expected = (renewed.to_string(), (renewed + LEASE_SECONDS).to_string());
+    assert_eq!(lease_of(db, &held.id), expected);
+    // At most one renewal a minute.
+    announce(&*store, &alice, "s-a", "src/x.rs", renewed + 30);
+    assert_eq!(lease_of(db, &held.id), expected);
+    // Neither another session of the lead token nor another token renews it.
+    tick(&*store, renewed, renewed + 600);
+    announce(&*store, &alice, "s-other", "docs/y.md", renewed + 600);
+    announce(&*store, &bob, "s-b", "docs/z.md", renewed + 600);
+    assert_eq!(lease_of(db, &held.id), expected);
+    // Once lapsed, a late touch of the lead does not revive it, and its edit needs fresh admission.
+    let late = renewed + LEASE_SECONDS + 1;
+    tick(&*store, renewed + 600, late);
+    store
+        .touch_session(
+            &alice.token,
+            &agentscm::hub::session::SessionCall {
+                session: Some("s-a".into()),
+                via: "mcp".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            late,
+        )
+        .unwrap();
+    assert_eq!(lease_of(db, &held.id), expected);
+    assert_eq!(
+        activity(&*store, &alice, &held.id, late).status,
+        ActivityStatus::Lapsed
+    );
+    assert!(
+        store
+            .work_start(&bob.token, &scoped("b-late", "s-b", "src/**"), late)
+            .unwrap()
+            .created
+    );
+}
+
+fn every_basis_lapses_and_retain_is_capped(db: &Db) {
+    use agentscm::hub::work_lifecycle::{LEASE_SECONDS, RETAIN_CAP_SECONDS};
+    let store = db.open();
+    let alice = lasting_agent(&*store, 1);
+    let bob = lasting_agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let retained = start_in(&*store, &alice, "r", "s-r", "kept/**", now);
+    let retain = store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&retained, "retain", WorkTransitionKind::Retain, Some("s-r")),
+            now,
+        )
+        .unwrap();
+    assert_eq!(db.reservation(&retained.id).1.as_deref(), Some("retained"));
+    assert_eq!(
+        lease_of(db, &retained.id).1,
+        (now + RETAIN_CAP_SECONDS).to_string()
+    );
+    let paused = start_in(&*store, &alice, "p", "s-p", "paused/**", now);
+    lead_checkpoint(
+        &*store,
+        &alice,
+        &paused,
+        "pause",
+        "s-p",
+        CheckpointKind::Pause,
+        now,
+    );
+    assert_eq!(
+        db.reservation(&paused.id).1.as_deref(),
+        Some("legacy_implicit")
+    );
+
+    // A pause's implicit reservation lapses on its own clock, even while its lead session keeps
+    // working; a retain outlasts the idle lease.
+    tick(&*store, now, now + 600);
+    let heartbeat = agentscm::hub::session::SessionCall {
+        session: Some("s-p".into()),
+        via: "mcp".into(),
+        task: None,
+        paths: Vec::new(),
+        deny: false,
+        report: false,
+    };
+    store
+        .touch_session(&alice.token, &heartbeat, now + 600)
+        .unwrap();
+    let idle = now + LEASE_SECONDS + 1;
+    tick(&*store, now + 600, idle);
+    assert!(
+        store
+            .work_start(&bob.token, &scoped("bp", "s-bp", "paused/**"), idle)
+            .unwrap()
+            .created
+    );
+    assert_eq!(db.reservation(&paused.id), (None, None));
+    assert_scope_overlap(
+        &store
+            .work_start(&bob.token, &scoped("br1", "s-br", "kept/**"), idle)
+            .unwrap(),
+    );
+    // The retain is capped; it never holds indefinitely.
+    let capped = now + RETAIN_CAP_SECONDS + 1;
+    tick(&*store, idle, capped);
+    assert!(
+        store
+            .work_start(&bob.token, &scoped("br2", "s-br2", "kept/**"), capped)
+            .unwrap()
+            .created
+    );
+    assert_eq!(db.reservation(&retained.id), (None, None));
+    assert!(retain.conflict.is_none());
+}
+
+fn a_gap_in_the_clock_grants_one_lease_of_grace(db: &Db) {
+    use agentscm::hub::work_lifecycle::LEASE_SECONDS;
+    let store = db.open();
+    let alice = lasting_agent(&*store, 1);
+    let bob = lasting_agent(&*store, 2);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let held = start_in(&*store, &alice, "a", "s-a", "src/**", now);
+    // The Hub is down for two hours. Before its first heartbeat the clock is stale, so a request
+    // lapses nothing.
+    let restart = now + 7200;
+    assert_scope_overlap(
+        &store
+            .work_start(&bob.token, &scoped("b1", "s-b", "src/**"), restart)
+            .unwrap(),
+    );
+    // The first heartbeat grants the reservation that was live one lease of grace.
+    store.observe_lease_clock(restart).unwrap();
+    assert_eq!(
+        lease_of(db, &held.id).1,
+        (restart + LEASE_SECONDS).to_string()
+    );
+    let edge = restart + LEASE_SECONDS - 1;
+    tick(&*store, restart, edge);
+    assert_scope_overlap(
+        &store
+            .work_start(&bob.token, &scoped("b2", "s-b", "src/**"), edge)
+            .unwrap(),
+    );
+    let after = restart + LEASE_SECONDS + 1;
+    tick(&*store, edge, after);
+    assert!(
+        store
+            .work_start(&bob.token, &scoped("b3", "s-b3", "src/**"), after)
+            .unwrap()
+            .created
+    );
+}
+
+fn lease_migration_starts_existing_reservations_now(db: &Db) {
+    use agentscm::hub::work_lifecycle::{LEASE_SECONDS, RETAIN_CAP_SECONDS};
+    let store = db.open();
+    let alice = lasting_agent(&*store, 1);
+    let now = unix_now();
+    let active = start_in(&*store, &alice, "a", "s-a", "src/**", now - 86_400);
+    let retained = start_in(&*store, &alice, "r", "s-r", "kept/**", now - 86_400);
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&retained, "retain", WorkTransitionKind::Retain, Some("s-r")),
+            now - 86_400,
+        )
+        .unwrap();
+    drop(store);
+
+    // Rebuild the schema a binary without this change leaves behind.
+    db.sql(
+        "ALTER TABLE hub_work_items DROP COLUMN reservation_renewed_at;
+         ALTER TABLE hub_work_items DROP COLUMN reservation_expires_at;
+         DROP TABLE hub_lease_clock;
+         DELETE FROM hub_named_migrations WHERE name = 'work_reservation_leases';",
+    );
+    let before = unix_now();
+    let _store = db.open();
+    let after = unix_now();
+    // The clock starts at migration time, not at the day-old admission.
+    for (id, lease) in [
+        (&active.id, LEASE_SECONDS),
+        (&retained.id, RETAIN_CAP_SECONDS),
+    ] {
+        let (renewed, expires) = lease_of(db, id);
+        let renewed: i64 = renewed.parse().unwrap();
+        assert!((before..=after).contains(&renewed), "{renewed}");
+        assert_eq!(expires.parse::<i64>().unwrap(), renewed + lease);
+    }
+    let observed = db.rows("SELECT observed_at FROM hub_lease_clock");
+    assert!((before..=after).contains(&observed[0][0].parse::<i64>().unwrap()));
 }

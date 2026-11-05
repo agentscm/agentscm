@@ -735,7 +735,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(
                     Method::POST,
-                    "/v1/hub/standup/start",
+                    "/v1/hub/standup/start?reclaimed=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
@@ -755,7 +755,7 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             (
                 hub.call(
                     Method::POST,
-                    "/v1/hub/standup/checkpoint",
+                    "/v1/hub/standup/checkpoint?reclaimed=1",
                     Some(serde_json::to_value(request)?),
                 )
                 .await?,

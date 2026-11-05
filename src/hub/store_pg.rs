@@ -102,7 +102,7 @@ use super::store::{
 };
 use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
-    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
+    ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
     WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
@@ -111,7 +111,11 @@ use super::work::{
     claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
     work_overlap_pairs, work_payload_row_bytes,
 };
-use super::work_lifecycle::{OperationalRow, OutcomeFact, operational_page};
+use super::work_lifecycle::{
+    CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
+    RENEW_INTERVAL_SECONDS, RenewalCoverage, Unheld, lapsed_refusal_text, lapsed_unheld_text,
+    lease_seconds, operational_page, reclaimed_hold,
+};
 use super::work_links::{
     self, WorkPrLink, WorkPrLinkQuery, WorkPrLinkResult, WorkPrLinkUpdate, WorkPrLinkView,
 };
@@ -1898,10 +1902,19 @@ fn set_work_reservation(
     id: &str,
     outcome: Option<&str>,
     basis: Option<&str>,
+    now: i64,
 ) -> Result<()> {
+    // A basis starts its lease now; clearing the basis clears the lease.
     tx.execute(
-        "UPDATE hub_work_items SET terminal_outcome = $2, reservation_basis = $3 WHERE id = $1",
-        &[&id, &outcome, &basis],
+        "UPDATE hub_work_items SET terminal_outcome = $2, reservation_basis = $3,
+             reservation_renewed_at = $4, reservation_expires_at = $5 WHERE id = $1",
+        &[
+            &id,
+            &outcome,
+            &basis,
+            &basis.map(|_| now),
+            &basis.map(|basis| now + lease_seconds(basis)),
+        ],
     )?;
     Ok(())
 }
@@ -1916,12 +1929,15 @@ fn work_scope_overlaps(
     if scope.is_empty() {
         return Ok(Vec::new());
     }
+    // A lapsed lease blocks nobody, unless the clock is stale and its lapse is not yet known.
+    let stale = !lease_clock_fresh(tx, now)?;
     // The scope column mirrors the snapshot's scope, so only overlapping snapshots are decoded.
     let rows = tx.query(
         "SELECT id, scope FROM hub_work_items
          WHERE provider = $1 AND host = $2 AND repository = $3
            AND repository_id IS NOT DISTINCT FROM $4 AND reservation_basis IS NOT NULL
            AND ($5::text IS NULL OR id <> $5)
+           AND (reservation_expires_at > $6 OR $7)
          ORDER BY id LIMIT 101",
         &[
             &who.owner.identity.provider,
@@ -1929,6 +1945,8 @@ fn work_scope_overlaps(
             &who.repository,
             &who.repository_id,
             &exclude,
+            &now,
+            &stale,
         ],
     )?;
     if rows.len() > 100 {
@@ -1955,6 +1973,361 @@ fn work_scope_overlaps(
         }
     }
     Ok(found)
+}
+
+/// Whether the Hub observed its own clock within the last lease. After a longer gap (a restart, or
+/// the clock jumping forward) nothing lapses until `observe_lease_clock` has granted grace.
+fn lease_clock_fresh(tx: &mut postgres::Transaction<'_>, now: i64) -> Result<bool> {
+    let observed: i64 = tx
+        .query_one("SELECT observed_at FROM hub_lease_clock WHERE id = 1", &[])?
+        .get(0);
+    Ok(now - observed <= LEASE_SECONDS)
+}
+
+/// The Hub's clock heartbeat. After a gap longer than a lease since the last observation, every
+/// reservation that was live then gets one lease of grace instead of lapsing. A backward jump only
+/// moves the observation back. The clock row lock serializes heartbeats; admissions only read it,
+/// and the grace takes each repository's Work lock in the order admissions do.
+fn observe_lease_clock(tx: &mut postgres::Transaction<'_>, now: i64) -> Result<()> {
+    let observed: i64 = tx
+        .query_one(
+            "SELECT observed_at FROM hub_lease_clock WHERE id = 1 FOR UPDATE",
+            &[],
+        )?
+        .get(0);
+    if now - observed > LEASE_SECONDS {
+        let until = now + LEASE_SECONDS;
+        // Each repository's Work lock first, as an admission takes it before any Work row, so the
+        // grace never holds a row an admission waits on while it waits on one the admission holds.
+        let repositories = tx.query(
+            "SELECT DISTINCT provider, host, repository, repository_id FROM hub_work_items
+             WHERE reservation_basis IS NOT NULL AND reservation_expires_at > $1
+               AND reservation_expires_at < $2
+             ORDER BY provider, host, repository, repository_id",
+            &[&observed, &until],
+        )?;
+        for row in repositories {
+            let (provider, host, repository, repository_id): (String, String, String, Option<i64>) =
+                (row.get(0), row.get(1), row.get(2), row.get(3));
+            lock_work_repository(tx, &provider, &host, &repository, repository_id)?;
+            tx.execute(
+                "UPDATE hub_work_items SET reservation_expires_at = $2
+                 WHERE provider = $3 AND host = $4 AND repository = $5
+                   AND repository_id IS NOT DISTINCT FROM $6
+                   AND reservation_basis IS NOT NULL AND reservation_expires_at > $1
+                   AND reservation_expires_at < $2",
+                &[
+                    &observed,
+                    &until,
+                    &provider,
+                    &host,
+                    &repository,
+                    &repository_id,
+                ],
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE hub_lease_clock SET observed_at = $1 WHERE id = 1",
+        &[&now],
+    )?;
+    Ok(())
+}
+
+/// Renews the live leases of the active or blocked Work this lead session holds, at most once a
+/// minute. Paused or handed-over Work lapses on its own clock, and a lapsed lease stays lapsed:
+/// only a new admission holds the scope again. Callers hold the repository's Work lock, so
+/// a renewal never interleaves with an admission's lapse.
+fn renew_leases(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    session: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_work_items SET reservation_renewed_at = $3,
+             reservation_expires_at = GREATEST(reservation_expires_at, $3::bigint + $4::bigint)
+         WHERE lead_token = $1 AND lead_session = $2
+           AND state <> 'finished' AND state IN ('active', 'blocked')
+           AND reservation_basis IS NOT NULL AND reservation_expires_at > $3
+           AND reservation_renewed_at <= $3::bigint - $5::bigint",
+        &[
+            &token,
+            &session,
+            &now,
+            &LEASE_SECONDS,
+            &RENEW_INTERVAL_SECONDS,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Records a tool call the session's hook reported: when tool activity was last seen and, for a
+/// shell call, how many are still running. While one runs, the session's live leases last up to
+/// `IN_FLIGHT_CAP_SECONDS`; when the last one ends they fall back to the idle lease. A count older
+/// than the cap is stale, its end lost, so a call that crashed holds at most the cap. Callers hold
+/// the repository's Work lock in shared mode, as a touch does.
+fn session_tool_call(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    session: &str,
+    phase: CallPhase,
+    now: i64,
+) -> Result<()> {
+    let stale = now - IN_FLIGHT_CAP_SECONDS;
+    match phase {
+        CallPhase::Tick => {
+            tx.execute(
+                "UPDATE hub_sessions SET tool_activity_at = $3 WHERE token = $1 AND session = $2",
+                &[&token, &session, &now],
+            )?;
+        }
+        CallPhase::Start => {
+            // A count still open since before the cap is stale: its ends were lost, so it restarts.
+            let opened: i64 = tx
+                .query_opt(
+                    "UPDATE hub_sessions SET tool_activity_at = $3,
+                         open_calls = CASE WHEN open_calls = 0 OR open_call_at IS NULL
+                                                OR open_call_at < $4 THEN 1
+                                           ELSE open_calls + 1 END,
+                         open_call_at = CASE WHEN open_calls = 0 OR open_call_at IS NULL
+                                                  OR open_call_at < $4 THEN $3
+                                             ELSE open_call_at END
+                     WHERE token = $1 AND session = $2 RETURNING open_call_at",
+                    &[&token, &session, &now, &stale],
+                )?
+                .map_or(now, |row| row.get(0));
+            tx.execute(
+                "UPDATE hub_work_items SET reservation_renewed_at = $3,
+                     reservation_expires_at = GREATEST(reservation_expires_at, $4::bigint + $5::bigint)
+                 WHERE lead_token = $1 AND lead_session = $2
+                   AND state <> 'finished' AND state IN ('active', 'blocked')
+                   AND reservation_basis IS NOT NULL AND reservation_expires_at > $3",
+                &[&token, &session, &now, &opened, &IN_FLIGHT_CAP_SECONDS],
+            )?;
+        }
+        CallPhase::End => {
+            let open: Option<i32> = tx
+                .query_opt(
+                    "UPDATE hub_sessions SET tool_activity_at = $3,
+                         open_calls = CASE WHEN open_call_at IS NULL OR open_call_at < $4 THEN 0
+                                           ELSE GREATEST(open_calls - 1, 0) END
+                     WHERE token = $1 AND session = $2 RETURNING open_calls",
+                    &[&token, &session, &now, &stale],
+                )?
+                .map(|row| row.get(0));
+            if open.unwrap_or(0) == 0 {
+                // Back to the idle lease. A retain keeps its own longer expiry.
+                tx.execute(
+                    "UPDATE hub_work_items SET reservation_expires_at = $3::bigint + $4::bigint
+                     WHERE lead_token = $1 AND lead_session = $2
+                       AND state <> 'finished' AND state IN ('active', 'blocked')
+                       AND reservation_basis IS NOT NULL AND reservation_basis <> 'retained'
+                       AND reservation_expires_at > $3::bigint + $4::bigint",
+                    &[&token, &session, &now, &LEASE_SECONDS],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The refusal of an edit by a lead session whose hold lapsed, when its latest Work change is that
+/// lapse: when it lapsed, who holds the scope now and how to resume. None otherwise.
+fn lapsed_hold_refusal(
+    tx: &mut postgres::Transaction<'_>,
+    work: &WorkWho,
+    session: &str,
+    only: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(row) = tx.query_opt(
+        "SELECT w.id, w.generation, e.data FROM hub_work_items w
+         JOIN hub_events e ON e.seq = w.updated_seq AND e.kind = 'reservation_lapsed'
+         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+           AND w.repository_id IS NOT DISTINCT FROM $4
+           AND w.lead_token = $5 AND w.lead_session = $6 AND ($7::text IS NULL OR w.id = $7)
+         ORDER BY e.seq DESC LIMIT 1",
+        &[
+            &work.owner.identity.provider,
+            &work.owner.identity.host,
+            &work.repository,
+            &work.repository_id,
+            &work.token,
+            &session,
+            &only,
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let (id, generation, data): (String, i64, String) = (row.get(0), row.get(1), row.get(2));
+    let data: serde_json::Value = json_value(&data)?;
+    let holder = data["admitted_by"].as_str().unwrap_or_default().to_owned();
+    let agent: Option<String> = tx
+        .query_opt(
+            "SELECT lead_agent FROM hub_work_items WHERE id = $1",
+            &[&holder],
+        )?
+        .map(|row| row.get(0));
+    Ok(Some(lapsed_refusal_text(
+        &id,
+        generation,
+        &data,
+        &holder,
+        agent.as_deref(),
+    )))
+}
+
+/// When this Work's lease was last renewed and when it lapsed, if it did and the clock is fresh.
+fn lapsed_at(tx: &mut postgres::Transaction<'_>, id: &str, now: i64) -> Result<Option<(i64, i64)>> {
+    if !lease_lapsed(tx, id, now)? {
+        return Ok(None);
+    }
+    let row = tx.query_one(
+        "SELECT reservation_renewed_at, reservation_expires_at FROM hub_work_items WHERE id = $1",
+        &[&id],
+    )?;
+    Ok(Some((row.get(0), row.get(1))))
+}
+
+/// Changes the basis and keeps the lease as it is, so a lapsed one stays lapsed.
+fn set_work_basis(tx: &mut postgres::Transaction<'_>, id: &str, basis: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_work_items SET reservation_basis = $2 WHERE id = $1",
+        &[&id, &basis],
+    )?;
+    Ok(())
+}
+
+/// Whether this Work's reservation lease has lapsed. A stale clock knows of no lapse.
+fn lease_lapsed(tx: &mut postgres::Transaction<'_>, id: &str, now: i64) -> Result<bool> {
+    let lapsed: bool = tx
+        .query_one(
+            "SELECT reservation_basis IS NOT NULL AND reservation_expires_at <= $2
+             FROM hub_work_items WHERE id = $1",
+            &[&id, &now],
+        )?
+        .get(0);
+    Ok(lapsed && lease_clock_fresh(tx, now)?)
+}
+
+/// The lapsed reservations whose scope overlaps `scope`, locked so no late renewal lands between
+/// this check and the admission. An admission that succeeds clears them with
+/// `lapse_reservations` in its own transaction; callers already hold the repository's Work lock.
+fn lapsed_overlapping(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    scope: &[String],
+    exclude: Option<&str>,
+    now: i64,
+) -> Result<Vec<String>> {
+    if scope.is_empty() || !lease_clock_fresh(tx, now)? {
+        return Ok(Vec::new());
+    }
+    // Every lapsed row is read, page by page in id order, so none that overlaps is left unfenced.
+    let mut lapsed = Vec::new();
+    let mut after = String::new();
+    loop {
+        let rows = tx.query(
+            "SELECT id, scope FROM hub_work_items
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 AND reservation_basis IS NOT NULL
+               AND ($5::text IS NULL OR id <> $5) AND reservation_expires_at <= $6 AND id > $7
+             ORDER BY id LIMIT 100 FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &exclude,
+                &now,
+                &after,
+            ],
+        )?;
+        let full = rows.len() == 100;
+        for row in rows {
+            let id: String = row.get(0);
+            let their_scope: String = row.get(1);
+            if !scope_overlap_reasons(scope, &json_value::<Vec<String>>(&their_scope)?).is_empty() {
+                lapsed.push(id.clone());
+            }
+            after = id;
+        }
+        if !full {
+            return Ok(lapsed);
+        }
+    }
+}
+
+/// Clears each lapsed reservation in `ids` for the admission of the Work `admitted`. The basis is
+/// cleared, the generation advances so the old lead is fenced, `active` becomes `paused` as on a
+/// release, the participants' intents are released, and a `reservation_lapsed` event records what
+/// the Hub saw. Compaction never deletes that event.
+fn lapse_reservations(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    ids: &[String],
+    admitted: &str,
+    now: i64,
+) -> Result<Vec<ReclaimedHold>> {
+    let mut reclaimed = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row = tx.query_one(
+            "SELECT snapshot, reservation_basis, reservation_renewed_at, reservation_expires_at
+             FROM hub_work_items WHERE id = $1",
+            &[id],
+        )?;
+        let (basis, renewed_at, expires_at): (String, i64, i64) =
+            (row.get(1), row.get(2), row.get(3));
+        let mut item: WorkItem = json_value(&row.get::<_, String>(0))?;
+        let seen: Option<String> = tx
+            .query_opt(
+                "SELECT i.paths FROM hub_sessions s JOIN hub_intents i ON i.id = s.intent
+                 WHERE s.token = $1 AND s.session = $2",
+                &[&item.lead_token, &item.lead_session],
+            )?
+            .map(|row| row.get(0));
+        let seen_paths: Vec<String> = seen
+            .as_deref()
+            .map(json_value)
+            .transpose()?
+            .unwrap_or_default();
+        let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+        item.generation += 1;
+        if item.state == WorkState::Active {
+            item.state = WorkState::Paused;
+        }
+        item.updated_at = now;
+        let mut event = Event::new(
+            "reservation_lapsed",
+            &item.id,
+            json!({"generation": item.generation, "owner": item.owner,
+                "repository": item.repository, "state": state_name(item.state), "basis": basis,
+                "lead": {"agent": item.lead_agent, "session": item.lead_session},
+                "renewed_at": renewed_at, "expires_at": expires_at, "branch": item.branch,
+                "scope": item.scope, "seen_paths": seen_paths, "push_state": "unknown",
+                "admitted_by": admitted}),
+        )?;
+        event.at = now;
+        let seq = append(tx, &event)?;
+        item.updated_seq = seq;
+        let snapshot = save_work_version(tx, &item, seq)?;
+        set_work_reservation(tx, &item.id, None, None, now)?;
+        let released = release_work_holds(
+            tx,
+            &item,
+            &work_transition::ReleaseCause::lapse(),
+            true,
+            now,
+        )?;
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .and_then(|bytes| bytes.checked_add(released))
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        record_work_payload_delta(tx, who, delta, now)?;
+        reclaimed.push(reclaimed_hold(&item, expires_at));
+    }
+    Ok(reclaimed)
 }
 
 fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
@@ -2062,7 +2435,7 @@ fn work_payload_bytes(
                    FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
                   WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                     AND w.repository_id IS NOT DISTINCT FROM $4
-                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential')
+                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_transition', 'work_lead_credential', 'reservation_lapsed')
                  UNION ALL
                  SELECT octet_length(r.proposed_scope)::bigint
                         + octet_length(r.proposed_title)::bigint + 256
@@ -3521,10 +3894,12 @@ fn coordination_page(
     })
 }
 
+/// `named` is false when the caller named no session and `start.session` was resolved for it.
 fn start_in(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
     start: &WorkStart,
+    named: bool,
     now: i64,
 ) -> Result<WorkStartResult> {
     if who.read_only {
@@ -3541,6 +3916,12 @@ fn start_in(
                     &[&item.id, &who.token, &start.session],
                 )?
                 .map(|row| row.get::<_, i64>(0));
+            work_transition::check_other_owner_share(
+                &item,
+                &who.owner.id,
+                &who.token,
+                &start.session,
+            )?;
             if let Some(existing) = item
                 .participants
                 .iter()
@@ -3553,6 +3934,7 @@ fn start_in(
                 }
                 if existing.role == start.role && participant_generation == Some(item.generation) {
                     return Ok(WorkStartResult {
+                        reclaimed: Vec::new(),
                         item,
                         created: false,
                         joined: false,
@@ -3609,6 +3991,7 @@ fn start_in(
                 .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
             adjust_work_payload_capacity(tx, who, delta, now)?;
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 item,
                 created: false,
                 joined: true,
@@ -3628,6 +4011,12 @@ fn start_in(
             && item.lead_session == start.session
             && start.takeover_generation.is_none()
         {
+            // A woken lead whose scope another Work took gets the answer the edit guard gives it.
+            if !work_holds_reservation(tx, &item.id)?
+                && let Some(refusal) = lapsed_hold_refusal(tx, who, &start.session, Some(&item.id))?
+            {
+                return Err(HubError::Invalid(refusal));
+            }
             if item.title != start.title
                 || item.scope != scope
                 || item.branch != start.branch
@@ -3637,6 +4026,7 @@ fn start_in(
                 || item.related_work != start.related_work
             {
                 return Ok(WorkStartResult {
+                    reclaimed: Vec::new(),
                     conflict: Some(WorkStartConflict {
                         kind: WorkConflictKind::MetadataChanged,
                         current_generation: item.generation,
@@ -3657,6 +4047,24 @@ fn start_in(
             } else {
                 Vec::new()
             };
+            // The lead asking again for its own lapsed Work is a fresh admission. A call that named
+            // no session is not the lead's own, so it cannot hold the scope again.
+            let mut reclaimed = Vec::new();
+            if overlaps.is_empty()
+                && let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)?
+            {
+                if !named {
+                    return Err(HubError::Invalid(lapsed_unheld_text(
+                        &item.id,
+                        renewed,
+                        expired,
+                        Unheld::UnnamedStart,
+                    )));
+                }
+                let lapsed = lapsed_overlapping(tx, who, &item.scope, Some(&item.id), now)?;
+                set_work_reservation(tx, &item.id, None, Some("admitted"), now)?;
+                reclaimed = lapse_reservations(tx, who, &lapsed, &item.id, now)?;
+            }
             let coordination_request = if overlaps.is_empty() {
                 None
             } else {
@@ -3676,6 +4084,7 @@ fn start_in(
                 )?)
             };
             return Ok(WorkStartResult {
+                reclaimed,
                 item,
                 created: false,
                 joined: false,
@@ -3686,15 +4095,25 @@ fn start_in(
                 preflight: None,
             });
         }
+        let held = work_holds_reservation(tx, &item.id)?;
+        // A held reservation is open to takeover only once its lease lapsed: a revoked lead token
+        // may still be carried to its successor (#337), and a stale progress report alone never
+        // opens it. Work that holds nothing keeps the claim-age rule.
+        let open = if held {
+            lease_lapsed(tx, &item.id, now)?
+        } else {
+            item.claim_status == ClaimStatus::Stale
+        };
         if start.takeover_generation != Some(item.generation) {
             let kind = if start.takeover_generation.is_some() {
                 WorkConflictKind::GenerationChanged
-            } else if item.claim_status == ClaimStatus::Stale {
+            } else if open {
                 WorkConflictKind::StaleTakeoverRequired
             } else {
                 WorkConflictKind::ClaimHeld
             };
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind,
                     current_generation: item.generation,
@@ -3712,17 +4131,14 @@ fn start_in(
         }
         // Work that released its reservation can be resumed by any token of its owner, whatever
         // the state or claim age; the admission check below decides whether it may hold again.
-        let released_by_owner =
-            item.owner == who.owner.id && !work_holds_reservation(tx, &item.id)?;
+        let released_by_owner = item.owner == who.owner.id && !held;
         let resuming_own_paused = (item.lead_token == who.token
             && item.state == WorkState::Paused
             && start.takeover_generation == Some(item.generation))
             || released_by_owner;
-        if !resuming_own_paused
-            && item.claim_status != ClaimStatus::Stale
-            && item.state != WorkState::Handover
-        {
+        if !resuming_own_paused && !open && item.state != WorkState::Handover {
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind: WorkConflictKind::ClaimHeld,
                     current_generation: item.generation,
@@ -3738,11 +4154,20 @@ fn start_in(
                 preflight: None,
             });
         }
-        // Work that released its reservation must win the scope again before anyone leads it.
-        if !work_holds_reservation(tx, &item.id)? {
+        // Work that holds no live reservation, released or lapsed, must win the scope again before
+        // anyone leads it.
+        let own_lapse = if held {
+            lapsed_at(tx, &item.id, now)?
+        } else {
+            None
+        };
+        let mut lapsed = Vec::new();
+        if !held || own_lapse.is_some() {
+            lapsed = lapsed_overlapping(tx, who, &item.scope, Some(&item.id), now)?;
             let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
             if let Some(first) = overlaps.first() {
                 return Ok(WorkStartResult {
+                    reclaimed: Vec::new(),
                     conflict: Some(WorkStartConflict {
                         kind: WorkConflictKind::ScopeOverlap,
                         current_generation: first.item.generation,
@@ -3764,6 +4189,7 @@ fn start_in(
             && current.id != item.id
         {
             return Ok(WorkStartResult {
+                reclaimed: Vec::new(),
                 conflict: Some(WorkStartConflict {
                     kind: WorkConflictKind::SessionGoalChanged,
                     current_generation: current.generation,
@@ -3779,6 +4205,10 @@ fn start_in(
                 preflight: None,
             });
         }
+        // Its previous lead may have unpushed edits too, so another taker is told before it leads.
+        let own_reclaimed = own_lapse
+            .filter(|_| item.lead_token != who.token || item.lead_session != start.session)
+            .map(|(_, expired)| reclaimed_hold(&item, expired));
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
         let previous_lead_token = item.lead_token.clone();
         let previous_lead_session = item.lead_session.clone();
@@ -3787,6 +4217,7 @@ fn start_in(
                 participant.role = WorkRole::Helper;
             }
         }
+        work_transition::check_other_owner_share(&item, &who.owner.id, &who.token, &start.session)?;
         if !item.participants.iter().any(|participant| {
             participant.token == who.token && participant.session == start.session
         }) && item.participants.len() >= 100
@@ -3841,7 +4272,9 @@ fn start_in(
             ],
         )?;
         let snapshot = save_work_version(tx, &item, seq)?;
-        set_work_reservation(tx, &item.id, None, Some("admitted"))?;
+        set_work_reservation(tx, &item.id, None, Some("admitted"), now)?;
+        let mut reclaimed: Vec<ReclaimedHold> = own_reclaimed.into_iter().collect();
+        reclaimed.extend(lapse_reservations(tx, who, &lapsed, &item.id, now)?);
         release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
         // Requests follow a new lead; the same lead resuming keeps them as they are.
         if previous_lead_token != who.token || previous_lead_session != start.session {
@@ -3859,6 +4292,7 @@ fn start_in(
             .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
         adjust_work_payload_capacity(tx, who, delta, now)?;
         return Ok(WorkStartResult {
+            reclaimed,
             item,
             created: false,
             joined: false,
@@ -3874,6 +4308,7 @@ fn start_in(
     }
     if let Some(item) = unfinished_for_session(tx, who, &start.session, now)? {
         return Ok(WorkStartResult {
+            reclaimed: Vec::new(),
             conflict: Some(WorkStartConflict {
                 kind: WorkConflictKind::SessionGoalChanged,
                 current_generation: item.generation,
@@ -3889,6 +4324,7 @@ fn start_in(
             preflight: None,
         });
     }
+    let lapsed = lapsed_overlapping(tx, who, &scope, None, now)?;
     let overlaps = work_scope_overlaps(tx, who, &scope, None, now)?;
     if let Some(first) = overlaps.first() {
         let coordination_request = create_coordination_request(
@@ -3906,6 +4342,7 @@ fn start_in(
             now,
         )?;
         return Ok(WorkStartResult {
+            reclaimed: Vec::new(),
             item: first.item.clone(),
             created: false,
             joined: false,
@@ -4000,9 +4437,10 @@ fn start_in(
              lead_session, generation, source_provider, source_host, source_repository,
              source_issue, request_key, title, state, scope, branch, worktree, next_action,
              current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq,
-             reservation_basis)
+             reservation_basis, reservation_renewed_at, reservation_expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14,
-                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22, 'admitted')",
+                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22, 'admitted',
+                 $21, $21::bigint + $23::bigint)",
         &[
             &item.id,
             &who.owner.identity.provider,
@@ -4026,6 +4464,7 @@ fn start_in(
             &snapshot,
             &now,
             &seq,
+            &LEASE_SECONDS,
         ],
     )?;
     tx.execute(
@@ -4060,8 +4499,10 @@ fn start_in(
             + work_payload_row_bytes(declarations_snapshot.len())?,
         now,
     )?;
+    let reclaimed = lapse_reservations(tx, who, &lapsed, &id, now)?;
     bind_coordination_request(tx, who, &start.session, &item, now)?;
     Ok(WorkStartResult {
+        reclaimed,
         item,
         created: true,
         joined: false,
@@ -4938,6 +5379,7 @@ fn guard_managed_touch(
     who: &WorkWho,
     name: &str,
     keys: &[String],
+    now: i64,
 ) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
@@ -4985,7 +5427,19 @@ fn guard_managed_touch(
         eligible.push(json_value::<WorkItem>(&row.get::<_, String>(0))?);
     }
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
+        if let Some(refusal) = lapsed_hold_refusal(tx, who, name, None)? {
+            return Err(HubError::Invalid(refusal));
+        }
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
+    }
+    // A lapsed lease no longer holds the scope, so editing under it needs fresh admission first.
+    if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
+        return Err(HubError::Invalid(lapsed_unheld_text(
+            &eligible[0].id,
+            renewed,
+            expired,
+            Unheld::Edit,
+        )));
     }
     Ok(())
 }
@@ -5037,10 +5491,13 @@ fn guard_announce(
     work_transition::check_announce(&eligible, &ineligible, keys)
 }
 
+/// `named` is false when the caller named no session and `call.session` is the one the Hub
+/// resolved for it: such a touch renews no lease and carries no lead credential.
 fn touch_in(
     tx: &mut postgres::Transaction<'_>,
     who: &Who,
     call: &Checked,
+    named: bool,
     now: i64,
 ) -> Result<Touched> {
     let token = who.token.as_str();
@@ -5073,7 +5530,7 @@ fn touch_in(
     {
         name = alias_hook_session(tx, token, observed, now)?;
     }
-    guard_managed_touch(tx, &work, &name, &call.keys)?;
+    guard_managed_touch(tx, &work, &name, &call.keys, now)?;
     let mut row = session_row(tx, token, &name)?;
     if row.is_none() && name != DEFAULT_SESSION && call.via.starts_with("hook:") {
         // An agent that called agentscm_start before its first hook keeps that session.
@@ -5214,12 +5671,16 @@ fn touch_in(
         append(tx, &event)?;
     }
     let requested = auto_ask(tx, who, &name, &guarded.denied_keys(), now);
-    let lead_notes = if work.read_only || (call.session.is_none() && !call.via.starts_with("hook:"))
-    {
+    let lead_notes = if work.read_only || (!named && !call.via.starts_with("hook:")) {
         Vec::new()
     } else {
         carry_identified_leads(tx, &work, &name, now)?
     };
+    // After the carry above, so a session whose token changed renews in the same touch. Only a
+    // named call renews: an unnamed one resolves to whichever session the token used last.
+    if named {
+        renew_leases(tx, token, &name, now)?;
+    }
     Ok(guarded.touched(
         token, &name, announced, notices, handoffs, requested, lead_notes,
     ))
@@ -6907,14 +7368,40 @@ impl Store for PgStore {
         })
     }
 
-    fn touch_session(&self, token: &str, call: &SessionCall, now: i64) -> Result<Touched> {
+    fn touch_session_named(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        named: bool,
+        now: i64,
+    ) -> Result<Touched> {
         let call = check(call)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
-            let touched = touch_in(&mut tx, &who, &call, now)?;
+            let touched = touch_in(&mut tx, &who, &call, named, now)?;
             tx.commit()?;
             Ok(touched)
+        })
+    }
+
+    fn session_activity(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        phase: CallPhase,
+        now: i64,
+    ) -> Result<()> {
+        let call = check(call)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = active_token(&mut tx, token, now)?;
+            let touched = touch_in(&mut tx, &who, &call, call.session.is_some(), now)?;
+            if call.session.is_some() {
+                session_tool_call(&mut tx, token, &touched.session, phase, now)?;
+            }
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -7119,7 +7606,7 @@ impl Store for PgStore {
                     )?;
                 }
                 let call = grant_call(&request.requester_session, &key, Some(&requester_row.via));
-                touch_in(&mut tx, &requester_who, &check(&call)?, now)?;
+                touch_in(&mut tx, &requester_who, &check(&call)?, true, now)?;
             }
             tx.execute(
                 "UPDATE hub_handoffs SET state = $2, decided_at = $3, reply = $4,
@@ -8880,7 +9367,13 @@ impl Store for PgStore {
             &coverage_name(status.state),&status.checked_at,&(status.unread_pages as i64),&(status.deferred as i64),&status.window_from])?;Ok(())})
     }
 
-    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+    fn work_start_named(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        named: bool,
+        now: i64,
+    ) -> Result<WorkStartResult> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
@@ -8915,14 +9408,14 @@ impl Store for PgStore {
             let scope = start.validate(&who)?;
             let preflight = preflight::evaluate(&mut tx, &who, start, &scope, now)?;
             if super::work_preflight::coordinates_active_scope_overlap(start, &preflight) {
-                let mut result = start_in(&mut tx, &who, start, now)?;
+                let mut result = start_in(&mut tx, &who, start, named, now)?;
                 super::work_preflight::require_overlap_coordination(&result, &preflight)?;
                 result.preflight = Some(preflight);
                 tx.commit()?;
                 return Ok(result);
             }
             require_clear_preflight(&who, start, &preflight)?;
-            let mut result = start_in(&mut tx, &who, start, now)?;
+            let mut result = start_in(&mut tx, &who, start, named, now)?;
             result.preflight = Some(preflight);
             tx.commit()?;
             Ok(result)
@@ -9003,6 +9496,7 @@ impl Store for PgStore {
                     operational: Vec::new(),
                 });
                 let result = WorkStartResult {
+                    reclaimed: Vec::new(),
                     item,
                     created: false,
                     joined: false,
@@ -9019,7 +9513,7 @@ impl Store for PgStore {
             created.request_key = Some(new_id("req")?);
             let preflight = preflight::evaluate(&mut tx, &who, &created, &planned_scope, now)?;
             require_clear_preflight(&who, start, &preflight)?;
-            let mut result = start_in(&mut tx, &who, &created, now)?;
+            let mut result = start_in(&mut tx, &who, &created, true, now)?;
             result.preflight = Some(preflight);
             tx.commit()?;
             Ok(result)
@@ -9071,6 +9565,7 @@ impl Store for PgStore {
                 let event_seq: i64 = row.get(2);
                 tx.commit()?;
                 return Ok(WorkCheckpointResult {
+                    reclaimed: Vec::new(),
                     item,
                     receipt: CheckpointReceipt {
                         work_id: checkpoint.work_id.clone(),
@@ -9164,9 +9659,11 @@ impl Store for PgStore {
                     }
                 }
             }
+            let mut lapsed = Vec::new();
             if let Some(scope) = checkpoint.normalized_scope()? {
                 // Work without a reservation claims nothing, so its scope change has nothing to check.
                 let overlaps = if held {
+                    lapsed = lapsed_overlapping(&mut tx, &who, &scope, Some(&item.id), now)?;
                     work_scope_overlaps(&mut tx, &who, &scope, Some(&item.id), now)?
                 } else {
                     Vec::new()
@@ -9198,6 +9695,8 @@ impl Store for PgStore {
                 // A refused checkpoint returns before this point and writes nothing.
                 carry_lead_credential(&mut tx, &who, &mut item, now)?;
             }
+            // After a carry the lead token is the caller's, so the renewal follows the credential.
+            renew_leases(&mut tx, token, &checkpoint.session, now)?;
             let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
             let referenced = checkpoint
                 .source_refs
@@ -9261,15 +9760,31 @@ impl Store for PgStore {
             let snapshot = save_work_version(&mut tx, &item, seq)?;
             match checkpoint.kind {
                 super::work::CheckpointKind::Finish => {
-                    set_work_reservation(&mut tx, &item.id, Some("completed"), None)?;
+                    set_work_reservation(&mut tx, &item.id, Some("completed"), None, now)?;
                 }
                 super::work::CheckpointKind::Pause | super::work::CheckpointKind::Handover => {
                     if let Some(basis) = work_transition::basis_after_pause(prior_basis) {
-                        set_work_reservation(&mut tx, &item.id, None, Some(basis.column()))?;
+                        // A pause reports on a live lease; it never revives a lapsed one.
+                        if lease_lapsed(&mut tx, &item.id, now)? {
+                            set_work_basis(&mut tx, &item.id, basis.column())?;
+                        } else {
+                            set_work_reservation(
+                                &mut tx,
+                                &item.id,
+                                None,
+                                Some(basis.column()),
+                                now,
+                            )?;
+                        }
                     }
                 }
                 _ => {}
             }
+            let reclaimed = if checkpoint.kind != super::work::CheckpointKind::Finish {
+                lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?
+            } else {
+                Vec::new()
+            };
             tx.execute(
                 "INSERT INTO hub_work_checkpoint_ops
                     (work, operation_id, request, event_seq)
@@ -9291,6 +9806,7 @@ impl Store for PgStore {
             }
             tx.commit()?;
             Ok(WorkCheckpointResult {
+                reclaimed,
                 item,
                 receipt: CheckpointReceipt {
                     work_id: checkpoint.work_id.clone(),
@@ -9355,6 +9871,7 @@ impl Store for PgStore {
                 let event_seq: i64 = row.get(2);
                 tx.commit()?;
                 return Ok(WorkTransitionResult {
+                    reclaimed: Vec::new(),
                     item,
                     receipt: Some(CheckpointReceipt {
                         work_id: request.work_id.clone(),
@@ -9377,11 +9894,18 @@ impl Store for PgStore {
             let basis_column: Option<String> = columns_row.get(1);
             let held = basis_column.is_some();
             work_transition::check(&item, held, &acting, request)?;
+            if request.transition == work_transition::WorkTransitionKind::Retain
+                && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
+            {
+                return Err(HubError::Invalid(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
+            }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
             }
+            let mut lapsed = Vec::new();
             if request.transition == work_transition::WorkTransitionKind::Reopen {
                 // Reopening is a fresh admission whatever the client checked beforehand.
+                lapsed = lapsed_overlapping(&mut tx, &who, &item.scope, Some(&item.id), now)?;
                 let overlaps =
                     work_scope_overlaps(&mut tx, &who, &item.scope, Some(&item.id), now)?;
                 if let Some(first) = overlaps.first() {
@@ -9392,6 +9916,7 @@ impl Store for PgStore {
                         operational: Vec::new(),
                     };
                     return Ok(WorkTransitionResult {
+                        reclaimed: Vec::new(),
                         item,
                         receipt: None,
                         conflict: Some(conflict),
@@ -9422,7 +9947,9 @@ impl Store for PgStore {
                 &item.id,
                 columns.outcome.map(work_transition::TerminalOutcome::column),
                 columns.basis.map(work_transition::ReservationBasis::column),
+                now,
             )?;
+            let reclaimed = lapse_reservations(&mut tx, &who, &lapsed, &item.id, now)?;
             if request.superseded_by.is_some() {
                 replace_relations(
                     &mut tx,
@@ -9495,6 +10022,7 @@ impl Store for PgStore {
             }
             tx.commit()?;
             Ok(WorkTransitionResult {
+                reclaimed,
                 receipt: Some(CheckpointReceipt {
                     work_id: item.id.clone(),
                     operation_id: request.operation_id.clone(),
@@ -9538,8 +10066,12 @@ impl Store for PgStore {
                 "w.reservation_basis IS NOT NULL"
             };
             let sql = format!(
-                "SELECT w.snapshot, w.terminal_outcome, w.reservation_basis, {settled}
+                "SELECT w.snapshot, w.terminal_outcome, w.reservation_basis, {settled},
+                        w.reservation_renewed_at, w.reservation_expires_at,
+                        s.via, s.tool_activity_at IS NOT NULL
                  FROM hub_work_items w
+                 LEFT JOIN hub_sessions s
+                   ON s.token = w.lead_token AND s.session = w.lead_session
                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                    AND w.repository_id IS NOT DISTINCT FROM $4 AND {filter}
                  ORDER BY w.id LIMIT 101"
@@ -9586,6 +10118,17 @@ impl Store for PgStore {
                         .as_deref()
                         .and_then(work_transition::ReservationBasis::from_column),
                     hidden_by_merged_pr: row.get::<_, bool>(3),
+                    lease: row
+                        .get::<_, Option<i64>>(4)
+                        .zip(row.get::<_, Option<i64>>(5))
+                        .map(|(renewed_at, expires_at)| Lease {
+                            renewed_at,
+                            expires_at,
+                        }),
+                    coverage: RenewalCoverage::of(
+                        row.get::<_, Option<String>>(6).as_deref(),
+                        row.get::<_, Option<bool>>(7).unwrap_or(false),
+                    ),
                 });
             }
             let forge_window = tx.query_opt(
@@ -9609,7 +10152,7 @@ impl Store for PgStore {
                 _ => None,
             };
             tx.commit()?;
-            Ok(operational_page(rows, forge_window_from, more))
+            Ok(operational_page(rows, forge_window_from, more, now))
         })
     }
 
@@ -11082,6 +11625,15 @@ impl Store for PgStore {
             let item = current_capture_work_for_session(&mut tx, &who, session, now)?;
             tx.commit()?;
             Ok(item)
+        })
+    }
+
+    fn observe_lease_clock(&self, now: i64) -> Result<()> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            observe_lease_clock(&mut tx, now)?;
+            tx.commit()?;
+            Ok(())
         })
     }
 

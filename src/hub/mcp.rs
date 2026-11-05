@@ -33,7 +33,8 @@ use super::promise::{
     PromiseInputV1, PromiseViewV1, current_admission,
 };
 use super::session::{
-    SESSION_REQUIRED, SessionCall, announce_for, done_for, duplicates_for, others_for, status_for,
+    SESSION_REQUIRED, SessionCall, announce_for, announce_named, done_for, duplicates_for,
+    others_for, status_for,
 };
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
@@ -42,6 +43,7 @@ use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, ForgeWorkRef, WorkCheckpoint,
     WorkConflictKind, WorkItem, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
 };
+use super::work_lifecycle::LEASE_LAPSED;
 use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult, WorkPreflightStatus};
 use super::work_transition::{
     OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionRequest,
@@ -1196,7 +1198,9 @@ pub(super) fn hub_failure(error: &HubError) -> Value {
         }
         HubError::Unavailable(_) => "hub unavailable",
         HubError::Invalid(message)
-            if message == SESSION_REQUIRED || message.starts_with(LEAD_SESSION_MISMATCH) =>
+            if message == SESSION_REQUIRED
+                || message.starts_with(LEAD_SESSION_MISMATCH)
+                || message.starts_with(LEASE_LAPSED) =>
         {
             message.as_str()
         }
@@ -3068,6 +3072,9 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     })
     .await?;
 
+    // A call that names no session acts for the session the Hub resolves, which is not its own:
+    // it renews nothing and holds no lapsed scope again (the store and the touch both check).
+    let named = session.is_some();
     // Resolve the same session rules as hooks without taking any coordinated path. The durable
     // claim below must succeed before this call announces the requested paths.
     let resolved = announce_for(
@@ -3108,7 +3115,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             preflight,
         };
         if explicit {
-            store.work_start(&token, &start, unix_now())
+            store.work_start_named(&token, &start, named, unix_now())
         } else {
             store.work_start_auto(&token, &start, unix_now())
         }
@@ -3172,10 +3179,13 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         ));
     }
 
-    let advice = announce_for(
+    // The session resolved once above is the target, so a hook session that turns fresh meanwhile
+    // cannot make this touch ambiguous after the start committed.
+    let advice = announce_named(
         state,
         principal,
         session_call(Some(resolved), Some(task.clone()), paths),
+        named,
     )
     .await?;
     let own = advice
@@ -3333,6 +3343,10 @@ fn start_result(
                 text.push_str(&format!("\nThe agent leading {} is not running (paused or no recent check-in), so it cannot answer. Its person, {}, is asked in the AgentSCM Hub's Needs you instead and can answer for it.", target.work_id, target.lead.login));
             }
         }
+    }
+    for reclaimed in &work.reclaimed {
+        text.push('\n');
+        text.push_str(&reclaimed.notice);
     }
     if work.item.scope.is_empty() {
         text.push_str("\nScope is undeclared and coverage is unknown. Have the lead checkpoint the intended scope before editing.");

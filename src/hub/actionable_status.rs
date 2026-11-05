@@ -811,6 +811,7 @@ mod tests {
     use super::*;
     use crate::hub::store::{self, ForgeIdentity, agent_token_digest, mint_bound_agent_token};
     use crate::hub::work::{CheckpointKind, WorkCheckpoint, WorkStart};
+    use crate::hub::work_lifecycle::{LEASE_SECONDS, Lease, RenewalCoverage};
     use crate::hub::work_lifecycle::{
         MergeStatus, OperationalFacts, ReservationBasis, work_operational,
     };
@@ -841,6 +842,13 @@ mod tests {
             } else {
                 MergeStatus::Unknown
             },
+            // A held reservation has a live lease, renewed on every tool call.
+            lease: held.then_some(Lease {
+                renewed_at: 100,
+                expires_at: 100 + LEASE_SECONDS,
+            }),
+            coverage: RenewalCoverage::ToolCalls,
+            now: 100,
         })
     }
     #[test]

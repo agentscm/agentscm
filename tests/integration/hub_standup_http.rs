@@ -621,7 +621,7 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
     let listed = &rich["operational"];
     assert_eq!(
         (&listed["schema_version"], &listed["complete"]),
-        (&json!(1), &json!(true))
+        (&json!(2), &json!(true))
     );
     let entry = &listed["work"][0];
     assert_eq!(entry["work_id"], id.as_str());
@@ -680,7 +680,7 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
         )
         .await;
     assert_eq!(status, 200, "{one}");
-    assert_eq!(one["schema_version"], 1);
+    assert_eq!(one["schema_version"], 2);
     for body in [
         one.to_string(),
         rich["conflict"]["operational"].to_string(),
@@ -765,6 +765,207 @@ fn operational_projection_is_opt_in_on_postgres() {
         )
         .await
     });
+}
+
+/// The lapsed holds an admission took are opt-in on every route that admits, so a strict older
+/// client decodes the reply: start, checkpoint and transition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaimed_holds_are_opt_in_over_http() {
+    let hub = Hub::start(None).await;
+    let (_, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, other) = hub.token(2, "acme/widgets", false).await;
+    let db = rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap();
+    let hold = |key: &str, path: &str| {
+        json!({"request_key": key, "title": "Billing rounding", "session": format!("s-{key}"),
+            "scope": [path], "branch": format!("feat/{key}"), "next_action": "Continue"})
+    };
+    let lapse = |id: &str| {
+        let now = agentscm::hub::store::unix_now();
+        db.execute(
+            "UPDATE hub_work_items SET reservation_renewed_at = ?1, reservation_expires_at = ?2
+             WHERE id = ?3",
+            rusqlite::params![now - 1300, now - 100, id],
+        )
+        .unwrap();
+    };
+    let basis = |id: &str| -> Option<String> {
+        db.query_row(
+            "SELECT reservation_basis FROM hub_work_items WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    // The lead holds four scopes, and every lease lapses.
+    let mut held = Vec::new();
+    for (key, path) in [
+        ("a", "src/a.rs"),
+        ("b", "src/b.rs"),
+        ("e", "src/e.rs"),
+        ("f", "src/f.rs"),
+    ] {
+        let (status, started) = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/start",
+                &lead,
+                Some(hold(key, path)),
+            )
+            .await;
+        assert_eq!(status, 200, "{started}");
+        held.push(started["item"]["id"].as_str().unwrap().to_owned());
+    }
+    held.iter().for_each(|id| lapse(id));
+    let store = hub.store.clone();
+    let now = agentscm::hub::store::unix_now();
+    tokio::task::spawn_blocking(move || store.observe_lease_clock(now).unwrap())
+        .await
+        .unwrap();
+    let take = |key: &str, path: &str| {
+        json!({"request_key": key, "title": "Take it", "session": format!("s-{key}"),
+            "scope": [path], "next_action": "Continue"})
+    };
+    for path in [
+        "/v1/hub/standup/start?reclaimed=2",
+        "/v1/hub/standup/checkpoint?reclaimed=yes",
+        "/v1/hub/standup/work-transition?reclaimed=2",
+    ] {
+        let body = if path.contains("start") {
+            take("x", "src/a.rs")
+        } else if path.contains("checkpoint") {
+            json!({"work_id": held[0], "operation_id": "bad", "generation": 1,
+                "expected_updated_seq": 1, "session": "s-a", "kind": "progress",
+                "summary": "s"})
+        } else {
+            json!({"work_id": held[0], "operation_id": "bad", "generation": 1,
+                "expected_updated_seq": 1, "session": "s-a", "transition": "release",
+                "reason": "synthetic reason"})
+        };
+        let (status, bad) = hub.call(Method::POST, path, &other, Some(body)).await;
+        assert_eq!(status, 400, "{path}: {bad}");
+    }
+
+    // Start: without the flag the reply has no new key; with it, it says whose hold it took.
+    let (status, plain) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &other,
+            Some(take("c", "src/a.rs")),
+        )
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert_eq!(plain["created"], true, "{plain}");
+    assert!(plain.get("reclaimed").is_none(), "{plain}");
+    assert_eq!(basis(&held[0]), None);
+    let (status, rich) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start?reclaimed=1",
+            &other,
+            Some(take("d", "src/b.rs")),
+        )
+        .await;
+    assert_eq!(status, 200, "{rich}");
+    assert_eq!(rich["reclaimed"][0]["work_id"], held[1].as_str(), "{rich}");
+    assert_eq!(rich["reclaimed"][0]["branch"], "feat/b", "{rich}");
+    assert!(
+        rich["reclaimed"][0]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("never pushed"),
+        "{rich}"
+    );
+    serde_json::from_value::<WorkStartResult>(rich.clone()).unwrap();
+
+    // Checkpoint: a scope change that takes a lapsed hold's scope.
+    let widen = |item: &Value, operation: &str, scope: &[&str]| {
+        json!({"work_id": item["id"], "operation_id": operation,
+            "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+            "session": "s-c", "kind": "progress", "summary": "widen", "scope": scope})
+    };
+    let (status, plain) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/checkpoint",
+            &other,
+            Some(widen(&plain["item"], "cp-plain", &["src/a.rs", "src/e.rs"])),
+        )
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain.get("reclaimed").is_none(), "{plain}");
+    assert_eq!(basis(&held[2]), None);
+    let (status, rich_checkpoint) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/checkpoint?reclaimed=1",
+            &other,
+            Some(widen(
+                &plain["item"],
+                "cp-rich",
+                &["src/a.rs", "src/e.rs", "src/f.rs"],
+            )),
+        )
+        .await;
+    assert_eq!(status, 200, "{rich_checkpoint}");
+    assert_eq!(
+        rich_checkpoint["reclaimed"][0]["work_id"],
+        held[3].as_str(),
+        "{rich_checkpoint}"
+    );
+
+    // Transition: a reopen into a lapsed hold's scope, once without the flag and once with it.
+    let mut item = rich["item"].clone();
+    for (round, query) in [("plain", ""), ("rich", "?reclaimed=1")] {
+        let finish = json!({"work_id": item["id"], "operation_id": format!("fin-{round}"),
+            "generation": item["generation"], "expected_updated_seq": item["updated_seq"],
+            "session": "s-d", "kind": "finish", "summary": "done"});
+        let (status, finished) = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/checkpoint",
+                &other,
+                Some(finish),
+            )
+            .await;
+        assert_eq!(status, 200, "{finished}");
+        let (status, retaken) = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/start",
+                &lead,
+                Some(hold(&format!("g-{round}"), "src/b.rs")),
+            )
+            .await;
+        assert_eq!(status, 200, "{retaken}");
+        let retaken = retaken["item"]["id"].as_str().unwrap().to_owned();
+        lapse(&retaken);
+        let item_now = &finished["item"];
+        let reopen = json!({"work_id": item_now["id"], "operation_id": format!("re-{round}"),
+            "generation": item_now["generation"], "expected_updated_seq": item_now["updated_seq"],
+            "session": "s-d", "transition": "reopen", "reason": "synthetic reason"});
+        let (status, reopened) = hub
+            .call(
+                Method::POST,
+                &format!("/v1/hub/standup/work-transition{query}"),
+                &other,
+                Some(reopen),
+            )
+            .await;
+        assert_eq!(status, 200, "{reopened}");
+        assert!(reopened["conflict"].is_null(), "{reopened}");
+        assert_eq!(basis(&retaken), None);
+        if query.is_empty() {
+            assert!(reopened.get("reclaimed").is_none(), "{reopened}");
+        } else {
+            assert_eq!(
+                reopened["reclaimed"][0]["work_id"],
+                retaken.as_str(),
+                "{reopened}"
+            );
+        }
+        item = reopened["item"].clone();
+    }
 }
 
 fn transition(item: &Value, operation: &str, kind: &str) -> Value {

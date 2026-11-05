@@ -1289,6 +1289,77 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unnamed_start_renews_and_readmits_nothing() {
+    use agentscm::hub::session::SessionCall;
+    let hub = Hub::start().await;
+    let (lead_id, alice) = hub.secret_with_id(1, "alice-agent");
+    let named = json!({"task": "billing", "session": "lead-s", "request_key": "billing-key",
+        "paths": ["src/billing.rs"]});
+    let started = hub
+        .tool_result(&alice, "agentscm_start", named.clone())
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let work_id = started["structuredContent"]["work"]["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The lead session is a hook session, so a call that names no session resolves to it.
+    let hook = SessionCall {
+        session: Some("lead-s".into()),
+        via: "hook:claude".into(),
+        task: None,
+        paths: Vec::new(),
+        deny: false,
+        report: false,
+    };
+    hub.store
+        .touch_session(&lead_id, &hook, unix_now())
+        .unwrap();
+    let db = rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap();
+    let expiry = |db: &rusqlite::Connection| -> i64 {
+        db.query_row(
+            "SELECT reservation_expires_at FROM hub_work_items WHERE id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let set_lease = |renewed: i64, expires: i64| {
+        db.execute(
+            "UPDATE hub_work_items SET reservation_renewed_at = ?2, reservation_expires_at = ?3
+             WHERE id = ?1",
+            rusqlite::params![work_id, renewed, expires],
+        )
+        .unwrap();
+    };
+    let now = unix_now();
+    set_lease(now - 600, now + 600);
+    let mut unnamed = named.clone();
+    unnamed.as_object_mut().unwrap().remove("session");
+    // Repeating the lead's start without naming the session renews nothing.
+    let repeated = hub
+        .tool_result(&alice, "agentscm_start", unnamed.clone())
+        .await;
+    assert_eq!(repeated["isError"], false, "{repeated}");
+    assert_eq!(expiry(&db), now + 600);
+    // Once the lease lapsed, it cannot hold the scope again either.
+    set_lease(now - 1300, now - 1);
+    hub.store.observe_lease_clock(unix_now()).unwrap();
+    let refused = hub.tool_result(&alice, "agentscm_start", unnamed).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = refused["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("LEASE_LAPSED") && text.contains("names no session"),
+        "{text}"
+    );
+    assert_eq!(expiry(&db), now - 1);
+    // The lead naming its session holds it again.
+    let again = hub.tool_result(&alice, "agentscm_start", named).await;
+    assert_eq!(again["isError"], false, "{again}");
+    assert!(expiry(&db) > now, "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn work_transition_releases_replays_and_fences_the_old_session() {
     let hub = Hub::start().await;
     let (lead_id, alice) = hub.secret_with_id(1, "alice-agent");
@@ -1308,7 +1379,7 @@ async fn work_transition_releases_replays_and_fences_the_old_session() {
         .tool_result(&alice, "agentscm_work_overview", json!({}))
         .await;
     let held = &overview["structuredContent"]["operational"];
-    assert_eq!(held["schema_version"], 1);
+    assert_eq!(held["schema_version"], 2);
     assert_eq!(held["work"][0]["work_id"], work_id.as_str());
     assert_eq!(held["work"][0]["reservation"]["status"], "held");
     let rival = hub

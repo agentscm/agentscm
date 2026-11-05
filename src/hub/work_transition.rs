@@ -16,7 +16,7 @@ pub use super::work_lifecycle::{
     ActorVia, OperationalOverviewV1, OutcomeProvenance, ReservationBasis, TerminalOutcome,
     WorkActorKind, WorkOperationalV1, WorkTransitionKind,
 };
-use super::work_lifecycle::{Refusal, decide_transition};
+use super::work_lifecycle::{MAX_OTHER_OWNER_PARTICIPANTS, Refusal, decide_transition};
 use super::{HubError, Result};
 
 const MAX_REASON_BYTES: usize = 500;
@@ -113,6 +113,9 @@ pub struct WorkTransitionResult {
     /// Absent when a reopen found a scope overlap and changed nothing.
     pub receipt: Option<CheckpointReceipt>,
     pub conflict: Option<WorkStartConflict>,
+    /// Lapsed holds a reopen took the scope of.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reclaimed: Vec<super::work::ReclaimedHold>,
 }
 
 impl WorkTransitionRequest {
@@ -156,6 +159,32 @@ impl WorkTransitionRequest {
         }))
         .map_err(|error| HubError::Unavailable(format!("encode transition request: {error}")))
     }
+}
+
+/// Refuses a new participant from an owner other than the Work's own once such participants fill
+/// `MAX_OTHER_OWNER_PARTICIPANTS`. Joins, takeovers and reopens all add participants; a session
+/// that already takes part is not new.
+pub(super) fn check_other_owner_share(
+    item: &WorkItem,
+    owner: &str,
+    token: &str,
+    session: &str,
+) -> Result<()> {
+    let known = item
+        .participants
+        .iter()
+        .any(|participant| participant.token == token && participant.session == session);
+    let others = item
+        .participants
+        .iter()
+        .filter(|participant| participant.owner != item.owner)
+        .count();
+    if owner == item.owner || known || others < MAX_OTHER_OWNER_PARTICIPANTS {
+        return Ok(());
+    }
+    Err(HubError::Invalid(format!(
+        "work has the maximum of {MAX_OTHER_OWNER_PARTICIPANTS} participants from other owners"
+    )))
 }
 
 fn invalid(message: &str) -> HubError {
@@ -356,6 +385,7 @@ pub(super) fn apply(
             if !known && item.participants.len() >= MAX_PARTICIPANTS {
                 return Err(invalid("work has the maximum of 100 participants"));
             }
+            check_other_owner_share(item, &acting.user_id, token, session)?;
             for participant in &mut item.participants {
                 if participant.role == WorkRole::Lead {
                     participant.role = WorkRole::Helper;
@@ -437,6 +467,14 @@ impl ReleaseCause {
         Self {
             transition: request.transition.as_str(),
             actor: json!({"kind": acting.kind, "id": acting.user_id, "via": acting.via}),
+        }
+    }
+
+    /// A lease that expired, cleared by the Hub at another Work's admission over its scope.
+    pub(super) fn lapse() -> Self {
+        Self {
+            transition: "lapse",
+            actor: json!({"kind": "lease"}),
         }
     }
 

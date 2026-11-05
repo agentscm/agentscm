@@ -2754,18 +2754,26 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
         0
     );
     assert_eq!(fixture.store.latest_event_seq().unwrap(), before_repeat);
+    // The old lead token can no longer renew, so the hold opens to takeover once its lease lapses.
+    let lapsed = now + 4 + agentscm::hub::work_lifecycle::LEASE_SECONDS + 1;
+    let mut at = now + 4;
+    while at < lapsed {
+        fixture.store.observe_lease_clock(at).unwrap();
+        at += 60;
+    }
+    fixture.store.observe_lease_clock(lapsed).unwrap();
     let mut takeover = start("retained", "src/retained.rs");
     takeover.takeover_generation = Some(original.generation);
     let resumed = fixture
         .store
-        .work_start(&new_token, &takeover, now + 4)
+        .work_start(&new_token, &takeover, lapsed)
         .unwrap();
     assert!(resumed.took_over);
     assert_eq!(resumed.item.id, original.id);
     assert_eq!(resumed.item.generation, original.generation + 1);
     let requests = fixture
         .store
-        .coordination_list(&new_token, &Default::default(), now + 5)
+        .coordination_list(&new_token, &Default::default(), lapsed + 1)
         .unwrap();
     let request = requests
         .requests
@@ -2782,7 +2790,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 session: resumed.item.lead_session.clone(),
                 expected_updated_seq: request.updated_seq,
             },
-            now + 5,
+            lapsed + 1,
         )
         .unwrap();
     // A different repository reusing the old name cannot see the migrated Work.
@@ -3532,7 +3540,7 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
     assert_eq!(settled, 0);
 
     let holders = operational_read(fixture, &reader, &OperationalSelect::Holders, t0 + 120);
-    assert_eq!((holders.schema_version, holders.complete), (1, true));
+    assert_eq!((holders.schema_version, holders.complete), (2, true));
     let mut expected = vec![hidden.id.clone(), plain.id.clone()];
     expected.sort();
     let listed_ids: Vec<_> = holders.work.iter().map(|w| w.work_id.clone()).collect();
@@ -3580,7 +3588,8 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
         Err(HubError::Invalid(_))
     ));
 
-    // No token identifier appears, and only `freshness` depends on the request time.
+    // No token identifier appears, and only `freshness` and the lease `activity` depend on the
+    // request time.
     let early = serde_json::to_value(&holders).unwrap();
     let text = early.to_string();
     assert!(!text.contains(&token) && !text.contains(&reader), "{text}");
@@ -3591,7 +3600,9 @@ fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
     assert_ne!(early, later, "a revoked lead changes freshness");
     for value in [&mut early, &mut later] {
         for work in value["work"].as_array_mut().unwrap() {
-            work.as_object_mut().unwrap().remove("freshness");
+            let work = work.as_object_mut().unwrap();
+            work.remove("freshness");
+            work.remove("activity");
         }
     }
     assert_eq!(early, later);

@@ -152,6 +152,13 @@ impl From<rusqlite::Error> for HubError {
 
 impl From<postgres::Error> for HubError {
     fn from(error: postgres::Error) -> Self {
+        use postgres::error::SqlState;
+        // The server rolled the whole transaction back, so nothing was written and a retry is safe.
+        if error.code().is_some_and(|code| {
+            *code == SqlState::T_R_DEADLOCK_DETECTED || *code == SqlState::T_R_SERIALIZATION_FAILURE
+        }) {
+            return Self::Busy;
+        }
         Self::Unavailable(error.to_string())
     }
 }
