@@ -79,11 +79,14 @@ pub async fn read(
             return Ok(json!({"version": 1, "availability": "not_connected"}));
         };
         let rows = store.observations(&repo.id, "pull_request")?;
-        let overview = store.work_overview(
-            &principal.token_id,
-            &WorkOverviewQuery::default(),
-            unix_now(),
-        )?;
+        let overview = super::viewer::shown(
+            store.work_overview(
+                &principal.token_id,
+                &WorkOverviewQuery::default(),
+                unix_now(),
+            )?,
+            &principal.owner.id,
+        );
         // Reuse supported-skill evaluation. The scan is deliberately bounded and never
         // described as exhaustive, including when an unknown catalog entry was skipped.
         let runs = super::skills::views(&*store, &principal.repository, None, None, RUN_SCAN)?;

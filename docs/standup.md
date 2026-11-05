@@ -452,6 +452,16 @@ All scope comes from the bearer token. There is no repository selector in these 
 
 `overview`, `start` and `preflight` add the operational projection only when the request carries `operational=1`; without it the response has no new key. `start` and `preflight` ignore other unknown query parameters, as before; the overview query stays strict. Only a conflict result carries `operational`: the HTTP error bodies for a preflight refusal (`WorkPreflight`) and for a required coordination request (`WorkCoordinationRequired`) do not. MCP fills it without the flag (for `start` and `preflight`, whenever there are overlapping items), and `agentscm_work_transition` is the MCP form of the transition route. See [Work outcomes and scope reservations](design/work-lifecycle.md).
 
+### Other owners' agents
+
+A reply shows the caller's own agents as stored. Every other owner's agent session is shown by its `session_key` digest (16 hex characters, the same key text replies print as `session 3f2a1b9c`), never by its native id. That covers `lead_session`, participant and checkpoint `session`, captured-event `session_id`, the reservation's `holder_session`, coordination agents, PR-link authors, change-record session setups and skill-run evidence.
+
+A token label that an older client stored as `client-<host name>-<hex>` is shown to other owners as `client-host-<hex>`. Current `client-<machine id>-<hex>` labels and names a user chose are unchanged. "Own" means the agent's owner, the same person through any token. Where a reply does not record whose agent it names, it is treated as another owner's: lapsed holds a start or checkpoint reclaims, insight usage groups, narrative facts and a hand-off answer's requester.
+
+The digest depends only on the token and session, so fields that name one session still compare equal. Work search does not match another owner's generated `client-…` label, so it cannot confirm a guessed host name.
+
+This applies to HTTP, MCP structured content and text, the MCP app views, briefings, catch-up, the status page, the companion's repository lists and every CLI command that prints these replies. Byte bounds on pages are computed before redaction: a digest is 16 characters, so a native session id shorter than that can make a page a few bytes longer than its bound.
+
 Pages contain at most 100 current items and 100 events. Titles and checkpoint summaries are bounded to 500 bytes; identifiers and labels are bounded to 255 bytes. Scope, participants, relations and source references also have fixed entry limits. Malformed cursors and out-of-scope identifiers are rejected instead of silently widening access.
 
 ## Current support and limits

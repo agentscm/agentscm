@@ -240,8 +240,8 @@ signed.
 Its repository-authenticated stand-up routes also include `GET /v1/hub/standup/work?q=…&limit=20&cursor=…`,
 which finds work by text, finished work included, in creation order, newest first (limit 1 through 50;
 `cursor` is the previous `next_cursor`, `<created_at>:<id>`, built from the immutable creation time,
-so an update between pages cannot repeat or skip an item; treat it as opaque). It matches title, branch, lead agent, owner login,
-work id, scope paths and the source issue number. The reply is `{"items": [{id, title, state,
+so an update between pages cannot repeat or skip an item; treat it as opaque). It matches title, branch, owner login,
+work id, scope paths, the source issue number and the lead agent label, except another owner's generated `client-…` label, which is masked as described in [other owners' agents](standup.md#other-owners-agents). The reply is `{"items": [{id, title, state,
 lead_agent, owner, branch, source_issue, updated_at, created_at}], "next_cursor": cursor|null, "complete": bool}`.
 Read-only tokens may call it. Items of `GET /v1/hub/repos/{repo}/publications` also carry the manifest `title`. It also includes `POST /v1/hub/standup/usage`,
 `GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.

@@ -9,6 +9,7 @@ use crate::change_record::{
     SessionSetupV1, SubjectSummaryV1, UnknownFactV1,
 };
 
+use super::viewer::Viewer;
 use super::work::{Checkpoint, SourceRef, WorkItem};
 use super::{HubError, Result};
 
@@ -178,12 +179,14 @@ pub struct StoredDecisionV1 {
     pub checkpoint: Checkpoint,
 }
 
+/// The record as `viewer` may see it: another owner's captured sessions by their digests.
 pub fn project(
     item: &WorkItem,
     sessions: SessionStatsV1,
     action: Option<StoredActionV1>,
     decision: Option<StoredDecisionV1>,
     as_of: i64,
+    viewer: Viewer<'_>,
 ) -> ChangeRecordSummaryV1 {
     let session_coverage = if sessions.count == 0 {
         CoverageV1::Unknown
@@ -245,7 +248,20 @@ pub fn project(
         unknowns.push(UnknownFactV1::Usage);
     }
     unknowns.push(UnknownFactV1::HumanDecision);
-    let decision = decision_summary(item, decision);
+    let decision = decision_summary(item, decision, viewer);
+    let mut session_setups = sessions.setups;
+    for setup in &mut session_setups {
+        // Capture comes from a participant's session; a parent session is that same agent's.
+        let (owner, token) = Viewer::capturer(
+            &item.participants,
+            &setup.session_id,
+            (None, &item.lead_token),
+        );
+        let sessions = std::iter::once(&mut setup.session_id).chain(&mut setup.parent_session_id);
+        for session in sessions {
+            viewer.session(owner, token, session);
+        }
+    }
     ChangeRecordSummaryV1 {
         schema_version: crate::change_record::SCHEMA_VERSION_V1,
         work_id: item.id.clone(),
@@ -267,7 +283,7 @@ pub fn project(
             coverage: session_coverage,
             gaps: sessions.gap_count,
         },
-        session_setups: sessions.setups,
+        session_setups,
         session_setups_omitted: sessions.setups_omitted,
         latest_action,
         decision,
@@ -293,8 +309,12 @@ pub fn project(
     }
 }
 
-fn decision_summary(item: &WorkItem, stored: Option<StoredDecisionV1>) -> DecisionSummaryV1 {
-    let Some(stored) = stored else {
+fn decision_summary(
+    item: &WorkItem,
+    stored: Option<StoredDecisionV1>,
+    viewer: Viewer<'_>,
+) -> DecisionSummaryV1 {
+    let Some(mut stored) = stored else {
         return DecisionSummaryV1 {
             status: DecisionStatusV1::Missing,
             reference: None,
@@ -312,6 +332,13 @@ fn decision_summary(item: &WorkItem, stored: Option<StoredDecisionV1>) -> Decisi
         .source_refs
         .len()
         .saturating_sub(MAX_PROJECTED_DECISION_REFS);
+    let author = item
+        .participants
+        .iter()
+        .find(|p| p.token == stored.checkpoint.token && p.session == stored.checkpoint.session)
+        .map(|p| p.owner.as_str());
+    viewer.label(author, &mut stored.checkpoint.agent);
+    let reporter = (author, stored.checkpoint.token.as_str());
     DecisionSummaryV1 {
         // A Work Decision is an authorized agent checkpoint. It does not prove human approval.
         status: DecisionStatusV1::Proposed,
@@ -329,12 +356,17 @@ fn decision_summary(item: &WorkItem, stored: Option<StoredDecisionV1>) -> Decisi
                 SourceRef::Commit { oid, path } => DecisionSourceRefV1::Commit { oid, path },
                 SourceRef::Work { work_id } => DecisionSourceRefV1::Work { work_id },
                 SourceRef::CapturedEvent {
-                    session_id,
+                    mut session_id,
                     event_id,
-                } => DecisionSourceRefV1::CapturedEvent {
-                    session_id,
-                    event_id,
-                },
+                } => {
+                    let (owner, token) =
+                        Viewer::capturer(&item.participants, &session_id, reporter);
+                    viewer.session(owner, token, &mut session_id);
+                    DecisionSourceRefV1::CapturedEvent {
+                        session_id,
+                        event_id,
+                    }
+                }
                 SourceRef::PriorWorkVersion { work_id, event_seq } => {
                     DecisionSourceRefV1::PriorWorkVersion { work_id, event_seq }
                 }

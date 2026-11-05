@@ -632,7 +632,11 @@ async fn operational_projection_is_opt_in_and_strictly_compatible(hub: Hub) {
     assert_eq!(entry["state"], "active");
     assert_eq!(entry["outcome"]["value"], "none");
     assert_eq!(entry["reservation"]["status"], "held");
-    assert_eq!(entry["reservation"]["holder_session"], "s-a");
+    // The reader is another owner: the holder is the lead session's digest, as in `current`.
+    let holder = &entry["reservation"]["holder_session"];
+    assert_ne!(holder, "s-a");
+    assert_eq!(holder.as_str().map(str::len), Some(16));
+    assert_eq!(holder, &rich["current"][0]["lead_session"]);
     // Parameters are strict.
     for bad in ["operational=2", "operational=yes", "operational=1&other=1"] {
         let path = format!("/v1/hub/standup/overview?{bad}");
