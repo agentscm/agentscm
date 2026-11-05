@@ -224,7 +224,7 @@ impl PlannedIssueSnapshot {
             });
         }
         issues.sort_by_key(|issue| issue.identity.number);
-        Ok(Self {
+        let snapshot = Self {
             provider: conn.provider.clone(),
             host: repo.host.clone(),
             repository_id: repo.repository_id,
@@ -237,7 +237,13 @@ impl PlannedIssueSnapshot {
             facts_observed_at_ms: Some(observed_at_ms),
             unread_pages: page.unread,
             issues,
-        })
+        };
+        // Character limits do not bound UTF-8 bytes. Reject an oversized optional read before
+        // storage so it leaves planning unknown without interrupting the coordination poll.
+        if serde_json::to_vec(&snapshot).map_err(|_| invalid())?.len() > MAX_SNAPSHOT_BYTES {
+            return Err(invalid());
+        }
+        Ok(snapshot)
     }
 }
 
@@ -601,6 +607,19 @@ mod tests {
         ] {
             assert!(PlannedIssueSnapshot::from_github(&conn, &repo, 1000, page(items, 0)).is_err());
         }
+    }
+
+    #[test]
+    fn multibyte_labels_cannot_exceed_the_optional_snapshot_byte_bound() {
+        let (conn, repo) = identity();
+        let label = "🧪".repeat(200);
+        let items = (1..=i64::try_from(MAX_ISSUES).unwrap())
+            .map(|number| {
+                json!({"number":number,"state":"open","title":label,
+                    "milestone":{"number":1,"title":label,"state":"open","due_on":null}})
+            })
+            .collect();
+        assert!(PlannedIssueSnapshot::from_github(&conn, &repo, 1000, page(items, 0)).is_err());
     }
 
     #[test]
