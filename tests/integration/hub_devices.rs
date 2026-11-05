@@ -3572,3 +3572,123 @@ async fn a_capacity_refusal_reaches_the_operator_with_what_to_run() {
         assert_eq!(facts["complete"], json!(false));
     }
 }
+
+const PICKUPS: &str = "/v1/hub/session/pickups";
+
+/// The person's record `id`, read through the page route.
+async fn pickup(env: &Env, page: &Page, id: &Value) -> Value {
+    pickups(env, page)
+        .await
+        .into_iter()
+        .find(|p| p["id"] == *id)
+        .unwrap()
+}
+
+async fn pickups(env: &Env, page: &Page) -> Vec<Value> {
+    let (status, body) = with_cookie(
+        &env.hub,
+        Method::GET,
+        &format!("{PICKUPS}?repository=acme%2Fwidgets"),
+        &page.cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["pickups"].as_array().unwrap().clone()
+}
+
+#[tokio::test]
+async fn a_hand_off_is_picked_up_only_by_its_own_persons_agent_start() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (alice_agent, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let (bob_agent, _) = agent_for(&env, &bob.id, "codex", false);
+    let body = json!({"repository": REPO, "title": "Synthetic task"});
+
+    // A page without its CSRF token cannot create one.
+    let (status, refused) = page_post(&env, &alice, false, PICKUPS, body.clone()).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (status, task) = page_post(&env, &alice, true, PICKUPS, body.clone()).await;
+    assert_eq!(status, 200, "{task}");
+    assert_eq!(task["state"], "waiting");
+    let key = task["request_key"].as_str().unwrap().to_owned();
+    assert_eq!(key, task["id"].as_str().unwrap());
+
+    // Another person's agent starting with the same key does not pick it up.
+    env.store
+        .work_start(&bob_agent, &work(&key, "bob-session"), unix_now())
+        .unwrap();
+    assert_eq!(pickup(&env, &alice, &task["id"]).await["state"], "waiting");
+    assert!(pickups(&env, &bob).await.is_empty());
+
+    // Alice's own agent does.
+    let mut start = work(&key, "alice-session");
+    start.scope = vec!["src/pickup.rs".into()];
+    let item = env
+        .store
+        .work_start(&alice_agent, &start, unix_now())
+        .unwrap()
+        .item;
+    let picked = pickup(&env, &alice, &task["id"]).await;
+    assert_eq!(picked["state"], "picked_up", "{picked}");
+    assert_eq!(picked["picked_up"]["agent"], "claude-code");
+    assert_eq!(picked["picked_up"]["session"], "alice-session");
+    assert_eq!(picked["picked_up"]["work_id"], item.id.as_str());
+
+    // A Work hand-off is picked up by a start that resumes that Work.
+    let (_, handed) = page_post(
+        &env,
+        &alice,
+        true,
+        PICKUPS,
+        json!({"repository": REPO, "work_id": item.id}),
+    )
+    .await;
+    assert_eq!(handed["request_key"], Value::Null);
+    let mut resume = start.clone();
+    (resume.request_key, resume.work_id) = (None, Some(item.id.clone()));
+    env.store
+        .work_start(&alice_agent, &resume, unix_now())
+        .unwrap();
+    assert_eq!(
+        pickup(&env, &alice, &handed["id"]).await["state"],
+        "picked_up"
+    );
+
+    // An abandoned hand-off stays abandoned; only its owner can abandon it.
+    let (_, dropped) = page_post(&env, &alice, true, PICKUPS, body.clone()).await;
+    let abandon = json!({"repository": REPO, "id": dropped["id"]});
+    let path = "/v1/hub/session/pickups/abandon";
+    assert_eq!(
+        page_post(&env, &bob, true, path, abandon.clone()).await.0,
+        404
+    );
+    let (status, abandoned) = page_post(&env, &alice, true, path, abandon).await;
+    assert_eq!(
+        (status, abandoned["state"].as_str()),
+        (200, Some("abandoned"))
+    );
+    let mut late = work(dropped["id"].as_str().unwrap(), "late-session");
+    late.scope = vec!["src/late.rs".into()];
+    env.store
+        .work_start(&alice_agent, &late, unix_now())
+        .unwrap();
+    assert_eq!(
+        pickup(&env, &alice, &dropped["id"]).await["state"],
+        "abandoned"
+    );
+
+    // One nobody picked up in time expires and is not picked up afterwards.
+    let old = unix_now() - agentscm::hub::pickup::PICKUP_TTL_SECONDS - 1;
+    let expired = env
+        .store
+        .pickup_create(&alice.id, REPO, None, None, old)
+        .unwrap();
+    let mut slow = work(&expired.id, "slow-session");
+    slow.scope = vec!["src/slow.rs".into()];
+    env.store
+        .work_start(&alice_agent, &slow, unix_now())
+        .unwrap();
+    let found = pickup(&env, &alice, &json!(expired.id)).await;
+    assert_eq!(found["state"], "expired");
+}

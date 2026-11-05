@@ -149,6 +149,9 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, "/v1/hub/session/work/transition".into(), "{}".into(), HumanOnly);
     row(&post, "/v1/hub/session/read-token".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/session/repositories".into(), "".into(), HumanOnly);
+    row(&get, "/v1/hub/session/pickups?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
+    row(&post, "/v1/hub/session/pickups".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
+    row(&post, "/v1/hub/session/pickups/abandon".into(), r#"{"repository":"acme/widgets","id":"pku_x"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/device/repositories".into(), "".into(), HumanOnly);
     row(&get, "/v1/hub/users".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/users/usr_x/disable".into(), "".into(), HumanOnly);

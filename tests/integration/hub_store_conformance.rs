@@ -3439,6 +3439,133 @@ macro_rules! conformance {
     };
 }
 
+fn hand_off_pickups(db: &Db) {
+    use agentscm::hub::pickup::{MAX_PICKUPS_PER_OWNER, PickupState};
+    let store = db.open();
+    let alice = store.upsert_user(&identity(7), "alice").unwrap();
+    let bob = store.upsert_user(&identity(8), "bob").unwrap();
+    let token = |owner: &str, name: &str| {
+        mint_bound_agent_token(&*store, owner, name, REPO, 4242, TTL, false)
+            .unwrap()
+            .0
+    };
+    let (alice_agent, bob_agent) = (token(&alice.id, "claude-code"), token(&bob.id, "codex"));
+    let start = |key: Option<&str>, work: Option<&str>, session: &str, path: &str| {
+        serde_json::from_value::<agentscm::hub::work::WorkStart>(json!({
+            "request_key": key, "work_id": work, "title": "Synthetic hand-off",
+            "session": session, "scope": [path]}))
+        .unwrap()
+    };
+    let now = unix_now();
+    let state = |id: &str| {
+        store
+            .pickups_of_owner(&alice.id, REPO, now, 50)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap()
+    };
+
+    let task = store
+        .pickup_create(&alice.id, REPO, None, Some("Synthetic"), now)
+        .unwrap();
+    assert_id(&task.id, "pku_");
+    assert_eq!(task.request_key.as_deref(), Some(task.id.as_str()));
+    store
+        .work_start(
+            &bob_agent,
+            &start(Some(&task.id), None, "b", "src/b.rs"),
+            now,
+        )
+        .unwrap();
+    assert_eq!(state(&task.id).state, PickupState::Waiting);
+    let item = store
+        .work_start(
+            &alice_agent,
+            &start(Some(&task.id), None, "a", "src/a.rs"),
+            now,
+        )
+        .unwrap()
+        .item;
+    let picked = state(&task.id).picked_up.unwrap();
+    assert_eq!(
+        (
+            picked.agent.as_str(),
+            picked.session.as_str(),
+            picked.work_id.as_str(),
+            picked.at
+        ),
+        ("claude-code", "a", item.id.as_str(), now)
+    );
+
+    let handed = store
+        .pickup_create(&alice.id, REPO, Some(&item.id), None, now)
+        .unwrap();
+    assert_eq!(handed.request_key, None);
+    store
+        .work_start(
+            &alice_agent,
+            &start(None, Some(&item.id), "a", "src/a.rs"),
+            now,
+        )
+        .unwrap();
+    assert_eq!(state(&handed.id).state, PickupState::PickedUp);
+
+    let dropped = store
+        .pickup_create(&alice.id, REPO, None, None, now)
+        .unwrap();
+    assert!(
+        store
+            .pickup_abandon(&bob.id, REPO, &dropped.id, now)
+            .unwrap()
+            .is_none()
+    );
+    let abandoned = store
+        .pickup_abandon(&alice.id, REPO, &dropped.id, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(abandoned.state, PickupState::Abandoned);
+    store
+        .work_start(
+            &alice_agent,
+            &start(Some(&dropped.id), None, "c", "src/c.rs"),
+            now,
+        )
+        .unwrap();
+    assert_eq!(state(&dropped.id).state, PickupState::Abandoned);
+    assert!(
+        store
+            .pickups_of_owner(&bob.id, REPO, now, 50)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Old records are pruned on the next create, and the per-person bound holds.
+    let old = now - agentscm::hub::pickup::PICKUP_RETAIN_SECONDS - 1;
+    let stale = store
+        .pickup_create(&alice.id, REPO, None, None, old)
+        .unwrap();
+    assert_eq!(stale.state, PickupState::Waiting);
+    for _ in 3..MAX_PICKUPS_PER_OWNER {
+        store
+            .pickup_create(&alice.id, REPO, None, None, now)
+            .unwrap();
+    }
+    let all = store.pickups_of_owner(&alice.id, REPO, now, 1000).unwrap();
+    assert_eq!(all.len() as i64, MAX_PICKUPS_PER_OWNER);
+    assert!(all.iter().all(|p| p.id != stale.id));
+    assert!(
+        store
+            .pickup_create(&alice.id, REPO, None, None, now)
+            .is_err()
+    );
+    assert!(
+        store
+            .pickup_create(&alice.id, "not a repo", None, None, now)
+            .is_err()
+    );
+}
+
 conformance!(
     token_lookup,
     expiry,
@@ -3481,6 +3608,7 @@ conformance!(
     local_ci_concurrent_changes_have_one_winner,
     local_ci_events_carry_ids_only,
     local_ci_corrupt_records_are_refused,
+    hand_off_pickups,
 );
 
 #[cfg(unix)]
