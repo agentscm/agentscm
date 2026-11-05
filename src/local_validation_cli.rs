@@ -582,23 +582,29 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
             MAX_INPUT_BYTES,
         )
     };
-    let policy = ValidationPolicy::from_slice(&read("policy.json")?)?;
-    let recipe = ValidationRecipe::from_slice(&read("recipe.json")?)?;
     let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")?)?;
-    if policy.repository != format!("github.com/{}", args.github_repo) {
-        eprintln!("policy repository does not match --github-repo; nothing written");
-        return Ok(2);
+    // Any load failure writes nothing, like the other configuration errors.
+    let loaded =
+        agentscm::local_validation::checks::load(&args.repo.join(&args.config_dir), &|path| {
+            read_bounded(path, MAX_INPUT_BYTES)
+        })?;
+    for check in &loaded {
+        if check.policy.repository != format!("github.com/{}", args.github_repo) {
+            eprintln!("policy repository does not match --github-repo; nothing written");
+            return Ok(2);
+        }
+        if registry.repository != check.policy.repository {
+            return Err(Error::Invalid(
+                "registry repository differs from the policy repository".into(),
+            ));
+        }
     }
-    if registry.repository != policy.repository {
-        return Err(Error::Invalid(
-            "registry repository differs from the policy repository".into(),
-        ));
-    }
+    let repository = loaded[0].policy.repository.clone();
     let fetch = if args.github_authenticated_fetch {
         agentscm::local_validation::fetch::FetchContext::authenticated(
             &args.repo,
             &args.github_repo,
-            &policy.repository,
+            &repository,
             &token,
         )
     } else {
@@ -613,23 +619,26 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
     };
     let base_url = check_base_url(&args.api_url).map_err(|e| Error::Invalid(e.to_string()))?;
     let api = Api::new(&base_url, &base_url).map_err(|e| Error::Invalid(e.to_string()))?;
-    Ok(Context {
-        api: &api,
-        token: &token,
-        github_repo: &args.github_repo,
-        base: &args.base,
-        config_dir,
-        verifier_workflow: &args.verifier_workflow,
-        git_repo: &args.repo,
-        fetch: &fetch,
-        repository: &policy.repository,
-        policy: &policy,
-        recipe: &recipe,
-        registry: &registry,
-        target_url: args.target_url.as_deref(),
-    }
-    .reconcile()
-    .await)
+    let contexts: Vec<Context> = loaded
+        .iter()
+        .map(|check| Context {
+            api: &api,
+            token: &token,
+            github_repo: &args.github_repo,
+            base: &args.base,
+            config_dir,
+            verifier_workflow: &args.verifier_workflow,
+            git_repo: &args.repo,
+            fetch: &fetch,
+            repository: &check.policy.repository,
+            policy: &check.policy,
+            recipe: &check.recipe,
+            registry: &registry,
+            target_url: args.target_url.as_deref(),
+            check_name: check.name.as_deref(),
+        })
+        .collect();
+    Ok(agentscm::local_validation::reconcile::reconcile_all(&contexts).await)
 }
 
 /// Posts the retained attestation as one PR comment, adopting this login's earlier comment for
