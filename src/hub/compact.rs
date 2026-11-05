@@ -138,12 +138,15 @@ pub(super) fn overview(
         "current_complete": overview.current_complete, "next_after": next_after,
         "recent": recent, "recent_listed": overview.recent.len(),
         "recent_complete": overview.recent_complete, "next_recent_before": next_recent_before,
+        // Complete only when every listed pair is shown: the rest are on `detail: "full"`.
+        "overlaps_complete": overview.overlaps_complete
+            && first
+            && overlaps.len() == overview.overlaps.len(),
         "overlaps": overlaps, "overlaps_listed": overview.overlaps.len(),
-        "overlaps_complete": overview.overlaps_complete,
         "history_retention_gap": overview.history_retention_gap,
         "settled_count": overview.settled_count,
         "held_reservations": held.work.len(), "held_reservations_complete": held.complete,
-        "pages": "The first page lists current Work, recent outcomes and overlaps. Pass next_after or next_recent_before, with the same limit, to continue that list alone. Pages are not one snapshot.",
+        "pages": "The first page lists current Work, recent outcomes and at most five overlap pairs (all of them with detail full). Pass next_after or next_recent_before, with the same limit, to continue that list alone. Pages are not one snapshot.",
     })
 }
 

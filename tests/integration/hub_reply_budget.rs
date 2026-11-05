@@ -286,4 +286,39 @@ async fn default_start_and_overview_replies_fit_the_budget_on_a_busy_repository(
     }
     let unique: std::collections::BTreeSet<String> = seen.iter().map(|id| id.to_string()).collect();
     assert_eq!((seen.len(), unique.len()), (37, 37));
+
+    // Recent outcomes page newest first on their own; a continuation lists nothing else.
+    let mut seqs = Vec::new();
+    let mut before = Value::Null;
+    let mut listed = 0;
+    loop {
+        let page: Value = serde_json::from_str(
+            &hub.result(
+                secret,
+                "agentscm_work_overview",
+                json!({"recent_before": before}),
+            )
+            .await,
+        )
+        .unwrap();
+        let page = &page["structuredContent"];
+        listed = page["recent_listed"].as_u64().unwrap();
+        seqs.extend(
+            page["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["seq"].as_i64().unwrap()),
+        );
+        if !before.is_null() {
+            assert!(page["current"].as_array().unwrap().is_empty(), "{page}");
+            assert!(page["overlaps"].as_array().unwrap().is_empty(), "{page}");
+        }
+        before = page["next_recent_before"].clone();
+        if before.is_null() {
+            break;
+        }
+    }
+    assert!(seqs.windows(2).all(|pair| pair[0] > pair[1]), "{seqs:?}");
+    assert_eq!(seqs.len() as u64, listed);
 }
