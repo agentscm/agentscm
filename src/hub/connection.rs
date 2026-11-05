@@ -273,6 +273,7 @@ pub(super) fn observation_kinds(kind: &str) -> Result<(&'static str, &'static st
         "pull_request" => Ok(("pull_request_observed", "pull_request_closed")),
         "branch" => Ok(("branch_observed", "branch_deleted")),
         "provider_context" => Ok(("provider_context_observed", "provider_context_removed")),
+        "planned_issues" => Ok(("planned_issues_observed", "planned_issues_removed")),
         _ => Err(invalid("unsupported observation kind")),
     }
 }
@@ -285,12 +286,21 @@ pub(super) fn gone_event(kind: &str, event: &str) -> Result<&'static str> {
         ("branch", "branch_deleted") => Ok("branch_deleted"),
         ("branch", "branch_unobserved") => Ok("branch_unobserved"),
         ("provider_context", "provider_context_removed") => Ok("provider_context_removed"),
+        ("planned_issues", "planned_issues_removed") => Ok("planned_issues_removed"),
         _ => Err(invalid("event does not fit the observation kind")),
     }
 }
 
 pub(super) fn validate_observation(kind: &str, key: &str, data: &str) -> Result<()> {
     observation_kinds(kind)?;
+    if kind == "planned_issues"
+        && (key != super::planned_issues::OBSERVATION_KEY
+            || data.len() > super::planned_issues::MAX_SNAPSHOT_BYTES)
+    {
+        return Err(invalid(
+            "planned issue snapshot exceeds its identity or size bounds",
+        ));
+    }
     if kind == "provider_context"
         && (data.len() > super::provider_context::MAX_SNAPSHOT_BYTES
             || (key != "_health" && !key.parse::<i64>().is_ok_and(|number| number > 0)))
@@ -441,7 +451,15 @@ impl Event {
             kind,
             "provider_context_observed" | "provider_context_removed"
         );
-        if provider_context {
+        if matches!(kind, "planned_issues_observed" | "planned_issues_removed") {
+            value = json!({
+                "repository_id": repo.repository_id, "scope": "planned_issues",
+                "change": if kind == "planned_issues_observed" { "observed" } else { "removed" },
+                "coverage": value.get("coverage"),
+                "issue_count": value["issues"].as_array().map(Vec::len),
+                "snapshot_digest": super::store::lower_hex_of(data.as_bytes()),
+            });
+        } else if provider_context {
             value = provider_context_event(
                 repo.repository_id,
                 key,

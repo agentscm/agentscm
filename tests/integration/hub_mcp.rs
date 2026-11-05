@@ -557,6 +557,7 @@ async fn protocol_basics() {
             "agentscm_pr_context",
             "agentscm_work_pr_link",
             "agentscm_work_pr_link_set",
+            "agentscm_work_issue_link_set",
             "agentscm_work_declarations",
             "agentscm_work_declarations_set",
             "agentscm_work_reconciliation",
@@ -1805,10 +1806,18 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
         post_takeover_retry["structuredContent"]["item"]["generation"],
         generation + 1
     );
-    assert_eq!(
-        post_takeover_retry["structuredContent"]["item"]["lead_session"],
-        "bob"
-    );
+    // Bob is another owner: Alice reads his session by its digest, the same one his
+    // participant entry carries.
+    let item = &post_takeover_retry["structuredContent"]["item"];
+    let lead = item["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["role"] == "lead")
+        .unwrap();
+    assert_ne!(item["lead_session"], "bob");
+    assert_eq!(item["lead_session"].as_str().map(str::len), Some(16));
+    assert_eq!(lead["session"], item["lead_session"]);
     let new_old_generation_operation = hub
         .tool_result(
             &alice,
@@ -2603,7 +2612,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (45, 48, 53));
+    assert_eq!((before.len(), listed.len(), all.len()), (46, 49, 54));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});

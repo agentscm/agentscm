@@ -53,7 +53,7 @@ fn action(
 
 /// Hash every captured byte independently of display and comparison caps. Collection
 /// bounds limit the records; hashing adds no retained copy or separate evidence-size cap.
-fn capture(hash: &mut Sha256, record: &[u8]) {
+pub(super) fn capture(hash: &mut Sha256, record: &[u8]) {
     hash.update((record.len() as u64).to_be_bytes());
     hash.update(record);
 }

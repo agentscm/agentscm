@@ -1438,6 +1438,7 @@ fn postgres_finish_and_live_heartbeat_share_one_lock_order() {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("postgres-finish-race".into()),
@@ -1881,6 +1882,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
         .work_start(
             &original,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("managed-takeover-race".into()),
@@ -2022,6 +2024,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
         takeover_store.work_start(
             &takeover_token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(takeover_id),
                 source: None,
                 request_key: None,
@@ -2095,6 +2098,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
         .work_start(
             &original,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("managed-finish-race".into()),

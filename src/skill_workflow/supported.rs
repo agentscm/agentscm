@@ -1177,6 +1177,16 @@ pub fn evaluate(
     }
 }
 
+/// Whether `agentscm skill stop` blocks at the run's current gate, before the local-HEAD check:
+/// only Stop-enforced gates the agent can act on block; ci, approval, merge and post_merge wait.
+pub fn stop_blocks(view: &RunView) -> bool {
+    view.blocks_finish
+        && view
+            .current_gate
+            .as_deref()
+            .is_some_and(|gate| !matches!(gate, "ci" | "approval" | "merge" | "post_merge"))
+}
+
 // ---- Admission --------------------------------------------------------------------------
 
 /// Why evidence is refused. `code` is one of `unknown_gate`, `stale_head`, `not_independent`
