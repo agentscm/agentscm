@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use agentscm::hook_relay::{self, Address, HookRequest, REPLY_BYTES, STDIN_BYTES};
 use agentscm::hub::forge_http::{self, check_base_url, send};
 use clap::Args;
 use serde_json::{Value, json};
@@ -21,8 +22,6 @@ const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
 const AUTO_CONNECT_WAIT: Duration = Duration::from_millis(2500);
 /// A failed auto-connect or renewal is not retried for this long.
 const RETRY_EVERY: Duration = Duration::from_secs(5 * 60);
-const STDIN_BYTES: usize = 4 << 20;
-const REPLY_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Args)]
 pub struct HookArgs {
@@ -336,33 +335,44 @@ async fn call_hub(
         .as_ref()
         .map(|connection| crate::client_activity::activity_binding(connection, &token));
     let mut activity = ActivityAttempt::new(activity_tracker, activity_binding);
-    let client = forge_http::client().map_err(|_| "hub unreachable")?;
     let outbound_body = if plugin_route || agent == "codex" {
         serde_json::to_vec(&outbound).map_err(|_| "payload unreadable")?
     } else {
         // Preserve the legacy transport contract, including original JSON bytes.
         original_body
     };
-    let mut request = hub_request(
-        &client,
-        &url,
-        &endpoint_agent,
-        repo.as_deref(),
-        &token,
-        &outbound_body,
-        root.as_deref(),
-    )?;
-    if let Some(connection) = client_connection.as_ref() {
-        request = request.header(
-            agentscm::hub::onboarding::CLIENT_HEADER,
-            client_config::onboarding_client(&connection.root, &token),
-        );
-    }
-    request = client_config::with_completion_reporting(request, report_completion);
-    // `send` errors carry no URL or credentials.
-    let (status, reply) = send(request, REPLY_BYTES)
-        .await
-        .map_err(|_| "hub unreachable")?;
+    let request = HookRequest {
+        agent: path_segment(&endpoint_agent),
+        repo,
+        client: client_connection
+            .as_ref()
+            .map(|connection| client_config::onboarding_client(&connection.root, &token)),
+        token,
+        root: root.as_deref().and_then(Path::to_str).map(str::to_owned),
+        report_completion,
+        body: outbound_body,
+    };
+    // Legacy hooks also use the relay: its key binds the Hub/config, and framing preserves raw JSON.
+    let forwarded = match config_dir()
+        .ok()
+        .and_then(|dir| Address::new(&dir, &url).ok())
+    {
+        Some(address) => hook_relay::try_forward(&address, &request, deadline).await,
+        None => None,
+    };
+    let (status, reply) = match forwarded {
+        Some(reply) => reply.map_err(|_| "hub unreachable")?,
+        None => {
+            let client = forge_http::client().map_err(|_| "hub unreachable")?;
+            let request = request
+                .request(&client, &url)
+                .map_err(|_| "hub unreachable")?;
+            // `send` errors carry no URL or credentials. An accepted relay call is never resent.
+            send(request, REPLY_BYTES)
+                .await
+                .map_err(|_| "hub unreachable")?
+        }
+    };
     match status {
         200 if reply.is_object() => {
             activity.finish(successful_hook_outcome(&outbound));
@@ -919,38 +929,6 @@ fn successful_hook_outcome(payload: &Value) -> crate::client_activity::ActivityO
     } else {
         crate::client_activity::ActivityOutcome::Acknowledged
     }
-}
-
-fn hub_request(
-    client: &reqwest::Client,
-    url: &str,
-    agent: &str,
-    repo: Option<&str>,
-    token: &str,
-    outbound: &[u8],
-    root: Option<&Path>,
-) -> Result<reqwest::RequestBuilder, String> {
-    // The hub answers "coordination unknown" when the repository differs from the token's.
-    let query = repo.map_or_else(String::new, |repo| format!("?repo={repo}"));
-    let request = client
-        .post(format!("{url}/v1/hub/hook/{}{query}", path_segment(agent)))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .bearer_auth(token)
-        .body(outbound.to_vec());
-    Ok(with_root_header(request, root))
-}
-
-fn with_root_header(
-    mut request: reqwest::RequestBuilder,
-    root: Option<&Path>,
-) -> reqwest::RequestBuilder {
-    if let Some(root) = root
-        .and_then(Path::to_str)
-        .and_then(|root| reqwest::header::HeaderValue::from_str(root).ok())
-    {
-        request = request.header("X-Agentscm-Root", root);
-    }
-    request
 }
 
 const MAX_WORKSPACE_ROOTS: usize = 16;
@@ -3565,15 +3543,16 @@ mod tests {
             &connections,
         )
         .unwrap();
-        let request = hub_request(
-            &reqwest::Client::new(),
-            "https://hub.example.test",
-            "codex",
-            Some("acme/widgets"),
-            "synthetic-token",
-            &serde_json::to_vec(&routed.payload).unwrap(),
-            None,
-        )
+        let request = HookRequest {
+            agent: "codex".into(),
+            repo: Some("acme/widgets".into()),
+            token: "synthetic-token".into(),
+            root: None,
+            client: None,
+            report_completion: false,
+            body: serde_json::to_vec(&routed.payload).unwrap(),
+        }
+        .request(&reqwest::Client::new(), "https://hub.example.test")
         .unwrap()
         .build()
         .unwrap();
