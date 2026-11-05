@@ -31,7 +31,7 @@ die() {
 }
 
 # Build the small std-only supervisor without starting Cargo or consuming a heavy-job slot.
-run_queued() {
+queue_binary() {
   local source digest cache build
   source=tools/heavy-job-queue.rs
   digest=$(shasum -a 256 "$source" | cut -d ' ' -f 1)
@@ -46,8 +46,18 @@ run_queued() {
     mv "$build/queue" "$cache"
     rmdir "$build"
   fi
-  exec "$cache" --run "$HOME/.agentscm/heavy-job-queue" "$HOME/.agentscm/attest-pr.lock" "$@"
+  printf '%s\n' "$cache"
 }
+run_queued() {
+  local kind=$1
+  shift
+  exec "$(queue_binary)" --run "$HOME/.agentscm/heavy-job-queue" "$HOME/.agentscm/attest-pr.lock" "$kind" "$@"
+}
+
+if [[ "${1:-}" == --queue ]]; then
+  (($# == 1)) || die "usage: tools/attest-pr.sh --queue"
+  exec "$(queue_binary)" --queue "$HOME/.agentscm/heavy-job-queue"
+fi
 
 queued=false
 if [[ "${1:-}" == --queued-attestation ]]; then
@@ -56,8 +66,14 @@ if [[ "${1:-}" == --queued-attestation ]]; then
 fi
 if [[ "${1:-}" == --with-lock ]]; then
   shift
+  kind=other
+  if [[ "${1:-}" == --kind ]]; then
+    kind=${2:-}
+    [[ "$kind" == focused || "$kind" == other ]] || die "kind must be focused or other"
+    shift 2
+  fi
   (($#)) || die "usage: tools/attest-pr.sh --with-lock COMMAND [ARG...]"
-  run_queued "$@"
+  run_queued "$kind" "$@"
   exit
 fi
 
@@ -86,7 +102,7 @@ head=$(git rev-parse HEAD)
 
 # Re-enter under the supervisor so all command descendants and cleanup share one slot.
 if [[ "$queued" == false ]]; then
-  run_queued bash tools/attest-pr.sh --queued-attestation "$pr"
+  run_queued attestation bash tools/attest-pr.sh --queued-attestation "$pr"
   exit
 fi
 
