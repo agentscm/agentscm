@@ -3933,8 +3933,10 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
         ok(&machine.run(&root, &args))
     };
     let said = doctor(&[]);
+    // Doctor may report other findings first, such as missing agent instructions.
     assert!(
-        said.starts_with("Unverified: call agentscm_setup_status"),
+        said.lines()
+            .any(|line| line.starts_with("Unverified: call agentscm_setup_status")),
         "{said}"
     );
     assert_eq!(doctor(&["--json"]).trim(), "[]");
