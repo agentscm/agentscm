@@ -195,7 +195,9 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
         ClientCommand::Connect(args) => {
             let root = selected_root(args.root.as_deref())?;
             let ui = Ui { yes: false };
-            connect(args, root, terminal_wait(&ui).as_ref()).await
+            connect(args, root.clone(), terminal_wait(&ui).as_ref()).await?;
+            offer_instructions(&root);
+            Ok(())
         }
         #[cfg(unix)]
         ClientCommand::Setup(args) => {
@@ -211,11 +213,13 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
             setup(
                 &[(args.agent, scope)],
                 args.connect,
-                root,
+                root.clone(),
                 &program,
                 terminal_wait(&ui).as_ref(),
             )
-            .await
+            .await?;
+            offer_instructions(&root);
+            Ok(())
         }
         ClientCommand::List => list(),
         ClientCommand::Remove(args) => remove(args).await,
@@ -230,6 +234,17 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
             auto_connect_command(&root, args.agent.as_deref()).await
         }
     }
+}
+
+/// Onboarding's last step after `client setup` or `client connect`: the checkout's agent
+/// instructions, previewed and offered for the agents set up here.
+fn offer_instructions(root: &Path) {
+    let agents = load()
+        .ok()
+        .and_then(|saved| saved.into_iter().find(|connection| connection.root == root))
+        .map(|connection| connection.agents)
+        .unwrap_or_default();
+    crate::init_cli::offer_after_setup(root, &agents);
 }
 
 async fn status(args: StatusArgs) -> Result<()> {
@@ -1803,6 +1818,13 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
         Some(Ok(verified)) => println!("{verified}"),
         Some(Err(problem)) => println!("Connection needs attention: {problem}."),
         None => {}
+    }
+    match crate::init_cli::instructions_state(&root, &connection.agents).as_slice() {
+        [] => println!("Agent instructions are current."),
+        stale => println!(
+            "Agent instructions are not current: {}. Run `agentscm init-repo` to preview and write them.",
+            stale.join("; ")
+        ),
     }
     if reply.as_array().is_some_and(Vec::is_empty) && matches!(checked, Some(Ok(_))) {
         println!(

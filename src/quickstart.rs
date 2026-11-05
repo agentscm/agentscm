@@ -1297,9 +1297,19 @@ async fn connect_checkout(
 }
 
 /// With `--init` only, writes `agentscm init-repo`'s instruction files: setup itself never writes
-/// to the repository. Failure is reported, not fatal.
+/// to the repository, and without it only reports files that are not current. Failure is
+/// reported, not fatal.
 fn init_stage(cx: &mut Cx<'_>) {
     if !cx.args.init {
+        if let Some(root) = &cx.found.repo_root {
+            let stale = crate::init_cli::instructions_state(root, &cx.live.agents);
+            if !stale.is_empty() {
+                println!(
+                    "This checkout's agent instructions are not current ({}). Run `agentscm init-repo` to preview and write them.",
+                    stale.join("; ")
+                );
+            }
+        }
         return;
     }
     let Some(root) = cx.found.repo_root.clone() else {

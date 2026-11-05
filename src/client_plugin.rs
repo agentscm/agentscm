@@ -15,7 +15,7 @@ pub struct PluginArgs {
     install: bool,
 }
 
-const SKILL: &str = crate::client_setup::SKILL;
+use crate::client_setup::SKILL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {

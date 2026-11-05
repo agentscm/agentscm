@@ -218,7 +218,12 @@ async fn every_fixture_gets_its_agents_output_shape() {
             Expect::Empty => assert_eq!(answer, json!({}), "{name}"),
             Expect::Context(pointer) => {
                 let text = text_at(&answer, pointer);
-                assert!(text.starts_with("AgentSCM:"), "{name}: {answer}");
+                // The session ID and required rules lead a start context.
+                assert!(text.starts_with("AgentSCM"), "{name}: {answer}");
+                assert!(
+                    agentscm::hub::agent_rules::carries_all(text),
+                    "{name}: {answer}"
+                );
                 assert!(
                     text.contains("Once the user intent is known, call agentscm_start"),
                     "{name}: {answer}"
@@ -739,8 +744,9 @@ async fn failures_are_200s_that_say_coordination_is_unknown() {
             Some(&secret),
             body.as_bytes(),
         );
+        // The required rules mention unknown coordination; only the failure note has a reason.
         assert!(
-            !ok.to_string().contains("coordination unknown"),
+            !ok.to_string().contains("coordination unknown ("),
             "{agent}: {ok}"
         );
     }

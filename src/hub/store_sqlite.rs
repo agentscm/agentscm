@@ -4240,13 +4240,23 @@ fn start_in(
         let held = work_holds_reservation(tx, &item.id)?;
         // A held reservation is open to takeover only once its lease lapsed: a revoked lead token
         // may still be carried to its successor (#337), and a stale progress report alone never
-        // opens it. Work that holds nothing keeps the claim-age rule.
-        let open = if held {
-            lease_lapsed(tx, &item.id, now)?
-        } else {
-            item.claim_status == ClaimStatus::Stale
-        };
-        if start.takeover_generation != Some(item.generation) {
+        // opens it. Work that holds nothing keeps the claim-age rule. Active Work this token
+        // started without naming a session passes to the same token's first named session that
+        // asks, so an unnamed start can be linked to the conversation whose hooks check its edits.
+        let adopting_default = named
+            && item.lead_token == who.token
+            && item.lead_session == DEFAULT_SESSION
+            && start.session != DEFAULT_SESSION
+            && matches!(item.state, WorkState::Active | WorkState::Blocked);
+        let open = adopting_default
+            || if held {
+                lease_lapsed(tx, &item.id, now)?
+            } else {
+                item.claim_status == ClaimStatus::Stale
+            };
+        let fenced = start.takeover_generation == Some(item.generation)
+            || (adopting_default && start.takeover_generation.is_none());
+        if !fenced {
             let kind = if start.takeover_generation.is_some() {
                 WorkConflictKind::GenerationChanged
             } else if open {
@@ -5443,6 +5453,9 @@ fn session_name(
     }
 }
 
+/// The session a hook's native session ID stands for. The first new native session after an
+/// unnamed start adopts that `default` Work (an alias); every later one is its own session, so
+/// one adoption never refuses the token's other conversations.
 fn alias_hook_session(
     tx: &Transaction<'_>,
     token: &str,
@@ -5476,9 +5489,8 @@ fn alias_hook_session(
         .optional()?
         .is_some()
     {
-        return Err(HubError::Invalid(
-            "durable default work is already bound to another hook session".into(),
-        ));
+        // Another conversation already adopted the unnamed Work; this one is its own session.
+        return Ok(observed.to_owned());
     }
     let eligible = tx
         .query_row(
@@ -5499,9 +5511,8 @@ fn alias_hook_session(
         params![token, observed, DEFAULT_SESSION, now],
     )?;
     if changed == 0 {
-        return Err(HubError::Invalid(
-            "durable default work is already bound to another hook session".into(),
-        ));
+        // A concurrent first touch adopted it first.
+        return Ok(observed.to_owned());
     }
     Ok(DEFAULT_SESSION.to_owned())
 }
@@ -12629,6 +12640,15 @@ impl Store for SqliteStore {
         let name = session_name(&tx, token, session, now)?;
         tx.commit()?;
         Ok(name)
+    }
+
+    fn default_session_bound(&self, token: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_session_aliases
+             WHERE token=?1 AND canonical_session=?2)",
+            params![token, DEFAULT_SESSION],
+            |row| row.get(0),
+        )?)
     }
 
     fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing> {

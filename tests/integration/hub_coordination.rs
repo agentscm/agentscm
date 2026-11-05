@@ -1167,8 +1167,9 @@ fn default_work_session_is_durably_aliased_to_the_first_hook(db: &Db) {
         )
         .unwrap();
     assert_eq!(touched.session, "default");
-    assert!(matches!(
-        store.touch_session(
+    // Once `default` is adopted, a later new native session is its own session, not refused.
+    let alternate = store
+        .touch_session(
             &lead,
             &SessionCall {
                 session: Some("alternate-hook".into()),
@@ -1179,9 +1180,10 @@ fn default_work_session_is_durably_aliased_to_the_first_hook(db: &Db) {
                 report: true,
             },
             delayed + 2,
-        ),
-        Err(HubError::Invalid(message)) if message.contains("already bound")
-    ));
+        )
+        .unwrap();
+    assert_eq!(alternate.session, "alternate-hook");
+    assert!(store.default_session_bound(&lead).unwrap());
     assert_eq!(
         store
             .session_name_for(&lead, Some("observed-hook"), delayed + 3)

@@ -612,6 +612,11 @@ guessed session.
 A hook that opens a new session first takes over the token's `default` session
 if that was created by MCP alone in the last 20 minutes, so calling
 `agentscm_start` before the first hook does not make the agent warn itself.
+Durable Work started under `default` is adopted the same way: the first new
+native session after it is bound to `default`, and every later new session of
+the token is its own session. While `default` is bound, an unnamed
+`agentscm_start` is not reported ready and names the start that moves its Work
+to the caller's own session ([required rules](agents.md#required-rules-and-the-session-id)).
 Because MCP clients send no session id, an MCP-only session and a hook session
 of the same token are never warned about each other; two hook sessions of one
 token are two agents and are. The hub records per session how it connects

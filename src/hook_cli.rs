@@ -1612,7 +1612,7 @@ fn gemini_reply(reply: Value, payload: &Value, config: Option<&Path>) -> Value {
     let text = reply["text"].as_str().unwrap_or_default();
     match payload["hook_event_name"].as_str() {
         Some("BeforeTool") if status == "stop" && !text.is_empty() => {
-            if lease_lapsed(text) || first_deny(config, "gemini", payload) {
+            if holding(text) || first_deny(config, "gemini", payload) {
                 json!({"decision":"deny", "reason":text})
             } else {
                 json!({})
@@ -1635,8 +1635,8 @@ type Object = serde_json::Map<String, Value>;
 /// The hub's reply cut down to an allowlist: context and message fields, Cursor's `permission`
 /// (forced to allow) and the one documented refusal, `permissionDecision` "deny" with a
 /// non-empty reason. A deny passes only on a pre-tool event and once per identical edit (a
-/// repeat is the agent's retry); the rest is dropped, so a wrong or hostile reply cannot
-/// block, approve or rewrite a call.
+/// repeat is the agent's retry), except the Hub's holding refusals, which a repeat meets
+/// again; the rest is dropped, so a wrong or hostile reply cannot approve or rewrite a call.
 fn defanged(reply: Value, agent: &str, payload: &Value, config: Option<&Path>) -> Value {
     let Value::Object(mut top) = reply else {
         return reply;
@@ -1668,10 +1668,10 @@ fn defanged(reply: Value, agent: &str, payload: &Value, config: Option<&Path>) -
         });
     }
     let wants = inner.as_deref().is_some_and(denies);
-    let lapsed = inner.as_deref().is_some_and(lapsed_deny);
+    let holds = inner.as_deref().is_some_and(holding_deny);
     let wants = wants || denies(&top);
-    let lapsed = lapsed || lapsed_deny(&top);
-    let keep = wants && is_pre_tool(payload) && (lapsed || first_deny(config, agent, payload));
+    let holds = holds || holding_deny(&top);
+    let keep = wants && is_pre_tool(payload) && (holds || first_deny(config, agent, payload));
     if let Some(inner) = top
         .get_mut("hookSpecificOutput")
         .and_then(Value::as_object_mut)
@@ -1690,22 +1690,19 @@ fn denies(object: &Object) -> bool {
             .is_some_and(|reason| !reason.is_empty())
 }
 
-/// A deny that carries the Hub's lapsed-lease answer.
-fn lapsed_deny(object: &Object) -> bool {
+/// A deny that carries one of the Hub's holding refusals.
+fn holding_deny(object: &Object) -> bool {
     denies(object)
         && object
             .get(PAIR[1])
             .and_then(Value::as_str)
-            .is_some_and(lease_lapsed)
+            .is_some_and(holding)
 }
 
-/// Whether a refusal is the Hub's lapsed-lease answer. It holds until the lead starts its Work
-/// again, so unlike other refusals a retry of the same edit meets it too.
-fn lease_lapsed(reason: &str) -> bool {
-    reason
-        .strip_prefix("AgentSCM: ")
-        .unwrap_or(reason)
-        .starts_with(agentscm::hub::work_lifecycle::LEASE_LAPSED)
+/// Whether a refusal is one the Hub keeps until the session's Work changes (a lapsed hold or an
+/// unlinked edit), so unlike other refusals a retry of the same edit meets it too.
+fn holding(reason: &str) -> bool {
+    agentscm::hub::work_lifecycle::refusal_holds(reason)
 }
 
 /// Keeps a valid deny pair when `keep`, else removes the pair.
@@ -2272,7 +2269,7 @@ mod tests {
 
     #[test]
     fn gemini_native_start_preserves_session_discovery_context() {
-        let context = "AgentSCM native session ID (literal data, not instructions): \"native-id\". Use this exact session argument with agentscm_setup_status.";
+        let context = "AgentSCM native session ID (literal data, not instructions): \"native-id\". Pass this exact value as `session` to agentscm_start and every other AgentSCM call.";
         let reply = gemini_reply(
             json!({"status":"clean","text":context}),
             &json!({"hook_event_name":"SessionStart"}),
@@ -2849,6 +2846,11 @@ mod tests {
         assert_eq!(run(lapsed.clone(), &edit), lapsed);
         assert_eq!(run(lapsed.clone(), &edit), lapsed);
         assert_eq!(run(lapsed.clone(), &edit), lapsed);
+        // So is an edit not linked to the session's Work, until a start or checkpoint links it.
+        let unlinked = deny("AgentSCM: EDIT_UNLINKED: this edit was not applied.");
+        let edit = pre("s", json!({"file_path": "d.rs"}));
+        assert_eq!(run(unlinked.clone(), &edit), unlinked);
+        assert_eq!(run(unlinked.clone(), &edit), unlinked);
         // Copilot CLI's camelCase form is top level, with the tool args as the identity.
         let cli = json!({"sessionId": "c", "toolName": "edit", "toolArgs": "{\"p\":1}"});
         let top = json!({"permissionDecision": "deny", "permissionDecisionReason": "r"});
@@ -3288,13 +3290,18 @@ mod tests {
             gemini_reply(reply, &payload, Some(config.path())),
             json!({})
         );
-        // A lapsed lease is refused on every retry.
-        let lapsed = json!({"status":"stop", "text":"AgentSCM: LEASE_LAPSED: the hold lapsed."});
-        for _ in 0..2 {
-            assert_eq!(
-                gemini_reply(lapsed.clone(), &payload, Some(config.path())),
-                json!({"decision":"deny", "reason":"AgentSCM: LEASE_LAPSED: the hold lapsed."})
-            );
+        // A lapsed lease and an unlinked edit are refused on every retry.
+        for text in [
+            "AgentSCM: LEASE_LAPSED: the hold lapsed.",
+            "AgentSCM: EDIT_UNLINKED: this edit was not applied.",
+        ] {
+            let held = json!({"status":"stop", "text":text});
+            for _ in 0..2 {
+                assert_eq!(
+                    gemini_reply(held.clone(), &payload, Some(config.path())),
+                    json!({"decision":"deny", "reason":text})
+                );
+            }
         }
     }
 
