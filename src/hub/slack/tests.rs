@@ -498,13 +498,8 @@ async fn two_holder_sessions_of_one_token_message_their_person_once() {
     };
     tokio::task::block_in_place(|| f.store().announce_intent(&f.alice, &rest, unix_now())).unwrap();
     f.edit(&f.alice, "a");
+    // c's refusal leaves its own request open on a: the button still answers bob, who it names.
     f.edit(&f.alice, "c");
-    // Settle c's own request, so bob's is the only one the button can answer.
-    tokio::task::block_in_place(|| {
-        f.store()
-            .answer_handoff(&f.alice, Some("a"), PATH, false, None, unix_now())
-            .unwrap()
-    });
     f.edit(&f.alice, "c");
     f.run().await;
     let before = f.sent().len();

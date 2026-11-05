@@ -7521,8 +7521,17 @@ impl Store for PgStore {
                  WHERE h.repository = $1 AND h.path = $2 AND h.holder_token = $3
                    AND h.state = 'pending' AND h.created_at > $4
                    AND h.holder_session = $5
-                 ORDER BY h.created_at, h.id LIMIT 1",
-                &[&who.repository, &key, &token, &cutoff(now), &name],
+                 ORDER BY CASE WHEN $6::boolean AND h.requester_token = h.holder_token
+                               THEN 1 ELSE 0 END,
+                          h.created_at, h.id LIMIT 1",
+                &[
+                    &who.repository,
+                    &key,
+                    &token,
+                    &cutoff(now),
+                    &name,
+                    &matches!(via, Via::Slack),
+                ],
             )?;
             let Some(request) = found.map(|row| Request {
                 id: row.get(0),

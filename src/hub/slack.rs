@@ -889,6 +889,7 @@ impl Slack {
             let mut holding: Vec<&Intent> = intents.iter().filter(|i| !skipped(i)).collect();
             holding.sort_by_key(|i| (!asked(i), i.created_at, i.id.as_str()));
             let mut told = BTreeSet::new();
+            let mut listed_holders = BTreeSet::new();
             for &intent in &holding {
                 let held: Vec<String> = paths
                     .iter()
@@ -979,8 +980,9 @@ impl Slack {
                         message(&headline, &fields, &guidance, handoff, &link),
                     ));
                 }
-                // One agent's hook and MCP sessions read alike: one holder, not two.
-                if !holders.contains(&holder) {
+                // One agent's hook and MCP sessions read alike: one holder, not two. Two tokens
+                // with one display name stay two.
+                if listed_holders.insert((intent.token.as_str(), holder.clone())) {
                     holders.push(holder);
                 }
             }
