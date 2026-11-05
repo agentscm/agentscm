@@ -601,7 +601,7 @@ post-merge events reserve bounded artifact workflows; the operator runs the reta
 Pause and revoke prevent subsequent managed effects and preserve history. See
 [operating policy](../advanced/operating-policy.md) for inspection, activation, dispatch and recovery.
 
-`operating-policy recover` accepts paired `--reconcile-operation OPERATION_ID` and `--observed-seq N` for explicit owner reconciliation of a retained ambiguous administrative request. It preserves that request with an unknown outcome; see the [operating-policy recovery guide](../advanced/operating-policy.md#pause-revoke-and-recover).
+`operating-policy recover` accepts paired `--reconcile-operation OPERATION_ID` and `--observed-seq N` for explicit owner reconciliation of a retained ambiguous administrative request. It preserves that request with an unknown outcome; see the [operating-policy recovery guide](../advanced/operating-policy.md#pause-revoke-and-recover). `operating-policy rebind DISPATCH_ID --expected-generation N --work-generation M` points the dispatch's Work binding at the Work's current generation after a release and resume, or a reopen, by the dispatch's own session; it previews unless `--apply`.
 
 Neither command grants forge merge permission or controls unrestricted tools in unrelated agents.
 

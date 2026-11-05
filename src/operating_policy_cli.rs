@@ -99,6 +99,21 @@ pub enum OperatingPolicyCommand {
         #[arg(long, requires = "reconcile_operation", value_parser = clap::value_parser!(i64).range(1..))]
         observed_seq: Option<i64>,
     },
+    /// Point a dispatch's Work binding at the Work's newer generation after the Work was released
+    /// and resumed, or reopened, by the dispatch's own session, so `recover` can continue it.
+    /// Previews unless --apply.
+    Rebind {
+        dispatch: String,
+        /// The dispatch claim generation, as `recover` takes it.
+        #[arg(long)]
+        expected_generation: i64,
+        /// The Hub Work generation the owner inspected; a newer one refuses with nothing changed.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        work_generation: i64,
+        /// Write the new binding. Omit to preview it.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Inspect the current contract, retained decisions and dispatch outcomes.
     Status { rule: String },
 }
@@ -560,6 +575,80 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
             }
             Ok(
                 json!({"work_id":work.id,"execution":result,"checkpoint":checkpoint.as_ref().ok(),"checkpoint_recorded":checkpoint.is_ok(),"checkpoint_error":checkpoint.err().map(|_|"Work checkpoint not confirmed; inspect current Work before retry")}),
+            )
+        }
+        OperatingPolicyCommand::Rebind {
+            dispatch,
+            expected_generation,
+            work_generation,
+            apply,
+        } => {
+            let _runner = runner_lease(&directory)?;
+            let retained = journal.dispatch(&dispatch)?;
+            let policy = journal.operating_policy(&retained.dispatch.rule.rule_id)?;
+            let managed = connect(&retained.dispatch.rule).await?;
+            if policy.reviewer != managed.identity.actor() || policy.mode != "active" {
+                return Err(Error::Conflict(
+                    "only the current owner of an active policy can rebind its dispatch".into(),
+                ));
+            }
+            if retained.claim_generation != expected_generation {
+                return Err(Error::Conflict(
+                    "dispatch rebind generation conflict".into(),
+                ));
+            }
+            journal.check_operating_dispatch(&dispatch, &managed.identity.actor())?;
+            let binding = journal
+                .operating_work(&dispatch)?
+                .ok_or_else(|| Error::Conflict("dispatch has no Work binding to rebind".into()))?;
+            if binding.identity_commitment != managed.identity_commitment()? {
+                return Err(Error::Conflict(
+                    "Hub identity changed since Work reservation".into(),
+                ));
+            }
+            let current = managed.read(&binding.work.id).await?;
+            if current.generation != work_generation {
+                return Err(Error::Conflict(format!(
+                    "Work generation is now {}; inspect it and retry with --work-generation {}",
+                    current.generation, current.generation
+                )));
+            }
+            if current.generation == binding.work.generation
+                && current.lead_token == binding.work.lead_token
+                && current.lead_session == binding.work.lead_session
+            {
+                return Ok(
+                    json!({"dispatch":retained,"work":binding,"rebound":false,"replayed":true,
+                    "next":"The binding already names this generation; recover the dispatch"}),
+                );
+            }
+            // Recovery continues only Work the dispatch's session holds again, so a released
+            // item is resumed first and a finished one is reopened or left to a completed dispatch.
+            let recoverable = matches!(current.state, WorkState::Active | WorkState::Blocked)
+                || retained.state == "complete" && current.state == WorkState::Finished;
+            if !recoverable {
+                return Err(Error::Conflict(format!(
+                    "Work is {}; resume it as session {} with agentscm work start and takeover_generation {} before rebinding",
+                    serde_json::to_value(current.state)?
+                        .as_str()
+                        .unwrap_or("unfinished"),
+                    binding.work.lead_session,
+                    current.generation
+                )));
+            }
+            let next = if apply {
+                journal.rebind_operating_work(&dispatch, &binding, &current)?
+            } else {
+                agentscm::operating_policy::rebound_operating_work(&binding, &current)?
+            };
+            Ok(
+                json!({"dispatch":retained,"from_generation":binding.work.generation,
+                "work":next,"rebound":apply,"applied":apply,
+                "next": if apply {
+                    format!("Recover the dispatch with --expected-generation {expected_generation}")
+                } else {
+                    "Rerun with --apply to write this binding".to_owned()
+                }}),
             )
         }
         OperatingPolicyCommand::Recover {
