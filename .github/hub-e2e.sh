@@ -130,9 +130,12 @@ esac
 project=agentscm-e2e-$profile-$$
 work=$(mktemp -d)
 dc() {
-  local extra=()
-  if [ -n "${AGENTSCM_E2E_OVERRIDE:-}" ]; then extra=(--env-file /dev/null -f "$AGENTSCM_E2E_OVERRIDE"); fi
-  docker compose -p "$project" -f compose.hub.yaml -f .github/compose.e2e.yaml "${extra[@]}" --profile "$profile" "$@"
+  if [ -n "${AGENTSCM_E2E_OVERRIDE:-}" ]; then
+    set -- --env-file /dev/null -f "$AGENTSCM_E2E_OVERRIDE" --profile "$profile" "$@"
+  else
+    set -- --profile "$profile" "$@"
+  fi
+  docker compose -p "$project" -f compose.hub.yaml -f .github/compose.e2e.yaml "$@"
 }
 health_url=http://127.0.0.1:7332/v1/hub/health
 refresh_endpoint() {
