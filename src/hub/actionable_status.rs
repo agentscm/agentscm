@@ -15,6 +15,9 @@ use crate::hub::work_reconciliation::ReconciliationView;
 use crate::hub::work_transition::{OperationalSelect, WorkLifecycleReader};
 use crate::hub::{HubError, Result};
 
+#[path = "actionable_checks.rs"]
+mod checks;
+pub use checks::{check_cleared, merge_blocked_after_stop};
 #[path = "actionable_conflicts.rs"]
 mod conflicts;
 
@@ -436,8 +439,6 @@ fn read_scoped(
     if requests.retention_gap {
         limits.insert("request_history_gap".to_owned());
     }
-    // This producer remains a separate issue slice, never inferred from Work checkpoint prose.
-    limits.insert("failed_check_attention_not_integrated".to_owned());
     // A recent capacity refusal here means some agent writes never landed. It is the
     // operator's to fix (Health and admin pages), so it limits coverage and is no one's action.
     for refusal in store.capacity_refusals(now)? {
@@ -568,6 +569,10 @@ fn read_scoped(
         conflicts::read(store, principal, now)?;
     actions.extend(conflicts);
     limits.extend(conflict_limits);
+    let (checks, check_limits, check_evidence_digest) =
+        checks::read(store, principal, &items, now)?;
+    actions.extend(checks);
+    limits.extend(check_limits);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -656,6 +661,7 @@ fn read_scoped(
         requests,
         complete_action_digest,
         conflict_evidence_digest,
+        check_evidence_digest,
     ))
     .expect("status serializes")]);
     Ok(result)
@@ -1242,6 +1248,376 @@ mod tests {
             "an arbitrary empty credential never confers person authority"
         );
     }
+    /// #291 from a real store: failed required checks on open pull requests at their observed
+    /// head, and a pr-gate run whose Stop hook blocks after its agent stopped. Other people's
+    /// failures, older heads, other contexts and a gate whose agent is still live never count.
+    fn checks_contract(store: &dyn Store) {
+        use crate::hub::connection::NewConnection;
+        use crate::hub::session::SessionCall;
+        use crate::hub::skills::{EvidenceRow, run_id_of};
+        let now = crate::hub::store::unix_now();
+        let token = |user_id: i64, login: &str| {
+            let user = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap();
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, login, "acme/widgets", 101, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let viewer = token(401, "viewer");
+        let other = token(402, "other");
+        let start = |who: &Principal, title: &str, branch: &str| {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": title, "title": title, "session": format!("{title}-session"),
+                "scope": [format!("src/{branch}.rs")], "branch": branch
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap().item
+        };
+        let checked = start(&viewer, "Viewer's checked work", "feature/v");
+        let gated = start(&viewer, "Viewer's gated work", "feature/g");
+        start(&other, "Other's live gate", "feature/live");
+        let connection = store
+            .insert_connection(
+                &NewConnection {
+                    id: format!("con_{}", "f".repeat(32)),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("viewer".into()),
+                },
+                &viewer.owner.id,
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        let sha = |c: char| c.to_string().repeat(40);
+        let base = sha('b');
+        let observe = |kind: &str, key: &str, value: serde_json::Value| {
+            store
+                .observe(&repo.id, kind, key, &value.to_string(), now * 1000)
+                .unwrap();
+        };
+        let pull = |number: i64, login: &str, id: i64, branch: &str, head: &str| {
+            observe(
+                "pull_request",
+                &number.to_string(),
+                json!({"number":number,"state":"open","head_ref":branch,"head_sha":head,
+                    "base_sha":base,"author":{"login":login,"id":id},"files":[],"files_truncated":false,
+                    "html_url":format!("https://github.com/acme/widgets/pull/{number}")}),
+            );
+        };
+        let statuses = |number: i64, head: &str, items: serde_json::Value| {
+            observe(
+                "provider_context",
+                &number.to_string(),
+                json!({"version":1,"provider":"github","repository_id":101,"number":number,
+                    "head_sha":head,"base_sha":base,
+                    "commit_statuses":{"availability":"available","complete":true,"items":items}}),
+            );
+        };
+        let status = |name: &str, state: &str, at: &str| json!({"name":name,"state":state,"head_relation":"same","provider_updated_at":at});
+        observe(
+            "provider_context",
+            "_health",
+            json!({"availability":"available","invalidated_through":0,
+                "permissions":{"pull_requests":"available","checks":"available","statuses":"available"}}),
+        );
+        // The viewer's own pull request: local validation failed after an earlier success.
+        pull(5, "viewer", 401, "feature/v", &sha('5'));
+        statuses(
+            5,
+            &sha('5'),
+            json!([
+                status(
+                    "agentscm/local-validation",
+                    "failure",
+                    "2026-11-05T10:00:00Z"
+                ),
+                status(
+                    "agentscm/local-validation",
+                    "success",
+                    "2026-11-05T09:00:00Z"
+                ),
+                status("ci/unrelated", "failure", "2026-11-05T10:00:00Z")
+            ]),
+        );
+        // Another person's failed Hub check counts for them, not the viewer.
+        pull(6, "other", 402, "feature/o", &sha('6'));
+        statuses(
+            6,
+            &sha('6'),
+            json!([status(
+                "agentscm/workflow/main",
+                "error",
+                "2026-11-05T10:00:00Z"
+            )]),
+        );
+        // A failure recorded for an older head is not current evidence.
+        pull(7, "viewer", 401, "feature/x", &sha('7'));
+        statuses(
+            7,
+            &sha('8'),
+            json!([status(
+                "agentscm/local-validation",
+                "failure",
+                "2026-11-05T10:00:00Z"
+            )]),
+        );
+        // A newer success replaces an earlier failure.
+        pull(9, "viewer", 401, "feature/y", &sha('9'));
+        statuses(
+            9,
+            &sha('9'),
+            json!([
+                status("agentscm/workflow/main", "success", "2026-11-05T10:00:00Z"),
+                status("agentscm/workflow/main", "failure", "2026-11-05T09:00:00Z")
+            ]),
+        );
+        // Pull requests the Hub opened have a bot author; the publication names their person,
+        // but only when its recorded URL is this pull request's, not a same-named one elsewhere.
+        for (number, url) in [
+            (10, "https://github.com/acme/widgets/pull/10"),
+            (
+                11,
+                "https://gitlab.example/acme/widgets/-/merge_requests/11",
+            ),
+        ] {
+            let branch = format!("feature/hub-{number}");
+            pull(number, "agentscm-bot", 999, &branch, &sha('c'));
+            statuses(
+                number,
+                &sha('c'),
+                json!([status(
+                    "agentscm/local-validation",
+                    "failure",
+                    "2026-11-05T10:00:00Z"
+                )]),
+            );
+            let commit = sha('d');
+            let id =
+                crate::hub::publish::derive_id("acme/widgets", number as u64, &commit, &branch);
+            let manifest = serde_json::from_value(json!({
+                "revision": "a".repeat(64), "event_seq": number, "commit": commit,
+                "tree": sha('e'), "parent": sha('f'), "branch": branch, "base": "main",
+                "title": "Synthetic publication", "body": "", "message": "message\n",
+                "author": {"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+                "committer": {"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+                "changes": [{"path":"src/a.rs","mode":"100644","blob":sha('9'),
+                    "sha256":"f".repeat(64),"size":5}]
+            }))
+            .unwrap();
+            assert!(matches!(
+                store
+                    .create_publication(
+                        &viewer.token_id,
+                        &crate::hub::publish::NewPublication {
+                            id: id.clone(),
+                            manifest
+                        },
+                        now
+                    )
+                    .unwrap(),
+                crate::hub::publish::Create::Done(_)
+            ));
+            use crate::hub::publish::Update;
+            for update in [
+                Update::BranchAttempt,
+                Update::BranchCreated,
+                Update::PullRequest {
+                    number,
+                    node_id: format!("PR_{number}"),
+                    html_url: url.into(),
+                },
+            ] {
+                store.update_publication(&id, &update, now).unwrap();
+            }
+        }
+        let entry = crate::skill_workflow::supported::catalog()
+            .iter()
+            .find(|e| e.name == "pr-gate")
+            .unwrap();
+        store
+            .touch_session(
+                &other.token_id,
+                &SessionCall {
+                    session: Some("live-session".into()),
+                    via: "mcp".into(),
+                    task: None,
+                    paths: vec![],
+                    deny: false,
+                    report: false,
+                },
+                now,
+            )
+            .unwrap();
+        for (who, branch, session, n) in [
+            (&viewer, "feature/g", "stopped-session", 1),
+            (&other, "feature/live", "live-session", 2),
+        ] {
+            store
+                .skill_evidence_add(&EvidenceRow {
+                    id: format!("evd_{n}"),
+                    repository: "acme/widgets".into(),
+                    branch: branch.into(),
+                    run_id: run_id_of("acme/widgets", branch, "pr-gate"),
+                    skill: "pr-gate".into(),
+                    skill_sha256: entry.sha256.clone(),
+                    gate: "branch".into(),
+                    kind: "task_branch".into(),
+                    head_sha: sha('a'),
+                    assurance: "self_reported".into(),
+                    summary: "Synthetic task branch".into(),
+                    url: None,
+                    pull_request: None,
+                    detail: None,
+                    token_id: who.token_id.clone(),
+                    session: session.into(),
+                    agent: who.owner.login.clone(),
+                    recorded_at: now,
+                })
+                .unwrap();
+        }
+        let status = read(store, &viewer, now).unwrap();
+        let mut personal = status
+            .actions
+            .iter()
+            .filter(|a| a.needs_you)
+            .map(|a| (a.kind.as_str(), a.id.clone(), a.work_ids.clone()))
+            .collect::<Vec<_>>();
+        personal.sort();
+        assert_eq!(
+            personal,
+            [
+                (
+                    "failed_check",
+                    format!("check:{}:10:agentscm/local-validation", repo.id),
+                    vec![]
+                ),
+                (
+                    "failed_check",
+                    format!("check:{}:5:agentscm/local-validation", repo.id),
+                    vec![checked.id.clone()]
+                ),
+                (
+                    "skill_gate",
+                    format!(
+                        "gate:{}:tests",
+                        run_id_of("acme/widgets", "feature/g", "pr-gate")
+                    ),
+                    vec![gated.id.clone()]
+                ),
+            ]
+        );
+        let others = status
+            .actions
+            .iter()
+            .filter(|a| a.kind == "failed_check" && !a.needs_you)
+            .map(|a| (a.id.clone(), a.recipients.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(others.len(), 2, "{others:?}");
+        let recipients = |number: i64| {
+            let id = format!("check:{}:{number}:", repo.id);
+            others
+                .iter()
+                .find(|(a, _)| a.starts_with(&id))
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(recipients(6)[0].login.as_deref(), Some("other"));
+        assert!(
+            recipients(11).is_empty(),
+            "a publication for another forge's pull request names nobody here"
+        );
+        assert!(
+            status
+                .limits
+                .contains(&"check_recipient_unknown".to_owned())
+        );
+        assert!(
+            !status
+                .actions
+                .iter()
+                .any(|a| a.id.contains("feature/live") || a.id.contains(":7:"))
+        );
+        assert!(
+            status
+                .limits
+                .contains(&"check_evidence_unavailable".to_owned()),
+            "the older-head snapshot leaves check coverage incomplete"
+        );
+        assert!(!status.limits.iter().any(|l| l.starts_with("failed_check")));
+        // Slack waits until the failure blocks a merge after its agent stopped.
+        let check = status
+            .actions
+            .iter()
+            .find(|a| a.kind == "failed_check" && a.needs_you && !a.work_ids.is_empty())
+            .unwrap();
+        assert!(!merge_blocked_after_stop(&status, check));
+        let gate = status
+            .actions
+            .iter()
+            .find(|a| a.kind == "skill_gate")
+            .unwrap();
+        assert!(merge_blocked_after_stop(&status, gate));
+        assert!(!check_cleared(&status, &check.id));
+        let later = read(
+            store,
+            &viewer,
+            now + crate::hub::work::CLAIM_STALE_SECONDS + 60,
+        )
+        .unwrap();
+        let check = later.actions.iter().find(|a| a.id == check.id).unwrap();
+        assert!(
+            merge_blocked_after_stop(&later, check),
+            "its Work's lead went quiet"
+        );
+        let theirs = read(store, &other, now).unwrap();
+        assert_eq!(
+            theirs
+                .actions
+                .iter()
+                .filter(|a| a.needs_you)
+                .map(|a| a.id.clone())
+                .collect::<Vec<_>>(),
+            [format!("check:{}:6:agentscm/workflow/main", repo.id)],
+            "the other person's failed Hub check counts for them"
+        );
+    }
+
+    #[test]
+    fn sqlite_failed_checks_and_stopped_gates_reach_their_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        checks_contract(&*store);
+    }
+
     /// What every surface counts, without ids, digests or read times.
     fn attention_signature(status: &ActionableStatus) -> Vec<String> {
         let login = |r: &StatusRecipient| r.login.clone().unwrap_or_default();
@@ -1444,6 +1820,10 @@ mod tests {
     }
 
     #[test]
+    fn needs_you_counts_match_the_shared_fixture_on_postgres() {
+        on_postgres(needs_you_contract);
+    }
+    #[test]
     fn sqlite_status_reader_is_scoped_deterministic_and_reports_limits() {
         let dir = tempfile::tempdir().unwrap();
         let store = store::open(&format!(
@@ -1553,8 +1933,8 @@ mod tests {
         on_postgres(store_contract);
     }
     #[test]
-    fn needs_you_counts_match_the_shared_fixture_on_postgres() {
-        on_postgres(needs_you_contract);
+    fn failed_checks_and_stopped_gates_reach_their_owner_on_postgres() {
+        on_postgres(checks_contract);
     }
     /// Runs one contract in its own disposable schema.
     fn on_postgres(contract: fn(&dyn Store)) {

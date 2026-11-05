@@ -668,13 +668,16 @@ async fn repositories_for_owner(
                 .repository_events(&scope, None, 1)?
                 .first()
                 .map(|row| row.event.at);
-            let status = super::super::work_http::actionable_status::read_person(
-                &*store,
-                &owner,
-                &repo.full_name,
-                repo.repository_id,
-                now,
-            )?;
+            let status = super::super::viewer::shown(
+                super::super::work_http::actionable_status::read_person(
+                    &*store,
+                    &owner,
+                    &repo.full_name,
+                    repo.repository_id,
+                    now,
+                )?,
+                &owner.id,
+            );
             let facts = Facts {
                 status,
                 live_complete: intents.len() <= LIST_LIVE_LIMIT
@@ -734,8 +737,12 @@ async fn repositories_for_owner(
                     .iter()
                     .take(PANEL_LIVE_LIMIT)
                     .map(|session| {
+                        // A session row names its owner by login, one person on this forge host.
                         json!({
-                            "agent": session.agent,
+                            "agent": super::super::viewer::shown_label(
+                                session.agent.clone(),
+                                session.owner == owner.login,
+                            ),
                             "task": session.task,
                             "source": "session",
                         })
@@ -749,7 +756,10 @@ async fn repositories_for_owner(
                         .take(PANEL_LIVE_LIMIT.saturating_sub(live.len()))
                         .map(|intent| {
                             json!({
-                                "agent": intent.agent,
+                                "agent": super::super::viewer::shown_label(
+                                    intent.agent.clone(),
+                                    intent.owner.id == owner.id,
+                                ),
                                 "task": intent.task,
                                 "source": "intent",
                             })

@@ -255,8 +255,7 @@
   "complete": false,
   "atomic_snapshot": false,
   "limits": [
-    "capacity_attention_not_integrated",
-    "failed_check_attention_not_integrated"
+    "check_evidence_unavailable"
   ],
   "digest": "2222222222222222222222222222222222222222222222222222222222222222"
 }

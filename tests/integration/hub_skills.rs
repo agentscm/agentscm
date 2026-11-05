@@ -798,3 +798,47 @@ async fn value_metrics_unbound_review_resolution_keeps_original_episode_generati
     assert_eq!(issue["state"], "resolved");
     assert_eq!(issue["applicability"], "current");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_owner_reads_evidence_by_session_digest_and_masked_label() {
+    let hub = Hub::start().await;
+    hub.adopt();
+    let owner = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 2,
+            },
+            "bob",
+        )
+        .unwrap();
+    let mint = |name: &str| {
+        mint_bound_agent_token(&*hub.store, &owner.id, name, REPO, 1, 600, true)
+            .unwrap()
+            .1
+            .expose()
+            .to_owned()
+    };
+    let bob = mint("client-bobs-desktop-5e6f7a8b");
+    let (status, _) = hub
+        .record("alice-native-session", "branch", "task_branch", H1)
+        .await;
+    assert_eq!(status, 200);
+    let path = format!("{REPO_PATH}/runs/by-branch?branch=feat%2Fx");
+    let (_, own) = hub.send(Method::GET, &path, &hub.reader, None).await;
+    let evidence = &own["gates"][0]["evidence"][0];
+    assert_eq!(
+        (&evidence["session"], &evidence["agent"]),
+        (&json!("alice-native-session"), &json!("writer"))
+    );
+    let (_, other) = hub.send(Method::GET, &path, &bob, None).await;
+    let seen = &other["gates"][0]["evidence"][0];
+    assert!(
+        !other.to_string().contains("alice-native-session"),
+        "{other}"
+    );
+    assert_eq!(seen["session"].as_str().map(str::len), Some(16), "{other}");
+    assert_eq!(seen["agent"], "writer");
+}
