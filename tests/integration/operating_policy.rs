@@ -2834,6 +2834,7 @@ fn reconciliation_distinguishes_absent_workflow_from_pending_or_incomplete_runti
             .work_start(
                 &hub.token_id,
                 &WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: Some(dispatch.run_id.clone()),

@@ -72,6 +72,7 @@ fn setup(db: &Db) -> (Arc<dyn Store>, String, String, i64) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some(format!("change-record-test-{setup_id}")),
@@ -297,6 +298,7 @@ fn action_capture_receipt(db: &Db) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -423,6 +425,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
         .work_start(
             &helper,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -583,6 +586,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -795,6 +799,7 @@ fn capture_survives_pause_and_stops_at_end_of_claim(fresh: &dyn Fn() -> Db) {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.clone()),
                 source: None,
                 request_key: None,
@@ -921,6 +926,7 @@ fn join_session(store: &dyn Store, token: &str, work_id: &str, session: &str) {
         .work_start(
             token,
             &WorkStart {
+                issue_choice: None,
                 work_id: Some(work_id.into()),
                 source: None,
                 request_key: None,
@@ -1167,6 +1173,7 @@ fn capture_target_prefers_active_then_lead(fresh: &dyn Fn() -> Db) {
             .work_start(
                 &other,
                 &WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: Some(format!("ambiguity-{session}")),

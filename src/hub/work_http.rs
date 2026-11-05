@@ -58,6 +58,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
         .route("/v1/hub/standup/work/{id}/pr-link", get(pr_link))
         .route("/v1/hub/standup/pr-link", post(set_pr_link))
+        .route("/v1/hub/standup/issue-link", post(set_issue_link))
         .route("/v1/hub/standup/work/{id}/declarations", get(declarations))
         .route("/v1/hub/standup/declarations", post(set_declarations))
         .route(
@@ -151,6 +152,22 @@ async fn set_pr_link(
         blocking(&state, move || {
             store
                 .work_pr_link_set(&principal.token_id, &request, unix_now())
+                .map(|result| shown(result, &principal.owner.id))
+        })
+        .await?,
+    ))
+}
+
+async fn set_issue_link(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    JsonBody(request): JsonBody<super::work_issues::WorkIssueLinkUpdate>,
+) -> Result<Json<WorkCheckpointResult>, ApiError> {
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store
+                .work_issue_link_set(&principal.token_id, &request, unix_now())
                 .map(|result| shown(result, &principal.owner.id))
         })
         .await?,
