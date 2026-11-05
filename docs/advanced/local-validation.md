@@ -61,6 +61,16 @@ Only one attestation runs at a time for a user account on a machine, across work
 
 When the recipe does not pass, the script posts nothing and exits 1. It prints where `run` kept the signed failure record and envelope in the state directory, which commands failed with the paths of their retained `<sha>.cmd<N>.stdout` and `.stderr` output, and the `local-validation show` command that renders the summary.
 
+A new worktree per pull request has no `target/`, so every attestation compiles the workspace and its test binaries from scratch. To reuse build output, keep one dedicated validation checkout and move it to each pushed head of a same-repository pull request:
+
+```sh
+git fetch origin <BRANCH>
+git checkout --detach FETCH_HEAD
+tools/attest-pr.sh <PR_NUMBER>
+```
+
+Pass the PR number: a detached checkout has no branch for the script to look up the pull request from. The script and `run` treat a checkout as clean when Git reports no modified or untracked files; ignored files such as `target/` do not count. Later runs reuse the compiled dependencies and rebuild only crates whose inputs changed. `npm ci` deletes `node_modules` on every run, so the UI and docs steps gain nothing. `CARGO_TARGET_DIR` is on the environment allowlist, so a cache directory shared between checkouts also reaches the recipe's Cargo commands. The attestation does not record which directory was used. Reused output carries files written by earlier pull requests' build scripts and tests, and can hide a problem that only a clean build shows. Delete `target/`, or the `CARGO_TARGET_DIR` directory, before an attestation that needs to show a clean build. A warm cache does not make fork code safe to run: never attest it on a signing host.
+
 The manual equivalent follows. This example uses the enrolled `boorad` issuer and conventional key location; set `AGENTSCM_LV_DIR` to another absolute private directory when needed. It requires an installed compatible `agentscm`, `gh`, `jq`, the recipe's tools and the service variables already exported. The example never prints private key bytes. Missing prerequisites, services, a dirty checkout or an unpushed head stop the example rather than silently skipping attestation.
 
 ```sh
