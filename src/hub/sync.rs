@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -2534,13 +2534,18 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
     manifest
 }
 
-/// The page that posts the app manifest to GitHub. The state in the URL is the capability.
+/// The page that shows who will own the app and what it is called, then posts the
+/// manifest to GitHub when the person clicks Continue. The state in the URL is the
+/// capability. `owner` and `name` in the query replace the defaults for this view only
+/// (an empty `owner` means the signed-in personal account); they are checked as
+/// `begin_setup` checks them and the callback never reads them back.
 async fn setup_page(
     State(state): State<HubState>,
     Path(secret): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> ApiResult<Response> {
     let (config, _) = state.sync.configured()?;
-    let (name, org, connection) = {
+    let (mut name, mut org, connection) = {
         let setups = lock(&state.sync.setups);
         let setup = setups
             .get(&secret, unix_now())
@@ -2551,22 +2556,50 @@ async fn setup_page(
             setup.connection.clone(),
         )
     };
+    if let Some(owner) = params.get("owner") {
+        org = Some(owner.trim().to_owned()).filter(|owner| !owner.is_empty());
+    }
+    if let Some(chosen) = params
+        .get("name")
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty())
+    {
+        name = chosen.to_owned();
+    }
+    if !simple(&name, b" -_", 34) || org.as_deref().is_some_and(|org| !simple(org, b"-", 39)) {
+        return Err(ApiError::invalid());
+    }
     let public = check_base_url(&config.public_url).map_err(|_| ApiError::invalid())?;
     let manifest = manifest(&name, &public, &connection);
-    let target = match org {
-        Some(org) => format!(
-            "{}/organizations/{org}/settings/apps/new?state={secret}",
-            config.web
+    let (target, owner) = match &org {
+        Some(org) => (
+            format!(
+                "{}/organizations/{org}/settings/apps/new?state={secret}",
+                config.web
+            ),
+            format!("the {} organization", escape(org)),
         ),
-        None => format!("{}/settings/apps/new?state={secret}", config.web),
+        None => (
+            format!("{}/settings/apps/new?state={secret}", config.web),
+            "your personal GitHub account (the one you are signed in to)".into(),
+        ),
     };
+    // No script: the form needs none, and the page's policy allows posting it to GitHub.
     Ok(page(Html(format!(
         "<!doctype html><meta charset=utf-8><title>Create the GitHub App</title>\
-         <form method=post action=\"{}\"><input type=hidden name=manifest value=\"{}\">\
-         <noscript><button>Continue to GitHub</button></noscript></form>\
-         <script>document.forms[0].submit()</script>",
-        escape(&target),
-        escape(&manifest.to_string())
+         <h1>Create the GitHub App</h1>\
+         <p>This creates a GitHub App named <b>{name}</b> owned by {owner}.</p>\
+         <form method=post action=\"{target}\"><input type=hidden name=manifest value=\"{manifest}\">\
+         <button>Continue to GitHub</button></form>\
+         <h2>Wrong owner or name?</h2>\
+         <form method=get><label>Organization (leave empty for your personal account) \
+         <input name=owner value=\"{org}\" maxlength=39></label><br>\
+         <label>App name <input name=name value=\"{name}\" maxlength=34></label><br>\
+         <button>Update</button></form>",
+        name = escape(&name),
+        target = escape(&target),
+        manifest = escape(&manifest.to_string()),
+        org = escape(org.as_deref().unwrap_or_default()),
     ))))
 }
 
