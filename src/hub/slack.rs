@@ -899,18 +899,17 @@ impl Slack {
                     continue;
                 }
                 // The label alone cannot say which session: another of the repeater's own token
-                // would read as itself, and several of one token would read alike.
-                let several = holding
-                    .iter()
-                    .filter(|other| {
-                        other.token == intent.token
-                            && other.session.is_some()
-                            && paths.iter().any(|path| {
-                                other.paths.iter().any(|spec| overlaps(path, key_of(spec)))
-                            })
-                    })
-                    .count()
-                    > 1;
+                // would read as itself, and distinct agents of one token would read alike.
+                use crate::hub::session::same_agent;
+                let several = holding.iter().any(|other| {
+                    other.id != intent.id
+                        && other.token == intent.token
+                        && other.session.is_some()
+                        && !same_agent(&intent.token, &intent.via, other)
+                        && paths
+                            .iter()
+                            .any(|path| other.paths.iter().any(|spec| overlaps(path, key_of(spec))))
+                });
                 let session_name = intent
                     .session
                     .as_deref()

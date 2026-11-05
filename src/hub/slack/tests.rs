@@ -508,7 +508,9 @@ async fn two_holder_sessions_of_one_token_message_their_person_once() {
     f.edit(&f.alice, "c");
     f.run().await;
     let before = f.sent().len();
-    assert!(!f.edit(&f.bob, "b").denied.is_empty());
+    let refused = f.edit(&f.bob, "b");
+    assert!(!refused.denied.is_empty());
+    let asked = refused.requested[0].1.session.clone().unwrap();
     assert!(!f.edit(&f.bob, "b").repeated.is_empty());
     f.run().await;
     let sent = f.sent();
@@ -519,13 +521,21 @@ async fn two_holder_sessions_of_one_token_message_their_person_once() {
     assert_eq!(holder.len(), 1, "{sent:?}");
     // Two sessions of one token read alike by label, so each side names them.
     let key = |session: &str| crate::hub::store::session_key(&f.alice, session)[..8].to_owned();
-    let (a, c) = (key("a"), key("c"));
+    let other = if asked == "a" { "c" } else { "a" };
     assert!(
-        holder[0].1.contains("Your agent: Claude Code session "),
+        holder[0]
+            .1
+            .contains(&format!("Your agent: Claude Code session {}", key(&asked)))
+            && !holder[0].1.contains(&key(other)),
         "{sent:?}"
     );
+    let repeater = sent[before..]
+        .iter()
+        .find(|(user, _)| user == "U2")
+        .map(|(_, text)| text.as_str())
+        .unwrap();
     assert!(
-        holder[0].1.contains(&a) || holder[0].1.contains(&c),
+        repeater.contains(&key("a")) && repeater.contains(&key("c")),
         "{sent:?}"
     );
     // The one button answers for the session the request was filed against.
@@ -533,6 +543,40 @@ async fn two_holder_sessions_of_one_token_message_their_person_once() {
     assert_eq!(
         f.update().await["blocks"][3]["elements"][0]["text"],
         "Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+    );
+}
+
+/// An MCP-only session may be the same agent as a hook session of its token: one agent, one name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holders_hook_and_mcp_sessions_keep_the_single_agent_wording() {
+    let f = Fixture::new().await;
+    let mcp = SessionCall {
+        session: Some("m".into()),
+        via: "mcp".into(),
+        task: None,
+        paths: vec![PATH.into()],
+        deny: false,
+        report: false,
+    };
+    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &mcp, unix_now())).unwrap();
+    f.edit(&f.alice, "a");
+    f.run().await;
+    let before = f.sent().len();
+    assert!(!f.edit(&f.bob, "b").denied.is_empty());
+    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    let sent = f.sent();
+    assert!(
+        sent[before..]
+            .iter()
+            .any(|(user, text)| user == "U1" && text.contains("which your Claude Code holds")),
+        "{sent:?}"
+    );
+    assert!(
+        sent[before..]
+            .iter()
+            .all(|(_, text)| !text.contains(" session ")),
+        "{sent:?}"
     );
 }
 

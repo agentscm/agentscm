@@ -105,7 +105,7 @@ pub(super) fn reclaimed_hold(item: &WorkItem, expired: i64) -> ReclaimedHold {
         notice: format!(
             "AgentSCM: this admission took the scope of {id}, whose hold lapsed at Unix {expired}. Its lead agent {agent} may have edits on {branch} that it never pushed: check with that agent or its owner before you change the same files.",
             id = item.id,
-            agent = item.lead_agent,
+            agent = super::advice::agent_name(&item.lead_agent),
         ),
     }
 }
