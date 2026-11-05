@@ -109,9 +109,41 @@ fn existing(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 fn write(path: &Path, text: &str) -> io::Result<()> {
-    let mut file = open(path)?;
+    atomic_write(path, text, |_| Ok(()))
+}
+fn atomic_write(
+    path: &Path,
+    text: &str,
+    before_publish: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // Validate an existing destination without following symlinks. Only metadata is renamed;
+    // the stable .job inode carrying the inherited lock is never replaced.
+    match existing(path) {
+        Ok(_) => (),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    let temporary = path.with_file_name(format!(
+        "{}.next",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let mut file = open(&temporary)?;
     file.set_len(0)?;
-    file.write_all(text.as_bytes())
+    file.write_all(text.as_bytes())?;
+    before_publish(&temporary)?;
+    fs::rename(temporary, path)
+}
+fn metadata_path(path: &Path) -> PathBuf {
+    path.with_extension("meta")
+}
+fn remove_job(path: &Path) -> io::Result<()> {
+    let _ = fs::remove_file(path.with_extension("meta.next"));
+    match fs::remove_file(metadata_path(path)) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    fs::remove_file(path)
 }
 fn bounded(command: &mut Command) -> io::Result<String> {
     let mut child = command
@@ -184,7 +216,11 @@ fn validate_job(text: &str) -> io::Result<()> {
     Ok(())
 }
 fn recorded_group(path: &Path) -> io::Result<Option<u32>> {
-    let text = read(path)?;
+    let text = match read(&metadata_path(path)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     validate_job(&text)?;
     let field = text
         .lines()
@@ -288,15 +324,16 @@ fn status(root: &Path) -> io::Result<()> {
     guard.lock()?;
     let mut count = 0;
     for path in entries(root)? {
-        let text = read(&path)?;
+        let file = existing(&path)?;
+        let idle = file.try_lock().is_ok();
+        let pid = recorded_group(&path)?;
+        if idle && !pid.is_some_and(|p| group_alive(p).unwrap_or(true)) {
+            continue;
+        }
+        let text = read(&metadata_path(&path))?;
         let fields = text.lines().collect::<Vec<_>>();
         if fields.len() != 5 || !["attestation", "focused", "other"].contains(&fields[1]) {
             return Err(io::Error::other("malformed job metadata"));
-        }
-        let pid = recorded_group(&path)?;
-        let file = existing(&path)?;
-        if file.try_lock().is_ok() && !pid.is_some_and(|p| group_alive(p).unwrap_or(true)) {
-            continue;
         }
         count += 1;
         let since: u64 = fields[3].parse().map_err(io::Error::other)?;
@@ -329,7 +366,7 @@ fn remove_idle(root: &Path, own: &Path) -> io::Result<Vec<PathBuf>> {
         if file.try_lock().is_ok()
             && !recorded_group(&path)?.is_some_and(|pid| group_alive(pid).unwrap_or(true))
         {
-            fs::remove_file(path)?;
+            remove_job(&path)?;
         } else {
             active.push(path);
         }
@@ -375,6 +412,7 @@ fn legacy_ready(root: &Path, own: &Path, legacy: &Path) -> io::Result<bool> {
     {
         // A new supervisor died between mkdir and PID publication. All participants must
         // have upgraded: an old wrapper has no recoverable registration for this crash gap.
+        let _ = fs::remove_file(legacy.join("pid.next"));
         fs::remove_dir(legacy)?;
     }
     write(&intent, &own.file_name().unwrap().to_string_lossy())?;
@@ -394,6 +432,7 @@ fn legacy_ready(root: &Path, own: &Path, legacy: &Path) -> io::Result<bool> {
                 && io::Error::last_os_error().raw_os_error() == Some(3)
             {
                 fs::remove_file(legacy.join("pid"))?;
+                let _ = fs::remove_file(legacy.join("pid.next"));
                 fs::remove_dir(legacy)?;
             }
             Ok(false)
@@ -404,6 +443,7 @@ fn legacy_ready(root: &Path, own: &Path, legacy: &Path) -> io::Result<bool> {
 fn release_legacy(legacy: &Path) -> io::Result<()> {
     if read(&legacy.join("pid")).ok().as_deref() == Some(&process::id().to_string()) {
         fs::remove_file(legacy.join("pid"))?;
+        let _ = fs::remove_file(legacy.join("pid.next"));
         fs::remove_dir(legacy)?;
     }
     Ok(())
@@ -439,7 +479,7 @@ fn run(root: &Path, legacy: &Path, kind: &str, args: &[std::ffi::OsString]) -> i
     counter.write_all(next.to_string().as_bytes())?;
     fs::rename(root.join("sequence.next"), sequence)?;
     let path = root.join(format!("{next:020}.job"));
-    let mut slot = OpenOptions::new()
+    let slot = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -448,7 +488,7 @@ fn run(root: &Path, legacy: &Path, kind: &str, args: &[std::ffi::OsString]) -> i
     slot.lock()?;
     let repo = env::current_dir()?;
     let metadata = format!("0\n{kind}\n{:?}\n{}\nnone\n", repo, now());
-    slot.write_all(metadata.as_bytes())?;
+    write(&metadata_path(&path), &metadata)?;
     drop(guard);
     eprintln!("attest-pr: queued job {next}");
     let mut position = 0;
@@ -465,22 +505,25 @@ fn run(root: &Path, legacy: &Path, kind: &str, args: &[std::ffi::OsString]) -> i
             position = current;
         }
         if SIGNAL.load(Ordering::Relaxed) != 0 {
-            fs::remove_file(&path)?;
+            remove_job(&path)?;
             return Ok(128 + SIGNAL.load(Ordering::Relaxed));
         }
         if current == 1 {
             match resources(&repo) {
                 Ok(()) => {
-                    write(&path, &metadata)?;
+                    write(&metadata_path(&path), &metadata)?;
                     if legacy_ready(root, &path, legacy)? {
                         break;
                     }
-                    write(&path, &metadata.replace("\nnone\n", "\nlegacy holder\n"))?;
+                    write(
+                        &metadata_path(&path),
+                        &metadata.replace("\nnone\n", "\nlegacy holder\n"),
+                    )?;
                 }
                 Err(error) => {
                     let reason = format!("{error:?}");
                     write(
-                        &path,
+                        &metadata_path(&path),
                         &metadata.replace("\nnone\n", &format!("\n{reason}\n")),
                     )?;
                 }
@@ -508,17 +551,10 @@ fn run(root: &Path, legacy: &Path, kind: &str, args: &[std::ffi::OsString]) -> i
         .process_group(0)
         .spawn()?;
     let pid = child.id();
-    // The launcher writes through the same open file description; do not overwrite it here.
-    slot.flush()?;
+    // The launcher publishes command identity before executing work.
     eprintln!("attest-pr: running job {next}");
     let status = loop {
-        let received = SIGNAL.swap(0, Ordering::Relaxed);
-        if received != 0 {
-            // SAFETY: a negative child PID addresses the dedicated command process group.
-            unsafe {
-                kill(-(pid as i32), received);
-            }
-        }
+        forward_signal(pid);
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -527,29 +563,50 @@ fn run(root: &Path, legacy: &Path, kind: &str, args: &[std::ffi::OsString]) -> i
     drop(slot);
     // Descendants may close inherited descriptors. Process-group liveness is an additional
     // conservative fence. Escaping the group and closing the descriptor is unsupported.
-    while group_alive(pid)? {
-        pause();
+    loop {
+        forward_signal(pid);
+        if group_alive(pid)? {
+            pause();
+            continue;
+        }
+        let probe = open(&path)?;
+        if probe.try_lock().is_err() {
+            pause();
+            continue;
+        }
+        let _guard = mutex(root)?;
+        // Recheck both fences under the mutex, without waiting while holding it.
+        if group_alive(pid)? {
+            continue;
+        }
+        remove_job(&path)?;
+        release_legacy(legacy)?;
+        break;
     }
-    let guard = mutex(root)?;
-    let probe = open(&path)?;
-    while probe.try_lock().is_err() {
-        pause();
-    }
-    fs::remove_file(&path)?;
-    release_legacy(legacy)?;
-    drop(guard);
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
 }
-fn main() {
-    // SAFETY: the handler only stores an atomic integer and never touches allocation or IO.
-    for value in [1, 2, 15] {
+fn forward_signal(pid: u32) {
+    let received = SIGNAL.swap(0, Ordering::Relaxed);
+    if received != 0 {
+        // SAFETY: the negative command PID addresses its dedicated process group.
         unsafe {
-            signal(value, interrupted);
+            kill(-(pid as i32), received);
         }
     }
+}
+fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
+    // Launchers retain default dispositions, including during metadata publication and exec.
+    // SAFETY: the supervisor handler only stores an atomic integer.
+    if !args.first().is_some_and(|s| s == "--execute") {
+        for value in [1, 2, 15] {
+            unsafe {
+                signal(value, interrupted);
+            }
+        }
+    }
     if args.first().is_some_and(|s| s == "--execute") {
         if args.len() < 3 {
             process::exit(2);
@@ -560,11 +617,11 @@ fn main() {
                 path.parent()
                     .ok_or_else(|| io::Error::other("missing queue directory"))?,
             )?;
-            let text = read(path)?;
+            let text = read(&metadata_path(path))?;
             validate_job(&text)?;
             let fields = text.lines().collect::<Vec<_>>();
             write(
-                path,
+                &metadata_path(path),
                 &format!(
                     "{}\n{}\n{}\n{}\nnone\n",
                     process::id(),
@@ -692,6 +749,105 @@ mod tests {
     fn send(child: &process::Child, value: i32) {
         // SAFETY: the child PID is a live synthetic test process.
         assert_eq!(unsafe { kill(child.id() as i32, value) }, 0);
+    }
+    #[test]
+    fn interrupted_publication_retains_metadata_and_recovers_unpublished_slot() {
+        const CHILD_PATH: &str = "AGENTSCM_QUEUE_TEST_INTERRUPTED_WRITE";
+        if let Some(path) = env::var_os(CHILD_PATH) {
+            atomic_write(Path::new(&path), "replacement", |temporary| {
+                fs::write(temporary, "partial")?;
+                // SAFETY: terminate only this synthetic writer at the publication boundary.
+                unsafe {
+                    kill(process::id() as i32, 9);
+                }
+                unreachable!()
+            })
+            .unwrap();
+            unreachable!();
+        }
+        let f = Fixture::new();
+        let state = f.root.join("state");
+        fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        for name in ["00000000000000000001.meta", "legacy-owner", "pid"] {
+            let path = state.join(name);
+            write(&path, "previous").unwrap();
+            assert!(
+                atomic_write(&path, "replacement", |temporary| {
+                    // Deterministically stop after a partial temporary write, before rename.
+                    fs::write(temporary, "partial")?;
+                    Err(io::Error::other("injected publication failure"))
+                })
+                .is_err()
+            );
+            assert_eq!(read(&path).unwrap(), "previous");
+            let killed = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::interrupted_publication_retains_metadata_and_recovers_unpublished_slot",
+                ])
+                .env(CHILD_PATH, &path)
+                .status()
+                .unwrap();
+            assert_eq!(killed.signal(), Some(9));
+            assert_eq!(read(&path).unwrap(), "previous");
+        }
+        fs::remove_file(state.join("00000000000000000001.meta")).unwrap();
+        fs::remove_file(state.join("legacy-owner")).unwrap();
+        // SIGKILL before initial publication leaves only an unlocked slot and partial temp.
+        drop(open(&state.join("00000000000000000001.job")).unwrap());
+        write(&state.join("sequence"), "1").unwrap();
+        let next = f.root.join("next");
+        let mut child = f.start("touch \"$1\"", &[&next]);
+        f.wait(|| next.exists());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(f.ticket_count(), 0);
+    }
+    #[test]
+    fn descendant_drain_forwards_cancellation_after_direct_child_exits() {
+        let f = Fixture::new();
+        let started = f.root.join("started");
+        let mut first = f.start("sleep 30 & touch \"$1\"", &[&started]);
+        f.wait(|| started.exists());
+        thread::sleep(Duration::from_millis(1500));
+        send(&first, 15);
+        f.wait(|| f.ticket_count() == 0);
+        assert!(first.wait().unwrap().success());
+    }
+    #[test]
+    fn escaped_descriptor_drain_keeps_status_and_registration_available() {
+        let f = Fixture::new();
+        let started = f.root.join("started");
+        let release = f.root.join("release");
+        let next = f.root.join("next");
+        // Fork preserves the inherited slot descriptor; setsid escapes only the group fence.
+        let mut first = Command::new(&f.binary).arg("--run").arg(f.root.join("state")).arg(f.root.join("legacy")).arg("other").env("AGENTSCM_HEAVY_MIN_MEMORY_PERCENT", "0").env("AGENTSCM_HEAVY_MIN_DISK_BYTES", "0")
+            .args(["python3", "-c", "import os,sys,time; pid=os.fork();\nif pid: os._exit(0)\nos.setsid(); open(sys.argv[1],'w').close()\nwhile not os.path.exists(sys.argv[2]): time.sleep(.02)"])
+            .args([&started, &release]).spawn().unwrap();
+        f.wait(|| started.exists());
+        thread::sleep(Duration::from_millis(1500));
+        let mut second = f.start("touch \"$1\"", &[&next]);
+        f.wait(|| f.ticket_count() == 2);
+        let mut status = Command::new(&f.binary)
+            .arg("--queue")
+            .arg(f.root.join("state"))
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        loop {
+            if let Some(result) = status.try_wait().unwrap() {
+                assert!(result.success());
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!next.exists());
+        fs::write(release, "").unwrap();
+        f.wait(|| next.exists());
+        assert!(first.wait().unwrap().success());
+        assert!(second.wait().unwrap().success());
+        assert_eq!(f.ticket_count(), 0);
     }
     #[test]
     fn fifo_cancellation_status_and_argument_boundaries() {
@@ -824,7 +980,7 @@ mod tests {
         assert!(lines[1].starts_with("waiter 2 kind=focused waited="));
         assert!(lines[2].starts_with("waiter 3 kind=attestation waited="));
         assert!(text.contains("repo=\""));
-        let fields = read(&f.root.join("state/00000000000000000001.job")).unwrap();
+        let fields = read(&f.root.join("state/00000000000000000001.meta")).unwrap();
         let pid = fields.lines().next().unwrap();
         assert!(lines[0].contains(&format!(" pid={pid} ")));
         assert!(lines[1].contains(" pid=pending "));
@@ -889,7 +1045,7 @@ mod tests {
             );
             fs::write(&memory_release, "").unwrap();
             f.wait(|| {
-                read(&f.root.join("state/00000000000000000001.job"))
+                read(&f.root.join("state/00000000000000000001.meta"))
                     .unwrap()
                     .contains("disk below")
             });
@@ -920,7 +1076,7 @@ mod tests {
         write(&big, &"x".repeat(LIMIT as usize + 1)).unwrap();
         assert!(read(&big).is_err());
         let job = f.root.join("bad.job");
-        write(&job, "malformed").unwrap();
+        write(&metadata_path(&job), "malformed").unwrap();
         assert!(recorded_group(&job).is_err());
     }
 }
