@@ -72,6 +72,7 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | `GET /v1/hub/standup/status` | Repository-scoped reader, read-only tokens allowed; bounded shared states, named recipients, personal actions, reservations, evidence digests and explicit coverage; advisory non-atomic reads, no generated prose required |
 | `GET /v1/hub/standup/work/{id}/pr-link` | Repository-scoped reader; optional `expected_updated_seq` and `expected_head` comparisons |
 | `POST /v1/hub/standup/pr-link` | Current Work lead with generation/session/sequence fencing; explicit set or `link:null` removal, idempotent operation ID |
+| `POST /v1/hub/standup/issue-link` | Current native Work lead; fenced, idempotent set or explicit `link:null` removal of a caller-declared issue relationship |
 | `GET /v1/hub/standup/work/{id}/reconciliation` | Repository-scoped reader, read-only tokens allowed; read-only PR evidence and prerequisite report for one Work item, `404` for Work the token cannot read; see [design](design/work-reconciliation.md) |
 | `GET /v1/hub/standup/work/{id}/declarations` | Repository-scoped reader; durable v2 caller-declared PR links and prerequisites, not provider facts |
 | `POST /v1/hub/standup/declarations` | Current lead; fenced, retry-safe replacement of durable declarations |
@@ -80,6 +81,27 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 
 MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the same
 Work store. The relationship records caller-reported identity, not provider approval.
+
+### Planned issues and issue linkage
+
+`GET /v1/hub/standup/overview` and `GET /v1/hub/standup/briefing` include `planned_issues`. Its `unclaimed`, `linked` (issue plus `work_ids`) and `linkage_unknown` buckets are distinct from Work reports. Coverage, freshness, `complete`, `linkage_complete`, `unread_pages`, `attempted_at_ms`, `facts_observed_at_ms` and `evaluated_at_ms` keep provider facts, caller links and the capture-time assessment separate. Frozen briefing replays retain that assessment. GitHub discovery is bounded to three pages/300 raw rows; facts are fresh for five minutes. The independent linkage inventory caps at 1,000 Work rows. Unsupported GitLab discovery, missing or stale evidence, outages and permission failures cannot establish an empty plan. See [planned issues](standup.md#planned-issues-and-native-work) for matching syntax, buckets and qualification limits.
+
+`POST /v1/hub/standup/preflight` returns `issue_advice`, independently of its existing admission status and reasons; start returns the advice in its `preflight`. It contains `planning`, at most 20 exact-reference `candidates`, `references_complete` and `choice_provided`. Advice never assigns ownership or refuses admission. Native `WorkStart` accepts optional `issue_choice`: `{"kind":"link","issue":ISSUE_IDENTITY}`, `{"kind":"new_issue","title":"…"}`, `{"kind":"none_applies","reason":"…"}`, or the unassessed compatibility value `{"kind":"not_provided"}`. Omission is also unassessed. This field does not apply to a forge-source start. Naming a new issue creates no forge object.
+
+`POST /v1/hub/standup/issue-link` accepts strict `WorkIssueLinkUpdate` JSON:
+
+```json
+{
+  "work_id":"wrk_0123456789abcdef0123456789abcdef",
+  "operation_id":"link-issue-42",
+  "generation":1,
+  "session":"lead-session",
+  "expected_updated_seq":91,
+  "link":{"provider":"github","host":"github.com","repository_id":101,"number":42}
+}
+```
+
+`link` is required; explicit `null` removes the current link. Only the current write-capable native Work lead may change it, with the inspected generation and sequence. A target must match the authenticated provider, host and stable repository ID. The response is a `WorkCheckpointResult` with the current `item` and immutable operation `receipt`; an exact retained retry returns the original receipt even if later linkage changed. A different request with the same operation ID is rejected. The caller assertion is stored separately as `item.issue_link`; `initial_issue_choice`, Work ID, original source and native request key remain unchanged. The metadata event is `work_issue_link`, not a progress or completion report. MCP exposes the same mutation as `agentscm_work_issue_link_set`; existing Work reads expose the current link. No provider write or automatic assignment occurs.
 
 
 The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on); clients must tolerate new kinds.

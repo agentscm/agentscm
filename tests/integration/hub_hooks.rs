@@ -316,6 +316,7 @@ async fn session_end_pauses_known_work_without_claiming_completion() {
         .work_start_auto(
             &principal.token_id,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: None,
@@ -378,6 +379,7 @@ async fn session_start_flags_records_omitted_from_a_complete_preview() {
             .work_start_auto(
                 &principal.token_id,
                 &WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: None,
@@ -843,6 +845,7 @@ async fn requests_reach_the_prompted_session_and_subagents_get_a_pointer() {
             .token_id
     };
     let start = |key: &str, session: &str| WorkStart {
+        issue_choice: None,
         work_id: None,
         source: None,
         request_key: Some(key.into()),
@@ -930,6 +933,7 @@ async fn every_tool_call_renews_only_its_own_sessions_lease() {
         .work_start(
             &token,
             &WorkStart {
+                issue_choice: None,
                 work_id: None,
                 source: None,
                 request_key: Some("busy".into()),

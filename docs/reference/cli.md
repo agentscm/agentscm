@@ -52,6 +52,25 @@ not owner amendments or verified evidence. See [Living Promises](../advanced/liv
 
 ### `work`
 
+`agentscm work overview` and `agentscm work briefing` include bounded `planned_issues` separately from Work: `unclaimed`, historical `linked` relationships and `linkage_unknown`, with coverage, freshness and capture-time timestamps. Missing or stale planning evidence remains unknown. GitHub discovery is bounded to three pages/300 raw rows; GitLab discovery is unsupported. Link absence is checked independently of the displayed Work page, through at most 1,000 durable Work rows. See [planned issues and native Work](../standup.md#planned-issues-and-native-work).
+
+Before a native start, run `agentscm work preflight --request start.json` and inspect `issue_advice`. Exact references in caller text (`#42`, `acme/widgets#42` or its canonical HTTPS issue URL) are advice, with at most 20 candidates; there is no fuzzy matching or automatic assignment. Add an explicit `issue_choice` to the start request: `link` with a stable issue identity, `new_issue` with a title, or `none_applies` with a reason. Naming a new issue creates no forge issue. Omitted or `not_provided` choices stay unassessed for compatibility and do not refuse admission.
+
+`agentscm work issue-link-set --request link.json` links existing native Work later; `--request -` (the default) reads standard input. The strict request includes `work_id`, `operation_id`, `generation`, `session`, `expected_updated_seq` and required `link`:
+
+```json
+{
+  "work_id":"wrk_0123456789abcdef0123456789abcdef",
+  "operation_id":"link-issue-42",
+  "generation":1,
+  "session":"lead-session",
+  "expected_updated_seq":91,
+  "link":{"provider":"github","host":"github.com","repository_id":101,"number":42}
+}
+```
+
+Use the current lead's session and inspected fences; the target must match the authenticated stable repository. Explicit `link:null` removes the caller assertion. Retry the exact operation after an uncertain result; its response separates the original receipt from current Work. Later linkage preserves Work identity, native request key and immutable initial choice, and proves no execution or provider approval.
+
 `agentscm work start` and `agentscm work checkpoint` read strict JSON requests from a file or
 standard input. Checkpoint `source_refs` accept repository paths, commit identities, Work
 identities, declared captured-event metadata and exact prior versions of the checkpoint's own Work:
