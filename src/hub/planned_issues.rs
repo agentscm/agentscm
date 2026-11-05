@@ -351,15 +351,21 @@ pub(super) fn project(
         };
     };
     let now_ms = now.saturating_mul(1000);
+    // The Store clock has whole-second precision. An observation within that same second
+    // cannot establish a backward clock; retain its precise timestamp for the assessment.
+    let freshness_at_ms = snapshot
+        .facts_observed_at_ms
+        .filter(|observed| observed.div_euclid(1000) == now)
+        .unwrap_or(now_ms);
     let mut view = PlannedIssuesView {
         evaluated_at_ms: now_ms,
         coverage: snapshot.coverage,
-        freshness: snapshot.freshness(now_ms),
+        freshness: snapshot.freshness(freshness_at_ms),
         attempted_at_ms: (snapshot.attempted_at_ms > 0).then_some(snapshot.attempted_at_ms),
         facts_observed_at_ms: snapshot.facts_observed_at_ms,
         unread_pages: snapshot.unread_pages,
         linkage_complete,
-        complete: snapshot.complete(now_ms) && linkage_complete,
+        complete: snapshot.complete(freshness_at_ms) && linkage_complete,
         ..Default::default()
     };
     for issue in snapshot.issues {
@@ -579,6 +585,25 @@ mod tests {
         assert!(other.issues.is_empty());
         assert_eq!(other.freshness(3000), IssueFreshness::Unknown);
         assert!(!other.complete(3000));
+    }
+
+    #[test]
+    fn whole_second_projection_keeps_a_current_millisecond_observation_fresh() {
+        let (conn, repo) = identity();
+        let snapshot =
+            PlannedIssueSnapshot::from_github(&conn, &repo, 1001, page(vec![issue(1)], 0)).unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let view = project(&who(), Some(&encoded), Vec::new(), 1);
+        assert_eq!(view.freshness, IssueFreshness::Fresh);
+        assert!(view.complete);
+        assert_eq!(view.facts_observed_at_ms, Some(1001));
+        assert_eq!(view.evaluated_at_ms, 1000);
+        let backwards = project(&who(), Some(&encoded), Vec::new(), 0);
+        assert_eq!(backwards.freshness, IssueFreshness::Stale);
+        assert!(!backwards.complete);
+        let expired = project(&who(), Some(&encoded), Vec::new(), 302);
+        assert_eq!(expired.freshness, IssueFreshness::Stale);
+        assert!(!expired.complete);
     }
 
     #[test]
