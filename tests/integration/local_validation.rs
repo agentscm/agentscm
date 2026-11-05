@@ -1229,7 +1229,7 @@ mod scoped {
             (&["docs/example.md", "src/a.rs"], &[RUST, DOCS].concat()),
             (&["README.md", "AGENTS.md", ".agents/commands/pr.md"], &[]),
             (&[".agents/bound-target.sh"], RUST),
-            (&[".github/pull_request_template.md"], &[]),
+            (&[".github/pull_request_template.md"], &["workflow-lint"]),
             (
                 &[".github/workflows/zizmor.yml"],
                 &[RUST, &["workflow-lint"]].concat(),
