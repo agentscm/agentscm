@@ -65,7 +65,7 @@ pub struct PlannedIssueSnapshot {
     pub host: String,
     pub repository_id: i64,
     pub coverage: IssueCoverage,
-    /// Time of the latest attempted read, not a refresh of retained facts.
+    /// Time of the latest attempted read, or zero when unsupported; never refreshes retained facts.
     pub attempted_at_ms: i64,
     pub facts_observed_at_ms: Option<i64>,
     pub unread_pages: u32,
@@ -158,7 +158,12 @@ impl PlannedIssueSnapshot {
             } else {
                 IssueCoverage::Unsupported
             },
-            attempted_at_ms,
+            // Unsupported providers never attempt an issue read. Keep this stable across polls.
+            attempted_at_ms: if conn.provider == "github" {
+                attempted_at_ms
+            } else {
+                0
+            },
             facts_observed_at_ms: previous.as_ref().and_then(|p| p.facts_observed_at_ms),
             unread_pages: previous.as_ref().map_or(0, |p| p.unread_pages),
             issues: previous.map_or_else(Vec::new, |p| p.issues),
@@ -618,7 +623,14 @@ mod tests {
         conn.provider = "gitlab".into();
         let unsupported = PlannedIssueSnapshot::unavailable(&conn, &repo, 1000, None);
         assert_eq!(unsupported.coverage, IssueCoverage::Unsupported);
+        assert_eq!(unsupported.attempted_at_ms, 0);
+        assert_eq!(unsupported.facts_observed_at_ms, None);
+        assert_eq!(unsupported.freshness(1000), IssueFreshness::Unknown);
+        assert!(unsupported.issues.is_empty());
         assert!(!unsupported.complete(1000));
+        let repeated =
+            PlannedIssueSnapshot::unavailable(&conn, &repo, 2000, Some(unsupported.clone()));
+        assert_eq!(repeated, unsupported);
     }
 
     #[test]
