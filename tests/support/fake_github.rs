@@ -1487,7 +1487,10 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     {
                         return json_reply(*code, json!({"message": "refused"}));
                     }
-                    let status = json!({"state": b["state"], "context": b["context"], "description": b["description"], "target_url": b["target_url"]});
+                    let mut status = json!({"state": b["state"], "context": b["context"], "description": b["description"]});
+                    if !b["target_url"].is_null() {
+                        status["target_url"] = b["target_url"].clone();
+                    }
                     let creator = state.status_creator.clone().unwrap_or_else(|| match &who {
                         Who::Reader(login, ..) => login.clone(),
                         Who::Installation(_) => format!("{APP_SLUG}[bot]"),
