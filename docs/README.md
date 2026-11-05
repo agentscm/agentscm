@@ -51,7 +51,7 @@ observed actions and source; they are not independent verification or human appr
 - [Operating policy](advanced/operating-policy.md): draft, inspect, rehearse and explicitly activate rules for managed post-merge work.
 - [Intent review](advanced/intent-review.md): advisory assessment and correction tracking for Git Work.
 - [Living Promises](advanced/living-promises.md): owner-authorized commitments and advisory agent reports.
-- [Slack capability map](slack-capabilities.md): optional coordination messages and current qualification limits.
+- [Slack capability map](slack-capabilities.md): private shared-status queries, optional bounded reminders, coordination messages and current qualification limits.
 
 ## Native workflow alpha
 

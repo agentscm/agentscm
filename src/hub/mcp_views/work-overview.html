@@ -82,33 +82,30 @@ function own(o,k){return typeof k==='string'&&Object.prototype.hasOwnProperty.ca
 function who(i){var a=i.lead_agent;return a?own(NAMES,a)?NAMES[a]:a:i.owner_login||'unknown agent'}
 function agc(i){return own(AGC,i.lead_agent)?AGC[i.lead_agent]:'#aaa5d2'}
 function plural(n,a,b){return n+' '+(n===1?a:b||a+'s')}
-function live(i){return !!i&&i.claim_status==='active'&&(i.state==='active'||i.state==='blocked')}
-function older(i){return i.state!=='finished'&&i.state!=='blocked'&&!(i.state==='active'&&i.claim_status==='active')}
-function needs(cur,ov){var rows=[];
-ov.filter(function(p){return live(p.left)&&live(p.right)}).forEach(function(p){var ps=(p.reasons||[]).map(function(r){return r.left_path===r.right_path?r.left_path:r.left_path+' / '+r.right_path}),shown=ps.slice(0,3).map(clip).join(', ')||'a path',more=ps.length>3?' and '+(ps.length-3)+' more':'';
-rows.push({icon:'overlap',tone:'warn',t:who(p.left)+' and '+who(p.right)+' both declare '+shown+more+(p.reasons_complete===false?' (more paths not shown)':''),s:'Coordination signal, not a Git conflict.'})});
-cur.forEach(function(i){if(i.state==='blocked')rows.push({icon:'block',tone:'bad',t:'“'+clip(i.title)+'” is blocked',s:who(i)+(i.blocker&&i.blocker.summary?': '+clip(i.blocker.summary):' has not said why')+'.'})});
-return rows}
 function workRow(i,word,tone,sub){var li=h('li'),sw=h('span','ag');sw.style.setProperty('--c',agc(i));add(li,sw,h('span','t',clip(i.title)),h('span','st '+tone,word),h('span','s',sub));return li}
 function render(root,d,at){
-var cur=Array.isArray(d.current)?d.current:[],ov=Array.isArray(d.overlaps)?d.overlaps:[],rec=Array.isArray(d.recent)?d.recent:[];
-var working=cur.filter(function(i){return i.state==='active'&&i.claim_status==='active'}).length,rows=needs(cur,ov),old=cur.filter(older).length,repo=cur[0]&&cur[0].repository;
-add(root,bar('AgentSCM · '+(repo?clip(repo):'Work overview'),'Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),failNote());
-if(d.current_complete===false)add(root,msg('warn','Showing a partial list.'));
-var big=h('p','big');add(big,plural(working,'agent')+' working. ');
-if(rows.length)add(big,h('em',null,plural(rows.length,'thing needs','things need')+' a person.'));else add(big,d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing blocked and no live overlaps.'+(old>0?' '+plural(old,'older task')+' in All work.':''));
-add(root,big);
-if(rows.length){var ul=h('ul','needs');rows.forEach(function(x){var li=h('li');add(li,ic(x.icon,x.tone),h('span','t',x.t),h('span','s',x.s));ul.appendChild(li)});add(root,ul)}
-var all=fold('all','All work',plural(cur.length,'task')+(old>0?' · '+old+' older':'')+(d.settled_count>0?' · '+d.settled_count+' with a merged PR':'')+' · '+rec.length+' finished recently'),wl=h('ul','w');
-if(!cur.length)add(all,h('p','note','No current work reported.'));
-cur.forEach(function(i){var st=own(STATE,i.state)?STATE[i.state]:[String(i.state),'move',''];wl.appendChild(workRow(i,st[0],st[2],who(i)+(i.owner_login?' for '+clip(i.owner_login):'')+(i.next_action?' · Next: '+clip(i.next_action):'')+(i.claim_status!=='active'?' · Claim '+i.claim_status+', stays claimed':'')+' · '+ago(i.last_checkin_at)))});
-if(cur.length)add(all,wl);
-if(d.history_retention_gap)add(all,msg('warn','Some history is no longer retained, so recently finished work may be missing.'));
-if(rec.length){var rl=h('ul','w');add(all,h('p','sh','Recently finished ('+rec.length+')'));rec.forEach(function(o){var i=o.item||{};rl.appendChild(workRow(i,o.kind==='decision'?'Decision':'Completed','ok',who(i)+' · '+ago(o.at)))});add(all,rl)}
-if(d.recent_complete===false)add(all,h('p','note','This list may be partial.'));
-add(root,all);
-var f=h('div','foot'),oc=d.overlaps_complete===false;add(f,add(h('span','mut'),ic(oc?'alert':'check',oc?'warn':'ok'),oc?'Overlap check incomplete':'Overlap check complete'),h('span',null,'Read-only. Stale claims stay claimed.'));
-add(root,f,h('p','note','Merged pull requests and change history: Hub › Catch up.'),h('p','note',manage))}
+var s=d.actionable_status;
+add(root,bar('AgentSCM · '+clip(s&&s.repository||'Work overview'),'Read '+pad(at.getHours())+':'+pad(at.getMinutes())),failNote());
+if(!s||!Array.isArray(s.work)||!s.counts){add(root,msg('warn','Shared status unavailable. Refresh or ask your agent for current work status.'));return}
+var c=s.counts;
+add(root,h('p','big',plural(c.active,'active task')+'. '+plural(c.needs_you,'action needs','actions need')+' you.'));
+add(root,h('p','note',c.awaiting_party+' awaiting a named party · '+c.blocked+' blocked · '+c.reassessment_needed+' reassessment needed · '+c.held_reservations+' held reservations'));
+if(!s.complete)add(root,msg('warn','Coverage incomplete; missing signals remain unknown.'));
+function recipient(r){return r&&r.login?r.login+(r.kind==='lead_agent'?'’s agent':''):r&&r.kind==='none'?'No action assigned':'Recipient unknown'}
+var rows=h('ul','needs');
+s.work.filter(function(w){return w.needs_you}).forEach(function(w){var li=h('li');add(li,ic('alert','warn'),h('span','t',clip(w.title)),h('span','s',recipient(w.recipient)+' · '+clip(w.action)));rows.appendChild(li)});
+(s.actions||[]).filter(function(a){return a.needs_you}).forEach(function(a){var li=h('li');add(li,ic('hand','warn'),h('span','t',clip(a.action)),h('span','s',(a.recipients||[]).map(recipient).join(', ')));rows.appendChild(li)});
+add(root,rows);
+var all=fold('all','All work and evidence',plural(s.work.length,'task')),wl=h('ul','w');
+s.work.forEach(function(w){var sub=recipient(w.recipient)+' · '+clip(w.action)+' · Claim '+w.freshness+' · Reservation '+w.operational.reservation.status;
+if(w.operational.report)sub+=' · Agent report '+w.operational.report.kind+' at '+w.operational.report.at;
+var r=w.reconciliation;
+if(r){(r.current_source_coverage||[]).forEach(function(p){sub+=' · '+p.source+': '+p.state+'; checked '+p.checked_at_seconds});if(!r.current)sub+=' · No current reconciliation synthesis'}else sub+=' · Provider coverage unavailable';
+if(w.limits&&w.limits.length)sub+=' · Coverage: '+w.limits.join(', ');
+wl.appendChild(workRow(w,String(w.state).replace(/_/g,' '),w.needs_you?'warn':'',sub))});
+add(all,wl,h('p','note','Read as of '+s.observed_at+'. Provider check times are shown separately. Reads are not one atomic snapshot.'),h('p','note','Evidence revision '+s.digest),h('p','note',(s.limits||[]).join(', ')));
+add(root,all,h('p','note',manage))}
+
 function onRefresh(){call({})}
 function gist(){var g=document.querySelector('.big');return g&&g.textContent}
 start();

@@ -1,3 +1,4 @@
+import type { ActionableStatus } from './actionableStatus.ts'
 // What needs a person, and where agents work: pure joins over the work overview and live intents,
 // shared by the dashboard's answer, its tabs and the rail badges so they always count the same things.
 // No DOM, no React.
@@ -9,6 +10,8 @@ export type NeedKind = 'blocked' | 'asked' | 'contested' | 'overlap' | 'pr'
 
 export interface Need {
   key: string
+  /** Shared server revision used only for browser dismissals. */
+  revision?: number | string
   kind: NeedKind
   tone: 'bad' | 'warn' | 'brand'
   /** The work item it is about, when there is one. */
@@ -50,7 +53,7 @@ const idle = (i: WorkItem) => i.state === 'paused' || i.claim_status !== 'active
  * are not here unless another agent is waiting on them: they stay in All work, still claimed. An
  * open agent-to-agent file request is marked `who: 'agents'`: listed, never counted.
  */
-export function needsYou(ov: WorkOverview | null, d: Derived | null, asked?: Asked): Need[] {
+export function legacyNeeds(ov: WorkOverview | null, d: Derived | null, asked?: Asked): Need[] {
   const out: Need[] = []
   const works = new Map((ov?.current ?? []).map((i) => [i.id, i]))
   for (const r of asked?.requests ?? []) {
@@ -70,8 +73,26 @@ export function needsYou(ov: WorkOverview | null, d: Derived | null, asked?: Ask
   return out.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || b.at - a.at)
 }
 
+/** Personal obligations come only from the shared projection. Legacy geometry stays advisory. */
+export function needsYou(ov: WorkOverview | null, d: Derived | null, asked?: Asked, shared?: ActionableStatus | null): Need[] {
+  if (!shared) return legacyNeeds(ov, d, asked).map((n) => ({ ...n, who: 'agents' as const }))
+  const items = new Map((ov?.current ?? []).map((i) => [i.id, i]))
+  return [
+    ...shared.work.filter((w) => w.needs_you).map((w): Need => {
+      const candidate = items.get(w.work_id)
+      const item = candidate?.generation === w.generation && candidate.updated_seq === w.updated_seq ? candidate : undefined
+      return { key: w.state === 'blocked' ? `blocked:${w.work_id}` : `status:${w.work_id}`, revision: w.updated_seq, kind: 'blocked', tone: w.state === 'blocked' ? 'bad' : 'warn', item, at: item?.updated_at ?? shared.observed_at, who: 'you' }
+    }),
+    ...shared.actions.filter((a) => a.needs_you).map((a): Need => ({ key: a.id, revision: a.semantic_version ?? a.updated_seq, kind: 'asked', tone: 'warn', at: shared.observed_at, who: 'you' })),
+  ]
+}
+
 /** What the Inbox badge counts: overlaps to talk about, and open requests to the viewer's agents that they have not answered. */
-export function inboxBadge(ov: WorkOverview | null, asked?: Asked): { n: number; tip: string } {
+export function inboxBadge(ov: WorkOverview | null, asked?: Asked, shared?: ActionableStatus | null): { n: number; tip: string } {
+  if (shared !== undefined) {
+    const n = shared?.actions.filter((a) => a.needs_you && ['directed_request', 'scope_overlap', 'file_conflict'].includes(a.kind)).length ?? 0
+    return { n, tip: shared ? `${n} shared actions in the Inbox` : 'Shared status unavailable' }
+  }
   const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
   const me = asked?.me
   const waiting = me == null ? 0 : (asked?.requests ?? []).filter((r) => pending(r) && r.targets.some((t) => t.lead.login === me && !currentResponse(r, t))).length
@@ -82,7 +103,7 @@ export function inboxBadge(ov: WorkOverview | null, asked?: Asked): { n: number;
 /** When a need last changed: its own time or its task's last update, whichever is newer. */
 export const needUpdatedAt = (n: Need): number => Math.max(n.at, n.item?.updated_at ?? 0)
 /** The browser-only hide key: a need that changes gets a new key, so it shows again. */
-export const needHideKey = (n: Need): string => `${n.key}@${needUpdatedAt(n)}`
+export const needHideKey = (n: Need): string => `${n.key}@${n.revision ?? needUpdatedAt(n)}`
 
 /** The top-level folder a path or `dir/**` spec lives in; files at the root share one area. */
 export function areaOf(spec: string): string {

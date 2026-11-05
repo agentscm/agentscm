@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Contested, Derived } from '../../src/derive.ts'
-import { areaOf, areas, inboxBadge, needsYou } from '../../src/needs.ts'
+import { areaOf, areas, inboxBadge, legacyNeeds as needsYou } from '../../src/needs.ts'
 import type { CoordinationRequest, WorkItem, WorkOverview } from '../../src/standup.ts'
 
 const item = (id: string, over: Partial<WorkItem>): WorkItem =>

@@ -1,10 +1,11 @@
+import { recipientLabel, statusLabel, statusProvenance, type ActionableStatus } from '../actionableStatus.ts'
 import { useId, useState, type MouseEvent, type ReactNode } from 'react'
 import { CatchupPanel } from '../Catchup.tsx'
 import { NarrativePanel } from '../Narrative.tsx'
 import type { Derived, LiveAgent } from '../derive.ts'
 import { HideButton, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
 import { Gloss } from '../Gloss.tsx'
-import { isLiveOverlap, needHideKey, needsYou, needUpdatedAt, type Asked, type Need } from '../needs.ts'
+import { isLiveOverlap, needHideKey, needsYou, legacyNeeds, needUpdatedAt, type Asked, type Need } from '../needs.ts'
 import { askedStep, blockedStep, contestedStep, overlapSteps, prStep, who, type NextStep } from '../nextStep.ts'
 import { StepAction, StepDetail, useStepActions } from '../NextStep.tsx'
 import { named } from '../inboxThreads.ts'
@@ -37,7 +38,7 @@ function Answer({ question, repo, d, ov, failing, needs }: { question: string; r
     [
       ['blocked', (i: WorkItem) => i.state === 'blocked'],
       ['paused', (i: WorkItem) => i.state === 'paused'],
-      ['waiting for another agent', (i: WorkItem) => i.state === 'handover'],
+      ['awaiting handover review', (i: WorkItem) => i.state === 'handover'],
       ['quiet', (i: WorkItem) => i.state === 'active'],
     ] as const
   )
@@ -69,7 +70,7 @@ function Answer({ question, repo, d, ov, failing, needs }: { question: string; r
             </>
           ) : (
             <>
-              <b>{plural(ov.current.length, 'unfinished task')}</b>: {going.length ? `${going.length} moving` : 'none moving'}{still.length ? `, ${still.length} stuck` : ''}. {still.length === 0 && <>Nothing is stuck. </>}
+              <b>{plural(ov.current.length, 'unfinished task')}</b>: {going.length ? `${going.length} moving` : 'none moving'}{still.length ? `, ${still.length} awaiting review or blocked` : ''}. {still.length === 0 && <>No task is waiting. </>}
             </>
           )}
           {needs.length === 0 ? <>Nothing needs you.</> : <><b>{plural(needs.length, 'thing')}</b> {needs.length === 1 ? 'needs' : 'need'} you.</>}
@@ -78,7 +79,7 @@ function Answer({ question, repo, d, ov, failing, needs }: { question: string; r
       fact={
         ov.current.length > 0 && (
           <>
-            {why.length > 0 && <>Stuck: {why.join(', ')}. </>}
+            {why.length > 0 && <>Reported: {why.join(', ')}. </>}
             {plural(d.agents.length, 'agent')} {d.agents.length === 1 ? 'is' : 'are'} connected.
           </>
         )
@@ -500,15 +501,16 @@ export type DashTab = 'home' | 'now' | 'activity' | 'team'
 /** The live status under each dashboard tab and the rail badge, from the same joins as the page. */
 /** `asOfMs` is when the data was read (the last successful poll); null before the first one. */
 /** `hidden` holds the needs hidden in this browser, which no count includes. */
-export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null, hidden: ReadonlySet<string> = new Set(), asked?: Asked) {
-  const needs = needsYou(ov, d, asked).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
+export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null, hidden: ReadonlySet<string> = new Set(), asked?: Asked, shared?: ActionableStatus | null) {
+  const needs = legacyNeeds(ov, d, asked).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   const contested = d?.contested.length ?? 0
   const overlaps = ov?.overlaps.filter(isLiveOverlap).length ?? 0
   const latest = events?.[0]
   const up = d && asOfMs ? d.agents.filter((a) => asOfMs / 1000 - a.lastActive < AWAKE_SECONDS).length : 0
+  const personal = shared === undefined ? needs : needsYou(ov, d, asked, shared).filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
   return {
-    needs,
-    home: d && ov ? (needs.length ? { text: 'Waiting on you', tone: 'bad' as const } : { text: 'Nothing needs you', tone: 'ok' as const }) : undefined,
+    needs: personal,
+    home: shared !== undefined ? (shared ? { text: personal.length ? 'Waiting on you' : shared.complete ? 'Nothing needs you' : 'No action observed · partial coverage', tone: personal.length ? 'bad' as const : shared.complete ? 'ok' as const : 'warn' as const } : { text: 'Shared status unavailable', tone: 'warn' as const }) : d && ov ? (needs.length ? { text: 'Waiting on you', tone: 'bad' as const } : { text: 'Nothing needs you', tone: 'ok' as const }) : undefined,
     now: d ? (contested || overlaps ? { text: `${plural(contested, 'contested file')} · ${plural(overlaps, 'overlap')}`, tone: 'bad' as const } : { text: 'No contested files', tone: 'muted' as const }) : undefined,
     activity: latest && asOfMs ? { text: `Last event ${relative(latest.at, asOfMs)}`, tone: 'brand' as const } : events ? { text: 'Quiet so far', tone: 'muted' as const } : undefined,
     team: d ? (d.agents.length ? { text: `${up} of ${d.agents.length} awake`, tone: up ? ('ok' as const) : ('warn' as const) } : { text: 'Nobody connected', tone: 'muted' as const }) : undefined,
@@ -516,17 +518,18 @@ export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, even
 }
 
 /** `answer` replaces the shared headline: the G layout gives each tab its own sentence. */
-export function DashboardPage({ section, question, token, repo, data, d, overview, asked, answer }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview>; asked?: Asked; answer?: ReactNode }) {
+export function DashboardPage({ section, question, token, repo, data, d, overview, asked, answer, status }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview>; asked?: Asked; answer?: ReactNode; status?: Poll<ActionableStatus> }) {
   const ov = overview.kind === 'ready' ? overview.value : null
   const hidden = useHidden()
-  const all = needsYou(ov, d, asked)
+  const all = legacyNeeds(ov, d, asked)
   const needs = all.filter((n) => n.who === 'you' && !hidden.has(needHideKey(n)))
+  const needsCount = status === undefined ? needs.length : status.kind === 'ready' ? status.value.counts.needs_you : 0
   const handoff = handoffOf(data.whoami)
   const start = <StartTask token={token} me={handoff.me} repo={handoff.repo} originUrl={handoff.originUrl} />
   return (
     <div className="page">
-      {answer ? <PageHead question={question} answer={answer} live /> : <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />}
-      {section === 'home' && ov && d && <Coach id="answer" side="below">This sentence is the page in brief: how many tasks are unfinished, how many are moving or stuck, and how many need you.</Coach>}
+      {status !== undefined ? <SharedAnswer question={question} status={status} /> : answer ? <PageHead question={question} answer={answer} live /> : <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />}
+      {section === 'home' && ov && d && <Coach id="answer" side="below">This sentence is the page in brief: how many tasks are unfinished, their reported states and named recipients, and how many need you.</Coach>}
       <SectionTabs label="Dashboard views" />
       {overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
@@ -537,11 +540,11 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
       {section === 'home' && (!ov || !d ? <Skeleton rows={6} /> : (
         <>
           {/* What waits on a person comes first; starting a task is one quiet line until asked for. With nothing waiting, it leads. */}
-          {needs.length === 0 && start}
+          {needsCount === 0 && start}
           <Coach id="needs" side="above">These wait on a person. Open a row for the reason and who decides; its button opens or copies the prompt for the agent.</Coach>
-          <NeedsYou needs={all} ov={ov} d={d} me={handoff.me} handoff={handoff} />
+          {status === undefined ? <NeedsYou needs={all} ov={ov} d={d} me={handoff.me} handoff={handoff} /> : <SharedNeeds status={status} legacy={{ ov, d, me: handoff.me, handoff }} />}
           <NarrativePanel token={token} compact />
-          {needs.length > 0 && start}
+          {needsCount > 0 && start}
           <Coach id="track" side="above">Every unfinished task, left to right: claimed, now, next, finished. Open a task for its full story.</Coach>
           <Track ov={ov} />
         </>
@@ -557,4 +560,31 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
       {section === 'team' && (!d ? <Skeleton rows={6} /> : <Team d={d} ov={ov} events={data.activity?.events ?? null} />)}
     </div>
   )
+}
+
+
+export function SharedAnswer({ question, status }: { question: string; status: Poll<ActionableStatus> }) {
+  const hidden = useHidden()
+  if (status.kind !== 'ready') return <PageHead question={question} answer={status.kind === 'loading' ? 'Checking shared status…' : 'Shared status is unavailable. Retry to check what needs you.'} live />
+  const s = status.value, personal = needsYou(null, null, undefined, status.value).filter((n) => !hidden.has(needHideKey(n))).length
+  const parts = [['active', s.counts.active], ['awaiting a named party', s.counts.awaiting_party], ['blocked', s.counts.blocked], ['needing reassessment', s.counts.reassessment_needed], ['retired', s.counts.retired]] as const
+  const states = parts.filter(([, n]) => n > 0).map(([label, n]) => `${n} ${label}`).join(', ')
+  return <PageHead question={question} live answer={<>{status.refreshError && 'Last known: '}{s.work.length ? `${s.work.length} tasks: ${states}. ` : 'No Work observed. '}{personal ? <b>{personal} {personal === 1 ? 'action needs' : 'actions need'} you.</b> : s.complete ? 'Nothing needs you.' : 'No visible personal action observed.'}</>} fact={<>{status.refreshError ? 'Showing the last status that loaded. ' : ''}{!s.complete && 'Coverage is incomplete; missing signals remain unknown. '}Read <Ago at={s.observed_at} />.</>} />
+}
+
+export function SharedNeeds({ status, legacy }: { status: Poll<ActionableStatus>; legacy?: { ov: WorkOverview; d: Derived; me: string | null; handoff: Handoff } }) {
+  const shared = status.kind === 'ready' ? status.value : null
+  const all = needsYou(legacy?.ov ?? null, legacy?.d ?? null, undefined, shared).filter((n) => n.who === 'you')
+  const { rows, count, show, setShow, isHidden } = useHideable(all, needHideKey)
+  if (status.kind === 'loading') return <Box id="box-needs" icon="bell" title="Needs you"><Skeleton rows={3} /></Box>
+  if (status.kind === 'error') return <Box id="box-needs" icon="bell" title="Needs you"><Notice title="Shared status could not load" action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={status.retry}>Retry</button>}>{status.message}</Notice></Box>
+  const s = status.value, keys = new Set(rows.map((n) => n.key)), work = s.work.filter((w) => w.needs_you && keys.has(w.state === 'blocked' ? `blocked:${w.work_id}` : `status:${w.work_id}`)), actions = s.actions.filter((a) => a.needs_you && keys.has(a.id))
+  return <Box id="box-needs" icon="bell" title="Needs you" count={rows.length || undefined} tone={work.some((w) => w.state === 'blocked') ? 'bad' : 'brand'} explain="Actions addressed to you by the shared status projection. Reports and observed evidence remain separate.">
+    {status.refreshError && <Notice title="Showing the last status that loaded">{status.refreshError}</Notice>}
+    {s.work.some((w) => w.limits.includes('provider_coverage_unavailable')) && <Notice title="Provider evidence is unavailable">The Hub could not observe all provider facts. Reports and older evidence do not establish clear status.</Notice>}
+    {work.length === 0 && actions.length === 0 && <Empty icon="check2-circle" title={s.complete ? 'All clear' : 'No personal action observed'}>{!s.complete && 'Coverage is incomplete. Open the evidence below before treating this as clear.'}</Empty>}
+    <ul className="attn">{work.map((w) => { const n = rows.find((n) => n.key === (w.state === 'blocked' ? `blocked:${w.work_id}` : `status:${w.work_id}`))!; return legacy && w.state === 'blocked' && n.item ? <NeedRow key={w.work_id} n={n} ov={legacy.ov} d={legacy.d} me={legacy.me} handoff={legacy.handoff} hidden={isHidden(n)} /> : <li className={`attn-item tone-${w.state === 'blocked' ? 'bad' : 'warn'}`} key={w.work_id}><span className="attn-icon" aria-hidden="true"><Icon name={w.state === 'blocked' ? 'sign-stop' : 'arrow-left-right'} /></span><div className="attn-main text-break"><a className="work-link" href={workHref(w.work_id)}>{w.title}</a><p>{statusLabel(w.state)} · {recipientLabel(w.recipient)}</p><p>{w.action}</p><details className="disclosure"><summary>Evidence and reported next step</summary><p>{statusProvenance(w)}</p><p>Reservation {w.operational.reservation.status}. Outcome {w.operational.outcome.value} ({w.operational.outcome.provenance}).</p>{w.reported_next_action && <p>Reported: {w.reported_next_action}</p>}{w.limits.length > 0 && <p>Coverage: {w.limits.join(', ')}</p>}</details><a className="btn btn-sm btn-outline-secondary" href={workHref(w.work_id)}>Open work</a></div></li>})}{actions.map((a) => <li className="attn-item tone-warn" key={a.id}><span className="attn-icon" aria-hidden="true"><Icon name="envelope-exclamation" /></span><div className="attn-main text-break"><p>{a.action}</p><p>{a.recipients.map(recipientLabel).join(', ')}</p><a className="btn btn-sm btn-outline-secondary" href={a.kind === 'pr_overlap' || a.kind === 'file_conflict' ? '#now' : '#inbox'}>{a.kind === 'pr_overlap' || a.kind === 'file_conflict' ? 'Open current work' : 'Open Inbox'}</a></div></li>)}</ul>
+    <ShowHidden count={count} show={show} onShow={setShow} />
+    <details className="disclosure text-break"><summary>All shared status evidence · {s.counts.held_reservations} held reservations</summary><ul>{s.work.map((w) => <li key={w.work_id}><a href={workHref(w.work_id)}>{w.title}</a> · {statusLabel(w.state)} · {recipientLabel(w.recipient)} · reservation {w.operational.reservation.status}<p>{statusProvenance(w)}</p></li>)}</ul><p>{s.limits.join(', ') || 'No collection limits reported.'}</p><p>Read as of {new Date(s.observed_at * 1000).toLocaleString()}; provider check times appear above.</p><p>Evidence revision <code className="text-break">{s.digest}</code>. Reads are not one atomic snapshot.</p></details>
+  </Box>
 }

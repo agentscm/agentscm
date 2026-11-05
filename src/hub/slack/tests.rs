@@ -40,9 +40,20 @@ fn private(path: &Path, text: &str) {
 
 /// A forge user with a read-only binding token (written to `dir/<login>`) and a coding agent.
 fn person(store: &dyn Store, dir: &Path, id: i64, login: &str, agent: &str) -> (Value, String) {
+    forge_person(store, dir, id, login, agent, "github", "github.com")
+}
+fn forge_person(
+    store: &dyn Store,
+    dir: &Path,
+    id: i64,
+    login: &str,
+    agent: &str,
+    provider: &str,
+    host: &str,
+) -> (Value, String) {
     let identity = ForgeIdentity {
-        provider: "github".into(),
-        host: "github.com".into(),
+        provider: provider.into(),
+        host: host.into(),
         user_id: id,
     };
     let user = store.upsert_user(&identity, login).unwrap();
@@ -51,8 +62,8 @@ fn person(store: &dyn Store, dir: &Path, id: i64, login: &str, agent: &str) -> (
     private(&dir.join(login), secret.expose());
     let (token, _, _) =
         mint_bound_agent_token(store, &user.id, agent, REPO, 101, 3600, false).unwrap();
-    let binding = json!({"slack_user": format!("U{id}"), "provider": "github",
-        "host": "github.com", "forge_user_id": id, "repository": REPO, "repository_id": 101,
+    let binding = json!({"slack_user": format!("U{id}"), "provider": provider,
+        "host": host, "forge_user_id": id, "repository": REPO, "repository_id": 101,
         "agent_token_file": dir.join(login)});
     (binding, token)
 }
@@ -77,6 +88,10 @@ fn rendered(body: &Value) -> String {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::configured(None, false).await
+    }
+
+    async fn configured(policy: Option<Value>, other_forge: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -84,8 +99,23 @@ impl Fixture {
         }
         let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
         let store = store::open(&url).unwrap();
-        let (alice_binding, alice) = person(&*store, dir.path(), 1, "alice", "claude");
-        let (bob_binding, bob) = person(&*store, dir.path(), 2, "bob", "codex");
+        let (mut alice_binding, alice) = person(&*store, dir.path(), 1, "alice", "claude");
+        let (bob_binding, bob) = if other_forge {
+            forge_person(
+                &*store,
+                dir.path(),
+                2,
+                "bob",
+                "codex",
+                "gitlab",
+                "gitlab.example.test",
+            )
+        } else {
+            person(&*store, dir.path(), 2, "bob", "codex")
+        };
+        if let Some(policy) = policy {
+            alice_binding["reminders"] = policy;
+        }
         private(&dir.path().join("signing"), "synthetic-signing-secret");
         private(&dir.path().join("bot"), "xoxb-synthetic");
         let config = json!({"version":1,"app_id":"A123","bot_id":"B123","team_id":"T123",
@@ -1134,16 +1164,797 @@ fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
 }
 
 #[test]
-fn manifest_requests_only_direct_messages() {
+fn manifest_requests_mentions_and_private_replies_without_history() {
     let manifest: Value =
         serde_json::from_str(include_str!("../../../examples/slack-manifest.json")).unwrap();
     assert_eq!(
         manifest["oauth_config"]["scopes"],
-        json!({"bot":["chat:write"]})
+        json!({"bot":["chat:write","app_mentions:read"]})
     );
     assert_eq!(
         manifest["settings"]["event_subscriptions"]["bot_events"],
-        json!(["tokens_revoked", "app_uninstalled"])
+        json!(["app_mention", "tokens_revoked", "app_uninstalled"])
     );
     assert!(manifest["features"].get("slash_commands").is_none());
+}
+
+fn status_event(id: &str, user: &str, command: &str) -> Value {
+    json!({"type":"event_callback","team_id":"T123","api_app_id":"A123","event_id":id,
+        "event":{"type":"app_mention","user":user,"channel":"CSHARED","text":format!("<@UAPP> {command}")}})
+}
+fn status_text(f: &Fixture) -> Vec<(String, String)> {
+    f.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p == "/api/chat.postMessage")
+        .map(|(_, b)| {
+            (
+                b["channel"].as_str().unwrap().into(),
+                b["text"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+fn status_work(f: &Fixture, token: &str, session: &str) -> crate::hub::work::WorkItem {
+    tokio::task::block_in_place(|| {
+        f.store().work_start(token,&serde_json::from_value(json!({
+        "title":"Synthetic review handover", "session":session,"request_key":format!("status-{session}"),"scope":[format!("src/{session}.rs")]
+    })).unwrap(),unix_now()).unwrap().item
+    })
+}
+fn status_checkpoint(
+    f: &Fixture,
+    token: &str,
+    item: &crate::hub::work::WorkItem,
+    kind: &str,
+) -> crate::hub::work::WorkItem {
+    tokio::task::block_in_place(|| {
+        f.store().work_checkpoint(token,&serde_json::from_value(json!({
+        "work_id":item.id,"operation_id":format!("synthetic-{kind}-{}",item.updated_seq),"generation":item.generation,
+        "session":item.lead_session,"expected_updated_seq":item.updated_seq,"kind":kind,"summary":"Synthetic status change",
+        "next_action":"Review the synthetic request","resolve_blocker":kind=="progress"
+    })).unwrap(),unix_now()).unwrap().item
+    })
+}
+fn scan_status(f: &Fixture, now: i64) {
+    let (slack, state) = (f.slack(), f.state.clone());
+    tokio::task::block_in_place(|| slack.collect_status_binding(&state, &slack.bindings[0], now))
+        .unwrap();
+}
+fn policy() -> Value {
+    json!({"enabled":true,"interval_seconds":900,"max_reminders":1,"escalation_user":"U2","escalation_after_seconds":900,"send_resolution":true})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mention_status_is_private_useful_deduplicated_and_independent_of_prose() {
+    let f = Fixture::new().await;
+    let work = status_work(&f, &f.alice, "status-query");
+    status_checkpoint(&f, &f.alice, &work, "handover");
+    let event = status_event("EvSTATUS1", "U1", "status");
+    assert_eq!(f.post(event.to_string(), true).await.0, StatusCode::OK);
+    assert_eq!(f.post(event.to_string(), true).await.0, StatusCode::OK);
+    f.run().await;
+    let sent = status_text(&f);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, "U1");
+    assert!(sent[0].1.contains("awaiting a named party"));
+    assert!(sent[0].1.contains("Review the handover"));
+    assert!(sent[0].1.contains("Evidence revision"));
+    assert!(sent[0].1.contains("Coverage incomplete"));
+    assert!(!sent[0].1.contains("waiting for another agent"));
+    let db = f.slack();
+    let db = db.database().unwrap();
+    let columns: Vec<String> = db
+        .prepare("PRAGMA table_info(status_jobs)")
+        .unwrap()
+        .query_map([], |r| r.get(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(!columns.iter().any(|c| c == "text" || c == "body"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mention_rejects_unbound_wrong_scope_and_bot_without_channel_disclosure() {
+    let f = Fixture::new().await;
+    for (id, user, command) in [
+        ("EvUNKNOWN", "U9", "status"),
+        ("EvWRONG", "U1", "status acme/private"),
+        ("EvCHAT", "U1", "tell me a story"),
+    ] {
+        assert_eq!(
+            f.post(status_event(id, user, command).to_string(), true)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let mut bot = status_event("EvBOT", "U1", "status");
+    bot["event"]["bot_id"] = json!("BOTHER");
+    assert_eq!(f.post(bot.to_string(), true).await.0, StatusCode::OK);
+    let mut wrong = status_event("EvTEAM", "U1", "status");
+    wrong["team_id"] = json!("TOTHER");
+    assert_eq!(
+        f.post(wrong.to_string(), true).await.0,
+        StatusCode::FORBIDDEN
+    );
+    f.run().await;
+    assert!(status_text(&f).is_empty());
+    assert!(
+        !f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body["channel"] == "CSHARED")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_retry_recomputes_facts_and_rechecks_binding() {
+    let f = Fixture::new().await;
+    let work = status_work(&f, &f.alice, "status-retry");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    f.post(status_event("EvRETRY", "U1", "status").to_string(), true)
+        .await;
+    f.replies.lock().unwrap().push((429, json!({"ok":false})));
+    f.slack().deliver(&f.state).await.unwrap();
+    status_checkpoint(&f, &f.alice, &blocked, "progress");
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    let sent = status_text(&f);
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0].1.contains("[blocked;"));
+    assert!(sent[1].1.contains("[active;"));
+    f.post(status_event("EvREVOKE", "U1", "status").to_string(), true)
+        .await;
+    let owner = f.owner(0);
+    let token = tokio::task::block_in_place(|| f.store().list_agent_tokens(&owner))
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "slack")
+        .unwrap();
+    tokio::task::block_in_place(|| f.store().revoke_agent_token(&token.id)).unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert_eq!(status_text(&f).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opt_in_reminders_retry_deduplicate_escalate_and_resolve() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "reminder");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    scan_status(&f, now + 901);
+    // Synthetic clock advances scheduling only; make the queued jobs due for this worker.
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.replies.lock().unwrap().push((429, json!({"ok":false})));
+    f.slack().deliver(&f.state).await.unwrap();
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    scan_status(&f, now + 902);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    let sent = status_text(&f);
+    assert_eq!(sent.len(), 3); // first API failure, successful retry, one escalation
+    assert_eq!(sent.iter().filter(|(u, _)| u == "U2").count(), 1);
+    scan_status(&f, now + 903);
+    f.slack().deliver(&f.state).await.unwrap();
+    assert_eq!(status_text(&f).len(), 3);
+    status_checkpoint(&f, &f.alice, &blocked, "progress");
+    scan_status(&f, now + 904);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    let sent = status_text(&f);
+    assert_eq!(sent.len(), 4);
+    assert!(
+        sent.last()
+            .unwrap()
+            .1
+            .contains("does not establish task success")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoked_escalation_recipient_does_not_block_later_status_queries() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "revoked-escalation");
+    status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    scan_status(&f, now + 902);
+    tokio::task::block_in_place(|| {
+        let slack = f.slack();
+        let target = slack.principal(&f.state, &slack.bindings[1]).unwrap();
+        assert!(f.state.store.revoke_agent_token(&target.token_id).unwrap());
+    });
+    f.slack()
+        .database()
+        .unwrap()
+        .execute(
+            "UPDATE status_jobs SET due=0,created=?1 WHERE kind='escalation'",
+            [now - 1],
+        )
+        .unwrap();
+    f.post(
+        status_event("EvAFTERREVOKE", "U1", "status").to_string(),
+        true,
+    )
+    .await;
+    let sent_before = status_text(&f).len();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert_eq!(status_text(&f).len(), sent_before);
+    assert_eq!(
+        f.slack()
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_jobs WHERE kind='escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        "suppressed"
+    );
+    f.slack().deliver(&f.state).await.unwrap();
+    let sent = status_text(&f);
+    assert_eq!(sent.len(), sent_before + 1);
+    assert_eq!(sent.last().unwrap().0, "U1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_action_suppresses_reminder_before_delivery_and_quiet_work_is_not_reminded() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "suppressed");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    status_checkpoint(&f, &f.alice, &blocked, "progress");
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert!(status_text(&f).is_empty());
+    let quiet = status_work(&f, &f.alice, "quiet");
+    status_checkpoint(&f, &f.alice, &quiet, "pause");
+    scan_status(&f, now + 2000);
+    scan_status(&f, now + 2500);
+    assert_eq!(
+        f.slack()
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>("SELECT count(*) FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_name_forge_bindings_do_not_hide_the_second_forge_request() {
+    let f = Fixture::configured(None, true).await;
+    let work = status_work(&f, &f.bob, "other-forge");
+    let paused = status_checkpoint(&f, &f.bob, &work, "pause");
+    let messages = tokio::task::block_in_place(|| {
+        let slack = f.slack();
+        let people = slack.people(&f.state).unwrap();
+        slack.asked(&f.state,&people,&json!({"requester":f.alice,"targets":[paused.id],"proposal":{"scope":["src/other-forge.rs"]}})).unwrap()
+    });
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, "U2");
+    f.post(status_event("EvFORGE", "U1", "status").to_string(), true)
+        .await;
+    f.slack().deliver(&f.state).await.unwrap();
+    assert!(!status_text(&f)[0].1.contains("Synthetic review handover"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generic_queued_messages_without_exact_binding_identity_are_suppressed() {
+    let f = Fixture::new().await;
+    f.slack().database().unwrap().execute("INSERT INTO messages(id,user,body,state,created,due) VALUES('legacy','U1','{}','queued',0,0)",[]).unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert!(f.calls.lock().unwrap().is_empty());
+    assert_eq!(f.state_of_messages(), vec!["failed"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reminders_are_off_by_default_and_failed_retry_does_not_outlive_its_action() {
+    let f = Fixture::new().await;
+    let work = status_work(&f, &f.alice, "default-off");
+    status_checkpoint(&f, &f.alice, &work, "blocker");
+    f.run().await;
+    assert_eq!(
+        f.slack()
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>("SELECT count(*) FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "retry-obsolete");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.replies.lock().unwrap().push((429, json!({"ok":false})));
+    f.slack().deliver(&f.state).await.unwrap();
+    status_checkpoint(&f, &f.alice, &blocked, "progress");
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert_eq!(status_text(&f).len(), 1);
+    assert_eq!(
+        f.slack()
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>("SELECT state FROM status_jobs", [], |r| r.get(0))
+            .unwrap(),
+        "suppressed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_binding_rotation_suppresses_old_coordination_jobs_and_attempts_are_bounded() {
+    let f = Fixture::new().await;
+    f.contest();
+    tokio::task::block_in_place(|| f.slack().collect(&f.state)).unwrap();
+    let owner = f.owner(0);
+    let (_, secret, _) = tokio::task::block_in_place(|| {
+        mint_bound_agent_token(&*f.state.store, &owner, "rotated", REPO, 101, 3600, true)
+    })
+    .unwrap();
+    private(&f.dir.path().join("alice"), secret.expose());
+    let changed = Slack::from_file(&f.dir.path().join("config")).unwrap();
+    // The other person's queued job may be selected first. Drain until the rotated recipient
+    // is encountered without making network requests.
+    for _ in 0..2 {
+        let _ = tokio::task::block_in_place(|| changed.next_message(&f.state)).unwrap();
+    }
+    let state: String = changed
+        .database()
+        .unwrap()
+        .query_row("SELECT state FROM messages WHERE user='U1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "failed");
+    f.post(status_event("EvLIMIT", "U2", "status").to_string(), true)
+        .await;
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET attempts=8", [])
+        .unwrap();
+    assert!(
+        tokio::task::block_in_place(|| f.slack().prepare_status_job(&f.state, unix_now()))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.slack()
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>("SELECT state FROM status_jobs", [], |r| r.get(0))
+            .unwrap(),
+        "failed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reminder_policy_requires_bounded_cadence_and_exact_authorized_escalation_scope() {
+    let f = Fixture::new().await;
+    let mut config: SlackConfig =
+        serde_json::from_str(&fs::read_to_string(f.dir.path().join("config")).unwrap()).unwrap();
+    config.bindings[0].reminders.interval_seconds = 0;
+    assert!(validate_config(&config).is_err());
+    config.bindings[0].reminders = serde_json::from_value(policy()).unwrap();
+    config.bindings[1].host = "other.example.test".into();
+    assert!(validate_config(&config).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directed_request_reminder_resolves_only_on_exact_retained_withdrawal() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "request-target");
+    status_checkpoint(&f, &f.alice, &work, "pause");
+    let request=tokio::task::block_in_place(||f.store().work_start_auto(&f.bob,&serde_json::from_value(json!({
+        "title":"Synthetic directed requester","session":"requesting","scope":["src/request-target.rs"]
+    })).unwrap(),unix_now())).unwrap().coordination_request.unwrap();
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert!(
+        status_text(&f)[0]
+            .1
+            .contains("directed coordination request")
+    );
+    tokio::task::block_in_place(|| {
+        f.store().coordination_withdraw(
+            &f.bob,
+            &crate::hub::coordination::CoordinationWithdraw {
+                request_id: request.id,
+                operation_id: "synthetic-withdraw".into(),
+                session: "requesting".into(),
+                expected_updated_seq: request.updated_seq,
+            },
+            unix_now(),
+        )
+    })
+    .unwrap();
+    scan_status(&f, now + 902);
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert!(
+        status_text(&f)
+            .last()
+            .unwrap()
+            .1
+            .contains("no longer outstanding")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_lead_generation_suppresses_the_former_recipients_reminder() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "new-recipient");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    let offered = status_checkpoint(&f, &f.alice, &blocked, "handover");
+    let claimed=tokio::task::block_in_place(||f.store().work_start(&f.bob,&serde_json::from_value(json!({
+        "work_id":offered.id,"takeover_generation":offered.generation,"title":"Synthetic review handover","session":"new-lead","role":"lead"
+    })).unwrap(),unix_now())).unwrap().item;
+    assert_eq!(claimed.lead_token, f.bob);
+    status_checkpoint(&f, &f.bob, &claimed, "blocker");
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0", [])
+        .unwrap();
+    f.slack().deliver(&f.state).await.unwrap();
+    assert!(status_text(&f).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_status_answers_unknown_privately_and_does_not_block_coordination_collection() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    f.contest();
+    f.post(
+        status_event("EvUNAVAILABLE", "U1", "status").to_string(),
+        true,
+    )
+    .await;
+    // Synthetic malformed retained input exercises a failed evidence read, not a clear result.
+    tokio::task::block_in_place(|| {
+        f.store()
+            .append_notices("edit_repeated", &[(f.alice.clone(), "not-json".into())])
+    })
+    .unwrap();
+    f.run().await;
+    let sent = status_text(&f);
+    assert!(sent.iter().any(|(u, text)| u == "U1"
+        && text.contains("Shared status is unavailable")
+        && text.contains("No clear status")));
+    assert!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body["blocks"][0]["type"] == "header")
+    );
+    assert!(!sent.iter().any(|(u, _)| u == "CSHARED"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contention() {
+    use crate::hub::work_http::actionable_status;
+    for resolution in ["grant", "release", "end"] {
+        let f = Fixture::new().await;
+        f.contest();
+        let read = || {
+            tokio::task::block_in_place(|| {
+                let slack = f.slack();
+                let who = slack.principal(&f.state, &slack.bindings[0]).unwrap();
+                actionable_status::read(&**f.store(), &who, unix_now()).unwrap()
+            })
+        };
+        assert!(
+            read()
+                .actions
+                .iter()
+                .any(|a| a.kind == "file_conflict" && a.needs_you)
+        );
+        tokio::task::block_in_place(|| match resolution {
+            "grant" => {
+                f.store()
+                    .answer_handoff(&f.alice, Some("a"), PATH, true, None, unix_now())
+                    .unwrap();
+            }
+            "release" => {
+                let held = f.store().live_intents(REPO, unix_now(), 100).unwrap();
+                f.store()
+                    .release_intent(
+                        &f.alice,
+                        &held.iter().find(|i| i.token == f.alice).unwrap().id,
+                        unix_now(),
+                    )
+                    .unwrap();
+            }
+            _ => {
+                f.store()
+                    .end_session(&f.bob, Some("b"), unix_now())
+                    .unwrap();
+            }
+        });
+        assert!(
+            !read().actions.iter().any(|a| a.kind == "file_conflict"),
+            "obsolete repeat after {resolution}"
+        );
+        tokio::task::block_in_place(|| {
+            f.store()
+                .end_session(&f.alice, Some("a"), unix_now())
+                .unwrap();
+            f.store()
+                .end_session(&f.bob, Some("b"), unix_now())
+                .unwrap();
+        });
+        f.contest();
+        assert!(
+            read()
+                .actions
+                .iter()
+                .any(|a| a.kind == "file_conflict" && a.needs_you),
+            "new repeat after {resolution}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn episode_maintenance_rotates_past_one_hundred_outstanding_subjects() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let now = unix_now();
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    // Retained subjects are confirmed individually even when the status list is bounded.
+    for n in 0..101 {
+        let work = status_work(&f, &f.alice, &format!("fair-{n}"));
+        let current = if n < 100 {
+            status_checkpoint(&f, &f.alice, &work, "blocker")
+        } else {
+            work
+        };
+        let subject = json!({"kind":"work","id":current.id,"generation":current.generation,"state":"blocked"}).to_string();
+        slack.database().unwrap().execute("INSERT INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)",params![format!("{n:04}"),key,subject,now,now+86400]).unwrap();
+    }
+    scan_status(&f, now);
+    let state = || {
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_episodes WHERE id='0100'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(state(), "active");
+    scan_status(&f, now + 1);
+    assert_eq!(state(), "resolved");
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_episodes WHERE length(id)=4 AND id<'0100' AND state='active'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        100
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_episode_journal_resolves_before_new_subject_admission_and_recovers_after_retention() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let old = status_work(&f, &f.alice, "old-cleared");
+    let fresh = status_work(&f, &f.alice, "new-blocked");
+    status_checkpoint(&f, &f.alice, &fresh, "blocker");
+    let now = unix_now();
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    let subject = json!({"kind":"work","id":old.id,"generation":old.generation,"state":"blocked"})
+        .to_string();
+    {
+        let mut db = slack.database().unwrap();
+        let tx = db.transaction().unwrap();
+        for n in 0..4096 {
+            let encoded = if n == 0 {
+                subject.clone()
+            } else {
+                json!({"kind":"work","id":format!("unknown-{n}"),"generation":1,"state":"blocked"})
+                    .to_string()
+            };
+            tx.execute("INSERT INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)",params![format!("{n:04}"),key,encoded,now,now+86400]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let result = tokio::task::block_in_place(|| {
+        slack.collect_status_binding(&f.state, &slack.bindings[0], now)
+    });
+    assert!(matches!(result, Err(HubError::Busy)));
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_episodes WHERE id='0000'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        "resolved"
+    );
+    // Retained history still consumes its quota until expiry; Unknown subjects stay active.
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_episodes WHERE state='active'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        4095
+    );
+    // Advance only the local journal's retention age; forge credentials keep their real clock.
+    slack
+        .database()
+        .unwrap()
+        .execute(
+            "UPDATE status_episodes SET first_seen=?1 WHERE id='0000'",
+            [now - 8 * 86400],
+        )
+        .unwrap();
+    tokio::task::block_in_place(|| slack.collect_status(&f.state, now + 61)).unwrap();
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>("SELECT count(*) FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        4096
+    );
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_episodes WHERE id='0000'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_status_queue_retains_resolution_progress_without_crossing_reactivated_cycles() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "queue-resolution");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let now = unix_now();
+    scan_status(&f, now);
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    {
+        let mut db = slack.database().unwrap();
+        let tx = db.transaction().unwrap();
+        // Synthetic completed jobs still occupy dedup history until its retention window ends.
+        for n in 0..CAPACITY {
+            tx.execute("INSERT INTO status_jobs(id,binding,user,kind,state,created,due) VALUES(?1,?2,'U1','query','done',?3,?3)",params![format!("history-{n}"),key,now]).unwrap();
+        }
+        tx.execute("UPDATE status_episodes SET delivered=1", [])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let active = status_checkpoint(&f, &f.alice, &blocked, "progress");
+    scan_status(&f, now + 1);
+    let db = slack.database().unwrap();
+    assert_eq!(
+        db.query_row::<String, _, _>("SELECT state FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        "resolved"
+    );
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM status_resolution_pending", [], |r| r
+            .get(0))
+            .unwrap(),
+        1
+    );
+    drop(db);
+    status_checkpoint(&f, &f.alice, &active, "blocker");
+    scan_status(&f, now + 2);
+    let db = slack.database().unwrap();
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT cycle FROM status_episodes", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM status_resolution_pending", [], |r| r
+            .get(0))
+            .unwrap(),
+        0
+    );
+    db.execute("DELETE FROM status_jobs WHERE id='history-0'", [])
+        .unwrap();
+    drop(db);
+    scan_status(&f, now + 3);
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM status_jobs WHERE kind='resolution'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        0
+    );
 }

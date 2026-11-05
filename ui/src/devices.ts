@@ -184,6 +184,9 @@ export async function mintWebReadToken(session: BrowserSession, repository: stri
 
 /** One connected repository the person can read now, as GET /v1/hub/session/repositories counts it. */
 export interface RepositoryRow {
+  statusCounts?: { active: number; awaiting_party: number; blocked: number; reassessment_needed: number; retired: number; held_reservations: number; needs_you: number } | null
+  coverage?: string[]
+  statusDigest?: string | null
   repository: string
   provider: string
   unfinished: { total: number; moving: number; stuck: number }
@@ -199,15 +202,19 @@ function decodeRepositoryRow(raw: unknown): RepositoryRow | null {
   const r = rec(raw)
   const repository = typeof r['repository'] === 'string' && REPO.test(r['repository']) ? r['repository'] : null
   if (!repository) return null
-  const u = rec(r['unfinished'])
+  const u = rec(r['unfinished']), c = rec(r['status_counts'])
+  const hasStatus = ['active', 'awaiting_party', 'blocked', 'reassessment_needed', 'retired', 'held_reservations', 'needs_you'].every((k) => typeof c[k] === 'number' && Number.isSafeInteger(c[k]) && (c[k] as number) >= 0)
   return {
     repository,
     provider: typeof r['provider'] === 'string' && PROVIDER.test(r['provider']) ? r['provider'] : 'github',
     unfinished: { total: count(u['total']), moving: count(u['moving']), stuck: count(u['stuck']) },
-    needsYou: count(r['needs_you']),
+    needsYou: hasStatus ? count(c['needs_you']) : 0,
+    statusCounts: hasStatus ? { active: count(c['active']), awaiting_party: count(c['awaiting_party']), blocked: count(c['blocked']), reassessment_needed: count(c['reassessment_needed']), retired: count(c['retired']), held_reservations: count(c['held_reservations']), needs_you: count(c['needs_you']) } : null,
+    coverage: Array.isArray(r['coverage']) ? r['coverage'].filter((v): v is string => typeof v === 'string').slice(0, 256) : ['shared_status_unavailable'],
+    statusDigest: typeof r['status_digest'] === 'string' ? r['status_digest'] : null,
     agents: count(r['agents']),
     lastActivityAt: unix(r['last_activity_at']),
-    complete: r['complete'] === true,
+    complete: hasStatus && r['complete'] === true,
   }
 }
 

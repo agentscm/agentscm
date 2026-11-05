@@ -1,11 +1,20 @@
+import { resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DeviceAuth } from '../../src/devices.ts'
+import type { ActionableStatus } from '../../src/actionableStatus.ts'
 import { RepositoriesPage } from '../../src/pages/Repositories.tsx'
 import type { WorkItem, WorkOverview } from '../../src/standup.ts'
 
+// Load shared evidence only at test runtime; the UI Docker build copies only ui/.
+const statusFixture = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/actionable-status.json'), 'utf8')) as ActionableStatus
+
 const AUTH = { kind: 'ready', value: { kind: 'browser', session: { login: 'example-user', provider: 'github', admin: false, csrf: 'csrf-token-0123456789' } } } as const satisfies { kind: 'ready'; value: DeviceAuth }
-const ROW = (repository: string, extra: Record<string, unknown> = {}) => ({ repository, repository_id: 1, provider: 'github', unfinished: { total: 0, moving: 0, stuck: 0 }, needs_you: 0, agents: 0, last_activity_at: null, complete: true, ...extra })
+const ROW = (repository: string, extra: Record<string, unknown> = {}) => {
+  const u = (extra.unfinished ?? { total: 0, moving: 0, stuck: 0 }) as { total: number; moving: number; stuck: number }
+  return { repository, repository_id: 1, provider: 'github', unfinished: u, needs_you: 0, agents: 0, last_activity_at: null, complete: true, status_counts: { active: u.moving, blocked: u.stuck, awaiting_party: 0, reassessment_needed: 0, retired: 0, held_reservations: u.total, needs_you: extra.needs_you ?? 0 }, ...extra }
+}
 
 const ITEM = (id: string, extra: Record<string, unknown> = {}) => ({ id, owner_login: 'maria', title: `Task ${id}`, state: 'active', claim_status: 'active', last_checkin_at: Math.floor(Date.now() / 1000) - 300, lead_agent: 'claude-code', ...extra }) as unknown as WorkItem
 const OVERVIEW = (current: WorkItem[]) => ({ current, recent: [], overlaps: [], recent_since: 0, until: 86_400, recent_complete: true, history_retention_gap: false }) as unknown as WorkOverview
@@ -26,6 +35,16 @@ afterEach(() => {
 describe('All repositories', () => {
   const now = () => Math.floor(Date.now() / 1000)
 
+  it('uses frozen shared counts and treats older Hub attention as unavailable', async () => {
+    stubList({ repositories: [ROW('example-org/api', { agents: 1, status_counts: statusFixture.counts }), ROW('example-org/legacy', { agents: 1, needs_you: 99, status_counts: undefined })], unchecked: 0, complete: true })
+    render(<RepositoriesPage auth={AUTH} web={{ repos: [], pick: vi.fn(), refusal: null }} current={null} />)
+    await screen.findByRole('region', { name: 'Needs you most: example-org/api' })
+    expect(document.querySelector('.answer-text')?.textContent).toBe('api needs you.')
+    expect(screen.getByText('Shared status unavailable; open the repository to check.')).toBeTruthy()
+    expect(screen.queryByText(/99 waiting on you/)).toBeNull()
+    expect(document.querySelector('.rp-focus')?.textContent).toContain('2 blocked')
+  })
+
   it('names the repositories that need you, leads with the one with most waiting, and groups the rest', async () => {
     stubList({ repositories: [
       ROW('example-org/ops', { needs_you: 2, unfinished: { total: 1, moving: 0, stuck: 1 }, agents: 1, last_activity_at: now() - 3600 }),
@@ -42,8 +61,8 @@ describe('All repositories', () => {
     // A tie on waiting-on-you goes to the most recent activity, and the card is for that repository only.
     expect(focus.getAttribute('aria-label')).toBe('Needs you most: example-org/api')
     expect(focus.querySelector('h2')?.textContent).toBe('2 things are waiting on you.')
-    expect(focus.querySelector('.rp-facts')?.textContent).toContain('2 stuck')
-    expect(focus.querySelector('.rp-facts')?.textContent).toContain('1 moving')
+    expect(focus.querySelector('.rp-facts')?.textContent).toContain('2 blocked')
+    expect(focus.querySelector('.rp-facts')?.textContent).toContain('1 active')
     expect(focus.querySelector('.rp-facts')?.textContent).toContain('4 agents connected')
     expect(focus.querySelector('.rp-facts')?.textContent).toContain('active')
     expect(document.querySelector('.answer-text')?.textContent).toBe('api and ops need you.')
@@ -52,18 +71,18 @@ describe('All repositories', () => {
     const rowsOf = (title: string) => within(screen.getByRole('list', { name: title })).getAllByRole('listitem')
     const names = (title: string) => rowsOf(title).map((r) => r.querySelector('.rp-rname')?.textContent)
     expect(names('Also needs you')).toEqual(['example-org/ops'])
-    expect(rowsOf('Also needs you')[0]!.querySelector('.rp-say')?.textContent).toBe('2 waiting on you, 1 stuck')
-    expect(names('Stuck')).toEqual(['example-org/slow'])
+    expect(rowsOf('Also needs you')[0]!.querySelector('.rp-say')?.textContent).toBe('2 waiting on you, 1 blocked')
+    expect(names('Awaiting action')).toEqual(['example-org/slow'])
     expect(names('Moving')).toEqual(['example-org/docs', 'example-org/busy'])
     // Lower bounds say so; a connected repository with nothing in progress says that, not a list of zeros.
     expect(rowsOf('Moving')[0]!.querySelector('.rp-say')?.textContent).toBe('Connected, nothing in progress')
-    expect(rowsOf('Moving')[1]!.querySelector('.rp-say')?.textContent).toBe('at least 3 moving')
+    expect(rowsOf('Moving')[1]!.querySelector('.rp-say')?.textContent).toBe('at least 3 active')
     // Each group head carries its count; the repositories in the focus card are not listed twice.
     expect(screen.getByRole('heading', { name: 'Also needs you' }).parentElement?.querySelector('.rp-n')?.textContent).toBe('1')
     expect(screen.queryByRole('button', { name: 'Open example-org/api' })).toBeNull()
     expect(screen.getByRole('button', { name: /2 quiet repositories/ }).getAttribute('aria-expanded')).toBe('false')
     expect(screen.getByText('1 repository could not be checked')).toBeTruthy()
-    expect(document.getElementById('repo-example-org/busy')?.textContent).toBe('Nothing needs you; at least 4 unfinished, 0 stuck; 6 agents connected.')
+    expect(document.getElementById('repo-example-org/busy')?.textContent).toBe('No personal action observed in partial coverage; at least 4 unfinished, 0 blocked, 0 awaiting a named party, 0 reassessment needed; 6 agents connected.')
   })
 
   it('says nothing needs you, names where agents work, and lists the active repositories as one group', async () => {
@@ -74,10 +93,10 @@ describe('All repositories', () => {
     expect(document.querySelector('.answer-fact')?.textContent).toBe('Agents are working in api and docs.')
     expect(document.querySelector('.rp-checked')?.textContent).toBe('Counts only, checked against your role on the forge.')
     expect(screen.queryByRole('region', { name: /Needs you most/ })).toBeNull()
-    expect(screen.queryByRole('list', { name: 'Stuck' })).toBeNull()
+    expect(screen.queryByRole('list', { name: 'Awaiting action' })).toBeNull()
     const rows = within(screen.getByRole('list', { name: 'Moving on their own' })).getAllByRole('listitem')
     expect(rows.map((r) => r.querySelector('.rp-rname')?.textContent)).toEqual(['example-org/api', 'example-org/recent', 'example-org/docs'])
-    expect(rows[0]!.textContent).toContain('3 moving')
+    expect(rows[0]!.textContent).toContain('3 active')
     expect(rows[1]!.textContent).toContain('No agent connected')
     expect(screen.getByRole('button', { name: /1 quiet repository/ })).toBeTruthy()
   })
