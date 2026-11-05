@@ -297,19 +297,25 @@ impl Hook {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_hooks_share_the_mcp_connection_and_keep_legacy_bytes_and_rotated_tokens() {
+async fn real_hooks_share_the_relays_own_pool_and_keep_legacy_bytes_and_rotated_tokens() {
     let fixture = Fixture::new().await;
     let mut host = fixture.host();
     let warm = fixture.received();
     assert!(warm.uri.starts_with("/mcp?"));
+    fixture.hook("PreToolUse", true, |_| {}).finish(true);
+    let owner = fixture.only_hook().peer;
+    assert_ne!(
+        owner, warm.peer,
+        "relay and MCP must have independent pools"
+    );
     for plugin in [true, false] {
         let hook = fixture.hook("PreToolUse", plugin, |_| {});
         let raw = hook.body.clone();
         hook.finish(true);
         let seen = fixture.only_hook();
         assert_eq!(
-            seen.peer, warm.peer,
-            "hook must use the MCP-owned pool, not direct HTTPS"
+            seen.peer, owner,
+            "separate hook processes must reuse the relay connection"
         );
         assert_eq!(seen.headers["authorization"], format!("Bearer {TOKEN}"));
         if plugin {
@@ -327,7 +333,7 @@ async fn real_hooks_share_the_mcp_connection_and_keep_legacy_bytes_and_rotated_t
     private_file(&fixture.token, b"synthetic-rotated-token");
     fixture.hook("PreToolUse", true, |_| {}).finish(true);
     let rotated = fixture.only_hook();
-    assert_eq!(rotated.peer, warm.peer);
+    assert_eq!(rotated.peer, owner);
     assert_eq!(
         rotated.headers["authorization"],
         "Bearer synthetic-rotated-token"
@@ -336,7 +342,7 @@ async fn real_hooks_share_the_mcp_connection_and_keep_legacy_bytes_and_rotated_t
     fixture.hook("PreToolUse", true, |_| {}).finish(true);
     assert_ne!(
         fixture.only_hook().peer,
-        warm.peer,
+        owner,
         "stdio EOF must release the relay"
     );
 }
@@ -347,7 +353,9 @@ async fn missing_or_proxy_or_binary_mismatched_relays_fall_back_without_loss() {
     fixture.hook("PreToolUse", true, |_| {}).finish(true);
     fixture.only_hook();
     let _host = fixture.host();
-    let owner = fixture.received().peer;
+    fixture.received();
+    fixture.hook("PreToolUse", true, |_| {}).finish(true);
+    let owner = fixture.only_hook().peer;
     fixture
         .hook("PreToolUse", true, |command| {
             command.env("NO_PROXY", "127.0.0.1");
@@ -378,15 +386,31 @@ async fn missing_or_proxy_or_binary_mismatched_relays_fall_back_without_loss() {
 async fn a_second_host_takes_over_when_the_owners_stdio_ends() {
     let fixture = Fixture::new().await;
     let mut first = fixture.host();
-    let owner = fixture.received().peer;
+    fixture.received();
+    fixture.hook("PreToolUse", true, |_| {}).finish(true);
+    let owner = fixture.only_hook().peer;
     let _second = fixture.host();
     let standby = fixture.received().peer;
     fixture.hook("PreToolUse", true, |_| {}).finish(true);
     assert_eq!(fixture.only_hook().peer, owner);
     first.stop();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    fixture.hook("PreToolUse", true, |_| {}).finish(true);
-    assert_eq!(fixture.only_hook().peer, standby);
+    let started = Instant::now();
+    let mut previous = None;
+    loop {
+        fixture.hook("PreToolUse", true, |_| {}).finish(true);
+        let successor = fixture.only_hook().peer;
+        assert_ne!(successor, owner);
+        assert_ne!(successor, standby, "standby's MCP pool stays independent");
+        if previous == Some(successor) {
+            break;
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "standby must take over and pool hooks"
+        );
+        previous = Some(successor);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -398,7 +422,9 @@ async fn accepted_then_dead_is_not_resent_and_wedged_calls_keep_the_hook_deadlin
     ] {
         let fixture = Fixture::new().await;
         let mut host = fixture.host();
-        let owner = fixture.received().peer;
+        fixture.received();
+        fixture.hook("PreToolUse", true, |_| {}).finish(true);
+        let owner = fixture.only_hook().peer;
         fixture.stalled.store(true, Ordering::SeqCst);
         let hook = fixture.hook(event, true, |_| {});
         assert_eq!(
@@ -429,7 +455,7 @@ async fn accepted_then_dead_is_not_resent_and_wedged_calls_keep_the_hook_deadlin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_real_hub_registers_and_ends_a_session_over_the_mcp_pool() {
+async fn a_real_hub_registers_and_ends_a_session_over_the_relay_pool() {
     use agentscm::backend::LocalBackend;
     use agentscm::hub::store::{self, ForgeIdentity, mint_agent_token};
     use agentscm::hub::{HubState, router};
@@ -489,7 +515,8 @@ async fn a_real_hub_registers_and_ends_a_session_over_the_mcp_pool() {
         .unwrap(),
     );
     let _host = fixture.host();
-    let owner = fixture.received().peer;
+    let mcp = fixture.received().peer;
+    let mut owner = None;
     for event in ["SessionStart", "SessionEnd"] {
         let output = fixture
             .hook(event, true, |_| {})
@@ -508,6 +535,8 @@ async fn a_real_hub_registers_and_ends_a_session_over_the_mcp_pool() {
         } else {
             assert_eq!(reply, json!({}));
         }
-        assert_eq!(fixture.only_hook().peer, owner);
+        let peer = fixture.only_hook().peer;
+        assert_ne!(peer, mcp);
+        assert_eq!(*owner.get_or_insert(peer), peer);
     }
 }

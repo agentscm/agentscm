@@ -276,8 +276,12 @@ impl Pool {
 pub struct Relay(JoinHandle<()>);
 
 impl Relay {
-    pub fn spawn(address: Address, client: Client) -> Self {
+    pub fn spawn(address: Address) -> Self {
         Self(tokio::spawn(async move {
+            let Ok(client) = crate::hub::forge_http::client() else {
+                eprintln!("agentscm: hook relay client unavailable; hooks can use direct HTTPS");
+                return;
+            };
             let pool = Arc::new(Mutex::new(Pool::new(client)));
             let mut retry = RETRY_MIN;
             loop {

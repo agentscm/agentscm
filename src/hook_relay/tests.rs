@@ -435,7 +435,7 @@ mod unix {
                     .is_err()
             );
         });
-        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let relay = Relay::spawn(address.clone());
         let mut hook = request();
         let first = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -501,7 +501,7 @@ mod unix {
     async fn another_mcp_host_takes_over_when_the_owner_exits() {
         let (_scratch, address) = address();
         let mut owner = transport::Listener::bind(&address).unwrap().unwrap();
-        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let relay = Relay::spawn(address.clone());
         let mut subscription = tokio::time::timeout(Duration::from_secs(1), owner.accept())
             .await
             .unwrap()
@@ -552,7 +552,7 @@ mod unix {
     async fn standby_retries_timeouts_with_backoff_and_still_takes_over() {
         let (_scratch, address) = address();
         let mut owner = transport::Listener::bind(&address).unwrap().unwrap();
-        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let relay = Relay::spawn(address.clone());
         let mut first = tokio::time::timeout(Duration::from_secs(1), owner.accept())
             .await
             .unwrap()
@@ -603,7 +603,7 @@ mod unix {
     async fn standby_stops_for_version_mismatch_and_observer_cap() {
         let (_scratch, address) = address();
         let mut owner = transport::Listener::bind(&address).unwrap().unwrap();
-        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let relay = Relay::spawn(address.clone());
         let mut stream = tokio::time::timeout(Duration::from_secs(1), owner.accept())
             .await
             .unwrap()
@@ -618,7 +618,7 @@ mod unix {
         .unwrap();
         drop(relay);
         drop(owner);
-        let owner = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let owner = Relay::spawn(address.clone());
         let mut observers = Vec::new();
         for _ in 0..OBSERVERS {
             let mut stream = ready(&address).await;
@@ -632,7 +632,7 @@ mod unix {
             wait_for_owner(&address).await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-        let standby = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let standby = Relay::spawn(address.clone());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !standby.0.is_finished() {
                 tokio::task::yield_now().await;
@@ -751,7 +751,7 @@ mod unix {
     async fn dropping_a_standby_host_closes_its_ownership_subscription() {
         let (_scratch, address) = address();
         let mut owner = transport::Listener::bind(&address).unwrap().unwrap();
-        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let relay = Relay::spawn(address.clone());
         let mut subscription = tokio::time::timeout(Duration::from_secs(1), owner.accept())
             .await
             .unwrap()
@@ -873,7 +873,7 @@ mod unix {
                     .is_err()
             );
         });
-        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let relay = Relay::spawn(address.clone());
         for _ in 0..2 {
             let reply = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -901,7 +901,7 @@ mod unix {
     #[tokio::test]
     async fn dropping_the_owner_cancels_pending_requests_and_observers() {
         let (_scratch, address) = address();
-        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let relay = Relay::spawn(address.clone());
         let mut observer = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Ok(stream) = transport::connect(&address).await {
