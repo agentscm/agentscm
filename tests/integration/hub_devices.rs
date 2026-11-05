@@ -1352,8 +1352,7 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     );
     let reply = machine.session_start("s2");
     assert!(
-        context(&reply)
-            .starts_with("AgentSCM: Your role on acme/widgets isn't enough for this Hub"),
+        context(&reply).starts_with("AgentSCM: alice has no access on private repository"),
         "{reply}"
     );
 
