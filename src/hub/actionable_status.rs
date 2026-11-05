@@ -1242,6 +1242,207 @@ mod tests {
             "an arbitrary empty credential never confers person authority"
         );
     }
+    /// What every surface counts, without ids, digests or read times.
+    fn attention_signature(status: &ActionableStatus) -> Vec<String> {
+        let login = |r: &StatusRecipient| r.login.clone().unwrap_or_default();
+        let mut rows = status
+            .work
+            .iter()
+            .map(|w| {
+                format!(
+                    "work {} {:?} {:?} {} needs_you={}",
+                    w.title,
+                    w.state,
+                    w.recipient.kind,
+                    login(&w.recipient),
+                    w.needs_you
+                )
+            })
+            .chain(status.actions.iter().map(|a| {
+                let mut logins = a.recipients.iter().map(login).collect::<Vec<_>>();
+                logins.sort();
+                format!("{} {} needs_you={}", a.kind, logins.join(","), a.needs_you)
+            }))
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    /// The #290 cases from a real store: the viewer's paused Work with a stale claim, a request
+    /// to it, a request between two other people, and file and pull request crossings with and
+    /// without the viewer. The shared fixture the companion and Hub tests count must match.
+    fn needs_you_contract(store: &dyn Store) {
+        use crate::hub::connection::NewConnection;
+        use crate::hub::intent::NewIntent;
+        let now = crate::hub::store::unix_now();
+        let token = |user_id: i64, login: &str| {
+            let user = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap();
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, login, "acme/widgets", 101, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let viewer = token(301, "viewer");
+        let other = token(302, "other");
+        let third = token(303, "third");
+        let start = |who: &Principal, title: &str, path: &str| {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": format!("{title}-{}", who.owner.login),
+                "title": title, "session": format!("{}-session", who.owner.login), "scope": [path]
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap()
+        };
+        let paused = start(&viewer, "Paused own work", "src/paused.rs").item;
+        store
+            .work_checkpoint(
+                &viewer.token_id,
+                &WorkCheckpoint {
+                    work_id: paused.id.clone(),
+                    operation_id: "synthetic-pause".into(),
+                    generation: paused.generation,
+                    session: paused.lead_session.clone(),
+                    expected_updated_seq: Some(paused.updated_seq),
+                    kind: CheckpointKind::Pause,
+                    summary: "Synthetic pause".into(),
+                    next_action: None,
+                    scope: None,
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: vec![],
+                    depends_on: vec![],
+                    related_work: vec![],
+                },
+                now,
+            )
+            .unwrap();
+        let to_viewer = start(&other, "Other asks viewer", "src/paused.rs");
+        assert!(to_viewer.coordination_request.is_some());
+        start(&third, "Third's work", "src/third.rs");
+        let between_others = start(&other, "Other asks third", "src/third.rs");
+        assert!(between_others.coordination_request.is_some());
+        let intent = |who: &Principal, id: char, path: &str| {
+            store
+                .announce_intent(
+                    &who.token_id,
+                    &NewIntent {
+                        id: format!("int_{}", id.to_string().repeat(32)),
+                        task: "Synthetic edit".into(),
+                        branch: None,
+                        base: None,
+                        machine: None,
+                        paths: vec![path.into()],
+                        ttl_seconds: 3600,
+                    },
+                    now,
+                )
+                .unwrap();
+        };
+        intent(&viewer, 'a', "src/shared.rs");
+        intent(&other, 'b', "src/shared.rs");
+        intent(&other, 'c', "src/others.rs");
+        intent(&third, 'd', "src/others.rs");
+        let connection = store
+            .insert_connection(
+                &NewConnection {
+                    id: format!("con_{}", "e".repeat(32)),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("viewer".into()),
+                },
+                &viewer.owner.id,
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(
+                &connection.id,
+                "github.com",
+                101,
+                "acme/widgets",
+                None,
+                None,
+            )
+            .unwrap();
+        for (number, file) in [(7, "src/shared.rs"), (8, "src/others.rs")] {
+            let pull = json!({"number":number,"state":"open","head_sha":"synthetic-head","files":[file],"files_truncated":false});
+            store
+                .observe(
+                    &repo.id,
+                    "pull_request",
+                    &number.to_string(),
+                    &pull.to_string(),
+                    now,
+                )
+                .unwrap();
+        }
+        // Every lead's claim is now stale; held reservations have not yet lapsed.
+        let later = now + crate::hub::work::CLAIM_STALE_SECONDS + 60;
+        let status = read(store, &viewer, later).unwrap();
+        let fixture: ActionableStatus =
+            serde_json::from_str(include_str!("fixtures/needs-you-surfaces.json")).unwrap();
+        assert_eq!(attention_signature(&status), attention_signature(&fixture));
+        assert_eq!(status.counts.needs_you, 4);
+        assert_eq!(status.counts.needs_you, fixture.counts.needs_you);
+        let mut personal = status
+            .work
+            .iter()
+            .filter(|w| w.needs_you)
+            .map(|w| w.work_id.clone())
+            .chain(
+                status
+                    .actions
+                    .iter()
+                    .filter(|a| a.needs_you)
+                    .map(|a| a.id.clone()),
+            )
+            .collect::<Vec<_>>();
+        personal.sort();
+        let mut expected = vec![
+            paused.id.clone(),
+            format!(
+                "request:{}:{}",
+                to_viewer.coordination_request.unwrap().id,
+                paused.id
+            ),
+            "file:src/shared.rs".into(),
+            format!("pr:{}:7", repo.id),
+        ];
+        expected.sort();
+        assert_eq!(personal, expected);
+        assert_eq!(
+            read(store, &third, later).unwrap().counts.needs_you,
+            4,
+            "the third person's own Work, request, file and pull request count for them instead"
+        );
+    }
+
+    #[test]
+    fn sqlite_needs_you_counts_match_the_shared_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        needs_you_contract(&*store);
+    }
+
     #[test]
     fn sqlite_status_reader_is_scoped_deterministic_and_reports_limits() {
         let dir = tempfile::tempdir().unwrap();
@@ -1349,6 +1550,14 @@ mod tests {
     }
     #[test]
     fn postgres_status_reader_conformance() {
+        on_postgres(store_contract);
+    }
+    #[test]
+    fn needs_you_counts_match_the_shared_fixture_on_postgres() {
+        on_postgres(needs_you_contract);
+    }
+    /// Runs one contract in its own disposable schema.
+    fn on_postgres(contract: fn(&dyn Store)) {
         let Ok(base) = std::env::var("AGENTSCM_TEST_DATABASE_URL") else {
             eprintln!("skipping PostgreSQL status conformance: AGENTSCM_TEST_DATABASE_URL unset");
             return;
@@ -1386,7 +1595,7 @@ mod tests {
             "{base}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
         );
         let store = store::open(&url).unwrap();
-        store_contract(&*store);
+        contract(&*store);
     }
     #[test]
     fn sqlite_status_keeps_reservations_visible_at_the_work_limit() {

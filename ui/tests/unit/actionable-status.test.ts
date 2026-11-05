@@ -13,6 +13,8 @@ import type { HubData } from '../../src/useHub.ts'
 
 // Load shared evidence only at test runtime; the UI Docker build copies only ui/.
 const fixture = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/actionable-status.json'), 'utf8')) as ActionableStatus
+// A real store's projection of #290's cases; the menu-bar companion counts the same file.
+const surfaces = JSON.parse(readFileSync(resolve(process.cwd(), '../src/hub/fixtures/needs-you-surfaces.json'), 'utf8')) as ActionableStatus
 
 describe('shared actionable status', () => {
   it('uses frozen counts and named recipients without reinterpreting reports', () => {
@@ -25,6 +27,17 @@ describe('shared actionable status', () => {
     expect(recipientLabel(status.work[2]!.recipient)).toBe('viewer')
     expect(statusLabel(status.work[2]!.state)).toBe('Awaiting a named party')
     expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs).toHaveLength(3)
+  })
+  it('badges the same needs the menu-bar companion counts', () => {
+    const status = decodeStatus(surfaces)
+    const rail = dashboardStatus(null, null, null, null, new Set(), undefined, status).needs
+    expect(rail.map((n) => n.key).sort()).toEqual([
+      'file:src/shared.rs',
+      'pr:rep_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:7',
+      'request:crq_cccccccccccccccccccccccccccccccc:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      'status:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    ])
+    expect(rail).toHaveLength(status.counts.needs_you)
   })
   it('uses semantic action versions for browser dismissals with legacy fixture compatibility', () => {
     const status = decodeStatus(fixture)
