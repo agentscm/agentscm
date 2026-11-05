@@ -16,7 +16,12 @@ use super::manifest::{Manifest, sha_hex};
 use super::process::{diagnostic, run};
 use crate::prompt::Ui;
 
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+fn control_timeout() -> Duration {
+    super::deadline_override(
+        "AGENTSCM_TEST_CONTROL_TIMEOUT_SECS",
+        Duration::from_secs(30),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Record {
@@ -1028,7 +1033,7 @@ fn user_domain() -> Result<String, String> {
 }
 
 fn launchctl(arguments: &[&str]) -> Result<(), String> {
-    let output = run(Command::new("launchctl").args(arguments), CONTROL_TIMEOUT)?;
+    let output = run(Command::new("launchctl").args(arguments), control_timeout())?;
     if output.success {
         Ok(())
     } else {
@@ -1043,7 +1048,7 @@ fn launchctl(arguments: &[&str]) -> Result<(), String> {
 fn native_service_loaded(target: &str, label: &str) -> Result<bool, String> {
     let status = run(
         Command::new("launchctl").args(["print", target]),
-        CONTROL_TIMEOUT,
+        control_timeout(),
     )?;
     if status.success {
         Ok(true)
@@ -1065,7 +1070,7 @@ fn stop_native_service(target: &str) -> Result<(), String> {
     let bootout = launchctl(&["bootout", target]);
     let status = run(
         Command::new("launchctl").args(["print", target]),
-        CONTROL_TIMEOUT,
+        control_timeout(),
     )?;
     if service_absent(&status, label) {
         return Ok(());
@@ -1939,7 +1944,7 @@ pub(crate) async fn start(
                 "print",
                 &format!("{}/{}", runtime.domain, runtime.record.label),
             ]),
-            CONTROL_TIMEOUT,
+            control_timeout(),
         )
         .map(|output| diagnostic(&output))
         .unwrap_or_default();
@@ -2043,7 +2048,7 @@ pub(crate) fn uninstall(manifest: &mut Manifest, home: &Path, wipe: bool) -> Res
     let target = format!("{domain}/{}", record.label);
     let printed = run(
         Command::new("launchctl").args(["print", &target]),
-        CONTROL_TIMEOUT,
+        control_timeout(),
     )?;
     if printed.success {
         if plist.is_none()
