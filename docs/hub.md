@@ -612,14 +612,14 @@ Bearer <token>` and the token's repository; both share one code path, so the
 same edit gives the same advice either way. Configuration files must take the
 token from an environment variable, never contain it.
 
-Native command hooks first try the local relay owned by `agentscm client mcp`. It reuses the
-MCP host's hardened HTTPS connection pool; the relay ends with that host's stdio session, with
+Native command hooks first try the local relay hosted by `agentscm client mcp`. The relay keeps
+its own hardened HTTPS connection pool; it ends with that host's stdio session, with
 another live host taking over if needed. macOS/Linux use an owner-private Unix socket and
 Windows uses a same-user named pipe. Only hooks with the same Hub, config directory, binary
 and proxy environment share it; others call the Hub directly. Missing or incompatible relays
 cost at most a 10 ms probe, within the existing 3 s hook / 4.5 s session-start budget. Once a
 relay accepts a call it is never resent, even if its reply is lost: coordination is unknown
-and the hook fails open. Pools older than 30 s since their last reply are refreshed using
+and the hook fails open. Pools with no completed reply in 30 s are refreshed using
 wall time, including laptop sleep. A connection that dies silently inside that window fails
 that one call open; it is never retried. Tokens cross only the same-user local transport per
 request and HTTPS, never a relay file or log. No secret is persisted by the relay.

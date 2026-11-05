@@ -17,17 +17,9 @@ AgentSCM is a native Rust source-control system for concurrent human and agent w
 - Rust is required for first-party engine/server/CLI/sync/policy/verifier/review orchestration. Established databases and external model runtimes remain dependencies.
 
 ## Hook transport
-`agentscm client mcp` owns the local command-hook relay for its stdio lifetime, sharing its
-hardened HTTPS pool rather than spawning a daemon. The key binds Hub origin, config directory,
-binary identity and proxy environment, not the per-request token. Hooks with a different key
-or no live relay use direct HTTPS. Unix sockets verify same-user peers and owner-private
-directory/socket permissions; Windows named pipes restrict and verify the owner. Only the
-configured Hub's hook endpoint is forwarded, with bounded framing and the original hook
-deadline. A 10 ms discovery probe may fall back; an accepted call never does, preventing
-duplicate non-idempotent POSTs. A pool with no completed reply in 30 s is rebuilt using wall
-time, so sleep expires it too. Silent connection loss within those 30 s fails that call open
-as coordination unknown, without a resend. Tokens and TLS state stay in memory; relay files
-contain no secrets. See [Agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints).
+`agentscm client mcp` hosts the local command-hook relay for its stdio lifetime; the relay
+keeps its own hardened HTTPS pool. See [Agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints)
+for transport security, matching rules, deadlines and fail-open limits.
 
 ## Alpha status
 The native engine is a local alpha: immutable blobs, persistent manifest trie, incremental revisions, selective reads/diff, a SQLite integration authority, bound local human approvals, durable journal/idempotency, CLI, read-only source HTTP API and container packaging. The local owner is trusted; no multi-tenant or production network-security claim is made. No native source garbage collector runs yet, so source objects persist until the operator removes the store. The current object encoding and API are experimental; a stable interoperable protocol requires conformance and migration work that is not yet done (see the [roadmap](roadmap.md)).
