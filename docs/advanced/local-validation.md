@@ -491,3 +491,54 @@ jobs:
 Set `AUTHENTICATED_FETCH` to `true` only for the canonical private GitHub case described above. The fallback builds only the exact pinned AgentSCM source and reads only the caller's default-branch configuration; pull request code is fetched as inert Git data and is never checked out or run.
 
 The job-level concurrency placement is security-relevant. A workflow-level group is entered before the `if:` is evaluated, so an ignored comment run could supersede the pending eligible run and then do nothing. GitHub keeps only the newest pending run in a group even with `cancel-in-progress: false`; full sweeps prevent a run for one pull request from superseding another pull request's only reconciliation.
+
+## Selected tests and merge batches (staged, unqualified)
+
+The optional `test_selection` command field supports deterministic, forge-neutral test selection. It is implemented in Rust independently of GitHub queue orchestration. This repository's active recipe still runs the full Rust gate: it has no selection rules, and its published producer/verifier pin must be upgraded before a recipe uses the new field. The GitHub adapter workflows are committed preparation, not evidence that a merge queue is enabled or qualified. GitLab merge trains and Codeberg landing adapters are not implemented or qualified.
+
+The intended three tiers are:
+
+1. PR development: formatting, Clippy and selected nextest tests, plus the existing path-selected documentation, UI, audit and installer checks. Unmapped or shared changes run the full Rust suite. A Markdown-only change retains the existing documentation-only checks.
+2. Merge batch: one full Rust nextest suite and separate doctests on GitHub's exact combined `merge_group.head_sha`, with PostgreSQL and S3. Two individually passing PR heads can fail together; PR-head evidence never authorizes a different combined tree. GitHub owns queue retries, splitting and landing; AgentSCM does not merge branches or operate a local train.
+3. Release: the separate platform, artifact and local Hub qualification in [releasing](../releasing.md). Neither a filtered pass nor a batch Rust pass establishes Windows, container smoke, Hub end-to-end, UI runtime or live execution coverage.
+
+### Selection contract
+
+A reviewed recipe may add this field to its existing nextest command, keeping `argv` exactly `cargo nextest run --locked`:
+
+```json
+{
+  "id": "nextest",
+  "argv": ["cargo", "nextest", "run", "--locked"],
+  "timeout_secs": 3600,
+  "test_selection": {
+    "rules": [
+      {"path": "tests/integration/git_collisions.rs", "filter": "test(/^git_collisions::/)"},
+      {"path": "tests/integration/local_validation.rs", "filter": "test(/^local_validation::/)"}
+    ]
+  }
+}
+```
+
+This is an example, not the repository's active configuration. Rules use exact repository paths and reviewed nextest expressions. Start with individually modified integration modules after inspecting their callers and shared helpers; a matching filename alone does not establish sufficient coverage. The product accepts explicit reviewed mappings for other files, but does not infer a mapping from names.
+
+Existing command `paths` first decide whether a command is required. Selection changes only a required command's argv. When every changed path is a mapped modification, its filters are sorted, deduplicated and joined with OR, then passed as one `-E` argument. An empty change, an unmapped path, any added/deleted/renamed/type-changed path, a trust input or a built-in shared input retains the full command. Shared inputs include `Cargo.*`, `build.rs`, `.config/`, `tests/integration/common/` and the integration runner `main.rs`. Non-UTF-8 paths or observations beyond the bounded path budget fail observation explicitly; they never yield an accepted reduced run.
+
+The signed record's `selections` binds command ID, typed reason (`selected`, `unmapped_path`, `non_modified_path`, `trust_input`, `shared_input` or `empty_change`), sorted changed paths, filters and effective argv. A reduced run carries a coverage omission and its comment displays the selection. `verify` and `reconcile` independently derive the selection from observed Git source and the trusted recipe, then compare it with the record and command results. A signed worker claim does not become selection authority. Absent selection fields retain legacy serialized bytes; strict older binaries reject the new fields.
+
+### GitHub adapter and activation
+
+`merge-admission.yml` runs trusted workflow-source scripts only; it never checks out PR source or downloads PR artifacts. It creates a pending `Merge batch gate` check on each current PR head before inspecting prerequisites, and accepts only the latest legacy `agentscm/local-validation` status from the GitHub Actions bot and the Conventional PR title check from the GitHub Actions app. It also validates the current title with the existing trusted title validator, and re-reads head, base and title before publishing. Missing, untrusted or pending inputs stay pending; failures refuse admission. Starting either prerequisite workflow invalidates admission to pending; completion refreshes open default-branch PRs, with a fail-closed 500-record pagination bound. An out-of-order start event can leave a newer acceptance pending; rerun a prerequisite workflow to reconcile it. These identity checks preserve the existing GitHub Actions trust boundary; they do not prove which workflow wrote a status.
+
+`merge-batch.yml` reports the same check name, `Merge batch gate`, from a service-backed full-suite job on the exact group SHA. Its checkout does not persist credentials and its permissions are read-only. The PR admission check means the PR can enter the queue; only the group check qualifies combined source. The existing Hub-native single-entry queue feature is a separate experimental interface and is not used by this adapter.
+
+Activate in reviewed stages:
+
+1. Merge and publish a compatible AgentSCM binary. Follow [published acquisition and pin qualification](../releasing.md#activating-the-reusable-local-validation-workflow), then upgrade the producer/verifier pin together. Keep the current full-head recipe and required checks throughout bootstrap.
+2. Qualify admission and group checks on real PRs with the full-head recipe still active. Exercise late evidence, failed/pending/untrusted prerequisites, head/base/title movement, API errors, combined semantic failures and queue retry/splitting. Confirm the check identity and exact group SHA. API failure after pending creation leaves admission blocked; failure to create that pending check cannot guarantee invalidation of an older success and requires operator investigation.
+3. In an operator-controlled ruleset change, require GitHub's merge queue and the `Merge batch gate` check from GitHub Actions. Replace the legacy local-validation and title required contexts only once the admission gate is observed enforcing both: those legacy workflows are PR-head-only and requiring their contexts on group commits stalls the queue. Preserve reviews, signing, permissions and bypass restrictions. Do not require a batch gate while allowing direct PR merges to bypass the queue.
+4. Only after the full group gate is enforced, add reviewed test mappings to the recipe and update its policy's recipe digest. Qualify a real filtered PR and shared/unmapped full fallbacks, then verify the combined group receives a fresh full-suite result. Configuration changes invalidate prior attestations.
+
+Committing these workflows does not configure the ruleset, release a compatible binary or prove real queue execution. Until those stages complete, #369's deployment acceptance remains open and this repository retains its current full-head gate. To roll back, restore the full-head recipe and qualify its accepted attestations before reverting the ruleset to the legacy required contexts; never remove batch enforcement while relying only on filtered PR evidence.
+
+Contributors without a signing key retain the current [unsigned fallback](../contributor-testing.md#focused-iteration): report focused results during development, obtain maintainer attestation for the final head, or run the documented locked unsigned full gate and request adoption. Hosted diagnostics do not mint an accepted local attestation. No fork code may execute on a signing host.

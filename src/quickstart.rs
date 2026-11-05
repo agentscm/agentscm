@@ -302,9 +302,19 @@ async fn healthy(client: &reqwest::Client, url: &str) -> bool {
     )
 }
 
+/// `limit`, or the whole seconds in the environment variable `name` when it holds a number. Tests
+/// that need a Hub to stay unhealthy, or a command to hang, set it so they do not wait out a
+/// production deadline.
+fn deadline_override(name: &str, limit: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|seconds| seconds.parse().ok())
+        .map_or(limit, Duration::from_secs)
+}
+
 async fn wait_healthy(url: &str, limit: Duration) -> bool {
     let Ok(client) = client() else { return false };
-    let deadline = Instant::now() + limit;
+    let deadline = Instant::now() + deadline_override("AGENTSCM_TEST_HEALTH_WAIT_SECS", limit);
     while Instant::now() < deadline {
         if healthy(&client, url).await {
             return true;

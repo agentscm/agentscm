@@ -34,7 +34,7 @@ use super::promise::{
     PromiseInputV1, PromiseViewV1, current_admission,
 };
 use super::session::{
-    DEFAULT_SESSION, SESSION_REQUIRED, SessionCall, announce_for, announce_named, done_for,
+    DEFAULT_SESSION, SESSION_REQUIRED, SessionCall, announce_for, announce_named, done_pausing_for,
     duplicates_for, others_for, status_for,
 };
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
@@ -3072,86 +3072,20 @@ async fn done(
     session: Option<String>,
     completion_reporting: bool,
 ) -> Result<String> {
-    let store = state.store.clone();
-    let token = principal.token_id.clone();
-    let requested = session;
-    let lookup = blocking(state, move || {
-        let now = unix_now();
-        let resolved = store.session_name_for(&token, requested.as_deref(), now)?;
-        let item = store.work_for_session(&token, &resolved, now);
-        if completion_reporting
-            && let Ok(Some(item)) = item.as_ref()
-            && super::insights::record_completion(store.as_ref(), &token, item, &resolved, now)
-                .is_err()
-        {
-            eprintln!("hub: completion report failed");
-        }
-        Ok((resolved, item))
-    })
-    .await?;
-    let (resolved, item) = lookup;
-    let ended = done_for(state, principal, Some(resolved)).await?;
-    if !ended {
-        return Ok("AgentSCM: nothing to release.".into());
-    }
-    let item = match item {
-        Ok(Some(item)) => item,
-        Ok(None) => return Ok("AgentSCM: released.".into()),
-        Err(error) => {
-            eprintln!("hub: work lookup at agentscm_done: {error}");
-            return Ok("AgentSCM: released. Larger work checkpoint status is unknown.".into());
-        }
-    };
-    match item.state {
-        WorkState::Paused => {
-            return Ok("AgentSCM: released; unfinished durable work remains paused for resumption or deliberate handover.".into());
-        }
-        WorkState::Blocked => {
-            return Ok("AgentSCM: released; durable work remains blocked and its blocker was not resolved.".into());
-        }
-        WorkState::Handover => {
-            return Ok(
-                "AgentSCM: released; durable work remains ready for deliberate handover.".into(),
-            );
-        }
-        WorkState::Active => {}
-        WorkState::Finished => return Ok("AgentSCM: released.".into()),
-    }
-    let checkpoint = WorkCheckpoint {
-        work_id: item.id,
-        operation_id: format!(
-            "mcp-done-{}-{}-{}",
-            item.lead_session, item.generation, item.updated_seq
-        ),
-        generation: item.generation,
-        expected_updated_seq: Some(item.updated_seq),
-        session: item.lead_session,
-        kind: CheckpointKind::Pause,
-        summary: super::work::AUTO_PAUSE_SUMMARY.into(),
-        next_action: item
-            .next_action
-            .or_else(|| Some("Resume or deliberately hand over this unfinished work.".into())),
-        scope: None,
-        branch: None,
-        worktree: None,
-        resolve_blocker: false,
-        source_refs: Vec::new(),
-        depends_on: item.depends_on,
-        related_work: item.related_work,
-    };
-    let store = state.store.clone();
-    let token = principal.token_id.clone();
-    match blocking(state, move || {
-        store.work_checkpoint(&token, &checkpoint, unix_now())
-    })
-    .await
+    let end = done_pausing_for(state, principal, session, "mcp", completion_reporting).await?;
+    Ok(if end.paused {
+        "AgentSCM: released; unfinished durable work was paused for resumption or deliberate handover."
+    } else if !end.ended {
+        "AgentSCM: nothing to release."
+    } else if end
+        .work
+        .is_some_and(|item| item.state == WorkState::Blocked)
     {
-        Ok(_) => Ok("AgentSCM: released; unfinished durable work was paused for resumption or deliberate handover.".into()),
-        Err(error) => {
-            eprintln!("hub: pause checkpoint at agentscm_done: {error}");
-            Ok("AgentSCM: released. Larger work checkpoint status is unknown.".into())
-        }
+        "AgentSCM: released; durable work remains blocked and its blocker was not resolved."
+    } else {
+        "AgentSCM: released."
     }
+    .into())
 }
 
 async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) -> Result<Value> {

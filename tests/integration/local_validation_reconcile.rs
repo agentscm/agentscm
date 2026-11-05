@@ -58,6 +58,7 @@ impl Env {
                 id: "gate".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
                 timeout_secs: 30,
+                test_selection: None,
                 paths: None,
             }],
             None,
@@ -81,6 +82,7 @@ impl Env {
                 id: "gate".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
                 timeout_secs: 30,
+                test_selection: None,
                 paths: None,
             }],
             None,
@@ -426,7 +428,12 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 fn cli(root: &Path, args: &[&str]) -> Output {
+    let path = std::env::join_paths(std::iter::once(root.join("bin")).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .env("PATH", path)
         .args(["--no-telemetry", "--data-dir"])
         .arg(root.join("data"))
         .arg("local-validation")
@@ -952,6 +959,7 @@ async fn a_bun_shaped_recipe_without_services_produces_posts_and_reconciles() {
             id: "bun-test".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "test -f bun.lock".into()],
             timeout_secs: 30,
+            test_selection: None,
             paths: None,
         }],
         Some(vec!["bun.lock".into()]),
@@ -1387,6 +1395,7 @@ async fn an_attestation_listing_a_path_scoped_command_as_not_required_passes() {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
         timeout_secs: 30,
+        test_selection: None,
         paths,
     };
     let env = Env::with_recipe(
@@ -1453,6 +1462,7 @@ fn sh(id: &str, script: &str) -> RecipeCommand {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         timeout_secs: 30,
+        test_selection: None,
         paths: None,
     }
 }
@@ -2129,4 +2139,55 @@ async fn the_legacy_single_check_keeps_its_context_and_unprefixed_descriptions()
             .collect()
     });
     assert_eq!(contexts, ["agentscm/local-validation".to_owned()].into());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn selected_evidence_discovers_an_unassociated_author_and_rechecks_git() {
+    use agentscm::local_validation::{TestSelection, TestSelectionRule};
+    let env = Env::build(
+        vec![("a.txt", "changed")],
+        vec![RecipeCommand {
+            id: "nextest".into(),
+            argv: ["cargo", "nextest", "run", "--locked"]
+                .map(String::from)
+                .to_vec(),
+            timeout_secs: 30,
+            paths: None,
+            test_selection: Some(TestSelection {
+                rules: vec![TestSelectionRule {
+                    path: "a.txt".into(),
+                    filter: "test(/^synthetic::/)".into(),
+                }],
+            }),
+        }],
+        Some(vec!["a.txt".into()]),
+        None,
+        |config| {
+            let root = config.parent().unwrap();
+            fs::write(root.join("work/a.txt"), "base").unwrap();
+            fs::create_dir(root.join("bin")).unwrap();
+            let cargo = root.join("bin/cargo");
+            fs::write(&cargo, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(cargo, fs::Permissions::from_mode(0o700)).unwrap();
+        },
+    )
+    .await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    let (_, bytes) = agentscm::local_validation::comment::parse(&body).unwrap();
+    let record = ValidationRecord::from_slice(&bytes).unwrap();
+    assert_eq!(
+        record.selections[0].reason,
+        agentscm::local_validation::SelectionReason::Selected
+    );
+    env.attest_comment(10, "NONE", body.clone());
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending", "success"]);
+    let wrong = signed_record_change(&env, &body, |record| {
+        record.selections[0].paths = vec!["unrelated.txt".into()];
+    });
+    env.attest_comment(10, "NONE", wrong);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ne!(env.states(&env.head).last().unwrap(), "success");
 }

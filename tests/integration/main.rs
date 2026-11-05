@@ -163,6 +163,7 @@ mod hub_publish;
 #[cfg(unix)]
 mod hub_read_only;
 mod hub_reply_budget;
+mod hub_session_end;
 mod hub_session_privacy;
 mod hub_sessions;
 #[cfg(unix)]
