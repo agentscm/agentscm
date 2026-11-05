@@ -71,7 +71,7 @@ proceed. **Advises** means it tells an agent or a person, who may ignore it.
 | Native `approve`, `integrate`, `initialize-target` (`src/authority.rs` → `workflows::require_current_success`) | **Blocks** | The target has an installed requirement and no receipt matches the exact revision and review context. With no requirement installed, admission passes. |
 | Forge status `agentscm/workflow/<target>` (`src/hub/forge_check.rs`), also on GitHub merge-queue groups (#91) | Advises, **blocks only if the operator requires it** | Posted `success` only when the pinned native store qualifies the exact candidate and the head (or group tree) matches. AgentSCM never edits branch protection or rulesets. |
 | `agentscm/coordination` status | Advises | Always `success`; documented as never to be required. |
-| `agentscm/local-validation` (`docs/advanced/local-validation.md`) | Advises unless required | Signed local attestation verified by a repository workflow. No Rust admission path reads it. |
+| `agentscm/local-validation`, and `agentscm/local-validation/<check>[/<constituent>]` when a repository configures several checks (`docs/advanced/local-validation.md`) | Advises unless required | Signed local attestation verified by a repository workflow. No Rust admission path reads it. |
 
 ### Observing it
 
