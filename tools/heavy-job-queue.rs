@@ -415,7 +415,11 @@ fn legacy_ready(root: &Path, own: &Path, legacy: &Path) -> io::Result<bool> {
         let _ = fs::remove_file(legacy.join("pid.next"));
         fs::remove_dir(legacy)?;
     }
-    write(&intent, &own.file_name().unwrap().to_string_lossy())?;
+    // Preserve the holder's identity through PID removal and directory removal. A waiter
+    // must not attribute an interrupted cleanup to itself and make it unreclaimable.
+    if !legacy.exists() {
+        write(&intent, &own.file_name().unwrap().to_string_lossy())?;
+    }
     match fs::DirBuilder::new().mode(0o700).create(legacy) {
         Ok(()) => {
             write(&legacy.join("pid"), &process::id().to_string())?;
@@ -569,23 +573,34 @@ fn run(root: &Path, legacy: &Path, kind: &str, args: &[std::ffi::OsString]) -> i
             pause();
             continue;
         }
-        let probe = open(&path)?;
-        if probe.try_lock().is_err() {
+        if !cleanup_slot(root, &path, legacy, pid)? {
             pause();
             continue;
         }
-        let _guard = mutex(root)?;
-        // Recheck both fences under the mutex, without waiting while holding it.
-        if group_alive(pid)? {
-            continue;
-        }
-        remove_job(&path)?;
-        release_legacy(legacy)?;
         break;
     }
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+}
+fn cleanup_slot(root: &Path, path: &Path, legacy: &Path, pid: u32) -> io::Result<bool> {
+    let _guard = mutex(root)?;
+    // Open and inspect under the mutex: a waiter may already have reclaimed the ticket.
+    // Never recreate it or lock an inode concurrently unlinked by another reclaimer.
+    let probe = match existing(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            release_legacy(legacy)?;
+            return Ok(true);
+        }
+        Err(e) => return Err(e),
+    };
+    if probe.try_lock().is_err() || group_alive(pid)? {
+        return Ok(false);
+    }
+    remove_job(path)?;
+    release_legacy(legacy)?;
+    Ok(true)
 }
 fn forward_signal(pid: u32) {
     let received = SIGNAL.swap(0, Ordering::Relaxed);
@@ -600,7 +615,7 @@ fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     // Launchers retain default dispositions, including during metadata publication and exec.
     // SAFETY: the supervisor handler only stores an atomic integer.
-    if !args.first().is_some_and(|s| s == "--execute") {
+    if args.first().is_none_or(|s| s != "--execute") {
         for value in [1, 2, 15] {
             unsafe {
                 signal(value, interrupted);
@@ -1078,5 +1093,45 @@ mod tests {
         let job = f.root.join("bad.job");
         write(&metadata_path(&job), "malformed").unwrap();
         assert!(recorded_group(&job).is_err());
+    }
+    #[test]
+    fn interrupted_legacy_cleanup_retains_holder_identity() {
+        let f = Fixture::new();
+        let state = f.root.join("state");
+        fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let legacy = f.root.join("legacy");
+        fs::DirBuilder::new().mode(0o700).create(&legacy).unwrap();
+        let holder = "00000000000000000001.job";
+        let waiter = state.join("00000000000000000002.job");
+        write(&state.join("legacy-owner"), holder).unwrap();
+        write(&legacy.join("pid"), &process::id().to_string()).unwrap();
+        // The finished holder's ticket has been reclaimed, but its supervisor is alive.
+        assert!(!legacy_ready(&state, &waiter, &legacy).unwrap());
+        assert_eq!(read(&state.join("legacy-owner")).unwrap(), holder);
+        // Model a kill after PID removal and before directory removal.
+        fs::remove_file(legacy.join("pid")).unwrap();
+        assert!(legacy_ready(&state, &waiter, &legacy).unwrap());
+        assert_eq!(
+            read(&state.join("legacy-owner")).unwrap(),
+            waiter.file_name().unwrap().to_str().unwrap()
+        );
+        release_legacy(&legacy).unwrap();
+    }
+    #[test]
+    fn completed_ticket_already_reclaimed_finishes_without_recreation() {
+        let f = Fixture::new();
+        let state = f.root.join("state");
+        fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let legacy = f.root.join("legacy");
+        fs::DirBuilder::new().mode(0o700).create(&legacy).unwrap();
+        write(&legacy.join("pid"), &process::id().to_string()).unwrap();
+        let ticket = state.join("00000000000000000001.job");
+        let slot = open(&ticket).unwrap();
+        drop(slot);
+        write(&metadata_path(&ticket), "0\nother\n\"fixture\"\n0\nnone\n").unwrap();
+        remove_job(&ticket).unwrap();
+        assert!(cleanup_slot(&state, &ticket, &legacy, u32::MAX).unwrap());
+        assert!(!ticket.exists());
+        assert!(!legacy.exists());
     }
 }
