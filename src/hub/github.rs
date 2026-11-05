@@ -587,6 +587,20 @@ impl Api {
         self.paged(token, &path, None, MAX_PULL_PAGES, etag).await
     }
 
+    /// Open issue inventory by immutable repository identity. Pull requests are filtered by
+    /// the typed decoder. Unread pages remain an explicit coverage gap.
+    pub async fn open_issues(&self, token: &str, repository_id: i64) -> Gh<Paged> {
+        if repository_id <= 0 {
+            return Err(GhError::Failed("invalid issue repository identity".into()));
+        }
+        self.get_all(
+            token,
+            &format!("/repositories/{repository_id}/issues?state=open&sort=created&direction=asc"),
+            super::planned_issues::MAX_ISSUE_PAGES,
+        )
+        .await
+    }
+
     /// Bounded recent closed proposals for opt-in local rule reconciliation. Each
     /// candidate is re-read individually before it can be accepted as merged.
     pub async fn recent_closed_pulls(&self, token: &str, full_name: &str) -> Gh<Paged> {
@@ -1661,6 +1675,56 @@ pub fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use crate::hub::forge_http::serve_once;
+
+    #[tokio::test]
+    async fn open_issues_uses_stable_repository_and_requires_an_array() {
+        let (base, server) = serve_once(200, "", "[]".into());
+        let api = Api::new(&base, &base).unwrap();
+        let page = api.open_issues("synthetic", 42).await.unwrap();
+        assert_eq!(page.unread, 0);
+        assert!(page.items.is_empty());
+        assert_eq!(
+            server.join().unwrap(),
+            "GET /repositories/42/issues?state=open&sort=created&direction=asc&per_page=100&page=1 HTTP/1.1"
+        );
+        let (base, server) = serve_once(200, "", "{}".into());
+        let api = Api::new(&base, &base).unwrap();
+        assert!(api.open_issues("synthetic", 42).await.is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_issues_permission_failure_is_not_an_empty_inventory() {
+        let (base, server) = serve_once(403, "", "{}".into());
+        let api = Api::new(&base, &base).unwrap();
+        assert!(matches!(
+            api.open_issues("synthetic", 42).await,
+            Err(GhError::Auth(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_issues_stops_at_three_pages_with_explicit_unread_coverage() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new().route("/repositories/42/issues", get(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { ([("link", "<http://unused/?page=4>; rel=\"next\", <http://unused/?page=9>; rel=\"last\"")], Json(json!([]))) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = Api::new(&base, &base).unwrap();
+        let page = api.open_issues("synthetic", 42).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(page.pages, 3);
+        assert_eq!(page.unread, 6);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn closed_pulls_page_asks_for_its_page_and_reports_next() {

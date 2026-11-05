@@ -10,8 +10,8 @@ use std::time::Duration;
 use agentscm::forge::encode_path_segment;
 use agentscm::hub::forge_http;
 use agentscm::skill_workflow::supported::{
-    self, AdoptionStatus, Assurance, CatalogEntry, Detail, Enforce, Evidence, EvidenceKind,
-    GateState, LOCK_PATH, Params, RunView, SkillLock, SkillPin,
+    self, AdoptionStatus, Assurance, CatalogEntry, Detail, Evidence, EvidenceKind, GateState,
+    LOCK_PATH, Params, RunView, SkillLock, SkillPin,
 };
 use agentscm::{Error, Result};
 use clap::{Subcommand, ValueEnum};
@@ -788,15 +788,7 @@ fn verdict_for_run(view: &RunView, local_head: Option<&str>) -> Verdict {
             short(local)
         )));
     }
-    let waiting = matches!(
-        view.current_gate.as_deref(),
-        Some("ci" | "approval" | "merge" | "post_merge")
-    );
-    let stop_gate = view
-        .gates
-        .iter()
-        .any(|g| Some(&g.id) == view.current_gate.as_ref() && g.enforce.contains(&Enforce::Stop));
-    if view.blocks_finish && !waiting && stop_gate {
+    if supported::stop_blocks(view) {
         Verdict::Block(bound(&view.next_action))
     } else {
         Verdict::Allow
