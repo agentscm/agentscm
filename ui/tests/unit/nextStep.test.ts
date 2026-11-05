@@ -99,6 +99,15 @@ describe('next steps', () => {
       expect(step.prompts[0]).toMatchObject({ login: 'maria', agent: 'claude-code' })
     })
 
+    it('a gone requester leaves the close to each target’s lead, with the sequence it must send', () => {
+      const r = base({ status: 'responded', updated_seq: 12, requester_unavailable: true, responses: [{ target_work_id: `wrk_${'b'.repeat(32)}`, target_generation: 1, responder: agent('dev'), kind: 'propose_split', seq: 11 }] as CoordinationRequest['responses'] })
+      const step = requestStep(r)!
+      expect(step.human).toBe(`${maria} is gone, so nobody can resolve this request. The lead of the affected work can close it.`)
+      expect(step.decides).toEqual(['dev'])
+      expect(said(step)).toEqual([{ for: dev, text: `Request req_1 from ${maria} can no longer be resolved, because that agent’s token can no longer act. Close it with agentscm_coordination_withdraw using expected_updated_seq 12. This releases no work. ${DATA_NOTE}` }])
+      expect(requestStep({ ...r, status: 'withdrawn' })).toBeNull()
+    })
+
     it('has nothing to do once resolved or withdrawn', () => {
       expect(requestStep(base({ status: 'resolved' }))).toBeNull()
       expect(requestStep(base({ status: 'withdrawn' }))).toBeNull()

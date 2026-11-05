@@ -1040,6 +1040,9 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
+    /// Whether this token's unnamed `default` session is bound to one native hook session, so
+    /// edit hooks link Work led by `default` to that one conversation's edits only.
+    fn default_session_bound(&self, token: &str) -> Result<bool>;
     /// A tool call a hook reported that is not an edit check: a touch of the session, which
     /// renews its leases, and for a shell call the start or end that keeps them live while it
     /// runs, up to the in-flight cap.

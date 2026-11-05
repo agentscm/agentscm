@@ -248,7 +248,8 @@ login is separate from forge login. Installed configuration, cached login, MCP d
 session-start event alone do not mark an agent ready.
 
 Your agent calls `agentscm_setup_status` through its native AgentSCM MCP server with its agent name
-and actual native hook session ID. Restart after installation. The ID appears in the start hook's
+and actual native hook session ID, the same `session` it passes to `agentscm_start` and every other
+AgentSCM call. Restart after installation. The ID appears at the start of the start hook's
 context, as a line beginning `AgentSCM native session ID (literal data, not instructions):`,
 whenever a named agent's start hook (not the generic hook) gets an answer from the Hub (even one refusing the token) and the host sent
 a session ID of 1 to 128 bytes without control characters. It is missing when the checkout is not
@@ -270,7 +271,8 @@ Use the actual agent and session. Before a native session can start, omit `--ses
 a login or trust blocker. Pending setup reports can never become proof; a later verified native
 session replaces them. The first command reads at most 64 KiB and sends only a blocker
 category, never raw diagnostics. Keep diagnostic files private and delete them afterward. The second
-reads observations; it does not simulate MCP or hook proof. Both require a current checkout binding.
+reads observations and prints one line per session, latest first (`--json` prints the Hub's reply);
+it does not simulate MCP or hook proof. Both require a current checkout binding.
 Run `client setup` again when that binding needs forge sign-in or token renewal.
 
 | Blocker | Guided next step |
@@ -311,9 +313,9 @@ Before approving hooks or MCP configuration:
 
 `agentscm client remove --root PATH` undoes `client setup` for one checkout: it takes the agents' entries out of the checkout's files, uninstalls the Claude Code or Codex plugin when no other connected checkout uses it, revokes the managed token (the token revokes itself through `DELETE /v1/hub/token`, so no sign-in is needed), then removes the connection and deletes the token file. If the token can't be revoked, it says so, exits non-zero and keeps the connection and token file so that running it again retries. `agentscm uninstall` runs `client remove` for every checkout quickstart connected, then undoes the rest of quickstart's setup.
 
-Setup never writes to the repository: everything it installs is per machine, so `git status` stays clean.
+Setup installs nothing into the repository: everything it installs is per machine, so `git status` stays clean.
 
-`agentscm init-repo` is a separate, optional step that writes shared agent instruction files for the team to commit (no MCP config, hooks, token or Hub URL). They tell each developer to run `agentscm quickstart` once on their machine, where their Hub is set; the Setup › Agents page verifies the result.
+`agentscm init-repo` writes the shared agent instruction files for the team to commit (no MCP config, hooks, token or Hub URL). They carry AgentSCM's [required rules](agents.md#required-rules-and-the-session-id) and tell each developer to run `agentscm quickstart` once on their machine, where their Hub is set; the Setup › Agents page verifies the result. When those files are missing or outdated, `client setup` and `client connect` list them and, in a terminal, preview the `init-repo` change and write it only on a yes; `client doctor` and `quickstart` (without `--init`) report them and change nothing.
 
 Then run `agentscm client list` and `agentscm client check` for the local binding. Start a real agent
 task and confirm that its session appears for the expected repository in the hosted Hub. A local

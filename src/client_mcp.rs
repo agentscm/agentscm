@@ -270,7 +270,11 @@ fn unconnected<T>(
                     "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                     "capabilities": {"tools": {"listChanged": true}},
                     "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "This checkout is not connected to an AgentSCM Hub yet. The tools are listed, and work once it connects; until then a call says why it cannot run.",
+                    // Initialize happens once, so a session that connects later keeps these.
+                    "instructions": format!(
+                        "This checkout is not connected to an AgentSCM Hub yet. The tools are listed, and work once it connects; until then a call says why it cannot run. {}",
+                        agentscm::hub::agent_rules::prose()
+                    ),
                 }),
                 Some("ping") => json!({}),
                 Some("tools/list") => json!({"tools": agentscm::hub::mcp::agent_tools()}),

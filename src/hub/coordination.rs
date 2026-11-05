@@ -119,6 +119,12 @@ pub struct CoordinationRequest {
     pub updated_at: i64,
     pub created_seq: i64,
     pub updated_seq: i64,
+    /// The requester's token can no longer act (revoked or expired, its owner disabled, or its
+    /// repository renamed since it was minted), so nobody can resolve or withdraw the request
+    /// for it. Derived when the request is read, not stored: a current affected lead, or the
+    /// person who owns it, may then withdraw the request. Left out of the JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requester_unavailable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -216,6 +222,21 @@ pub struct CoordinationWithdraw {
     pub operation_id: String,
     pub session: String,
     pub expected_updated_seq: i64,
+    /// The target Work and generation a lead saw when it closed a request whose requester is
+    /// gone. Refused unless the caller leads that Work at that generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<CoordinationWithdrawTarget>,
+    /// Set only by the Hub's browser-session route, never read from a request body: the person
+    /// who owns the lead agent closed the request for it. Recorded as `via: "hub"` on the event.
+    #[serde(skip)]
+    pub via_hub: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinationWithdrawTarget {
+    pub work_id: String,
+    pub generation: i64,
 }
 
 const fn default_limit() -> usize {
@@ -294,7 +315,14 @@ impl CoordinationResolve {
 impl CoordinationWithdraw {
     pub(super) fn validate(&self) -> Result<()> {
         validate_mutation(&self.request_id, &self.session, self.expected_updated_seq)?;
-        text("operation_id", &self.operation_id, 255)
+        text("operation_id", &self.operation_id, 255)?;
+        if let Some(target) = &self.target {
+            validate_id("target work", &target.work_id, "wrk")?;
+            if target.generation < 1 {
+                return Err(invalid("target generation must be positive"));
+            }
+        }
+        Ok(())
     }
 }
 

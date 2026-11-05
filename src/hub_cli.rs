@@ -979,6 +979,15 @@ async fn whoami(hub: Option<&str>) -> Result<()> {
         println!("{}", row.hub);
         println!("  login: {}", login.as_deref().unwrap_or("not signed in"));
         println!("  computer: {}", row.state());
+        if row.computer.is_some() && row.auto_connect.is_none() {
+            for line in AUTO_CONNECT_HELP.lines() {
+                println!("    {line}");
+            }
+            println!(
+                "    Choose with `agentscm hub auto-connect on|off --hub {}`.",
+                row.hub
+            );
+        }
         let health = match call(
             &client,
             Method::GET,

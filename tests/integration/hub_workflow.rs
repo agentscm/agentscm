@@ -881,6 +881,10 @@ async fn durable_coordination_replays_until_ack_and_requires_a_real_resolution()
     let hooked = hooked.to_string();
     assert!(hooked.contains(&request_id), "{hooked}");
     assert!(hooked.contains("needs your response"), "{hooked}");
+    assert!(
+        hooked.contains(agentscm::hub::agent_rules::NO_BYPASS),
+        "{hooked}"
+    );
 
     let acknowledged_seq = first_inbox["requests"][0]["updated_seq"].as_i64().unwrap();
     let (status, acknowledged) = hub
@@ -1625,38 +1629,48 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
         answer["hookSpecificOutput"]["permissionDecision"] == "deny"
             && answer["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
-                .is_some_and(|reason| {
-                    reason.contains("not covered by a current unfinished assignment")
-                })
+                .is_some_and(|reason| reason.starts_with("AgentSCM: EDIT_UNLINKED: "))
     };
 
+    // Another conversation of the token is its own session once the default Work is adopted, so
+    // it meets the ordinary warn-once refusal of a file another session holds, not a link
+    // refusal, and its repeat passes as its own session's edit.
     let second_unknown_session = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let second_edit = edit(
+        second_unknown_session,
+        "src/native-hook.rs",
+        "second-unknown-session",
+    );
     let (status, second_unknown) = hub
         .call(
             Method::POST,
             hook_path,
             &original,
-            Some(edit(
-                second_unknown_session,
-                "src/native-hook.rs",
-                "rejected-second-unknown-session",
-            )),
+            Some(second_edit.clone()),
         )
         .await;
     assert_eq!(status, 200, "{second_unknown}");
-    assert_eq!(
-        second_unknown["hookSpecificOutput"]["permissionDecision"], "deny",
-        "{second_unknown}"
-    );
-    assert_eq!(
-        second_unknown["hookSpecificOutput"]["hookEventName"], "PreToolUse",
-        "{second_unknown}"
-    );
+    let reason = second_unknown["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        second_unknown["hookSpecificOutput"]["permissionDecisionReason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("could not be linked to a current assignment")),
+        reason.contains("another agent is working on that file") && !denied(&second_unknown),
         "{second_unknown}"
+    );
+    let (status, second_repeat) = hub
+        .call(Method::POST, hook_path, &original, Some(second_edit))
+        .await;
+    assert_eq!(status, 200, "{second_repeat}");
+    assert_ne!(
+        second_repeat["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{second_repeat}"
+    );
+    let intents = hub.store.live_intents(REPOSITORY, unix_now(), 100).unwrap();
+    assert!(
+        intents
+            .iter()
+            .any(|intent| intent.session.as_deref() == Some(second_unknown_session)),
+        "{intents:?}"
     );
 
     let (status, allowed) = hub
@@ -1678,7 +1692,8 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
             .live_intents(REPOSITORY, unix_now(), 100)
             .unwrap()
             .iter()
-            .any(|intent| intent.paths.contains(&"src/native-hook.rs".to_owned()))
+            .any(|intent| intent.session.as_deref() == Some("default")
+                && intent.paths.contains(&"src/native-hook.rs".to_owned()))
     );
 
     let (status, outside) = hub
@@ -2315,4 +2330,310 @@ fn postgres_managed_touches_are_atomic_with_takeover_and_finish() {
         "%20-c%20statement_timeout%3D3000&application_name=",
     );
     assert_managed_touch_transitions_are_atomic(&database);
+}
+
+/// A Claude Code edit of `path` in the synthetic checkout; `subagent` adds the fields Claude Code
+/// sends when the edit comes from a subagent, which keeps its parent's `session_id`.
+fn claude_edit(session: &str, path: &str, subagent: Option<&str>) -> Value {
+    let mut edit = json!({
+        "session_id": session,
+        "cwd": "/work/acme-widgets",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("/work/acme-widgets/{path}"),
+            "old_string": "old",
+            "new_string": "new"
+        }
+    });
+    if let Some(agent) = subagent {
+        edit["agent_id"] = json!(agent);
+        edit["agent_type"] = json!("general-purpose");
+    }
+    edit
+}
+
+fn refusal(answer: &Value) -> Option<&str> {
+    (answer["hookSpecificOutput"]["permissionDecision"] == "deny")
+        .then(|| answer["hookSpecificOutput"]["permissionDecisionReason"].as_str())
+        .flatten()
+}
+
+/// The issue #343 path: a fresh session gets the rules and its ID at start, a start that follows
+/// them links its edits, and each refusal names the call that fixes it, which then works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn following_the_start_context_and_each_refusal_links_the_edits() {
+    let hub = Hub::start().await;
+    let token = hub.token(41, "rules-agent", REPOSITORY, false).await;
+    let hook = "/v1/hub/hook/claude";
+    let session = "11111111-aaaa-4bbb-8ccc-000000000343";
+
+    let (status, started) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(json!({"session_id": session, "cwd": "/work/acme-widgets",
+                "hook_event_name": "SessionStart", "source": "startup"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{started}");
+    let context = started["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(context.contains(&format!("\"{session}\"")), "{context}");
+    assert!(
+        context.contains("as `session` to agentscm_start"),
+        "{context}"
+    );
+    assert!(
+        agentscm::hub::agent_rules::carries_all(context),
+        "{context}"
+    );
+    let (status, initialized) = hub
+        .call(
+            Method::POST,
+            "/mcp",
+            &token,
+            Some(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{initialized}");
+    assert!(agentscm::hub::agent_rules::carries_all(
+        initialized["result"]["instructions"].as_str().unwrap()
+    ));
+
+    let begun = hub
+        .mcp(
+            &token,
+            "agentscm_start",
+            json!({"task": "Link edits to this session", "request_key": "rules-343",
+                "paths": ["src/linked.rs"], "session": session}),
+        )
+        .await;
+    assert_eq!(begun["isError"], false, "{begun}");
+    assert_eq!(
+        begun["structuredContent"]["claim_acquired"], true,
+        "{begun}"
+    );
+    assert!(
+        begun["structuredContent"]["session_warning"].is_null(),
+        "{begun}"
+    );
+    let item = &begun["structuredContent"]["work"]["item"];
+    let work_id = item["id"].as_str().unwrap().to_owned();
+    assert_eq!(item["lead_session"], session, "{begun}");
+
+    let (_, linked) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(claude_edit(session, "src/linked.rs", None)),
+        )
+        .await;
+    assert!(refusal(&linked).is_none(), "{linked}");
+    // A subagent's edit carries its parent's session, so it is checked under the parent's Work.
+    let (_, delegated) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(claude_edit(session, "src/linked.rs", Some("agent-343"))),
+        )
+        .await;
+    assert!(refusal(&delegated).is_none(), "{delegated}");
+
+    // Outside the scope: the refusal names this session and the checkpoint that adds the path.
+    let outside = claude_edit(session, "src/outside.rs", None);
+    let (_, refused) = hub
+        .call(Method::POST, hook, &token, Some(outside.clone()))
+        .await;
+    let reason = refusal(&refused).unwrap_or_else(|| panic!("{refused}"));
+    let seq = item["updated_seq"].as_i64().unwrap();
+    for part in [
+        "AgentSCM: EDIT_UNLINKED: ".to_owned(),
+        format!(
+            "agentscm_work_checkpoint with work_id {work_id}, session \"{session}\", generation 1, expected_updated_seq {seq}"
+        ),
+        "[\"src/outside.rs\"]".to_owned(),
+        "another tool".to_owned(),
+    ] {
+        assert!(reason.contains(&part), "{part}: {reason}");
+    }
+    // A repeat meets the same refusal; only the named call changes it.
+    let (_, repeated) = hub
+        .call(Method::POST, hook, &token, Some(outside.clone()))
+        .await;
+    assert_eq!(refusal(&repeated), Some(reason), "{repeated}");
+    // A subagent is told to leave the edit to its parent instead of starting Work of its own.
+    let (_, child) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(claude_edit(session, "src/outside.rs", Some("agent-343"))),
+        )
+        .await;
+    let child = refusal(&child).unwrap_or_else(|| panic!("{child}"));
+    assert!(child.contains("You are a subagent"), "{child}");
+    assert!(
+        child.contains(&format!("parent's session \"{session}\"")),
+        "{child}"
+    );
+    assert!(!child.contains("agentscm_work_checkpoint with"), "{child}");
+
+    let widened = hub
+        .mcp(
+            &token,
+            "agentscm_work_checkpoint",
+            json!({"work_id": work_id, "operation_id": "widen-343", "generation": 1,
+                "expected_updated_seq": seq, "session": session, "kind": "progress",
+                "summary": "Add the outside file", "scope": ["src/linked.rs", "src/outside.rs"]}),
+        )
+        .await;
+    assert_eq!(widened["isError"], false, "{widened}");
+    let (_, allowed) = hub.call(Method::POST, hook, &token, Some(outside)).await;
+    assert!(refusal(&allowed).is_none(), "{allowed}");
+
+    // Paused Work: the refusal names the generation-checked start that resumes it.
+    let seq = widened["structuredContent"]["item"]["updated_seq"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{widened}"));
+    let paused = hub
+        .mcp(
+            &token,
+            "agentscm_work_checkpoint",
+            json!({"work_id": work_id, "operation_id": "pause-343", "generation": 1,
+                "expected_updated_seq": seq, "session": session, "kind": "pause",
+                "summary": "Pause for a moment"}),
+        )
+        .await;
+    assert_eq!(paused["isError"], false, "{paused}");
+    let (_, refused) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(claude_edit(session, "src/linked.rs", None)),
+        )
+        .await;
+    let reason = refusal(&refused).unwrap_or_else(|| panic!("{refused}"));
+    let resume = format!(
+        "agentscm_start with work_id {work_id}, session \"{session}\" and takeover_generation 1"
+    );
+    assert!(reason.contains(&resume), "{reason}");
+    let resumed = hub
+        .mcp(
+            &token,
+            "agentscm_start",
+            json!({"task": "Link edits to this session", "work_id": work_id,
+                "paths": ["src/linked.rs", "src/outside.rs"], "session": session,
+                "takeover_generation": 1}),
+        )
+        .await;
+    assert_eq!(resumed["isError"], false, "{resumed}");
+    let (_, allowed) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(claude_edit(session, "src/linked.rs", None)),
+        )
+        .await;
+    assert!(refusal(&allowed).is_none(), "{allowed}");
+}
+
+/// An unnamed start whose `default` session is already bound to another conversation's hooks
+/// warns instead of reporting readiness, and the start it names links the claim to the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unnamed_start_bound_elsewhere_warns_and_its_fix_links_the_claim() {
+    let hub = Hub::start().await;
+    let token = hub.token(42, "unnamed-agent", REPOSITORY, false).await;
+    let hook = "/v1/hub/hook/claude";
+    let earlier = "22222222-aaaa-4bbb-8ccc-000000000343";
+    let current = "33333333-aaaa-4bbb-8ccc-000000000343";
+    let unnamed = json!({"task": "Unnamed start", "request_key": "unnamed-343",
+        "paths": ["src/unnamed.rs"]});
+    let first = hub.mcp(&token, "agentscm_start", unnamed.clone()).await;
+    assert_eq!(first["isError"], false, "{first}");
+    // Without hook evidence nothing is bound yet, so nothing is reported.
+    assert!(
+        first["structuredContent"]["session_warning"].is_null(),
+        "{first}"
+    );
+    let work_id = first["structuredContent"]["work"]["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The first native session after the start adopts `default`.
+    let session_start = |session: &str| {
+        json!({"session_id": session, "cwd": "/work/acme-widgets",
+            "hook_event_name": "SessionStart", "source": "startup"})
+    };
+    let (status, _) = hub
+        .call(Method::POST, hook, &token, Some(session_start(earlier)))
+        .await;
+    assert_eq!(status, 200);
+
+    let again = hub.mcp(&token, "agentscm_start", unnamed).await;
+    assert_eq!(again["isError"], false, "{again}");
+    let structured = &again["structuredContent"];
+    assert_eq!(structured["ready_for_work"], false, "{again}");
+    let warning = structured["session_warning"].as_str().unwrap();
+    assert!(
+        warning.contains(&format!("agentscm_start again with work_id {work_id}")),
+        "{warning}"
+    );
+    let text = again["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains("Edits are checked automatically by hooks"),
+        "{text}"
+    );
+
+    // Another conversation of the same token starts cleanly as its own session.
+    let (status, started) = hub
+        .call(Method::POST, hook, &token, Some(session_start(current)))
+        .await;
+    assert_eq!(status, 200, "{started}");
+    let context = started["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(context.contains(&format!("\"{current}\"")), "{context}");
+    assert!(!context.contains("coordination unknown ("), "{context}");
+
+    // Following the warning moves the claim to this conversation, whose edits then link to it.
+    let linked = hub
+        .mcp(
+            &token,
+            "agentscm_start",
+            json!({"task": "Unnamed start", "work_id": work_id,
+                "paths": ["src/unnamed.rs"], "session": current}),
+        )
+        .await;
+    assert_eq!(linked["isError"], false, "{linked}");
+    let work = &linked["structuredContent"]["work"];
+    assert_eq!(work["took_over"], true, "{linked}");
+    assert_eq!(work["item"]["lead_session"], current, "{linked}");
+    let (_, allowed) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(claude_edit(current, "src/unnamed.rs", None)),
+        )
+        .await;
+    assert!(refusal(&allowed).is_none(), "{allowed}");
+    let (_, outside) = hub
+        .call(
+            Method::POST,
+            hook,
+            &token,
+            Some(claude_edit(current, "src/other.rs", None)),
+        )
+        .await;
+    assert!(
+        refusal(&outside).is_some_and(|reason| reason.starts_with("AgentSCM: EDIT_UNLINKED: ")),
+        "{outside}"
+    );
 }

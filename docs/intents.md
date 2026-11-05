@@ -12,7 +12,7 @@ anywhere is already working on the same file. The `agentscm intent` command is a
 only: it never blocks an edit, never asks for permission, and always exits 0. Agents wired
 through the hub's hook endpoints behave slightly differently: on Claude Code, Codex and
 Copilot the first edit in a session to a file another agent holds is refused once, and a
-repeat of the edit goes through (see [below](#without-installing-anything-mcp-and-hook-endpoints)).
+repeat of the edit goes through while that holder keeps the file (see [below](#without-installing-anything-mcp-and-hook-endpoints)).
 Nothing is locked either way.
 
 An **intent** is one agent session's announcement of its task and the files it is
@@ -70,7 +70,7 @@ in that agent's own format. Sessions there expire 20 minutes after their last
 call (30 minutes at most per hold). The first time in a session an agent is about
 to edit a file another agent holds, the edit is refused once with a factual
 reason (where the agent's hook can refuse: Claude Code, Codex, Copilot); a repeat
-of the edit passes, and the refused agent can ask the holder to hand the file
+of the edit passes while that holder keeps the file (a new holder is refused once again), and the refused agent can ask the holder to hand the file
 over (`agentscm_ask`, answered with `agentscm_handoff`; experimental, see
 [Handoff](hub.md#handoff)). Elsewhere the hub adds a note: Cursor's hook cannot refuse, so it
 gets the note just after the edit, and an agent that only has MCP gets advice. See
@@ -135,8 +135,8 @@ should resume). The edit proceeds either way.
 ## Limits
 
 - `agentscm intent` only advises and always exits 0. Through the hub's hook endpoints, the
-  first contested edit in a session is refused once on Claude Code, Codex and Copilot, and a
-  repeat goes through. Nothing is locked.
+  first contested edit in a session is refused once per hold on Claude Code, Codex and Copilot,
+  and a repeat goes through while that hold lasts. Nothing is locked.
 - When Work ends or is released, the hub releases the intents it held. If the stored intent
   id was released, the next `intent check` mints a new id, keeps the session's paths and
   retries once. An intent from this command is advisory and reserves nothing; the hub

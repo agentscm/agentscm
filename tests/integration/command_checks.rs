@@ -833,20 +833,22 @@ fn cli_runs_command_check_from_default_relative_data_dir_and_admits() {
     assert_eq!(derived["candidate"]["base_revision"], revision.as_str());
     assert_eq!(derived["candidate"]["changes"], 2);
     assert_eq!(cli(&["check-command-candidate", "cli-3"], None).1, derived);
-    // Both docker flags are needed together.
-    let (ok, error) = cli(
-        &[
+    // Both docker flags are needed together; a usage error is plain text, not JSON.
+    let usage = std::process::Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .current_dir(root)
+        .args([
             "check-recover-command",
             "cli-2",
             "1",
             "x",
             "--docker",
             "/bin/true",
-        ],
-        None,
-    );
+        ])
+        .output()
+        .expect("run agentscm");
+    let error = String::from_utf8_lossy(&usage.stderr);
     assert!(
-        !ok && error.to_string().contains("--docker-socket"),
+        !usage.status.success() && error.contains("--docker-socket"),
         "{error}"
     );
     // Snapshots and the Docker configuration are transient.

@@ -131,6 +131,8 @@ enum Status {
 
 struct Planned {
     path: &'static str,
+    /// An `@AGENTS.md` import line rather than instructions.
+    import: bool,
     old: String,
     new: String,
     status: Status,
@@ -156,21 +158,22 @@ fn plan(root: &Path, agents: &[Agent]) -> Vec<Planned> {
     targets::targets(agents, &skills_section(root))
         .into_iter()
         .map(|target| {
+            let import = matches!(target.content, targets::Content::Import(_));
             let path = root.join(target.path);
             if !stays_inside(root, &path) {
                 return Planned {
                     path: target.path,
+                    import,
                     old: String::new(),
                     new: String::new(),
                     status: Status::Skip("it resolves to a path outside the repository".into()),
                 };
             }
             // A CLAUDE.md that is a link to AGENTS.md would make AGENTS.md import itself.
-            if matches!(target.content, targets::Content::Import(_))
-                && same_file(&path, &root.join("AGENTS.md"))
-            {
+            if import && same_file(&path, &root.join("AGENTS.md")) {
                 return Planned {
                     path: target.path,
+                    import,
                     old: String::new(),
                     new: String::new(),
                     status: Status::Skip(
@@ -184,6 +187,7 @@ fn plan(root: &Path, agents: &[Agent]) -> Vec<Planned> {
                 Err(_) => {
                     return Planned {
                         path: target.path,
+                        import,
                         old: String::new(),
                         new: String::new(),
                         status: Status::Skip("it cannot be read as text".into()),
@@ -199,6 +203,7 @@ fn plan(root: &Path, agents: &[Agent]) -> Vec<Planned> {
             };
             Planned {
                 path: target.path,
+                import,
                 old,
                 new,
                 status,
@@ -274,6 +279,16 @@ fn show_diff(item: &Planned) {
 
 /// Writes the instruction files at `root`; `agents` of `None` means all of them.
 pub(crate) fn run_in(root: &Path, agents: Option<&[Agent]>, ui: &Ui) -> Result<Outcome> {
+    run_asking(root, agents, ui, true)
+}
+
+/// `run_in`, with what an empty answer to its question means.
+fn run_asking(
+    root: &Path,
+    agents: Option<&[Agent]>,
+    ui: &Ui,
+    default_yes: bool,
+) -> Result<Outcome> {
     let agents = agents.unwrap_or(&ALL);
     if agents.is_empty() {
         return Err(invalid("--agents is empty"));
@@ -314,7 +329,7 @@ pub(crate) fn run_in(root: &Path, agents: Option<&[Agent]>, ui: &Ui) -> Result<O
         changed.len(),
         if changed.len() == 1 { "" } else { "s" }
     );
-    if !ui.confirm(&question, true) {
+    if !ui.confirm(&question, default_yes) {
         println!("Nothing written.");
         return Ok(outcome);
     }
@@ -324,6 +339,91 @@ pub(crate) fn run_in(root: &Path, agents: Option<&[Agent]>, ui: &Ui) -> Result<O
     }
     println!("Wrote {} file(s).", outcome.written.len());
     Ok(outcome)
+}
+
+/// The instruction-file agents for the coding agents a checkout was set up for (their
+/// `client setup` names). Codex reads `AGENTS.md` itself, so it stands for `AGENTS.md` alone.
+fn instruction_agents(names: &[String]) -> Vec<Agent> {
+    let mut agents: Vec<Agent> = names
+        .iter()
+        .filter_map(|name| Agent::from_str(name, true).ok())
+        .collect();
+    if agents.is_empty() {
+        agents.push(Agent::Codex);
+    }
+    agents
+}
+
+/// What is missing or outdated in the instruction files `init-repo` would write for the
+/// checkout's agents, one line per file; empty when every file is current.
+pub(crate) fn instructions_state(root: &Path, names: &[String]) -> Vec<String> {
+    plan(root, &instruction_agents(names))
+        .iter()
+        .filter_map(|item| {
+            let why = match (&item.status, item.import) {
+                (Status::Unchanged, _) => return None,
+                // A CLAUDE.md linked to AGENTS.md already reads the instructions.
+                (Status::Skip(_), true)
+                    if same_file(&root.join(item.path), &root.join("AGENTS.md")) =>
+                {
+                    return None;
+                }
+                (Status::Create, _) => "is missing".to_owned(),
+                (Status::Update, true) => "does not import AGENTS.md".to_owned(),
+                (Status::Update, false) if item.old.contains(merge::BEGIN_PREFIX) => {
+                    "has an outdated AgentSCM block".to_owned()
+                }
+                (Status::Update, false) => "has no current AgentSCM block".to_owned(),
+                (Status::Skip(why), _) => format!("cannot be updated ({why})"),
+            };
+            Some(format!("{} {why}", item.path))
+        })
+        .collect()
+}
+
+/// After `client setup` or `client connect`: the agent instructions are part of onboarding, but
+/// they change committed files, so they are previewed and written only on a yes in a terminal.
+pub(crate) fn offer_after_setup(root: &Path, names: &[String]) {
+    let ui = Ui { yes: false };
+    offer(root, names, std::io::stdin().is_terminal().then_some(&ui));
+}
+
+/// `offer_after_setup` with the terminal to ask in, if any. Without one, after a no, or when
+/// writing fails, setup still succeeds and this says so; it returns what was written.
+fn offer(root: &Path, names: &[String], ui: Option<&Ui>) -> Vec<PathBuf> {
+    let state = instructions_state(root, names);
+    if state.is_empty() {
+        return Vec::new();
+    }
+    println!();
+    println!("This checkout's agent instructions are not current:");
+    for line in &state {
+        println!("  {line}");
+    }
+    let later = "Run `agentscm init-repo` here to preview and write them.";
+    let Some(ui) = ui else {
+        println!("There is no terminal to ask in, so nothing was changed. {later}");
+        return Vec::new();
+    };
+    println!("They tell every agent how to coordinate. Review the change; it is a committed file:");
+    // Asked in the middle of another command, so only an explicit yes writes.
+    match run_asking(root, Some(&instruction_agents(names)), ui, false) {
+        Ok(outcome) if !outcome.written.is_empty() => {
+            println!(
+                "Commit the instruction file{} written above.",
+                if outcome.written.len() == 1 { "" } else { "s" }
+            );
+            outcome.written
+        }
+        Ok(_) => {
+            println!("Setup is done without them. {later}");
+            Vec::new()
+        }
+        Err(error) => {
+            println!("Couldn't write them all ({error}); setup is done without them. {later}");
+            Vec::new()
+        }
+    }
 }
 
 pub(crate) fn print_next_steps(hub: Option<&str>, written: &[PathBuf]) {
@@ -456,6 +556,98 @@ mod tests {
         let out = run_all(root, Some(&[Agent::Claude]));
         assert_eq!(read(root, "AGENTS.md"), "<!-- agentscm:begin -->\n");
         assert_eq!(out.skipped.len(), 1);
+    }
+
+    fn names(agents: &[&str]) -> Vec<String> {
+        agents.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn setup_offers_the_block_and_keeps_the_rest_of_agents_md() {
+        let dir = repo();
+        let root = dir.path();
+        std::fs::write(root.join("AGENTS.md"), "# Team\n\nOur rules.\n").unwrap();
+        let claude = names(&["claude"]);
+        assert_eq!(
+            instructions_state(root, &claude),
+            [
+                "CLAUDE.md is missing",
+                "AGENTS.md has no current AgentSCM block"
+            ]
+        );
+        // No terminal and a declined prompt both change nothing.
+        assert!(offer(root, &claude, None).is_empty());
+        assert!(offer(root, &claude, Some(&Ui { yes: false })).is_empty());
+        assert_eq!(read(root, "AGENTS.md"), "# Team\n\nOur rules.\n");
+        assert!(!root.join("CLAUDE.md").exists());
+        let written = offer(root, &claude, Some(&Ui { yes: true }));
+        assert_eq!(written.len(), 2, "{written:?}");
+        let agents = read(root, "AGENTS.md");
+        assert!(agents.starts_with("# Team\n\nOur rules.\n\n<!-- agentscm:begin -->\n"));
+        assert!(agentscm::hub::agent_rules::carries_all(&agents));
+        assert_eq!(read(root, "CLAUDE.md"), "@AGENTS.md\n");
+        // A repeat finds everything current and writes nothing.
+        assert!(instructions_state(root, &claude).is_empty());
+        assert!(offer(root, &claude, Some(&Ui { yes: true })).is_empty());
+        assert_eq!(read(root, "AGENTS.md"), agents);
+    }
+
+    #[test]
+    fn an_outdated_block_is_replaced_and_the_text_around_it_kept() {
+        let dir = repo();
+        let root = dir.path();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Mine\n\n<!-- agentscm:begin -->\nold rules\n<!-- agentscm:end -->\n\nafter\n",
+        )
+        .unwrap();
+        // A checkout set up for no named agent still gets AGENTS.md itself.
+        assert_eq!(
+            instructions_state(root, &[]),
+            ["AGENTS.md has an outdated AgentSCM block"]
+        );
+        offer(root, &[], Some(&Ui { yes: true }));
+        let text = read(root, "AGENTS.md");
+        assert!(
+            text.starts_with("# Mine\n\n<!-- agentscm:begin -->\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("<!-- agentscm:end -->\n\nafter\n"), "{text}");
+        assert!(!text.contains("old rules"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_md_linked_to_agents_md_counts_as_current() {
+        let dir = repo();
+        let root = dir.path();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# Team\n").unwrap();
+        let claude = names(&["claude"]);
+        assert_eq!(
+            instructions_state(root, &claude),
+            ["AGENTS.md has no current AgentSCM block"]
+        );
+        offer(root, &claude, Some(&Ui { yes: true }));
+        assert!(instructions_state(root, &claude).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_checkout_is_reported_and_setup_goes_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repo();
+        let root = dir.path();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A superuser writes anyway, so there is nothing to show there.
+        if std::fs::write(root.join("probe"), "").is_ok() {
+            return;
+        }
+        let written = offer(root, &[], Some(&Ui { yes: true }));
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(written.is_empty());
+        assert!(!root.join("AGENTS.md").exists());
+        assert_eq!(instructions_state(root, &[]), ["AGENTS.md is missing"]);
     }
 
     #[test]
