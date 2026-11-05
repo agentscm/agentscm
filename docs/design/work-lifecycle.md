@@ -5,9 +5,9 @@ title: "Design: Work outcomes and scope reservations"
 # Design: Work outcomes and scope reservations
 
 > **Status: design for issue #310; the rules, store operations, routes and MCP tool are in the
-> tree.** Nothing here is a released capability until the change has merged. Not part of this
-> change: a harness preview and apply flow (#313), status relabeling (#315) and claim repair
-> (#316). Liveness leases on every reservation (#311) are section 8.
+> tree.** Nothing here is a released capability until the change has merged. Liveness leases on
+> every reservation (#311) are section 8, and the recovery inspection, previews and batches
+> (#313) are section 9. Not part of this design: status relabeling (#315) and claim repair (#316).
 
 Today `WorkState::Finished` is both the end of the Work and the release of its scope. Two things
 are mixed: why the Work ended, and whether it still blocks other agents. This design separates them.
@@ -189,17 +189,22 @@ or `none`, with a `provenance` of `agent_report`, `person`, `admin` or `unknown`
 (`status`, `basis`, `scope`, `holder_agent`, `holder_session`; never a token id); `report` (time and
 kind of the last agent report); `freshness` (the existing claim status); `activity` (`live` or
 `lapsed` for a held reservation, from its lease at request time, with `lease_renewed_at`,
-`lease_expires_at`, a reason that says what to do, and `coverage`: what renews the lead session's
-lease; `unknown` when nothing is held); `merge`
+`lease_expires_at`, `lease_grace_at` (when the Hub last extended the lease after a restart or a
+clock gap, cleared by the next renewal, admission or decision), a reason that says what to do and
+who last extended the lease, and `coverage`: what renews the lead session's lease; `unknown` when
+nothing is held); `merge`
 (`hidden_by_merged_pr` and a status: `observed` when hidden by a merged pull request, `none` only when
 the Hub knows its forge pull-request read reached back to the Work's creation and the merge rule applies
 to the Work, otherwise `unknown`); `actionable` (a recipient of
 `lead`, `owner`, `admin` or `none`, with a reason); `remedies`; and `completeness` (`complete` and
 the list of `unknown` field names).
 
-`actionable` is derived from stored facts only (state, reservation, merge observation), so the only
-field that follows the request clock is `freshness`. Finished Work and Work with no reservation name
-no recipient. A held reservation with a legacy merged-branch observation, or held by paused or handed-over
+`reservation.status` is `held` while the reservation blocks overlapping Work, `lapsed` once its
+lease expired (it then blocks nobody and the next admission over its scope clears it) and `none`
+when nothing is held; a lapsed reservation keeps its basis, scope and holder. `actionable` is
+derived from stored facts and that status (state, reservation, merge observation), so the fields
+that follow the request clock are `freshness`, `activity` and a lapse. Finished Work, Work with no
+reservation and a lapsed reservation name no recipient. A held reservation with a legacy merged-branch observation, or held by paused or handed-over
 Work, names the owner. A held reservation on active or blocked Work names the lead. The reason says
 which in plain words. `completeness.unknown` also lists `freshness` when the claim status is unknown
 and `outcome_provenance` when a stated outcome has no surviving event that says who stated it.
@@ -231,8 +236,8 @@ leaves of `MAX_BRIEFING_BYTES`: entries that do not fit are shed and `complete` 
 always did; the overview query stays strict. The agent route is
 `POST /v1/hub/standup/work-transition`, the person route is
 `POST /v1/hub/session/work/transition` with a web sign-in and CSRF check, and the MCP tool is
-`agentscm_work_transition`. There is no UI action or CLI command in this change; #313 owns
-user-facing recovery. The UI only renders the new event kind in history.
+`agentscm_work_transition`. The recovery read, previews, batches, CLI commands and the Hub task
+page action of section 9 build on these routes.
 
 ## 7. Migration and mixed-client behavior
 
@@ -338,6 +343,11 @@ NULL when nothing is held.
   admission. If PostgreSQL still aborts a transaction for a deadlock or a serialization failure,
   the call fails as `Busy` with nothing written, and a retry is safe.
 
+- A clock heartbeat that grants grace records `reservation_grace_at` on each reservation it
+  extended (named migration `work_recovery`). The projection reports it as `lease_grace_at` and
+  says the Hub, not the lead session, extended the lease. Renewal, admission, pause, handover,
+  retain and release clear it.
+
 ### Coverage and participants
 
 - `activity.coverage` says what renews the lead session: `tool_calls` once a hook reported one of
@@ -375,3 +385,80 @@ any other.
   allows.
 - Renewal from each agent's hooks is tested with sample payloads written from the vendors'
   documentation, not in live sessions of every agent.
+
+## 9. Recovery: inspect, preview, apply
+
+`work_recovery.rs` turns the projection and the transition rules into answers for a harness agent
+and for a person: what is active, what needs them, what can resume, why each item still exists,
+what ending it would reach, and which remedies they may apply. It adds no authority. The store
+operations of sections 3 and 8 stay the only writers.
+
+### Inspection
+
+One store read, `work_recovery_read`, runs in one transaction on both stores and never writes. It
+reads the page of the reader owner's unfinished Work by id after a cursor (at most 50), or one
+`work_id` of the repository whoever owns it; with up to 32 paths it also reads the live holds over
+them (the admission overlap scan, so the exact path pairs and the 100-holder bound are the
+admission's) and the owner's unfinished Work whose declared scope overlaps them (at most 100
+scanned, 25 listed). For every listed Work it reads the open coordination requests that target or
+propose it and the unfinished Work whose `depends_on` names it, 25 each plus one to say the list
+was cut. The named migration `work_recovery` adds an index on `hub_work_relations(related)` for
+that read.
+
+Each item carries the caller's standing (`lead`: its token and named session lead it; `owner`: the
+owner, or another session of an agent of the owner; `admin`: a Hub administrator signed in on the
+web; `other`), a bucket (`active`, `needs_you`, `resumable`, `finished`, `other`), a sentence on why
+it still exists, the follow-up that a release or an end keeps (next action and blocker), the
+affected requests and dependents, the projection, and every remedy.
+
+### Remedies
+
+A remedy is a transition (`release`, `retain`, `complete`, `abandon`, `supersede`, `reopen`),
+`resume` (a start with `takeover_generation`, a fresh admission) or `handover` (the lead's handover
+checkpoint, optionally with a narrower scope). Each is permitted or refused for this caller with a
+stable code, decided in this order: a read-only token; for a transition, the standing and the
+matrix of section 3 (a retain of a lapsed hold is `lease_lapsed`); for a resume or handover, a
+person or an unnamed agent (`needs_session`) and finished Work (`wrong_state`, reopen instead).
+`handover` needs the lead. `resume` follows the start's takeover rules: the lead may resume its own
+lapsed, paused or handed-over Work; any token of the owner may resume Work that holds nothing; a
+token may resume its own paused Work; anyone may take Work over once its hold lapsed, or Work that
+holds nothing once its claim is stale, or handed-over Work; otherwise `hold_live` (with the lease
+expiry) or `claim_current`. A permitted remedy carries the exact call: the MCP tool (none for a
+person), the route, and the arguments with `generation` and `expected_updated_seq` from the read,
+plus the fields the caller supplies (`operation_id`, `reason` or `summary`).
+
+The preview of one remedy adds what it would change: state, reservation and outcome after, whether
+the generation advances, who is fenced (agent and login, never a token or another owner's session),
+the freed and kept paths, the affected requests and dependents, the follow-up, and whether apply
+runs a fresh admission. A handover scope must lie inside the current scope.
+
+Previews mirror the store's rules but are not authority. They do not check the participant caps or
+a reopen's or resume's overlap; the apply does, inside its own transaction, with the generation and
+`updated_seq` fences, and refuses with nothing changed if anything moved.
+
+### Batches
+
+`apply_batch` runs up to 25 `work_transition` requests in order, each in its own transaction under
+the same actor, and returns one outcome per item. A refused item never stops the rest; an exact
+retry of the batch replays applied items through their `operation_id` and retries the others.
+Refusals carry a fixed code and sentence, never the store's internal text, except a `LEASE_LAPSED`
+refusal, which every surface already passes through. The shared error envelope (#314) will carry
+the same codes for single calls.
+
+### Resolving before a duplicate
+
+An MCP lead start with paths and no `work_id` first reads the owner's resumable Work over those
+paths. If one exists under another identity, the start creates and claims nothing and lists it
+with the resume call; `new_work: true` starts different work. A start whose request key or forge
+source is that Work's own goes ahead, since the store resolves it. HTTP and CLI starts are
+unchanged, so older clients keep their behavior. A start refused for any reason in MCP carries
+`recovery`: the inspection of the conflicting Work with the requested paths.
+
+### People
+
+The person routes take `repository`, pass the same allow-list and forge role check as a read-token
+mint, and call the same functions with a person caller. The Hub's task page offers the owner's and
+an administrator's permitted transitions after a preview, sends one-item batches with the preview's
+fences, and shows the outcome and its retry advice. #289's close of an orphaned request stays on
+the Inbox; when the target's lead token is gone too, the owner releases or ends the target Work, or
+has another agent resume it so the Inbox can close the request for that agent.

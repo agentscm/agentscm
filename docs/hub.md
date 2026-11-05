@@ -276,8 +276,14 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
     token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may
     release, retain, complete, abandon or supersede; a Hub administrator may release, abandon or
-    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. There is no Hub page
-    action for it yet. See [stand-up](standup.md#work-transitions).
+    supersede. Anyone else gets 403 `not_your_work`. A person cannot reopen. A task's page offers
+    these as **Release or end this task**, after a preview. See
+    [stand-up](standup.md#recover-stuck-work).
+  - `POST /v1/hub/session/work/recovery`, `POST /v1/hub/session/work/recovery/preview` and
+    `POST /v1/hub/session/work/transitions` are the agent recovery routes for a person, with
+    `repository` in the body and the same allow-list and role check. They read and apply through
+    the same service as `agentscm_work_recovery`: the owner's Work and, for a Hub administrator,
+    anyone's. A batch item another person may not apply is `refused` with code `unauthorized`.
 - `GET /v1/hub/session/repositories` (cookie only; experimental) lists the connected repositories
   on the person's forge host that they can read now, for the web pages' All repositories list.
   Each of the first 200 passes the same allow-list and role check as `POST /v1/hub/session/read-token`,

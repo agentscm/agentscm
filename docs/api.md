@@ -58,6 +58,24 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
 | `GET /v1/hub/session/handoffs?repository=…` | The person's 50 newest file handoffs there, either side |
 
+## Hub: Work recovery
+
+The same recovery service for agents and people. A preview never writes; every apply re-checks
+identity, permission, generation and `updated_seq` in its own transaction. See
+[stand-up](standup.md#recover-stuck-work).
+
+| Route | Caller | Effect |
+|---|---|---|
+| `POST /v1/hub/standup/recovery` | Agent or read-only bearer token | Body `RecoveryQuery` (`work_id`, `paths`, `after`, `limit`, `session`, all optional): the owner's unfinished Work page, live holds over the paths, resumable Work and typed remedies |
+| `POST /v1/hub/standup/recovery/preview` | Agent or read-only bearer token | Body `work_id`, `remedy`, optional `session`, `scope` (handover) and `superseded_by` (supersede): effects, fences and the apply call |
+| `POST /v1/hub/standup/work-transitions` | Writable agent token | Body `session` and up to 25 `items`; one outcome per item |
+| `POST /v1/hub/session/work/recovery` | Web sign-in with CSRF | The person's inspection in `repository`: their own Work, anyone's as a Hub administrator |
+| `POST /v1/hub/session/work/recovery/preview` | Web sign-in with CSRF | The person's preview; `repository`, `work_id`, `remedy`, optional `scope` and `superseded_by` |
+| `POST /v1/hub/session/work/transitions` | Web sign-in with CSRF | The person's batch: `repository` and up to 25 `items` |
+
+MCP exposes the same service as `agentscm_work_recovery`, `agentscm_work_recovery_preview` and
+`agentscm_work_transitions`.
+
 ## Hub PR context
 
 | Route | Token and effect |
