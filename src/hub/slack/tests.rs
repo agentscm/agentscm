@@ -433,6 +433,32 @@ async fn ingress_checks_signature_workspace_app_and_request_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_between_two_sessions_of_one_token_messages_the_person_once() {
+    let f = Fixture::new().await;
+    f.edit(&f.alice, "a");
+    assert!(!f.edit(&f.alice, "b").denied.is_empty());
+    assert!(!f.edit(&f.alice, "b").repeated.is_empty());
+    f.run().await;
+    let key = &crate::hub::store::session_key(&f.alice, "a")[..8];
+    // Never a message about the repeater's own session, and not one to the holder as well.
+    assert_eq!(
+        f.sent(),
+        [(
+            "U1".to_owned(),
+            format!(
+                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+            )
+        )]
+    );
+    // A session repeating on its own file alone says nothing.
+    let quiet = Fixture::new().await;
+    quiet.edit(&quiet.alice, "a");
+    quiet.edit(&quiet.alice, "a");
+    quiet.run().await;
+    assert!(quiet.sent().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_button() {
     let f = Fixture::new().await;
     f.contest();

@@ -5030,6 +5030,7 @@ fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Intent, String, Opti
             },
             via: Vec::new(),
             session: row.get(18)?,
+            started_at: row.get(19)?,
         },
         row.get(16)?,
         row.get(17)?,
@@ -5102,7 +5103,7 @@ fn announce_in(
     who: &Who,
     intent: &NewIntent,
     keys: &[String],
-    via: &[String],
+    (session, via): (Option<&str>, &[String]),
     now: i64,
 ) -> Result<Announced> {
     let paths = display_all(keys);
@@ -5199,7 +5200,7 @@ fn announce_in(
     let ids: Vec<String> = ids.into_iter().collect();
     let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
     if let Plan::Write { previous } = &plan {
-        for event in notice_events(who, intent, via, previous, &announced)? {
+        for event in notice_events(who, intent, (session, via), previous, &announced)? {
             append(tx, &event)?;
         }
     }
@@ -5780,7 +5781,14 @@ fn touch_in(
         _ => Vec::new(),
     };
     let announced = match &step.new {
-        Some(new) => Some(announce_in(tx, who, new, &step.keys, &step.via, now)?),
+        Some(new) => Some(announce_in(
+            tx,
+            who,
+            new,
+            &step.keys,
+            (Some(&name), &step.via),
+            now,
+        )?),
         None => None,
     };
     if let Some(new) = &step.new {
@@ -7472,7 +7480,7 @@ impl Store for SqliteStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
         guard_announce(&tx, &who, &keys)?;
-        let announced = announce_in(&tx, &who, intent, &keys, &[], now)?;
+        let announced = announce_in(&tx, &who, intent, &keys, (None, &[]), now)?;
         tx.commit()?;
         Ok(announced)
     }

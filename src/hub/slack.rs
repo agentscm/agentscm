@@ -23,10 +23,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::advice::{agent_name, sanitize};
+use super::advice::{agent_name, sanitize, session_kind};
 use super::handoff::{Answered, Via};
 use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
+use super::store::session_key;
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
 use super::{HubError, HubState, Result};
 
@@ -868,7 +869,13 @@ impl Slack {
             // Opens the header, which is not a name to keep lower case.
             let opening = named.unwrap_or_else(|| "Another agent".into());
             let mut holders = Vec::new();
-            for intent in intents.iter().filter(|i| i.token != token) {
+            // The repeater's own session is skipped, not its other sessions under one token;
+            // an event without a session id skips the whole token.
+            let own = data["session"].as_str();
+            let skipped = |i: &Intent| {
+                i.token == token && own.is_none_or(|own| i.session.as_deref() == Some(own))
+            };
+            for intent in intents.iter().filter(|i| !skipped(i)) {
                 let held: Vec<String> = paths
                     .iter()
                     .filter(|path| intent.paths.iter().any(|spec| overlaps(path, key_of(spec))))
@@ -877,7 +884,17 @@ impl Slack {
                 if held.is_empty() {
                     continue;
                 }
-                let holder = label(&intent.owner.login, &intent.agent);
+                let mut holder = label(&intent.owner.login, &intent.agent);
+                if let (true, Some(session)) = (intent.token == token, intent.session.as_deref()) {
+                    // Another session of the repeater's own token: the label alone would read as itself.
+                    let kind = session_kind(&intent.via).unwrap_or_else(|| "agent".into());
+                    let key = session_key(&intent.token, session);
+                    holder = format!(
+                        "{}’s {kind} session {}",
+                        sanitize(&intent.owner.login, NAME_CHARS),
+                        &key[..8]
+                    );
+                }
                 if let Some(person) = Self::bound(people, &repository, &intent.token)
                     && repeater.is_none_or(|r| r.slack_user != person.slack_user)
                 {
@@ -918,7 +935,10 @@ impl Slack {
                     };
                     out.push((
                         person.slack_user.clone(),
-                        format!("holder\n{}", intent.token),
+                        match &intent.session {
+                            Some(session) => format!("holder\n{}\n{session}", intent.token),
+                            None => format!("holder\n{}", intent.token),
+                        },
                         message(&headline, &fields, &guidance, handoff, &link),
                     ));
                 }

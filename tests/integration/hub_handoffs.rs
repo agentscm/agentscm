@@ -955,6 +955,57 @@ fn a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told(db: 
     );
 }
 
+/// The 8 hex the refusal shows for session `session` of `who`, derived here from the documented digest.
+fn shown_key(who: &Agent, session: &str) -> String {
+    let input = format!("agentscm.hub.session-view.v1\0{}\0{session}", who.token);
+    store::lower_hex_of(input.as_bytes())[..8].to_owned()
+}
+
+fn two_sessions_of_one_token_are_told_apart_in_the_refusal(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    // Sessions ha and hb of one token hold different files; hc and hd each want the other's.
+    touch(&*store, &alice, "ha-secret", &[A], T0);
+    touch(&*store, &alice, "hb-secret", &["src/b.rs"], T0 + 600);
+    let reason = |session: &str, path: &str| {
+        let denied = touch(&*store, &alice, session, &[path], T0 + 700);
+        assert_eq!(denied.denied.len(), 1, "{session} {path}");
+        agentscm::hub::advice::deny_reason(&denied.denied, (Some(session), true), T0 + 700)
+    };
+    let first = reason("hc", A);
+    let second = reason("hd", "src/b.rs");
+    assert!(
+        first.contains(&format!(
+            "user1's Claude Code session {}, started 11 min ago",
+            shown_key(&alice, "ha-secret")
+        )),
+        "{first}"
+    );
+    assert!(
+        second.contains(&format!(
+            "user1's Claude Code session {}, started 1 min ago",
+            shown_key(&alice, "hb-secret")
+        )),
+        "{second}"
+    );
+    for text in [&first, &second] {
+        assert!(
+            !text.contains("-secret") && !text.contains("agent1"),
+            "{text}"
+        );
+    }
+    assert_ne!(
+        shown_key(&alice, "ha-secret"),
+        shown_key(&alice, "hb-secret")
+    );
+    // The same session alone, with nobody contesting, is not told anything.
+    let alone = touch(&*store, &alice, "ha-secret", &[A], T0 + 701);
+    assert!(alone.denied.is_empty() && alone.overlaps.is_empty());
+    // Every live session intent has the hub's first sight of its session.
+    let held = live(&*store, T0 + 701);
+    assert!(held.iter().all(|intent| intent.started_at.is_some()));
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -969,6 +1020,7 @@ macro_rules! conformance {
 }
 
 conformance!(
+    two_sessions_of_one_token_are_told_apart_in_the_refusal,
     a_person_acting_through_the_hub_is_recorded_and_the_agents_are_told,
     a_person_answering_from_slack_is_recorded_as_slack_and_the_agent_is_told,
     a_grant_moves_the_file_and_is_told_once,

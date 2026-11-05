@@ -557,7 +557,10 @@ body or query string is a 400 with a fixed body.
   It is what the [status page](#status-page) reads.
 - `I` is `{id, repository, task, branch, base, machine, paths, expires_at,
   created_at, agent: {token, name}, owner: {id, provider, host, user_id, login},
-  via}`. `via` lists how the intent's session connects (`mcp`, `hook:claude`,
+  via, session}`. `session` is `{key, kind, started_at}` for the session holding the intent
+  (`key` as in `S`, `kind` the brand of its first `hook:` connection or null,
+  `started_at` the hub's first sight of the session), and null for an intent announced
+  through this route; the session id is never returned. `via` lists how the intent's session connects (`mcp`, `hook:claude`,
   ...; see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)); it is
   empty for an intent announced through this route.
 

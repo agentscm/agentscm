@@ -4861,6 +4861,7 @@ fn intent_row(row: &postgres::Row) -> (Intent, String, Option<String>) {
             },
             via: Vec::new(),
             session: row.get(18),
+            started_at: row.get(19),
         },
         row.get(16),
         row.get(17),
@@ -4971,7 +4972,7 @@ fn announce_in(
     who: &Who,
     intent: &NewIntent,
     keys: &[String],
-    via: &[String],
+    (session, via): (Option<&str>, &[String]),
     now: i64,
 ) -> Result<Announced> {
     let token = who.token.as_str();
@@ -5068,7 +5069,10 @@ fn announce_in(
     let ids: Vec<String> = ids.into_iter().collect();
     let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
     if let Plan::Write { previous } = &plan {
-        append_all(tx, &notice_events(who, intent, via, previous, &announced)?)?;
+        append_all(
+            tx,
+            &notice_events(who, intent, (session, via), previous, &announced)?,
+        )?;
     }
     Ok(announced)
 }
@@ -5620,7 +5624,14 @@ fn touch_in(
         _ => Vec::new(),
     };
     let announced = match &step.new {
-        Some(new) => Some(announce_in(tx, who, new, &step.keys, &step.via, now)?),
+        Some(new) => Some(announce_in(
+            tx,
+            who,
+            new,
+            &step.keys,
+            (Some(&name), &step.via),
+            now,
+        )?),
         None => None,
     };
     if let Some(new) = &step.new {
@@ -7321,7 +7332,7 @@ impl Store for PgStore {
                 work.repository_id,
             )?;
             guard_announce(&mut tx, &work, &keys)?;
-            let announced = announce_in(&mut tx, &who, intent, &keys, &[], now)?;
+            let announced = announce_in(&mut tx, &who, intent, &keys, (None, &[]), now)?;
             tx.commit()?;
             Ok(announced)
         })

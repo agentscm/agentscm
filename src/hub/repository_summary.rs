@@ -149,6 +149,7 @@ mod tests {
             },
             via: via.iter().map(|v| (*v).into()).collect(),
             session: None,
+            started_at: None,
         }
     }
 
