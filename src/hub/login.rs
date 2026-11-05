@@ -383,7 +383,27 @@ struct BrowserLogin {
     workspace: bool,
     /// Signs the browser itself in to the Hub's web pages.
     web: bool,
+    /// The Hub page a web sign-in returns to: a same-origin path, `/ui/` unless the page asked.
+    return_to: String,
     client: IpAddr,
+}
+
+/// The page a web sign-in may return to (`?return_to=`): a same-origin path of plain segments
+/// ending in `/`, such as `/ui/` or `/next/`, and never an API route. Anything else is refused,
+/// so the sign-in cannot be used to redirect to another site.
+fn web_return_path(path: &str) -> Option<&str> {
+    let plain = (2..=128).contains(&path.len())
+        && path.starts_with('/')
+        && path.ends_with('/')
+        && !path.starts_with("//")
+        && !path.starts_with("/v1/")
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~/".contains(&b))
+        && path
+            .split('/')
+            .all(|segment| segment != "." && segment != "..");
+    plain.then_some(path)
 }
 
 struct DeviceLogin {
@@ -787,6 +807,11 @@ async fn browser_start(
         return Err(not_found());
     }
     let web = !workspace && params.get("web").is_some_and(|value| value == "1");
+    let return_to = match params.get("return_to") {
+        Some(path) if web => web_return_path(path).ok_or_else(ApiError::invalid)?,
+        _ => "/ui/",
+    }
+    .to_owned();
     let cli_port = if workspace || web {
         0
     } else {
@@ -840,6 +865,7 @@ async fn browser_start(
         cli_challenge,
         workspace,
         web,
+        return_to,
         client,
     };
     let mut pending = state.login.pending();
@@ -888,7 +914,11 @@ fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> 
             .query_pairs_mut()
             .append_pair("status", "refused")
             .append_pair("reason", error.code());
-        let location = format!("/ui/#/signed-in?{}", query.query().unwrap_or_default());
+        let location = format!(
+            "{}#/signed-in?{}",
+            pending.return_to,
+            query.query().unwrap_or_default()
+        );
         return found(&location, cookie_attributes("", 0));
     }
     // The CLI's loopback hears why, stops waiting, and sends the browser to the Hub page.
@@ -970,7 +1000,10 @@ async fn callback_inner(
             store.insert_browser_session(&owner, &digest, now + SESSION_SECONDS, now)
         })
         .await?;
-        let mut response = found("/ui/#home", cookie_attributes("", 0))?;
+        let mut response = found(
+            &format!("{}#home", pending.return_to),
+            cookie_attributes("", 0),
+        )?;
         response.headers_mut().append(
             header::SET_COOKIE,
             HeaderValue::from_str(&browser_cookie_attributes(
@@ -1771,6 +1804,32 @@ async fn enable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_sign_in_returns_only_to_a_same_origin_page() {
+        for ok in ["/ui/", "/next/", "/a/b-c_d.e~f/"] {
+            assert_eq!(web_return_path(ok), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/",
+            "/next",
+            "next/",
+            "//evil.example/",
+            "/\\evil.example/",
+            "https://evil.example/",
+            "/v1/hub/session/",
+            "/a/../v1/",
+            "/./",
+            "/next/?x=1/",
+            "/next/#x/",
+            "/next%2F/",
+            "/n\next/",
+        ] {
+            assert_eq!(web_return_path(bad), None, "{bad:?}");
+        }
+        assert_eq!(web_return_path(&format!("/{}/", "a".repeat(127))), None);
+    }
 
     fn human(user: &str) -> Human {
         Human {

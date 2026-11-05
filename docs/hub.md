@@ -191,7 +191,11 @@ sign-in there.
 `GET /v1/hub/login/{provider}?web=1` signs the browser itself in, with the same allow-list and
 repository checks as any sign-in. On success it redirects to `/ui/#home` and sets
 `__Host-agentscm_session` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`); a refusal
-redirects to `/ui/#/signed-in?status=refused&reason=<kind>`.
+redirects to `/ui/#/signed-in?status=refused&reason=<kind>`. Another page served on the Hub's
+origin can ask to come back to itself with `&return_to=<path>`: a path of plain segments
+(letters, digits, `-._~`) that starts and ends with `/` and is not under `/v1/`, such as
+`/next/`. Both redirects then use that path instead of `/ui/`; any other value is refused with
+400 `invalid_request` before the forge is asked, so the sign-in never redirects off the Hub.
 This is the Hub API; the bundled web UI does not use it yet and still asks for a pasted token.
 
 - The Hub keeps only a domain-separated digest of the cookie, in the database (named migration
