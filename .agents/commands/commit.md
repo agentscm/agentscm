@@ -9,18 +9,18 @@ Commit the intended working-tree changes with a factual message. If `$ARGUMENTS`
 3. Do not commit on `main`. If the current branch is `main`, create a focused feature branch whose name describes the intended changes. If the current branch is unrelated to the changes or has already merged, stop and ask where the work belongs rather than moving commits or stashing changes automatically.
 4. Check `git log HEAD..origin/main --oneline`. If upstream has advanced, report it; do not rebase or merge unless the user asks.
 5. Review the diff and distinguish the intended changes from unrelated user work. Stage only the intended paths. Never use `git add -A` without first establishing that every changed and untracked path belongs to this commit.
-6. Run checks appropriate to the staged changes. Always run both `git diff --check` and `git diff --cached --check` so unstaged and staged changes are covered. For Rust, manifest, toolchain, or build-related changes, run the full repository gate from `AGENTS.md`:
+6. Run checks appropriate to the staged changes. Always run both `git diff --check` and `git diff --cached --check` so unstaged and staged changes are covered. For Rust, manifest, toolchain, or build-related changes, run:
 
    ```sh
    cargo fmt --check
    cargo clippy --all-targets --locked -- -D warnings
-   cargo nextest run --locked
-   cargo test --locked --doc
    ```
 
-   When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`; when the container image or its inputs change, also run `docker build -t agentscm . && .github/docker-smoke.sh agentscm`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+   and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite to commit; when the recipe selects the Rust gate, the one full run of a head that is ready to merge is its attestation, as in `.agents/commands/pr.md`.
 
-   Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
+   When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Run `.github/hub-e2e.sh default` when `compose.hub.yaml`, `.github/compose.e2e.yaml`, `.github/hub-e2e.sh`, `examples/hub_seed.rs` or the Dockerfile's `e2e-seed` stages change; the `postgres` profile runs only in the hosted `Hub end-to-end` workflow, which starts automatically on a same-repository pull request that changes a PostgreSQL migration, `src/hub/store_pg.rs`, `src/hub/store_pg/` or its harness; when any other change could affect it, report it as not run locally and, once the head is pushed, a same-repository author runs `gh workflow run hub-e2e.yml --ref <branch>` and matches the run's `headSha`. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+
+   Applicable reviews remain required. Runner or test-configuration changes still need a full nextest run and doctests; that run is the attestation of the ready head.
 
    If a required check cannot run, stop and report the failure or missing prerequisite explicitly.
 7. Re-read `git diff --staged` and verify that it contains no credentials, confidential information, machine-specific paths, unrelated edits, or accidental generated files.

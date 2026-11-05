@@ -1041,3 +1041,148 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     assert_eq!(events[0]["agent"], session["agent"]);
     assert!(events[0]["data"].is_object() && events[0]["seq"].is_i64());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_hand_off_events_carry_session_keys_and_no_session_ids() {
+    let hub = Hub::start().await;
+    let (alice, bob) = (hub.secret(1, "a"), hub.secret(2, "b"));
+    let token = |secret: &str| {
+        let digest = agent_token_digest(secret).unwrap();
+        hub.store
+            .authenticate(&digest, unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id
+    };
+    let (alice_token, bob_token) = (token(&alice), token(&bob));
+    let call = |session: &str, paths: &[&str]| SessionCall {
+        session: Some(session.into()),
+        via: "hook:claude".into(),
+        task: None,
+        paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+        deny: true,
+        report: true,
+    };
+    let now = unix_now();
+    hub.store
+        .touch_session(&alice_token, &call("raw-holder-id", &["src/a.rs"]), now)
+        .unwrap();
+    let denied = hub
+        .store
+        .touch_session(&bob_token, &call("raw-requester-id", &["src/a.rs"]), now)
+        .unwrap();
+    assert_eq!(denied.requested.len(), 1);
+    hub.store
+        .answer_handoff(
+            &alice_token,
+            Some("raw-holder-id"),
+            "src/a.rs",
+            true,
+            None,
+            now,
+        )
+        .unwrap();
+    let (status, body) = hub
+        .call(reqwest::Method::GET, ACTIVITY, Some(&alice), None)
+        .await;
+    assert_eq!(status, 200);
+    let text = body.to_string();
+    assert!(
+        !text.contains("raw-holder-id") && !text.contains("raw-requester-id"),
+        "{text}"
+    );
+    let events = body["events"].as_array().unwrap();
+    let find = |kind: &str| events.iter().find(|e| e["kind"] == kind).unwrap();
+    let key = |token: &str, session: &str| {
+        let input = format!("agentscm.hub.session-view.v1\0{token}\0{session}");
+        agentscm::hub::store::lower_hex_of(input.as_bytes())[..16].to_owned()
+    };
+    assert_eq!(
+        find("handoff_request")["data"]["to"]["session"],
+        json!({"key": key(&alice_token, "raw-holder-id"), "kind": "Claude Code"})
+    );
+    assert_eq!(
+        find("handoff_grant")["data"]["from"]["session"],
+        json!({"key": key(&bob_token, "raw-requester-id"), "kind": "Claude Code"})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let hub = Hub::start().await;
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 1,
+    };
+    let user = hub.store.upsert_user(&identity, "user1").unwrap();
+    let (token, secret) = mint_agent_token(&*hub.store, &user.id, "a", REPO, TTL).unwrap();
+    let started = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: Some("w".into()),
+                title: "Synthetic work".into(),
+                session: "w".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/**".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: None,
+                preflight: None,
+            },
+            unix_now(),
+        )
+        .unwrap()
+        .item;
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token },
+            &WorkTransitionRequest {
+                work_id: started.id.clone(),
+                operation_id: "rel".into(),
+                generation: started.generation,
+                expected_updated_seq: started.updated_seq,
+                session: Some("w".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let body = announce_body(1, &["src/b.rs", "lib/ok.rs", "src/sub/**", "src/a.rs"]);
+    let (status, reply) = hub
+        .call(
+            reqwest::Method::POST,
+            INTENTS,
+            Some(secret.expose()),
+            Some(&body),
+        )
+        .await;
+    assert_eq!(status, 400);
+    let mut keys: Vec<&str> = reply
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["error", "message", "refused_paths"]);
+    assert_eq!(reply["error"], "invalid_request");
+    assert!(reply["message"].as_str().unwrap().contains(&started.id));
+    assert_eq!(
+        reply["refused_paths"],
+        json!(["src/a.rs", "src/b.rs", "src/sub/**"])
+    );
+}

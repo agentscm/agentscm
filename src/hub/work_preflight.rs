@@ -84,6 +84,10 @@ pub struct WorkPreflightResult {
     pub checked_observations: Vec<CatchupMergeObservation>,
     pub reasons: Vec<WorkPreflightReason>,
     pub complete: bool,
+    /// The operational projection of each overlapping Work, filled only by a surface that was
+    /// asked for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operational: Vec<super::work_lifecycle::WorkOperationalV1>,
 }
 
 impl WorkPreflightRequest {

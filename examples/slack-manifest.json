@@ -16,7 +16,8 @@
   "oauth_config": {
     "scopes": {
       "bot": [
-        "chat:write"
+        "chat:write",
+        "app_mentions:read"
       ]
     }
   },
@@ -24,6 +25,7 @@
     "event_subscriptions": {
       "request_url": "https://example.invalid/v1/hub/slack",
       "bot_events": [
+        "app_mention",
         "tokens_revoked",
         "app_uninstalled"
       ]

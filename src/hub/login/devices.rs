@@ -20,12 +20,12 @@ use super::super::device::{
 use super::super::forge_api::ForgeApi;
 use super::super::github::GhError;
 use super::super::http::{ApiError, JsonBody, bearer, blocking};
-use super::super::repository_summary::{Facts, is_live_overlap, summarize};
+use super::super::repository_summary::{Facts, summarize};
 use super::super::store::{
     NewAgentToken, Principal, User, agent_token_digest, device_digest, mint_web_read_token,
     unix_now, validate_agent_name, validate_repository,
 };
-use super::super::work::{WorkOverviewQuery, WorkState};
+use super::super::work::WorkOverviewQuery;
 use super::super::{HubError, HubState};
 use super::{ApiResult, Human, Login, random_hex, session_digest};
 use crate::team::auth::generate_secret;
@@ -49,7 +49,7 @@ pub(super) fn routes() -> Router<HubState> {
 
 /// Why a mint was refused: a kind, or a role from [`super::missing_role`].
 #[derive(Debug, PartialEq, Eq)]
-enum Denial {
+pub(in crate::hub) enum Denial {
     Kind(&'static str),
     Role((&'static str, &'static str, &'static str)),
 }
@@ -108,13 +108,13 @@ impl FromRequestParts<HubState> for DeviceAuth {
 }
 
 /// A human session or a computer credential: the routes a person uses about their computers.
-enum Owner {
+pub(in crate::hub) enum Owner {
     Human(Human),
     Device(DevicePrincipal),
 }
 
 impl Owner {
-    fn user(&self) -> &User {
+    pub(in crate::hub) fn user(&self) -> &User {
         match self {
             Self::Human(human) => &human.user,
             Self::Device(device) => &device.owner,
@@ -419,7 +419,7 @@ async fn mint(
 
 /// The connected repository `repository` when `owner` may have a token for it now: the allow
 /// list and their current role, checked for every mint. A refusal is recorded under `via`.
-async fn mint_check(
+pub(in crate::hub) async fn mint_check(
     state: &HubState,
     owner: &User,
     repository: &str,
@@ -664,7 +664,15 @@ async fn repositories_for_owner(
                 .repository_events(&scope, None, 1)?
                 .first()
                 .map(|row| row.event.at);
+            let status = super::super::work_http::actionable_status::read_person(
+                &*store,
+                &owner,
+                &repo.full_name,
+                repo.repository_id,
+                now,
+            )?;
             let facts = Facts {
+                status,
                 live_complete: intents.len() <= LIST_LIVE_LIMIT
                     && sessions.len() <= LIST_LIVE_LIMIT,
                 overview,
@@ -675,24 +683,38 @@ async fn repositories_for_owner(
             const PANEL_WORK_LIMIT: usize = 20;
             const PANEL_LIVE_LIMIT: usize = 40;
             let work_complete =
-                facts.overview.current_complete && facts.overview.current.len() <= PANEL_WORK_LIMIT;
+                facts.status.complete && facts.status.work.len() <= PANEL_WORK_LIMIT && facts.status.actions.len() <= PANEL_WORK_LIMIT;
             let live_complete = facts.live_complete
                 && facts.sessions.len().saturating_add(facts.intents.len()) <= PANEL_LIVE_LIMIT;
             let work = if include_work {
                 facts
-                    .overview
-                    .current
+                    .status
+                    .work
                     .iter()
                     .take(PANEL_WORK_LIMIT)
                     .map(|item| {
                         json!({
-                            "agent": item.lead_agent,
+                            "agent": super::super::work_http::actionable_status::recipient_label(&item.recipient),
                             "title": item.title,
                             "state": item.state,
-                            "claim_status": item.claim_status,
-                            "next_action": item.next_action,
+                            "claim_status": item.freshness,
+                            "next_action": item.action,
+                            "needs_you": item.needs_you,
+                            "recipient": item.recipient,
+                            "reconciliation": item.reconciliation,
+                            "limits": item.limits,
                         })
                     })
+                    .chain(facts.status.actions.iter().take(PANEL_WORK_LIMIT).map(|action| json!({
+                        "agent": action.recipients.iter().map(super::super::work_http::actionable_status::recipient_label).collect::<Vec<_>>().join(", "),
+                        "title": action.action,
+                        "state": "action",
+                        "claim_status": "unknown",
+                        "next_action": action.action,
+                        "needs_you": action.needs_you,
+                        "recipients": action.recipients,
+                        "limits": action.limits,
+                    })))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -742,7 +764,7 @@ async fn repositories_for_owner(
             let revision = if include_work && summary.needs_you > 0 {
                 revision_key
                     .as_deref()
-                    .map(|key| attention_revision(&facts, &summary.contested_markers, key))
+                    .map(|key| attention_revision(&facts.status, key))
             } else {
                 None
             };
@@ -781,27 +803,40 @@ async fn repositories_for_owner(
 }
 
 /// A stable change marker for actionable items, without returning paths or token values.
-fn attention_revision(facts: &Facts, contested_markers: &[String], key: &str) -> String {
-    let mut keys = Vec::new();
-    for item in &facts.overview.current {
-        if item.state == WorkState::Blocked {
-            keys.push(format!("work:{}", item.id));
-        }
-    }
-    for pair in facts
-        .overview
-        .overlaps
+fn attention_revision(
+    status: &super::super::work_http::actionable_status::ActionableStatus,
+    key: &str,
+) -> String {
+    let actions = status
+        .work
         .iter()
-        .filter(|pair| is_live_overlap(pair))
-    {
-        keys.push(format!("overlap:{}:{}", pair.left.id, pair.right.id));
-    }
-    // Only contested pairs and their overlapping keys affect this revision.
-    for marker in contested_markers {
-        keys.push(format!("intent-pair:{marker}"));
-    }
-    keys.sort();
-    crate::hmac::hmac_sha256(key.as_bytes(), keys.join("\0").as_bytes())
+        .filter(|w| w.needs_you)
+        .map(|w| {
+            serde_json::to_string(&(
+                &w.work_id,
+                w.generation,
+                w.updated_seq,
+                w.state,
+                &w.recipient,
+                &w.action,
+                w.operational.reservation.status,
+            ))
+            .expect("action version serializes")
+        })
+        .chain(status.actions.iter().filter(|a| a.needs_you).map(|a| {
+            serde_json::to_string(&(
+                &a.id,
+                &a.kind,
+                &a.work_ids,
+                a.updated_seq,
+                &a.semantic_version,
+                &a.recipients,
+                &a.action,
+            ))
+            .expect("action version serializes")
+        }))
+        .collect::<Vec<_>>();
+    crate::hmac::hmac_sha256(key.as_bytes(), actions.join("\0").as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -984,7 +1019,7 @@ async fn fork_parent(state: &HubState, owner: &User, repository: &str) -> Option
 ///
 /// The only source today is the forge; an administrator-issued grant for other Git hosts would
 /// be a second source here.
-async fn repository_role(
+pub(in crate::hub) async fn repository_role(
     state: &HubState,
     owner: &User,
     repo: &ConnectedRepository,
@@ -1164,6 +1199,213 @@ async fn admin_refusals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_revision_ignores_provider_poll_time_but_tracks_actions_and_recipients() {
+        use crate::hub::work_http::actionable_status::{ActionableStatus, StatusReconciliation};
+        let mut status: ActionableStatus =
+            serde_json::from_str(include_str!("../fixtures/actionable-status.json")).unwrap();
+        let before = super::attention_revision(&status, "synthetic-key");
+        status.observed_at += 1;
+        status.digest = "new-full-evidence-digest".into();
+        let row = status.work.iter_mut().find(|w| w.needs_you).unwrap();
+        row.reconciliation = Some(StatusReconciliation {
+            current: false,
+            declaration_seq: 1,
+            current_evidence_digest: Some("fresh-provider-read".into()),
+            current_source_coverage: vec![crate::hub::work_reconciliation::SourceEvidence {
+                source: "forge_pull".into(),
+                state: "observed_only".into(),
+                checked_at_seconds: 9876,
+                unread_pages: 0,
+                deferred: 0,
+            }],
+            stale_reasons: vec![],
+            digest: "new-reconciliation-digest".into(),
+        });
+        assert_eq!(super::attention_revision(&status, "synthetic-key"), before);
+        status
+            .work
+            .iter_mut()
+            .find(|w| w.needs_you)
+            .unwrap()
+            .recipient
+            .owner = Some("usr_other".into());
+        let changed = super::attention_revision(&status, "synthetic-key");
+        assert_ne!(changed, before);
+        status
+            .work
+            .iter_mut()
+            .find(|w| w.needs_you)
+            .unwrap()
+            .action
+            .push_str(" Updated action.");
+        assert_ne!(super::attention_revision(&status, "synthetic-key"), changed);
+    }
+
+    #[test]
+    fn pr_attention_revision_tracks_semantics_across_real_store_polls() {
+        use crate::hub::{
+            connection::NewConnection,
+            intent::NewIntent,
+            store::{self, ForgeIdentity, agent_token_digest, mint_bound_agent_token},
+            work_http::actionable_status,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let now = store::unix_now();
+        let owner = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                "synthetic",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            &*store,
+            &owner.id,
+            "synthetic",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let who = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        let con = store
+            .insert_connection(
+                &NewConnection {
+                    id: format!("con_{}", "a".repeat(32)),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "pat".into(),
+                    app_id: None,
+                    app_slug: None,
+                    acts_as: Some("synthetic".into()),
+                },
+                &owner.id,
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(&con.id, "github.com", 101, "acme/widgets", None, None)
+            .unwrap();
+        store
+            .announce_intent(
+                &who.token_id,
+                &NewIntent {
+                    id: format!("int_{}", "b".repeat(32)),
+                    task: "Synthetic overlap".into(),
+                    branch: None,
+                    base: None,
+                    machine: None,
+                    paths: vec!["src/a.rs".into()],
+                    ttl_seconds: 3600,
+                },
+                now,
+            )
+            .unwrap();
+        let read = || actionable_status::read(&*store, &who, now).unwrap();
+        let mut pull = json!({"number":1,"state":"open","head_sha":"first-head","files":["src/a.rs","src/b.rs"],"files_truncated":false});
+        store
+            .observe(&repo.id, "pull_request", "1", &pull.to_string(), 1000)
+            .unwrap();
+        let first = read();
+        let revision = attention_revision(&first, "synthetic-key");
+        store
+            .observe(&repo.id, "pull_request", "1", &pull.to_string(), 2000)
+            .unwrap();
+        let second = read();
+        assert_ne!(
+            first.digest, second.digest,
+            "full source version retains provider read time"
+        );
+        assert_eq!(revision, attention_revision(&second, "synthetic-key"));
+        pull["files"] = json!(["src/b.rs", "src/a.rs"]);
+        store
+            .observe(&repo.id, "pull_request", "1", &pull.to_string(), 3000)
+            .unwrap();
+        assert_eq!(revision, attention_revision(&read(), "synthetic-key"));
+        for (field, value) in [
+            ("head_sha", json!("second-head")),
+            ("files", json!(["src/a.rs", "src/c.rs"])),
+            ("files_truncated", json!(true)),
+        ] {
+            let before = attention_revision(&read(), "synthetic-key");
+            pull[field] = value;
+            store
+                .observe(
+                    &repo.id,
+                    "pull_request",
+                    "1",
+                    &pull.to_string(),
+                    store.observation_floor(&repo.id).unwrap() + 1000,
+                )
+                .unwrap();
+            assert_ne!(before, attention_revision(&read(), "synthetic-key"));
+        }
+        let before = attention_revision(&read(), "synthetic-key");
+        let other = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 2,
+                },
+                "synthetic-other",
+            )
+            .unwrap();
+        let (token, _, _) = mint_bound_agent_token(
+            &*store,
+            &other.id,
+            "synthetic-other",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        store
+            .announce_intent(
+                &token,
+                &NewIntent {
+                    id: format!("int_{}", "c".repeat(32)),
+                    task: "Synthetic second recipient".into(),
+                    branch: None,
+                    base: None,
+                    machine: None,
+                    paths: vec!["src/a.rs".into()],
+                    ttl_seconds: 3600,
+                },
+                now,
+            )
+            .unwrap();
+        let after = read();
+        assert_ne!(before, attention_revision(&after, "synthetic-key"));
+        assert_ne!(
+            first
+                .actions
+                .iter()
+                .find(|a| a.kind == "pr_overlap")
+                .unwrap()
+                .semantic_version,
+            after
+                .actions
+                .iter()
+                .find(|a| a.kind == "pr_overlap")
+                .unwrap()
+                .semantic_version
+        );
+    }
 
     #[test]
     fn github_roles_follow_missing_role() {

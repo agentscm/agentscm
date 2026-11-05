@@ -5,6 +5,9 @@ use std::sync::Arc;
 use agentscm::backend::LocalBackend;
 use agentscm::hub::insights::{MAX_OBSERVATIONS, UsageRecord};
 use agentscm::hub::store::{ForgeIdentity, Store, mint_bound_agent_token, unix_now};
+use agentscm::hub::work_transition::{
+    WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+};
 use agentscm::hub::{HubState, router, store};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -338,7 +341,7 @@ async fn http_and_mcp_finish_share_one_opted_in_completion_observation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_finished_checkpoint_replays_do_not_report_completion() {
     let hub = Hub::start().await;
-    let writer = hub.token(false);
+    let (token_id, writer) = hub.token_with_id(false);
     let work = start_work(&hub, &writer).await;
     let id = work["item"]["id"].as_str().unwrap();
     let stale_finish = finish(
@@ -356,38 +359,26 @@ async fn stale_finished_checkpoint_replays_do_not_report_completion() {
         .await;
     assert_eq!(status, StatusCode::OK, "{finished}");
 
-    let handover = json!({
-        "work_id":id,"operation_id":"handover-after-finish","generation":1,
-        "expected_updated_seq":finished["item"]["updated_seq"],
-        "session":"surface-session","kind":"handover",
-        "summary":"Reopen this work under a new generation","next_action":null,
-        "scope":null,"branch":null,"worktree":null,"resolve_blocker":false,
-        "source_refs":[],"depends_on":[],"related_work":[]
-    });
-    let (status, handed_over) = hub
-        .request(
-            reqwest::Method::POST,
-            "/v1/hub/standup/checkpoint",
-            &writer,
-            Some(handover),
+    // Finished work accepts no checkpoint or takeover; reopening it is a separate transition.
+    let reopened = hub
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token_id },
+            &WorkTransitionRequest {
+                work_id: id.to_owned(),
+                operation_id: "reopen-generation-two".into(),
+                generation: 1,
+                expected_updated_seq: finished["item"]["updated_seq"].as_i64().unwrap(),
+                session: Some("surface-session".into()),
+                transition: WorkTransitionKind::Reopen,
+                reason: "continue after review".into(),
+                superseded_by: None,
+            },
+            unix_now(),
         )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{handed_over}");
-    let takeover = json!({
-        "work_id":id,"source":null,"request_key":null,
-        "title":"verify insight contracts","session":"surface-session","role":"lead",
-        "scope":["src/synthetic.rs"],"branch":null,"worktree":null,"next_action":null,
-        "depends_on":[],"related_work":[],"takeover_generation":1
-    });
-    let (status, reopened) = hub
-        .request(
-            reqwest::Method::POST,
-            "/v1/hub/standup/start",
-            &writer,
-            Some(takeover),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{reopened}");
+        .unwrap();
+    assert!(reopened.conflict.is_none());
+    let reopened = json!({"item": reopened.item});
     assert_eq!(reopened["item"]["generation"], 2);
     assert_eq!(reopened["item"]["state"], "active");
 

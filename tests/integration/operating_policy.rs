@@ -2119,6 +2119,65 @@ fn definite_draft_preflight_errors_do_not_reserve_requests() {
     assert_eq!(count, 0);
 }
 
+/// Points the local binding at the reopened Work. A reopen raises the generation, which the
+/// journal treats as a change of responsibility and refuses to bind, so the staging writes the
+/// binding row directly.
+fn rebind_after_reopen(
+    f: &Fixture,
+    dispatch: &str,
+    binding: &OperatingWork,
+    reopened: &agentscm::hub::work::WorkItem,
+) -> OperatingWork {
+    let mut rebound = binding.clone();
+    rebound.work = reopened.clone();
+    let db = rusqlite::Connection::open(f.data.join("pipeline-rules/state.sqlite")).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE operating_reservations SET work = ?1 WHERE dispatch_id = ?2",
+            rusqlite::params![serde_json::to_string(&rebound).unwrap(), dispatch],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    rebound
+}
+
+/// Reopens finished Work as its lead session and returns the reopened item.
+fn reopen_as_lead(
+    hub: &LocalHub,
+    work: &agentscm::hub::work::WorkItem,
+    operation_id: &str,
+) -> agentscm::hub::work::WorkItem {
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let current = hub
+        .store
+        .work_get(&hub.token_id, &work.id, agentscm::hub::store::unix_now())
+        .unwrap()
+        .unwrap();
+    let result = hub
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent {
+                token: &hub.token_id,
+            },
+            &WorkTransitionRequest {
+                work_id: current.id.clone(),
+                operation_id: operation_id.into(),
+                generation: current.generation,
+                expected_updated_seq: current.updated_seq,
+                session: Some(work.lead_session.clone()),
+                transition: WorkTransitionKind::Reopen,
+                reason: "stage a lost recovery response".into(),
+                superseded_by: None,
+            },
+            agentscm::hub::store::unix_now(),
+        )
+        .unwrap();
+    assert!(result.conflict.is_none());
+    result.item
+}
+
 #[test]
 fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unbound_legacy_refusal()
  {
@@ -2168,10 +2227,21 @@ fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unb
         branch: None,
         worktree: None,
         resolve_blocker: true,
-        source_refs: vec![],
+        // Recovery requests carry the accepted commit, as the production request does.
+        source_refs: vec![agentscm::hub::work::SourceRef::Commit {
+            oid: dispatch.event.accepted_commit.clone(),
+            path: None,
+        }],
         depends_on: vec![],
         related_work: vec![],
     };
+    // The run already finished the Work, and finished Work accepts no new checkpoint. Reopen it
+    // as its lead so the recovery checkpoint below is a first commit whose response is lost.
+    let reopened = reopen_as_lead(&hub, &binding.work, "stage-reopen-1");
+    let binding = rebind_after_reopen(&f, &dispatch.dispatch_id, &binding, &reopened);
+    let mut request = request;
+    request.generation = reopened.generation;
+    request.expected_updated_seq = Some(reopened.updated_seq);
     let mut reserved = binding.clone();
     reserved.recovery = Some(OperatingRecovery {
         dispatch_generation: retained.claim_generation,
@@ -2205,9 +2275,14 @@ fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unb
     );
     let successful_workflow = skill_workflow::runtime::status(&f.data, &dispatch.run_id).unwrap();
     let before_compaction = j.operating_work(&dispatch.dispatch_id).unwrap().unwrap();
+    // Finished again by the recovery above; reopen once more to stage the compacted finish.
+    let reopened = reopen_as_lead(&hub, &before_compaction.work, "stage-reopen-2");
+    let before_compaction =
+        rebind_after_reopen(&f, &dispatch.dispatch_id, &before_compaction, &reopened);
     let mut old_finish = request.clone();
     old_finish.operation_id = "compacted-finish-recovery".into();
-    old_finish.expected_updated_seq = Some(before_compaction.work.updated_seq);
+    old_finish.generation = reopened.generation;
+    old_finish.expected_updated_seq = Some(reopened.updated_seq);
     let mut uncertain = before_compaction.clone();
     uncertain.recovery = Some(OperatingRecovery {
         dispatch_generation: retained.claim_generation,
@@ -2309,6 +2384,302 @@ fn recovery_replays_the_exact_checkpoint_after_lost_response_and_can_requeue_unb
             .len(),
         1
     );
+}
+
+/// A completed dispatch whose Work the run finished, with the retained dispatch's claim
+/// generation.
+fn completed_run(
+    f: &Fixture,
+    hub: &LocalHub,
+    j: &mut RuleJournal,
+) -> (String, OperatingWork, String, i64) {
+    activated(f, j);
+    let mut next = event(f);
+    next.proposal_number += 1;
+    let dispatch = j
+        .accept_operating_event(&f.rule.rule_id, &next, ACTOR)
+        .unwrap()
+        .remove(0);
+    let result = hub.success(f, &["run", &dispatch.dispatch_id], false);
+    assert_eq!(result["checkpoint_recorded"], true, "{result}");
+    let binding = j.operating_work(&dispatch.dispatch_id).unwrap().unwrap();
+    assert_eq!(binding.work.state, agentscm::hub::work::WorkState::Finished);
+    let retained = j.dispatch(&dispatch.dispatch_id).unwrap();
+    (
+        dispatch.dispatch_id,
+        binding,
+        dispatch.event.accepted_commit.clone(),
+        retained.claim_generation,
+    )
+}
+
+fn hub_work(hub: &LocalHub, id: &str) -> agentscm::hub::work::WorkItem {
+    hub.store
+        .work_get(&hub.token_id, id, agentscm::hub::store::unix_now())
+        .unwrap()
+        .unwrap()
+}
+
+fn lead_report(
+    hub: &LocalHub,
+    work: &agentscm::hub::work::WorkItem,
+    operation: &str,
+    kind: agentscm::hub::work::CheckpointKind,
+    commit: Option<&str>,
+) -> agentscm::hub::work::WorkItem {
+    let request = agentscm::hub::work::WorkCheckpoint {
+        work_id: work.id.clone(),
+        operation_id: operation.into(),
+        generation: work.generation,
+        session: work.lead_session.clone(),
+        expected_updated_seq: Some(work.updated_seq),
+        kind,
+        summary: "synthetic step".into(),
+        next_action: None,
+        scope: None,
+        branch: None,
+        worktree: None,
+        resolve_blocker: false,
+        source_refs: commit
+            .map(|oid| {
+                vec![agentscm::hub::work::SourceRef::Commit {
+                    oid: oid.into(),
+                    path: None,
+                }]
+            })
+            .unwrap_or_default(),
+        depends_on: vec![],
+        related_work: vec![],
+    };
+    hub.store
+        .work_checkpoint(&hub.token_id, &request, agentscm::hub::store::unix_now())
+        .unwrap()
+        .item
+}
+
+fn lead_transition(
+    hub: &LocalHub,
+    work: &agentscm::hub::work::WorkItem,
+    operation: &str,
+    transition: agentscm::hub::work_transition::WorkTransitionKind,
+) -> agentscm::hub::work::WorkItem {
+    use agentscm::hub::work_transition::{WorkTransitionActor, WorkTransitionRequest};
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent {
+                token: &hub.token_id,
+            },
+            &WorkTransitionRequest {
+                work_id: work.id.clone(),
+                operation_id: operation.into(),
+                generation: work.generation,
+                expected_updated_seq: work.updated_seq,
+                session: Some(work.lead_session.clone()),
+                transition,
+                reason: "stage a recovery case".into(),
+                superseded_by: None,
+            },
+            agentscm::hub::store::unix_now(),
+        )
+        .unwrap()
+        .item
+}
+
+/// Retains an unresolved finish recovery against `current` and returns the reconcile arguments.
+fn retain_unresolved_finish(
+    f: &Fixture,
+    j: &mut RuleJournal,
+    dispatch: &str,
+    binding: &OperatingWork,
+    current: &agentscm::hub::work::WorkItem,
+    commit: &str,
+    claim_generation: i64,
+) {
+    let binding = rebind_after_reopen(f, dispatch, binding, current);
+    let mut reserved = binding.clone();
+    reserved.recovery = Some(OperatingRecovery {
+        dispatch_generation: claim_generation,
+        request: agentscm::hub::work::WorkCheckpoint {
+            work_id: current.id.clone(),
+            operation_id: "unresolved-finish".into(),
+            generation: current.generation,
+            session: current.lead_session.clone(),
+            expected_updated_seq: Some(current.updated_seq - 1),
+            kind: agentscm::hub::work::CheckpointKind::Finish,
+            summary: "Reconciled retained successful workflow".into(),
+            next_action: None,
+            scope: None,
+            branch: None,
+            worktree: None,
+            resolve_blocker: true,
+            source_refs: vec![agentscm::hub::work::SourceRef::Commit {
+                oid: commit.into(),
+                path: None,
+            }],
+            depends_on: vec![],
+            related_work: vec![],
+        },
+        rejected_at_seq: None,
+    });
+    j.bind_operating_work(dispatch, Some(&binding), &reserved)
+        .unwrap();
+}
+
+fn reconcile(
+    f: &Fixture,
+    hub: &LocalHub,
+    dispatch: &str,
+    claim_generation: i64,
+    observed: i64,
+) -> std::process::Output {
+    let generation = claim_generation.to_string();
+    let observed = observed.to_string();
+    hub.cli(
+        f,
+        &[
+            "recover",
+            dispatch,
+            "--expected-generation",
+            &generation,
+            "--reconcile-operation",
+            "unresolved-finish",
+            "--observed-seq",
+            &observed,
+        ],
+        false,
+    )
+}
+
+#[test]
+fn finished_work_reconciles_only_when_the_hub_holds_the_matching_finish() {
+    use agentscm::hub::work::CheckpointKind;
+    use agentscm::hub::work_transition::WorkTransitionKind;
+    let message = |out: &std::process::Output| String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // The finish the run recorded matches: the observation is recorded, no checkpoint is
+    // written and nothing stays pending.
+    let f = fixture();
+    let hub = LocalHub::start(&f);
+    let mut j = journal(&f);
+    let (dispatch, binding, commit, claim) = completed_run(&f, &hub, &mut j);
+    let current = hub_work(&hub, &binding.work.id);
+    retain_unresolved_finish(&f, &mut j, &dispatch, &binding, &current, &commit, claim);
+    let out = reconcile(&f, &hub, &dispatch, claim, current.updated_seq);
+    assert!(out.status.success(), "{}", message(&out));
+    let bound = j.operating_work(&dispatch).unwrap().unwrap();
+    assert!(bound.recovery.is_none());
+    assert_eq!(bound.recovery_reconciliations.len(), 1);
+    assert_eq!(
+        hub_work(&hub, &binding.work.id).updated_seq,
+        current.updated_seq
+    );
+
+    // A finish that carries another commit is a conflict.
+    let f = fixture();
+    let hub = LocalHub::start(&f);
+    let mut j = journal(&f);
+    let (dispatch, binding, commit, claim) = completed_run(&f, &hub, &mut j);
+    let reopened = reopen_as_lead(&hub, &binding.work, "stage-reopen");
+    let other = "f".repeat(commit.len());
+    let finished = lead_report(
+        &hub,
+        &reopened,
+        "other-finish",
+        CheckpointKind::Finish,
+        Some(&other),
+    );
+    retain_unresolved_finish(&f, &mut j, &dispatch, &binding, &finished, &commit, claim);
+    let out = reconcile(&f, &hub, &dispatch, claim, finished.updated_seq);
+    assert!(!out.status.success());
+    assert!(
+        message(&out).contains("lacks the matching result checkpoint"),
+        "{}",
+        message(&out)
+    );
+    assert!(
+        j.operating_work(&dispatch)
+            .unwrap()
+            .unwrap()
+            .recovery
+            .is_some()
+    );
+
+    // Work ended by a `complete` or `abandon` transition is not a matching finish either.
+    for (name, transition) in [
+        ("complete", WorkTransitionKind::Complete),
+        ("abandon", WorkTransitionKind::Abandon),
+    ] {
+        let f = fixture();
+        let hub = LocalHub::start(&f);
+        let mut j = journal(&f);
+        let (dispatch, binding, commit, claim) = completed_run(&f, &hub, &mut j);
+        let reopened = reopen_as_lead(&hub, &binding.work, "stage-reopen");
+        let progressed = lead_report(&hub, &reopened, "progress", CheckpointKind::Progress, None);
+        let ended = lead_transition(&hub, &progressed, name, transition);
+        assert_eq!(ended.state, agentscm::hub::work::WorkState::Finished);
+        retain_unresolved_finish(&f, &mut j, &dispatch, &binding, &ended, &commit, claim);
+        let out = reconcile(&f, &hub, &dispatch, claim, ended.updated_seq);
+        assert!(!out.status.success(), "{name}");
+        assert!(
+            message(&out).contains("lacks the matching result checkpoint"),
+            "{name}: {}",
+            message(&out)
+        );
+        assert!(
+            j.operating_work(&dispatch)
+                .unwrap()
+                .unwrap()
+                .recovery
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn recovery_after_release_or_reopen_fails_closed_without_success() {
+    use agentscm::hub::work_transition::WorkTransitionKind;
+    for release in [false, true] {
+        let f = fixture();
+        let hub = LocalHub::start(&f);
+        let mut j = journal(&f);
+        let (dispatch, binding, _commit, claim) = completed_run(&f, &hub, &mut j);
+        let reopened = reopen_as_lead(&hub, &binding.work, "stage-reopen");
+        let current = if release {
+            lead_transition(
+                &hub,
+                &reopened,
+                "stage-release",
+                WorkTransitionKind::Release,
+            )
+        } else {
+            reopened
+        };
+        let before = hub_work(&hub, &binding.work.id);
+        let generation = claim.to_string();
+        let out = hub.cli(
+            &f,
+            &["recover", &dispatch, "--expected-generation", &generation],
+            false,
+        );
+        assert!(!out.status.success(), "release={release}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("authority changed"), "{stderr}");
+        assert!(
+            out.stdout.is_empty() || !String::from_utf8_lossy(&out.stdout).contains("reconciled")
+        );
+        // The Hub and the local binding are untouched.
+        assert_eq!(
+            hub_work(&hub, &binding.work.id).updated_seq,
+            before.updated_seq
+        );
+        assert_eq!(
+            hub_work(&hub, &binding.work.id).generation,
+            current.generation
+        );
+        let bound = j.operating_work(&dispatch).unwrap().unwrap();
+        assert_eq!(bound.work.generation, binding.work.generation);
+        assert!(bound.recovery.is_none());
+    }
 }
 
 #[test]

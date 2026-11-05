@@ -22,6 +22,8 @@ use super::{HubError, HubState, Result};
 
 pub const SESSION_TTL_SECONDS: i64 = 1200;
 pub const DEFAULT_SESSION: &str = "default";
+/// The refusal of an omitted session that the Hub cannot match to exactly one hook session.
+pub const SESSION_REQUIRED: &str = "session is required: this agent token has more than one hook session, or its only one is idle, so an omitted session is ambiguous. Pass session with your own native session ID (the AgentSCM SessionStart context shows it) on every AgentSCM call; a client without hooks can pass any stable name of its own.";
 const MAX_SESSION_BYTES: usize = 128;
 /// Session rows untouched this long are pruned; their intents expired long before.
 pub(super) const STALE_SESSION_SECONDS: i64 = 7 * 86_400;
@@ -40,9 +42,10 @@ pub(super) const NOTICES_PER_TOUCH: usize = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionCall {
-    /// None: the token's default session, which is its most recently updated session whose `via`
-    /// contains a `hook:` mode and was updated within `SESSION_TTL_SECONDS` (so an MCP call joins
-    /// the hook-connected session of the same agent); if none, `DEFAULT_SESSION`.
+    /// None: the token's only kept hook session when it was updated within
+    /// `SESSION_TTL_SECONDS` (so an MCP call joins the hook-connected session of the same agent);
+    /// `DEFAULT_SESSION` when the token keeps no hook session; otherwise refused with
+    /// `SESSION_REQUIRED`.
     pub session: Option<String>,
     /// `mcp` or `hook:<agent>`, the latter with 1-32 of [a-z0-9-].
     pub via: String,
@@ -80,8 +83,12 @@ pub struct Touched {
     /// Handoff requests to this session and answers to its requests, each told once; none
     /// while the call was refused.
     pub handoffs: Vec<HandoffNote>,
-    /// Refused files this call asked the holder to hand over (best effort).
-    pub requested: Vec<String>,
+    /// Refused files this call asked the holder to hand over (best effort), each with the holder
+    /// it asked.
+    pub requested: Vec<(String, Intent)>,
+    /// Same-owner notice that this touch kept a lead whose recorded token or
+    /// agent label did not match the caller. Empty when nothing was carried.
+    pub lead_notes: Vec<String>,
 }
 
 pub struct Advice {
@@ -377,6 +384,16 @@ fn contested(token: &str, via: &[String], keys: &[String], intents: Vec<Intent>)
     found
 }
 
+/// The one session a refused call asked, to be named in its refusal; `None` when it asked
+/// several (the wording stays generic) or none.
+pub fn asked_holder(requested: &[(String, Intent)]) -> Option<&Intent> {
+    let (_, first) = requested.first()?;
+    requested
+        .iter()
+        .all(|(_, holder)| holder.id == first.id)
+        .then_some(first)
+}
+
 /// What to do with the files a call edits for the first time, given the session's refusals so far.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Decision {
@@ -547,6 +564,7 @@ impl Guarded {
     }
 
     /// The result of the call; `announced` is the announce of `step.new`, if one was made.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn touched(
         self,
         token: &str,
@@ -554,7 +572,8 @@ impl Guarded {
         announced: Option<Announced>,
         notices: Vec<HubEvent>,
         handoffs: Vec<HandoffNote>,
-        requested: Vec<String>,
+        requested: Vec<(String, Intent)>,
+        lead_notes: Vec<String>,
     ) -> Touched {
         let Self {
             step,
@@ -592,6 +611,7 @@ impl Guarded {
             rate_limited,
             handoffs,
             requested,
+            lead_notes,
         }
     }
 }
@@ -644,7 +664,22 @@ pub async fn announce_for(
     principal: &Principal,
     call: SessionCall,
 ) -> Result<Advice> {
-    Ok(announce_reading(state, principal, call, |_, _| ()).await?.0)
+    let named = call.session.is_some();
+    announce_named(state, principal, call, named).await
+}
+
+/// [`announce_for`], where `named` is false when the caller named no session and `call.session`
+/// is the one the Hub already resolved for it. The touch targets exactly that session but renews
+/// no lease and carries no lead credential.
+pub async fn announce_named(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    named: bool,
+) -> Result<Advice> {
+    Ok(announce_with(state, principal, call, named, |_, _| ())
+        .await?
+        .0)
 }
 
 /// [`announce_for`], also running `read` in the same store hop right after the touch commits.
@@ -655,10 +690,21 @@ pub(super) async fn announce_reading<T: Send + 'static>(
     call: SessionCall,
     read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
 ) -> Result<(Advice, T)> {
+    let named = call.session.is_some();
+    announce_with(state, principal, call, named, read).await
+}
+
+async fn announce_with<T: Send + 'static>(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    named: bool,
+    read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
+) -> Result<(Advice, T)> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let (touched, read) = blocking(state, move || {
-        let touched = store.touch_session(&token, &call, unix_now())?;
+        let touched = store.touch_session_named(&token, &call, named, unix_now())?;
         let read = read(&*store, &touched);
         Ok((touched, read))
     })
@@ -694,18 +740,26 @@ pub(super) async fn announce_reading<T: Send + 'static>(
         }
         text.push_str(&unknown);
     }
+    for note in &touched.lead_notes {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(note);
+    }
     let deny = (!touched.denied.is_empty()).then(|| {
+        // Say the holder was asked only when every refused file was.
+        let requested = !touched.requested.is_empty()
+            && touched
+                .denied
+                .iter()
+                .flat_map(|overlap| &overlap.your_paths)
+                .all(|path| touched.requested.iter().any(|(asked, _)| asked == path));
         advice::deny_reason(
             &touched.denied,
-            // Say the holder was asked only when every refused file was.
             (
                 Some(&touched.session),
-                !touched.requested.is_empty()
-                    && touched
-                        .denied
-                        .iter()
-                        .flat_map(|overlap| &overlap.your_paths)
-                        .all(|path| touched.requested.contains(path)),
+                requested,
+                asked_holder(&touched.requested),
             ),
             unix_now(),
         )
@@ -960,6 +1014,7 @@ mod tests {
             rate_limited: false,
             handoffs: Vec::new(),
             requested: Vec::new(),
+            lead_notes: Vec::new(),
         };
         let woken = |touched: &Touched| {
             let notified = waiters.notified();

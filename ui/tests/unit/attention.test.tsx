@@ -2,7 +2,7 @@ import { act, fireEvent, render, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Derived } from '../../src/derive.ts'
 import { STALE_SECONDS } from '../../src/dismiss.tsx'
-import { needHideKey, needsYou } from '../../src/needs.ts'
+import { needHideKey, legacyNeeds as needsYou } from '../../src/needs.ts'
 import { DashboardPage, dashboardStatus } from '../../src/pages/Dashboard.tsx'
 import type { CoordinationRequest, WorkItem, WorkOverview } from '../../src/standup.ts'
 import type { HubData } from '../../src/useHub.ts'
@@ -131,8 +131,8 @@ describe('Headline', () => {
       item('f', 'sam', { state: 'handover', claim_status: 'active' }),
     ])
     render(page(ov))
-    expect(document.querySelector('.answer-text')!.textContent).toBe('5 unfinished tasks: 2 moving, 3 stuck. 1 thing needs you.')
-    expect(document.querySelector('.answer-fact')!.textContent).toBe('Stuck: 1 blocked, 1 paused, 1 waiting for another agent. 0 agents are connected.')
+    expect(document.querySelector('.answer-text')!.textContent).toBe('5 unfinished tasks: 2 moving, 3 awaiting review or blocked. 1 thing needs you.')
+    expect(document.querySelector('.answer-fact')!.textContent).toBe('Reported: 1 blocked, 1 paused, 1 awaiting handover review. 0 agents are connected.')
     expect(dashboardStatus(ov, d, null, null).home?.text).toBe('Waiting on you')
   })
 })

@@ -1,5 +1,6 @@
 //! Immutable local CI declarations. These contracts do not execute jobs or grant admission.
 mod coverage;
+mod device;
 mod evidence;
 #[cfg(unix)]
 mod git;
@@ -9,6 +10,11 @@ mod resolve;
 pub use coverage::{
     CellObservation, CoverageAssessment, CoverageReport, ObservationOutcome, ServiceObservation,
     verify_coverage,
+};
+pub use device::{
+    DEVICE_ID_PREFIX, DeviceAssurance, DeviceAuthorization, DeviceClaim, DeviceDecision, DeviceKey,
+    DeviceRefusal, DeviceUnknown, EnrollmentExpectation, EnrollmentStatement, KeyLocationRefusal,
+    OwnerIdentity, OwnerStanding, assess_device, key_location_refused, verify_enrollment,
 };
 pub use evidence::{LOCAL_CI_CHECK_KIND, LOCAL_CI_REQUIREMENT_ID, PlanArtifact};
 

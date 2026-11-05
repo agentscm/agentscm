@@ -21,6 +21,8 @@ pub mod hook;
 pub mod http;
 pub mod insights;
 pub mod intent;
+mod lead_credential;
+pub mod local_ci_devices;
 pub mod login;
 pub mod mcp;
 pub mod narrative;
@@ -47,8 +49,12 @@ pub mod value_metrics;
 pub mod view_settings;
 pub mod work;
 pub mod work_http;
+pub mod work_lifecycle;
 pub mod work_links;
 pub mod work_preflight;
+pub mod work_reconcile;
+pub mod work_reconciliation;
+pub mod work_transition;
 pub mod workspace;
 #[cfg(unix)]
 pub mod workspace_agent_tasks;
@@ -146,6 +152,13 @@ impl From<rusqlite::Error> for HubError {
 
 impl From<postgres::Error> for HubError {
     fn from(error: postgres::Error) -> Self {
+        use postgres::error::SqlState;
+        // The server rolled the whole transaction back, so nothing was written and a retry is safe.
+        if error.code().is_some_and(|code| {
+            *code == SqlState::T_R_DEADLOCK_DETECTED || *code == SqlState::T_R_SERIALIZATION_FAILURE
+        }) {
+            return Self::Busy;
+        }
         Self::Unavailable(error.to_string())
     }
 }
@@ -449,6 +462,7 @@ pub fn router(state: HubState) -> Router {
         .merge(intent::routes())
         .merge(hook::routes())
         .merge(login::routes())
+        .merge(local_ci_devices::routes())
         .merge(mcp::routes())
         .merge(publish::routes())
         .merge(sync::routes())

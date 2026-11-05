@@ -463,3 +463,269 @@ fn watch_starts_from_now_not_from_history() {
     assert_eq!(lines.lines().count(), 1, "{lines}");
     assert!(lines.contains("started working on src/x.rs (which you are changing)"));
 }
+
+fn work_start(session: &str, scope: &[&str]) -> agentscm::hub::work::WorkStart {
+    serde_json::from_value(json!({
+        "work_id": null, "source": null, "request_key": "synthetic-key",
+        "title": "Synthetic work", "session": session, "role": "lead",
+        "scope": scope, "branch": null, "worktree": null, "next_action": null,
+        "depends_on": [], "related_work": [], "takeover_generation": null, "preflight": null
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_released_intent_id_is_replaced_and_a_refusal_is_shown() {
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let client = Client::new(&hub, &alice, "laptop-a");
+    let work = repo();
+    let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+
+    // One id is reused across calls; the first edit announces it.
+    silent(&client.edit("s", "Edit", work.path(), &path("src/a.rs")));
+    let first = hub.live();
+    assert_eq!(first, vec![vec!["src/a.rs".to_owned()]]);
+
+    // The Hub releases the stored id (as when its Work finishes). The next edit must mint a new
+    // id, keep the earlier path and not stay stuck.
+    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    let first_id = live[0].id.clone();
+    assert!(
+        hub.store
+            .release_intent(&alice.id, &first_id, unix_now())
+            .unwrap()
+    );
+    assert!(hub.live().is_empty());
+    silent(&client.edit("s", "Edit", work.path(), &path("src/b.rs")));
+    let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_ne!(live[0].id, first_id);
+    let mut paths = live[0].paths.clone();
+    paths.sort();
+    assert_eq!(paths, ["src/a.rs", "src/b.rs"]);
+
+    // Work whose reservation was released refuses its scope on the plain route and says why;
+    // the hook still exits 0.
+    let started = hub
+        .store
+        .work_start(&alice.id, &work_start("w", &["lib/**"]), unix_now())
+        .unwrap()
+        .item;
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &alice.id },
+            &WorkTransitionRequest {
+                work_id: started.id.clone(),
+                operation_id: "rel".into(),
+                generation: started.generation,
+                expected_updated_seq: started.updated_seq,
+                session: Some("w".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let output = client.edit("s", "Edit", work.path(), &path("lib/c.rs"));
+    let text = context(&output, "PreToolUse");
+    assert!(text.contains(&started.id), "{text}");
+    assert!(text.contains("Resume"), "{text}");
+    assert!(!hub.live().iter().flatten().any(|p| p == "lib/c.rs"));
+}
+
+/// Starts Work with `scope` for `agent` and releases it, so its scope is fenced for the token.
+fn start_and_release(hub: &Hub, agent: &Agent, session: &str, scope: &[&str]) -> String {
+    use agentscm::hub::work_transition::{
+        WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+    };
+    let started = hub
+        .store
+        .work_start(&agent.id, &work_start(session, scope), unix_now())
+        .unwrap()
+        .item;
+    hub.store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &agent.id },
+            &WorkTransitionRequest {
+                work_id: started.id.clone(),
+                operation_id: format!("rel-{session}"),
+                generation: started.generation,
+                expected_updated_seq: started.updated_seq,
+                session: Some(session.into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic reason".into(),
+                superseded_by: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    started.id
+}
+
+#[test]
+fn a_fenced_path_is_dropped_and_the_other_paths_are_still_announced() {
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let bob = hub.agent(2, "bob", "claude-2");
+    let client = Client::new(&hub, &alice, "laptop-a");
+    let work = repo();
+    let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+
+    // A path accumulated before the release, then the Work is released.
+    silent(&client.edit("s", "Edit", work.path(), &path("src/a.rs")));
+    let id = start_and_release(&hub, &alice, "w", &["src/**"]);
+    hub.hold(&bob, 9, &["lib/x.rs"], "laptop-b", 0);
+
+    // One invocation meets the released intent id and then the fenced path: it mints a new id,
+    // drops `src/a.rs`, announces `lib/x.rs` and shows both the Hub's reason and the overlap.
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("lib/x.rs")),
+        "PreToolUse",
+    );
+    assert!(text.contains(&id), "{text}");
+    assert!(text.contains("Resume"), "{text}");
+    assert!(text.contains("lib/x.rs"), "{text}");
+    let mine: Vec<Vec<String>> = hub
+        .store
+        .live_intents(REPO, unix_now(), 10)
+        .unwrap()
+        .into_iter()
+        .filter(|i| {
+            i.paths.iter().any(|p| p == "lib/x.rs") && i.machine.as_deref() != Some("laptop-b")
+        })
+        .map(|i| i.paths)
+        .collect();
+    assert_eq!(mine, vec![vec!["lib/x.rs".to_owned()]]);
+
+    // The refused path is not sent again with the next unrelated edit.
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("lib/x.rs")),
+        "PreToolUse",
+    );
+    assert!(!text.contains(&id), "{text}");
+    // Editing the fenced path again is refused with the reason and nothing else is lost.
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("src/b.rs")),
+        "PreToolUse",
+    );
+    assert!(text.contains(&id), "{text}");
+    assert!(!hub.live().iter().flatten().any(|p| p.starts_with("src/")));
+}
+
+/// A hub stub that answers whoami and notices, and answers each `POST .../intents` with the next
+/// of `announces` (a status and a JSON body), repeating the last one.
+fn stub_hub(announces: Vec<(u16, Value)>) -> String {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut served = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // The request head, then as much body as it declares.
+            let head = loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                buffer.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&buffer).into_owned();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let head = text[..end].to_owned();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buffer.len() >= end + 4 + length {
+                        break head;
+                    }
+                }
+                if read == 0 {
+                    break text;
+                }
+            };
+            let line = head.lines().next().unwrap_or_default().to_owned();
+            let (status, body) = if line.contains("/whoami") {
+                (200, json!({"token": {"repository": REPO}}))
+            } else if line.starts_with("POST") && line.contains("/intents") {
+                let reply = announces[served.min(announces.len() - 1)].clone();
+                served += 1;
+                reply
+            } else {
+                (200, json!({"cursor": 0, "notices": []}))
+            };
+            let body = body.to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    url
+}
+
+fn stubbed_client(hub: &Hub, agent: &Agent, url: String) -> Client {
+    let mut client = Client::new(hub, agent, "laptop-a");
+    client.url = url;
+    client
+}
+
+#[test]
+fn a_failed_retry_after_a_refusal_keeps_the_refusal_note() {
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let work = repo();
+    let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+    let url = stub_hub(vec![
+        (200, json!({"intent": "x", "overlaps": []})),
+        (
+            400,
+            json!({"error": "invalid_request", "message": "Work w holds src/a.rs. Resume it.",
+                "refused_paths": ["src/a.rs"]}),
+        ),
+        (
+            500,
+            json!({"error": "internal", "message": "synthetic failure"}),
+        ),
+    ]);
+    let client = stubbed_client(&hub, &alice, url);
+    silent(&client.edit("s", "Edit", work.path(), &path("src/a.rs")));
+    let text = context(
+        &client.edit("s", "Edit", work.path(), &path("lib/x.rs")),
+        "PreToolUse",
+    );
+    assert!(text.contains("hub error 500"), "{text}");
+    assert!(text.contains("Resume it."), "{text}");
+}
+
+#[test]
+fn an_incomplete_overlap_scan_is_reported_as_such_and_not_as_a_busy_hub() {
+    let hub = Hub::start();
+    let alice = hub.agent(1, "alice", "claude-1");
+    let work = repo();
+    let url = stub_hub(vec![(503, json!({"error": "work_overlap_incomplete"}))]);
+    let client = stubbed_client(&hub, &alice, url);
+    let file = work.path().join("src/a.rs");
+    let text = context(
+        &client.edit("s", "Edit", work.path(), file.to_str().unwrap()),
+        "PreToolUse",
+    );
+    assert!(text.contains("work_overlap_incomplete"), "{text}");
+    assert!(
+        text.contains("could not finish its work overlap check, more than 100 items to compare"),
+        "{text}"
+    );
+    assert!(!text.contains("unfinished Work"), "{text}");
+    assert!(!text.contains("hub busy"), "{text}");
+}

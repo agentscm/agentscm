@@ -81,6 +81,8 @@ mod init_cli;
 mod intent_cli;
 #[cfg(unix)]
 mod intent_review_cli;
+#[cfg(unix)]
+mod local_ci_cli;
 mod local_recovery_cli;
 #[cfg(unix)]
 mod local_service;
@@ -185,6 +187,13 @@ enum Command {
     AgentTask {
         #[command(subcommand)]
         command: agent_task_cli::AgentTaskCommand,
+    },
+    /// [experimental] Create trusted local CI device keys and enrollment requests.
+    #[command(hide = true)]
+    #[cfg(unix)]
+    LocalCi {
+        #[command(subcommand)]
+        command: local_ci_cli::LocalCiCommand,
     },
     /// [experimental] Produce, show and verify Git-bound local validation attestations.
     #[command(hide = true)]
@@ -960,6 +969,10 @@ async fn run(cli: Cli) -> Result<RunExit> {
             if code != 0 {
                 return Ok(RunExit::SpecializedFailure(code));
             }
+        }
+        #[cfg(unix)]
+        Command::LocalCi { command } => {
+            print_json(&local_ci_cli::run(command)?);
         }
         #[cfg(unix)]
         Command::LocalValidation { command } => {

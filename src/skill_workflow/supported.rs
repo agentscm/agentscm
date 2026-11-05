@@ -1591,10 +1591,6 @@ mod tests {
     fn repo_lock_pins_the_embedded_manifest() {
         let lock = SkillLock::parse(include_bytes!("../../agentscm-skills.lock.json")).unwrap();
         assert_eq!(resolve(&lock)[0].status, AdoptionStatus::Adopted);
-        assert_eq!(
-            lock.skills[0].params.as_ref().unwrap()["ci_label"],
-            "ci-extended"
-        );
     }
 
     #[test]

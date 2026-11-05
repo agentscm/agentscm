@@ -1,24 +1,24 @@
 //! The web pages' repository list: for each connected repository a person can read now, counts of
 //! unfinished work, what needs a person, live agents and the last activity. Counts only: titles,
-//! paths and people stay behind each repository's own read token. The rules mirror the status
-//! page's (`ui/src/needs.ts` and `ui/src/derive.ts`), so a row and its Dashboard count alike.
+//! paths and people remain on the role-checked detail read. Shared Rust status owns all attention
+//! counts; live-agent and last-activity fields retain their independent provenance.
 //! The separate device catalog adds bounded role-checked Work and live-agent details.
 use std::collections::BTreeSet;
 
 use serde::Serialize;
 
-use super::intent::{Intent, key_of, overlaps};
-use super::session::same_agent;
+use super::intent::Intent;
 use super::store::SessionView;
-use super::work::{ClaimStatus, WorkItem, WorkOverlapPair, WorkOverview, WorkState};
+use super::work::WorkOverview;
+use super::work::{ClaimStatus, WorkItem, WorkOverlapPair, WorkState};
+use super::work_http::actionable_status::{ActionableStatus, StatusState};
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Unfinished {
     pub total: usize,
     /// Active, with a lead that is checking in.
     pub moving: usize,
-    /// Blocked, or a lead gone quiet while still holding it. Stuck is a state, not a call on a person:
-    /// only blocked work counts in `needs_you`.
+    /// Compatibility count: shared blocked and reassessment-needed states.
     pub stuck: usize,
 }
 
@@ -28,22 +28,21 @@ pub struct RepositorySummary {
     pub repository_id: i64,
     pub provider: String,
     pub unfinished: Unfinished,
-    /// Blockers, declared-scope overlaps between live tasks and files two agents hold. Paused,
-    /// handed-over and stale-claim work stays in the unfinished count, never here.
-    /// Pull-request overlaps and files with only a recent refusal are not counted.
+    /// Shared actions addressed to this stable person identity.
     pub needs_you: usize,
     pub agents: usize,
     pub last_activity_at: Option<i64>,
     /// False when a list was cut short, so the counts are lower bounds.
     pub complete: bool,
-    /// Only used to form the computer catalog's change marker; never serialized.
-    #[serde(skip)]
-    pub(crate) contested_markers: Vec<String>,
+    pub status_counts: super::work_http::actionable_status::StatusCounts,
+    pub status_digest: String,
+    pub coverage: Vec<String>,
 }
 
 /// What the Hub read for one repository.
 pub(super) struct Facts {
     pub overview: WorkOverview,
+    pub status: ActionableStatus,
     pub intents: Vec<Intent>,
     pub sessions: Vec<SessionView>,
     /// Whether `intents` and `sessions` are every live one.
@@ -58,10 +57,18 @@ pub(super) fn summarize(
     facts: &Facts,
 ) -> RepositorySummary {
     let current = &facts.overview.current;
-    let (unfinished, decisions) =
-        work_counts(current.iter().map(|item| (&item.state, &item.claim_status)));
-    let (contested_count, contested_markers) = contested_files_and_markers(&facts.intents);
-    let needs_you = decisions + live_overlaps(&facts.overview.overlaps) + contested_count;
+    let c = &facts.status.counts;
+    let unfinished = Unfinished {
+        total: facts
+            .status
+            .work
+            .iter()
+            .filter(|w| w.state != StatusState::Retired)
+            .count(),
+        moving: c.active,
+        stuck: c.blocked + c.reassessment_needed,
+    };
+    let needs_you = c.needs_you;
     let last_activity_at = current
         .iter()
         .map(|item| item.updated_at)
@@ -77,33 +84,14 @@ pub(super) fn summarize(
         needs_you,
         agents: agent_count(&facts.sessions, &facts.intents),
         last_activity_at,
-        complete: facts.overview.current_complete
+        complete: facts.status.complete
+            && facts.overview.current_complete
             && facts.overview.overlaps_complete
             && facts.live_complete,
-        contested_markers,
+        status_counts: c.clone(),
+        status_digest: facts.status.digest.clone(),
+        coverage: facts.status.limits.clone(),
     }
-}
-
-/// Unfinished work and how many items need a person: only blocked work does. A quiet claim, a pause
-/// or a handover is counted as unfinished (and a quiet claim as stuck) but waits for no one.
-fn work_counts<'a>(
-    items: impl IntoIterator<Item = (&'a WorkState, &'a ClaimStatus)>,
-) -> (Unfinished, usize) {
-    let mut counts = Unfinished::default();
-    let mut decisions = 0;
-    for (state, claim) in items {
-        counts.total += 1;
-        let quiet = *claim != ClaimStatus::Active;
-        if *state == WorkState::Blocked {
-            decisions += 1;
-        }
-        if *state == WorkState::Blocked || quiet {
-            counts.stuck += 1;
-        } else if *state == WorkState::Active {
-            counts.moving += 1;
-        }
-    }
-    (counts, decisions)
 }
 
 /// An overlap where both tasks hold an active claim and are active or blocked.
@@ -113,32 +101,6 @@ pub(super) fn is_live_overlap(pair: &WorkOverlapPair) -> bool {
             && matches!(item.state, WorkState::Active | WorkState::Blocked)
     };
     live(&pair.left) && live(&pair.right)
-}
-
-fn live_overlaps(pairs: &[WorkOverlapPair]) -> usize {
-    pairs.iter().filter(|pair| is_live_overlap(pair)).count()
-}
-
-/// Files held by two different agents now, each counted once by its more specific key.
-fn contested_files_and_markers(intents: &[Intent]) -> (usize, Vec<String>) {
-    let mut found = BTreeSet::new();
-    for (i, a) in intents.iter().enumerate() {
-        for b in &intents[i + 1..] {
-            if same_agent(&a.token, &a.via, b) {
-                continue;
-            }
-            for x in a.paths.iter().map(|path| key_of(path)) {
-                for y in b.paths.iter().map(|path| key_of(path)) {
-                    if overlaps(x, y) {
-                        let key = if y.len() > x.len() { y } else { x };
-                        found.insert(key);
-                    }
-                }
-            }
-        }
-    }
-    let count = found.len();
-    (count, found.into_iter().map(str::to_owned).collect())
 }
 
 /// One per live session, plus one per live intent no session holds, as the status page lists them.
@@ -187,6 +149,7 @@ mod tests {
             },
             via: via.iter().map(|v| (*v).into()).collect(),
             session: None,
+            started_at: None,
         }
     }
 
@@ -202,30 +165,6 @@ mod tests {
             created_at: 1_000,
             updated_at: 1_500,
         }
-    }
-
-    #[test]
-    fn counts_each_item_once_worst_first() {
-        use ClaimStatus::{Active, Stale, Unknown};
-        use WorkState::{Blocked, Handover, Paused};
-        let items = [
-            (WorkState::Active, Active),
-            (WorkState::Active, Stale),
-            (Blocked, Unknown),
-            (Blocked, Active),
-            (Handover, Active),
-            (Paused, Active),
-        ];
-        let (counts, decisions) = work_counts(items.iter().map(|(s, c)| (s, c)));
-        assert_eq!(
-            counts,
-            Unfinished {
-                total: 6,
-                moving: 1,
-                stuck: 3
-            }
-        );
-        assert_eq!(decisions, 2);
     }
 
     fn work_item(state: WorkState, claim_status: ClaimStatus) -> WorkItem {
@@ -282,52 +221,9 @@ mod tests {
             pair((Paused, Active), (Working, Active)),
             pair((Working, Active), (Handover, Active)),
         ];
-        assert_eq!(live_overlaps(&pairs), 1);
+        assert_eq!(pairs.iter().filter(|p| is_live_overlap(p)).count(), 1);
         assert!(is_live_overlap(&pairs[0]));
         assert!(pairs[1..].iter().all(|p| !is_live_overlap(p)));
-    }
-
-    #[test]
-    fn contested_needs_two_agents_on_one_file() {
-        let a = intent(
-            "int_a",
-            "tok_a",
-            &["hook:claude"],
-            &["src/lib.rs", "docs/**"],
-        );
-        let b = intent(
-            "int_b",
-            "tok_b",
-            &["hook:codex"],
-            &["src/lib.rs", "docs/a.md"],
-        );
-        // The same token over MCP and a hook is one agent, as the hub's own refusals judge it.
-        let same = intent("int_c", "tok_a", &["mcp"], &["src/lib.rs"]);
-        let unrelated = intent("int_d", "tok_d", &["hook:codex"], &["other.rs"]);
-        let result = contested_files_and_markers(&[a.clone(), b, unrelated]);
-        assert_eq!(result.0, 2);
-        assert!(
-            result
-                .1
-                .iter()
-                .all(|marker| marker.starts_with("src/") || marker.starts_with("docs/"))
-        );
-        assert_eq!(result.1.len(), 2);
-        assert_eq!(contested_files_and_markers(&[a, same]), (0, Vec::new()));
-    }
-
-    #[test]
-    fn contested_marker_changes_when_the_same_agents_move_their_overlap() {
-        let pair = |path| {
-            contested_files_and_markers(&[
-                intent("int_a", "tok_a", &["hook:claude"], &[path]),
-                intent("int_b", "tok_b", &["hook:codex"], &[path]),
-            ])
-        };
-        let before = pair("src/old.rs");
-        let after = pair("src/new.rs");
-        assert_eq!((before.0, after.0), (1, 1));
-        assert_ne!(before.1, after.1);
     }
 
     #[test]

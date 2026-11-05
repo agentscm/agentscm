@@ -17,6 +17,8 @@ jobs:
     if: ${{ github.repository_id == '1423506417' && github.repository_owner_id == '326639785' && !github.event.repository.private && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      branch: ${{ steps.candidate-pr.outputs.branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,6 +81,7 @@ jobs:
           git diff --check
           if ! git diff --quiet; then echo 'changed=true' >> "$GITHUB_OUTPUT"; fi
       - name: Open release candidate
+        id: candidate-pr
         if: steps.files.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
@@ -110,4 +113,24 @@ jobs:
           gh api graphql --input "$RUNNER_TEMP/release-commit.json" > "$RUNNER_TEMP/release-commit-result.json"
           jq -e '.data.createCommitOnBranch.commit.oid | strings | length > 0' "$RUNNER_TEMP/release-commit-result.json" > /dev/null
           printf '%s\n' 'Review the version and changelog changes in the files. Publishing begins after this candidate is merged and its release tag is created.' > "$RUNNER_TEMP/release-pr.md"
-          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title 'chore: Prepare release' --label ci-extended --body-file "$RUNNER_TEMP/release-pr.md"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title 'chore: Prepare release' --body-file "$RUNNER_TEMP/release-pr.md"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+  # The candidate's files select none of these workflows' pull request triggers, so dispatch them once.
+  qualify:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.branch != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch release qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: |
+          set -euo pipefail
+          for workflow in ci windows hub-e2e container execution-live; do
+            gh workflow run "$workflow.yml" --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          done

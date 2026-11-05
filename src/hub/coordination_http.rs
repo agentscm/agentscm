@@ -35,6 +35,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/coordination/withdraw", post(withdraw))
         .route("/v1/hub/session/handoffs", get(person_handoffs))
         .route("/v1/hub/session/coordination/reply", post(person_reply))
+        .route("/v1/hub/session/work/transition", post(person_transition))
         .route("/v1/hub/session/handoff/answer", post(person_answer))
         .route("/v1/hub/session/handoff/ask", post(person_ask))
 }
@@ -267,6 +268,73 @@ async fn person_reply(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PersonTransition {
+    repository: String,
+    work_id: String,
+    operation_id: String,
+    generation: i64,
+    expected_updated_seq: i64,
+    transition: super::work_transition::WorkTransitionKind,
+    reason: String,
+    #[serde(default)]
+    superseded_by: Option<String>,
+}
+
+/// A signed-in person releases, retains or ends Work they own, or, as a Hub administrator,
+/// releases or ends anyone's. No agent token is involved, so a revoked lead token does not
+/// stop them. The store derives owner or admin from the Work and refuses anyone else.
+async fn person_transition(
+    State(state): State<HubState>,
+    human: HumanSession,
+    reclaimed: std::result::Result<Query<super::work_http::ReclaimedFlag>, QueryRejection>,
+    JsonBody(body): JsonBody<PersonTransition>,
+) -> std::result::Result<Json<super::work_transition::WorkTransitionResult>, ApiError> {
+    let reclaimed = super::work_http::ReclaimedFlag::requested(reclaimed)?;
+    let user = human.web_user()?.clone();
+    let is_admin = human.admin().is_ok();
+    super::store::validate_repository(&body.repository)?;
+    // The same allow-list and current forge role checks a read-token mint makes.
+    let repository =
+        super::login::devices::mint_check(&state, &user, &body.repository, "work_transition")
+            .await?;
+    let request = super::work_transition::WorkTransitionRequest {
+        work_id: body.work_id,
+        operation_id: body.operation_id,
+        generation: body.generation,
+        expected_updated_seq: body.expected_updated_seq,
+        session: None,
+        transition: body.transition,
+        reason: body.reason,
+        superseded_by: body.superseded_by,
+    };
+    let store = state.store.clone();
+    let mut result = blocking(&state, move || {
+        store.work_transition(
+            &super::work_transition::WorkTransitionActor::Person {
+                user: &user,
+                repository: &repository.full_name,
+                repository_id: repository.repository_id,
+                is_admin,
+            },
+            &request,
+            unix_now(),
+        )
+    })
+    .await
+    .map_err(|error| match error {
+        HubError::Unauthorized => ApiError::new(StatusCode::FORBIDDEN, "not_your_work")
+            .with_message("Only the Work's owner or a Hub administrator can change it"),
+        other => person_error(other),
+    })?;
+    if !reclaimed {
+        result.reclaimed.clear();
+    }
+    CHANGED.notify_waiters();
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersonAnswer {
     /// The agent token holding the file.
     token: String,
@@ -300,8 +368,8 @@ async fn person_answer(
     .await
     .map_err(person_error)?;
     let (outcome, requester) = match answered {
-        Answered::Granted { requester } => ("granted", Some(requester)),
-        Answered::Declined { requester } => ("declined", Some(requester)),
+        Answered::Granted { requester, .. } => ("granted", Some(requester)),
+        Answered::Declined { requester, .. } => ("declined", Some(requester)),
         Answered::NoRequest => ("no_open_request", None),
         Answered::NotHeld => ("not_held", None),
     };
@@ -363,9 +431,10 @@ struct HandoffQuery {
 const PERSON_HANDOFFS: usize = 50;
 
 /// One side of a handoff. The token and session, which the page needs to answer, are given only
-/// for the person's own agent.
+/// for the person's own agent; every reader gets the session's key and kind, never its id.
 fn party_json(party: &HandoffParty, me: &str) -> Value {
-    let mut out = json!({"agent": party.agent, "login": party.login, "mine": party.owner == me});
+    let mut out = json!({"agent": party.agent, "login": party.login, "mine": party.owner == me,
+        "session_key": party.key, "session_kind": party.kind});
     if party.owner == me {
         out["token"] = json!(party.token);
         out["session"] = json!(party.session);

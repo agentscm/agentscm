@@ -585,6 +585,18 @@ fn start_claim_conflicts_keep_json_and_exit_nonzero() {
             .revoke_agent_token(&first_client.token_id)
             .unwrap()
     );
+    // A revoked lead token no longer renews, but another owner waits for the lease to lapse.
+    conflict_result(
+        &second_client.start(&request.to_string()),
+        WorkConflictKind::ClaimHeld,
+    );
+    hub.sqlite()
+        .execute(
+            "UPDATE hub_work_items SET reservation_expires_at = ?2 WHERE id = ?1",
+            rusqlite::params![first_result.item.id, unix_now() - 1],
+        )
+        .unwrap();
+    hub.store.observe_lease_clock(unix_now()).unwrap();
     let stale = conflict_result(
         &second_client.start(&request.to_string()),
         WorkConflictKind::StaleTakeoverRequired,
@@ -697,4 +709,78 @@ fn explicit_pr_link_cli_uses_work_service_and_stale_fence() {
             .status
             .success()
     );
+}
+
+#[test]
+fn reconcile_cli_prints_the_report_and_fails_for_unknown_work() {
+    let hub = Hub::start();
+    let client = hub.bound_client(1, "alice", 42);
+    let started =
+        client.start(r#"{"request_key":"reconcile-task","title":"A task","session":"s"}"#);
+    assert!(started.status.success(), "{started:?}");
+    let start: WorkStartResult = serde_json::from_slice(&started.stdout).unwrap();
+    let run = |id: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(["work", "reconcile", id])
+            .env_clear()
+            .env("HOME", client.config.path())
+            .env("XDG_CONFIG_HOME", client.config.path())
+            .env("AGENTSCM_HUB_URL", &client.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+            .output()
+            .unwrap()
+    };
+    let ok = run(&start.item.id);
+    assert!(ok.status.success(), "{ok:?}");
+    let report: serde_json::Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(report["work_id"], start.item.id);
+    assert_eq!(report["provider"]["status"], "not_linked");
+    assert_eq!(report["atomic_snapshot"], false);
+
+    let missing = run("wrk_00000000000000000000000000000001");
+    let error = cli_error(&missing);
+    assert_eq!(error["error"], "invalid: hub error 404", "{error}");
+}
+
+#[test]
+fn shared_status_cli_has_text_and_json_without_generated_prose() {
+    let hub = Hub::start();
+    let client = hub.bound_client(901, "synthetic-status-owner", 101);
+    let started = client.start(r#"{"request_key":"status-cli","title":"Synthetic status task","session":"status-cli","scope":["src/status.rs"]}"#);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let run = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command.args(["work", "status"]);
+        if json {
+            command.arg("--json");
+        }
+        command
+            .env_clear()
+            .env("HOME", client.config.path())
+            .env("XDG_CONFIG_HOME", client.config.path())
+            .env("AGENTSCM_HUB_URL", &client.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &client.token_file)
+            .output()
+            .unwrap()
+    };
+    let text = run(false);
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("1 active"));
+    assert!(text.contains("Synthetic status task"));
+    assert!(text.contains("Coverage incomplete"));
+    let json = run(true);
+    assert!(json.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(status["schema_version"], 1);
+    assert_eq!(status["counts"]["active"], 1);
+    assert_eq!(status["work"][0]["state"], "active");
 }

@@ -2,6 +2,54 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.2.1](https://github.com/agentscm/agentscm/compare/v0.2.0...v0.2.1) - 2026-11-03
+
+### Fixed
+
+- *(release)* Upload the whole UI build for release binaries ([#304](https://github.com/agentscm/agentscm/pull/304))
+
+## [0.2.0](https://github.com/agentscm/agentscm/compare/v0.1.3...v0.2.0) - 2026-11-03
+
+### Added
+
+- *(ui)* count requests waiting on you in the Inbox badge ([#288](https://github.com/agentscm/agentscm/pull/288))
+- Add recorded contributions across Hub and agent surfaces ([#250](https://github.com/agentscm/agentscm/pull/250))
+- *(hub)* tell the owner when a request waits on their idle agent ([#286](https://github.com/agentscm/agentscm/pull/286))
+- *(hub)* refresh the in-agent MCP views on their own ([#264](https://github.com/agentscm/agentscm/pull/264))
+- *(ui)* clearer heading roles and one Needs you row for overlaps ([#255](https://github.com/agentscm/agentscm/pull/255))
+- Define immutable local CI plans and required coverage ([#277](https://github.com/agentscm/agentscm/pull/277))
+- show repository connections across revisions ([#266](https://github.com/agentscm/agentscm/pull/266))
+- Add managed agent continuation and operating policy
+- add continuity preparation for GitHub and GitLab ([#265](https://github.com/agentscm/agentscm/pull/265))
+- *(ui)* add an opt-in task-first layout over live Hub data ([#261](https://github.com/agentscm/agentscm/pull/261))
+- *(hub)* thread the Inbox and let people answer for their own agent ([#252](https://github.com/agentscm/agentscm/pull/252))
+- Add source maps and authored change walkthroughs
+- *(hub)* restyle the in-agent MCP views to the Twilight panel ([#251](https://github.com/agentscm/agentscm/pull/251))
+- *(ui)* rework All repositories and quiet the first-visit tour ([#249](https://github.com/agentscm/agentscm/pull/249))
+- *(ui)* lead the Dashboard with Needs you, compact rows and tips ([#244](https://github.com/agentscm/agentscm/pull/244))
+- show agent work across repositories in tray panel
+- Add taskbar companion with Hub attention and CLI prompts ([#238](https://github.com/agentscm/agentscm/pull/238))
+- connect PR evidence with Work and branch advice ([#245](https://github.com/agentscm/agentscm/pull/245))
+- *(hub)* greet web sign-ins by profile first name ([#243](https://github.com/agentscm/agentscm/pull/243))
+- *(ui)* Make the installed Hub app feel native ([#242](https://github.com/agentscm/agentscm/pull/242))
+- *(ui)* rework the Hub sign-in, work pages and agent hand-off ([#240](https://github.com/agentscm/agentscm/pull/240))
+- Add an All repositories page to the Hub web UI ([#236](https://github.com/agentscm/agentscm/pull/236))
+
+### Fixed
+
+- *(hub)* Cut old content from agent windows and the Hub ([#287](https://github.com/agentscm/agentscm/pull/287))
+- *(ui)* make agent names, pills and disclosures consistent ([#260](https://github.com/agentscm/agentscm/pull/260))
+- *(ui)* polish after the Nov 1-2 Hub UI merges ([#276](https://github.com/agentscm/agentscm/pull/276))
+- Require signed local validation for routine CI ([#279](https://github.com/agentscm/agentscm/pull/279))
+- *(hub)* make Slack direct messages match the Hub's wording and links ([#263](https://github.com/agentscm/agentscm/pull/263))
+- *(ui)* reuse the Hub's palette, pill and helpers in the G layout ([#262](https://github.com/agentscm/agentscm/pull/262))
+
+### Other
+
+- enroll jhawlwut's local-validation signing key ([#283](https://github.com/agentscm/agentscm/pull/283))
+- *(hub)* cache role checks for the All repositories list ([#241](https://github.com/agentscm/agentscm/pull/241))
+- Cut per-call work in capture, status and hub paths ([#231](https://github.com/agentscm/agentscm/pull/231))
+
 ## [0.1.3](https://github.com/agentscm/agentscm/compare/v0.1.2...v0.1.3) - 2026-10-29
 
 ### Fixed

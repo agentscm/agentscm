@@ -224,7 +224,7 @@ export function Via({ via }: { via: string }) {
   )
 }
 
-// Client setup names tokens "client-<host>-<hex id>": every agent on one computer shares the host, so the id is what tells them apart.
+// Client setup names tokens "client-<machine id>-<hex id>" (older: host name): every agent on one computer shares the first part, so the hex id is what tells them apart.
 const CLIENT_TOKEN = /^client-(.+)-([0-9a-f]{6,})$/i
 /** The name people read: "Agent 6a36" for a generated client token (the full name stays in the title), anything else as given. */
 export const agentLabel = (name: string) => {

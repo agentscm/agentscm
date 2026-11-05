@@ -175,7 +175,7 @@ exit 0
     assert_eq!(manifest["settings"]["org_deploy_enabled"], false);
     assert_eq!(
         manifest["oauth_config"]["scopes"]["bot"],
-        json!(["chat:write"])
+        json!(["chat:write", "app_mentions:read"])
     );
     assert!(manifest["settings"]["interactivity"].is_null());
     assert!(!project.join("package.json").exists());

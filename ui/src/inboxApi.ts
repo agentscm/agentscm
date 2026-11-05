@@ -22,6 +22,9 @@ export interface HandoffSide {
   mine: boolean
   token?: string
   session?: string
+  /** The Hub's key for the session (never its id) and its agent kind, when the Hub knows them; present for either side. */
+  sessionKey?: string
+  sessionKind?: string | null
 }
 export type HandoffState = 'pending' | 'granted' | 'declined' | 'lapsed'
 export interface MyHandoff {
@@ -57,7 +60,9 @@ function side(v: unknown): HandoffSide | null {
   const mine = s['mine'] === true
   const token = text(s['token'], 100)
   const session = text(s['session'], 255)
-  return { agent, login, mine, ...(mine && token ? { token } : {}), ...(mine && session ? { session } : {}) }
+  const sessionKey = /^[0-9a-f]{8,64}$/.test(text(s['session_key'], 64)) ? text(s['session_key'], 64) : ''
+  const sessionKind = textOrNull(s['session_kind'], 40)
+  return { agent, login, mine, ...(mine && token ? { token } : {}), ...(mine && session ? { session } : {}), ...(sessionKey ? { sessionKey, sessionKind } : {}) }
 }
 
 export function decodeHandoffs(raw: unknown): MyHandoff[] {

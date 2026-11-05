@@ -523,6 +523,17 @@ fn queued_expansion_requires_the_proposed_scope(db: &Db) {
         )
         .unwrap();
     assert_eq!(expanded.item.scope, vec!["src/", "ui/"]);
+    // Finishing the target recorded a `coordination_target_released` event on the open request,
+    // so the request has moved on from the version the requester first saw.
+    let current = store
+        .coordination_list(&requester, &CoordinationListQuery::default(), now + 5)
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|candidate| candidate.id == request.id)
+        .unwrap();
+    assert!(current.updated_seq > request.updated_seq);
+    assert_eq!(current.status, request.status);
     let resolved = store
         .coordination_resolve(
             &requester,
@@ -530,7 +541,7 @@ fn queued_expansion_requires_the_proposed_scope(db: &Db) {
                 request_id: request.id,
                 operation_id: "scope-applied".into(),
                 session: "expanding-session".into(),
-                expected_updated_seq: request.updated_seq,
+                expected_updated_seq: current.updated_seq,
             },
             now + 6,
         )
@@ -703,6 +714,29 @@ fn generation_upgrade_preserves_only_current_lead(db: &Db) {
     );
 
     drop(db.open());
+    let declaration_version: (i64, Option<i64>) = if db._pg.is_some() {
+        let row = postgres::Client::connect(&db.url, postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT d.event_seq,w.updated_seq FROM hub_work_declarations d
+                 JOIN hub_work_items w ON w.id=d.work WHERE w.id='wrk_upgrade'",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    } else {
+        rusqlite::Connection::open(db.url.strip_prefix("sqlite://").unwrap())
+            .unwrap()
+            .query_row(
+                "SELECT d.event_seq,w.updated_seq FROM hub_work_declarations d
+                 JOIN hub_work_items w ON w.id=d.work WHERE w.id='wrk_upgrade'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    // Upgrade succeeds without inventing a Work or declaration version for the legacy row.
+    assert_eq!(declaration_version, (0, None));
     assert_eq!(
         db.participant_generations(),
         vec![

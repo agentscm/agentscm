@@ -1442,6 +1442,12 @@ async fn reread_pull(
         Some(pull) => json!({"number": number, "node_id": pull["node_id"],
             "state": pull["state"], "merged": pull["merged"].as_bool().unwrap_or(false),
             "merge_commit_sha": pull["merge_commit_sha"], "head_sha": pull["head"]["sha"],
+            "provider_number": pull["number"],
+            "provider_base_repository_id": match conn.provider.as_str() {
+                "github" => &pull["base"]["repo"]["id"],
+                "gitlab" => &pull["target_project_id"],
+                _ => &Value::Null,
+            },
             "head_ref": pull["head"]["ref"], "html_url": pull["html_url"]}),
     }
     .to_string();
@@ -1853,7 +1859,7 @@ fn comment_body(
         body.push_str(&format!(
             "- {} by agent {} (owner {}): {}{}\n",
             code(&intent.task, COMMENT_TASK_CHARS),
-            code(&intent.agent, 64),
+            code(&super::advice::agent_name(&intent.agent), 64),
             code(&intent.owner.login, 64),
             shown.join(", "),
             if more > 0 {
@@ -2839,6 +2845,29 @@ async fn work(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pull_request_comment_masks_a_stored_host_label() {
+        let repo = ConnectedRepository {
+            id: "rep_1".into(),
+            connection: "con_1".into(),
+            host: "github.com".into(),
+            repository_id: 1,
+            full_name: "acme/widgets".into(),
+            node_id: None,
+            installation_id: None,
+            pulls_etag: None,
+        };
+        let mut intent = super::super::advice::test_intent("int_a", "t", &["src/a.rs"]);
+        intent.agent = "client-synthetic-host-6a36b2c1".into();
+        let body = comment_body(
+            &repo,
+            &serde_json::json!({"number": 1, "head_sha": "abc"}),
+            &[(intent, vec!["src/a.rs".into()])],
+        );
+        assert!(body.contains("Agent 6a36"), "{body}");
+        assert!(!body.contains("synthetic-host"), "{body}");
+    }
 
     #[test]
     fn observation_stamps_advance_when_the_wall_clock_moves_backwards() {

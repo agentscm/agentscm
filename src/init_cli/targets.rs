@@ -15,7 +15,7 @@ AgentSCM tells agents when another agent is working on the same files. Check bef
 - Read `agentscm_work_insights` or `agentscm_work_insight` for work measurements. If structured usage is available for an explicitly associated attempt, report it with `agentscm_work_usage` and a stable `observation_id`. Keep unavailable counts and cost null and unavailable agent/provider/model labels `unknown`; never infer charges or submit prompts, transcripts or credentials.
 - Acknowledge a briefing only after receiving its complete page sequence. Repeat the returned subscriber/session on continuation; independent sessions must not share a catch-up cursor.
 - Before editing a file you have not edited in this session, call `agentscm_check` with its path. Skip this only in Claude Code, Codex or Copilot after `agentscm client setup` on this machine: its hooks check each edit.
-- If the result says another agent is working on that file, work on something else first or ask the user; edit it only if the overlap is acceptable.
+- If the result says another agent is working on that file, work on something else first, ask the holder with `agentscm_ask`, or edit it if the overlap is acceptable. Settle coordination without the user and report what you resolved in one line. Involve the user only if two live agents need the same change with incompatible intent, a step risks data loss or breaking main or a release, it needs a security, billing or public decision, or AgentSCM refuses every path.
 - An edit refused with an AgentSCM reason was not applied. Follow the reason: scope and coordination-request refusals require a work update or response before retrying. A legacy file-intent notice is advisory; repeating it is not proof that the work is coordinated.
 - An edit refused because another agent holds the file also asks that agent to hand it over. When another agent asks for a file you hold, answer with `agentscm_handoff`.
 - If `agentscm_check` is unavailable or reports that coordination is unknown, tell the user and give them the command under \"Connecting this checkout\".
@@ -47,7 +47,7 @@ fn snippet(skills: &str) -> String {
         format!("\n\n{skills}")
     };
     format!(
-        "{SNIPPET}{skills}\n\n### Connecting this checkout\n\nAgentSCM's MCP tools and edit hooks are set up on each machine, not committed. If they are missing here, ask the user to run `agentscm quickstart` once on this machine (their Hub is set per machine, and setup writes nothing to this repository)."
+        "{SNIPPET}{skills}\n\n### Connecting this checkout\n\nAgentSCM's MCP tools and edit hooks are set up on each machine, not committed. If they are missing here, give the user `agentscm quickstart` to run once on this machine (their Hub is set per machine, and setup writes nothing to this repository)."
     )
 }
 

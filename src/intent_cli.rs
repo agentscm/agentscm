@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::hub_cli::{clean, config_dir, map_hub_error, write_private};
 
 const TTL_SECONDS: i64 = 7200;
+/// The Hub's refusal text for an announce that reuses a released intent id.
+const RELEASED: &str = "intent was released";
 /// Claude Code runs hooks with a 10 s budget; one hook makes up to three calls.
 const HOOK_LIMIT: Duration = Duration::from_secs(3);
 const CLI_LIMIT: Duration = Duration::from_secs(10);
@@ -383,6 +385,23 @@ impl Hub {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value> {
+        let (status, reply) = self.call_status(method, path, body).await?;
+        match status {
+            200..=299 => Ok(reply),
+            _ => Err(Error::Invalid(match reply["message"].as_str() {
+                Some(message) => format!("hub error {status}: {}", bound_message(message)),
+                None => format!("hub error {status}"),
+            })),
+        }
+    }
+
+    /// Like `call`, but a reply the hub answered with another status is returned with it.
+    async fn call_status(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value)> {
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base))
@@ -398,12 +417,14 @@ impl Hub {
             .await
             .map_err(|_| invalid("hub unreachable"))?;
         match status {
-            200..=299 => Ok(reply),
             401 => Err(invalid(
                 "the agent token was rejected (expired or revoked; mint a new one)",
             )),
+            503 if reply["error"] == "work_overlap_incomplete" => Err(invalid(
+                "the hub could not finish its work overlap check, more than 100 items to compare (work_overlap_incomplete)",
+            )),
             429 | 503 => Err(invalid("hub busy")),
-            _ => Err(Error::Invalid(format!("hub error {status}"))),
+            _ => Ok((status, reply)),
         }
     }
 
@@ -485,11 +506,15 @@ fn save(path: &Path, state: &State) -> Result<()> {
     write_private(path, &serde_json::to_string(state)?)
 }
 
-fn fresh(ctx: &Ctx) -> Result<State> {
+fn new_intent_id() -> Result<String> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random).map_err(|_| invalid("random source"))?;
+    Ok(format!("int_{}", hex(&random)))
+}
+
+fn fresh(ctx: &Ctx) -> Result<State> {
     Ok(State {
-        intent_id: format!("int_{}", hex(&random)),
+        intent_id: new_intent_id()?,
         repo: String::new(),
         task: default_task(&ctx.cwd),
         branch: head_branch(&ctx.cwd),
@@ -498,6 +523,11 @@ fn fresh(ctx: &Ctx) -> Result<State> {
         remote_ok: None,
         notice_cursor: 0,
     })
+}
+
+/// The Hub's one-sentence reason, cleaned and cut so it cannot flood a hook's output.
+fn bound_message(message: &str) -> String {
+    bound(message, 300).unwrap_or_default()
 }
 
 /// Cleaned, non-empty and at most `max` bytes, as the hub requires.
@@ -563,28 +593,13 @@ pub(crate) fn repo_root(cwd: &Path) -> Option<PathBuf> {
     find_root(&cwd.canonicalize().ok()?)
 }
 
+/// Only an explicit `AGENTSCM_MACHINE`; the host name is never sent by default.
 fn machine() -> Option<String> {
-    std::env::var("AGENTSCM_MACHINE")
-        .ok()
-        .or_else(hostname)
-        .and_then(|m| bound(&m, MAX_LABEL_BYTES))
-        .or_else(|| Some("unknown".into()))
+    machine_label(std::env::var("AGENTSCM_MACHINE").ok())
 }
 
-#[cfg(unix)]
-pub(crate) fn hostname() -> Option<String> {
-    let mut buffer = [0_u8; 256];
-    // SAFETY: the pointer and length describe `buffer`, which outlives the call.
-    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
-        return None;
-    }
-    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
-    String::from_utf8(buffer[..end].to_vec()).ok()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn hostname() -> Option<String> {
-    None
+fn machine_label(explicit: Option<String>) -> Option<String> {
+    explicit.and_then(|m| bound(&m, MAX_LABEL_BYTES))
 }
 
 // ---- path normalisation ----
@@ -690,7 +705,10 @@ fn agent_of(owner: &Value, agent: &Value, machine: &Value) -> String {
     format!(
         "{}'s agent ({}){on}",
         text(&owner["login"], NAME_CHARS),
-        text(agent, NAME_CHARS)
+        text(
+            &Value::from(agent.as_str().map(agentscm::hub::advice::agent_name)),
+            NAME_CHARS
+        )
     )
 }
 
@@ -814,6 +832,15 @@ async fn ready(hub: &Hub, state: &mut State, root: &Path) -> Result<bool> {
     Ok(state.remote_ok == Some(true))
 }
 
+/// The error with the refusal notes already collected, so a failed retry does not lose why
+/// paths were dropped.
+fn keep_notes(notes: &[String], error: Error) -> Error {
+    match block(notes) {
+        Some(notes) => Error::Invalid(format!("{} (earlier refusal: {notes})", reason(&error))),
+        None => error,
+    }
+}
+
 /// Announce the session's paths plus `new`, then collect overlap and notice warnings.
 async fn track(
     hub: &Hub,
@@ -836,11 +863,63 @@ async fn track(
     if !ready? {
         return Ok(None);
     }
-    let body = json!({"intent_id": state.intent_id, "task": state.task, "branch": state.branch,
-        "machine": machine(), "paths": state.paths, "ttl_s": TTL_SECONDS});
     let url = format!("{}/intents", Hub::repo_path(&state.repo));
-    let reply = hub.call(Method::POST, &url, Some(body)).await?;
-    let mut lines = announce_warnings(&reply, &state.pending, unix_now());
+    // At most one fresh id (the stored one was released: its Work finished or was released) and
+    // one drop of refused paths, so a hub that keeps refusing cannot loop this.
+    let mut minted = false;
+    let mut dropped = false;
+    let mut notes: Vec<String> = Vec::new();
+    let reply = loop {
+        if state.paths.is_empty() {
+            save(path, state)?;
+            return Ok(block(&notes));
+        }
+        let body = json!({"intent_id": state.intent_id, "task": state.task,
+            "branch": state.branch, "machine": machine(), "paths": state.paths,
+            "ttl_s": TTL_SECONDS});
+        let (status, reply) = hub
+            .call_status(Method::POST, &url, Some(body))
+            .await
+            .map_err(|error| keep_notes(&notes, error))?;
+        if (200..=299).contains(&status) {
+            break reply;
+        }
+        let message = reply["message"].as_str().unwrap_or_default();
+        if !minted && status == 400 && message.ends_with(RELEASED) {
+            // A resumed agent must not stay stuck on a dead id: keep the paths and mint anew.
+            minted = true;
+            state.intent_id = new_intent_id()?;
+            save(path, state)?;
+            continue;
+        }
+        let refused: Vec<&str> = reply["refused_paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let before = state.paths.len();
+        let State { paths, pending, .. } = &mut *state;
+        paths.retain(|p| !refused.contains(&p.as_str()));
+        pending.retain(|p| !refused.contains(&p.as_str()));
+        if !dropped && status == 400 && state.paths.len() < before {
+            // The hub refused these paths only; announce the others and show why.
+            dropped = true;
+            notes.extend(bound(message, 300));
+            save(path, state)?;
+            continue;
+        }
+        save(path, state)?;
+        return Err(keep_notes(
+            &notes,
+            Error::Invalid(match reply["message"].as_str() {
+                Some(message) => format!("hub error {status}: {}", bound_message(message)),
+                None => format!("hub error {status}"),
+            }),
+        ));
+    };
+    let mut lines = notes;
+    lines.extend(announce_warnings(&reply, &state.pending, unix_now()));
     state.pending.clear();
     // The announce already succeeded; a notice failure only defers them to the next call.
     lines.extend(notices(hub, state, 0, true).await.unwrap_or_default());
@@ -1103,6 +1182,11 @@ mod tests {
             "bob's agent (claude-2) on laptop-b is already working on src/billing.rs \
              for \"Fix invoice[31m rounding\", started 12 min ago."
         );
+        assert_eq!(machine_label(None), None);
+        assert_eq!(machine_label(Some("laptop-b".into())).unwrap(), "laptop-b");
+        let mut legacy = overlap.clone();
+        legacy["intent"]["agent"]["name"] = json!("client-synthetic-host-6a36b2c1");
+        assert!(overlap_line(&legacy, 1000).starts_with("bob's agent (Agent 6a36) on laptop-b"));
         let mut no_machine = overlap.clone();
         no_machine["intent"]["machine"] = Value::Null;
         assert!(overlap_line(&no_machine, 1000).starts_with("bob's agent (claude-2) is already"));

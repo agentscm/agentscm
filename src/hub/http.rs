@@ -13,10 +13,13 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use super::lead_credential::LEAD_SESSION_MISMATCH;
 use super::login::{Login, LoginConfig};
+use super::session::SESSION_REQUIRED;
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
 use super::store::{self, Principal, agent_token_digest, unix_now, web_read_token_digest};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
+use super::work_lifecycle::LEASE_LAPSED;
 use super::{HubError, HubState, Result, open_objects, router};
 
 pub struct HubConfig {
@@ -64,6 +67,20 @@ pub async fn blocking<T: Send + 'static>(
     })
     .await
     .map_err(|_| HubError::Unavailable("blocking task failed".into()))?
+}
+
+/// Observes the Hub's clock once a minute, first at startup, so a restart or clock jump longer
+/// than a lease grants grace instead of lapsing every reservation, and a quiet Hub does not.
+async fn lease_clock_loop(state: HubState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let store = state.store.clone();
+        if let Err(error) = blocking(&state, move || store.observe_lease_clock(unix_now())).await {
+            eprintln!("hub: lease clock observation failed: {error}");
+        }
+    }
 }
 
 pub async fn serve(config: HubConfig) -> Result<()> {
@@ -180,6 +197,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     tokio::spawn(sync::poll_loop(state.clone(), config.poll_seconds));
     tokio::spawn(super::change_record_http::sweep_loop(state.clone()));
     tokio::spawn(super::work_compaction_loop(state.clone()));
+    tokio::spawn(lease_clock_loop(state.clone()));
     #[cfg(unix)]
     let execution_worker = state
         .workspace_execution
@@ -298,7 +316,17 @@ impl ApiError {
 impl From<HubError> for ApiError {
     fn from(error: HubError) -> Self {
         match error {
-            HubError::Invalid(_) => Self::invalid(),
+            HubError::Invalid(message)
+                if message == SESSION_REQUIRED
+                    || message.starts_with(LEAD_SESSION_MISMATCH)
+                    || message.starts_with(LEASE_LAPSED) =>
+            {
+                Self::invalid().with_message(message)
+            }
+            HubError::Invalid(detail) => {
+                eprintln!("hub: request rejected as invalid: {detail:?}");
+                Self::invalid()
+            }
             HubError::WorkCheckpointSequenceConflict { current_seq } => Self {
                 status: StatusCode::CONFLICT,
                 code: "work_checkpoint_sequence_conflict",

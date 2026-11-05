@@ -69,7 +69,9 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
     };
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5)]}],
-        "PreToolUse":[{"matcher":"^apply_patch$|^Edit$|^Write$", "hooks":[hook("AgentSCM: check overlapping edits", 5)]}],
+        // Every tool call keeps this chat's hold live; the Hub checks only the edits.
+        "PreToolUse":[{"hooks":[hook("AgentSCM: coordinate this tool call", 5)]}],
+        "PostToolUse":[{"hooks":[hook("AgentSCM: keep this chat's hold live", 3)]}],
         "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3)]}]
     }});
     let common = json!({"name":"agentscm", "version":env!("CARGO_PKG_VERSION"),
@@ -119,11 +121,14 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
             "timeout":timeout
         })
     };
-    let mut pre = json!({"hooks":[hook(5)]});
-    pre["matcher"] = json!("^(Edit|Write|MultiEdit|NotebookEdit)$");
+    // UserPromptSubmit fires only in the session the person types in, so requests reach it
+    // there rather than a subagent. It runs on every prompt, hence the short timeout. Every tool
+    // call keeps the session's hold live; the Hub checks only the edits.
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook(5)]}],
-        "PreToolUse":[pre],
+        "UserPromptSubmit":[{"hooks":[hook(3)]}],
+        "PreToolUse":[{"hooks":[hook(5)]}],
+        "PostToolUse":[{"hooks":[hook(3)]}],
         "SessionEnd":[{"hooks":[hook(3)]}]
     }});
     // Like the hooks, it inherits the agent's environment. The server's working directory is

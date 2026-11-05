@@ -10,9 +10,7 @@ use agentscm::backend::LocalBackend;
 use agentscm::hub::coordination::CoordinationRequest;
 use agentscm::hub::session::SessionCall;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
-use agentscm::hub::work::{
-    CLAIM_STALE_SECONDS, CheckpointKind, WorkCheckpoint, WorkRole, WorkStart,
-};
+use agentscm::hub::work::{CheckpointKind, WorkCheckpoint, WorkRole, WorkStart};
 use agentscm::hub::{HubState, router};
 use hub_pg::PgSchema;
 use postgres::NoTls;
@@ -1970,7 +1968,16 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
         .item;
     drop(setup);
 
-    let takeover_at = now + 3 + CLAIM_STALE_SECONDS + 1;
+    // Takeover needs the old lead's lease to have lapsed on the Hub's own clock.
+    let takeover_at = now + 3 + agentscm::hub::work_lifecycle::LEASE_SECONDS + 1;
+    let clock = store::open(database).unwrap();
+    let mut at = now;
+    while at < takeover_at {
+        clock.observe_lease_clock(at).unwrap();
+        at += 60;
+    }
+    clock.observe_lease_clock(takeover_at).unwrap();
+    drop(clock);
 
     let barrier = Arc::new(Barrier::new(3));
     let old_store = store::open(database).unwrap();
@@ -2019,14 +2026,15 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
         )
     });
     barrier.wait();
-    let touched = touch.join().unwrap();
-    if let Err(error) = &touched {
-        assert!(
-            matches!(error, agentscm::hub::HubError::Invalid(message)
-                if message.contains("not covered by a current unfinished assignment")),
-            "unexpected managed touch error: {error:?}"
-        );
-    }
+    // The old lead's edit never lands: before the takeover its lease has lapsed, and after it the
+    // assignment is gone.
+    let error = touch.join().unwrap().unwrap_err();
+    assert!(
+        matches!(&error, agentscm::hub::HubError::Invalid(message)
+            if message.contains("not covered by a current unfinished assignment")
+                || message.starts_with(agentscm::hub::work_lifecycle::LEASE_LAPSED)),
+        "unexpected managed touch error: {error:?}"
+    );
     assert!(takeover.join().unwrap().unwrap().took_over);
 
     let after_takeover = store::open(database).unwrap();

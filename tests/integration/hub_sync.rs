@@ -2556,10 +2556,48 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
             "alice",
         )
         .unwrap();
-    let (_, bound, _) =
+    let (bound_id, bound, _) =
         mint_bound_agent_token(&*env.store, &owner.id, "bound", REPO, REPO_ID, 3600, false)
             .unwrap();
     let bound = bound.expose().to_owned();
+    // The token leads Work, so the announce guard has something to look at after the rename.
+    let started = env
+        .store
+        .work_start(
+            &bound_id,
+            &serde_json::from_value(json!({
+                "work_id": null, "source": null, "request_key": "renamed-key",
+                "title": "Rework billing", "session": "default", "role": "lead",
+                "scope": ["lib/**"], "branch": null, "worktree": null, "next_action": null,
+                "depends_on": [], "related_work": [], "takeover_generation": null,
+                "preflight": null
+            }))
+            .unwrap(),
+            unix_now(),
+        )
+        .unwrap()
+        .item;
+    {
+        use agentscm::hub::work_transition::{
+            WorkTransitionActor, WorkTransitionKind, WorkTransitionRequest,
+        };
+        env.store
+            .work_transition(
+                &WorkTransitionActor::Agent { token: &bound_id },
+                &WorkTransitionRequest {
+                    work_id: started.id.clone(),
+                    operation_id: "rel".into(),
+                    generation: started.generation,
+                    expected_updated_seq: started.updated_seq,
+                    session: Some("default".into()),
+                    transition: WorkTransitionKind::Release,
+                    reason: "synthetic reason".into(),
+                    superseded_by: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
     // The repository is renamed and another one takes the old name.
     env.fake.with(|s| {
         s.repos.get_mut(&REPO_ID).unwrap().full_name = "acme/widgets-renamed".into();
@@ -2584,6 +2622,19 @@ async fn work_follows_the_repository_id_across_a_rename_and_a_name_taken_over() 
     assert_eq!(numbers(&env.work(&unbound).await), [9]);
     let reply = env.announce(&bound, 1, &["src/a.rs"], None).await;
     assert_eq!(reply["pull_requests"][0]["number"], 5);
+
+    // The guard still finds the token's released Work by repository id: a path in its scope is
+    // refused for the renamed repository's token, and the response says why.
+    let body = json!({"intent_id": format!("int_{:032x}", 2), "task": "rework billing",
+        "branch": null, "paths": ["lib/b.rs"], "ttl_s": 3600});
+    let (status, refused) = env
+        .post("/v1/hub/repos/acme%2Fwidgets/intents", Some(&bound), body)
+        .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused["message"].as_str().unwrap().contains(&started.id),
+        "{refused}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4314,4 +4365,170 @@ async fn pat_sync_skips_provider_evidence_reads_and_observations() {
             .is_empty()
     );
     assert!(env.events("provider_context_observed").is_empty());
+}
+
+/// Requested lookup keys must not launder a provider's rejected PR/repository identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merged_tombstones_keep_raw_provider_identity_before_qualifying_publication_heads() {
+    use agentscm::hub::catchup::{CatchupRepositoryScope, NewCatchupMerge};
+    use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
+    use agentscm::hub::work_reconciliation::{ConditionState, ReconciliationApply};
+
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    env.refresh(&connection).await;
+    let number = 91;
+    let published = "a".repeat(40);
+    let actual = "b".repeat(40);
+    let merged = "c".repeat(40);
+    add_pull(&env, number, &["src/a.rs"]);
+    env.pull(number, |p| {
+        p.state = "closed".into();
+        p.merged = true;
+        p.head_sha = actual.clone();
+        p.merge_commit_sha = Some(merged.clone());
+    });
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: env.host(),
+                user_id: 81,
+            },
+            "synthetic-owner",
+        )
+        .unwrap();
+    let (token, secret, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "writer", REPO, REPO_ID, 3600, false)
+            .unwrap();
+    let started = env.store.work_start(&token, &serde_json::from_value(json!({
+        "request_key":"provider-identity", "title":"Verify provider identity", "session":"identity",
+        "scope":["src/identity.rs"]
+    })).unwrap(), unix_now()).unwrap().item;
+    env.store
+        .work_pr_link_set(
+            &token,
+            &WorkPrLinkUpdate {
+                work_id: started.id.clone(),
+                operation_id: "link".into(),
+                generation: started.generation,
+                session: started.lead_session.clone(),
+                expected_updated_seq: started.updated_seq,
+                link: Some(WorkPrLinkTarget {
+                    repository_id: REPO_ID,
+                    number: number as i64,
+                    head_sha: actual.clone(),
+                }),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    env.store
+        .record_catchup_merge(
+            &CatchupRepositoryScope {
+                provider: "github".into(),
+                host: env.host(),
+                repository: REPO.into(),
+                repository_id: Some(REPO_ID),
+            },
+            &NewCatchupMerge {
+                source: CatchupMergeSource::TrackedPublication,
+                source_id: "synthetic-publication".into(),
+                occurred_at: None,
+                title: None,
+                branch: "feat/91".into(),
+                base: "main".into(),
+                head_commit: published,
+                merge_commit: merged,
+                pull_number: number as i64,
+                paths: vec![],
+                paths_complete: false,
+                same_repository_head: true,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    for (case, raw_number, raw_repository, expected) in [
+        ("wrong-number", number + 1, REPO_ID, ConditionState::Unknown),
+        (
+            "wrong-repository",
+            number,
+            REPO_ID + 1,
+            ConditionState::Unknown,
+        ),
+        ("valid-recovery", number, REPO_ID, ConditionState::Satisfied),
+    ] {
+        env.pull(number, |p| {
+            p.number = raw_number;
+            p.base_repo_id = Some(raw_repository);
+        });
+        assert_eq!(fake_github::deliver(&env.url, &connection, "pull_request", case,
+            &json!({"action":"closed","number":number,"repository":{"id":REPO_ID},"pull_request":{"number":number}}),
+            fake_github::WEBHOOK_SECRET).await, 202);
+        eventually("the raw merged provider identity", || {
+            env.store
+                .observation_retained(&env.repo().id, "pull_request", &number.to_string())
+                .unwrap()
+                .is_some_and(|(o, deleted)| {
+                    let data: Value = serde_json::from_str(&o.data).unwrap();
+                    deleted
+                        && data["provider_number"] == raw_number
+                        && data["provider_base_repository_id"] == raw_repository
+                })
+        })
+        .await;
+        let (observation, _) = env
+            .store
+            .observation_retained(&env.repo().id, "pull_request", &number.to_string())
+            .unwrap()
+            .unwrap();
+        let data: Value = serde_json::from_str(&observation.data).unwrap();
+        assert_eq!(
+            data["number"], number,
+            "lookup identity is deliberately canonical"
+        );
+        let (status, v1) = env
+            .get(
+                &format!("/v1/hub/standup/work/{}/reconciliation", started.id),
+                Some(secret.expose()),
+            )
+            .await;
+        assert_eq!(status, 200, "{v1}");
+        assert_eq!(
+            v1["provider"]["head_relation"],
+            if expected == ConditionState::Satisfied {
+                "same"
+            } else {
+                "unknown"
+            },
+            "{case}: {v1}"
+        );
+        let declared = env
+            .store
+            .work_declarations_get(&token, &started.id, unix_now())
+            .unwrap()
+            .unwrap();
+        let result = env
+            .store
+            .work_reconciliation_apply(
+                &token,
+                &ReconciliationApply {
+                    work_id: started.id.clone(),
+                    operation_id: case.into(),
+                    generation: declared.generation,
+                    session: started.lead_session.clone(),
+                    expected_updated_seq: declared.updated_seq,
+                    declaration_seq: declared.declaration_seq,
+                },
+                unix_now(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.view.current.unwrap().links[0].state,
+            expected,
+            "{case}"
+        );
+    }
 }

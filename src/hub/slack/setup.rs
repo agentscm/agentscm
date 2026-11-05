@@ -593,6 +593,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 repository_id: 101,
                 agent_token_file: directory.path().join("agent"),
+                reminders: Default::default(),
             }],
         };
         (directory, config)
@@ -792,7 +793,7 @@ mod tests {
         assert!(bootstrap["settings"].get("interactivity").is_none());
         assert_eq!(
             bootstrap["oauth_config"]["scopes"],
-            serde_json::json!({"bot":["chat:write"]})
+            serde_json::json!({"bot":["chat:write","app_mentions:read"]})
         );
         let home = &bootstrap["features"]["app_home"];
         assert_eq!(home["home_tab_enabled"], false);
@@ -824,7 +825,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&report.manifest_file).unwrap()).unwrap();
         assert_eq!(
             value["oauth_config"]["scopes"],
-            serde_json::json!({"bot":["chat:write"]})
+            serde_json::json!({"bot":["chat:write","app_mentions:read"]})
         );
         assert!(value["settings"].get("interactivity").is_none());
         assert_eq!(

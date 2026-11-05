@@ -7,8 +7,8 @@ use std::sync::Arc;
 use agentscm::backend::LocalBackend;
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::session::{
-    DEFAULT_SESSION, HOLD_CAP_SECONDS, SESSION_TTL_SECONDS, SessionCall, Touched, announce_for,
-    done_for, others_for, status_for,
+    DEFAULT_SESSION, HOLD_CAP_SECONDS, SESSION_REQUIRED, SESSION_TTL_SECONDS, SessionCall, Touched,
+    announce_for, done_for, others_for, status_for,
 };
 use agentscm::hub::store::{
     self, ForgeIdentity, Principal, Store, agent_token_digest, mint_agent_token,
@@ -268,14 +268,24 @@ fn the_default_session_joins_a_recent_hook_session(db: &Db) {
     assert_eq!(joined.session, "s-1");
     assert_eq!(joined.via, ["hook:claude-code", "mcp"]);
     assert_eq!(intent_id(&joined), intent_id(&hook));
-    // Past the TTL the hook session is no longer recent.
+    // Past the TTL the only hook session is idle: an omission is ambiguous, not the default.
     let late = T0 + 20 + SESSION_TTL_SECONDS + 1;
-    assert_eq!(touch(&*store, &alice, &[], late).session, DEFAULT_SESSION);
+    assert_session_required(store.touch_session(&alice.token, &call("mcp", None, &[]), late));
+    assert_session_required(store.session_name_for(&alice.token, None, late));
     assert!(store.end_session(&alice.token, Some("s-1"), late).unwrap());
     assert!(!store.end_session(&alice.token, Some("s-1"), late).unwrap());
+    // With no hook session kept, an omission is the default session again.
+    assert_eq!(touch(&*store, &alice, &[], late).session, DEFAULT_SESSION);
 }
 
-fn an_ambiguous_default_stays_default(db: &Db) {
+fn assert_session_required<T: std::fmt::Debug>(result: Result<T, HubError>) {
+    match result {
+        Err(HubError::Invalid(message)) => assert_eq!(message, SESSION_REQUIRED),
+        other => panic!("expected the session to be required, got {other:?}"),
+    }
+}
+
+fn an_ambiguous_omitted_session_is_refused(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1, "a");
     let hook = |session: &str, now| {
@@ -285,19 +295,36 @@ fn an_ambiguous_default_stays_default(db: &Db) {
     hook("s-1", T0);
     assert_eq!(touch(&*store, &alice, &[], T0 + 1).session, "s-1");
     hook("s-2", T0 + 2);
-    assert_eq!(touch(&*store, &alice, &[], T0 + 3).session, DEFAULT_SESSION);
-    // Neither hook session is ended by a done that names none.
-    assert!(store.end_session(&alice.token, None, T0 + 4).unwrap());
-    assert!(
+    let events = store.events_after(0, 1000).unwrap().len();
+    assert_session_required(store.touch_session(
+        &alice.token,
+        &call("mcp", None, &["b.rs"]),
+        T0 + 3,
+    ));
+    assert_session_required(store.session_name_for(&alice.token, None, T0 + 3));
+    // A done that names no session is refused and ends neither hook session.
+    assert_session_required(store.end_session(&alice.token, None, T0 + 4));
+    assert_eq!(store.events_after(0, 1000).unwrap().len(), events);
+    // Naming the session still works, and an older idle session keeps the omission ambiguous.
+    assert_eq!(
         store
-            .end_session(&alice.token, Some("s-1"), T0 + 5)
+            .touch_session(&alice.token, &call("mcp", Some("s-2"), &[]), T0 + 5)
             .unwrap()
+            .session,
+        "s-2"
     );
-    assert!(
-        store
-            .end_session(&alice.token, Some("s-2"), T0 + 5)
-            .unwrap()
+    let late = T0 + SESSION_TTL_SECONDS + 1;
+    hook("s-2", late);
+    assert_session_required(store.session_name_for(&alice.token, None, late));
+    assert!(store.end_session(&alice.token, Some("s-1"), late).unwrap());
+    assert_eq!(
+        store.session_name_for(&alice.token, None, late).unwrap(),
+        "s-2"
     );
+    assert!(store.end_session(&alice.token, Some("s-2"), late).unwrap());
+    // A token that never used hooks keeps the default session.
+    let bob = agent(&*store, 2, "b");
+    assert_eq!(touch(&*store, &bob, &[], late).session, DEFAULT_SESSION);
 }
 
 fn a_first_hook_adopts_the_recent_mcp_default(db: &Db) {
@@ -997,7 +1024,7 @@ conformance!(
     expired_intent_is_not_revived,
     done_releases_and_a_later_touch_starts_afresh,
     the_default_session_joins_a_recent_hook_session,
-    an_ambiguous_default_stays_default,
+    an_ambiguous_omitted_session_is_refused,
     a_first_hook_adopts_the_recent_mcp_default,
     via_accumulates_and_is_listed,
     notices_piggyback_once,
@@ -1045,7 +1072,7 @@ async fn advice_flow(state: &HubState, [alice, bob, carol]: [Principal; 3]) {
             .starts_with("AgentSCM: another agent is already working on src/a.rs.")
     );
     assert!(
-        stop.text.contains("user1's agent (alice-agent)"),
+        stop.text.contains("user1's Claude Code session ") && !stop.text.contains("alice-agent"),
         "{}",
         stop.text
     );
@@ -1064,8 +1091,11 @@ async fn advice_flow(state: &HubState, [alice, bob, carol]: [Principal; 3]) {
         beat.text
     );
     assert!(
+        beat.text.contains("user2's agent session ")
+            && beat.text.contains(" started working on src/a.rs")
+            && !beat.text.contains("bob-agent"),
+        "{}",
         beat.text
-            .contains("user2's agent (bob-agent) started working on src/a.rs")
     );
     let quiet = announce_for(state, &alice, hook("s", &[])).await.unwrap();
     assert_eq!(quiet.text, "");
@@ -1114,7 +1144,9 @@ async fn advice_flow(state: &HubState, [alice, bob, carol]: [Principal; 3]) {
         "{reason}"
     );
     assert!(
-        reason.contains("user1's agent alice-agent, last active"),
+        reason.contains("user1's Claude Code session ")
+            && reason.contains(", last active")
+            && !reason.contains("alice-agent"),
         "{reason}"
     );
     assert!(refused.text.is_empty() && !refused.stop);

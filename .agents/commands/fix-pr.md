@@ -48,21 +48,20 @@ Present a compact table with source, file and line when available, summary, deci
 
 ### 4. Fix and validate
 
-Make focused changes and add or update deterministic synthetic tests when appropriate. Run:
+Make focused changes and add or update deterministic synthetic tests when appropriate. Before each push, run:
+
+Always run `git diff --check`. For Rust, manifest, toolchain, or build-related changes, also run:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo nextest run --locked
-cargo test --locked --doc
-git diff --check
 ```
 
-When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`; when the container image or its inputs change, also run `docker build -t agentscm . && .github/docker-smoke.sh agentscm`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+and focused `cargo nextest run --locked -E '<filter>'` runs that select the changed behavior, its callers and its failure paths. Record each filter and its selected scope. Do not run the full suite before pushing; step 11 of `.agents/commands/pr.md` handles attestation, including when there is no signing key.
 
-All applicable checks must pass before committing. Report missing prerequisites and failures explicitly; do not describe an incomplete gate as successful verification.
+When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`. Run `docker build -t agentscm . && .github/docker-smoke.sh agentscm` only when `Dockerfile`, `.dockerignore` or `.github/docker-smoke.sh` change, or when a new compile-time include falls outside the Dockerfile's `COPY` list. Run `docker compose -f compose.yaml config -q` only when `compose.yaml` changes. Run `.github/hub-e2e.sh default` when `compose.hub.yaml`, `.github/compose.e2e.yaml`, `.github/hub-e2e.sh`, `examples/hub_seed.rs` or the Dockerfile's `e2e-seed` stages change; the `postgres` profile runs only in the hosted `Hub end-to-end` workflow, which starts automatically on a same-repository pull request that changes a PostgreSQL migration, `src/hub/store_pg.rs`, `src/hub/store_pg/` or its harness; when any other change could affect it, report it as not run locally and, once the head is pushed, a same-repository author runs `gh workflow run hub-e2e.yml --ref <branch>` and matches the run's `headSha`. An ordinary `src/` change does not require a local image build, because the `Container` workflow builds and smoke-tests the image on both architectures on every push to `main`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
 
-Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
+All applicable checks must pass before committing. Report missing prerequisites and failures explicitly; do not describe an incomplete check as successful verification. Applicable reviews remain required.
 
 ### 5. Commit, push, and verify
 
@@ -72,6 +71,8 @@ If code changed, stage only the files changed for the reviewed fixes, commit wit
 git rev-parse HEAD
 gh pr view --json headRefOid --jq .headRefOid
 ```
+
+A new head has no valid attestation, so it is not ready to merge until it is attested. Do not attest each intermediate push. Once the review feedback is settled, run `tools/attest-pr.sh <PR#>` as in step 11 of `.agents/commands/pr.md` on the final head of the last fix round and report the result. A round with no code change on an unattested head still attests that head once the review feedback is settled. Until then, report the head as not ready, with no attestation. If the recipe fails because of the branch, treat the failure as a new item to fix in this step and attest the new head again. After two attestation failures caused by the change on successive heads, stop and report instead of looping. A failure shown to be unrelated to the change may be attested again on the same head without a push, under the evidence rule in that step.
 
 If nothing changed, do not create an empty commit.
 

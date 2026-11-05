@@ -19,8 +19,15 @@ use agentscm::hub::work::{
     BriefingQuery, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverviewQuery,
     WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
+use agentscm::hub::work_lifecycle::{
+    MergeStatus, OperationalOverviewV1, OutcomeValue, ReservationStatus,
+};
 use agentscm::hub::work_preflight::{
     WorkPreflightReason, WorkPreflightRequest, WorkPreflightStatus,
+};
+use agentscm::hub::work_transition::{
+    OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionKind,
+    WorkTransitionRequest,
 };
 use hub_pg::PgSchema;
 use postgres::{Client, NoTls};
@@ -2747,18 +2754,26 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
         0
     );
     assert_eq!(fixture.store.latest_event_seq().unwrap(), before_repeat);
+    // The old lead token can no longer renew, so the hold opens to takeover once its lease lapses.
+    let lapsed = now + 4 + agentscm::hub::work_lifecycle::LEASE_SECONDS + 1;
+    let mut at = now + 4;
+    while at < lapsed {
+        fixture.store.observe_lease_clock(at).unwrap();
+        at += 60;
+    }
+    fixture.store.observe_lease_clock(lapsed).unwrap();
     let mut takeover = start("retained", "src/retained.rs");
     takeover.takeover_generation = Some(original.generation);
     let resumed = fixture
         .store
-        .work_start(&new_token, &takeover, now + 4)
+        .work_start(&new_token, &takeover, lapsed)
         .unwrap();
     assert!(resumed.took_over);
     assert_eq!(resumed.item.id, original.id);
     assert_eq!(resumed.item.generation, original.generation + 1);
     let requests = fixture
         .store
-        .coordination_list(&new_token, &Default::default(), now + 5)
+        .coordination_list(&new_token, &Default::default(), lapsed + 1)
         .unwrap();
     let request = requests
         .requests
@@ -2775,7 +2790,7 @@ fn repository_namespace_repair(fixture: &Fixture, collision: bool) {
                 session: resumed.item.lead_session.clone(),
                 expected_updated_seq: request.updated_seq,
             },
-            now + 5,
+            lapsed + 1,
         )
         .unwrap();
     // A different repository reusing the old name cannot see the migrated Work.
@@ -2963,8 +2978,11 @@ fn settles_and_returns_on_a_later_check_in(fixture: &Fixture) {
     );
 
     merged(fixture, 1, "feat/a", "main", true, t0 + 100);
-    assert_eq!(listed(fixture, &reader, 100, now), (Vec::new(), 1, true));
-    assert!(briefing_ids(fixture, &reader, now).is_empty());
+    assert_eq!(
+        listed(fixture, &reader, 100, now),
+        (vec![item.id.clone()], 0, true)
+    );
+    assert_eq!(briefing_ids(fixture, &reader, now), vec![item.id.clone()]);
     // The record is untouched and still readable.
     let kept = fixture
         .store
@@ -3068,7 +3086,7 @@ fn a_merge_at_the_check_in_instant_settles(fixture: &Fixture) {
     merged(fixture, 8, "feat/tie", "main", true, t0 + 50);
     assert_eq!(
         listed(fixture, &reader, 100, t0 + 500),
-        (Vec::new(), 1, true)
+        (vec![item.id.clone()], 0, true)
     );
 }
 
@@ -3105,7 +3123,15 @@ fn an_automatic_pause_after_the_merge_settles_until_resumed(fixture: &Fixture) {
     assert_eq!(auto.state, WorkState::Paused);
     assert_eq!(
         listed(fixture, &reader, 100, t0 + 500),
-        (vec![manual.id], 1, true)
+        (
+            {
+                let mut ids = vec![manual.id.clone(), auto.id.clone()];
+                ids.sort();
+                ids
+            },
+            0,
+            true
+        )
     );
 
     // A resume through takeover keeps the pause summary but changes the state.
@@ -3152,17 +3178,16 @@ fn the_limit_counts_only_visible_items_and_paging_skips_hidden_ones(fixture: &Fi
         );
         if n < 3 {
             merged(fixture, 20 + n, &branch, "main", true, t0 + 100);
-        } else {
-            visible.push(item.id);
         }
+        visible.push(item.id);
     }
     visible.sort();
     assert_eq!(
         listed(fixture, &reader, 2, t0 + 500),
-        (visible.clone(), 3, true)
+        (visible[..2].to_vec(), 0, false)
     );
     let (first, settled, complete) = listed(fixture, &reader, 1, t0 + 500);
-    assert_eq!((first.len(), settled, complete), (1, 3, false));
+    assert_eq!((first.len(), settled, complete), (1, 0, false));
     assert_eq!(briefing_ids(fixture, &reader, t0 + 500), visible);
 }
 
@@ -3170,7 +3195,7 @@ fn a_hidden_item_still_conflicts_with_a_new_start(fixture: &Fixture) {
     let (token, reader, t0) = settled_work(fixture);
     let item = begin(fixture, &token, "adm", Some("feat/adm"), "src/adm.rs", t0);
     merged(fixture, 30, "feat/adm", "main", true, t0 + 100);
-    assert_eq!(listed(fixture, &reader, 100, t0 + 500).1, 1);
+    assert_eq!(listed(fixture, &reader, 100, t0 + 500).1, 0);
     let other_owner = fixture.owner(SETTLED_RID + 1);
     let other = fixture.token(&other_owner, "settled-other", SETTLED_RID, false);
     let result = fixture
@@ -3215,7 +3240,10 @@ fn settled_state_survives_compaction_of_merge_observations(fixture: &Fixture) {
     let t0 = now - 3 * 86_400;
     let item = begin(fixture, &token, "cmp", Some("feat/cmp"), "src/cmp.rs", t0);
     merged(fixture, 40, "feat/cmp", "main", true, t0 + 100);
-    assert_eq!(listed(fixture, &reader, 100, now), (Vec::new(), 1, true));
+    assert_eq!(
+        listed(fixture, &reader, 100, now),
+        (vec![item.id.clone()], 0, true)
+    );
 
     let work_scope = WorkRepositoryScope {
         provider: "github".into(),
@@ -3231,7 +3259,10 @@ fn settled_state_survives_compaction_of_merge_observations(fixture: &Fixture) {
     assert!(fixture.merge_ids(SETTLED_RID).is_empty());
 
     // The observation is gone, the derived branch record is not.
-    assert_eq!(listed(fixture, &reader, 100, now), (Vec::new(), 1, true));
+    assert_eq!(
+        listed(fixture, &reader, 100, now),
+        (vec![item.id.clone()], 0, true)
+    );
     assert!(
         fixture
             .store
@@ -3319,7 +3350,7 @@ fn a_merge_without_a_provider_time_does_not_settle(fixture: &Fixture) {
     merged(fixture, 61, "feat/nt", "main", true, t0 + 100);
     assert_eq!(
         listed(fixture, &reader, 100, t0 + 500),
-        (Vec::new(), 1, true)
+        (vec![item.id.clone()], 0, true)
     );
 }
 
@@ -3367,7 +3398,7 @@ fn settling_works_in_an_unbound_repository(fixture: &Fixture) {
         .unwrap();
     assert_eq!(
         listed(fixture, &token, 100, t0 + 500),
-        (Vec::new(), 1, true)
+        (vec![item.id.clone()], 0, true)
     );
 }
 
@@ -3429,12 +3460,21 @@ fn a_check_in_after_the_merge_survives_the_automatic_pause(fixture: &Fixture) {
     assert_eq!(early.reported_at, Some(t0 + 50));
     assert_eq!(
         listed(fixture, &reader, 100, t0 + 500),
-        (vec![late.id.clone()], 1, true)
+        (
+            {
+                let mut ids = vec![late.id.clone(), early.id.clone()];
+                ids.sort();
+                ids
+            },
+            0,
+            true
+        )
     );
-    assert_eq!(
-        briefing_ids(fixture, &reader, t0 + 500),
-        vec![late.id.clone()]
-    );
+    assert_eq!(briefing_ids(fixture, &reader, t0 + 500), {
+        let mut ids = vec![late.id.clone(), early.id.clone()];
+        ids.sort();
+        ids
+    });
 
     // A repeated automatic pause keeps the value; a real checkpoint clears it.
     let again = checkin(
@@ -3455,6 +3495,179 @@ fn a_check_in_after_the_merge_survives_the_automatic_pause(fixture: &Fixture) {
         t0 + 450,
     );
     assert_eq!(real.reported_at, None);
+}
+
+fn operational_read(
+    fixture: &Fixture,
+    token: &str,
+    select: &OperationalSelect<'_>,
+    now: i64,
+) -> OperationalOverviewV1 {
+    fixture
+        .store
+        .work_operational(&WorkLifecycleReader::Token(token), select, now)
+        .unwrap()
+}
+
+fn operational_covers_reserving_work_hidden_by_a_merged_pr(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let now = t0 + 5_000;
+    let hidden = begin(fixture, &token, "oph", Some("feat/oph"), "src/oph.rs", t0);
+    let plain = begin(fixture, &token, "opp", Some("feat/opp"), "src/opp.rs", t0);
+    let freed = begin(fixture, &token, "opf", None, "src/opf.rs", t0);
+    fixture
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token },
+            &WorkTransitionRequest {
+                work_id: freed.id.clone(),
+                operation_id: "release-opf".into(),
+                generation: freed.generation,
+                expected_updated_seq: freed.updated_seq,
+                session: Some("session-opf".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "synthetic release".into(),
+                superseded_by: None,
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    merged(fixture, 60, "feat/oph", "main", true, t0 + 100);
+
+    // Held scope remains visible, while the legacy merge observation stays inspectable.
+    let (ids, settled, _) = listed(fixture, &reader, 100, now);
+    assert!(ids.contains(&hidden.id), "{ids:?}");
+    assert_eq!(settled, 0);
+
+    let holders = operational_read(fixture, &reader, &OperationalSelect::Holders, t0 + 120);
+    assert_eq!((holders.schema_version, holders.complete), (2, true));
+    let mut expected = vec![hidden.id.clone(), plain.id.clone()];
+    expected.sort();
+    let listed_ids: Vec<_> = holders.work.iter().map(|w| w.work_id.clone()).collect();
+    assert_eq!(listed_ids, expected, "ordered by id, freed work absent");
+    let entry = holders
+        .work
+        .iter()
+        .find(|w| w.work_id == hidden.id)
+        .unwrap();
+    assert!(entry.merge.hidden_by_merged_pr);
+    assert_eq!(entry.merge.status, MergeStatus::Observed);
+    // A merge changes neither the state, the outcome nor the reservation.
+    assert_eq!(entry.state, WorkState::Active);
+    assert_eq!(entry.outcome.value, OutcomeValue::None);
+    assert_eq!(entry.reservation.status, ReservationStatus::Held);
+    assert_eq!(entry.reservation.scope, vec!["src/oph.rs".to_owned()]);
+    assert_eq!(entry.generation, hidden.generation);
+    let other = holders.work.iter().find(|w| w.work_id == plain.id).unwrap();
+    assert!(!other.merge.hidden_by_merged_pr);
+    assert_eq!(
+        other.merge.status,
+        MergeStatus::Unknown,
+        "no coverage known"
+    );
+
+    // Unfinished and released: readable by id with no reservation, never a holder.
+    let one = operational_read(fixture, &reader, &OperationalSelect::One(&freed.id), now);
+    let one = &one.work[0];
+    assert_eq!(one.reservation.status, ReservationStatus::None);
+    assert!(one.reservation.scope.is_empty() && one.reservation.basis.is_none());
+    assert_eq!(one.state, WorkState::Paused);
+    // Unknown and foreign ids read as empty.
+    let missing = format!("wrk_{}", "0".repeat(32));
+    assert!(
+        operational_read(fixture, &reader, &OperationalSelect::One(&missing), now)
+            .work
+            .is_empty()
+    );
+    assert!(matches!(
+        fixture.store.work_operational(
+            &WorkLifecycleReader::Token(&reader),
+            &OperationalSelect::One("not-an-id"),
+            now
+        ),
+        Err(HubError::Invalid(_))
+    ));
+
+    // No token identifier appears, and only `freshness` and the lease `activity` depend on the
+    // request time.
+    let early = serde_json::to_value(&holders).unwrap();
+    let text = early.to_string();
+    assert!(!text.contains(&token) && !text.contains(&reader), "{text}");
+    fixture.store.revoke_agent_token(&token).unwrap();
+    let later = operational_read(fixture, &reader, &OperationalSelect::Holders, now + 600);
+    let mut later = serde_json::to_value(&later).unwrap();
+    let mut early = early;
+    assert_ne!(early, later, "a revoked lead changes freshness");
+    for value in [&mut early, &mut later] {
+        for work in value["work"].as_array_mut().unwrap() {
+            let work = work.as_object_mut().unwrap();
+            work.remove("freshness");
+            work.remove("activity");
+        }
+    }
+    assert_eq!(early, later);
+}
+
+fn merge_status_is_none_only_when_forge_coverage_is_known(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let now = t0 + 5_000;
+    let branch = begin(fixture, &token, "mnb", Some("feat/mnb"), "src/mnb.rs", t0);
+    let loose = begin(fixture, &token, "mnl", None, "src/mnl.rs", t0);
+    let status_of = |id: &str| {
+        operational_read(fixture, &reader, &OperationalSelect::One(id), now).work[0]
+            .merge
+            .status
+    };
+    assert_eq!(status_of(&branch.id), MergeStatus::Unknown);
+    let record = |state, window_from| {
+        fixture
+            .store
+            .record_catchup_source_status(
+                &scope(SETTLED_RID),
+                &CatchupSourceStatus {
+                    source: CatchupMergeSource::ForgePull,
+                    state,
+                    checked_at: t0 + 1_000,
+                    unread_pages: 0,
+                    deferred: 0,
+                    window_from,
+                },
+            )
+            .unwrap();
+    };
+    // A read that does not reach the item's creation, or an incomplete one, proves nothing.
+    record(CatchupCoverageState::ObservedOnly, Some(t0 + 500));
+    assert_eq!(status_of(&branch.id), MergeStatus::Unknown);
+    record(CatchupCoverageState::Incomplete, Some(t0 - 100));
+    assert_eq!(status_of(&branch.id), MergeStatus::Unknown);
+    record(CatchupCoverageState::ObservedOnly, Some(t0 - 100));
+    assert_eq!(status_of(&branch.id), MergeStatus::None);
+    // Work with no branch is never judged by the merge rule.
+    assert_eq!(status_of(&loose.id), MergeStatus::Unknown);
+    merged(fixture, 61, "feat/mnb", "main", true, t0 + 100);
+    let after = operational_read(fixture, &reader, &OperationalSelect::One(&branch.id), now);
+    assert_eq!(after.work[0].merge.status, MergeStatus::Observed);
+    assert!(after.work[0].merge.hidden_by_merged_pr);
+}
+
+fn more_than_a_hundred_holders_are_bounded_and_flagged(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    for index in 0..101 {
+        begin(
+            fixture,
+            &token,
+            &format!("many{index}"),
+            None,
+            &format!("src/many{index}.rs"),
+            t0,
+        );
+    }
+    let page = operational_read(fixture, &reader, &OperationalSelect::Holders, t0 + 10);
+    assert_eq!((page.work.len(), page.complete), (100, false));
+    let ids: Vec<_> = page.work.iter().map(|w| w.work_id.clone()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
 }
 
 macro_rules! settled_cases {
@@ -3498,4 +3711,49 @@ settled_cases!(
     a_branch_that_is_also_a_base_stays_listed_in_either_order,
     settling_works_in_an_unbound_repository,
     a_check_in_after_the_merge_survives_the_automatic_pause,
+    operational_covers_reserving_work_hidden_by_a_merged_pr,
+    merge_status_is_none_only_when_forge_coverage_is_known,
+    more_than_a_hundred_holders_are_bounded_and_flagged,
 );
+
+fn released_work_can_still_use_legacy_branch_settling(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let item = begin(
+        fixture,
+        &token,
+        "released-merge",
+        Some("feat/released"),
+        "src/released.rs",
+        t0,
+    );
+    fixture
+        .store
+        .work_transition(
+            &WorkTransitionActor::Agent { token: &token },
+            &WorkTransitionRequest {
+                work_id: item.id.clone(),
+                operation_id: "release-before-merge".into(),
+                generation: item.generation,
+                expected_updated_seq: item.updated_seq,
+                session: Some("session-released-merge".into()),
+                transition: WorkTransitionKind::Release,
+                reason: "No more scope is reserved".into(),
+                superseded_by: None,
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    merged(fixture, 700, "feat/released", "main", true, t0 + 100);
+    assert_eq!(listed(fixture, &reader, 100, t0 + 500), (vec![], 1, true));
+    assert!(briefing_ids(fixture, &reader, t0 + 500).is_empty());
+}
+#[test]
+fn sqlite_released_work_can_still_use_legacy_branch_settling() {
+    released_work_can_still_use_legacy_branch_settling(&Fixture::sqlite());
+}
+#[test]
+fn postgres_released_work_can_still_use_legacy_branch_settling() {
+    if let Some(f) = Fixture::postgres() {
+        released_work_can_still_use_legacy_branch_settling(&f);
+    }
+}

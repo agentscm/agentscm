@@ -412,12 +412,15 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
             "agentscm_work_briefing",
             "agentscm_work_catchup",
             "agentscm_work_catchup_ack",
+            "agentscm_work_declarations",
             "agentscm_work_insight",
             "agentscm_work_insights",
             "agentscm_work_overview",
             "agentscm_work_pr_link",
             "agentscm_work_preflight",
+            "agentscm_work_reconciliation",
             "agentscm_work_search",
+            "agentscm_work_status",
             "agentscm_workflow_runs_list",
             "agentscm_workflow_status"
         ]

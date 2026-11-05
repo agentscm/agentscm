@@ -2,7 +2,7 @@ name: Installer
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
     paths:
       - "install.sh"
       - ".github/pin-release-installers.js"
@@ -23,12 +23,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: installer-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
+  group: installer-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   shellcheck:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -39,7 +39,6 @@ jobs:
 
   # Windows remains automatic platform coverage when installer paths match.
   npm-windows:
-    if: ${{ github.event.action != 'labeled' || github.event.label.name == 'ci-extended' }}
     runs-on: windows-2025
     timeout-minutes: 5
     steps:
@@ -54,7 +53,7 @@ jobs:
         working-directory: packages/npm
 
   npm-linux:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && ((github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')))) }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

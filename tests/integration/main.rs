@@ -144,6 +144,7 @@ mod hub_insights_http;
 #[cfg(unix)]
 mod hub_insights_store;
 mod hub_intents;
+mod hub_leases;
 mod hub_login;
 mod hub_mcp;
 #[cfg(unix)]
@@ -176,6 +177,8 @@ mod hub_work;
 #[cfg(unix)]
 mod hub_work_auto_compaction;
 #[cfg(unix)]
+mod hub_work_reconcile;
+#[cfg(unix)]
 mod hub_workflow;
 #[cfg(unix)]
 mod hub_workspace;
@@ -193,6 +196,10 @@ mod issue_workflow_recovery;
 #[cfg(unix)]
 mod license;
 mod local_ci;
+#[cfg(unix)]
+mod local_ci_device_cli;
+#[cfg(unix)]
+mod local_ci_devices;
 #[cfg(unix)]
 mod local_read_http;
 #[cfg(unix)]

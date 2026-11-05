@@ -19,10 +19,10 @@ use axum::routing::post;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
-use super::advice::unknown;
+use super::advice::{agent_name, unknown};
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
-use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
+use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
@@ -33,6 +33,7 @@ use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{
     Briefing, CheckpointKind, WorkCheckpoint, WorkOverview, WorkOverviewQuery, WorkState,
 };
+use super::work_lifecycle::{CallPhase, LEASE_LAPSED};
 use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
@@ -112,7 +113,12 @@ impl Agent {
 enum Kind {
     Ignore,
     Start,
+    /// The person typed a prompt in this session: delivers pending requests, writes nothing.
+    Prompt,
     Check,
+    /// Any other tool call: renews the lead session's lease, writes nothing else, says nothing.
+    /// A shell call's start and end keep the lease live while it runs.
+    Activity(CallPhase),
     Done,
     Fail(&'static str),
 }
@@ -149,6 +155,8 @@ struct Call {
     paths: Vec<String>,
     /// Runs before the edit, in an agent whose hook can refuse it.
     deny: bool,
+    /// Made by a subagent (Claude Code sends `agent_id`), whose context ends when it returns.
+    child: bool,
 }
 
 struct Outcome {
@@ -235,7 +243,7 @@ async fn hook(
         Ok(Err(reason)) => Outcome::unknown(reason),
         Err(_) => Outcome::unknown("hub timed out"),
     };
-    if matches!(call.kind, Kind::Start | Kind::Check)
+    if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
         && let Some(token) = token
     {
         let delivery = async {
@@ -266,36 +274,56 @@ async fn hook(
         };
         match timeout_at(deadline, delivery).await {
             Ok(Ok((principal, session, page))) => {
-                for request in page.requests.iter().take(5) {
-                    if matches!(
+                let open = |request: &&CoordinationRequest| {
+                    !matches!(
                         request.status,
                         CoordinationStatus::Resolved | CoordinationStatus::Withdrawn
-                    ) {
-                        continue;
+                    )
+                };
+                // A subagent's context ends when it returns, so a request shown there is lost
+                // with it: point it at its lead instead, and never hold its edits for a reply.
+                if call.child {
+                    let waiting = page.requests.iter().filter(open).count();
+                    if waiting > 0 {
+                        outcome.text.push_str(&format!("\nAgentSCM: {waiting} coordination request(s) wait for your lead session. Do not answer them here; finish your task and mention them in your report."));
+                        if outcome.status == "clean" {
+                            outcome.status = "fyi";
+                        }
                     }
-                    outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
-                    let reply_needed = request.targets.iter().any(|target| {
-                        target.lead.token == principal.token_id
-                            && target.lead.session == session
-                            && !request.responses.iter().any(|reply| {
-                                reply.target_work_id == target.work_id
-                                    && reply.target_generation == target.generation
-                                    && reply.responder.token == principal.token_id
-                                    && reply.responder.session == session
-                            })
-                    });
-                    if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
-                        outcome.deny = Some(format!(
-                            "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline.",
-                            request.id
-                        ));
-                        outcome.status = "stop";
-                    } else if outcome.status == "clean" {
-                        outcome.status = "fyi";
+                } else {
+                    let mut shown = 0;
+                    for request in page.requests.iter().filter(open).take(5) {
+                        let reply_needed = request.targets.iter().any(|target| {
+                            target.lead.token == principal.token_id
+                                && target.lead.session == session
+                                && !request.responses.iter().any(|reply| {
+                                    reply.target_work_id == target.work_id
+                                        && reply.target_generation == target.generation
+                                        && reply.responder.token == principal.token_id
+                                        && reply.responder.session == session
+                                })
+                        });
+                        // A prompt repeats every turn, so it carries only what this session must answer.
+                        if call.kind == Kind::Prompt && !reply_needed {
+                            continue;
+                        }
+                        shown += 1;
+                        outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                        if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
+                            outcome.deny = Some(format!(
+                                "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline.",
+                                request.id
+                            ));
+                            outcome.status = "stop";
+                        } else if outcome.status == "clean" {
+                            outcome.status = "fyi";
+                        }
                     }
-                }
-                if !page.complete || page.requests.len() > 5 {
-                    outcome.text.push_str("\nCoordination inbox is partial in this hook. Page agentscm_coordination_inbox before relying on coverage.");
+                    if (!page.complete || page.requests.len() > 5)
+                        && (call.kind != Kind::Prompt || shown > 0)
+                    {
+                        outcome.text.push_str("\nCoordination inbox is partial in this hook. Page agentscm_coordination_inbox before relying on coverage.");
+                    }
                 }
             }
             _ if outcome.status != "unknown" => {
@@ -349,7 +377,11 @@ fn reason(error: HubError) -> &'static str {
             "checkpoint sequence changed; inspect current Work"
         }
         HubError::Unauthorized => DENIED,
-        HubError::Invalid(_) => "invalid hook payload",
+        HubError::Invalid(detail) => {
+            // Debug-quoted so each message stays on one log line.
+            eprintln!("hub: hook rejected as invalid: {detail:?}");
+            "invalid hook payload"
+        }
         HubError::Unavailable(detail) => {
             eprintln!("hub error: {detail}");
             "hub unavailable"
@@ -404,6 +436,7 @@ impl Call {
             task: None,
             paths: Vec::new(),
             deny: false,
+            child: false,
         }
     }
 
@@ -420,6 +453,11 @@ impl Call {
     /// The call may be refused: the agent has not run the edit yet and its hook can stop it.
     fn deny(mut self) -> Self {
         self.deny = true;
+        self
+    }
+
+    fn child(mut self, child: bool) -> Self {
+        self.child = child;
         self
     }
 
@@ -497,7 +535,32 @@ impl Call {
         };
         match self.kind {
             Kind::Fail(reason) => Err(reason),
-            Kind::Ignore => Ok(Outcome::clean()),
+            // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
+            Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
+            Kind::Activity(phase) => {
+                // Best effort and silent: the touch renews the session's own leases, and a
+                // failure must not disturb the agent. An unnamed session renews nothing.
+                if self.session.is_some()
+                    && let Ok(principal) = authenticate(state, token, repo).await
+                {
+                    let store = state.store.clone();
+                    let heartbeat = call(Vec::new());
+                    let heartbeat = SessionCall {
+                        task: None,
+                        deny: false,
+                        report: false,
+                        ..heartbeat
+                    };
+                    if let Err(error) = blocking(state, move || {
+                        store.session_activity(&principal.token_id, &heartbeat, phase, unix_now())
+                    })
+                    .await
+                    {
+                        eprintln!("hub: activity hook did not renew: {error}");
+                    }
+                }
+                Ok(Outcome::clean())
+            }
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
@@ -532,8 +595,13 @@ impl Call {
                         *delivered = Some((principal.clone(), session, page));
                         advice
                     }
-                    Err(HubError::Invalid(_)) => {
-                        let text = "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned();
+                    Err(HubError::Invalid(detail)) => {
+                        eprintln!("hub: edit hook not linked to work: {detail:?}");
+                        let text = if detail.starts_with(LEASE_LAPSED) {
+                            format!("AgentSCM: {detail} No new file intent was announced.")
+                        } else {
+                            "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned()
+                        };
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
                             text,
@@ -622,6 +690,22 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
+                let store = state.store.clone();
+                let scope = principal.clone();
+                // Bound optional enrichment after the committed touch; a slow read cannot consume
+                // the native client's whole startup deadline or hide that touch's outcome.
+                let current_status = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    blocking(state, move || {
+                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
+                    }),
+                )
+                .await;
+                text.push('\n');
+                match current_status {
+                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
+                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
+                }
                 if !principal.read_only {
                     text.push('\n');
                     text.push_str(super::mcp::NARRATIVE_GUIDANCE);
@@ -716,7 +800,7 @@ fn render_briefing(briefing: &Briefing) -> String {
         lines.push(format!(
             "- {} by {} [{:?}, claim {:?}]: {} (third-party text)",
             item.id,
-            bounded_hook_text(&item.lead_agent, 64),
+            bounded_hook_text(&agent_name(&item.lead_agent), 64),
             item.state,
             item.claim_status,
             bounded_hook_text(&item.title, 120)
@@ -769,7 +853,7 @@ fn render_overview(overview: &WorkOverview) -> String {
             "- {:?}: {} by {} — {} (third-party text)",
             outcome.kind,
             bounded_hook_text(&outcome.item.title, 100),
-            bounded_hook_text(&outcome.item.lead_agent, 64),
+            bounded_hook_text(&agent_name(&outcome.item.lead_agent), 64),
             bounded_hook_text(summary, 160)
         ));
     }
@@ -781,8 +865,8 @@ fn render_overview(overview: &WorkOverview) -> String {
         .collect();
     for overlap in live_overlaps.iter().take(5) {
         lines.push(format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
-            bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&overlap.left.lead_agent, 64),
-            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&overlap.right.lead_agent, 64)));
+            bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&agent_name(&overlap.left.lead_agent), 64),
+            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&agent_name(&overlap.right.lead_agent), 64)));
     }
     if !overview.current_complete
         || !overview.recent_complete
@@ -792,7 +876,7 @@ fn render_overview(overview: &WorkOverview) -> String {
     {
         lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
     }
-    lines.push("Only declared work is visible; empty scope is unknown coverage. Give each agent a separate token for independent catch-up. Reported finish does not prove tests, review or merge.".into());
+    lines.push("Only declared work is visible; empty scope is unknown coverage. Reported finish does not prove tests, review or merge.".into());
     lines.join("\n")
 }
 
@@ -952,6 +1036,29 @@ fn is_edit(tool: &str) -> bool {
     EDIT_TOOLS.contains(&tool.to_ascii_lowercase().as_str())
 }
 
+/// The agents' shell tools, whose single call can run longer than a lease.
+pub fn is_shell_tool(tool: &str) -> bool {
+    [
+        "bash",
+        "shell",
+        "exec_command",
+        "local_shell",
+        "run_shell_command",
+        "run_terminal_cmd",
+        "run_in_terminal",
+    ]
+    .contains(&tool.to_ascii_lowercase().as_str())
+}
+
+/// The activity phase of a tool event: a shell call starts before and ends after it runs.
+fn phase(tool: &str, before: bool) -> CallPhase {
+    match (is_shell_tool(tool), before) {
+        (false, _) => CallPhase::Tick,
+        (true, true) => CallPhase::Start,
+        (true, false) => CallPhase::End,
+    }
+}
+
 /// The files a tool call edits: patch headers for `apply_patch`, else the first path field.
 fn edit_paths<'a>(tool: &str, input: &'a Value) -> Vec<&'a str> {
     if tool.eq_ignore_ascii_case("apply_patch")
@@ -983,17 +1090,28 @@ fn patch_paths(patch: &str) -> Vec<&str> {
 
 /// Claude Code, Codex and the PascalCase form of Copilot (VS Code, `.github/hooks`).
 fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
-    let call = |kind, shape| Call::new(agent, kind, shape).session(str_at(v, "session_id"));
+    let call = |kind, shape| {
+        Call::new(agent, kind, shape)
+            .session(str_at(v, "session_id"))
+            .child(v.get("agent_id").is_some())
+    };
     let tool = str_at(v, "tool_name").unwrap_or_default();
     match str_at(v, "hook_event_name") {
         // The start prompt is never read: it would become a team-visible task.
         Some("SessionStart") => call(Kind::Start, Shape::Hook("SessionStart")),
+        // Fires only where a person types, so it reaches the session they are talking to. The
+        // prompt itself is never read; the client does not forward it.
+        Some("UserPromptSubmit") => call(Kind::Prompt, Shape::Hook("UserPromptSubmit")),
         Some("PreToolUse") if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Hook("PreToolUse"))
                 .deny()
                 .paths(edit_paths(tool, input), scope)
         }
+        Some(event @ ("PreToolUse" | "PostToolUse")) => call(
+            Kind::Activity(phase(tool, event == "PreToolUse")),
+            Shape::Silent,
+        ),
         Some("SessionEnd") => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
@@ -1001,7 +1119,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
 
 /// Copilot CLI and cloud agent: camelCase fields and no event name, so the event is read from
 /// the fields. Edits are checked on preToolUse, which can refuse but has no context field;
-/// postToolUse (it has a `toolResult`) is ignored.
+/// every other tool event, postToolUse (it has a `toolResult`) included, is activity.
 fn copilot(v: &Value, scope: &Scope) -> Call {
     let call = |kind, shape| Call::new(Agent::Copilot, kind, shape).session(str_at(v, "sessionId"));
     match str_at(v, "toolName") {
@@ -1015,7 +1133,10 @@ fn copilot(v: &Value, scope: &Scope) -> Call {
                 .deny()
                 .paths(edit_paths(tool, &args), scope)
         }
-        Some(_) => call(Kind::Ignore, Shape::Silent),
+        Some(tool) => call(
+            Kind::Activity(phase(tool, v.get("toolResult").is_none())),
+            Shape::Silent,
+        ),
         None if v.get("reason").is_some() => call(Kind::Done, Shape::Silent),
         None if v.get("source").is_some() || v.get("initialPrompt").is_some() => {
             call(Kind::Start, Shape::Camel)
@@ -1032,21 +1153,30 @@ fn cursor(v: &Value, scope: &Scope) -> Call {
     match event {
         "sessionStart" => call(Kind::Start, Shape::Snake),
         // No non-blocking context field before a tool runs: the check waits for postToolUse.
-        _ if CURSOR_PERMISSION_EVENTS.contains(&event) => call(Kind::Ignore, Shape::Allow),
+        // Cursor reports no tool start, so its calls only renew.
+        _ if CURSOR_PERMISSION_EVENTS.contains(&event) => {
+            call(Kind::Activity(CallPhase::Tick), Shape::Allow)
+        }
         "postToolUse" if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Snake).paths(edit_paths(tool, input), scope)
         }
+        "postToolUse" => call(Kind::Activity(CallPhase::Tick), Shape::Silent),
         "sessionEnd" => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
 }
 
-/// `{agent?, session?, event: start|check|done, paths?, task?, cwd?}`.
+/// `{agent?, session?, event: start|check|activity|done, phase?: start|end, paths?, task?, cwd?}`.
 fn generic(v: &Value, scope: &Scope) -> Call {
     let kind = match str_at(v, "event") {
         Some("start") => Kind::Start,
         Some("check") => Kind::Check,
+        Some("activity") => Kind::Activity(match str_at(v, "phase") {
+            Some("start") => CallPhase::Start,
+            Some("end") => CallPhase::End,
+            _ => CallPhase::Tick,
+        }),
         Some("done") => Kind::Done,
         _ => return Call::failed(Agent::Generic, "hook event not recognised"),
     };
@@ -1436,15 +1566,36 @@ mod tests {
             Agent::Claude,
             &json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": "/r"}),
         );
-        assert_eq!((bash.kind, bash.shape), (Kind::Ignore, Shape::Silent));
+        assert_eq!(
+            (bash.kind, bash.shape),
+            (Kind::Activity(CallPhase::Start), Shape::Silent)
+        );
+        let post = parse(
+            Agent::Codex,
+            &json!({"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "apply_patch"}),
+        );
+        assert_eq!(
+            (post.kind, post.shape),
+            (Kind::Activity(CallPhase::Tick), Shape::Silent)
+        );
+        let bash_done = parse(
+            Agent::Claude,
+            &json!({"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Bash"}),
+        );
+        assert_eq!(bash_done.kind, Kind::Activity(CallPhase::End));
         let cursor_pre = parse(
             Agent::Cursor,
             &json!({"hook_event_name": "preToolUse", "tool_name": "Write"}),
         );
         assert_eq!(
             (cursor_pre.kind, cursor_pre.shape),
-            (Kind::Ignore, Shape::Allow)
+            (Kind::Activity(CallPhase::Tick), Shape::Allow)
         );
+        let cursor_post = parse(
+            Agent::Cursor,
+            &json!({"hook_event_name": "postToolUse", "tool_name": "Shell"}),
+        );
+        assert_eq!(cursor_post.kind, Kind::Activity(CallPhase::Tick));
         let camel_pre = parse(
             Agent::Copilot,
             &json!({"sessionId": "s", "cwd": "/r", "toolName": "edit",
@@ -1466,7 +1617,7 @@ mod tests {
             Agent::Copilot,
             &json!({"sessionId": "s", "toolName": "bash"}),
         );
-        assert_eq!(camel_bash.kind, Kind::Ignore);
+        assert_eq!(camel_bash.kind, Kind::Activity(CallPhase::Start));
         assert!(claude.deny && !cursor_pre.deny);
         // Without a tool or reason, a Copilot event is a start only when it says how it began.
         let camel = |v| parse(Agent::Copilot, &v).kind;
@@ -1497,8 +1648,8 @@ mod tests {
             &json!({"sessionId": "s", "cwd": "/r", "toolName": "edit", "toolResult": {},
                 "toolArgs": {"path": "/r/a.rs"}}),
         );
-        // The check ran on preToolUse; a second one would use up the dedupe.
-        assert_eq!(camel_post.kind, Kind::Ignore);
+        // The check ran on preToolUse; a second one would use up the dedupe, so it is activity.
+        assert_eq!(camel_post.kind, Kind::Activity(CallPhase::Tick));
         let bad_session = parse(
             Agent::Codex,
             &json!({"hook_event_name": "SessionStart", "session_id": "a\nb"}),
@@ -1512,6 +1663,19 @@ mod tests {
             (generic.via.as_str(), generic.paths),
             ("hook:generic", vec!["a.rs".into()])
         );
+        let tick = parse(
+            Agent::Generic,
+            &json!({"event": "activity", "agent": "gemini", "session": "s"}),
+        );
+        assert_eq!(
+            (tick.kind, tick.shape),
+            (Kind::Activity(CallPhase::Tick), Shape::Generic)
+        );
+        let shell = parse(
+            Agent::Generic,
+            &json!({"event": "activity", "phase": "end", "agent": "gemini", "session": "s"}),
+        );
+        assert_eq!(shell.kind, Kind::Activity(CallPhase::End));
         let unreadable = Call::parse(Agent::Claude, b"[1]", None);
         assert_eq!(unreadable.shape, Shape::Unreadable);
         assert!(matches!(

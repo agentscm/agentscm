@@ -780,25 +780,65 @@ fn inferred_provider(host: &str) -> Option<Provider> {
 }
 
 fn token_name() -> Result<String> {
-    let host: String = crate::intent_cli::hostname()
-        .unwrap_or_else(|| "host".into())
-        .split('.')
-        .next()
-        .unwrap_or("host")
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || "-_".contains(*character))
-        .take(40)
-        .collect();
-    let mut random = [0_u8; 4];
-    getrandom::fill(&mut random).map_err(|_| invalid("random source unavailable"))?;
-    let random: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!(
-        "client-{}-{random}",
-        if host.is_empty() { "host" } else { &host }
-    ))
+    label_in(
+        crate::hub_cli::config_dir()
+            .ok()
+            .map(|dir| dir.join("agentscm"))
+            .as_deref(),
+    )
+}
+
+/// `client-<machine id>-<hex>`, or `<machine-name>-<hex>` when the user wrote a `machine-name` file
+/// in `dir`. The machine id is random, kept in `dir/machine-id` and never derived from the host
+/// name. Unreadable or unwritable files only cost a fresh random id; an unavailable random source
+/// is an error.
+fn label_in(dir: Option<&Path>) -> Result<String> {
+    let hex = |count: usize| -> Result<String> {
+        let mut bytes = vec![0_u8; count];
+        getrandom::fill(&mut bytes).map_err(|_| invalid("random source unavailable"))?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    };
+    let name = dir
+        .and_then(|dir| std::fs::read_to_string(dir.join("machine-name")).ok())
+        .map(|name| {
+            name.trim()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c))
+                .take(50)
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty());
+    let suffix = hex(4)?;
+    if let Some(name) = name {
+        return Ok(format!("{name}-{suffix}"));
+    }
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| {
+                id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    };
+    let fresh = hex(8)?;
+    // ponytail: last writer wins a first-run race; one label may carry the loser's id, harmless.
+    let id = dir
+        .map(|dir| dir.join("machine-id"))
+        .and_then(|path| {
+            read(&path).or_else(|| {
+                crate::hub_cli::write_private(&path, &fresh).ok()?;
+                read(&path)
+            })
+        })
+        .unwrap_or(fresh);
+    Ok(format!("client-{id}-{suffix}"))
 }
 
 async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Value)> {
+    mint_named(hub, session, repo, &token_name()?).await
+}
+
+async fn mint_named(hub: &str, session: &str, repo: &str, name: &str) -> Result<(u16, Value)> {
     let client = forge_http::client().map_err(map_hub_error)?;
     call(
         &client,
@@ -806,7 +846,7 @@ async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Valu
         &format!("{hub}/v1/hub/tokens"),
         Some(session),
         Some(json!({
-            "name": token_name()?,
+            "name": name,
             "repository": repo,
             "ttl_seconds": AGENT_TOKEN_TTL,
         })),
@@ -1874,6 +1914,82 @@ mod tests {
         );
     }
 
+    /// The Hub's agent-name rule: 1-64 bytes of `[A-Za-z0-9._-]`.
+    fn valid_name(name: &str) {
+        assert!(
+            (1..=64).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn default_label_uses_a_stable_random_machine_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (
+            label_in(Some(dir.path())).unwrap(),
+            label_in(Some(dir.path())).unwrap(),
+        );
+        let id = |label: &str| label[7..label.len() - 9].to_owned();
+        assert!(a.starts_with("client-") && id(&a).len() == 16, "{a}");
+        assert_eq!(id(&a), id(&b));
+        assert_ne!(a, b);
+        let file = dir.path().join("machine-id");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), id(&a));
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&file).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn label_survives_an_unusable_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("machine-id"), "not an id\n").unwrap();
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, "x").unwrap();
+        for target in [Some(dir.path()), Some(blocked.join("sub").as_path()), None] {
+            let label = label_in(target).unwrap();
+            assert!(label.starts_with("client-"), "{label}");
+            valid_name(&label);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_machine_id_is_repaired_and_stays_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("machine-id");
+        std::fs::write(&file, "not an id\n").unwrap();
+        let label = label_in(Some(dir.path())).unwrap();
+        let repaired = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(repaired.len(), 16, "{repaired}");
+        assert!(label.contains(&repaired), "{label}");
+        assert!(label_in(Some(dir.path())).unwrap().contains(&repaired));
+    }
+
+    #[test]
+    fn machine_name_replaces_the_generated_prefix_and_stays_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("machine-name");
+        std::fs::write(&file, "  work laptop!\n").unwrap();
+        let label = label_in(Some(dir.path())).unwrap();
+        assert!(
+            label.starts_with("worklaptop-") && label.len() == 19,
+            "{label}"
+        );
+        std::fs::write(&file, format!("\"; rm -rf /\n{}", "n".repeat(500))).unwrap();
+        let label = label_in(Some(dir.path())).unwrap();
+        valid_name(&label);
+        assert!(label.starts_with("rm-rfnnnn"), "{label}");
+        std::fs::write(&file, " !! \n").unwrap();
+        assert!(label_in(Some(dir.path())).unwrap().starts_with("client-"));
+    }
+
     #[cfg(target_os = "macos")]
     fn integration_connection(agents: Vec<String>) -> Connection {
         Connection {
@@ -2033,7 +2149,8 @@ mod tests {
                 }),
             ),
         ]);
-        let (status, minted) = mint_request(&hub, "session-synthetic", "acme/widgets")
+        // Named here: `token_name` reads and writes the real config directory.
+        let (status, minted) = mint_named(&hub, "session-synthetic", "acme/widgets", "synthetic")
             .await
             .unwrap();
         assert_eq!(status, 201);

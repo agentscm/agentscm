@@ -1966,6 +1966,202 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
     assert!(responded[0].data.contains("\"via\":\"hub\""));
 }
 
+const TRANSITION: &str = "/v1/hub/session/work/transition";
+
+fn person_transition(item: &agentscm::hub::work::WorkItem, operation: &str, kind: &str) -> Value {
+    json!({"repository": REPO, "work_id": item.id, "operation_id": operation,
+        "generation": item.generation, "expected_updated_seq": item.updated_seq,
+        "transition": kind, "reason": "synthetic reason"})
+}
+
+#[tokio::test]
+async fn a_web_session_releases_or_ends_work_without_any_agent_token() {
+    let env = Env::start("github").await;
+    let (alice, bob, admin) = (
+        page(&env, ALICE).await,
+        page(&env, BOB).await,
+        page(&env, ADMIN).await,
+    );
+    let now = unix_now();
+    let start = |token: &str, key: &str, path: &str, at: i64| {
+        let mut start = work(key, &format!("{key}-session"));
+        start.scope = vec![path.into()];
+        env.store.work_start(token, &start, at).unwrap().item
+    };
+    let (lead, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let first = start(&lead, "first", "src/first.rs", now);
+    // The lead's token is gone; the owner still acts.
+    env.store.revoke_agent_token(&lead).unwrap();
+
+    // Signed out, without the page's CSRF token, and a computer's bearer session are refused.
+    let release = person_transition(&first, "rel-1", "release");
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            TRANSITION,
+            None,
+            Some(release.clone()),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, refused) = page_post(&env, &alice, false, TRANSITION, release.clone()).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (session, _, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            TRANSITION,
+            Some(&session),
+            Some(release.clone()),
+        )
+        .await;
+    assert_eq!(status, 403);
+    // Another person, even one who can read the repository, cannot touch Alice's Work.
+    let (status, refused) = page_post(&env, &bob, true, TRANSITION, release.clone()).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_work"))
+    );
+
+    // The route takes the same `reclaimed` opt-in as the agent routes.
+    assert_eq!(
+        page_post(
+            &env,
+            &alice,
+            true,
+            &format!("{TRANSITION}?reclaimed=2"),
+            release.clone()
+        )
+        .await
+        .0,
+        400
+    );
+
+    // Unknown fields and an unconnected repository are refused.
+    let mut stray = release.clone();
+    stray["session"] = json!("someone");
+    assert_eq!(
+        page_post(&env, &alice, true, TRANSITION, stray).await.0,
+        400
+    );
+    let mut elsewhere = release.clone();
+    elsewhere["repository"] = json!("acme/elsewhere");
+    assert_eq!(
+        page_post(&env, &alice, true, TRANSITION, elsewhere).await.0,
+        403
+    );
+
+    // The owner releases without a token, and an exact retry returns the same receipt.
+    let (status, done) = page_post(&env, &alice, true, TRANSITION, release.clone()).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["item"]["state"], "paused");
+    assert!(done["conflict"].is_null());
+    assert!(done.get("reclaimed").is_none(), "{done}");
+    let (status, retry) = page_post(&env, &alice, true, TRANSITION, release).await;
+    assert_eq!(status, 200, "{retry}");
+    assert_eq!(retry["receipt"]["event_seq"], done["receipt"]["event_seq"]);
+    assert_eq!(retry["receipt"]["replayed"], true);
+    let events = env.store.events_after(0, 1000).unwrap();
+    let recorded: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "work_transition")
+        .collect();
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].data.contains("\"kind\":\"owner\""));
+    assert!(recorded[0].data.contains("\"via\":\"person\""));
+    assert!(!recorded[0].data.contains(&lead));
+
+    // An administrator who is not the owner may release or abandon, never complete.
+    let (second_lead, _) = agent_for(&env, &alice.id, "codex", false);
+    let second = start(&second_lead, "second", "src/second.rs", now + 1);
+    let (status, refused) = page_post(
+        &env,
+        &admin,
+        true,
+        TRANSITION,
+        person_transition(&second, "adm-complete", "complete"),
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    let (status, released) = page_post(
+        &env,
+        &admin,
+        true,
+        TRANSITION,
+        person_transition(&second, "adm-release", "release"),
+    )
+    .await;
+    assert_eq!(status, 200, "{released}");
+    assert_eq!(released["item"]["state"], "paused");
+    // A person cannot reopen: a lead needs an agent session.
+    let third = start(&second_lead, "third", "src/third.rs", now + 2);
+    let (_, ended) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&third, "end-third", "abandon"),
+    )
+    .await;
+    assert_eq!(ended["item"]["state"], "finished");
+    let finished = env
+        .store
+        .work_get(&second_lead, &third.id, now + 3)
+        .unwrap()
+        .unwrap();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&finished, "reopen-third", "reopen"),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    // Repository access is checked on every call: no role, or read on a public repository.
+    let fourth = start(&second_lead, "fourth", "src/fourth.rs", now + 4);
+    env.drop_role(ALICE);
+    let (status, refused) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&fourth, "no-role", "release"),
+    )
+    .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+    env.set_repo(REPO, REPO_ID, "public");
+    env.role(ALICE, "read", "read", 20);
+    let (status, refused) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&fourth, "read-only", "release"),
+    )
+    .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+    env.role(ALICE, "write", "write", 30);
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        TRANSITION,
+        person_transition(&fourth, "role-back", "release"),
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
 #[tokio::test]
 async fn a_web_session_asks_and_answers_file_handoffs_only_for_its_own_agents() {
     let env = Env::start("github").await;
@@ -2445,7 +2641,10 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         json!({"total": 0, "moving": 0, "stuck": 0})
     );
     assert!(widgets["last_activity_at"].as_i64().is_some());
-    assert_eq!(widgets["complete"], true);
+    assert_eq!(
+        widgets["complete"], false,
+        "unsupported attention producers remain unknown"
+    );
     assert_eq!(body["repositories"][1]["last_activity_at"], Value::Null);
     assert_eq!(
         (&body["unchecked"], &body["complete"]),
@@ -2459,11 +2658,14 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         [
             "agents",
             "complete",
+            "coverage",
             "last_activity_at",
             "needs_you",
             "provider",
             "repository",
             "repository_id",
+            "status_counts",
+            "status_digest",
             "unfinished"
         ]
     );
@@ -2515,9 +2717,14 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     );
     assert_eq!(
         device_list["repositories"][0]["work"][0]["next_action"],
-        "Check the diff"
+        "Continue the reported work; activity is not independently observed."
     );
-    assert_eq!(device_list["repositories"][0]["work_complete"], true);
+    assert_eq!(
+        device_list["repositories"][0]["work"][0]["needs_you"],
+        false
+    );
+    assert_eq!(device_list["repositories"][0]["status_counts"]["active"], 1);
+    assert_eq!(device_list["repositories"][0]["work_complete"], false);
     assert_eq!(device_list["repositories"][0]["live_complete"], true);
     assert_eq!(
         device_list["repositories"][0]["attention_revision"],
@@ -2547,6 +2754,76 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         )
         .await;
     assert_eq!(status, 401);
+
+    // Catalog counts, recipient and next action are exactly the shared person/token projection.
+    let mut work = started["item"].clone();
+    let mut previous_marker = Value::Null;
+    for (operation, summary) in [
+        ("catalog-handover-1", "Synthetic handover"),
+        ("catalog-handover-2", "Synthetic updated handover"),
+    ] {
+        let (code, checkpoint) = env.call(&env.hub, Method::POST, "/v1/hub/standup/checkpoint", minted["token"].as_str(), Some(json!({
+            "work_id":work["id"],"operation_id":operation,"generation":work["generation"],"session":"tray-test-session", "expected_updated_seq":work["updated_seq"],"kind":"handover","summary":summary
+        }))).await;
+        assert_eq!(code, 200, "{checkpoint}");
+        work = checkpoint["item"].clone();
+        let (code, catalog) = env
+            .call(
+                &env.hub,
+                Method::GET,
+                "/v1/hub/device/repositories",
+                Some(&device),
+                None,
+            )
+            .await;
+        assert_eq!(code, 200, "{catalog}");
+        let (_, status) = env
+            .call(
+                &env.hub,
+                Method::GET,
+                "/v1/hub/standup/status",
+                minted["token"].as_str(),
+                None,
+            )
+            .await;
+        let row = catalog["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["repository"] == REPO)
+            .unwrap();
+        assert_eq!(row["status_counts"], status["counts"]);
+        assert_eq!(row["status_digest"], status["digest"]);
+        assert_eq!(row["work"][0]["state"], "awaiting_party");
+        assert_eq!(row["work"][0]["recipient"], status["work"][0]["recipient"]);
+        assert_eq!(row["work"][0]["next_action"], status["work"][0]["action"]);
+        assert_eq!(row["work"][0]["needs_you"], true);
+        assert!(row["attention_revision"].as_str().is_some());
+        assert_ne!(
+            row["attention_revision"], previous_marker,
+            "same count with changed action evidence changes attention identity"
+        );
+        previous_marker = row["attention_revision"].clone();
+        let (_, again) = env
+            .call(
+                &env.hub,
+                Method::GET,
+                "/v1/hub/device/repositories",
+                Some(&device),
+                None,
+            )
+            .await;
+        let again = again["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["repository"] == REPO)
+            .unwrap();
+        assert_eq!(
+            again["attention_revision"], previous_marker,
+            "poll time does not create new attention"
+        );
+    }
 
     // Only the web sign-in asks.
     let (status, refused) = env
