@@ -204,6 +204,7 @@ mod tests {
                 id: "gate".into(),
                 argv: vec!["true".into()],
                 timeout_secs: 30,
+                test_selection: None,
                 paths: None,
             }],
             dependency_files: None,

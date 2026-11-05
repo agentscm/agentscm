@@ -42,6 +42,7 @@ fn command(id: &str, script: &str, timeout_secs: u64) -> RecipeCommand {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         timeout_secs,
+        test_selection: None,
         paths: None,
     }
 }

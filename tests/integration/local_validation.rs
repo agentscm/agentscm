@@ -66,6 +66,7 @@ fn recipe() -> ValidationRecipe {
             id: "test".into(),
             argv: vec!["cargo".into(), "test".into()],
             timeout_secs: 60,
+            test_selection: None,
             paths: None,
         }],
         dependency_files: None,
@@ -103,6 +104,7 @@ fn record() -> ValidationRecord {
             incomplete: false,
         }],
         not_required: vec![],
+        selections: vec![],
         services: Services {
             postgres: true,
             s3: true,
@@ -141,6 +143,7 @@ struct Case {
     observed: [String; 5],
     /// Ids the changed paths require; every recipe command when unset.
     required: Option<Vec<String>>,
+    selections: Vec<CommandSelection>,
     clock: EvaluationClock,
     tamper_payload: Option<Tamper>,
     tamper_record: bool,
@@ -158,6 +161,7 @@ impl Case {
             assess_policy: None,
             observed: ["repo-1", COMMIT, TREE, "refs/heads/main", BASE].map(String::from),
             required: None,
+            selections: vec![],
             clock: EvaluationClock::Known { unix_ms: NOW },
             tamper_payload: None,
             tamper_record: false,
@@ -226,6 +230,7 @@ impl Case {
                 base_ref,
                 merge_base,
                 required: &required,
+                selections: &self.selections,
             },
             self.clock,
         );
@@ -716,6 +721,7 @@ fn select_all(bodies: &[&str], clock: EvaluationClock) -> Verdict {
             base_ref: "refs/heads/main",
             merge_base: BASE,
             required: &["test".to_owned()],
+            selections: &[],
         },
         clock,
     )
@@ -783,6 +789,7 @@ fn skipped_commands_are_never_a_pass() {
         id: "lint".into(),
         argv: vec!["cargo".into(), "clippy".into()],
         timeout_secs: 60,
+        test_selection: None,
         paths: None,
     });
     c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
@@ -1155,12 +1162,129 @@ mod scoped {
         assert!(!exempt(d.path(), &b, &h, &["docs/**"]));
     }
 
+    fn selection_recipe() -> ValidationRecipe {
+        let mut r = recipe();
+        r.commands[0].argv = ["cargo", "nextest", "run", "--locked"]
+            .map(String::from)
+            .to_vec();
+        r.commands[0].test_selection = Some(TestSelection {
+            rules: vec![
+                TestSelectionRule {
+                    path: "src/a.rs".into(),
+                    filter: "test(/^a::/)".into(),
+                },
+                TestSelectionRule {
+                    path: "README.md".into(),
+                    filter: "test(/^b::/)".into(),
+                },
+            ],
+        });
+        r
+    }
+
+    #[test]
+    fn selected_tests_are_deterministic_and_fail_closed() {
+        use agentscm::local_validation::run::command_selections;
+        let r = selection_recipe();
+        let (d, b, h) = repo(|p| {
+            write(p, "src/a.rs");
+            write(p, "README.md");
+        });
+        let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
+        assert_eq!(selected[0].reason, SelectionReason::Selected);
+        assert_eq!(selected[0].paths, ["README.md", "src/a.rs"]);
+        assert_eq!(
+            selected[0].argv.last().unwrap(),
+            "(test(/^a::/)) | (test(/^b::/))"
+        );
+        for (path, reason) in [
+            ("unknown", SelectionReason::NonModifiedPath),
+            (
+                ".github/local-validation/recipe.json",
+                SelectionReason::TrustInput,
+            ),
+        ] {
+            let (d, b, h) = repo(|p| write(p, path));
+            let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
+            assert_eq!(selected[0].reason, reason);
+            assert_eq!(selected[0].argv, r.commands[0].argv);
+        }
+        let (d, b, h) = repo(|p| {
+            std::fs::remove_file(p.join("src/a.rs")).unwrap();
+        });
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::NonModifiedPath
+        );
+        let (d, b, h) = repo(|p| {
+            std::fs::rename(p.join("src/a.rs"), p.join("new.rs")).unwrap();
+        });
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::NonModifiedPath
+        );
+    }
+
+    #[test]
+    fn selected_tests_handle_unmapped_shared_empty_and_duplicate_filters() {
+        use agentscm::local_validation::run::command_selections;
+        let mut r = selection_recipe();
+        r.commands[0]
+            .test_selection
+            .as_mut()
+            .unwrap()
+            .rules
+            .remove(1);
+        let (d, b, h) = repo(|p| write(p, "README.md"));
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::UnmappedPath
+        );
+        let (d, b, h) = repo(|_| {});
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::EmptyChange
+        );
+        r.commands[0]
+            .test_selection
+            .as_mut()
+            .unwrap()
+            .rules
+            .push(TestSelectionRule {
+                path: "Cargo.toml".into(),
+                filter: "all()".into(),
+            });
+        let (d, b, h) = repo(|p| write(p, "Cargo.toml"));
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].reason,
+            SelectionReason::SharedInput
+        );
+        r.commands[0]
+            .test_selection
+            .as_mut()
+            .unwrap()
+            .rules
+            .push(TestSelectionRule {
+                path: "README.md".into(),
+                filter: "test(/^a::/)".into(),
+            });
+        let (d, b, h) = repo(|p| {
+            write(p, "README.md");
+            write(p, "src/a.rs");
+        });
+        assert_eq!(
+            command_selections(d.path(), &b, &h, &r, &trust()).unwrap()[0].filters,
+            ["test(/^a::/)"]
+        );
+    }
+
     fn scoped_recipe() -> ValidationRecipe {
         let mut r = recipe();
         let command = |id: &str, paths: Option<&[&str]>| RecipeCommand {
             id: id.into(),
             argv: vec!["true".into()],
             timeout_secs: 1,
+            test_selection: None,
             paths: paths.map(|p| p.iter().map(|s| (*s).to_owned()).collect()),
         };
         r.commands = vec![
@@ -1314,6 +1438,7 @@ fn scoped(required: &[&str], not_required: &[&str]) -> Case {
         id: "lint".into(),
         argv: vec!["cargo".into(), "clippy".into()],
         timeout_secs: 60,
+        test_selection: None,
         paths: Some(vec!["src".into()]),
     });
     c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
@@ -1475,6 +1600,7 @@ fn select_with(
             base_ref: "refs/heads/main",
             merge_base: BASE,
             required: &["test".to_owned()],
+            selections: &[],
         },
         clock,
     )
@@ -1823,6 +1949,7 @@ fn cmd(id: &str, paths: Option<&[&str]>) -> RecipeCommand {
         id: id.into(),
         argv: vec!["run".into(), id.into()],
         timeout_secs: 60,
+        test_selection: None,
         paths: paths.map(|p| p.iter().map(|s| (*s).to_owned()).collect()),
     }
 }
@@ -2064,5 +2191,69 @@ fn constituent_declarations_are_validated() {
     assert_eq!(
         (verdict.state, verdict.outcome, verdict.reason),
         (VerdictState::Error, Outcome::Error, "policy invalid")
+    );
+}
+
+#[test]
+fn selected_evidence_requires_independent_selection_and_exact_argv() {
+    let selected_case = || {
+        let mut c = Case::new();
+        c.recipe.commands[0].argv = ["cargo", "nextest", "run", "--locked"]
+            .map(String::from)
+            .to_vec();
+        c.recipe.commands[0].test_selection = Some(TestSelection {
+            rules: vec![TestSelectionRule {
+                path: "tests/a.rs".into(),
+                filter: "test(/^a::/)".into(),
+            }],
+        });
+        c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
+        c.record.recipe_sha256 = c.policy.recipe_sha256.clone();
+        let mut argv = c.recipe.commands[0].argv.clone();
+        argv.extend(["-E".into(), "(test(/^a::/))".into()]);
+        c.record.results[0].argv = argv.clone();
+        c.record.selections = vec![CommandSelection {
+            command_id: "test".into(),
+            reason: SelectionReason::Selected,
+            paths: vec!["tests/a.rs".into()],
+            filters: vec!["test(/^a::/)".into()],
+            argv,
+        }];
+        c.selections = c.record.selections.clone();
+        c
+    };
+    assert_eq!(selected_case().run().state, VerdictState::Success);
+    let mut changed = selected_case();
+    changed.record.selections[0].reason = SelectionReason::UnmappedPath;
+    assert_eq!(changed.run().reason, "selection mismatch");
+    let mut changed = selected_case();
+    changed.record.results[0].argv = vec!["true".into()];
+    assert_ne!(changed.run().state, VerdictState::Success);
+    let mut changed = selected_case();
+    changed.record.selections[0].paths.push("forged.rs".into());
+    assert_eq!(changed.run().reason, "selection mismatch");
+
+    let mut c = Case::new();
+    c.record.selections = vec![CommandSelection {
+        command_id: "test".into(),
+        reason: SelectionReason::Selected,
+        paths: vec![],
+        filters: vec![],
+        argv: vec!["true".into()],
+    }];
+    assert_eq!(c.run().reason, "selection mismatch");
+}
+
+#[test]
+fn absent_selection_preserves_legacy_serialization() {
+    assert!(
+        !String::from_utf8(serde_json::to_vec(&recipe()).unwrap())
+            .unwrap()
+            .contains("test_selection")
+    );
+    assert!(
+        !String::from_utf8(record().to_bytes().unwrap())
+            .unwrap()
+            .contains("selections")
     );
 }

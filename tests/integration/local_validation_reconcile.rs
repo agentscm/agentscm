@@ -58,6 +58,7 @@ impl Env {
                 id: "gate".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
                 timeout_secs: 30,
+                test_selection: None,
                 paths: None,
             }],
             None,
@@ -81,6 +82,7 @@ impl Env {
                 id: "gate".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
                 timeout_secs: 30,
+                test_selection: None,
                 paths: None,
             }],
             None,
@@ -952,6 +954,7 @@ async fn a_bun_shaped_recipe_without_services_produces_posts_and_reconciles() {
             id: "bun-test".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "test -f bun.lock".into()],
             timeout_secs: 30,
+            test_selection: None,
             paths: None,
         }],
         Some(vec!["bun.lock".into()]),
@@ -1387,6 +1390,7 @@ async fn an_attestation_listing_a_path_scoped_command_as_not_required_passes() {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
         timeout_secs: 30,
+        test_selection: None,
         paths,
     };
     let env = Env::with_recipe(
@@ -1453,6 +1457,7 @@ fn sh(id: &str, script: &str) -> RecipeCommand {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         timeout_secs: 30,
+        test_selection: None,
         paths: None,
     }
 }
