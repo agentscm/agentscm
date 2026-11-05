@@ -269,7 +269,8 @@ impl Context<'_> {
     /// Association visibility depends on the API viewer. An otherwise unrecognized author
     /// can opt in only with fresh, currently trusted signed evidence for this repository,
     /// head and base. The record's tree and merge-base are used here only for discovery;
-    /// `verdict` still fetches Git and independently checks every source binding. Evidence
+    /// The signed selection is likewise only a discovery hint here; `verdict` fetches Git
+    /// and independently recomputes every selection and source binding. Evidence
     /// from such an author that is authentic for this check but revoked, stale or expired is
     /// returned separately as a hint: it never opts a head in or joins the fingerprint, and
     /// `select` still verifies it fully before it can choose a pending reason.
@@ -308,6 +309,7 @@ impl Context<'_> {
                     base_ref: &pull.base,
                     merge_base: &record.context.merge_base,
                     required: &required,
+                    selections: &record.selections,
                 },
                 now,
             );
@@ -512,6 +514,16 @@ impl Context<'_> {
             Ok(required) => required,
             Err(error) => return Err(format!("{error:?}")),
         };
+        let selections = tokio::task::block_in_place(|| {
+            super::run::command_selections(
+                self.git_repo,
+                &git.merge_base,
+                &git.commit,
+                self.recipe,
+                &trust,
+            )
+        })
+        .map_err(|e| format!("{e:?}"))?;
         let bodies: Vec<&str> = c
             .bodies
             .iter()
@@ -530,6 +542,7 @@ impl Context<'_> {
                 base_ref: self.base,
                 merge_base: &git.merge_base,
                 required: &required,
+                selections: &selections,
             },
             clock,
         );
