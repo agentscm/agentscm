@@ -2,12 +2,21 @@
 # End-to-end test of the hub containers: two agents on two "machines" and one warning.
 # Usage: .github/hub-e2e.sh default|postgres|local-release EVIDENCE_DIR
 # local-release qualifies locally built images, not published release artifacts.
-# Needs Docker and curl; builds the images, starts a uniquely named compose project and
+# Needs Docker, curl and Python 3; builds the images, starts a uniquely named compose project and
 # removes it, volumes included, on exit. Single profiles use port 7332; local-release
 # uses ephemeral loopback ports and requires Compose support for !override (2.24.4+).
 set -euo pipefail
 profile=${1:?usage: hub-e2e.sh default|postgres|local-release EVIDENCE_DIR}
 cd "$(dirname "$0")/.."
+
+# Shared stage budget; cleanup uses its own bounded allowance after a failure.
+stage_started=$SECONDS
+bounded() {
+  python3 .github/hub-e2e-timeout.py "$((2400 - SECONDS + stage_started))" "$@"
+}
+timeout_status() {
+  if grep -q '^TIMEOUT:' "$1"; then printf 'timeout\n'; else printf 'fail\n'; fi
+}
 
 local_release() (
   local evidence candidate tree context runtime seed image role stage result=0
@@ -46,11 +55,11 @@ local_release() (
     for role in runtime seed; do
       stage=runtime
       [ "$role" != seed ] || stage=e2e-seed
-      docker build --target "$stage" --build-arg "AGENTSCM_BUILD_COMMIT=$candidate" --iidfile "$evidence/$role.iid" "$context" || exit 1
+      bounded docker build --target "$stage" --build-arg "AGENTSCM_BUILD_COMMIT=$candidate" --iidfile "$evidence/$role.iid" "$context" || exit 1
       image=$(cat "$evidence/$role.iid") || exit 1
       [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
-      [ "$(docker image inspect --format '{{.Id}}' "$image")" = "$image" ] || exit 1
-      docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image" >"$evidence/$role.platform" || exit 1
+      [ "$(bounded docker image inspect --format '{{.Id}}' "$image")" = "$image" ] || exit 1
+      bounded docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image" >"$evidence/$role.platform" || exit 1
       grep -Eq '^[a-z0-9]+/[a-z0-9]+$' "$evidence/$role.platform" || exit 1
     done
   ) >"$evidence/build.log" 2>&1; then
@@ -58,7 +67,7 @@ local_release() (
     printf 'pass\n' >"$evidence/build.status"
   else
     date -u +%Y-%m-%dT%H:%M:%SZ >"$evidence/build.finished_utc"
-    printf 'fail\n' >"$evidence/build.status"
+    timeout_status "$evidence/build.log" >"$evidence/build.status"
     return 1
   fi
   runtime=$(cat "$evidence/runtime.iid")
@@ -100,7 +109,7 @@ EOF
       grep -Eq "^PASS \[$stage [0-9]+s\] all steps$" "$evidence/$stage.log"; then
       printf 'pass\n' >"$evidence/$stage.status"
     else
-      printf 'fail\n' >"$evidence/$stage.status"
+      timeout_status "$evidence/$stage.log" >"$evidence/$stage.status"
       result=1
     fi
     date -u +%Y-%m-%dT%H:%M:%SZ >"$evidence/$stage.finished_utc"
@@ -135,7 +144,7 @@ dc() {
   else
     set -- --profile "$profile" "$@"
   fi
-  docker compose -p "$project" -f compose.hub.yaml -f .github/compose.e2e.yaml "$@"
+  bounded docker compose -p "$project" -f compose.hub.yaml -f .github/compose.e2e.yaml "$@"
 }
 health_url=http://127.0.0.1:7332/v1/hub/health
 refresh_endpoint() {
@@ -148,13 +157,16 @@ refresh_endpoint() {
 }
 cleanup() {
   status=$?
+  # Give diagnostics and teardown separate allowances even after stage timeout.
+  stage_started=$((SECONDS - 2370))
   if [ "$status" -ne 0 ]; then
     echo "FAIL ($profile)" >&2
     dc logs --no-color >&2 || true
   fi
-  if ! dc down -v --remove-orphans >/dev/null 2>&1; then
+  stage_started=$((SECONDS - 2370))
+  if ! dc down -v --remove-orphans >/dev/null; then
     if [ -n "${AGENTSCM_E2E_OVERRIDE:-}" ]; then
-      echo "FAIL ($profile): compose cleanup failed" >&2
+      echo "FAIL ($profile): compose cleanup failed for $project" >&2
       status=1
     fi
   fi
@@ -166,7 +178,11 @@ trap cleanup EXIT
 pass() { echo "PASS [$profile ${SECONDS}s] $1"; }
 wait_healthy() {
   for _ in $(seq 60); do
-    if curl -fsS "$health_url" 2>/dev/null | grep -q '"status":"ok"'; then return 0; fi
+    if [ "$((SECONDS - stage_started))" -ge 2400 ]; then
+      echo 'TIMEOUT: qualification health deadline exhausted' >&2
+      return 124
+    fi
+    if curl --connect-timeout 2 --max-time 5 -fsS "$health_url" 2>/dev/null | grep -q '"status":"ok"'; then return 0; fi
     sleep 1
   done
   echo "hub did not become healthy" >&2
@@ -210,6 +226,7 @@ assert_warned "$out"
 pass "agent B was warned about agent A"
 
 dc restart "${up[@]}"
+refresh_endpoint
 wait_healthy
 out=$(check_b sb2)
 assert_warned "$out"
@@ -220,7 +237,7 @@ if [ "$profile" = default ]; then
   dc stop "$hub"
   dc run --rm -T --no-deps --entrypoint tar "$hub" -C /data -czf - . >"$work/hub.tgz"
   dc rm -sf "$hub"
-  docker volume rm "${project}_hub-data" >/dev/null
+  bounded docker volume rm "${project}_hub-data" >/dev/null
   dc run --rm -T --no-deps --entrypoint tar "$hub" -C /data -xzf - <"$work/hub.tgz"
   dc up --no-build -d "$hub"
   refresh_endpoint

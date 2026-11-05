@@ -154,7 +154,7 @@ Advancing the base branch tip does not invalidate it; only the merge-base is bou
 
 ## Coverage omissions
 
-A command skipped by `paths` is listed as `not required: <id>`. Missing PostgreSQL or S3 adds a service omission only when the policy requires that service. Comments preserve all signed omissions, including service omissions in historical attestations, regardless of current policy. Every attestation records these as not covered: ignored tests, Windows, container smoke, hub end-to-end and live execution. Hosted CI remains the way to get platform and runtime coverage; request it as described above.
+A command skipped by `paths` is listed as `not required: <id>`. Missing PostgreSQL or S3 adds a service omission only when the policy requires that service. Comments preserve all signed omissions, including service omissions in historical attestations, regardless of current policy. Every attestation records these as not covered: ignored tests, Windows, container smoke, hub end-to-end and live execution. Hosted CI provides the platform and runtime coverage described above. Hub end-to-end coverage is a separate local release-only gate: run `.github/hub-e2e.sh local-release EVIDENCE_DIR` on the clean committed candidate and retain both profile results as described in [releasing](../releasing.md#local-hub-release-qualification).
 
 ## Not done
 

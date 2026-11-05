@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory(prefix='hub-e2e-test-') as temporary:
     repo.mkdir()
     (repo / '.github').mkdir()
     shutil.copy(script, repo / '.github/hub-e2e.sh')
+    shutil.copy(script.with_name('hub-e2e-timeout.py'), repo / '.github/hub-e2e-timeout.py')
     for name in ['compose.hub.yaml', '.github/compose.e2e.yaml', 'Dockerfile']:
         (repo / name).write_text('# synthetic fixture\n')
     def git(*args):
@@ -54,8 +55,14 @@ elif args[0] == 'compose':
         assert '--env-file' in args and args[args.index('--env-file') + 1] == '/dev/null'
         assert not any(k.startswith('AGENTSCM_GITHUB') or k.startswith('AGENTSCM_GITLAB') for k in os.environ)
         if 'build' in args: raise AssertionError('profile rebuilt image')
+    if 'up' in args and mode == profile + '-timeout':
+        print('TIMEOUT: synthetic stage deadline', file=sys.stderr)
+        sys.exit(124)
     if 'up' in args and mode == profile + '-fail': sys.exit(1)
     if 'down' in args and mode == profile + '-cleanup-fail': sys.exit(1)
+    if 'restart' in args and mode != 'legacy':
+        portfile = root / 'port'
+        portfile.write_text(str(int(portfile.read_text()) + 1))
     if 'port' in args:
         portfile = root / 'port'
         port = int(portfile.read_text()) + 1 if portfile.exists() else 49999
@@ -119,6 +126,34 @@ print('{"status":"ok"}')
         evidence, calls = run(mode, False)
         assert (evidence / 'result').read_text() == 'fail\n'
         assert any(c[0] == 'compose' and c[c.index('--profile') + 1] == 'postgres' for c in calls)
+    evidence, calls = run('default-timeout', False)
+    assert (evidence / 'default.status').read_text() == 'timeout\n'
+    assert (evidence / 'postgres.status').read_text() == 'pass\n'
+    assert any(c[0] == 'compose' and 'down' in c and 'default' in c for c in calls)
+    # Exercise the real deadline runner, including a grandchild ignoring TERM.
+    child_pid = root / 'hanging-child.pid'
+    hanging = root / 'hanging.py'
+    hanging.write_text('''import os, pathlib, signal, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])
+pathlib.Path(sys.argv[1]).write_text(str(child.pid))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(60)
+''')
+    started = time.monotonic()
+    timed = subprocess.run(['python3', str(script.with_name('hub-e2e-timeout.py')), '0.5',
+                            'python3', str(hanging), str(child_pid)],
+                           text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    assert timed.returncode == 124 and 'TIMEOUT:' in timed.stderr
+    assert time.monotonic() - started < 5 and child_pid.exists()
+    # A killed orphan can briefly remain a zombie; it must not be running.
+    deadline = time.monotonic() + 1
+    while True:
+        state = subprocess.run(['ps', '-o', 'stat=', '-p', child_pid.read_text()],
+                               text=True, stdout=subprocess.PIPE).stdout.strip()
+        if not state or state.startswith('Z'):
+            break
+        assert time.monotonic() < deadline, state
+        time.sleep(.01)
     (repo / 'dirty').write_text('synthetic change\n')
     evidence, calls = run('dirty', False)
     assert not calls and not evidence.exists()
@@ -146,5 +181,5 @@ print('{"status":"ok"}')
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
-    print('PASS synthetic Hub release orchestration (14 scenarios)')
+    print('PASS synthetic Hub release orchestration (16 scenarios)')
 PY

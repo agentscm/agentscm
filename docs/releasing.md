@@ -24,13 +24,15 @@ Committing the workflow does not install the app, provision its key, approve ins
 
 Hub container end-to-end is a local release-only gate. It has no hosted PR, nightly or manual-dispatch workflow and is outside the routine signed validation recipe. A successful PR check, attestation or release dispatch does not imply that it ran. Before merging or tagging, require successful retained evidence for both `default` (SQLite) and `postgres` (PostgreSQL/S3) profiles on the exact release candidate. Missing, incomplete, failed or stale evidence blocks release readiness; rerun after candidate source changes.
 
-Use a clean checkout of the committed candidate, Docker with a running daemon, curl, and Docker Compose 2.24.4 or newer with `!override` support. Choose a new evidence directory outside the checkout whose parent already exists:
+Use a clean checkout of the committed candidate, Python 3, Docker with a running daemon, curl, and Docker Compose 2.24.4 or newer with `!override` support. Choose a new evidence directory outside the checkout whose parent already exists:
 
 ```sh
 .github/hub-e2e.sh local-release /path/outside/checkout/new-candidate-evidence
 ```
 
 The command refuses dirty candidates and existing evidence directories. It archives the committed source, builds runtime and test-seeder images once, records their immutable IDs and platforms, and runs both profiles with those exact images, unique Compose projects and ephemeral loopback ports. It removes the test projects and volumes, preserving existing Hubs. Retain the external evidence directory: `source` binds the commit and tree; `runtime.iid`, `seed.iid` and the platform files identify the images; `build.status`, `default.status`, `postgres.status`, their logs and timestamps, and `result` record the outcome. Require all three statuses and `result` to be `pass`, inspect the logs and source binding, and retain the evidence with the release qualification record. The directory is local evidence, not a signed attestation or independent proof of execution; do not commit raw evidence or credentials.
+
+The build and each profile have separate 40-minute command budgets. Docker commands and their child processes are terminated on timeout; health requests have a 2-second connection and 5-second total limit. Diagnostics and Compose teardown each receive a separate 30-second allowance, and the PostgreSQL profile is still attempted after a SQLite failure or timeout. A timed-out stage records `timeout` and cannot qualify the release; interrupted execution retains incomplete evidence. If Docker cannot complete teardown within its allowance, inspect and remove the named test project manually before rerunning.
 
 This qualifies locally built candidate images on the recorded platform only. It does not qualify published GHCR/npm artifacts, other architectures or public acquisition. Preserve the separate native-hardware, artifact, checksum and provenance requirements below.
 
