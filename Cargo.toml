@@ -37,6 +37,9 @@ toml_edit = "=0.25.17"
 semver = "=1.0.28"
 tempfile = "=3.25.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_Threading"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "=0.30.13", default-features = false }
 tray-icon = { version = "=0.26.1", default-features = false }
