@@ -36,6 +36,10 @@ pub struct CollisionsArgs {
     /// Also scan branches whose changes the default branch already has (squash or rebase merged).
     #[arg(long)]
     include_merged: bool,
+    /// Also check each branch against the base and suggest the merge order that needs the
+    /// fewest new heads.
+    #[arg(long)]
+    merge_order: bool,
     /// Print the full JSON report. This is the default when stdout is not a terminal.
     #[arg(long, conflicts_with = "text")]
     json: bool,
@@ -56,6 +60,7 @@ pub fn run(args: CollisionsArgs) -> Result<()> {
         include_merged: args.include_merged,
         deadline: None,
         max_bytes: None,
+        merge_order: args.merge_order,
     });
     let report = match report {
         Ok(report) => report,
@@ -127,6 +132,62 @@ fn pair_lines(out: &mut String, pairs: &[&Value]) {
     }
 }
 
+/// Up to `max` names from a JSON list, then how many more.
+fn names(list: &Value, max: usize) -> String {
+    let list = list.as_array().map_or(&[][..], Vec::as_slice);
+    let mut text = list
+        .iter()
+        .take(max)
+        .map(name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if list.len() > max {
+        let _ = write!(text, " (+{} more)", list.len() - max);
+    }
+    text
+}
+
+fn order_lines(out: &mut String, order: &Value, base: &str) {
+    if order["complete"] != true {
+        let _ = writeln!(out, "\nNo merge order: {}.", name(&order["reason"]));
+        return;
+    }
+    let later = order["new_head_first"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if later.is_empty() {
+        out.push_str(
+            "\nMerge order: any. No merge is predicted to make another branch conflict.\n",
+        );
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "\nMerge order ({} a new head):",
+        count(later.len(), "branch needs", "branches need")
+    );
+    let first = names(&order["merge_first"], MAX_PAIRS);
+    if !first.is_empty() {
+        let _ = writeln!(out, "  First, in any order: {first}");
+    }
+    out.push_str("  Then, one at a time, update from the base and merge:\n");
+    for entry in later.iter().take(MAX_PAIRS) {
+        let mut why = Vec::new();
+        let paths = names(&entry["base_conflicted_paths"], MAX_PATHS);
+        if !paths.is_empty() {
+            why.push(format!("conflicts with {base} in {paths}"));
+        }
+        let with = names(&entry["conflicts_with"], MAX_PATHS);
+        if !with.is_empty() {
+            why.push(format!("conflicts with {with}"));
+        }
+        let _ = writeln!(out, "    {}   {}", name(&entry["id"]), why.join("; "));
+    }
+    if later.len() > MAX_PAIRS {
+        let _ = writeln!(out, "    ... and {} more", later.len() - MAX_PAIRS);
+    }
+}
+
 fn render(report: &Value, worktrees: bool) -> String {
     let all: Vec<&Value> = report["collisions"]
         .as_array()
@@ -166,6 +227,13 @@ fn render(report: &Value, worktrees: bool) -> String {
             let _ = writeln!(out, "\n{title}");
             pair_lines(&mut out, pairs);
         }
+    }
+    if report["merge_order"].is_object() {
+        order_lines(
+            &mut out,
+            &report["merge_order"],
+            &name(&report["base"]["name"]),
+        );
     }
 
     // Counts only the shared paths listed per pair, which the report caps.
@@ -285,6 +353,26 @@ mod tests {
         r["merged_refs_excluded"] = json!(1);
         assert!(render(&r, false).contains("1 branch skipped: already merged"));
         assert!(!render(&report(vec![]), false).contains("already merged"));
+    }
+
+    #[test]
+    fn renders_merge_order_or_why_there_is_none() {
+        let mut r = report(vec![]);
+        r["merge_order"] = json!({"complete": true, "merge_first": ["a"], "new_head_first": [
+            {"id": "b", "conflicts_with": ["a", "c", "d", "e"], "base_conflicted_paths": []},
+            {"id": "c\x1b[2J", "conflicts_with": ["b"], "base_conflicted_paths": ["h"]}]});
+        let text = render(&r, false);
+        assert!(
+            text.contains(
+                "Merge order (2 branches need a new head):\n  First, in any order: a\n  Then, one at a time, update from the base and merge:\n    b   conflicts with a, c, d (+1 more)\n    c[2J   conflicts with origin/main in h; conflicts with b\n"
+            ),
+            "{text}"
+        );
+        r["merge_order"] = json!({"complete": true, "merge_first": ["a"], "new_head_first": []});
+        assert!(render(&r, false).contains("\nMerge order: any."));
+        r["merge_order"] = json!({"complete": false, "reason": "the scan stopped early"});
+        assert!(render(&r, false).contains("\nNo merge order: the scan stopped early.\n"));
+        assert!(!render(&report(vec![]), false).contains("erge order"));
     }
 
     #[test]

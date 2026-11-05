@@ -1,1 +1,1 @@
-{"repository":"github.com/agentscm/agentscm","recipe_sha256":"15bb5b011dd1abf9de64a277271d3f452589a0bf51bad556e7e1e6c7499eb83c","required_services":{"postgres":true,"s3":true},"max_age_seconds":2592000,"epoch":1}
+{"repository":"github.com/agentscm/agentscm","recipe_sha256":"e0d6b6b2dfd0350c7a0b1a745d4901248a9a8441a09f3cc9335f81c4369657cc","required_services":{"postgres":true,"s3":true},"max_age_seconds":2592000,"epoch":1}
