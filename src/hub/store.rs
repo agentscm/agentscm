@@ -723,7 +723,19 @@ pub trait Store: Send + Sync {
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>>;
     /// The highest event `seq`, or 0 with no events.
     fn latest_event_seq(&self) -> Result<i64>;
-    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
+    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        self.work_start_named(token, start, true, now)
+    }
+    /// `work_start`, where `named` is false when the caller named no session and `start.session`
+    /// is the one the Hub resolved for it. That session is not the call's own, so such a start
+    /// never holds its lapsed scope again.
+    fn work_start_named(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        named: bool,
+        now: i64,
+    ) -> Result<WorkStartResult>;
     /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
     fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
     fn work_checkpoint(

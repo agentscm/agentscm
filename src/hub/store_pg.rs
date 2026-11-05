@@ -113,7 +113,7 @@ use super::work::{
 };
 use super::work_lifecycle::{
     CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
-    RENEW_INTERVAL_SECONDS, RenewalCoverage, lapsed_refusal_text, lapsed_unheld_text,
+    RENEW_INTERVAL_SECONDS, RenewalCoverage, Unheld, lapsed_refusal_text, lapsed_unheld_text,
     lease_seconds, operational_page, reclaimed_hold,
 };
 use super::work_links::{
@@ -3894,10 +3894,12 @@ fn coordination_page(
     })
 }
 
+/// `named` is false when the caller named no session and `start.session` was resolved for it.
 fn start_in(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
     start: &WorkStart,
+    named: bool,
     now: i64,
 ) -> Result<WorkStartResult> {
     if who.read_only {
@@ -4045,9 +4047,20 @@ fn start_in(
             } else {
                 Vec::new()
             };
-            // The lead asking again for its own lapsed Work is a fresh admission.
+            // The lead asking again for its own lapsed Work is a fresh admission. A call that named
+            // no session is not the lead's own, so it cannot hold the scope again.
             let mut reclaimed = Vec::new();
-            if overlaps.is_empty() && lease_lapsed(tx, &item.id, now)? {
+            if overlaps.is_empty()
+                && let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)?
+            {
+                if !named {
+                    return Err(HubError::Invalid(lapsed_unheld_text(
+                        &item.id,
+                        renewed,
+                        expired,
+                        Unheld::UnnamedStart,
+                    )));
+                }
                 let lapsed = lapsed_overlapping(tx, who, &item.scope, Some(&item.id), now)?;
                 set_work_reservation(tx, &item.id, None, Some("admitted"), now)?;
                 reclaimed = lapse_reservations(tx, who, &lapsed, &item.id, now)?;
@@ -5425,7 +5438,7 @@ fn guard_managed_touch(
             &eligible[0].id,
             renewed,
             expired,
-            false,
+            Unheld::Edit,
         )));
     }
     Ok(())
@@ -9346,7 +9359,13 @@ impl Store for PgStore {
             &coverage_name(status.state),&status.checked_at,&(status.unread_pages as i64),&(status.deferred as i64),&status.window_from])?;Ok(())})
     }
 
-    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+    fn work_start_named(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        named: bool,
+        now: i64,
+    ) -> Result<WorkStartResult> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
@@ -9381,14 +9400,14 @@ impl Store for PgStore {
             let scope = start.validate(&who)?;
             let preflight = preflight::evaluate(&mut tx, &who, start, &scope, now)?;
             if super::work_preflight::coordinates_active_scope_overlap(start, &preflight) {
-                let mut result = start_in(&mut tx, &who, start, now)?;
+                let mut result = start_in(&mut tx, &who, start, named, now)?;
                 super::work_preflight::require_overlap_coordination(&result, &preflight)?;
                 result.preflight = Some(preflight);
                 tx.commit()?;
                 return Ok(result);
             }
             require_clear_preflight(&who, start, &preflight)?;
-            let mut result = start_in(&mut tx, &who, start, now)?;
+            let mut result = start_in(&mut tx, &who, start, named, now)?;
             result.preflight = Some(preflight);
             tx.commit()?;
             Ok(result)
@@ -9486,7 +9505,7 @@ impl Store for PgStore {
             created.request_key = Some(new_id("req")?);
             let preflight = preflight::evaluate(&mut tx, &who, &created, &planned_scope, now)?;
             require_clear_preflight(&who, start, &preflight)?;
-            let mut result = start_in(&mut tx, &who, &created, now)?;
+            let mut result = start_in(&mut tx, &who, &created, true, now)?;
             result.preflight = Some(preflight);
             tx.commit()?;
             Ok(result)
@@ -9870,7 +9889,7 @@ impl Store for PgStore {
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {
-                return Err(HubError::Invalid(lapsed_unheld_text(&item.id, renewed, expired, true)));
+                return Err(HubError::Invalid(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
             }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;

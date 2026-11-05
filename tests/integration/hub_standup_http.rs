@@ -767,6 +767,81 @@ fn operational_projection_is_opt_in_on_postgres() {
     });
 }
 
+/// The lapsed holds a start took are opt-in too, so a strict older client decodes the reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaimed_holds_are_opt_in_over_http() {
+    let hub = Hub::start(None).await;
+    let (_, lead) = hub.token(1, "acme/widgets", false).await;
+    let (_, other) = hub.token(2, "acme/widgets", false).await;
+    let db = rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap();
+    // The lead holds two scopes, and both leases lapse.
+    let mut held = Vec::new();
+    for (key, session, path) in [("a", "s-a", "src/a.rs"), ("b", "s-b", "src/b.rs")] {
+        let body = json!({"request_key": key, "title": "Billing rounding", "session": session,
+            "scope": [path], "branch": format!("feat/{key}"), "next_action": "Continue"});
+        let (status, started) = hub
+            .call(Method::POST, "/v1/hub/standup/start", &lead, Some(body))
+            .await;
+        assert_eq!(status, 200, "{started}");
+        held.push(started["item"]["id"].as_str().unwrap().to_owned());
+    }
+    let now = agentscm::hub::store::unix_now();
+    db.execute(
+        "UPDATE hub_work_items SET reservation_renewed_at = ?1, reservation_expires_at = ?2",
+        rusqlite::params![now - 1300, now - 100],
+    )
+    .unwrap();
+    let store = hub.store.clone();
+    tokio::task::spawn_blocking(move || store.observe_lease_clock(now).unwrap())
+        .await
+        .unwrap();
+    let take = |key: &str, path: &str| {
+        json!({"request_key": key, "title": "Take it", "session": format!("s-{key}"),
+            "scope": [path], "next_action": "Continue"})
+    };
+    let (status, bad) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start?reclaimed=2",
+            &other,
+            Some(take("x", "src/a.rs")),
+        )
+        .await;
+    assert_eq!(status, 400, "{bad}");
+    // Without the flag the reply has no new key.
+    let (status, plain) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start",
+            &other,
+            Some(take("c", "src/a.rs")),
+        )
+        .await;
+    assert_eq!(status, 200, "{plain}");
+    assert_eq!(plain["created"], true, "{plain}");
+    assert!(plain.get("reclaimed").is_none(), "{plain}");
+    // With it, the start says whose hold it took and that its branch may hold unpushed edits.
+    let (status, rich) = hub
+        .call(
+            Method::POST,
+            "/v1/hub/standup/start?reclaimed=1",
+            &other,
+            Some(take("d", "src/b.rs")),
+        )
+        .await;
+    assert_eq!(status, 200, "{rich}");
+    assert_eq!(rich["reclaimed"][0]["work_id"], held[1].as_str(), "{rich}");
+    assert_eq!(rich["reclaimed"][0]["branch"], "feat/b", "{rich}");
+    assert!(
+        rich["reclaimed"][0]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("never pushed"),
+        "{rich}"
+    );
+    serde_json::from_value::<WorkStartResult>(rich).unwrap();
+}
+
 fn transition(item: &Value, operation: &str, kind: &str) -> Value {
     json!({"work_id": item["id"], "operation_id": operation, "generation": item["generation"],
         "expected_updated_seq": item["updated_seq"], "session": "s-a", "transition": kind,

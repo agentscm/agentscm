@@ -194,6 +194,26 @@ impl OperationalFlag {
     }
 }
 
+/// `?reclaimed=1` asks for the lapsed holds an admission took the scope of, in `reclaimed`.
+/// Without it the response has no `reclaimed` key, so a strict older client decodes it unchanged,
+/// and an older Hub ignores the parameter.
+#[derive(serde::Deserialize)]
+struct ReclaimedFlag {
+    reclaimed: Option<u8>,
+}
+
+impl ReclaimedFlag {
+    fn requested(
+        flag: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
+    ) -> Result<bool, ApiError> {
+        match flag.map_err(|_| ApiError::invalid())?.0.reclaimed {
+            None | Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(_) => Err(ApiError::invalid()),
+        }
+    }
+}
+
 /// The operational projection of the Work that overlaps, for a conflict or a preflight.
 pub(super) fn operational_for_overlaps(
     store: &dyn super::Store,
@@ -273,9 +293,11 @@ async fn work_transition(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
     flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
+    reclaimed: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkTransitionRequest>,
 ) -> Result<Json<WorkTransitionResult>, ApiError> {
     let operational = flag.map_err(|_| ApiError::invalid())?.0.requested()?;
+    let reclaimed = ReclaimedFlag::requested(reclaimed)?;
     let store = state.store.clone();
     let result = blocking(&state, move || {
         let now = unix_now();
@@ -289,6 +311,9 @@ async fn work_transition(
         if operational && let Some(conflict) = &mut result.conflict {
             conflict.operational =
                 operational_for_overlaps(&*store, &principal.token_id, &conflict.overlaps, now)?;
+        }
+        if !reclaimed {
+            result.reclaimed.clear();
         }
         Ok(result)
     })
@@ -517,6 +542,7 @@ async fn start(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
     flag: std::result::Result<Query<OperationalFlag>, QueryRejection>,
+    reclaimed: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkStart>,
 ) -> Response {
     let operational = match flag
@@ -524,6 +550,10 @@ async fn start(
         .and_then(|f| f.0.requested())
     {
         Ok(operational) => operational,
+        Err(error) => return error.into_response(),
+    };
+    let reclaimed = match ReclaimedFlag::requested(reclaimed) {
+        Ok(reclaimed) => reclaimed,
         Err(error) => return error.into_response(),
     };
     let store = state.store.clone();
@@ -534,6 +564,9 @@ async fn start(
             let mut result = store.work_start(&principal.token_id, &request, now)?;
             super::coordination_http::CHANGED.notify_waiters();
             result.context = Some(context);
+            if !reclaimed {
+                result.reclaimed.clear();
+            }
             if operational && let Some(conflict) = &mut result.conflict {
                 conflict.operational = operational_for_overlaps(
                     &*store,
@@ -564,14 +597,19 @@ async fn checkpoint(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
     headers: HeaderMap,
+    reclaimed: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
     JsonBody(request): JsonBody<WorkCheckpoint>,
 ) -> Result<Json<WorkCheckpointResult>, Response> {
+    let reclaimed = ReclaimedFlag::requested(reclaimed).map_err(IntoResponse::into_response)?;
     let store = state.store.clone();
     let completion =
         super::insights::completion_enabled(&headers) && request.kind == CheckpointKind::Finish;
     let result = blocking(&state, move || {
         let now = unix_now();
-        let result = store.work_checkpoint(&principal.token_id, &request, now)?;
+        let mut result = store.work_checkpoint(&principal.token_id, &request, now)?;
+        if !reclaimed {
+            result.reclaimed.clear();
+        }
         if completion
             && result.item.generation == request.generation
             && result.item.state == WorkState::Finished

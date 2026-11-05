@@ -242,7 +242,9 @@ user-facing recovery. The UI only renders the new event kind in history.
   `retained`, 20 minutes for the others. The clock row starts then too. A second migration adds the
   session columns for tool activity and running shell calls; existing sessions start with none.
 - Older clients decode all existing responses unchanged and read `abandoned` and `superseded` Work
-  as `finished`. They do not see the optional `operational` fields unless they ask for them.
+  as `finished`. They do not see the optional `operational` fields unless they ask for them, nor
+  the `reclaimed` list of a start, checkpoint or transition unless the request has
+  `?reclaimed=1`, which the current CLI sends. An older Hub ignores that parameter.
 - The schema change is a named migration. After it has applied, an older server binary is refused,
   so rolling the server back requires restoring a backup taken before the migration.
 - Older CLIs that send a start or checkpoint keep working. Taking over finished Work is now refused
@@ -269,7 +271,9 @@ NULL when nothing is held.
   Renewal follows the lead credential (#337): a checkpoint and a touch renew after the credential
   carry, so the same owner and session renew under a new token in the same call. Another session
   of the same token, a helper and another token renew nothing, and neither does a call that names
-  no session, even when the Hub resolves it to the lead session.
+  no session, even when the Hub resolves it to the lead session. Such an unnamed `agentscm_start`
+  that repeats the lead's start renews nothing and cannot hold a lapsed scope again; the lead
+  names its session for that.
 - Renewal is a conditional update that matches only a live lease of `active` or `blocked` Work, so
   a late touch never revives a lapsed lease, and a paused or handed-over item lapses on its own
   clock even while its session works on something else.
@@ -298,7 +302,9 @@ NULL when nothing is held.
   never deletes that event kind.
 - The admission response lists every lapsed hold it took the scope of in `reclaimed`: the Work, its
   lead agent, its branch, when it lapsed and a notice that the branch may hold edits its lead never
-  pushed. A start, a takeover, a scope-changing checkpoint and a reopen all report it.
+  pushed. A start, a takeover, a scope-changing checkpoint and a reopen all report it. MCP always
+  includes it and adds the notice to the start text; over HTTP it is sent only when the request has
+  `?reclaimed=1`, so a strict older client decodes the reply unchanged.
 - A woken lead whose scope was taken is refused by the managed-edit guard with `LEASE_LAPSED`: when
   the hold lapsed and how long after the session last renewed it, which Work took the scope, that
   the branch may hold unpushed work, and the `agentscm_start` with `work_id` and
@@ -362,3 +368,10 @@ any other.
   branch may hold unpushed work, and the woken lead is told to push or set it aside.
 - Leases run on the Hub's clock; a client clock never decides a lapse. A backward jump of the Hub's
   clock lengthens leases by the jump.
+- A shell call keeps its session's leases live for at most 60 minutes from the first call still
+  running; a longer one lapses meanwhile, like a long non-shell call.
+- A session name is only a label within a token, so any holder of the token can send activity under
+  the lead's session name and renew its lease. That gives nothing beyond what the token already
+  allows.
+- Renewal from each agent's hooks is tested with sample payloads written from the vendors'
+  documentation, not in live sessions of every agent.

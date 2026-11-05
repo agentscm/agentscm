@@ -33,16 +33,31 @@ fn held_minutes(renewed: i64, expired: i64) -> i64 {
     (expired - renewed).max(0) / 60
 }
 
-/// The refusal of an edit or a retain on Work `id` whose lease, last renewed at `renewed`, lapsed
-/// at `expired` while nothing took its scope: it must be held again through fresh admission first.
-pub(super) fn lapsed_unheld_text(id: &str, renewed: i64, expired: i64, retain: bool) -> String {
-    let what = if retain {
-        "A retain cannot revive it: hold it again with"
-    } else {
-        "Hold it again before editing: the lead runs"
+/// What met a lapsed hold that nothing took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Unheld {
+    Edit,
+    Retain,
+    /// A start whose session the Hub resolved because the call named none.
+    UnnamedStart,
+}
+
+/// The refusal on Work `id` whose lease, last renewed at `renewed`, lapsed at `expired` while
+/// nothing took its scope: it must be held again through fresh admission first.
+pub(super) fn lapsed_unheld_text(id: &str, renewed: i64, expired: i64, what: Unheld) -> String {
+    let what = match what {
+        Unheld::Edit => {
+            format!("Hold it again before editing: the lead runs agentscm_start with work_id {id}")
+        }
+        Unheld::Retain => format!(
+            "A retain cannot revive it: hold it again with agentscm_start with work_id {id}"
+        ),
+        Unheld::UnnamedStart => format!(
+            "This start names no session, so it cannot hold it again: the lead runs agentscm_start with work_id {id} and its session named"
+        ),
     };
     format!(
-        "{LEASE_LAPSED}: the hold on {id} lapsed at Unix {expired}, {} minutes after its lead session last renewed it. Nothing held the scope when this was refused, but other Work may take it at any time. {what} agentscm_start with work_id {id}; a helper rejoins after that.",
+        "{LEASE_LAPSED}: the hold on {id} lapsed at Unix {expired}, {} minutes after its lead session last renewed it. Nothing held the scope when this was refused, but other Work may take it at any time. {what}; a helper rejoins after that.",
         held_minutes(renewed, expired)
     )
 }

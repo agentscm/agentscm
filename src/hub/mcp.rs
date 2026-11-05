@@ -3007,6 +3007,9 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     })
     .await?;
 
+    // A call that names no session acts for the session the Hub resolves, which is not its own:
+    // it renews nothing and holds no lapsed scope again (the store and the touch both check).
+    let named = session.is_some();
     // Resolve the same session rules as hooks without taking any coordinated path. The durable
     // claim below must succeed before this call announces the requested paths.
     let resolved = announce_for(
@@ -3047,7 +3050,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             preflight,
         };
         if explicit {
-            store.work_start(&token, &start, unix_now())
+            store.work_start_named(&token, &start, named, unix_now())
         } else {
             store.work_start_auto(&token, &start, unix_now())
         }
@@ -3114,7 +3117,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let advice = announce_for(
         state,
         principal,
-        session_call(Some(resolved), Some(task.clone()), paths),
+        session_call(named.then_some(resolved), Some(task.clone()), paths),
     )
     .await?;
     let own = advice

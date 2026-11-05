@@ -1165,6 +1165,32 @@ fn two_takeovers_of_one_lapsed_hold_have_one_winner(db: &Db) {
     );
 }
 
+fn an_unnamed_start_holds_no_lapsed_scope_again(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let start_a = start("a", "s-a", "src/**");
+    let held = admitted(&*store, &alice, &start_a, now).item;
+    let after = now + LEASE_SECONDS + 1;
+    tick(&*store, now, after);
+    // The same start, but its session was resolved for a call that named none.
+    let Err(HubError::Invalid(message)) =
+        store.work_start_named(&alice.token, &start_a, false, after)
+    else {
+        panic!("an unnamed start must not hold a lapsed scope again");
+    };
+    assert!(message.starts_with(LEASE_LAPSED), "{message}");
+    assert!(message.contains("names no session"), "{message}");
+    assert_eq!(db.lease(&held.id).1, (now + LEASE_SECONDS).to_string());
+    // The lead naming its session holds it again.
+    store.work_start(&alice.token, &start_a, after + 1).unwrap();
+    assert_eq!(
+        db.lease(&held.id).1,
+        (after + 1 + LEASE_SECONDS).to_string()
+    );
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -1198,6 +1224,7 @@ conformance!(
     an_unnamed_call_renews_no_lease,
     a_takeover_of_a_lapsed_hold_is_fenced_like_a_new_start,
     two_takeovers_of_one_lapsed_hold_have_one_winner,
+    an_unnamed_start_holds_no_lapsed_scope_again,
     a_leaked_call_count_falls_back_to_the_idle_lease,
     every_overlapping_lapsed_reservation_is_cleared,
     takeovers_by_other_owners_respect_their_share,
