@@ -712,7 +712,12 @@ impl Slack {
                     return Ok(None);
                 }
                 if kind == "entry" {
-                    let Subject::Work { id: work_id, .. } = &subject else {
+                    let Subject::Work {
+                        id: work_id,
+                        generation,
+                        state: work_state,
+                    } = &subject
+                    else {
                         self.obsolete_status_job(&id)?;
                         return Ok(None);
                     };
@@ -725,11 +730,12 @@ impl Slack {
                         }
                     };
                     let Some(item) = item.filter(|item| {
-                        status.work.iter().any(|work| {
-                            work.work_id == item.id
-                                && work.updated_seq == item.updated_seq
-                                && work.generation == item.generation
-                        })
+                        item.generation == *generation
+                            && matches!(
+                                (item.state, work_state),
+                                (WorkState::Blocked, StatusState::Blocked)
+                                    | (WorkState::Handover, StatusState::AwaitingParty)
+                            )
                     }) else {
                         self.obsolete_status_job(&id)?;
                         return Ok(None);
