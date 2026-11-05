@@ -452,7 +452,8 @@ paths. If one exists under another identity, the start creates and claims nothin
 with the resume call; `new_work: true` starts different work. A start whose request key or forge
 source is that Work's own goes ahead, since the store resolves it. HTTP and CLI starts are
 unchanged, so older clients keep their behavior. A start refused for any reason in MCP carries
-`recovery`: the inspection of the conflicting Work with the requested paths.
+`recovery`: the inspection of the conflicting Work with the requested paths, cut in the compact
+default to each item's permitted calls, the live holds and the resumable ids.
 
 ### People
 
