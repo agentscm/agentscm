@@ -1,7 +1,8 @@
 //! An MCP-owned, same-user hook relay. Credentials and HTTPS pools stay in memory.
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,10 @@ const PROBE: Duration = Duration::from_millis(10);
 const MAX_TIME: Duration = Duration::from_millis(4500);
 const CONNECTIONS: usize = 32;
 const OBSERVERS: usize = 128;
+// Wall time includes sleep; 30 seconds keeps edit bursts pooled without trusting long-idle sockets.
+const POOL_IDLE: Duration = Duration::from_secs(30);
+const RETRY_MIN: Duration = Duration::from_millis(250);
+const RETRY_MAX: Duration = Duration::from_secs(5);
 
 fn unavailable() -> io::Error {
     io::Error::other("hook relay unavailable")
@@ -102,7 +107,7 @@ pub struct HookRequest {
 }
 
 impl HookRequest {
-    pub fn request(&self, client: &Client, hub: &str) -> io::Result<reqwest::RequestBuilder> {
+    pub fn request(self, client: &Client, hub: &str) -> io::Result<reqwest::RequestBuilder> {
         if self.agent.is_empty()
             || !self
                 .agent
@@ -121,7 +126,7 @@ impl HookRequest {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .bearer_auth(&self.token)
-            .body(self.body.clone());
+            .body(self.body);
         if let Some(root) = self
             .root
             .as_deref()
@@ -219,11 +224,11 @@ async fn wait_for_owner(address: &Address) -> io::Result<()> {
         let mut hello = [0; 64];
         stream.read_exact(&mut hello).await?;
         if hello != address.key.as_bytes() {
-            return Err(unavailable());
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         write_frame(&mut stream, &[], HEAD_BYTES).await?;
         if stream.read_u8().await? != 0 {
-            return Err(unavailable());
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         Ok(stream)
     };
@@ -237,12 +242,44 @@ async fn wait_for_owner(address: &Address) -> io::Result<()> {
     Ok(())
 }
 
+struct Pool {
+    client: Client,
+    created: SystemTime,
+    last_reply: Option<SystemTime>,
+}
+
+impl Pool {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            created: SystemTime::now(),
+            last_reply: None,
+        }
+    }
+
+    fn client(&mut self) -> io::Result<Client> {
+        if self
+            .last_reply
+            .unwrap_or(self.created)
+            .elapsed()
+            .map_or(true, |idle| idle >= POOL_IDLE)
+        {
+            self.client = crate::hub::forge_http::client().map_err(|_| unavailable())?;
+            self.created = SystemTime::now();
+            self.last_reply = None;
+        }
+        Ok(self.client.clone())
+    }
+}
+
 /// Drop this with the MCP stdio server: no independent process or orphan lifecycle.
 pub struct Relay(JoinHandle<()>);
 
 impl Relay {
     pub fn spawn(address: Address, client: Client) -> Self {
         Self(tokio::spawn(async move {
+            let pool = Arc::new(Mutex::new(Pool::new(client)));
+            let mut retry = RETRY_MIN;
             loop {
                 match transport::Listener::bind(&address) {
                     Ok(Some(mut listener)) => {
@@ -253,7 +290,7 @@ impl Relay {
                                 connected = listener.accept(), if calls.len() < CONNECTIONS => {
                                     match connected {
                                         Ok(stream) => {
-                                            calls.spawn(serve(stream, address.clone(), client.clone()));
+                                            calls.spawn(serve(stream, address.clone(), pool.clone()));
                                         }
                                         Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) => {
                                             tokio::time::sleep(PROBE).await;
@@ -265,26 +302,31 @@ impl Relay {
                                     }
                                 }
                                 completed = calls.join_next(), if !calls.is_empty() => {
-                                    if let Some(Ok(Some(mut stream))) = completed
-                                        && observers.len() < OBSERVERS
-                                    {
-                                        observers.spawn(async move {
-                                            if stream.write_u8(0).await.is_ok() {
-                                                let mut byte = [0];
-                                                let _ = stream.read(&mut byte).await;
-                                            }
-                                        });
+                                    if let Some(Ok(Some(mut stream))) = completed {
+                                        if observers.len() < OBSERVERS {
+                                            observers.spawn(async move {
+                                                if stream.write_u8(0).await.is_ok() {
+                                                    let mut byte = [0];
+                                                    let _ = stream.read(&mut byte).await;
+                                                }
+                                            });
+                                        } else {
+                                            let _ = tokio::time::timeout(PROBE, stream.write_u8(1)).await;
+                                        }
                                     }
                                 }
                                 _ = observers.join_next(), if !observers.is_empty() => {}
                             }
                         }
                     }
-                    Ok(None) => {
-                        if wait_for_owner(&address).await.is_err() {
-                            return;
+                    Ok(None) => match wait_for_owner(&address).await {
+                        Ok(()) => retry = RETRY_MIN,
+                        Err(error) if error.kind() == io::ErrorKind::InvalidData => return,
+                        Err(_) => {
+                            tokio::time::sleep(retry).await;
+                            retry = (retry * 2).min(RETRY_MAX);
                         }
-                    }
+                    },
                     Err(_) => {
                         eprintln!("agentscm: hook relay bind failed; hooks can use direct HTTPS");
                         return;
@@ -304,7 +346,7 @@ impl Drop for Relay {
 async fn serve(
     mut stream: transport::ServerStream,
     address: Address,
-    client: Client,
+    pool: Arc<Mutex<Pool>>,
 ) -> Option<transport::ServerStream> {
     let started = Instant::now();
     let exchange = async {
@@ -320,8 +362,13 @@ async fn serve(
             if deadline <= Instant::now() {
                 return Err(unavailable());
             }
+            let client = pool.lock().map_err(|_| unavailable())?.client()?;
             let request = head.request.request(&client, &address.hub)?;
-            send(request, REPLY_BYTES).await.map_err(|_| unavailable())
+            let reply = send(request, REPLY_BYTES)
+                .await
+                .map_err(|_| unavailable())?;
+            pool.lock().map_err(|_| unavailable())?.last_reply = Some(SystemTime::now());
+            Ok::<_, io::Error>(reply)
         };
         let response = tokio::time::timeout_at(deadline.into(), response)
             .await

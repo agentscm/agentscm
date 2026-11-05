@@ -82,6 +82,7 @@ fn forward_is_only_a_hook_post_and_preserves_headers_body_and_token_rotation() {
     hook.root = Some("synthetic-root".into());
     hook.client = Some("synthetic-binding".into());
     hook.report_completion = true;
+    let body_pointer = hook.body.as_ptr();
     let built = hook
         .request(&client, "https://hub.example.com")
         .unwrap()
@@ -103,6 +104,11 @@ fn forward_is_only_a_hook_post_and_preserves_headers_body_and_token_rotation() {
         "true"
     );
     assert_eq!(built.body().unwrap().as_bytes().unwrap(), b"{}");
+    assert_eq!(
+        built.body().unwrap().as_bytes().unwrap().as_ptr(),
+        body_pointer
+    );
+    let mut hook = request();
     hook.token = "synthetic-rotated-token".into();
     assert_eq!(
         hook.request(&client, "https://hub.example.com")
@@ -119,9 +125,31 @@ fn forward_is_only_a_hook_post_and_preserves_headers_body_and_token_rotation() {
         "claude/other",
         "https://elsewhere.example.com",
     ] {
+        let mut hook = request();
         hook.agent = bad.into();
         assert!(hook.request(&client, "https://hub.example.com").is_err());
     }
+}
+
+#[test]
+fn pool_refresh_uses_wall_time_including_backwards_clock_changes() {
+    let mut pool = Pool::new(crate::hub::forge_http::client().unwrap());
+    let completed = SystemTime::now();
+    pool.last_reply = Some(completed);
+    pool.client().unwrap();
+    assert_eq!(pool.last_reply, Some(completed));
+    for completed in [
+        SystemTime::now() - POOL_IDLE - Duration::from_secs(1),
+        SystemTime::now() + Duration::from_secs(60),
+    ] {
+        pool.last_reply = Some(completed);
+        pool.client().unwrap();
+        assert!(pool.last_reply.is_none());
+        assert!(pool.created.elapsed().unwrap() < POOL_IDLE);
+    }
+    pool.created = SystemTime::now() - POOL_IDLE - Duration::from_secs(1);
+    pool.client().unwrap();
+    assert!(pool.created.elapsed().unwrap() < POOL_IDLE);
 }
 
 #[tokio::test]
@@ -159,6 +187,30 @@ async fn no_relay_or_expired_deadline_allows_direct_fallback() {
 mod unix {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    async fn ready(address: &Address) -> transport::ServerStream {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(stream) = transport::connect(address).await {
+                    break stream;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn read_post(stream: &mut tokio::net::TcpStream) {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        while !bytes.ends_with(b"\r\n\r\n{}") {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0 && bytes.len() < HEAD_BYTES);
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        assert!(bytes.starts_with(b"POST /v1/hub/hook/claude?repo=acme%2Fwidgets HTTP/1.1\r\n"));
+    }
 
     fn socket_path(address: &Address) -> std::path::PathBuf {
         address
@@ -231,6 +283,68 @@ mod unix {
         assert!(moved.exists());
         assert!(transport::connect(&address).await.is_ok());
         drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn ownership_reaps_only_old_unlocked_private_single_link_lock_files() {
+        let (_scratch, address) = address();
+        drop(transport::Listener::bind(&address).unwrap().unwrap());
+        let current = socket_path(&address).with_extension("lock");
+        let old = SystemTime::now() - transport::LOCK_AGE - Duration::from_secs(1);
+        let create = |name: &str, modified: SystemTime| {
+            let path = address.directory.join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            file.set_modified(modified).unwrap();
+            path
+        };
+        std::fs::File::open(&current)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let stale = create("stale.lock", old);
+        let active = create("active.lock", old);
+        let lease = crate::lease::Lease::try_exclusive(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&active)
+                .unwrap(),
+        )
+        .unwrap();
+        let recent = create("recent.lock", SystemTime::now());
+        let other = create("old.other", old);
+        let target = create("target.other", old);
+        let symlink = address.directory.join("symlink.lock");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        let linked = create("linked.lock", old);
+        let extra_link = address.directory.join("linked.other");
+        std::fs::hard_link(&linked, &extra_link).unwrap();
+        let public = create("public.lock", old);
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let directory = address.directory.join("directory.lock");
+        std::fs::create_dir(&directory).unwrap();
+        let owner = transport::Listener::bind(&address).unwrap().unwrap();
+        assert!(!stale.exists());
+        for preserved in [
+            &current,
+            &active,
+            &recent,
+            &other,
+            &target,
+            &symlink,
+            &linked,
+            &extra_link,
+            &public,
+            &directory,
+        ] {
+            assert!(std::fs::symlink_metadata(preserved).is_ok());
+        }
+        drop(owner);
+        drop(lease);
+        drop(transport::Listener::bind(&address).unwrap().unwrap());
+        assert!(!active.exists());
     }
 
     #[tokio::test]
@@ -358,7 +472,9 @@ mod unix {
             let _ = serve(
                 stream,
                 server_address,
-                crate::hub::forge_http::client().unwrap(),
+                Arc::new(Mutex::new(Pool::new(
+                    crate::hub::forge_http::client().unwrap(),
+                ))),
             )
             .await;
         });
@@ -430,6 +546,205 @@ mod unix {
             .await
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn standby_retries_timeouts_with_backoff_and_still_takes_over() {
+        let (_scratch, address) = address();
+        let mut owner = transport::Listener::bind(&address).unwrap().unwrap();
+        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let mut first = tokio::time::timeout(Duration::from_secs(1), owner.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        first.write_all(address.key.as_bytes()).await.unwrap();
+        assert!(read_frame(&mut first, HEAD_BYTES).await.unwrap().is_empty());
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(MAX_TIME + Duration::from_secs(1), first.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(
+            tokio::time::timeout(RETRY_MIN / 2, owner.accept())
+                .await
+                .is_err()
+        );
+        let second = tokio::time::timeout(RETRY_MIN * 2, owner.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(second);
+        assert!(
+            tokio::time::timeout(RETRY_MIN, owner.accept())
+                .await
+                .is_err()
+        );
+        let mut third = tokio::time::timeout(RETRY_MIN * 4, owner.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        third.write_all(address.key.as_bytes()).await.unwrap();
+        assert!(read_frame(&mut third, HEAD_BYTES).await.unwrap().is_empty());
+        third.write_u8(0).await.unwrap();
+        drop(owner);
+        drop(third);
+        let mut stream = ready(&address).await;
+        let mut hello = [0; 64];
+        stream.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello, address.key.as_bytes());
+        assert!(!relay.0.is_finished());
+        drop(relay);
+    }
+
+    #[tokio::test]
+    async fn standby_stops_for_version_mismatch_and_observer_cap() {
+        let (_scratch, address) = address();
+        let mut owner = transport::Listener::bind(&address).unwrap().unwrap();
+        let relay = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let mut stream = tokio::time::timeout(Duration::from_secs(1), owner.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        stream.write_all(&[b'x'; 64]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !relay.0.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(relay);
+        drop(owner);
+        let owner = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        let mut observers = Vec::new();
+        for _ in 0..OBSERVERS {
+            let mut stream = ready(&address).await;
+            let mut hello = [0; 64];
+            stream.read_exact(&mut hello).await.unwrap();
+            write_frame(&mut stream, &[], HEAD_BYTES).await.unwrap();
+            assert_eq!(stream.read_u8().await.unwrap(), 0);
+            observers.push(stream);
+        }
+        assert_eq!(
+            wait_for_owner(&address).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let standby = Relay::spawn(address.clone(), crate::hub::forge_http::client().unwrap());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !standby.0.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(standby);
+        drop(owner);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_idle_reset_refreshes_only_after_wall_clock_threshold_without_resending() {
+        use std::os::fd::AsRawFd;
+
+        for expired in [false, true] {
+            let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = scratch();
+            let address = address_in(&config, &format!("http://{}", hub.local_addr().unwrap()));
+            let client = crate::hub::forge_http::client().unwrap();
+            let pool = Arc::new(Mutex::new(Pool::new(client.clone())));
+            let mut listener = transport::Listener::bind(&address).unwrap().unwrap();
+            let server_pool = pool.clone();
+            let server_address = address.clone();
+            let relay = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let stream = listener.accept().await.unwrap();
+                    assert!(
+                        serve(stream, server_address.clone(), server_pool.clone())
+                            .await
+                            .is_none()
+                    );
+                }
+            });
+            let server = tokio::spawn(async move {
+                let (mut idle, _) = hub.accept().await.unwrap();
+                read_post(&mut idle).await;
+                idle.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                // SAFETY: the socket is live and linger points to the correctly sized option.
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            idle.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_LINGER,
+                            (&linger as *const libc::linger).cast(),
+                            size_of::<libc::linger>() as libc::socklen_t,
+                        )
+                    },
+                    0
+                );
+                let mut byte = [0];
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::select! {
+                        observed = idle.peek(&mut byte) => {
+                            assert!(observed.unwrap() > 0);
+                            assert!(!expired);
+                            read_post(&mut idle).await;
+                            drop(idle);
+                        }
+                        connected = hub.accept() => {
+                            assert!(expired);
+                            let (mut fresh, _) = connected.unwrap();
+                            read_post(&mut fresh).await;
+                            fresh.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+                            let mut byte = [0];
+                            assert!(tokio::time::timeout(Duration::from_millis(50), idle.read(&mut byte)).await.is_err());
+                        }
+                    }
+                }).await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), hub.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let first = try_forward(
+                &address,
+                &request(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(first, (200, json!({})));
+            assert!(pool.lock().unwrap().last_reply.is_some());
+            if expired {
+                pool.lock().unwrap().last_reply =
+                    Some(SystemTime::now() - POOL_IDLE - Duration::from_secs(1));
+            }
+            let second = try_forward(
+                &address,
+                &request(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            if expired {
+                assert_eq!(second.unwrap(), (200, json!({})));
+            } else {
+                assert!(second.is_err());
+            }
+            server.await.unwrap();
+            relay.await.unwrap();
+            drop(client);
+        }
     }
 
     #[tokio::test]
@@ -507,7 +822,9 @@ mod unix {
             let server = tokio::spawn(serve(
                 accepted,
                 address.clone(),
-                crate::hub::forge_http::client().unwrap(),
+                Arc::new(Mutex::new(Pool::new(
+                    crate::hub::forge_http::client().unwrap(),
+                ))),
             ));
             let mut hello = [0; 64];
             stream.read_exact(&mut hello).await.unwrap();

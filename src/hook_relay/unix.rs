@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 
@@ -9,6 +10,8 @@ use super::{Address, unavailable};
 use crate::lease::Lease;
 
 pub(super) type ServerStream = UnixStream;
+
+pub(super) const LOCK_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 fn owner() -> u32 {
     // SAFETY: geteuid has no preconditions.
@@ -51,6 +54,42 @@ fn same_user(stream: &UnixStream) -> io::Result<()> {
     Ok(())
 }
 
+fn clean_locks(directory: &Path, current: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path == current || path.extension().is_none_or(|extension| extension != "lock") {
+            continue;
+        }
+        let clean = || -> io::Result<()> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || !private(&metadata, 0o600)
+                || metadata.nlink() != 1
+                || metadata
+                    .modified()?
+                    .elapsed()
+                    .map_or(true, |age| age < LOCK_AGE)
+            {
+                return Ok(());
+            }
+            let _lease = Lease::try_exclusive(file).map_err(io::Error::from)?;
+            if std::fs::symlink_metadata(&path).is_ok_and(|current| {
+                (current.dev(), current.ino()) == (metadata.dev(), metadata.ino())
+            }) {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(())
+        };
+        let _ = clean();
+    }
+    Ok(())
+}
+
 pub(super) async fn connect(address: &Address) -> io::Result<UnixStream> {
     let path = socket(address)?;
     checked_socket(&path)?;
@@ -77,6 +116,7 @@ impl Listener {
             Err(error) => return Err(error),
         }
         let path = socket(address)?;
+        let lock_path = path.with_extension("lock");
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -84,7 +124,7 @@ impl Listener {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(path.with_extension("lock"))?;
+            .open(&lock_path)?;
         let metadata = lock.metadata()?;
         if !metadata.is_file() || !private(&metadata, 0o600) || metadata.nlink() != 1 {
             return Err(unavailable());
@@ -94,6 +134,12 @@ impl Listener {
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(error) => return Err(io::Error::from(error)),
         };
+        // A cleaner may have unlinked this inode after open but before we acquired its lease.
+        if !std::fs::symlink_metadata(&lock_path)
+            .is_ok_and(|current| (current.dev(), current.ino()) == (metadata.dev(), metadata.ino()))
+        {
+            return Err(unavailable());
+        }
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_socket()
@@ -110,6 +156,7 @@ impl Listener {
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let metadata = std::fs::symlink_metadata(&path)?;
+        let _ = clean_locks(&address.directory, &lock_path);
         Ok(Some(Self {
             listener,
             path,
