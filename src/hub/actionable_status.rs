@@ -1438,7 +1438,18 @@ mod tests {
                     "success",
                     "2026-11-05T09:00:00Z"
                 ),
-                status("ci/unrelated", "failure", "2026-11-05T10:00:00Z")
+                status("ci/unrelated", "failure", "2026-11-05T10:00:00Z"),
+                // A named check's own context is required; a look-alike name is not.
+                status(
+                    "agentscm/local-validation/static",
+                    "failure",
+                    "2026-11-05T10:00:00Z"
+                ),
+                status(
+                    "agentscm/local-validation-foo",
+                    "failure",
+                    "2026-11-05T10:00:00Z"
+                )
             ]),
         );
         // Another person's failed Hub check counts for them, not the viewer.
@@ -1596,6 +1607,11 @@ mod tests {
                 (
                     "failed_check",
                     format!("check:{}:5:agentscm/local-validation", repo.id),
+                    vec![checked.id.clone()]
+                ),
+                (
+                    "failed_check",
+                    format!("check:{}:5:agentscm/local-validation/static", repo.id),
                     vec![checked.id.clone()]
                 ),
                 (

@@ -1663,30 +1663,31 @@ async fn entry_rechecks_cycle_episode_opt_in_user_and_shared_recipient() {
         if fence == "recipient" {
             slack.bindings[1].config.reminders.enabled = true;
         }
-        let db = slack.database().unwrap();
-        match fence {
-            "cycle" => {
-                db.execute("UPDATE status_jobs SET cycle=cycle+1", [])
-                    .unwrap();
+        {
+            let db = slack.database().unwrap();
+            match fence {
+                "cycle" => {
+                    db.execute("UPDATE status_jobs SET cycle=cycle+1", [])
+                        .unwrap();
+                }
+                "episode" => {
+                    db.execute("UPDATE status_episodes SET state='resolved'", [])
+                        .unwrap();
+                }
+                "opt-in" => {}
+                "user" => {
+                    db.execute("UPDATE status_jobs SET user='U2'", []).unwrap();
+                }
+                "recipient" => {
+                    let key = status::binding_key(&slack.bindings[1]);
+                    db.execute("UPDATE status_jobs SET binding=?1,user='U2'", [&key])
+                        .unwrap();
+                    db.execute("UPDATE status_episodes SET binding=?1", [&key])
+                        .unwrap();
+                }
+                _ => unreachable!(),
             }
-            "episode" => {
-                db.execute("UPDATE status_episodes SET state='resolved'", [])
-                    .unwrap();
-            }
-            "opt-in" => {}
-            "user" => {
-                db.execute("UPDATE status_jobs SET user='U2'", []).unwrap();
-            }
-            "recipient" => {
-                let key = status::binding_key(&slack.bindings[1]);
-                db.execute("UPDATE status_jobs SET binding=?1,user='U2'", [&key])
-                    .unwrap();
-                db.execute("UPDATE status_episodes SET binding=?1", [&key])
-                    .unwrap();
-            }
-            _ => unreachable!(),
         }
-        drop(db);
         assert!(
             !Arc::new(slack).deliver_status(&f.state).await.unwrap(),
             "{fence}"

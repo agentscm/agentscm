@@ -12,7 +12,7 @@ use agentscm::execution::Cancellation;
 use agentscm::local_validation::comment::{self, envelope_sha256};
 use agentscm::local_validation::run::{observe, produce, required_commands, trust_paths};
 use agentscm::local_validation::{
-    DEFAULT_VERIFIER_WORKFLOW, Issuance, MAX_RECORD_BYTES, Observed, ValidationPolicy,
+    DEFAULT_VERIFIER_WORKFLOW, Issuance, MAX_RECORD_BYTES, Observed, Outcome, ValidationPolicy,
     ValidationRecipe, ValidationRecord, Verdict, VerdictState, assess, evidence_payload, select,
 };
 use agentscm::policy::issuers::{IssuerRegistrySnapshot, issuer_key_id};
@@ -389,15 +389,25 @@ fn read_retained(state_dir: &Path, sha: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 fn verdict_exit(verdict: &Verdict, commit: &str) -> i32 {
-    let (name, code) = match verdict.state {
-        VerdictState::Success => ("success", 0),
-        VerdictState::Failure => ("failure", 1),
-        VerdictState::Error => ("error", 2),
-        VerdictState::Pending => ("pending", 3),
+    let code = match verdict.state {
+        VerdictState::Success => 0,
+        VerdictState::Failure => 1,
+        VerdictState::Error => 2,
+        VerdictState::Pending => 3,
     };
+    let constituents: Vec<_> = verdict
+        .constituents
+        .iter()
+        .map(|c| {
+            json!({"id": c.id, "name": c.name, "state": c.state.as_str(),
+                   "outcome": c.outcome.as_str(), "reason": c.reason})
+        })
+        .collect();
     println!(
         "{}",
-        json!({"state": name, "reason": verdict.reason, "detail": verdict.detail,
+        json!({"state": verdict.state.as_str(), "outcome": verdict.outcome.as_str(),
+               "reason": verdict.reason, "detail": verdict.detail,
+               "constituents": constituents,
                "envelope_sha256": verdict.envelope_sha256, "commit": commit})
     );
     code
@@ -408,10 +418,12 @@ fn verify(args: VerifyArgs) -> Result<i32> {
     verify_inputs(args).or_else(|error| {
         let verdict = Verdict {
             state: VerdictState::Error,
+            outcome: Outcome::Error,
             reason: "input error",
             detail: error.to_string(),
             applies_to_head: false,
             envelope_sha256: String::new(),
+            constituents: Vec::new(),
         };
         Ok(verdict_exit(&verdict, ""))
     })
@@ -452,10 +464,12 @@ fn verify_inputs(args: VerifyArgs) -> Result<i32> {
         Err(error) => {
             let verdict = Verdict {
                 state: VerdictState::Error,
+                outcome: Outcome::Error,
                 reason: "git unavailable",
                 detail: error.to_string(),
                 applies_to_head: false,
                 envelope_sha256: String::new(),
+                constituents: Vec::new(),
             };
             return Ok(verdict_exit(&verdict, ""));
         }
@@ -568,23 +582,36 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
             MAX_INPUT_BYTES,
         )
     };
-    let policy = ValidationPolicy::from_slice(&read("policy.json")?)?;
-    let recipe = ValidationRecipe::from_slice(&read("recipe.json")?)?;
+    // Any load failure writes nothing, like the other configuration errors. The load also
+    // refuses a symbolic-link `registry.json` when a manifest is in use, so it runs first.
+    let loaded =
+        agentscm::local_validation::checks::load(&args.repo.join(&args.config_dir), &|path| {
+            read_bounded(path, MAX_INPUT_BYTES)
+        })?;
+    if loaded.iter().any(|check| check.name.is_some()) {
+        agentscm::local_validation::checks::refuse_config_dir_symlinks(
+            &args.repo,
+            &args.config_dir,
+        )?;
+    }
     let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")?)?;
-    if policy.repository != format!("github.com/{}", args.github_repo) {
-        eprintln!("policy repository does not match --github-repo; nothing written");
-        return Ok(2);
+    for check in &loaded {
+        if check.policy.repository != format!("github.com/{}", args.github_repo) {
+            eprintln!("policy repository does not match --github-repo; nothing written");
+            return Ok(2);
+        }
+        if registry.repository != check.policy.repository {
+            return Err(Error::Invalid(
+                "registry repository differs from the policy repository".into(),
+            ));
+        }
     }
-    if registry.repository != policy.repository {
-        return Err(Error::Invalid(
-            "registry repository differs from the policy repository".into(),
-        ));
-    }
+    let repository = loaded[0].policy.repository.clone();
     let fetch = if args.github_authenticated_fetch {
         agentscm::local_validation::fetch::FetchContext::authenticated(
             &args.repo,
             &args.github_repo,
-            &policy.repository,
+            &repository,
             &token,
         )
     } else {
@@ -599,23 +626,26 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
     };
     let base_url = check_base_url(&args.api_url).map_err(|e| Error::Invalid(e.to_string()))?;
     let api = Api::new(&base_url, &base_url).map_err(|e| Error::Invalid(e.to_string()))?;
-    Ok(Context {
-        api: &api,
-        token: &token,
-        github_repo: &args.github_repo,
-        base: &args.base,
-        config_dir,
-        verifier_workflow: &args.verifier_workflow,
-        git_repo: &args.repo,
-        fetch: &fetch,
-        repository: &policy.repository,
-        policy: &policy,
-        recipe: &recipe,
-        registry: &registry,
-        target_url: args.target_url.as_deref(),
-    }
-    .reconcile()
-    .await)
+    let contexts: Vec<Context> = loaded
+        .iter()
+        .map(|check| Context {
+            api: &api,
+            token: &token,
+            github_repo: &args.github_repo,
+            base: &args.base,
+            config_dir,
+            verifier_workflow: &args.verifier_workflow,
+            git_repo: &args.repo,
+            fetch: &fetch,
+            repository: &check.policy.repository,
+            policy: &check.policy,
+            recipe: &check.recipe,
+            registry: &registry,
+            target_url: args.target_url.as_deref(),
+            check_name: check.name.as_deref(),
+        })
+        .collect();
+    Ok(agentscm::local_validation::reconcile::reconcile_all(&contexts).await)
 }
 
 /// Posts the retained attestation as one PR comment, adopting this login's earlier comment for
