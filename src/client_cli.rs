@@ -826,6 +826,10 @@ fn label_in(dir: Option<&Path>) -> Result<String> {
 }
 
 async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Value)> {
+    mint_named(hub, session, repo, &token_name()?).await
+}
+
+async fn mint_named(hub: &str, session: &str, repo: &str, name: &str) -> Result<(u16, Value)> {
     let client = forge_http::client().map_err(map_hub_error)?;
     call(
         &client,
@@ -833,7 +837,7 @@ async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Valu
         &format!("{hub}/v1/hub/tokens"),
         Some(session),
         Some(json!({
-            "name": token_name()?,
+            "name": name,
             "repository": repo,
             "ttl_seconds": AGENT_TOKEN_TTL,
         })),
@@ -2056,7 +2060,8 @@ mod tests {
                 }),
             ),
         ]);
-        let (status, minted) = mint_request(&hub, "session-synthetic", "acme/widgets")
+        // Named here: `token_name` reads and writes the real config directory.
+        let (status, minted) = mint_named(&hub, "session-synthetic", "acme/widgets", "synthetic")
             .await
             .unwrap();
         assert_eq!(status, 201);

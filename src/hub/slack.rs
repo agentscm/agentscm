@@ -889,7 +889,7 @@ impl Slack {
             let mut holding: Vec<&Intent> = intents.iter().filter(|i| !skipped(i)).collect();
             holding.sort_by_key(|i| (!asked(i), i.created_at, i.id.as_str()));
             let mut told = BTreeSet::new();
-            for intent in holding {
+            for &intent in &holding {
                 let held: Vec<String> = paths
                     .iter()
                     .filter(|path| intent.paths.iter().any(|spec| overlaps(path, key_of(spec))))
@@ -898,23 +898,40 @@ impl Slack {
                 if held.is_empty() {
                     continue;
                 }
-                let mut holder = label(&intent.owner.login, &intent.agent);
-                if let (true, Some(session)) = (intent.token == token, intent.session.as_deref()) {
-                    // Another session of the repeater's own token: the label alone would read as itself.
-                    let kind = session_kind(&intent.via).unwrap_or_else(|| "agent".into());
-                    let key = session_key(&intent.token, session);
-                    holder = format!(
-                        "{}’s {kind} session {}",
-                        sanitize(&intent.owner.login, NAME_CHARS),
-                        &key[..8]
-                    );
-                }
+                // The label alone cannot say which session: another of the repeater's own token
+                // would read as itself, and several of one token would read alike.
+                let several = holding
+                    .iter()
+                    .filter(|other| {
+                        other.token == intent.token
+                            && other.session.is_some()
+                            && paths.iter().any(|path| {
+                                other.paths.iter().any(|spec| overlaps(path, key_of(spec)))
+                            })
+                    })
+                    .count()
+                    > 1;
+                let session_name = intent
+                    .session
+                    .as_deref()
+                    .filter(|_| several || intent.token == token)
+                    .map(|session| {
+                        let kind = session_kind(&intent.via).unwrap_or_else(|| "agent".into());
+                        let key = session_key(&intent.token, session);
+                        format!("{kind} session {}", &key[..8])
+                    });
+                let holder = session_name.as_ref().map_or_else(
+                    || label(&intent.owner.login, &intent.agent),
+                    |name| format!("{}’s {name}", sanitize(&intent.owner.login, NAME_CHARS)),
+                );
                 if let Some(person) = Self::bound(people, &repository, &intent.token)
                     && repeater.is_none_or(|r| r.slack_user != person.slack_user)
                     && told.insert(intent.token.as_str())
                 {
                     // One message per holder token and event; buttons answer one file only.
-                    let mine = person.agent(&intent.token);
+                    let mine = session_name
+                        .filter(|_| several)
+                        .unwrap_or_else(|| person.agent(&intent.token));
                     let (headline, guidance) = match held.as_slice() {
                         [path] => (
                             format!(

@@ -517,6 +517,17 @@ async fn two_holder_sessions_of_one_token_message_their_person_once() {
         .filter(|(user, text)| user == "U1" && text.contains("which your"))
         .collect();
     assert_eq!(holder.len(), 1, "{sent:?}");
+    // Two sessions of one token read alike by label, so each side names them.
+    let key = |session: &str| crate::hub::store::session_key(&f.alice, session)[..8].to_owned();
+    let (a, c) = (key("a"), key("c"));
+    assert!(
+        holder[0].1.contains("Your agent: Claude Code session "),
+        "{sent:?}"
+    );
+    assert!(
+        holder[0].1.contains(&a) || holder[0].1.contains(&c),
+        "{sent:?}"
+    );
     // The one button answers for the session the request was filed against.
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
     assert_eq!(

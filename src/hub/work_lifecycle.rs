@@ -78,7 +78,10 @@ pub(super) fn lapsed_refusal_text(
         |branch| format!("Branch {branch}"),
     );
     let holder = match holder_agent {
-        Some(agent) => format!("{holder} (led by agent {agent} when this was refused)"),
+        Some(agent) => format!(
+            "{holder} (led by agent {} when this was refused)",
+            super::advice::agent_name(agent)
+        ),
         None => holder.to_owned(),
     };
     format!(
