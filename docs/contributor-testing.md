@@ -93,7 +93,7 @@ Measure on an otherwise idle host and record the exact revision, operating syste
 
 Report build time separately from each warm execution time, along with test counts, failures, ignored tests, early returns and service availability. Do not claim an improvement from unmatched revisions or environments.
 
-The suite is limited by summed test time, because every test slot is busy for most of a run, so a slow test costs wall time even while it only waits. To find where a slow test spends it, run the slowest tests one at a time (`cargo nextest run -j 1 -E 'test(=NAME)'`) and compare each one's wall time with its CPU time (`/usr/bin/time -l` on the test binary, run with `--exact NAME`). CPU close to wall means compute, such as hashing the CLI, and CPU far below wall means waiting on a deadline, a lock or `fsync`. For counts of spawned processes, interpose `posix_spawn` with `DYLD_INSERT_LIBRARIES`; Git and interpreter wrappers that a lifecycle test runs thousands of times should be `/bin/sh` scripts, not Python.
+The suite is limited by summed test time, because every test slot is busy for most of a run, so a slow test costs wall time even while it only waits. To find where a slow test spends it, run the slowest tests one at a time (`cargo nextest run -j 1 -E 'test(=NAME)'`) and compare each one's wall time with its CPU time (`/usr/bin/time -l` on the test binary, run with `--exact NAME`). CPU close to wall means compute, such as hashing the CLI, and CPU far below wall means waiting on a deadline, a lock or `fsync`. A Git wrapper that a lifecycle test runs thousands of times should be a `/bin/sh` script, not Python, because interpreter startup then dominates the test.
 
 Two settings keep the slow cases short without weakening what they check:
 

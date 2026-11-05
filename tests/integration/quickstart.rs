@@ -3401,7 +3401,6 @@ fn native_uninstall_recovers_a_missing_plist_but_preserves_unknown_service_state
             .command(repo.path(), &["uninstall", "--yes"])
             .env("FAKE_PRINT_MODE", mode)
             .env("FAKE_EXECUTABLE", &executable)
-            .env("AGENTSCM_TEST_CONTROL_TIMEOUT_SECS", "5")
             .output()
             .unwrap();
         if mode == "unavailable" {
