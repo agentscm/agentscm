@@ -10,8 +10,8 @@
 #                            $AGENTSCM_LV_DIR/$ISSUER.key)
 #
 # One attestation or --with-lock command runs per machine at a time, across worktrees; concurrent
-# full suites fail timing-sensitive tests. The lock is ~/.agentscm/attest-pr.lock, and a lock whose
-# holder has died is reclaimed.
+# full suites fail timing-sensitive tests. A machine-local FIFO under ~/.agentscm/heavy-job-queue
+# supervises commands and also honors the legacy ~/.agentscm/attest-pr.lock exclusion.
 #
 # Exits 0 without posting when this machine has no signing key; say so in the PR. Any other
 # failure, including a recipe that does not pass, exits nonzero and posts nothing. A recipe that
@@ -30,47 +30,50 @@ die() {
   exit 1
 }
 
-# macOS has no flock(1): mkdir is the atomic step, and the pid file says who holds the lock.
-lock="$HOME/.agentscm/attest-pr.lock"
-take_lock() {
-  local holder waiting_for=
-  mkdir -p "${lock%/*}"
-  until mkdir "$lock" 2>/dev/null; do
-    holder=$(cat "$lock/pid" 2>/dev/null || true)
-    # One reclaimer at a time, and only if the dead holder still owns the lock, so a waiter that
-    # read a stale pid cannot remove a lock another waiter has just taken.
-    # shortcut: a process killed between mkdir and writing its pid, or inside this reclaim step,
-    # leaves a lock nobody reclaims; remove $lock and $lock.reclaim by hand if a wait never ends.
-    if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null && mkdir "$lock.reclaim" 2>/dev/null; then
-      if [[ "$(cat "$lock/pid" 2>/dev/null || true)" == "$holder" ]]; then
-        echo "attest-pr: reclaiming the lock from $holder, which is no longer running" >&2
-        rm -rf "$lock"
-      fi
-      rmdir "$lock.reclaim"
-      continue
+# Build the small std-only supervisor without starting Cargo or consuming a heavy-job slot.
+queue_binary() {
+  local source digest cache build
+  source=tools/heavy-job-queue.rs
+  digest=$(shasum -a 256 "$source" | cut -d ' ' -f 1)
+  cache="$HOME/.agentscm/bin/heavy-job-queue-$digest"
+  mkdir -p "${cache%/*}"
+  if [[ ! -x "$cache" ]]; then
+    build=$(mktemp -d "${cache%/*}/heavy-job-build.XXXXXX")
+    if ! rustc --edition=2024 -D warnings "$source" -o "$build/queue"; then
+      rm -rf "$build"
+      die "cannot compile heavy-job queue with the pinned Rust toolchain"
     fi
-    if [[ "$holder" != "$waiting_for" ]]; then
-      if [[ -n "$holder" ]]; then
-        echo "attest-pr: waiting for $holder ($(ps -o command= -p "$holder" 2>/dev/null | cut -c1-120)) to release $lock" >&2
-      else
-        echo "attest-pr: waiting for a starting run to release $lock" >&2
-      fi
-      waiting_for=$holder
-    fi
-    sleep 2
-  done
-  echo $$ >"$lock/pid"
+    mv "$build/queue" "$cache"
+    rmdir "$build"
+  fi
+  printf '%s\n' "$cache"
 }
-release_lock() {
-  if [[ "$(cat "$lock/pid" 2>/dev/null || true)" == "$$" ]]; then rm -rf "$lock"; fi
+run_queued() {
+  local kind=$1
+  shift
+  exec "$(queue_binary)" --run "$HOME/.agentscm/heavy-job-queue" "$HOME/.agentscm/attest-pr.lock" "$kind" "$@"
 }
 
+if [[ "${1:-}" == --queue ]]; then
+  (($# == 1)) || die "usage: tools/attest-pr.sh --queue"
+  exec "$(queue_binary)" --queue "$HOME/.agentscm/heavy-job-queue"
+fi
+
+queued=false
+if [[ "${1:-}" == --queued-attestation ]]; then
+  queued=true
+  shift
+fi
 if [[ "${1:-}" == --with-lock ]]; then
   shift
+  kind=other
+  if [[ "${1:-}" == --kind ]]; then
+    kind=${2:-}
+    [[ "$kind" == focused || "$kind" == other ]] || die "kind must be focused or other"
+    shift 2
+  fi
   (($#)) || die "usage: tools/attest-pr.sh --with-lock COMMAND [ARG...]"
-  trap release_lock EXIT
-  take_lock
-  "$@"
+  run_queued "$kind" "$@"
   exit
 fi
 
@@ -97,6 +100,12 @@ head=$(git rev-parse HEAD)
 [[ "$(gh pr view "$pr" --json headRefOid --jq .headRefOid)" == "$head" ]] \
   || die "local HEAD is not the head of pull request $pr; push first"
 
+# Re-enter under the supervisor so all command descendants and cleanup share one slot.
+if [[ "$queued" == false ]]; then
+  run_queued attestation bash tools/attest-pr.sh --queued-attestation "$pr"
+  exit
+fi
+
 tmp=$(mktemp -d)
 pg_container="attest-pr-postgres-$$"
 s3_container="attest-pr-s3-$$"
@@ -104,10 +113,8 @@ started=()
 cleanup() {
   if ((${#started[@]})); then docker rm -f "${started[@]}" >/dev/null 2>&1 || true; fi
   rm -rf "$tmp"
-  release_lock
 }
 trap cleanup EXIT
-take_lock
 
 # The producer runs the release the verifier workflow pins.
 version=$(sed -n 's/^ *release-version: *//p' .github/workflows/local-validation.yml)
