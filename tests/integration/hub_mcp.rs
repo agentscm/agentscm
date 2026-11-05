@@ -1586,7 +1586,7 @@ async fn done_leaves_blocked_work_blocked_and_says_so() {
         "AgentSCM: released; durable work remains blocked and its blocker was not resolved."
     );
     let overview = hub
-        .tool_result(&alice, "agentscm_work_overview", json!({}))
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
         .await;
     assert_eq!(
         overview["structuredContent"]["operational"]["work"][0]["state"], "blocked",
