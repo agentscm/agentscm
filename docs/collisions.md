@@ -114,7 +114,8 @@ Merge order (1 branch needs a new head):
   than 16 branches conflict with each other, `merge_order` is
   `{"complete": false, "reason": "..."}` and no order is suggested.
 - It is a prediction from pairwise `git merge-tree` results. Three branches can conflict
-  together even when no two of them do, and a later push changes the answer. Uncommitted
+  together even when no two of them do, and a later push changes the answer. It sees only
+  textual conflicts: two branches that merge cleanly can still break each other's tests. Uncommitted
   worktrees are not ordered. It costs one more `merge-tree` per branch.
 
 To check a repository's open pull requests, fetch first, then pass their branches. The
