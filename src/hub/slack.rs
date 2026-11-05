@@ -1388,11 +1388,11 @@ impl Slack {
             unix_now(),
         )?;
         Ok(match answered {
-            Answered::Granted { requester } => format!(
+            Answered::Granted { requester, .. } => format!(
                 "Handed {file} to {}. They see it on their next edit.",
                 label(&requester.1, &requester.0)
             ),
-            Answered::Declined { requester } => format!(
+            Answered::Declined { requester, .. } => format!(
                 "Kept {file} for now. {} sees that on their next edit.",
                 label(&requester.1, &requester.0)
             ),

@@ -93,11 +93,15 @@ const DID: Record<CoordinationResponseKind, string> = { propose_split: 'proposed
 
 
 /** "Your Codex" for the person's own agent, "dev’s Codex" for anyone else's. */
-export const named = (login: string, agent: string, me: string | null): string => (me !== null && login === me ? `Your ${agentName(agent)}` : `${login}’s ${agentName(agent)}`)
+export const named = (login: string, agent: string, me: string | null, session?: { sessionKey?: string; sessionKind?: string | null }): string => {
+  // A session the Hub identified replaces the connection's shared label: "Claude Code session 3f2a1b9c", "agent session 3f2a1b9c" when its kind is unknown.
+  const what = session?.sessionKey ? `${session.sessionKind || 'agent'} session ${session.sessionKey.slice(0, 8)}` : agentName(agent)
+  return me !== null && login === me ? `Your ${what}` : `${login}’s ${what}`
+}
 
 /** Who an action was done by: the agent, or a person acting for it on the Hub's web pages or in Slack (never passed off as the agent). */
-const actor = (a: { login: string; agent: string }, viaHub: boolean, me: string | null): string =>
-  viaHub ? (me !== null && a.login === me ? `You, as your ${agentName(a.agent)}` : `${a.login}, for their ${agentName(a.agent)}`) : named(a.login, a.agent, me)
+const actor = (a: { login: string; agent: string; sessionKey?: string; sessionKind?: string | null }, viaHub: boolean, me: string | null): string =>
+  viaHub ? (me !== null && a.login === me ? `You, as your ${agentName(a.agent)}` : `${a.login}, for their ${agentName(a.agent)}`) : named(a.login, a.agent, me, a)
 
 const uniq = (xs: string[]): string[] => [...new Set(xs)]
 const base = (path: string): string => path.replace(/\/+$/, '').split('/').pop() || path
@@ -270,8 +274,8 @@ function handoffThread(h: MyHandoff, me: string | null, works: Map<string, WorkI
   const mine = asHolder ? side(h.holder, true) : side(h.requester, true)
   const theirs = asHolder ? side(h.requester, false) : side(h.holder, false)
   const group: Group = !open ? 'earlier' : asHolder ? 'needs' : 'waiting'
-  const requester = named(h.requester.login, h.requester.agent, me)
-  const holder = named(h.holder.login, h.holder.agent, me)
+  const requester = named(h.requester.login, h.requester.agent, me, h.requester)
+  const holder = named(h.holder.login, h.holder.agent, me, h.holder)
   const rows: Row[] = [
     row({ key: 'asked', kind: 'agent', tone: h.requester.mine ? 'me' : '', agent: h.requester.agent, who: actor(h.requester, h.askedViaHub, me), did: 'asked for the file', at: h.createdAt, text: h.note, quote: !!h.note }),
   ]

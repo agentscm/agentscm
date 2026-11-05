@@ -83,8 +83,9 @@ pub struct Touched {
     /// Handoff requests to this session and answers to its requests, each told once; none
     /// while the call was refused.
     pub handoffs: Vec<HandoffNote>,
-    /// Refused files this call asked the holder to hand over (best effort).
-    pub requested: Vec<String>,
+    /// Refused files this call asked the holder to hand over (best effort), each with the holder
+    /// it asked.
+    pub requested: Vec<(String, Intent)>,
     /// Same-owner notice that this touch kept a lead whose recorded token or
     /// agent label did not match the caller. Empty when nothing was carried.
     pub lead_notes: Vec<String>,
@@ -383,6 +384,16 @@ fn contested(token: &str, via: &[String], keys: &[String], intents: Vec<Intent>)
     found
 }
 
+/// The one session a refused call asked, to be named in its refusal; `None` when it asked
+/// several (the wording stays generic) or none.
+pub fn asked_holder(requested: &[(String, Intent)]) -> Option<&Intent> {
+    let (_, first) = requested.first()?;
+    requested
+        .iter()
+        .all(|(_, holder)| holder.id == first.id)
+        .then_some(first)
+}
+
 /// What to do with the files a call edits for the first time, given the session's refusals so far.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Decision {
@@ -561,7 +572,7 @@ impl Guarded {
         announced: Option<Announced>,
         notices: Vec<HubEvent>,
         handoffs: Vec<HandoffNote>,
-        requested: Vec<String>,
+        requested: Vec<(String, Intent)>,
         lead_notes: Vec<String>,
     ) -> Touched {
         let Self {
@@ -736,17 +747,19 @@ async fn announce_with<T: Send + 'static>(
         text.push_str(note);
     }
     let deny = (!touched.denied.is_empty()).then(|| {
+        // Say the holder was asked only when every refused file was.
+        let requested = !touched.requested.is_empty()
+            && touched
+                .denied
+                .iter()
+                .flat_map(|overlap| &overlap.your_paths)
+                .all(|path| touched.requested.iter().any(|(asked, _)| asked == path));
         advice::deny_reason(
             &touched.denied,
-            // Say the holder was asked only when every refused file was.
             (
                 Some(&touched.session),
-                !touched.requested.is_empty()
-                    && touched
-                        .denied
-                        .iter()
-                        .flat_map(|overlap| &overlap.your_paths)
-                        .all(|path| touched.requested.contains(path)),
+                requested,
+                asked_holder(&touched.requested),
             ),
             unix_now(),
         )

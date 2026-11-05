@@ -196,6 +196,17 @@ describe('Inbox', () => {
     expect(rows.at(-1)).toContain('sees it at its next edit')
   })
 
+  it('names the requesting session by kind and the first 8 of its key, and keeps the agent name without one', async () => {
+    const key = '3f2a1b9c0d4e5f60'
+    const withSession = handoffRow('hof_5', 'pending', 'holder', { requester: { agent: 'codex', login: 'dev', mine: false, session_key: key, session_kind: 'Claude Code' } })
+    hub([], [withSession, handoffRow('hof_6', 'pending', 'holder', { path: 'src/other.rs' })])
+    render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} session={session} />)
+    await screen.findAllByText('Hand over retry.rs?')
+    expect(screen.getAllByText(/dev’s Claude Code session 3f2a1b9c/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(new RegExp(key))).toBeNull()
+    expect(screen.getAllByText(/dev’s Codex/).length).toBeGreaterThan(0)
+  })
+
   it('marks a handoff answered from a Slack button as the person’s, from Slack', async () => {
     hub([], [handoffRow('hof_4', 'declined', 'holder', { path: 'src/tax.rs', decided_at: now - 100, requester_told: true, answered_via_slack: true })])
     render(<InboxPage token="t" overview={ready(overviewOf({ overlaps: [] }))} handoff={me} session={session} />)

@@ -713,7 +713,30 @@ counter-offer.
 Events `handoff_request` (by the requester), `handoff_grant` and
 `handoff_decline` (by the holder) are recorded, carry the path, note (or the decline's reason) and the
 other agent, and appear on the status page's activity feed and contested-files
-card.
+card. The other side is `to` (the asked holder) or `from` (the requester), each with
+`session: {key, kind}`: the session key described under [intents and notices](#intents-and-notices)
+and the brand of its first `hook:` connection (null when unknown), never the session id. The event's
+top-level `session` is the id and is removed from the activity route; the nested key is not.
+
+**Which session.** A request is filed against one holding session and delivered only to it:
+rows are matched on the holder's `(token, session)`, so a second session of the same token
+(a bystander) is never told and cannot answer; an answer with no session named is refused
+when the token has several hook sessions. When a refusal asks several holders (different
+files, different sessions), its text keeps the generic "asked the holder"; when it asked
+one, it says `AgentSCM asked bob's Claude Code session 3f2a1b9c to hand it over`. Each side
+is named in the other's lines the same way (`bob's Claude Code session 3f2a1b9c asks to take
+over src/a.rs`; `agent session 3f2a1b9c` when the kind is unknown, for example after the
+requester's session ended). A request or answer made by a person from the Hub's pages or
+Slack keeps its wording. The status page's handoff list carries `session_key` and
+`session_kind` for both sides, for any reader; the raw `session` stays for the person's own
+agent only.
+
+Limits: this is correct delivery among cooperating sessions, not an authorization boundary,
+because any holder of the token can name any of its sessions. A session key is a digest of
+the token and the session name, so it changes when the token is renewed with a new token
+id, and a request filed against the old token is not delivered to, or answerable from, the
+same session name under the new one (it lapses after 30 minutes). Worktree and branch names
+are not part of the identity.
 
 The rest of the session rules:
 
