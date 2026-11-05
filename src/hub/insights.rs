@@ -775,6 +775,8 @@ mod tests {
             .collect();
         let last = history.last().unwrap();
         let item = WorkItem {
+            initial_issue_choice: Default::default(),
+            issue_link: None,
             id: "wrk_0123456789abcdef0123456789abcdef".into(),
             repository: "sample/repo".into(),
             owner: "user".into(),

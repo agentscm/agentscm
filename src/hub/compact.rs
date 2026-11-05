@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use super::catchup::CatchupPreview;
 use super::coordination::CoordinationRequest;
 use super::narrative::NarrativeView;
+use super::planned_issues::{IssueCandidateAdvice, PlannedIssue, PlannedIssuesView};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkStartConflict};
 use super::work_http::actionable_status::ActionableStatus;
 use super::work_preflight::WorkPreflightResult;
@@ -54,7 +55,41 @@ pub(super) fn brief(item: &WorkItem) -> Value {
         "updated_at": item.updated_at, "branch": item.branch,
         "scope": item.scope.iter().take(SCOPE_PATHS).collect::<Vec<_>>(), "scope_count": item.scope.len(),
         "next_action": item.next_action.as_deref().map(|text| clip(text, TEXT_CHARS)),
-        "blocked": item.blocker.is_some()})
+        "blocked": item.blocker.is_some(), "issue_link": item.issue_link})
+}
+
+fn issue(issue: &PlannedIssue) -> Value {
+    json!({"identity": issue.identity, "title": clip(&issue.title, TITLE_CHARS),
+        "milestone": issue.milestone.as_ref().map(|m| clip(&m.title, TITLE_CHARS))})
+}
+
+/// Planned issues with their coverage, at most five of each kind. Absence is never proved: the
+/// coverage and completeness fields say what was read.
+fn planned(view: &PlannedIssuesView) -> Value {
+    json!({"coverage": view.coverage, "freshness": view.freshness,
+        "evaluated_at_ms": view.evaluated_at_ms, "unread_pages": view.unread_pages,
+        "linkage_complete": view.linkage_complete, "complete": view.complete,
+        "unclaimed": view.unclaimed.iter().take(LIST).map(issue).collect::<Vec<_>>(),
+        "unclaimed_listed": view.unclaimed.len(),
+        "linked": view.linked.iter().take(LIST).map(|linked| {
+            let mut value = issue(&linked.issue);
+            value["work_ids"] = json!(linked.work_ids);
+            value
+        }).collect::<Vec<_>>(),
+        "linked_listed": view.linked.len(),
+        "linkage_unknown": view.linkage_unknown.iter().take(LIST).map(issue).collect::<Vec<_>>(),
+        "linkage_unknown_listed": view.linkage_unknown.len(),
+        "read": "agentscm_work_overview with detail full"})
+}
+
+/// The exact-reference issue candidates to choose `issue_choice` from.
+fn issue_advice(advice: &IssueCandidateAdvice) -> Value {
+    json!({"candidates": advice.candidates.iter().take(LIST).map(issue).collect::<Vec<_>>(),
+        "candidates_listed": advice.candidates.len(),
+        "references_complete": advice.references_complete,
+        "choice_provided": advice.choice_provided,
+        "planning": {"coverage": advice.planning.coverage, "freshness": advice.planning.freshness,
+            "complete": advice.planning.complete}})
 }
 
 /// Where a compact overview page starts.
@@ -146,6 +181,7 @@ pub(super) fn overview(
         "history_retention_gap": overview.history_retention_gap,
         "settled_count": overview.settled_count,
         "held_reservations": held.work.len(), "held_reservations_complete": held.complete,
+        "planned_issues": first.then(|| planned(&overview.planned_issues)),
         "pages": "The first page lists current Work, recent outcomes and at most five overlap pairs (all of them with detail full). Pass next_after or next_recent_before, with the same limit, to continue that list alone. Pages are not one snapshot.",
     })
 }
@@ -204,6 +240,7 @@ fn preflight(preflight: &WorkPreflightResult) -> Value {
         "merge_after": preflight.merge_after, "merge_through": preflight.merge_through,
         "current_merge_through": preflight.current_merge_through,
         "reasons": preflight.reasons,
+        "issue_advice": issue_advice(&preflight.issue_advice),
         "subject_match": preflight.subject_match.as_ref().map(brief),
         "scope_overlaps": preflight.scope_overlaps.iter().take(LIST).map(|o| brief(&o.item)).collect::<Vec<_>>(),
         "scope_overlaps_listed": preflight.scope_overlaps.len(),
@@ -230,7 +267,12 @@ pub(super) fn context(overview: &WorkOverview) -> Value {
         "overlaps": overview.overlaps.len(), "current_complete": overview.current_complete,
         "recent_complete": overview.recent_complete, "overlaps_complete": overview.overlaps_complete,
         "recent_since": overview.recent_since, "until": overview.until,
-        "settled_count": overview.settled_count, "read": "agentscm_work_overview"})
+        "settled_count": overview.settled_count,
+        "planned_issues": {"unclaimed": overview.planned_issues.unclaimed.len(),
+            "linked": overview.planned_issues.linked.len(),
+            "linkage_unknown": overview.planned_issues.linkage_unknown.len(),
+            "complete": overview.planned_issues.complete},
+        "read": "agentscm_work_overview"})
 }
 
 /// The startup briefing preview, by counts; `agentscm_work_briefing` pages it.
@@ -238,6 +280,10 @@ pub(super) fn briefing(briefing: &Briefing) -> Value {
     json!({"subscriber": briefing.subscriber, "delivery": briefing.delivery,
         "from": briefing.from, "through": briefing.through, "items": briefing.items.len(),
         "events": briefing.events.len(), "retention_gap": briefing.retention_gap,
+        "planned_issues": {"unclaimed": briefing.planned_issues.unclaimed.len(),
+            "linked": briefing.planned_issues.linked.len(),
+            "linkage_unknown": briefing.planned_issues.linkage_unknown.len(),
+            "complete": briefing.planned_issues.complete},
         "complete": briefing.complete, "read": "agentscm_work_briefing"})
 }
 
