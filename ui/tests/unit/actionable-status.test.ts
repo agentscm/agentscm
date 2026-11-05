@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import type { ActionableStatus } from '../../src/actionableStatus.ts'
-import { needsYou, needHideKey } from '../../src/needs.ts'
+import { inboxBadge, needsYou, needHideKey } from '../../src/needs.ts'
 import { decodeStatus, recipientLabel, statusLabel, statusProvenance } from '../../src/actionableStatus.ts'
 import { DashboardPage, dashboardStatus, SharedAnswer, SharedNeeds } from '../../src/pages/Dashboard.tsx'
 import type { WorkOverview } from '../../src/standup.ts'
@@ -76,6 +76,20 @@ describe('shared actionable status', () => {
     expect(screen.getByText('Awaiting a named party · viewer')).toBeTruthy()
     expect(screen.queryByText(/waiting for another agent/i)).toBeNull()
     expect(screen.getByText(/Coverage is incomplete/)).toBeTruthy()
+  })
+  it('sends failed checks and stopped gates to their pages and counts them in the badge', () => {
+    const status = decodeStatus(fixture)
+    const base = status.actions[0]!
+    status.actions = [
+      { ...base, id: 'check:rep_synthetic:5:agentscm/local-validation', kind: 'failed_check', action: 'Required check agentscm/local-validation reports failure on pull request #5; fix or rerun it before merging.' },
+      { ...base, id: 'gate:run_synthetic:tests', kind: 'skill_gate', action: 'pr-gate is at its tests gate on branch feature/g and the agent that recorded it has stopped.' },
+    ]
+    status.counts.needs_you = status.work.filter((w) => w.needs_you).length + 2
+    expect(dashboardStatus(null, null, null, null, new Set(), undefined, status).needs).toHaveLength(status.counts.needs_you)
+    expect(inboxBadge(null, undefined, status).n).toBe(0)
+    render(createElement(SharedNeeds, { status: { kind: 'ready', value: status, fetchedAt: 0, refreshError: null, retry: () => undefined } }))
+    expect(screen.getByRole('link', { name: 'Open changes' }).getAttribute('href')).toBe('#landed')
+    expect(screen.getByRole('link', { name: 'Open Skills' }).getAttribute('href')).toBe('#skills')
   })
   it('labels provider failure and retained refresh results separately from clear status', () => {
     const status = decodeStatus(fixture)

@@ -161,7 +161,9 @@ fn files(value: &Value) -> BTreeSet<&str> {
         .collect()
 }
 
-fn provider_evidence(
+/// The retained provider snapshot for `context.pull_request`'s exact head and base, after the
+/// repository's grant observation; shared with the actionable-status check producer.
+pub(super) fn provider_evidence(
     context: &Value,
     repository_id: i64,
     rows: &[Observation],
