@@ -109,6 +109,7 @@ fn busy(hub: &Hub) -> Vec<(String, String)> {
             related_work: Vec::new(),
             takeover_generation: None,
             preflight: None,
+            issue_choice: None,
         };
         let item = hub.store.work_start(token, &start, now).unwrap().item;
         let mut seq = item.updated_seq;
@@ -163,6 +164,7 @@ fn busy(hub: &Hub) -> Vec<(String, String)> {
             related_work: Vec::new(),
             takeover_generation: None,
             preflight: None,
+            issue_choice: None,
         };
         hub.store.work_start(token, &start, now + 2).unwrap();
     }
