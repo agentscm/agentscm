@@ -365,6 +365,57 @@ async fn session_end_pauses_known_work_without_claiming_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_end_naming_no_session_pauses_no_work() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    let started = hub
+        .store
+        .work_start_auto(
+            &principal.token_id,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: None,
+                title: "implement hook handover".into(),
+                session: "default".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/hub/hook.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let state = |hub: &Hub| {
+        hub.store
+            .work_get(&principal.token_id, &started.item.id, unix_now())
+            .unwrap()
+            .unwrap()
+            .state
+    };
+
+    // The session an omitted name resolves to is not the call's own, so its Work is kept.
+    hub.hook("generic", &secret, &json!({"event": "done"}));
+    assert_eq!(state(&hub), WorkState::Active);
+    hub.hook(
+        "generic",
+        &secret,
+        &json!({"event": "done", "session": "default"}),
+    );
+    assert_eq!(state(&hub), WorkState::Paused);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_start_flags_records_omitted_from_a_complete_preview() {
     let mut hub = Hub::start().await;
     let secret = hub.agent();

@@ -681,6 +681,32 @@ impl ForgeWorkRef {
 }
 
 impl WorkCheckpoint {
+    /// The pause that ends a session whose Work reported no outcome. It keeps the next action and
+    /// relations. Its operation id follows the Work's generation and sequence, so a repeat of the
+    /// same end is a replay, and any change to the Work fences it.
+    pub(super) fn auto_pause(item: &WorkItem, via: &str) -> Self {
+        Self {
+            work_id: item.id.clone(),
+            operation_id: format!("{via}-done-{}-{}", item.generation, item.updated_seq),
+            generation: item.generation,
+            expected_updated_seq: Some(item.updated_seq),
+            session: item.lead_session.clone(),
+            kind: CheckpointKind::Pause,
+            summary: AUTO_PAUSE_SUMMARY.into(),
+            next_action: item
+                .next_action
+                .clone()
+                .or_else(|| Some("Resume or deliberately hand over this unfinished work.".into())),
+            scope: None,
+            branch: None,
+            worktree: None,
+            resolve_blocker: false,
+            source_refs: Vec::new(),
+            depends_on: item.depends_on.clone(),
+            related_work: item.related_work.clone(),
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         validate_id("work", &self.work_id, "wrk")?;
         label("operation_id", &self.operation_id)?;
