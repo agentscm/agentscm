@@ -366,7 +366,12 @@ impl Env {
             .events_after(0, 1000)
             .unwrap()
             .into_iter()
-            .filter(|event| event.kind != "provider_context_observed")
+            .filter(|event| {
+                !matches!(
+                    event.kind.as_str(),
+                    "provider_context_observed" | "planned_issues_observed"
+                )
+            })
             .collect()
     }
 
@@ -1815,7 +1820,11 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
     kinds.sort_unstable();
     assert_eq!(
         kinds,
-        vec!["connection_status", "provider_context_observed"]
+        vec![
+            "connection_status",
+            "planned_issues_observed",
+            "provider_context_observed"
+        ]
     );
     let health_event = added
         .iter()
@@ -1832,6 +1841,18 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
         .unwrap();
     let health: Value = serde_json::from_str(&health.data).unwrap();
     assert_eq!(health["availability"], "unavailable");
+    let planned = env
+        .store
+        .observation(&env.repo().id, "planned_issues", "_snapshot")
+        .unwrap()
+        .unwrap();
+    let planned: agentscm::hub::planned_issues::PlannedIssueSnapshot =
+        serde_json::from_str(&planned.data).unwrap();
+    assert_eq!(
+        planned.coverage,
+        agentscm::hub::planned_issues::IssueCoverage::Unavailable
+    );
+    assert!(!planned.complete(unix_now() * 1000));
     let events_after_failure = env.event_count();
     // The failed credential is not retried every round.
     let next = env
@@ -1856,7 +1877,8 @@ async fn bad_credentials_and_rate_limits_change_the_connection_not_the_data() {
         });
     });
     env.refresh(&connection).await;
-    assert_eq!(env.event_count(), events_after_failure);
+    // Independent planning coverage records the new failed discovery attempt.
+    assert_eq!(env.event_count(), events_after_failure + 1);
     // A working call (an administrator's refresh does not wait) puts it back.
     assert_eq!(env.refresh(&connection).await.len(), 1);
     assert_eq!(status().await, ("enabled".to_owned(), Value::Null));
