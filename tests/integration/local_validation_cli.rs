@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use agentscm::local_validation::{
-    CHECK_KIND, RecipeCommand, Services, ValidationPolicy, ValidationRecipe, comment,
+    CHECK_KIND, RecipeCommand, Services, TestSelection, TestSelectionRule, ValidationPolicy,
+    ValidationRecipe, comment,
 };
 use agentscm::policy::issuers::{
     CommonControl, IssuerKeyRecord, IssuerRecord, IssuerRegistrySnapshot, issuer_key_id,
@@ -156,6 +157,14 @@ impl Fixture {
             .arg(data)
             .arg("local-validation")
             .args(args)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root().join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("GH_TOKEN", "synthetic-secret")
             .output()
             .unwrap()
@@ -874,4 +883,49 @@ fn unsafe_trust_paths_are_refused_by_run_and_verify() {
         ]);
         assert_eq!(out.status.code(), Some(2), "{flag:?}");
     }
+}
+
+#[test]
+fn selected_cli_evidence_round_trips_and_tampering_is_rejected() {
+    let selected = RecipeCommand {
+        id: "nextest".into(),
+        argv: ["cargo", "nextest", "run", "--locked"]
+            .map(String::from)
+            .to_vec(),
+        timeout_secs: 30,
+        paths: None,
+        test_selection: Some(TestSelection {
+            rules: vec![TestSelectionRule {
+                path: "a.txt".into(),
+                filter: "test(/^synthetic::/)".into(),
+            }],
+        }),
+    };
+    let f = Fixture::new(vec![selected]);
+    // The command transport is synthetic; Git, signing and verification are real.
+    fs::create_dir(f.root().join("bin")).unwrap();
+    let cargo = f.root().join("bin/cargo");
+    fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    git(&f.repo(), &["reset", "--hard", "origin/main"]);
+    fs::write(f.repo().join("a.txt"), "changed").unwrap();
+    git(&f.repo(), &["commit", "-qam", "mapped change"]);
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let (_, record) = record_of(&f, &sha);
+    assert_eq!(record["selections"][0]["reason"], "selected");
+    assert_eq!(record["results"][0]["argv"][5], "(test(/^synthetic::/))");
+    let body = f.show_to_file(&sha, "selected.md");
+    assert!(
+        fs::read_to_string(&body)
+            .unwrap()
+            .contains("Test selection for")
+    );
+    assert_eq!(f.verify(&body, "repo-1").0, 0);
+    let (envelope, mut record) = comment::parse(&fs::read_to_string(&body).unwrap()).unwrap();
+    let mut value: Value = serde_json::from_slice(&record).unwrap();
+    value["selections"][0]["paths"] = serde_json::json!(["forged.txt"]);
+    record = serde_json::to_vec(&value).unwrap();
+    fs::write(&body, comment::render(&envelope, &record).unwrap()).unwrap();
+    assert_ne!(f.verify(&body, "repo-1").0, 0);
 }

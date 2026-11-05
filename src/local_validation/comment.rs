@@ -94,6 +94,31 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
             r.duration_ms
         ));
     }
+    for selection in &parsed.selections {
+        body.push_str(&format!(
+            "- Test selection for {}: {:?}; paths: {}; filters: {}; argv: {}\n",
+            code(&selection.command_id),
+            selection.reason,
+            selection
+                .paths
+                .iter()
+                .map(|p| code(p))
+                .collect::<Vec<_>>()
+                .join(", "),
+            selection
+                .filters
+                .iter()
+                .map(|f| code(f))
+                .collect::<Vec<_>>()
+                .join(", "),
+            selection
+                .argv
+                .iter()
+                .map(|a| code(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+    }
     if !parsed.not_required.is_empty() {
         let ids: Vec<String> = parsed.not_required.iter().map(|id| code(id)).collect();
         body.push_str(&format!(

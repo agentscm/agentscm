@@ -1162,6 +1162,56 @@ mod scoped {
         assert!(!exempt(d.path(), &b, &h, &["docs/**"]));
     }
 
+    #[test]
+    fn combined_git_batch_detects_a_semantic_failure_between_green_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("left.rs"), "pub const VALUE: u32 = 1;\n").unwrap();
+        std::fs::write(p.join("right.rs"), "pub const VALUE: u32 = 1;\n").unwrap();
+        std::fs::write(
+            p.join("check.rs"),
+            "mod left; mod right; #[test] fn capacity() { assert!(left::VALUE + right::VALUE <= 3); }\n",
+        ).unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        let base = git(p, &["rev-parse", "HEAD"]);
+        let output = tempfile::tempdir().unwrap();
+        let check = || {
+            let binary = output.path().join("capacity");
+            let compiled = Command::new("rustc")
+                .current_dir(p)
+                .args(["--test", "check.rs", "-o"])
+                .arg(&binary)
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            Command::new(binary).output().unwrap()
+        };
+        git(p, &["checkout", "-qb", "left"]);
+        std::fs::write(p.join("left.rs"), "pub const VALUE: u32 = 2;\n").unwrap();
+        git(p, &["commit", "-qam", "left"]);
+        assert!(check().status.success());
+        git(p, &["checkout", "-qb", "right", &base]);
+        std::fs::write(p.join("right.rs"), "pub const VALUE: u32 = 2;\n").unwrap();
+        git(p, &["commit", "-qam", "right"]);
+        assert!(check().status.success());
+        git(p, &["merge", "--no-ff", "-qm", "batch", "left"]);
+        let combined = check();
+        assert!(!combined.status.success());
+        assert!(String::from_utf8_lossy(&combined.stdout).contains("capacity ... FAILED"));
+        assert_eq!(
+            git(p, &["rev-list", "--parents", "-n", "1", "HEAD"])
+                .split_whitespace()
+                .count(),
+            3
+        );
+    }
+
     fn selection_recipe() -> ValidationRecipe {
         let mut r = recipe();
         r.commands[0].argv = ["cargo", "nextest", "run", "--locked"]
