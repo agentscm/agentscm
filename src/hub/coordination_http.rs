@@ -14,7 +14,7 @@ use tokio::time::Instant;
 use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
     CoordinationReply, CoordinationRequest, CoordinationResolve, CoordinationResponseKind,
-    CoordinationWithdraw,
+    CoordinationWithdraw, CoordinationWithdrawTarget,
 };
 use super::handoff::{Answered, Asked, HandoffParty, Via};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
@@ -36,6 +36,10 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/coordination/withdraw", post(withdraw))
         .route("/v1/hub/session/handoffs", get(person_handoffs))
         .route("/v1/hub/session/coordination/reply", post(person_reply))
+        .route(
+            "/v1/hub/session/coordination/withdraw",
+            post(person_withdraw),
+        )
         .route("/v1/hub/session/work/transition", post(person_transition))
         .route("/v1/hub/session/handoff/answer", post(person_answer))
         .route("/v1/hub/session/handoff/ask", post(person_ask))
@@ -272,6 +276,53 @@ async fn person_reply(
         store
             .coordination_reply(&body.token, &reply, now)
             .map(|result| shown(result, &owner))
+    })
+    .await
+    .map_err(person_error)?;
+    CHANGED.notify_waiters();
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonWithdraw {
+    /// The agent token that leads a target Work of the request.
+    token: String,
+    request_id: String,
+    operation_id: String,
+    session: String,
+    expected_updated_seq: i64,
+    target_work_id: String,
+    target_generation: i64,
+}
+
+/// A signed-in person closes a request whose requesting agent is gone, for their own agent that
+/// leads the affected Work. It is the store's lead cleanup, so it works only while the requester
+/// is revoked, expired or disabled; nothing is released and the audit says a person did it.
+async fn person_withdraw(
+    State(state): State<HubState>,
+    human: HumanSession,
+    JsonBody(body): JsonBody<PersonWithdraw>,
+) -> std::result::Result<Json<CoordinationRequest>, ApiError> {
+    let owner = human.web_user()?.id.clone();
+    let store = state.store.clone();
+    let result = blocking(&state, move || {
+        let now = unix_now();
+        if !owns_agent(&*store, &owner, &body.token, now)? {
+            return Err(HubError::Unauthorized);
+        }
+        let withdraw = CoordinationWithdraw {
+            request_id: body.request_id,
+            operation_id: body.operation_id,
+            session: body.session,
+            expected_updated_seq: body.expected_updated_seq,
+            target: Some(CoordinationWithdrawTarget {
+                work_id: body.target_work_id,
+                generation: body.target_generation,
+            }),
+            via_hub: true,
+        };
+        store.coordination_withdraw(&body.token, &withdraw, now)
     })
     .await
     .map_err(person_error)?;

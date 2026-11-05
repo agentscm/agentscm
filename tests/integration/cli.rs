@@ -58,9 +58,13 @@ fn cli_parsing_works_with_a_small_main_thread_stack() {
 
     let invalid = agentscm_with_small_stack(&["init-repo", "--invalid-option"]);
     assert_eq!(invalid.status.code(), Some(2));
-    let error: Value = serde_json::from_slice(&invalid.stderr).expect("JSON standard error");
-    assert_eq!(error["ok"], false);
-    assert_eq!(error["error_kind"], "invalid");
+    // Usage errors are clap's own text even when standard error is a pipe.
+    let usage = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        usage.contains("unexpected argument '--invalid-option'") && usage.contains("Usage:"),
+        "{usage}"
+    );
+    assert!(serde_json::from_slice::<Value>(&invalid.stderr).is_err());
 
     let capture = agentscm_with_small_stack(&["workspace-client", "hook", "--unknown-option"]);
     assert!(capture.status.success());
@@ -70,8 +74,7 @@ fn cli_parsing_works_with_a_small_main_thread_stack() {
     );
     let stop = agentscm_with_small_stack(&["skill-workflow", "claude-stop", "--unknown-option"]);
     assert_eq!(stop.status.code(), Some(1));
-    let error: Value = serde_json::from_slice(&stop.stderr).expect("JSON stop-hook error");
-    assert_eq!(error["error_kind"], "invalid");
+    assert!(String::from_utf8_lossy(&stop.stderr).contains("unexpected argument"));
 }
 
 #[test]

@@ -34,8 +34,8 @@ use super::promise::{
     PromiseInputV1, PromiseViewV1, current_admission,
 };
 use super::session::{
-    SESSION_REQUIRED, SessionCall, announce_for, announce_named, done_for, duplicates_for,
-    others_for, status_for,
+    DEFAULT_SESSION, SESSION_REQUIRED, SessionCall, announce_for, announce_named, done_for,
+    duplicates_for, others_for, status_for,
 };
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
@@ -593,8 +593,11 @@ fn initialize(
         "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
         "instructions": match (read_only, all_tools) {
             (true, _) => READ_ONLY_INSTRUCTIONS.to_owned(),
-            (false, false) => AGENT_INSTRUCTIONS.to_owned(),
-            (false, true) => format!("{AGENT_INSTRUCTIONS}{ALL_TOOLS_INSTRUCTIONS}"),
+            (false, false) => format!("{} {AGENT_INSTRUCTIONS}", super::agent_rules::prose()),
+            (false, true) => format!(
+                "{} {AGENT_INSTRUCTIONS}{ALL_TOOLS_INSTRUCTIONS}",
+                super::agent_rules::prose()
+            ),
         },
     })
 }
@@ -3306,7 +3309,23 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             unknown("other agents could not be listed")
         }
     });
-    if advice
+    let unlinked = if named || advice.touched.session != DEFAULT_SESSION {
+        None
+    } else {
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        match blocking(state, move || store.default_session_bound(&token)).await {
+            Ok(false) => None,
+            Ok(true) => Some(unlinked_start(&work.item, false)),
+            Err(error) => {
+                eprintln!("hub: default session binding for a start: {error}");
+                Some(unlinked_start(&work.item, true))
+            }
+        }
+    };
+    if let Some(warning) = &unlinked {
+        parts.push(warning.clone());
+    } else if advice
         .touched
         .via
         .iter()
@@ -3314,14 +3333,29 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     {
         parts.push(HOOKED.to_owned());
     }
-    Ok(start_result(
-        parts.join("\n"),
-        briefing,
-        work,
-        catchup,
-        false,
-        detail,
-    ))
+    let mut result = start_result(parts.join("\n"), briefing, work, catchup, false, detail);
+    if let Some(warning) = unlinked
+        && let Some(object) = result["structuredContent"].as_object_mut()
+    {
+        // The claim is held, but by `default`: an edit hook may not link to it, so not ready.
+        object.insert("ready_for_work".into(), json!(false));
+        object.insert("session_warning".into(), json!(warning));
+    }
+    Ok(result)
+}
+
+/// The warning for a start that named no session and landed on `default` while one native
+/// session's hooks are bound to it: other conversations' edits will not link to this claim.
+fn unlinked_start(item: &WorkItem, unknown: bool) -> String {
+    let why = if unknown {
+        "AgentSCM could not check whether edit hooks link to it"
+    } else {
+        "edit hooks link `default` to one earlier native session only, so your edits are not linked to this claim unless this is that session"
+    };
+    format!(
+        "AgentSCM: this start named no session, so {id} is held by session `default`, and {why}. Do not edit yet. Link it to this conversation: call agentscm_start again with work_id {id}, the same task and paths, and session set to your native session ID (the AgentSCM SessionStart context shows it); that moves the claim from `default` to your session. A client without hooks passes any stable session name of its own.",
+        id = item.id,
+    )
 }
 
 fn start_result(

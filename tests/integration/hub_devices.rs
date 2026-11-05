@@ -1216,7 +1216,7 @@ async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
     env.fake.lock().unwrap().approve = ALICE;
     let machine = Machine::new(REPO);
     let (hub, root) = (env.hub.clone(), machine.root());
-    let (ok, _, stderr) = machine.run(&[
+    let (ok, connected, stderr) = machine.run(&[
         "--no-telemetry",
         "client",
         "connect",
@@ -1228,6 +1228,10 @@ async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
         root.to_str().unwrap(),
     ]);
     assert!(ok, "{stderr}");
+    assert!(
+        connected.contains("renews automatically") && connected.contains("agentscm client renew"),
+        "{connected}"
+    );
     let expires = machine.connection()["owned_token_expires_at"]
         .as_i64()
         .unwrap();
@@ -1264,6 +1268,14 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     // Before auto-connect is on, an agent in the checkout is only told how to connect.
     let reply = machine.session_start("s0");
     assert!(context(&reply).contains("no client connection"), "{reply}");
+    // whoami says what the unchosen setting does and how to choose it.
+    let (ok, whoami, stderr) = machine.run(&["hub", "whoami"]);
+    assert!(ok, "{stderr}");
+    assert!(whoami.contains("auto-connect not chosen yet"), "{whoami}");
+    assert!(
+        whoami.contains(&format!("agentscm hub auto-connect on|off --hub {hub}")),
+        "{whoami}"
+    );
     let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
     assert!(ok, "{stderr}");
 
@@ -1952,6 +1964,187 @@ async fn a_web_session_answers_a_coordination_request_only_for_its_own_agent() {
         .collect();
     assert_eq!(responded.len(), 1);
     assert!(responded[0].data.contains("\"via\":\"hub\""));
+}
+
+const WITHDRAW: &str = "/v1/hub/session/coordination/withdraw";
+
+#[tokio::test]
+async fn a_web_session_closes_a_request_only_once_its_requester_is_gone() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (lead, lead_secret) = agent_for(&env, &alice.id, "claude-code", false);
+    let (lead_read_only, _) = agent_for(&env, &alice.id, "viewer", true);
+    let (asker, _) = agent_for(&env, &bob.id, "codex", false);
+    let now = unix_now();
+    let incumbent = env
+        .store
+        .work_start(&lead, &work("billing", "alice-session"), now)
+        .unwrap()
+        .item;
+    let request = env
+        .store
+        .work_start(&asker, &work("rounding", "bob-session"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let target = &request.targets[0];
+    let body = |token: &str, operation: &str| {
+        json!({"token": token, "request_id": request.id, "operation_id": operation,
+            "session": "alice-session", "expected_updated_seq": request.updated_seq,
+            "target_work_id": target.work_id, "target_generation": target.generation})
+    };
+    let action = format!("request:{}:{}", request.id, target.work_id);
+    let has_action = |status: &Value| {
+        status["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(action) && a["kind"] == "directed_request")
+    };
+    let listed = |value: &Value| value["requests"][0]["requester_unavailable"].clone();
+
+    // While the requesting agent can act, nobody closes it for it, and the list says so.
+    let (_, status) = env.get("/v1/hub/standup/status", &lead_secret).await;
+    assert!(has_action(&status), "{status}");
+    let (_, before) = env.get("/v1/hub/standup/coordination", &lead_secret).await;
+    assert_eq!(listed(&before), Value::Null, "{before}");
+    let (status, refused) = page_post(&env, &alice, true, WITHDRAW, body(&lead, "early")).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    // The requester's owner cannot close its live request here either: this route is for leads.
+    let mut as_requester = body(&asker, "own");
+    as_requester["session"] = json!("bob-session");
+    let (status, refused) = page_post(&env, &bob, true, WITHDRAW, as_requester).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+
+    env.store.revoke_agent_token(&asker).unwrap();
+    let (_, after) = env.get("/v1/hub/standup/coordination", &lead_secret).await;
+    assert_eq!(listed(&after), json!(true), "{after}");
+
+    // Signed out, a cookie without its CSRF token, and a computer's bearer session are refused.
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            WITHDRAW,
+            None,
+            Some(body(&lead, "a")),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, refused) = page_post(&env, &alice, false, WITHDRAW, body(&lead, "a")).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (session, _, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, refused) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            WITHDRAW,
+            Some(&session),
+            Some(body(&lead, "a")),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("forbidden"))
+    );
+
+    // Nobody closes it for an agent that is not theirs: not another person's, not a read-only
+    // token of their own, not one that does not exist. All look alike.
+    for (who, token) in [
+        (&bob, lead.as_str()),
+        (&alice, asker.as_str()),
+        (&alice, lead_read_only.as_str()),
+        (&alice, "tok_00000000000000000000000000000000"),
+    ] {
+        let (status, refused) = page_post(&env, who, true, WITHDRAW, body(token, "b")).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (403, Some("not_your_agent")),
+            "{token}"
+        );
+    }
+    // The store's own rule still holds for the right owner: only the Work's lead session.
+    let mut wrong_session = body(&lead, "c");
+    wrong_session["session"] = json!("someone-elses-session");
+    assert_eq!(
+        page_post(&env, &alice, true, WITHDRAW, wrong_session)
+            .await
+            .0,
+        403
+    );
+
+    // Unknown fields (no one sets the mark themselves), a missing fence and bad values are refused.
+    let mut marked = body(&lead, "d");
+    marked["via_hub"] = json!(false);
+    assert_eq!(page_post(&env, &alice, true, WITHDRAW, marked).await.0, 400);
+    let mut unfenced = body(&lead, "d");
+    unfenced
+        .as_object_mut()
+        .unwrap()
+        .remove("target_generation");
+    assert_eq!(
+        page_post(&env, &alice, true, WITHDRAW, unfenced).await.0,
+        400
+    );
+    let mut zero = body(&lead, "d");
+    zero["target_generation"] = json!(0);
+    assert_eq!(page_post(&env, &alice, true, WITHDRAW, zero).await.0, 400);
+
+    // A page that saw an older sequence or generation is told to look again.
+    for (field, value) in [
+        ("expected_updated_seq", json!(request.updated_seq + 99)),
+        ("target_generation", json!(target.generation + 1)),
+    ] {
+        let mut stale = body(&lead, "e");
+        stale[field] = value;
+        let (status, refused) = page_post(&env, &alice, true, WITHDRAW, stale).await;
+        assert_eq!(status, 400, "{refused}");
+        assert!(
+            refused["message"].as_str().unwrap().contains("changed"),
+            "{refused}"
+        );
+    }
+    let (_, untouched) = env.get("/v1/hub/standup/coordination", &lead_secret).await;
+    assert_eq!(untouched["requests"][0]["status"], "pending");
+
+    // The owner closes it for the agent that leads the Work; the record says a person did.
+    let (status, closed) = page_post(&env, &alice, true, WITHDRAW, body(&lead, "f")).await;
+    assert_eq!(status, 200, "{closed}");
+    assert_eq!(closed["status"], "withdrawn");
+    // A retry replays the same close instead of closing twice.
+    let (status, replay) = page_post(&env, &alice, true, WITHDRAW, body(&lead, "f")).await;
+    assert_eq!(
+        (status, &replay["updated_seq"]),
+        (200, &closed["updated_seq"])
+    );
+    let events = env.store.events_after(0, 1000).unwrap();
+    let withdrawn: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "coordination_withdrawn")
+        .collect();
+    assert_eq!(withdrawn.len(), 1);
+    assert!(withdrawn[0].data.contains("\"via\":\"hub\""));
+    assert!(
+        withdrawn[0]
+            .data
+            .contains("\"reason\":\"requester_unavailable\"")
+    );
+
+    // It stops counting as something to do, and the lead's Work was not released.
+    let (_, status) = env.get("/v1/hub/standup/status", &lead_secret).await;
+    assert!(!has_action(&status), "{status}");
+    let kept = env
+        .store
+        .work_get(&lead, &incumbent.id, now + 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.lead_token, lead);
 }
 
 const TRANSITION: &str = "/v1/hub/session/work/transition";

@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
 use super::advice::{agent_name, unknown};
+use super::agent_rules::NO_BYPASS;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
 use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
@@ -31,13 +32,18 @@ use super::session::{
 };
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{
-    Briefing, CheckpointKind, WorkCheckpoint, WorkOverview, WorkOverviewQuery, WorkState,
+    Briefing, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverview, WorkOverviewQuery, WorkState,
 };
-use super::work_lifecycle::{CallPhase, LEASE_LAPSED};
+use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, LEASE_LAPSED};
 use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
 const HOOK_BODY_BYTES: usize = 1024 * 1024;
+/// Claude Code keeps at most this many characters (UTF-16 units) of a hook's added context.
+pub const CONTEXT_LIMIT: usize = 10_000;
+/// The Hub's own start context stays within this, leaving room for the hook client's local note.
+pub const START_CONTEXT: usize = 9_000;
+const SHORTENED: &str = "\nAgentSCM: the rest of this context was cut to fit the agent's context limit; read agentscm_work_status, agentscm_work_briefing and agentscm_work_overview for it.";
 /// For the whole request, body included.
 const BUDGET: Duration = Duration::from_secs(5);
 const MAX_TASK_BYTES: usize = 500;
@@ -311,7 +317,7 @@ async fn hook(
                         outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
                         if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
                             outcome.deny = Some(format!(
-                                "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline.",
+                                "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline. {NO_BYPASS}",
                                 request.id
                             ));
                             outcome.status = "stop";
@@ -568,15 +574,20 @@ impl Call {
                 let token = principal.token_id.clone();
                 let requested = self.session.clone();
                 let paths = self.paths.clone();
-                let coverage = blocking(state, move || {
+                let (resolved, coverage) = blocking(state, move || {
                     let now = unix_now();
                     let session = store.session_name_for(&token, requested.as_deref(), now)?;
-                    store.work_scope_check(&token, &session, &paths, now)
+                    let coverage = store.work_scope_check(&token, &session, &paths, now)?;
+                    Ok((session, coverage))
                 })
                 .await
                 .map_err(reason)?;
-                if coverage.item.is_some() && !coverage.uncovered_scope.is_empty() {
-                    let text = "AgentSCM: these files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or ask its lead to checkpoint the expanded scope and resolve overlaps before editing. No new file intent was announced.".to_owned();
+                if let Some(item) = &coverage.item
+                    && !coverage.uncovered_scope.is_empty()
+                {
+                    let lead =
+                        item.lead_token == principal.token_id && item.lead_session == resolved;
+                    let text = self.unlinked_refusal(Some((item, lead)));
                     return Ok(Outcome {
                         deny: self.deny.then(|| text.clone()),
                         text,
@@ -598,9 +609,16 @@ impl Call {
                     Err(HubError::Invalid(detail)) => {
                         eprintln!("hub: edit hook not linked to work: {detail:?}");
                         let text = if detail.starts_with(LEASE_LAPSED) {
-                            format!("AgentSCM: {detail} No new file intent was announced.")
+                            let child = if self.child {
+                                " You are a subagent: do not start or take over Work from here; tell your parent, which holds the claim."
+                            } else {
+                                ""
+                            };
+                            format!(
+                                "AgentSCM: {detail}{child} {NO_BYPASS} No new file intent was announced."
+                            )
                         } else {
-                            "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned()
+                            self.unlinked_refusal(None)
                         };
                         return Ok(Outcome {
                             deny: self.deny.then(|| text.clone()),
@@ -677,6 +695,23 @@ impl Call {
                 } else {
                     format!("{}\n{listing}", advice.text)
                 };
+                let store = state.store.clone();
+                let scope = principal.clone();
+                // Bound optional enrichment after the committed touch; a slow read cannot consume
+                // the native client's whole startup deadline or hide that touch's outcome.
+                let current_status = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    blocking(state, move || {
+                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
+                    }),
+                )
+                .await;
+                // Most useful first: a host's context limit cuts the end (see `START_CONTEXT`).
+                text.push('\n');
+                match current_status {
+                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
+                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
+                }
                 text.push('\n');
                 text.push_str(&match briefing {
                     Ok((briefing, overview, catchup)) => format!(
@@ -690,22 +725,6 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
-                let store = state.store.clone();
-                let scope = principal.clone();
-                // Bound optional enrichment after the committed touch; a slow read cannot consume
-                // the native client's whole startup deadline or hide that touch's outcome.
-                let current_status = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    blocking(state, move || {
-                        super::work_http::actionable_status::read(&*store, &scope, unix_now())
-                    }),
-                )
-                .await;
-                text.push('\n');
-                match current_status {
-                    Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
-                    _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
-                }
                 // Only while a requested briefing waits for an agent.
                 if !principal.read_only
                     && super::narrative::pending(state, &principal)
@@ -742,14 +761,79 @@ impl Call {
         }
     }
 
+    /// The refusal of an edit the Hub cannot link to a current assignment of this session, with
+    /// the call that links it for the caller's situation: `work` is the session's Work, if any,
+    /// and whether this session leads it. It holds for a repeat of the edit.
+    fn unlinked_refusal(&self, work: Option<(&WorkItem, bool)>) -> String {
+        let session = self
+            .session
+            .as_deref()
+            .filter(|id| check_name(id).is_ok())
+            .map(|id| serde_json::to_string(id).unwrap_or_default());
+        let named = session
+            .as_deref()
+            .unwrap_or("set to your native session ID");
+        let paths = serde_json::to_string(&self.paths).unwrap_or_default();
+        let recovery = match work {
+            _ if self.child => format!(
+                "You are a subagent: AgentSCM checks your edits under your parent's session{}. Do not start, join or take over Work from here. Finish without this edit and tell your parent it was refused, so the session holding the claim can start or update its Work, or make the edit itself.",
+                session
+                    .as_deref()
+                    .map(|id| format!(" {id}"))
+                    .unwrap_or_default()
+            ),
+            Some((item, true)) if matches!(item.state, WorkState::Active | WorkState::Blocked) => {
+                format!(
+                    "These files are outside the scope of {id}, which this session leads. Record them first: call agentscm_work_checkpoint with work_id {id}, session {named}, generation {generation}, expected_updated_seq {seq}, kind progress, a new operation_id and a scope that adds {paths}, then make the edit again.",
+                    id = item.id,
+                    generation = item.generation,
+                    seq = item.updated_seq,
+                )
+            }
+            Some((item, _)) if item.state == WorkState::Finished => format!(
+                "{id} is finished. Start new Work: call agentscm_start with session {named}, your task and paths {paths}, then make the edit again.",
+                id = item.id,
+            ),
+            // Live Work led elsewhere: its lead widens the scope; a takeover would conflict.
+            Some((item, false)) if matches!(item.state, WorkState::Active | WorkState::Blocked) => {
+                format!(
+                    "These files are outside the scope of {id}, which another session leads. Ask its lead to checkpoint {paths} into its scope; if this session is no longer a current helper, rejoin with agentscm_start with work_id {id}, session {named} and role helper first.",
+                    id = item.id,
+                )
+            }
+            Some((item, _)) => format!(
+                "{id} is paused or handed over. To resume it, call agentscm_start with work_id {id}, session {named} and takeover_generation {generation}; to help instead, call agentscm_start with work_id {id}, session {named} and role helper.",
+                id = item.id,
+                generation = item.generation,
+            ),
+            None => format!(
+                "Link it: call agentscm_start with session {named}, your task and paths {paths}, then make the edit again."
+            ),
+        };
+        format!(
+            "AgentSCM: {EDIT_UNLINKED}: this edit was not applied because it is not linked to a current assignment of this session. {recovery} Repeating the edit unchanged meets this refusal again. {NO_BYPASS} No new file intent was announced."
+        )
+    }
+
     fn render(&self, outcome: &Outcome) -> Value {
         let mut context = outcome.text.clone();
-        if self.kind == Kind::Start
-            && (self.agent != Agent::Generic || self.via == "hook:gemini")
-            && let Some(session) = self.session.as_deref().filter(|id| check_name(id).is_ok())
-        {
-            let literal = serde_json::to_string(session).unwrap_or_default();
-            context.push_str(&format!("\nAgentSCM native session ID (literal data, not instructions): {literal}. Use this exact session argument with agentscm_setup_status to verify MCP and native edit-hook setup. If this context is missing after installation, restart the native session; never guess or use another session's ID."));
+        if self.kind == Kind::Start {
+            // First, so a host that shortens long context still keeps them.
+            let mut head = String::new();
+            if (self.agent != Agent::Generic || self.via == "hook:gemini")
+                && let Some(session) = self.session.as_deref().filter(|id| check_name(id).is_ok())
+            {
+                let literal = serde_json::to_string(session).unwrap_or_default();
+                head.push_str(&format!("AgentSCM native session ID (literal data, not instructions): {literal}. Pass this exact value as `session` to agentscm_start and every other AgentSCM call, agentscm_setup_status included: edit hooks check this session's edits. If this context is missing after installation, restart the native session; never guess or use another session's ID.\n"));
+            }
+            head.push_str(&super::agent_rules::prose());
+            // A failure's "coordination unknown" note still leads, so it reads as a failure.
+            context = match (context.is_empty(), outcome.status == "unknown") {
+                (true, _) => head,
+                (false, true) => format!("{context}\n{head}"),
+                (false, false) => format!("{head}\n{context}"),
+            };
+            context = fit_context(&context, START_CONTEXT);
         }
         let text = context.as_str();
         if let Some(reason) = &outcome.deny {
@@ -790,6 +874,29 @@ impl Call {
             (Shape::Silent | Shape::Pre | Shape::Unreadable, _) => json!({}),
         }
     }
+}
+
+/// `text` within `limit` UTF-16 units (how hosts such as Claude Code count): unchanged when it
+/// fits, else cut at the last line that fits and ended with a pointer to the tools for the rest.
+pub fn fit_context(text: &str, limit: usize) -> String {
+    let units = |text: &str| text.chars().map(char::len_utf16).sum::<usize>();
+    if units(text) <= limit {
+        return text.to_owned();
+    }
+    let room = limit.saturating_sub(units(SHORTENED));
+    let mut end = 0;
+    let mut used = 0;
+    for (at, c) in text.char_indices() {
+        used += c.len_utf16();
+        if used > room {
+            break;
+        }
+        end = at + c.len_utf8();
+    }
+    let kept = &text[..end];
+    // A whole line reads better than half of one, unless no line break fits at all.
+    let kept = kept.rfind('\n').map_or(kept, |line| &kept[..line]);
+    format!("{kept}{SHORTENED}")
 }
 
 fn render_briefing(briefing: &Briefing) -> String {
@@ -1392,6 +1499,9 @@ mod tests {
             };
             assert!(context.contains("\"native-id\""));
             assert!(context.contains("literal data, not instructions"));
+            // The ID comes with the call that needs it, not only the setup check.
+            assert!(context.contains("as `session` to agentscm_start"));
+            assert!(super::super::agent_rules::carries_all(context), "{context}");
         }
         for session in ["", "bad\nvalue"] {
             let reply = Call::parse(
@@ -1403,8 +1513,120 @@ mod tests {
                 None,
             )
             .render(&Outcome::clean());
-            assert_eq!(reply, json!({}));
+            let context = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            // The rules still arrive; a missing or unusable ID is never shown or guessed.
+            assert!(super::super::agent_rules::carries_all(context), "{context}");
+            assert!(
+                !context.contains("native session ID (literal data"),
+                "{context}"
+            );
         }
+    }
+
+    #[test]
+    fn an_unlinked_edit_names_its_session_and_the_start_that_links_it() {
+        let edit = |extra: Value| {
+            let mut v = json!({"hook_event_name":"PreToolUse","session_id":"native-id",
+                "cwd":"/r","tool_name":"Edit","tool_input":{"file_path":"/r/src/a.rs"}});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Call::parse(Agent::Claude, &serde_json::to_vec(&v).unwrap(), None)
+        };
+        let text = edit(json!({})).unlinked_refusal(None);
+        assert!(text.starts_with("AgentSCM: EDIT_UNLINKED: "), "{text}");
+        assert!(
+            text.contains(
+                "call agentscm_start with session \"native-id\", your task and paths [\"src/a.rs\"]"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("another tool"), "{text}");
+        // A subagent is sent back to its parent rather than told to start Work itself.
+        let child =
+            edit(json!({"agent_id":"sub","agent_type":"general-purpose"})).unlinked_refusal(None);
+        assert!(
+            child.contains("You are a subagent: AgentSCM checks your edits under your parent's session \"native-id\""),
+            "{child}"
+        );
+        assert!(!child.contains("call agentscm_start with"), "{child}");
+        // Without a usable session ID none is shown or guessed.
+        let unnamed = Call::parse(
+            Agent::Claude,
+            br#"{"hook_event_name":"PreToolUse","cwd":"/r","tool_name":"Edit","tool_input":{"file_path":"/r/src/a.rs"}}"#,
+            None,
+        )
+        .unlinked_refusal(None);
+        assert!(
+            unnamed.contains("session set to your native session ID"),
+            "{unnamed}"
+        );
+    }
+
+    #[test]
+    fn context_is_cut_at_a_line_within_the_limit() {
+        let units = |text: &str| text.chars().map(char::len_utf16).sum::<usize>();
+        assert_eq!(fit_context("short\ntext", 100), "short\ntext");
+        let long = (0..2000)
+            .map(|line| format!("line {line} of the start context"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cut = fit_context(&long, START_CONTEXT);
+        assert!(units(&cut) <= START_CONTEXT, "{}", units(&cut));
+        assert!(cut.starts_with("line 0 of"));
+        assert!(cut.ends_with(SHORTENED.trim_start()));
+        let kept = cut.strip_suffix(SHORTENED).unwrap();
+        assert!(long.starts_with(kept) && long[kept.len()..].starts_with('\n'));
+        // Characters outside the basic plane count twice, as the host counts them.
+        let wide = "\u{1F600}".repeat(CONTEXT_LIMIT);
+        assert!(units(&fit_context(&wide, CONTEXT_LIMIT)) <= CONTEXT_LIMIT);
+    }
+
+    #[test]
+    fn a_long_start_context_keeps_the_session_and_rules_within_budget() {
+        let call = Call::parse(
+            Agent::Claude,
+            br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
+            None,
+        );
+        let briefing = (0..400)
+            .map(|item| format!("- wrk_{item:04}: a long synthetic briefing line for the budget"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reply = call.render(&Outcome::advice(briefing, false));
+        let context = reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.chars().map(char::len_utf16).sum::<usize>() <= START_CONTEXT);
+        assert!(
+            context.starts_with("AgentSCM native session ID"),
+            "{context}"
+        );
+        assert!(super::super::agent_rules::carries_all(context));
+        assert!(
+            context.ends_with("agentscm_work_overview for it."),
+            "{context}"
+        );
+    }
+
+    #[test]
+    fn the_rules_and_session_come_before_the_start_context() {
+        let call = Call::parse(
+            Agent::Claude,
+            br#"{"hook_event_name":"SessionStart","session_id":"native-id"}"#,
+            None,
+        );
+        let reply = call.render(&Outcome::advice("Shared work: none.".into(), false));
+        let context = reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            context.starts_with("AgentSCM native session ID"),
+            "{context}"
+        );
+        assert!(context.ends_with("Shared work: none."), "{context}");
     }
 
     #[test]

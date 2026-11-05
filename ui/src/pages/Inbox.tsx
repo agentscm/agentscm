@@ -16,7 +16,7 @@ import { AgentMark } from '../AgentMark.tsx'
 import { type BrowserSession } from '../devices.ts'
 import type { Contested, LiveAgent } from '../derive.ts'
 import { HideButton, hideKey, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
-import { answerHandoff, askHandoff, fetchMyHandoffs, operationId, OUTCOME_SENTENCE, replyToRequest, sendError, type MyHandoff } from '../inboxApi.ts'
+import { answerHandoff, askHandoff, fetchMyHandoffs, operationId, OUTCOME_SENTENCE, replyToRequest, sendError, withdrawRequest, type MyHandoff } from '../inboxApi.ts'
 import { IdleScene } from '../InboxIdle.tsx'
 import { agentName, askOption, buildThreads, GROUP_TITLE, GROUPS, named, REPLY_CHOICES, type Group, type Row, type Say, type SideView, type Thread } from '../inboxThreads.ts'
 import { OVERLAP_IS_SIGNAL } from '../copy.ts'
@@ -167,9 +167,40 @@ function ReplyBar({ thread, draft, local, onDraft, onSend, canSend }: { thread: 
   )
 }
 
+/** A request nobody can resolve any more, because the agent that made it is gone: the person closes it as their own agent. */
+function CloseBar({ thread, local, canSend, onClose }: { thread: Thread; local: Local | undefined; canSend: boolean; onClose: () => void }) {
+  const plan = thread.close!
+  const mineAgent = agentName(plan.target.lead.agent)
+  const sending = local?.status === 'sending'
+  return (
+    <div className="in-reply">
+      <span className="in-lbl">
+        <Icon name="x-circle" /> The requesting agent is gone
+      </span>
+      <p className="in-foot">Nothing can resolve this request now. Closing it withdraws it as your {mineAgent}. It does not release or change anyone’s work.</p>
+      {canSend ? (
+        <div className="in-send">
+          <button type="button" className="in-go" disabled={sending} onClick={onClose}>
+            <Icon name="x-circle" /> {sending ? 'Closing…' : 'Close the request'}
+          </button>
+        </div>
+      ) : (
+        <p className="in-foot">
+          <Icon name="person-lock" /> Sign in on the web to close it from here. Until then, copy a prompt and paste it into your {mineAgent}.
+        </p>
+      )}
+      {local?.status === 'error' && (
+        <p className="in-err" role="alert">
+          <Icon name="exclamation-triangle" /> {local.message}
+        </p>
+      )}
+    </div>
+  )
+}
+
 /* ---------- the pane ---------- */
 
-function Pane({ thread, local, draft, canSend, handoff, ask, onDraft, onSend, onAsk, hide }: { thread: Thread; local: Local | undefined; draft: Draft; canSend: boolean; handoff?: Handoff; ask: ReturnType<typeof askOption>; onDraft: (d: Draft) => void; onSend: () => void; onAsk: () => void; hide: ReactNode }) {
+function Pane({ thread, local, closeLocal, draft, canSend, handoff, ask, onDraft, onSend, onClose, onAsk, hide }: { thread: Thread; local: Local | undefined; closeLocal: Local | undefined; draft: Draft; canSend: boolean; handoff?: Handoff; ask: ReturnType<typeof askOption>; onDraft: (d: Draft) => void; onSend: () => void; onClose: () => void; onAsk: () => void; hide: ReactNode }) {
   const step = stepFor(thread)
   const st = thread.request ? stage(thread.request) : null
   // What was just sent joins the timeline at once; what happens next stays last.
@@ -186,6 +217,11 @@ function Pane({ thread, local, draft, canSend, handoff, ask, onDraft, onSend, on
           {st && (
             <Pill tone={st.tone} icon={st.icon}>
               {st.label}
+            </Pill>
+          )}
+          {thread.close && (
+            <Pill tone="warn" icon="x-circle">
+              The requesting agent is gone
             </Pill>
           )}
           {hide}
@@ -217,14 +253,15 @@ function Pane({ thread, local, draft, canSend, handoff, ask, onDraft, onSend, on
       {thread.reply ? (
         <ReplyBar thread={thread} draft={draft} local={local} canSend={canSend} onDraft={onDraft} onSend={onSend} />
       ) : (
-        local?.done && (
+        (local?.done || closeLocal?.done) && (
           <div className="in-reply">
             <p className="in-done" role="status">
-              <Icon name="send" /> {local.done}
+              <Icon name="send" /> {local?.done ?? closeLocal?.done}
             </p>
           </div>
         )
       )}
+      {thread.close && <CloseBar thread={thread} local={closeLocal} canSend={canSend} onClose={onClose} />}
       {local?.status === 'error' && !thread.reply && (
         <p className="in-err in-padded" role="alert">
           <Icon name="exclamation-triangle" /> {local.message}
@@ -359,6 +396,23 @@ export function InboxPage({ token, overview, handoff, session = null, live = nul
     }
   }
 
+  const close = async (t: Thread) => {
+    if (!session || !t.close) return
+    const { request, target } = t.close
+    const key = `${t.id}|close`
+    // Sending the same close again after a failure reuses the key, so the Hub replays it instead of closing twice.
+    const op = (ops.current[key] ??= operationId())
+    setPicked(t.id)
+    setLocal(key, { status: 'sending' })
+    try {
+      const updated = await withdrawRequest(session, { token: target.lead.token, request_id: request.id, operation_id: op, session: target.lead.session, expected_updated_seq: request.updated_seq, target_work_id: target.work_id, target_generation: target.generation })
+      setOverrides((o) => ({ ...o, [updated.id]: updated }))
+      setLocal(key, { status: 'sent', done: `Closed as your ${agentName(target.lead.agent)}. No work was released or changed.` })
+    } catch (e) {
+      setLocal(key, { status: 'error', message: sendError(e) })
+    }
+  }
+
   const ask = async (t: Thread, option: NonNullable<ReturnType<typeof askOption>>) => {
     if (!session) return
     setPicked(t.id)
@@ -435,12 +489,14 @@ export function InboxPage({ token, overview, handoff, session = null, live = nul
                   key={selected.id}
                   thread={selected}
                   local={locals[selected.id]}
+                  closeLocal={locals[`${selected.id}|close`]}
                   draft={draftOf(selected)}
                   canSend={canSend}
                   handoff={handoff}
                   ask={canSend && live ? askOption(selected, { me, agents: live.agents, contested: live.contested, handoffs }) : null}
                   onDraft={(d) => setDrafts((all) => ({ ...all, [selected.id]: d }))}
                   onSend={() => void send(selected)}
+                  onClose={() => void close(selected)}
                   onAsk={() => {
                     const option = live ? askOption(selected, { me, agents: live.agents, contested: live.contested, handoffs }) : null
                     if (option) void ask(selected, option)

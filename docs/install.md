@@ -282,9 +282,11 @@ the agent's start-up check runs in every project, including a fresh clone. It co
 in a checkout connected to one, and a checkout is connected automatically the first time an agent
 starts in it.
 
-Setup never writes to the repository: hooks, MCP entries, tokens and the Hub URL live in your user
-account and `~/.config/agentscm`, so `git status` stays clean, which matters on a public
-repository. Only `agentscm init-repo` writes committable instruction files, and they name no Hub.
+Setup installs nothing into the repository: hooks, MCP entries, tokens and the Hub URL live in your
+user account and `~/.config/agentscm`, so `git status` stays clean, which matters on a public
+repository. Committable instruction files, which name no Hub, come only from the `init-repo`
+change: `agentscm init-repo` writes it, `client setup` and `client connect` preview it in a terminal
+and write it only on a yes, and quickstart only reports it unless you pass `--init`.
 For Claude Code, setup also allows the AgentSCM tools in `~/.claude/settings.json`, so the agent
 does not stop to ask before each call.
 

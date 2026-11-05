@@ -1,5 +1,6 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
+pub mod agent_rules;
 pub mod catchup;
 mod catchup_sync;
 pub mod change_record;
