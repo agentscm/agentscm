@@ -653,7 +653,22 @@ pub async fn announce_for(
     principal: &Principal,
     call: SessionCall,
 ) -> Result<Advice> {
-    Ok(announce_reading(state, principal, call, |_, _| ()).await?.0)
+    let named = call.session.is_some();
+    announce_named(state, principal, call, named).await
+}
+
+/// [`announce_for`], where `named` is false when the caller named no session and `call.session`
+/// is the one the Hub already resolved for it. The touch targets exactly that session but renews
+/// no lease and carries no lead credential.
+pub async fn announce_named(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    named: bool,
+) -> Result<Advice> {
+    Ok(announce_with(state, principal, call, named, |_, _| ())
+        .await?
+        .0)
 }
 
 /// [`announce_for`], also running `read` in the same store hop right after the touch commits.
@@ -664,10 +679,21 @@ pub(super) async fn announce_reading<T: Send + 'static>(
     call: SessionCall,
     read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
 ) -> Result<(Advice, T)> {
+    let named = call.session.is_some();
+    announce_with(state, principal, call, named, read).await
+}
+
+async fn announce_with<T: Send + 'static>(
+    state: &HubState,
+    principal: &Principal,
+    call: SessionCall,
+    named: bool,
+    read: impl FnOnce(&dyn Store, &Touched) -> T + Send + 'static,
+) -> Result<(Advice, T)> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let (touched, read) = blocking(state, move || {
-        let touched = store.touch_session(&token, &call, unix_now())?;
+        let touched = store.touch_session_named(&token, &call, named, unix_now())?;
         let read = read(&*store, &touched);
         Ok((touched, read))
     })

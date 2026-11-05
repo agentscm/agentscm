@@ -2026,14 +2026,15 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
         )
     });
     barrier.wait();
-    let touched = touch.join().unwrap();
-    if let Err(error) = &touched {
-        assert!(
-            matches!(error, agentscm::hub::HubError::Invalid(message)
-                if message.contains("not covered by a current unfinished assignment")),
-            "unexpected managed touch error: {error:?}"
-        );
-    }
+    // The old lead's edit never lands: before the takeover its lease has lapsed, and after it the
+    // assignment is gone.
+    let error = touch.join().unwrap().unwrap_err();
+    assert!(
+        matches!(&error, agentscm::hub::HubError::Invalid(message)
+            if message.contains("not covered by a current unfinished assignment")
+                || message.starts_with(agentscm::hub::work_lifecycle::LEASE_LAPSED)),
+        "unexpected managed touch error: {error:?}"
+    );
     assert!(takeover.join().unwrap().unwrap().took_over);
 
     let after_takeover = store::open(database).unwrap();

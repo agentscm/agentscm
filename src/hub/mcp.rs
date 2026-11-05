@@ -33,7 +33,8 @@ use super::promise::{
     PromiseInputV1, PromiseViewV1, current_admission,
 };
 use super::session::{
-    SESSION_REQUIRED, SessionCall, announce_for, done_for, duplicates_for, others_for, status_for,
+    SESSION_REQUIRED, SessionCall, announce_for, announce_named, done_for, duplicates_for,
+    others_for, status_for,
 };
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
@@ -3114,10 +3115,13 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         ));
     }
 
-    let advice = announce_for(
+    // The session resolved once above is the target, so a hook session that turns fresh meanwhile
+    // cannot make this touch ambiguous after the start committed.
+    let advice = announce_named(
         state,
         principal,
-        session_call(named.then_some(resolved), Some(task.clone()), paths),
+        session_call(Some(resolved), Some(task.clone()), paths),
+        named,
     )
     .await?;
     let own = advice

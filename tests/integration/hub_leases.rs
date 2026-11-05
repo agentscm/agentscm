@@ -1088,6 +1088,22 @@ fn an_unnamed_call_renews_no_lease(db: &Db) {
             )
             .unwrap();
     }
+    // Nor does a touch aimed at the session the Hub resolved for such a call.
+    store
+        .touch_session_named(
+            &alice.token,
+            &SessionCall {
+                session: Some("s-a".into()),
+                via: "mcp".into(),
+                task: None,
+                paths: Vec::new(),
+                deny: false,
+                report: false,
+            },
+            false,
+            now + 1150,
+        )
+        .unwrap();
     assert_eq!(db.lease(&held.id).1, (now + LEASE_SECONDS).to_string());
     tick(&*store, now, now + LEASE_SECONDS);
     admitted(

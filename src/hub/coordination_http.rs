@@ -286,8 +286,10 @@ struct PersonTransition {
 async fn person_transition(
     State(state): State<HubState>,
     human: HumanSession,
+    reclaimed: std::result::Result<Query<super::work_http::ReclaimedFlag>, QueryRejection>,
     JsonBody(body): JsonBody<PersonTransition>,
 ) -> std::result::Result<Json<super::work_transition::WorkTransitionResult>, ApiError> {
+    let reclaimed = super::work_http::ReclaimedFlag::requested(reclaimed)?;
     let user = human.web_user()?.clone();
     let is_admin = human.admin().is_ok();
     super::store::validate_repository(&body.repository)?;
@@ -306,7 +308,7 @@ async fn person_transition(
         superseded_by: body.superseded_by,
     };
     let store = state.store.clone();
-    let result = blocking(&state, move || {
+    let mut result = blocking(&state, move || {
         store.work_transition(
             &super::work_transition::WorkTransitionActor::Person {
                 user: &user,
@@ -324,6 +326,9 @@ async fn person_transition(
             .with_message("Only the Work's owner or a Hub administrator can change it"),
         other => person_error(other),
     })?;
+    if !reclaimed {
+        result.reclaimed.clear();
+    }
     CHANGED.notify_waiters();
     Ok(Json(result))
 }

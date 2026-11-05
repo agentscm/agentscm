@@ -5491,10 +5491,13 @@ fn guard_announce(
     work_transition::check_announce(&eligible, &ineligible, keys)
 }
 
+/// `named` is false when the caller named no session and `call.session` is the one the Hub
+/// resolved for it: such a touch renews no lease and carries no lead credential.
 fn touch_in(
     tx: &mut postgres::Transaction<'_>,
     who: &Who,
     call: &Checked,
+    named: bool,
     now: i64,
 ) -> Result<Touched> {
     let token = who.token.as_str();
@@ -5668,15 +5671,14 @@ fn touch_in(
         append(tx, &event)?;
     }
     let requested = auto_ask(tx, who, &name, &guarded.denied_keys(), now);
-    let lead_notes = if work.read_only || (call.session.is_none() && !call.via.starts_with("hook:"))
-    {
+    let lead_notes = if work.read_only || (!named && !call.via.starts_with("hook:")) {
         Vec::new()
     } else {
         carry_identified_leads(tx, &work, &name, now)?
     };
     // After the carry above, so a session whose token changed renews in the same touch. Only a
     // named call renews: an unnamed one resolves to whichever session the token used last.
-    if call.session.is_some() {
+    if named {
         renew_leases(tx, token, &name, now)?;
     }
     Ok(guarded.touched(
@@ -7366,12 +7368,18 @@ impl Store for PgStore {
         })
     }
 
-    fn touch_session(&self, token: &str, call: &SessionCall, now: i64) -> Result<Touched> {
+    fn touch_session_named(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        named: bool,
+        now: i64,
+    ) -> Result<Touched> {
         let call = check(call)?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
-            let touched = touch_in(&mut tx, &who, &call, now)?;
+            let touched = touch_in(&mut tx, &who, &call, named, now)?;
             tx.commit()?;
             Ok(touched)
         })
@@ -7388,7 +7396,7 @@ impl Store for PgStore {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
-            let touched = touch_in(&mut tx, &who, &call, now)?;
+            let touched = touch_in(&mut tx, &who, &call, call.session.is_some(), now)?;
             if call.session.is_some() {
                 session_tool_call(&mut tx, token, &touched.session, phase, now)?;
             }
@@ -7598,7 +7606,7 @@ impl Store for PgStore {
                     )?;
                 }
                 let call = grant_call(&request.requester_session, &key, Some(&requester_row.via));
-                touch_in(&mut tx, &requester_who, &check(&call)?, now)?;
+                touch_in(&mut tx, &requester_who, &check(&call)?, true, now)?;
             }
             tx.execute(
                 "UPDATE hub_handoffs SET state = $2, decided_at = $3, reply = $4,

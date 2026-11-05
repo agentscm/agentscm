@@ -198,12 +198,12 @@ impl OperationalFlag {
 /// Without it the response has no `reclaimed` key, so a strict older client decodes it unchanged,
 /// and an older Hub ignores the parameter.
 #[derive(serde::Deserialize)]
-struct ReclaimedFlag {
+pub(super) struct ReclaimedFlag {
     reclaimed: Option<u8>,
 }
 
 impl ReclaimedFlag {
-    fn requested(
+    pub(super) fn requested(
         flag: std::result::Result<Query<ReclaimedFlag>, QueryRejection>,
     ) -> Result<bool, ApiError> {
         match flag.map_err(|_| ApiError::invalid())?.0.reclaimed {

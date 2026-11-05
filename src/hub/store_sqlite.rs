@@ -2708,10 +2708,11 @@ fn identified_lead_notes(
     tx: &Transaction<'_>,
     token: &str,
     call: &Checked,
+    named: bool,
     session: &str,
     now: i64,
 ) -> Result<Vec<String>> {
-    if call.session.is_none() && !call.via.starts_with("hook:") {
+    if !named && !call.via.starts_with("hook:") {
         return Ok(Vec::new());
     }
     let who = match work_who(tx, token, now) {
@@ -5670,7 +5671,15 @@ fn guard_announce(tx: &Transaction<'_>, who: &Who, keys: &[String]) -> Result<()
 }
 
 /// the session's behalf, or answered without text) tells and consumes nothing.
-fn touch_in(tx: &Transaction<'_>, who: &Who, call: &Checked, now: i64) -> Result<Touched> {
+/// `named` is false when the caller named no session and `call.session` is the one the Hub
+/// resolved for it: such a touch renews no lease and carries no lead credential.
+fn touch_in(
+    tx: &Transaction<'_>,
+    who: &Who,
+    call: &Checked,
+    named: bool,
+    now: i64,
+) -> Result<Touched> {
     let token = who.token.as_str();
     tx.execute(
         "DELETE FROM hub_sessions WHERE token = ?1 AND updated_at < ?2",
@@ -5822,10 +5831,10 @@ fn touch_in(tx: &Transaction<'_>, who: &Who, call: &Checked, now: i64) -> Result
         append(tx, &event)?;
     }
     let requested = auto_ask(tx, who, &name, &guarded.denied_keys(), now);
-    let lead_notes = identified_lead_notes(tx, token, call, &name, now)?;
+    let lead_notes = identified_lead_notes(tx, token, call, named, &name, now)?;
     // After the carry above, so a session whose token changed renews in the same touch. Only a
     // named call renews: an unnamed one resolves to whichever session the token used last.
-    if call.session.is_some() {
+    if named {
         renew_leases(tx, token, &name, now)?;
     }
     Ok(guarded.touched(
@@ -7507,12 +7516,18 @@ impl Store for SqliteStore {
         Ok(released)
     }
 
-    fn touch_session(&self, token: &str, call: &SessionCall, now: i64) -> Result<Touched> {
+    fn touch_session_named(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        named: bool,
+        now: i64,
+    ) -> Result<Touched> {
         let call = check(call)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
-        let touched = touch_in(&tx, &who, &call, now)?;
+        let touched = touch_in(&tx, &who, &call, named, now)?;
         tx.commit()?;
         Ok(touched)
     }
@@ -7528,7 +7543,7 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let who = active_token(&tx, token, now)?;
-        let touched = touch_in(&tx, &who, &call, now)?;
+        let touched = touch_in(&tx, &who, &call, call.session.is_some(), now)?;
         if call.session.is_some() {
             session_tool_call(&tx, token, &touched.session, phase, now)?;
         }
@@ -7702,7 +7717,7 @@ impl Store for SqliteStore {
                 )?;
             }
             let call = grant_call(&request.requester_session, &key, Some(&requester_row.via));
-            touch_in(&tx, &requester_who, &check(&call)?, now)?;
+            touch_in(&tx, &requester_who, &check(&call)?, true, now)?;
         }
         tx.execute(
             "UPDATE hub_handoffs SET state = ?2, decided_at = ?3, reply = ?4, answered_via_hub = ?5,

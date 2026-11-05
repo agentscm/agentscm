@@ -344,7 +344,19 @@ pub trait Store: Send + Sync {
     /// Upsert the session, add `call.paths` to its intent (creating a fresh intent when it has none,
     /// or it was released), renew the intent to now + `SESSION_TTL_SECONDS`, and collect new
     /// overlaps and notices.
-    fn touch_session(&self, token: &str, call: &SessionCall, now: i64) -> Result<Touched>;
+    fn touch_session(&self, token: &str, call: &SessionCall, now: i64) -> Result<Touched> {
+        self.touch_session_named(token, call, call.session.is_some(), now)
+    }
+    /// `touch_session`, where `named` is false when the caller named no session and
+    /// `call.session` is the one the Hub resolved for it. Such a touch renews no lease and carries
+    /// no lead credential, since that session is not the call's own.
+    fn touch_session_named(
+        &self,
+        token: &str,
+        call: &SessionCall,
+        named: bool,
+        now: i64,
+    ) -> Result<Touched>;
     /// Release the session's intent (if any) and delete the session row. `None` resolves like
     /// `SessionCall.session`. True if a session existed.
     fn end_session(&self, token: &str, session: Option<&str>, now: i64) -> Result<bool>;

@@ -2013,6 +2013,20 @@ async fn a_web_session_releases_or_ends_work_without_any_agent_token() {
         (403, Some("not_your_work"))
     );
 
+    // The route takes the same `reclaimed` opt-in as the agent routes.
+    assert_eq!(
+        page_post(
+            &env,
+            &alice,
+            true,
+            &format!("{TRANSITION}?reclaimed=2"),
+            release.clone()
+        )
+        .await
+        .0,
+        400
+    );
+
     // Unknown fields and an unconnected repository are refused.
     let mut stray = release.clone();
     stray["session"] = json!("someone");
@@ -2032,6 +2046,7 @@ async fn a_web_session_releases_or_ends_work_without_any_agent_token() {
     assert_eq!(status, 200, "{done}");
     assert_eq!(done["item"]["state"], "paused");
     assert!(done["conflict"].is_null());
+    assert!(done.get("reclaimed").is_none(), "{done}");
     let (status, retry) = page_post(&env, &alice, true, TRANSITION, release).await;
     assert_eq!(status, 200, "{retry}");
     assert_eq!(retry["receipt"]["event_seq"], done["receipt"]["event_seq"]);
