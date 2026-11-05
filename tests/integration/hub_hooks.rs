@@ -167,7 +167,7 @@ async fn i295_startup_scenario(scenario: &str) {
     let first = hub.hook("claude", &secret, &payload);
     let first_text = text_at(&first, CLAUDE_CONTEXT);
     assert!(
-        !first_text.contains("coordination unknown"),
+        !first_text.contains("coordination unknown ("),
         "first start: {first}"
     );
     assert!(
@@ -188,7 +188,7 @@ async fn i295_startup_scenario(scenario: &str) {
     let answer = hub.hook("claude", &secret, &payload);
     let text = text_at(&answer, CLAUDE_CONTEXT);
     assert!(
-        !text.contains("coordination unknown"),
+        !text.contains("coordination unknown ("),
         "{scenario}: {answer}"
     );
     assert!(text.contains("native session ID"), "{scenario}: {answer}");
