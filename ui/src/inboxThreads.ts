@@ -6,7 +6,7 @@
 // API for other packages:
 //   buildThreads({ me, overview, requests, handoffs })   every thread, newest first within a group
 //   GROUP_TITLE, GROUPS                                   the list's headings, in order
-//   Thread, Row, SideView, ReplyPlan                      what the page draws
+//   Thread, Row, SideView, ReplyPlan, ClosePlan           what the page draws
 //   REPLY_CHOICES                                         the coordination reply kinds, in words, with what each does
 //   agentName(agent), named(login, agent, me)             "Claude Code", "dev’s Codex" / "Your Codex"
 //   askOption(thread, ctx)                                the person's own agent that could ask the holder of a file to hand it over, or null
@@ -52,6 +52,12 @@ export interface Row {
 
 export type ReplyPlan = { kind: 'coordination'; request: CoordinationRequest; target: CoordinationTarget } | { kind: 'handoff'; handoff: MyHandoff }
 
+/** Closing a request whose requesting agent is gone, as the person's own agent that leads `target`. */
+export interface ClosePlan {
+  request: CoordinationRequest
+  target: CoordinationTarget
+}
+
 export interface Thread {
   id: string
   group: Group
@@ -71,6 +77,8 @@ export interface Thread {
   theirs: SideView | null
   rows: Row[]
   reply: ReplyPlan | null
+  /** Set when the person's own agent leads a target of an open request that nobody can resolve any more. */
+  close: ClosePlan | null
   request: CoordinationRequest | null
   overlap: WorkOverlapPair | null
   handoff: MyHandoff | null
@@ -144,6 +152,8 @@ function requestThread(r: CoordinationRequest, me: string | null, works: Map<str
         ? [`Your ${agentName(mine.agent)} asked ${named(first.lead.login, first.lead.agent, me)} to coordinate on `, where, `${more(focus)}.`]
         : [`${named(r.requester.login, r.requester.agent, me)} asked ${named(first.lead.login, first.lead.agent, me)} to coordinate on `, where, `${more(focus)}.`]
 
+  const gone = open && r.requester_unavailable
+  const closer = gone ? myTargets[0] : undefined
   const rows: Row[] = []
   rows.push(row({ key: 'asked', kind: 'agent', tone: iRequested ? 'me' : '', agent: r.requester.agent, who: named(r.requester.login, r.requester.agent, me), did: 'asked to coordinate', at: r.created_at, text: `“${r.proposal.title}”${r.proposal.scope.length ? ` · plans to change ${files(r.proposal.scope)}` : ''}`, quote: true }))
   const pairs = first.reasons.slice(0, 2).map((x) => (x.your_path === x.their_path ? x.your_path : `${x.your_path} and ${x.their_path}`))
@@ -168,6 +178,7 @@ function requestThread(r: CoordinationRequest, me: string | null, works: Map<str
     notes.push('Some receipt or reply history is omitted. The status above is authoritative; the history shown here is incomplete.')
     rows.push(row({ key: 'omitted', kind: 'omitted', who: 'AgentSCM', did: 'omitted some history', text: 'Some receipt or reply history is no longer shown.' }))
   }
+  if (gone) rows.push(notice('gone', 'cannot act any more', null, 'The requesting agent’s token can no longer act: it was revoked or expired, its owner was disabled, or its repository was renamed. It cannot make the agreed change or close this request.', 'warn'))
   if (open) {
     for (const t of r.targets) {
       if (currentResponse(r, t) || t === asTarget) continue
@@ -175,10 +186,11 @@ function requestThread(r: CoordinationRequest, me: string | null, works: Map<str
       rows.push(row({ key: `waiting:${t.work_id}`, kind: 'pending', agent: t.lead.agent, who: named(t.lead.login, t.lead.agent, me), did: 'has not replied yet', text }))
     }
     const latest = responses.at(-1)
-    if (latest && (!lastSeen || lastSeen.through_seq < latest.seq)) rows.push(row({ key: 'sees', kind: 'pending', agent: r.requester.agent, who: named(r.requester.login, r.requester.agent, me), did: 'sees it at its next edit' }))
+    if (!gone && latest && (!lastSeen || lastSeen.through_seq < latest.seq)) rows.push(row({ key: 'sees', kind: 'pending', agent: r.requester.agent, who: named(r.requester.login, r.requester.agent, me), did: 'sees it at its next edit' }))
   }
   const status =
     group === 'earlier' ? st.label
+    : gone ? 'The requesting agent is gone'
     : group === 'needs' ? `${named(r.requester.login, r.requester.agent, me)} is waiting`
     : perspective === 'requester' ? `You asked · ${st.label.toLowerCase()}`
     : st.label
@@ -198,6 +210,7 @@ function requestThread(r: CoordinationRequest, me: string | null, works: Map<str
     theirs,
     rows: sortRows(rows),
     reply: unanswered ? { kind: 'coordination', request: r, target: unanswered } : null,
+    close: closer ? { request: r, target: closer } : null,
     request: r,
     overlap: null,
     handoff: null,
@@ -254,6 +267,7 @@ function overlapThread(o: WorkOverlapPair, me: string | null): Thread {
     theirs: sides[1],
     rows: sortRows(rows),
     reply: null,
+    close: null,
     request: null,
     overlap: o,
     handoff: null,
@@ -307,6 +321,7 @@ function handoffThread(h: MyHandoff, me: string | null, works: Map<string, WorkI
     theirs,
     rows: sortRows(rows),
     reply: open && asHolder ? { kind: 'handoff', handoff: h } : null,
+    close: null,
     request: null,
     overlap: null,
     handoff: h,
@@ -352,6 +367,7 @@ export function buildThreads({ me, overview, requests, handoffs }: ThreadInput):
         theirs: null,
         rows: [row({ key: 'decision', kind: 'agent', tone: mine ? 'me' : '', agent: l.agent, who: named(l.login, l.agent, me), did: 'reported a decision', at: o.at, text: summary, quote: true })],
         reply: null,
+        close: null,
         request: null,
         overlap: null,
         handoff: null,
