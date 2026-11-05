@@ -363,6 +363,7 @@ mod tests {
     use super::*;
     fn overview() -> WorkOverview {
         WorkOverview {
+            planned_issues: Default::default(),
             recent_since: 0,
             until: 100,
             current: vec![],
@@ -594,6 +595,7 @@ mod tests {
             expected_head: None,
         };
         let overview = WorkOverview {
+            planned_issues: Default::default(),
             settled_count: 3,
             ..overview()
         };

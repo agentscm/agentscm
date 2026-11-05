@@ -784,10 +784,41 @@ async fn polling_converges_without_webhooks_and_does_not_rewrite_what_is_unchang
     );
 
     // GitLab has no conditional list: the list is read again, and nothing is written.
+    let planned = env
+        .store
+        .observation(&env.repo().id, "planned_issues", "_snapshot")
+        .unwrap()
+        .unwrap();
+    let snapshot: agentscm::hub::planned_issues::PlannedIssueSnapshot =
+        serde_json::from_str(&planned.data).unwrap();
+    assert_eq!(
+        snapshot.coverage,
+        agentscm::hub::planned_issues::IssueCoverage::Unsupported
+    );
+    assert_eq!(snapshot.attempted_at_ms, 0);
+    assert_eq!(snapshot.facts_observed_at_ms, None);
+    assert_eq!(
+        snapshot.freshness(unix_now() * 1000),
+        agentscm::hub::planned_issues::IssueFreshness::Unknown
+    );
+    assert!(snapshot.issues.is_empty());
+    assert!(!snapshot.complete(unix_now() * 1000));
     let events = env.event_count();
     let reports = env.poll().await;
     assert!(!reports[0].not_modified);
     assert_eq!(env.event_count(), events);
+    assert_eq!(
+        env.store
+            .observation(&env.repo().id, "planned_issues", "_snapshot")
+            .unwrap()
+            .unwrap()
+            .data,
+        planned.data
+    );
+    assert!(env.fake.with(|state| state.requests.iter().all(|request| {
+        !request.path_and_query.contains("/issues")
+            && !request.path_and_query.contains("/milestones")
+    })));
     let lists = env.fake.with(|s| {
         s.requests
             .iter()

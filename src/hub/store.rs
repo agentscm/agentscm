@@ -776,6 +776,13 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<Option<WorkItem>>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// Set/remove a caller-declared issue link without changing Work identity.
+    fn work_issue_link_set(
+        &self,
+        token: &str,
+        update: &super::work_issues::WorkIssueLinkUpdate,
+        now: i64,
+    ) -> Result<WorkCheckpointResult>;
     /// Read the single explicit PR relationship; comparison statuses confer no approval.
     fn work_pr_link_get(
         &self,

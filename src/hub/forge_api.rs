@@ -18,6 +18,16 @@ pub enum ForgeApi<'a> {
 }
 
 impl ForgeApi<'_> {
+    /// GitHub first. An unsupported provider must never look like an empty inventory.
+    pub async fn open_issues(&self, token: &str, repo: &Repo) -> Gh<Paged> {
+        match self {
+            Self::Github(api) => api.open_issues(token, repo.repository_id).await,
+            Self::Gitlab(_) => Err(GhError::Failed(
+                "planned issues unsupported for provider".into(),
+            )),
+        }
+    }
+
     /// By name, to connect a repository.
     pub async fn repo(&self, token: &str, full_name: &str) -> Gh<Option<RepoInfo>> {
         match self {

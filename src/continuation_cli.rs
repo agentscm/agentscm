@@ -129,6 +129,7 @@ pub async fn run(data_dir: &Path, command: ContinuationCommand) -> Result<Value>
             let session = format!("enrolled-{binding}");
             let item = managed
                 .start(&WorkStart {
+                    issue_choice: None,
                     work_id: None,
                     source: None,
                     request_key: Some(key),
@@ -507,6 +508,7 @@ async fn advance(
             }
             managed
                 .start(&WorkStart {
+                    issue_choice: None,
                     work_id: Some(before.id.clone()),
                     source: None,
                     request_key: None,
