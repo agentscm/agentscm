@@ -1077,7 +1077,7 @@ async fn snapshot_serves_work_and_activity_and_answers_a_current_etag_with_304()
     assert_eq!(first.status(), 200);
     let tag = first.headers()["etag"].to_str().unwrap().to_owned();
     assert!(tag.starts_with('"') && tag.ends_with('"') && !tag.starts_with("W/"));
-    let body: Value = first.json().await.unwrap();
+    let body: Value = serde_json::from_str(&first.text().await.unwrap()).unwrap();
     let (_, work) = hub.call(get.clone(), WORK, Some(&alice), None).await;
     let (_, activity) = hub.call(get.clone(), ACTIVITY, Some(&alice), None).await;
     assert_eq!(body, json!({"work": work, "activity": activity}));
@@ -1095,7 +1095,7 @@ async fn snapshot_serves_work_and_activity_and_answers_a_current_etag_with_304()
     let changed = fetch(Some(tag.clone())).await;
     assert_eq!(changed.status(), 200);
     assert_ne!(changed.headers()["etag"], tag.as_str());
-    let changed: Value = changed.json().await.unwrap();
+    let changed: Value = serde_json::from_str(&changed.text().await.unwrap()).unwrap();
     assert_eq!(changed["work"]["intents"].as_array().unwrap().len(), 1);
 }
 
