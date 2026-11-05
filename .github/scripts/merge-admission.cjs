@@ -48,7 +48,7 @@ async function admit({github, context, validateTitle}) {
     // Prerequisite workflows invalidate prior acceptance as soon as they start. Their
     // completion event will recompute; an out-of-order start can only leave pending.
     if (context.payload.workflow_run && context.payload.action !== 'completed') continue;
-    const statuses = await pages(args => github.rest.repos.listCommitStatuses({...repo, ref: head, ...args}));
+    const statuses = await pages(args => github.rest.repos.listCommitStatusesForRef({...repo, ref: head, ...args}));
     const checks = await pages(args => github.rest.checks.listForRef({...repo, ref: head, filter: 'latest', ...args}), 'check_runs');
     // GitHub returns newest statuses first. A newer pending/failing status must defeat old success.
     const local = statuses.find(s => s.context === 'agentscm/local-validation');
