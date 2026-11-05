@@ -2824,8 +2824,8 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
     );
     assert!(widgets["last_activity_at"].as_i64().is_some());
     assert_eq!(
-        widgets["complete"], false,
-        "unsupported attention producers remain unknown"
+        widgets["complete"], true,
+        "every attention producer is integrated and nothing limited this summary"
     );
     assert_eq!(body["repositories"][1]["last_activity_at"], Value::Null);
     assert_eq!(
