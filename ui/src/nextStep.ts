@@ -13,13 +13,13 @@
 //   contestedStep(c, wanter, holder)    two agents want one file
 //   overlapSteps(pair)  two tasks declared the same files
 //   prStep(p)           a pull request touches held files
-//   requestStep(r)      a directed request, by stage; null when resolved, withdrawn or history is incomplete
+//   requestStep(r)      a directed request, by stage (or, once its requester is gone, how a lead closes it); null when resolved, withdrawn or history is incomplete
 //   Render with <NextStepView step=… /> from NextStep.tsx.
 import type { Contested, PrOverlap } from './derive.ts'
 import type { CoordinationAgent, CoordinationRequest, WorkItem, WorkOverlapPair } from './standup.ts'
 import { brandName } from './agentIcons.tsx'
 import { agentLabel } from './ui.tsx'
-import { currentAck, currentResponse, RESPONSE_LABEL, stage } from './requests.ts'
+import { currentAck, currentResponse, pending, RESPONSE_LABEL, stage } from './requests.ts'
 import { lead } from './pages/workParts.tsx'
 
 export interface Person {
@@ -151,6 +151,13 @@ export function prStep(p: PrOverlap): NextStep {
 export function requestStep(r: CoordinationRequest): NextStep | null {
   const requester = whoOf(r.requester)
   const st = stage(r).label
+  if (r.requester_unavailable && pending(r)) {
+    return {
+      human: `${requester} is gone, so nobody can resolve this request. The lead of the affected work can close it.`,
+      decides: logins(...r.targets.map((t) => t.lead.login)),
+      prompts: r.targets.map((t) => ({ for: whoOf(t.lead), login: t.lead.login, agent: t.lead.agent, text: `Request ${r.id} from ${requester} can no longer be resolved, because that agent’s token can no longer act. Close it with agentscm_coordination_withdraw using expected_updated_seq ${r.updated_seq}. This releases no work. ${DATA_NOTE}` })),
+    }
+  }
   if (st === 'Awaiting receipt') {
     const unseen = r.targets.filter((t) => !currentAck(r, t) && !currentResponse(r, t))
     return {

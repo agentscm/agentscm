@@ -8,7 +8,7 @@ use agentscm::hub::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInboxQuery,
     CoordinationListQuery, CoordinationProposal, CoordinationReply, CoordinationRequest,
     CoordinationResolve, CoordinationResponse, CoordinationResponseKind, CoordinationStatus,
-    CoordinationTarget, CoordinationWithdraw,
+    CoordinationTarget, CoordinationWithdraw, CoordinationWithdrawTarget,
 };
 use agentscm::hub::session::SessionCall;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
@@ -157,6 +157,10 @@ impl Db {
 }
 
 fn token(store: &dyn Store, user_id: i64, name: &str) -> String {
+    mint(store, user_id, name, false)
+}
+
+fn mint(store: &dyn Store, user_id: i64, name: &str, read_only: bool) -> String {
     let user = store
         .upsert_user(
             &ForgeIdentity {
@@ -174,7 +178,7 @@ fn token(store: &dyn Store, user_id: i64, name: &str) -> String {
         REPOSITORY,
         REPOSITORY_ID,
         3600,
-        false,
+        read_only,
     )
     .unwrap()
     .0
@@ -358,6 +362,8 @@ fn durable_refusal_replays_on_both_stores(db: &Db) {
                 operation_id: "withdraw-operation".into(),
                 session: "withdraw-session".into(),
                 expected_updated_seq: withdraw_request.updated_seq,
+                target: None,
+                via_hub: false,
             },
             now + 12,
         )
@@ -788,6 +794,8 @@ fn quotas_and_unavailable_requester_cleanup_are_enforced(db: &Db) {
         operation_id: "target-cleanup".into(),
         session: "incumbent-session".into(),
         expected_updated_seq: requests[0].updated_seq,
+        target: None,
+        via_hub: false,
     };
     assert!(matches!(
         store.coordination_withdraw(&incumbent, &cleanup, now + 10),
@@ -821,6 +829,8 @@ fn quotas_and_unavailable_requester_cleanup_are_enforced(db: &Db) {
         operation_id: "target-cleanup-after-watermark".into(),
         session: "incumbent-session".into(),
         expected_updated_seq: requests[2].updated_seq,
+        target: None,
+        via_hub: false,
     };
     store
         .coordination_withdraw(&incumbent, &later, now + 14)
@@ -880,6 +890,8 @@ fn quotas_and_unavailable_requester_cleanup_are_enforced(db: &Db) {
                     operation_id: "expired-cleanup".into(),
                     session: "incumbent-session".into(),
                     expected_updated_seq: expired_request.updated_seq,
+                    target: None,
+                    via_hub: false,
                 },
                 now + 18,
             )
@@ -908,6 +920,8 @@ fn quotas_and_unavailable_requester_cleanup_are_enforced(db: &Db) {
                     operation_id: "disabled-cleanup".into(),
                     session: "incumbent-session".into(),
                     expected_updated_seq: disabled_request.updated_seq,
+                    target: None,
+                    via_hub: false,
                 },
                 now + 20,
             )
@@ -1031,6 +1045,8 @@ fn compacted_coordination_reports_a_gap_and_reclaims_capacity(db: &Db) {
         operation_id: "compact-withdraw".into(),
         session: "closed-session".into(),
         expected_updated_seq: closed.updated_seq,
+        target: None,
+        via_hub: false,
     };
     store
         .coordination_withdraw(&closed_requester, &withdrawal, old + 3)
@@ -1419,6 +1435,255 @@ fn a_person_reply_through_the_hub_is_marked_and_delivered(db: &Db) {
     );
 }
 
+/// The lead of an affected Work, or the person who owns it, closes a request whose requester can
+/// no longer act. Both stores show the flag for each way a requester becomes unavailable, refuse
+/// everyone else, fence on the request sequence and the target generation, and replay safely.
+fn a_lead_closes_a_request_whose_requester_is_gone(db: &Db) {
+    let store = db.open();
+    let incumbent = token(&*store, 1, "incumbent");
+    let viewer = mint(&*store, 1, "viewer", true);
+    let stranger = token(&*store, 5, "stranger");
+    let now = unix_now();
+    store
+        .work_start(&incumbent, &start("incumbent", "incumbent-session"), now)
+        .unwrap();
+    let requesters = [
+        token(&*store, 2, "revoked"),
+        token(&*store, 3, "expired"),
+        token(&*store, 4, "disabled"),
+        token(&*store, 6, "alive"),
+    ];
+    let requests: Vec<CoordinationRequest> = requesters
+        .iter()
+        .enumerate()
+        .map(|(index, requester)| {
+            store
+                .work_start(
+                    requester,
+                    &start_scope(
+                        &format!("requester-{index}"),
+                        "requester-session",
+                        WorkRole::Lead,
+                        None,
+                        &[&format!("src/area{index}/**")],
+                    ),
+                    now + 1 + index as i64,
+                )
+                .unwrap()
+                .coordination_request
+                .unwrap()
+        })
+        .collect();
+    let list = |at: i64| {
+        store
+            .coordination_list(&incumbent, &CoordinationListQuery::default(), at)
+            .unwrap()
+            .requests
+    };
+    // Every requester can act, so nothing is flagged.
+    assert!(list(now + 10).iter().all(|r| !r.requester_unavailable));
+
+    // Revoked, expired and disabled-owner requesters are each reported as unavailable.
+    assert!(store.revoke_agent_token(&requesters[0]).unwrap());
+    db.expire_token(&requesters[1]);
+    db.disable_token_owner(&requesters[2]);
+    let flagged: Vec<(String, bool)> = list(now + 11)
+        .into_iter()
+        .map(|r| (r.id, r.requester_unavailable))
+        .collect();
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            flagged.iter().find(|(id, _)| *id == request.id).unwrap().1,
+            index < 3,
+            "request {index}"
+        );
+    }
+
+    let current = |request: &CoordinationRequest| {
+        list(now + 12)
+            .into_iter()
+            .find(|r| r.id == request.id)
+            .unwrap()
+    };
+    let revoked = current(&requests[0]);
+    let led = revoked
+        .targets
+        .iter()
+        .find(|target| target.lead.token == incumbent)
+        .unwrap();
+    let withdraw = |request: &CoordinationRequest, operation: &str, via_hub: bool| {
+        let led = request
+            .targets
+            .iter()
+            .find(|target| target.lead.token == incumbent)
+            .unwrap();
+        CoordinationWithdraw {
+            request_id: request.id.clone(),
+            operation_id: operation.into(),
+            session: "incumbent-session".into(),
+            expected_updated_seq: request.updated_seq,
+            target: Some(CoordinationWithdrawTarget {
+                work_id: led.work_id.clone(),
+                generation: led.generation,
+            }),
+            via_hub,
+        }
+    };
+    let by_person = withdraw(&revoked, "person", true);
+
+    // Nobody else may close it: not another owner, not a read-only token of the lead's owner,
+    // not the lead's token under another session, and not while the requester can still act.
+    for (caller, call) in [
+        (&stranger, by_person.clone()),
+        (&viewer, by_person.clone()),
+        (
+            &incumbent,
+            CoordinationWithdraw {
+                session: "someone-elses-session".into(),
+                ..by_person.clone()
+            },
+        ),
+        (&incumbent, withdraw(&current(&requests[3]), "alive", true)),
+    ] {
+        assert!(
+            matches!(
+                store.coordination_withdraw(caller, &call, now + 13),
+                Err(HubError::Unauthorized)
+            ),
+            "{caller}"
+        );
+    }
+
+    // A person never closes a request as its requester, even one that can act; the agent still can.
+    let alive = current(&requests[3]);
+    let own = CoordinationWithdraw {
+        request_id: alive.id.clone(),
+        operation_id: "own".into(),
+        session: "requester-session".into(),
+        expected_updated_seq: alive.updated_seq,
+        target: None,
+        via_hub: true,
+    };
+    assert!(matches!(
+        store.coordination_withdraw(&requesters[3], &own, now + 13),
+        Err(HubError::Unauthorized)
+    ));
+    let own = CoordinationWithdraw {
+        via_hub: false,
+        ..own
+    };
+    assert_eq!(
+        store
+            .coordination_withdraw(&requesters[3], &own, now + 13)
+            .unwrap()
+            .status,
+        CoordinationStatus::Withdrawn
+    );
+
+    // A stale sequence, another generation and another Work are each refused, and change nothing.
+    for (stale, message) in [
+        (
+            CoordinationWithdraw {
+                expected_updated_seq: revoked.updated_seq + 99,
+                ..by_person.clone()
+            },
+            "request changed",
+        ),
+        (
+            CoordinationWithdraw {
+                target: Some(CoordinationWithdrawTarget {
+                    work_id: led.work_id.clone(),
+                    generation: led.generation + 1,
+                }),
+                ..by_person.clone()
+            },
+            "target changed",
+        ),
+        (
+            CoordinationWithdraw {
+                target: Some(CoordinationWithdrawTarget {
+                    work_id: format!("wrk_{:032x}", 1),
+                    generation: led.generation,
+                }),
+                ..by_person.clone()
+            },
+            "target changed",
+        ),
+    ] {
+        match store.coordination_withdraw(&incumbent, &stale, now + 14) {
+            Err(HubError::Invalid(reason)) => assert!(reason.contains(message), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(current(&requests[0]).status, revoked.status);
+
+    // The lead's owner closes it for the lead; the record says a person did, and why.
+    let closed = store
+        .coordination_withdraw(&incumbent, &by_person, now + 15)
+        .unwrap();
+    assert_eq!(closed.status, CoordinationStatus::Withdrawn);
+    let withdrawn_events = || -> Vec<String> {
+        store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "coordination_withdrawn")
+            .map(|event| event.data)
+            .filter(|data| data.contains("requester_unavailable"))
+            .collect()
+    };
+    let events = withdrawn_events();
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].contains("\"reason\":\"requester_unavailable\""),
+        "{events:?}"
+    );
+    assert!(events[0].contains("\"via\":\"hub\""), "{events:?}");
+
+    // A retry replays the same close; a new attempt on the closed request is refused.
+    let again = store
+        .coordination_withdraw(&incumbent, &by_person, now + 16)
+        .unwrap();
+    assert_eq!(again.updated_seq, closed.updated_seq);
+    assert_eq!(withdrawn_events().len(), 1);
+    assert!(matches!(
+        store.coordination_withdraw(&incumbent, &withdraw(&closed, "second", true), now + 17),
+        Err(HubError::Invalid(reason)) if reason.contains("closed")
+    ));
+
+    // Nothing was released: the lead still holds its Work, and the request left the active list.
+    let item = store
+        .work_get(&incumbent, &led.work_id, now + 18)
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.lead_token, incumbent);
+    let active = store
+        .coordination_list(
+            &incumbent,
+            &CoordinationListQuery {
+                active_only: true,
+                ..CoordinationListQuery::default()
+            },
+            now + 19,
+        )
+        .unwrap();
+    assert!(active.requests.iter().all(|r| r.id != revoked.id));
+
+    // The lead's own agent closes another one directly, with no fence and no mark.
+    let expired = current(&requests[1]);
+    let direct = CoordinationWithdraw {
+        target: None,
+        ..withdraw(&expired, "agent", false)
+    };
+    let closed = store
+        .coordination_withdraw(&incumbent, &direct, now + 20)
+        .unwrap();
+    assert_eq!(closed.status, CoordinationStatus::Withdrawn);
+    let events = withdrawn_events();
+    assert_eq!(events.len(), 2);
+    assert!(!events[1].contains("\"via\""), "{events:?}");
+}
+
 macro_rules! parity_case {
     ($name:ident, $case:ident) => {
         mod $name {
@@ -1440,6 +1705,10 @@ macro_rules! parity_case {
 parity_case!(
     person_reply_through_the_hub,
     a_person_reply_through_the_hub_is_marked_and_delivered
+);
+parity_case!(
+    close_orphaned_request,
+    a_lead_closes_a_request_whose_requester_is_gone
 );
 parity_case!(
     queued_expansion,
@@ -1540,6 +1809,7 @@ fn maximum_projected_coordination_request_fits_the_json_budget() {
         updated_at: 2,
         created_seq: 1,
         updated_seq: 2,
+        requester_unavailable: true,
     };
 
     let encoded = serde_json::to_vec(&request).unwrap();

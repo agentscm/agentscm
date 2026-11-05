@@ -216,7 +216,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `forbidden`, and a computer credential 401. Each call stores a new token, so a page keeps its
   token in memory and asks again only near `expires_at`. Signing out does not end a token
   already handed out; it lasts until it expires.
-- <a id="people-answering-for-their-own-agent"></a>**People answering for their own agent** (experimental). The Inbox page offers four routes
+- <a id="people-answering-for-their-own-agent"></a>**People answering for their own agent** (experimental). The Inbox page offers five routes
   that need the web sign-in's cookie, and the CSRF token for a change; a `hub login` session or a
   computer credential is refused (403 `forbidden`, 401) and a cookie alone answers 403 `csrf`.
   Each names the person's own agent by its token id (`token`). The Hub requires that token to be
@@ -230,6 +230,20 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     `POST /v1/hub/standup/coordination/reply` for the agent that leads the target Work. Same
     kinds (`propose_split`, `join`, `handover`, `decline`), 500-byte note, `operation_id`
     replay and `expected_updated_seq` check. Reply: the updated request.
+  - `POST /v1/hub/session/coordination/withdraw` (`token`, `request_id`, `operation_id`, `session`,
+    `expected_updated_seq`, `target_work_id`, `target_generation`) is
+    `POST /v1/hub/standup/coordination/withdraw` for the agent that leads the target Work, once
+    the requesting agent can no longer act: its token is revoked or expired, its owner is
+    disabled, or its repository was renamed since the token was minted. Every request the Hub
+    lists says so with `requester_unavailable: true` (left out otherwise). Nothing else is closed
+    this way: not while the requester can act, not as the requester, not for a lead that is not
+    the named agent and session, and not for a read-only or another person's token; each answer
+    is the same 403 `not_your_agent`. A request that changed (400, "request changed") or whose
+    target Work moved to another generation (400, "target changed") must be read again first, a
+    replayed `operation_id` returns the first close, and a closed request is a 400. The request
+    becomes `withdrawn` with reason `requester_unavailable` and `"via": "hub"` on its
+    `coordination_withdrawn` event; no Work, reservation or assignment is released or changed.
+    Reply: the updated request.
   - `POST /v1/hub/session/handoff/answer` (`token`, optional `session`, `path`, `accept`,
     optional `reason`) answers the oldest open file handoff request addressed to that agent's
     session, as `agentscm_handoff` does. Reply: `{"outcome": "granted" | "declined" |
@@ -245,8 +259,10 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     request past the 30-minute hold cap), `note`, `reply`, `created_at`, `decided_at`,
     `holder_told`, `requester_told`, `asked_via_hub`, `answered_via_hub`, `answered_via_slack` and the two sides
     (`agent`, `login`, `mine`); `token` and `session` appear only on the person's own side.
-  There is no withdrawal: the store has no way to retract a reply or a file request, so the page
-  offers none. The coordination request's own requester can still withdraw it, as an agent.
+  There is no withdrawal of a reply or a file request: the store has no way to retract either, so
+  the page offers none. The one close it offers is for a coordination request whose requesting
+  agent is gone (see `POST /v1/hub/session/coordination/withdraw` below); a requester that can
+  still act withdraws its own request, as an agent.
   These routes use the store permits of the agent routes (503 `busy` when saturated) and no extra
   limit. The record says a person answered (a holder who presses a Slack button is `"via": "slack"` on the `handoff_grant` or `handoff_decline` event, `answered_via_slack` on the handoff, and "from Slack" in the line the requesting agent reads): a coordination response carries `"via": "hub"` beside
   the agent that leads the Work (`responder` is still that agent, whose `login` is its owner, the
