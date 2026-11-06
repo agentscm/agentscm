@@ -762,7 +762,7 @@ async fn announce_with<T: Send + 'static>(
         {
             Ok(found) => pulls = found,
             Err(error) => {
-                crate::hub::error_envelope::log_internal(&error);
+                eprintln!("hub: pull requests for a session touch: {error}");
                 unknown = Some(advice::unknown("pull requests could not be read"));
             }
         }
@@ -897,7 +897,7 @@ pub async fn duplicates_for(
     let pulls = open_pulls(state, host, &principal.repository, principal.repository_id)
         .await
         .unwrap_or_else(|error| {
-            crate::hub::error_envelope::log_internal(&error);
+            eprintln!("hub: open pull requests for a start: {error}");
             Vec::new()
         });
     let same: Vec<&WorkItem> = current
@@ -942,7 +942,7 @@ pub async fn status_for(
     parts.push(match others_for(state, principal, own).await {
         Ok(others) => others,
         Err(error) => {
-            crate::hub::error_envelope::log_internal(&error);
+            eprintln!("hub: other agents for a status: {error}");
             advice::unknown("other agents could not be listed")
         }
     });
@@ -956,7 +956,7 @@ pub async fn status_for(
     {
         Ok(pulls) => parts.push(advice::pulls(&pulls)),
         Err(error) => {
-            crate::hub::error_envelope::log_internal(&error);
+            eprintln!("hub: open pull requests for a status: {error}");
             parts.push(advice::unknown("pull requests could not be read"));
         }
     }

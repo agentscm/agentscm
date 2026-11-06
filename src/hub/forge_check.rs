@@ -386,7 +386,7 @@ pub(super) async fn reconcile_repo(
                     Ok(false) => break,
                     Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
                     Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                        crate::hub::error_envelope::log_internal(&detail);
+                        eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
                         break;
                     }
                 }
@@ -436,10 +436,10 @@ async fn retire_disabled(
                     if let Err(error) =
                         record_merge(state, conn, repo, number, merge_commit, head).await
                     {
-                        crate::hub::error_envelope::log_internal(&format!(
+                        eprintln!(
                             "hub: forge check for {}#{number}: recording the merge: {error}",
                             repo.full_name
-                        ));
+                        );
                     }
                     continue;
                 }
@@ -459,7 +459,7 @@ async fn retire_disabled(
             Ok(None) => None,
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                crate::hub::error_envelope::log_internal(&detail);
+                eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
                 continue;
             }
         };
@@ -794,10 +794,10 @@ async fn post(
     };
     let gitlab = conn.provider == "gitlab";
     let uncertain = |detail: &str| {
-        crate::hub::error_envelope::log_internal(&format!(
+        eprintln!(
             "hub: forge check post for {}#{number}: {detail}",
             repo.full_name
-        ));
+        );
         Ok(Posting::Unknown)
     };
     // A list that cannot be read leaves the status uncertain; a stopped pass still stops.

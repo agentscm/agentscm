@@ -1063,16 +1063,11 @@ async fn mint_agent_token(
         (403, Some("not_connected")) => Err(invalid(
             "this repository isn't connected to this Hub yet; ask a Hub admin to connect it",
         )),
-        (403, code) => {
-            let invisible = "your forge account can't see that repository, or it was renamed or moved; check the name and your access";
-            // A bare `forbidden` carries no reason of its own; every other refusal speaks for itself.
-            Err(invalid(
-                &match (code, crate::hub_cli::refusal_message(&reply)) {
-                    (Some("forbidden"), _) | (_, None) => invisible.to_owned(),
-                    (_, Some(message)) => message,
-                },
-            ))
-        }
+        (403, _) => Err(invalid(
+            &crate::hub_cli::refusal_message(&reply).unwrap_or_else(|| {
+                "your forge account can't see that repository, or it was renamed or moved; check the name and your access".to_owned()
+            }),
+        )),
         (401, _) => Err(invalid("Hub sign-in expired or was rejected")),
         (201, _) => minted_from(&reply, HubAuth::Session(session)),
         _ => Err(invalid("Hub could not create an agent token")),

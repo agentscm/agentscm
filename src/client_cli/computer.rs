@@ -17,7 +17,7 @@ use super::{
     write_owned_token,
 };
 use crate::client_config::{Connection, load, origin_identity, owned_token_path, update};
-use crate::hub_cli::{self, HubAuth, SavedDevice, call};
+use crate::hub_cli::{self, HubAuth, SavedDevice, call, refusal_message};
 
 /// A computer's agent token is renewed when less than this is left of its 24 hours.
 pub(crate) const RENEW_BEFORE_SECONDS: i64 = 12 * 60 * 60;
@@ -40,32 +40,15 @@ pub(crate) fn refusal_text(kind: &str, repo: &str, forge: &str) -> String {
         "permission_unavailable" => format!(
             "{forge} didn't answer the Hub's access check; nothing changed, so try again in a minute"
         ),
-        _ => agentscm::hub::error_envelope::ErrorCode::parse(kind)
-            .unwrap_or(agentscm::hub::error_envelope::ErrorCode::SignInRequired)
-            .message()
-            .to_owned(),
+        "not_allowed" => {
+            "This Hub only lets in people its admins have allowed; ask a Hub admin to add you"
+                .to_owned()
+        }
+        "user_disabled" => {
+            "Your account is turned off on this Hub; ask a Hub admin to turn it back on".to_owned()
+        }
+        _ => "This computer isn't signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app or run agentscm hub login".to_owned(),
     }
-}
-
-fn refusal_reply(reply: &Value, repo: &str, forge: &str) -> String {
-    use agentscm::hub::error_envelope::{ErrorCode, decode};
-    let kind = reply["error"].as_str().unwrap_or("sign_in_required");
-    let code = ErrorCode::parse(kind).unwrap_or(ErrorCode::SignInRequired);
-    let mut envelope = decode(code.status(), reply);
-    if reply["message"].is_null()
-        || reply["message"].as_str() == Some(code.message())
-        || (matches!(
-            kind,
-            "not_connected"
-                | "insufficient_role"
-                | "no_repository_role"
-                | "access_check_unavailable"
-                | "permission_unavailable"
-        ) && envelope.message.contains("[redacted]"))
-    {
-        envelope.message = refusal_text(kind, repo, forge);
-    }
-    envelope.render()
 }
 
 /// Why a mint through this computer did not happen.
@@ -118,11 +101,13 @@ pub(super) async fn mint(
     };
     let refused = |reply: &Value| {
         let kind = reply["error"].as_str().unwrap_or_default();
-        let message = refusal_reply(
-            reply,
-            &connection.repo,
-            forge_of(provider, &connection.origin_host),
-        );
+        let message = refusal_message(reply).unwrap_or_else(|| {
+            refusal_text(
+                kind,
+                &connection.repo,
+                forge_of(provider, &connection.origin_host),
+            )
+        });
         match kind {
             "not_connected" => MintError::NotConnected(message),
             "permission_unavailable" => MintError::Unavailable(message),
@@ -198,11 +183,13 @@ pub(crate) async fn check(connection: &Connection) -> Option<std::result::Result
     let client = forge_http::client().ok()?;
     let hub = &connection.hub;
     let failed = |reply: &Value| {
-        Err(refusal_reply(
-            reply,
-            &connection.repo,
-            forge_of(None, &connection.origin_host),
-        ))
+        Err(refusal_message(reply).unwrap_or_else(|| {
+            refusal_text(
+                reply["error"].as_str().unwrap_or_default(),
+                &connection.repo,
+                forge_of(None, &connection.origin_host),
+            )
+        }))
     };
     let (status, me) = match call(
         &client,
@@ -615,25 +602,5 @@ mod tests {
             let text = refusal_text(kind, "acme/widgets", "GitHub");
             assert!(text.contains("; "), "{kind} has no fix: {text}");
         }
-    }
-
-    #[test]
-    fn old_hub_refusals_keep_repository_and_forge_guidance() {
-        for body in [
-            json!({"error":"permission_unavailable"}),
-            serde_json::to_value(agentscm::hub::error_envelope::decode(
-                503,
-                &json!({"error":"permission_unavailable"}),
-            ))
-            .unwrap(),
-        ] {
-            assert!(
-                refusal_reply(&body, "acme/widgets", "GitLab").contains("GitLab didn't answer")
-            );
-        }
-        assert!(
-            refusal_reply(&json!({"error":"not_connected"}), "acme/widgets", "GitHub")
-                .contains("acme/widgets isn't connected")
-        );
     }
 }

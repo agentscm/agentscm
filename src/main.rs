@@ -1707,13 +1707,6 @@ fn print_page(value: &Value) -> Result<()> {
 
 fn print_error(error: &Error) {
     let kind = match error {
-        Error::Hub(envelope) => match envelope.status {
-            401 | 403 => "denied",
-            404 | 410 => "nonexistent",
-            409 => "conflict",
-            400..500 => "invalid",
-            _ => "failed",
-        },
         Error::MissingObject(_) => "unavailable",
         Error::NotFound(message) if message.starts_with("object: ") => "unavailable",
         Error::NotFound(_) => "nonexistent",
@@ -1733,15 +1726,6 @@ fn print_error(error: &Error) {
 
 /// A person at a terminal reads a sentence; scripts and agents get the JSON contract.
 fn render_error(error: &Error, kind: &str, terminal: bool) -> String {
-    if let Error::Hub(envelope) = error {
-        if terminal {
-            return format!("error: {}", envelope.render());
-        }
-        return json!({"ok":false,"error":envelope.message,"error_kind":kind,
-            "code":envelope.code,"retryable":envelope.retryable,"recovery":envelope.recovery,
-            "fields":envelope.fields,"correlation_id":envelope.correlation_id})
-        .to_string();
-    }
     if terminal {
         match error {
             Error::Invalid(message) => format!("error: {message}"),
@@ -1763,40 +1747,8 @@ mod tests {
         let piped: Value = serde_json::from_str(&render_error(&error, "invalid", false)).unwrap();
         assert_eq!(
             piped,
-            serde_json::from_str::<Value>(include_str!(
-                "../tests/fixtures/hub_errors/cli-baseline.json"
-            ))
-            .unwrap()
+            json!({"ok": false, "error": "invalid: pass --hub", "error_kind": "invalid"})
         );
-    }
-
-    #[test]
-    fn hub_errors_keep_safe_actionable_fields_in_terminal_and_json() {
-        use agentscm::hub::error_envelope::{self, ErrorCode};
-        let reference = "cor_0123456789abcdef0123456789abcdef";
-        for code in ErrorCode::ALL {
-            let envelope = error_envelope::decode(
-                code.status(),
-                &json!({
-                    "error":code.as_str(),"message":"\u{1b}[31munsafe\nAuthorization: Bearer example-secret /private/example/token.json",
-                    "correlation_id":reference
-                }),
-            );
-            let error = Error::Hub(Box::new(envelope));
-            let terminal = render_error(&error, "failed", true);
-            let json = render_error(&error, "failed", false);
-            for output in [&terminal, &json] {
-                assert!(output.contains(reference));
-                assert!(!output.contains("example-secret"));
-                assert!(!output.contains("/private/example"));
-                assert!(!output.contains('\u{1b}'));
-            }
-            let body: Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(body["ok"], false);
-            assert_eq!(body["code"], code.as_str());
-            assert!(body["retryable"].is_boolean());
-            assert!(body["recovery"].is_object());
-        }
     }
 
     #[test]

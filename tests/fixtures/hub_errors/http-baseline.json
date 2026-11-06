@@ -1,7 +1,0 @@
-[
-  {"error":"invalid_request"},
-  {"error":"unauthorized"},
-  {"error":"work_storage_capacity"},
-  {"error":"work_checkpoint_sequence_conflict","current_seq":17},
-  {"error":"work_scope_overlap","overlaps":[],"alternatives":["Split the declared scope or join the existing work as helper or reviewer.","Arrange a deliberate handover with the current lead."]}
-]
