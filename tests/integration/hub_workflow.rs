@@ -2049,9 +2049,8 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
     let error = touch.join().unwrap().unwrap_err();
     assert!(
         matches!(&error, agentscm::hub::HubError::Invalid(message)
-        if message.contains("not covered by a current unfinished assignment")
-             )
-            || matches!(&error, agentscm::hub::HubError::Rejected(rejection) if rejection.code() == agentscm::hub::error_envelope::ErrorCode::LeaseLapsed),
+            if message.contains("not covered by a current unfinished assignment")
+                || message.starts_with(agentscm::hub::work_lifecycle::LEASE_LAPSED)),
         "unexpected managed touch error: {error:?}"
     );
     assert!(takeover.join().unwrap().unwrap().took_over);

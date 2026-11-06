@@ -262,7 +262,7 @@ async fn a_read_only_token_reaches_only_the_read_routes_and_writes_nothing() {
             Allowed => assert_eq!(status, 200, "{label}: {body}"),
             AgentOnly => {
                 assert_eq!(status, 403, "{label}: {body}");
-                crate::assert_hub_error!(
+                assert_eq!(
                     serde_json::from_str::<Value>(&body).unwrap(),
                     json!({"error": "read_only"}),
                     "{label}"
@@ -270,17 +270,8 @@ async fn a_read_only_token_reaches_only_the_read_routes_and_writes_nothing() {
             }
             HumanOnly => assert_eq!(status, 401, "{label}: {body}"),
             AsUnknownToken => {
-                let (bogus_status, bogus_body) = hub.send(&row, Some("agt_not-a-token")).await;
-                assert_eq!(status, bogus_status, "{label}");
-                let mut actual: Value = serde_json::from_str(&body).unwrap();
-                let mut expected: Value = serde_json::from_str(&bogus_body).unwrap();
-                actual.as_object_mut().unwrap().remove("correlation_id");
-                expected.as_object_mut().unwrap().remove("correlation_id");
-                assert_eq!(
-                    crate::hub_error_assert::blank_references(&actual.to_string()),
-                    crate::hub_error_assert::blank_references(&expected.to_string()),
-                    "{label}"
-                );
+                let bogus = hub.send(&row, Some("agt_not-a-token")).await;
+                assert_eq!((status, body), bogus, "{label}");
             }
             Status(expected) => assert_eq!(status, *expected, "{label}: {body}"),
         }

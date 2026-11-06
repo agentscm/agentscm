@@ -73,7 +73,7 @@ async fn workspace_two_people_csrf_scope_roles_revocation_and_last_admin() {
     );
     let mut collision = add.clone();
     collision["roles"] = json!(["reader"]);
-    crate::assert_hub_error!(
+    assert_eq!(
         env.request(
             Method::PUT,
             "/v1/hub/workspace/members",
@@ -142,7 +142,7 @@ async fn workspace_two_people_csrf_scope_roles_revocation_and_last_admin() {
         403
     );
     // No removal of the final administrator.
-    crate::assert_hub_error!(
+    assert_eq!(
         env.request(
             Method::PUT,
             "/v1/hub/workspace/members",
@@ -155,7 +155,7 @@ async fn workspace_two_people_csrf_scope_roles_revocation_and_last_admin() {
         (409, json!({"error":"last_administrator"}))
     );
     let settings = json!({"request_id":"stale-settings","expected_generation":1,"name":"Renamed workspace","max_concurrent_runs":1});
-    crate::assert_hub_error!(
+    assert_eq!(
         env.request(
             Method::PUT,
             "/v1/hub/workspace/settings",

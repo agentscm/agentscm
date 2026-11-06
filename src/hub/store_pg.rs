@@ -88,9 +88,9 @@ use super::publish::{
     SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
-    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
-    SessionCall, SessionEnd, Touched, check, check_name, expiry_cause, guard, held,
-    plan as plan_touch,
+    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_REQUIRED, SESSION_TTL_SECONDS,
+    STALE_SESSION_SECONDS, SessionCall, SessionEnd, Touched, check, check_name, expiry_cause,
+    guard, held, plan as plan_touch,
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
@@ -299,7 +299,7 @@ impl Drop for PgStore {
             Ok(thread) => {
                 let _ = thread.join();
             }
-            Err(error) => crate::hub::error_envelope::log_internal(&error),
+            Err(error) => eprintln!("hub: postgres client not closed: {error}"),
         }
     }
 }
@@ -4300,7 +4300,7 @@ fn start_in(
             if !work_holds_reservation(tx, &item.id)?
                 && let Some(refusal) = lapsed_hold_refusal(tx, who, &start.session, Some(&item.id))?
             {
-                return Err(HubError::lease_lapsed(refusal));
+                return Err(HubError::Invalid(refusal));
             }
             if item.title != start.title
                 || item.scope != scope
@@ -4339,7 +4339,7 @@ fn start_in(
                 && let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)?
             {
                 if !named {
-                    return Err(HubError::lease_lapsed(lapsed_unheld_text(
+                    return Err(HubError::Invalid(lapsed_unheld_text(
                         &item.id,
                         renewed,
                         expired,
@@ -5615,7 +5615,7 @@ fn session_name(
     match kept.as_slice() {
         [] => Ok(DEFAULT_SESSION.to_owned()),
         [only] if only.get::<_, bool>(1) => Ok(only.get(0)),
-        _ => Err(HubError::session_required()),
+        _ => Err(HubError::Invalid(SESSION_REQUIRED.into())),
     }
 }
 
@@ -5758,13 +5758,13 @@ fn guard_managed_touch(
     }
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
         if let Some(refusal) = lapsed_hold_refusal(tx, who, name, None)? {
-            return Err(HubError::lease_lapsed(refusal));
+            return Err(HubError::Invalid(refusal));
         }
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
     // A lapsed lease no longer holds the scope, so editing under it needs fresh admission first.
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
-        return Err(HubError::lease_lapsed(lapsed_unheld_text(
+        return Err(HubError::Invalid(lapsed_unheld_text(
             &eligible[0].id,
             renewed,
             expired,
@@ -6157,7 +6157,7 @@ fn auto_ask(
             Ok(Asked::Requested { holder }) => requested.push((key.clone(), holder)),
             Ok(_) => {}
             Err(error) => {
-                crate::hub::error_envelope::log_internal(&error);
+                eprintln!("hub: handoff request for a refused edit: {error}");
                 let _ = tx.batch_execute("ROLLBACK TO auto_ask; RELEASE auto_ask");
             }
         }
@@ -6957,7 +6957,7 @@ fn work_checkpoint_in(
     let carry = match lead_access(&item, &who.owner.id, token, &who.agent, &checkpoint.session) {
         LeadAccess::Current => false,
         LeadAccess::Carry => true,
-        LeadAccess::Refuse { message } => return Err(HubError::lead_session_mismatch(message)),
+        LeadAccess::Refuse { message } => return Err(HubError::Invalid(message)),
     };
     let prior_basis = work_reservation_basis(tx, &item.id)?;
     let held = prior_basis.is_some();
@@ -10494,7 +10494,7 @@ impl Store for PgStore {
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {
-                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
+                return Err(HubError::Invalid(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
             }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;

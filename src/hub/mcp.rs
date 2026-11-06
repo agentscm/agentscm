@@ -26,16 +26,16 @@ use super::coordination::{
     CoordinationAck, CoordinationInboxQuery, CoordinationReply, CoordinationResolve,
     CoordinationStatus, CoordinationWithdraw,
 };
-use super::error_envelope::{self, ErrorCode, FieldProblem, InputProblem};
 use super::http::{ApiError, Reader, blocking};
 use super::insights::{InsightQuery, UsageRecord};
+use super::lead_credential::LEAD_SESSION_MISMATCH;
 use super::promise::{
     DEFAULT_PROMISE_PAGE, MAX_PROMISE_PAGE, PromiseConstraintV1, PromiseCriterionV1,
     PromiseInputV1, PromiseViewV1, current_admission,
 };
 use super::session::{
-    DEFAULT_SESSION, SessionCall, announce_for, announce_named, done_pausing_for, duplicates_for,
-    others_for, status_for,
+    DEFAULT_SESSION, SESSION_REQUIRED, SessionCall, announce_for, announce_named, done_pausing_for,
+    duplicates_for, others_for, status_for,
 };
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
@@ -46,6 +46,7 @@ use super::work::{
     WorkConflictKind, WorkItem, WorkOverviewQuery, WorkRole, WorkSource, WorkStart,
     WorkStartResult, WorkState,
 };
+use super::work_lifecycle::LEASE_LAPSED;
 use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult, WorkPreflightStatus};
 use super::work_transition::{
     OperationalSelect, WorkLifecycleReader, WorkTransitionActor, WorkTransitionRequest,
@@ -409,7 +410,7 @@ async fn mcp(
                 .is_some_and(|repo| repo != principal.repository);
             if params.and_then(|p| p["name"].as_str()) == Some("agentscm_setup_status") {
                 if foreign {
-                    Ok(refused("wrong_repository"))
+                    Ok(refused("this token is for another repository"))
                 } else {
                     // Say which argument is wrong (e.g. "missing field `agent`"), as other tools do.
                     match try_args::<super::onboarding::SetupCall>(
@@ -448,21 +449,7 @@ async fn mcp(
         _ => Err(NO_METHOD),
     };
     Ok(match outcome {
-        Ok(result) => {
-            let reference = result
-                .pointer("/structuredContent/error/correlation_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let mut response =
-                Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response();
-            if let Some(reference) = reference {
-                response.headers_mut().insert(
-                    "x-agentscm-correlation-id",
-                    reference.parse().expect("Hub correlation header"),
-                );
-            }
-            response
-        }
+        Ok(result) => Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
         Err(error) => failure(id, error),
     })
 }
@@ -552,16 +539,8 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
 }
 
 fn failure(id: &Value, (code, message): (i32, &str)) -> Response {
-    let envelope = error_envelope::from_code(ErrorCode::InvalidRequest);
-    let reference = envelope.correlation_id.clone();
-    let mut response = Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": envelope}})).into_response();
-    if let Some(reference) = reference {
-        response.headers_mut().insert(
-            "x-agentscm-correlation-id",
-            reference.parse().expect("Hub correlation header"),
-        );
-    }
-    response
+    Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}))
+        .into_response()
 }
 
 /// Which views are served, as (uri, html) pairs.
@@ -588,7 +567,7 @@ fn resources_list(settings: &ViewSettings) -> Value {
 fn resources_read(
     params: Option<&Value>,
     settings: &ViewSettings,
-    _principal: &Principal,
+    principal: &Principal,
 ) -> std::result::Result<Value, (i32, &'static str)> {
     let uri = params
         .and_then(|p| p["uri"].as_str())
@@ -597,6 +576,7 @@ fn resources_read(
         .into_iter()
         .find(|(known, _)| *known == uri)
         .ok_or(INVALID_PARAMS)?;
+    eprintln!("mcp resources/read uri={uri} token={}", principal.token_id);
     Ok(json!({"contents": [{"uri": uri, "mimeType": UI_MIME, "text": html}]}))
 }
 
@@ -1261,24 +1241,11 @@ fn safe_detail(error: &str) -> String {
 
 /// A malformed call is the caller's mistake, not a coordination outage.
 pub(super) fn invalid_args(tool: &str, detail: &str) -> Value {
-    let mut error = error_envelope::from_code(ErrorCode::InvalidRequest);
-    // Name the field that is wrong, as the caller needs, but only when it passes the field-name
-    // check: the serde text can carry caller-chosen characters, which are never echoed.
-    let field = InputProblem::from_json_error(detail);
-    let reason = match &field {
-        Some(field) => match field.problem {
-            FieldProblem::Missing => format!("missing field `{}`", field.name),
-            FieldProblem::Unknown => format!("unknown field `{}`", field.name),
-            _ => format!("field `{}` has the wrong type or value", field.name),
-        },
-        None => "the arguments do not match the tool's input schema".to_owned(),
-    };
-    error.message = format!(
-        "invalid arguments for {}: {reason}",
-        error_envelope::server_message(tool)
-    );
-    error.fields = field.map(|field| vec![field]);
-    error.mcp()
+    let detail: String = detail.chars().take(200).collect();
+    result(
+        &format!("AgentSCM: invalid arguments for {tool}: {detail}"),
+        true,
+    )
 }
 
 fn session_call(session: Option<String>, task: Option<String>, paths: Vec<String>) -> SessionCall {
@@ -1294,26 +1261,39 @@ fn session_call(session: Option<String>, task: Option<String>, paths: Vec<String
 
 /// A tool result; reasons are hub strings and schema text, never client input.
 fn result(text: &str, is_error: bool) -> Value {
-    if is_error {
-        return error_envelope::from_code(ErrorCode::InvalidRequest).mcp();
-    }
-    json!({"content": [{"type": "text", "text": text}], "isError": false})
+    json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
 
-/// A refusal whose reason carries numbers or a command the registry text cannot hold.
-fn refused_with(code: &str, message: String) -> Value {
-    let mut envelope =
-        error_envelope::from_code(ErrorCode::parse(code).unwrap_or(ErrorCode::Unavailable));
-    envelope.message = message;
-    envelope.mcp()
-}
-
-fn refused(code: &str) -> Value {
-    error_envelope::from_code(ErrorCode::parse(code).unwrap_or(ErrorCode::Unavailable)).mcp()
+fn refused(reason: &str) -> Value {
+    result(&unknown(reason), true)
 }
 
 pub(super) fn hub_failure(error: &HubError) -> Value {
-    error_envelope::from_hub_error(error).mcp()
+    refused(match error {
+        HubError::Busy => "hub busy",
+        HubError::WorkCapacity(_) => "work storage capacity reached",
+        HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
+        HubError::WorkCoordinationRequired { .. } => {
+            "work scope needs coordination; inspect the agent inbox"
+        }
+        HubError::WorkOverlapIncomplete => {
+            "work overlap coverage is incomplete; no new scope was claimed"
+        }
+        HubError::WorkPreflight(_) => "work preflight requires review; no new work was claimed",
+        HubError::WorkCheckpointSequenceConflict { .. } => {
+            "checkpoint sequence changed; inspect current Work before retry"
+        }
+        HubError::Unavailable(_) => "hub unavailable",
+        HubError::Invalid(message)
+            if message == SESSION_REQUIRED
+                || message.starts_with(LEAD_SESSION_MISMATCH)
+                || message.starts_with(LEASE_LAPSED) =>
+        {
+            message.as_str()
+        }
+        HubError::Invalid(_) => "invalid request",
+        HubError::Unauthorized => "token not accepted",
+    })
 }
 
 /// Optional read enrichment never replaces a committed mutation or delivery receipt.
@@ -1574,7 +1554,7 @@ fn promise_failure(error: &HubError) -> Value {
                 || code == "promise_forbidden"
                 || code == "promise_not_found" =>
         {
-            hub_failure(&HubError::reviewed(ErrorCode::NotFound))
+            refused("promise unavailable")
         }
         _ => work_failure(error),
     }
@@ -1597,10 +1577,10 @@ async fn promise_call(
         return None;
     }
     let Some(workspace) = state.workspace.clone() else {
-        return Some(refused("unavailable"));
+        return Some(refused("promise workspace unavailable"));
     };
     let Some(token) = crate::http_listener::bearer(headers).map(str::to_owned) else {
-        return Some(refused("unauthorized"));
+        return Some(refused("token not accepted"));
     };
     let store = state.store.clone();
     #[cfg(unix)]
@@ -1660,7 +1640,7 @@ async fn promise_call(
             .await
             {
                 Ok(Some(view)) => structured(&view),
-                Ok(None) => refused("not_found"),
+                Ok(None) => refused("promise unavailable"),
                 Err(error) => promise_failure(&error),
             }
         }
@@ -1692,7 +1672,7 @@ async fn promise_call(
             .await
             {
                 Ok(Some(page)) => structured(&page),
-                Ok(None) => refused("not_found"),
+                Ok(None) => refused("promise unavailable"),
                 Err(error) => promise_failure(&error),
             }
         }
@@ -1870,7 +1850,7 @@ async fn call_inner(
         return Err(INVALID_PARAMS);
     }
     if foreign {
-        return Ok(refused("wrong_repository"));
+        return Ok(refused("this token is for another repository"));
     }
     let arguments = params.and_then(|params| params.get("arguments"));
     if name == "agentscm_value_metrics" {
@@ -1883,7 +1863,7 @@ async fn call_inner(
             .as_ref()
             .is_some_and(|repository| repository != &principal.repository)
         {
-            return Ok(refused("wrong_repository"));
+            return Ok(refused("this token is for another repository"));
         }
         let scope = json!({"work_id":query.work_id,"since":query.since,"until":query.until});
         let store = state.store.clone();
@@ -2136,7 +2116,7 @@ async fn call_inner(
             .await
             {
                 Ok(Some(value)) => structured(&value),
-                Ok(None) => refused("not_found"),
+                Ok(None) => refused("work insight not found"),
                 Err(error) => work_failure(&error),
             },
         );
@@ -2172,7 +2152,7 @@ async fn call_inner(
             .await
             {
                 Ok(Some(v)) => structured(&work_reconciliation_summary(v)),
-                Ok(None) => refused("not_found"),
+                Ok(None) => refused("work not found"),
                 Err(e) => work_failure(&e),
             },
         );
@@ -2247,7 +2227,7 @@ async fn call_inner(
             .await
             {
                 Ok(Some(value)) => structured(&shown(value, &principal.owner.id)),
-                Ok(None) => refused("not_found"),
+                Ok(None) => refused("work not found"),
                 Err(error) => work_failure(&error),
             },
         );
@@ -2320,7 +2300,7 @@ async fn call_inner(
                     Ok(response) => change_record_result(response),
                     Err(error) => work_failure(&error),
                 },
-                Ok(None) => refused("not_found"),
+                Ok(None) => refused("change record not found"),
                 Err(error) => work_failure(&error),
             },
         );
@@ -2408,9 +2388,8 @@ async fn call_inner(
         return Ok(if name == "agentscm_briefing_prepare" {
             match super::narrative::claim(state, principal, query).await {
                 Ok(value) => structured(&value),
-                Err(HubError::Busy) => refused_with(
-                    "busy",
-                    "briefing temporarily busy; retry the same prepare request at most twice after a short delay; do not generate without a lease".into(),
+                Err(HubError::Busy) => refused(
+                    "briefing temporarily busy; retry the same prepare request at most twice after a short delay; do not generate without a lease",
                 ),
                 Err(error) => hub_failure(&error),
             }
@@ -2429,9 +2408,8 @@ async fn call_inner(
         return Ok(
             match super::narrative::submit(state, principal, submission).await {
                 Ok(value) => narrative_result(&value),
-                Err(HubError::Busy) => refused_with(
-                    "busy",
-                    "briefing temporarily busy; retry this same id, digest, lease and output at most twice after a short delay while the lease remains valid; do not regenerate".into(),
+                Err(HubError::Busy) => refused(
+                    "briefing temporarily busy; retry this same id, digest, lease and output at most twice after a short delay while the lease remains valid; do not regenerate",
                 ),
                 Err(error) => hub_failure(&error),
             },
@@ -2646,11 +2624,11 @@ async fn picker_call(
         {
             Ok(Ok(envelope)) => structured(&envelope),
             Ok(Err(SkillWorkflowReadError::InvalidRunId | SkillWorkflowReadError::NotFound)) => {
-                refused("not_found")
+                refused("workflow runs not found")
             }
             Ok(Err(SkillWorkflowReadError::Internal(detail))) => {
-                crate::hub::error_envelope::log_internal(&detail);
-                refused("unavailable")
+                eprintln!("hub workflow error: {detail}");
+                refused("hub unavailable")
             }
             Err(error) => hub_failure(&error),
         };
@@ -2707,15 +2685,15 @@ async fn workflow_status(state: &HubState, principal: &Principal, run_id: &str) 
     match blocking(state, move || Ok(registry.read(&repository, &run_id))).await {
         Ok(Ok(envelope)) => match serde_json::to_string(&envelope) {
             Ok(text) => result(&text, false),
-            Err(_) => refused("unavailable"),
+            Err(_) => refused("hub unavailable"),
         },
         Ok(Err(SkillWorkflowReadError::InvalidRunId)) => {
             invalid_args("agentscm_workflow_status", "run_id is not a valid run id")
         }
-        Ok(Err(SkillWorkflowReadError::NotFound)) => refused("not_found"),
+        Ok(Err(SkillWorkflowReadError::NotFound)) => refused("workflow run not found"),
         Ok(Err(SkillWorkflowReadError::Internal(detail))) => {
-            crate::hub::error_envelope::log_internal(&detail);
-            refused("unavailable")
+            eprintln!("hub workflow error: {detail}");
+            refused("hub unavailable")
         }
         Err(error) => hub_failure(&error),
     }
@@ -2978,9 +2956,9 @@ fn structured<T: Serialize>(value: &T) -> Value {
                 "structuredContent": value,
                 "isError": false
             }),
-            Err(_) => refused("unavailable"),
+            Err(_) => refused("hub unavailable"),
         },
-        Err(_) => refused("unavailable"),
+        Err(_) => refused("hub unavailable"),
     }
 }
 
@@ -2996,22 +2974,18 @@ async fn shared_conversation(
         digest,
     } = args;
     let refusal = |error: super::http::ApiError| {
-        let mut envelope = error.envelope().clone();
-        let specific = match envelope.code.as_str() {
+        refused(match error.code() {
             "forbidden" => {
-                Some("only the person who shared this conversation and Hub admins can read it")
+                "only the person who shared this conversation and Hub admins can read it"
             }
-            "not_found" => Some("shared conversation not found"),
-            "gone" => Some("this conversation body has expired or been deleted"),
+            "not_found" => "shared conversation not found",
+            "gone" => "this conversation body has expired or been deleted",
             "integrity_failure" => {
-                Some("the stored body is missing or failed verification (integrity_failure)")
+                "the stored body is missing or failed verification (integrity_failure)"
             }
-            _ => None,
-        };
-        if let Some(message) = specific {
-            envelope.message = message.into();
-        }
-        envelope.mcp()
+            "invalid_request" => "invalid request",
+            _ => "hub unavailable",
+        })
     };
     let Some(digest) = digest else {
         return match super::change_record_http::conversation_page(state, principal, work_id, cursor)
@@ -3039,24 +3013,21 @@ async fn shared_conversation(
         Err(error) => return refusal(error),
     };
     if bytes.len() > MAX_CHANGE_RECORD_RESPONSE_BYTES {
-        return refused_with(
-            "source_body_too_large",
-            format!(
-                "this body is {} bytes, over the {MAX_CHANGE_RECORD_RESPONSE_BYTES}-byte limit for this tool; it is not truncated. Read it with `agentscm change-capture conversation --digest` or the Hub UI",
-                bytes.len()
-            ),
-        );
+        return refused(&format!(
+            "this body is {} bytes, over the {MAX_CHANGE_RECORD_RESPONSE_BYTES}-byte limit for this tool; it is not truncated. Read it with `agentscm change-capture conversation --digest` or the Hub UI",
+            bytes.len()
+        ));
     }
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(content) => structured(&json!({
             "digest": digest, "untrusted_agent_content": true, "content": content})),
-        Err(_) => refused("integrity_failure"),
+        Err(_) => refused("the stored body is not valid JSON (integrity_failure)"),
     }
 }
 
 fn change_record_result(response: ChangeRecordResponseV1) -> Value {
     let Ok(value) = serde_json::to_value(response) else {
-        return refused("unavailable");
+        return refused("hub unavailable");
     };
     let summary = &value["summary"];
     let action = &summary["latest_action"];
@@ -3083,11 +3054,89 @@ fn change_record_result(response: ChangeRecordResponseV1) -> Value {
 }
 
 fn work_failure(error: &HubError) -> Value {
-    if let HubError::Invalid(message) = error {
-        hub_failure(&HubError::invalid_or_changed(message.clone()))
-    } else {
-        hub_failure(error)
+    if let HubError::WorkPreflight(preflight) = error {
+        let mut result = structured(&json!({"error": {
+            "kind": "work_preflight_required",
+            "message": "Atomic admission found changed, incomplete or conflicting source facts. No new Work was claimed.",
+            "preflight": preflight,
+            "alternatives": [
+                "Inspect the exact merge observations and declared-scope overlaps in preflight.",
+                "For Git, verify each relation with merge-base --is-ancestor; missing objects leave it unknown.",
+                "Retry the read-only preflight and start with its current fixed merge high-water."
+            ]
+        }}));
+        result["isError"] = json!(true);
+        return result;
     }
+    if let HubError::WorkCoordinationRequired { overlaps, request } = error {
+        let mut result = structured(&json!({"error": {"kind":"work_coordination_required",
+            "message":"Scope was not changed. A durable coordination request is queued for the affected leads.",
+            "overlaps":overlaps,"coordination_request":request}}));
+        result["isError"] = json!(true);
+        return result;
+    }
+    if let HubError::WorkOverlap(overlaps) = error {
+        let mut result = structured(&json!({"error": {"kind": "work_scope_overlap",
+            "message": "Declared scope overlaps an existing assignment. No scope change was recorded.",
+            "overlaps": overlaps,
+            "alternatives": ["Split the scope or join the existing work as helper or reviewer.", "Arrange a deliberate handover with the lead."]}}));
+        result["isError"] = json!(true);
+        return result;
+    }
+    let (kind, message, alternatives): (&str, &str, &[&str]) = match error {
+        HubError::Invalid(message) => (
+            "invalid_or_changed",
+            message,
+            &[
+                "Refresh agentscm_work_briefing and inspect the current generation.",
+                "Retry with the same stable identity only when the request is unchanged.",
+            ],
+        ),
+        HubError::WorkCheckpointSequenceConflict { .. } => (
+            "work_checkpoint_sequence_conflict",
+            "Checkpoint was not committed because the Work sequence changed.",
+            &["Inspect current Work before preparing a new checkpoint request."],
+        ),
+        HubError::Busy => (
+            "busy",
+            "hub busy",
+            &["Retry the same idempotent request later."],
+        ),
+        HubError::WorkCapacity(_) => (
+            "work_storage_capacity",
+            "work storage capacity reached",
+            &[
+                "Request that the hub operator run agentscm work compact for this repository; do not access the hub database automatically.",
+            ],
+        ),
+        HubError::WorkOverlapIncomplete => (
+            "work_overlap_incomplete",
+            "Overlap coverage is incomplete; no new scope was claimed.",
+            &["Inspect ongoing assignments and retry with a narrower declared scope."],
+        ),
+        HubError::WorkOverlap(_) => unreachable!("scope overlaps are rendered above"),
+        HubError::WorkPreflight(_) => unreachable!("work preflight is rendered above"),
+        HubError::WorkCoordinationRequired { .. } => {
+            unreachable!("coordination request is rendered above")
+        }
+        HubError::Unauthorized => (
+            "unauthorized",
+            "token not accepted",
+            &["Use an active agent token for this repository."],
+        ),
+        HubError::Unavailable(_) => (
+            "unavailable",
+            "hub unavailable",
+            &["Preserve the same idempotency key and retry after the hub recovers."],
+        ),
+    };
+    let value = json!({"error": {"kind": kind, "message": message, "alternatives": alternatives}});
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| "hub unavailable".to_owned());
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": value,
+        "isError": true
+    })
 }
 
 /// `Err(detail)`: the arguments do not fit the tool.
@@ -3262,7 +3311,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             match store.work_catchup_preview(&token, &CatchupPreviewQuery { subscriber }, now) {
                 Ok(page) => Some(page),
                 Err(error) => {
-                    crate::hub::error_envelope::log_internal(&error);
+                    eprintln!("hub: durable catch-up for agentscm_start: {error}");
                     None
                 }
             };
@@ -3427,13 +3476,13 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
         match duplicates_for(state, principal, &task, current).await {
             Ok(text) if !text.is_empty() => parts.push(text),
             Ok(_) => {}
-            Err(error) => crate::hub::error_envelope::log_internal(&error),
+            Err(error) => eprintln!("hub: similar work for a start: {error}"),
         }
     }
     parts.push(match others_for(state, principal, own).await {
         Ok(others) => others,
         Err(error) => {
-            crate::hub::error_envelope::log_internal(&error);
+            eprintln!("hub: other agents for a start: {error}");
             unknown("other agents could not be listed")
         }
     });
@@ -3446,7 +3495,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             Ok(false) => None,
             Ok(true) => Some(unlinked_start(&work.item, false)),
             Err(error) => {
-                crate::hub::error_envelope::log_internal(&error);
+                eprintln!("hub: default session binding for a start: {error}");
                 Some(unlinked_start(&work.item, true))
             }
         }

@@ -388,7 +388,10 @@ impl Hub {
         let (status, reply) = self.call_status(method, path, body).await?;
         match status {
             200..=299 => Ok(reply),
-            _ => Err(crate::hub_cli::refusal_error(status, &reply)),
+            _ => Err(Error::Invalid(match reply["message"].as_str() {
+                Some(message) => format!("hub error {status}: {}", bound_message(message)),
+                None => format!("hub error {status}"),
+            })),
         }
     }
 
@@ -410,14 +413,19 @@ impl Hub {
                 .body(body.to_string());
         }
         // `send` and the timeout carry no URL or credentials in their errors.
-        let (status, reply) = send(request, BODY_BYTES).await.map_err(|_| {
-            Error::Hub(Box::new(
-                agentscm::hub::error_envelope::ErrorEnvelope::local(
-                    agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
-                ),
-            ))
-        })?;
-        Ok((status, reply))
+        let (status, reply) = send(request, BODY_BYTES)
+            .await
+            .map_err(|_| invalid("hub unreachable"))?;
+        match status {
+            401 => Err(invalid(
+                "the agent token was rejected (expired or revoked; mint a new one)",
+            )),
+            503 if reply["error"] == "work_overlap_incomplete" => Err(invalid(
+                "the hub could not finish its work overlap check, more than 100 items to compare (work_overlap_incomplete)",
+            )),
+            429 | 503 => Err(invalid("hub busy")),
+            _ => Ok((status, reply)),
+        }
     }
 
     /// The repository as one path segment.
@@ -518,6 +526,10 @@ fn fresh(ctx: &Ctx) -> Result<State> {
 }
 
 /// The Hub's one-sentence reason, cleaned and cut so it cannot flood a hook's output.
+fn bound_message(message: &str) -> String {
+    bound(message, 300).unwrap_or_default()
+}
+
 /// Cleaned, non-empty and at most `max` bytes, as the hub requires.
 fn bound(text: &str, max: usize) -> Option<String> {
     let mut out = String::new();
@@ -900,7 +912,10 @@ async fn track(
         save(path, state)?;
         return Err(keep_notes(
             &notes,
-            crate::hub_cli::refusal_error(status, &reply),
+            Error::Invalid(match reply["message"].as_str() {
+                Some(message) => format!("hub error {status}: {}", bound_message(message)),
+                None => format!("hub error {status}"),
+            }),
         ));
     };
     let mut lines = notes;

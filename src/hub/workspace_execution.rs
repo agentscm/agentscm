@@ -850,11 +850,11 @@ impl ExecutionService {
                     Ok(Ok(true)) => continue,
                     Ok(Ok(false)) => {}
                     Ok(Err(error)) => {
-                        crate::hub::error_envelope::log_internal(&error);
+                        eprintln!("workspace execution worker stopped: {error}");
                         break;
                     }
                     Err(error) => {
-                        crate::hub::error_envelope::log_internal(&error);
+                        eprintln!("workspace execution worker interrupted: {error}");
                         break;
                     }
                 }

@@ -15,7 +15,6 @@ use axum::body::to_bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{DefaultBodyLimit, Json, Path, Query, Request, State};
 use axum::http::HeaderMap;
-use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
@@ -25,7 +24,6 @@ use super::agent_rules::NO_BYPASS;
 use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::CoordinationInbox;
 use super::coordination::{CoordinationInboxQuery, CoordinationRequest, CoordinationStatus};
-use super::error_envelope::{self, ErrorCode, ErrorEnvelope};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
@@ -34,7 +32,7 @@ use super::session::{
 };
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
-use super::work_lifecycle::{CallPhase, EDIT_UNLINKED};
+use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, LEASE_LAPSED};
 use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
@@ -50,6 +48,7 @@ const MAX_TASK_BYTES: usize = 500;
 const MAX_AGENT_BYTES: usize = 32;
 const ROOT_HEADER: &str = "x-agentscm-root";
 const MAX_ROOT_BYTES: usize = 1024;
+const DENIED: &str = "token not accepted";
 /// Sessions that were already told coordination is unknown; cleared when it grows past the bound.
 static NOTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 const MAX_NOTED: usize = 10_000;
@@ -181,7 +180,6 @@ impl Outcome {
         }
     }
 
-    #[cfg(test)]
     fn unknown(reason: &str) -> Self {
         Self {
             text: unknown(reason),
@@ -209,7 +207,7 @@ async fn hook(
     Path(name): Path<String>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
     request: Request,
-) -> Result<Response, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let onboarding_epoch = state.onboarding.epoch();
     let agent = Agent::from_name(&name).ok_or_else(ApiError::not_found)?;
     let repo = query.ok().and_then(|Query(mut query)| query.remove("repo"));
@@ -232,7 +230,7 @@ async fn hook(
         },
     );
     let mut delivered = None;
-    let (mut outcome, mut failure) = match timeout_at(
+    let mut outcome = match timeout_at(
         deadline,
         call.run(
             &state,
@@ -245,26 +243,9 @@ async fn hook(
     )
     .await
     {
-        Ok(Ok(outcome)) => (outcome, None),
-        Ok(Err(error)) => (
-            Outcome {
-                text: error.hook_note(),
-                status: "unknown",
-                deny: None,
-            },
-            Some(error),
-        ),
-        Err(_) => {
-            let error = error_envelope::from_code(ErrorCode::Unavailable);
-            (
-                Outcome {
-                    text: error.hook_note(),
-                    status: "unknown",
-                    deny: None,
-                },
-                Some(error),
-            )
-        }
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(reason)) => Outcome::unknown(reason),
+        Err(_) => Outcome::unknown("hub timed out"),
     };
     if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
         && let Some(token) = token
@@ -293,7 +274,7 @@ async fn hook(
             })
             .await
             .map_err(reason)?;
-            Ok::<_, ErrorEnvelope>((principal, session, page))
+            Ok::<_, &'static str>((principal, session, page))
         };
         match timeout_at(deadline, delivery).await {
             Ok(Ok((principal, session, page))) => {
@@ -349,14 +330,8 @@ async fn hook(
                     }
                 }
             }
-            failed if outcome.status != "unknown" => {
-                let error = match failed {
-                    Ok(Err(error)) => error,
-                    _ => error_envelope::from_code(ErrorCode::Unavailable),
-                };
-                outcome.text = format!("{}\n{}", error.hook_note(), outcome.text);
-                outcome.status = "unknown";
-                failure = Some(error);
+            _ if outcome.status != "unknown" => {
+                outcome.text.push_str("\nAgentSCM coordination inbox delivery is unknown; inspect agentscm_coordination_inbox before assuming coverage.");
             }
             _ => {}
         }
@@ -364,28 +339,14 @@ async fn hook(
     if outcome.status == "unknown" {
         count_fail_open();
         // Said once per session; later failures are silent no-ops.
-        if call.kind != Kind::Start
-            && let Some(session) = &call.session
-            && !first_note(format!(
-                "{who}\0{}\0{session}\0{}",
-                call.agent.name(),
-                failure
-                    .as_ref()
-                    .map_or("unavailable", |error| error.code.as_str())
-            ))
+        if let Some(session) = &call.session
+            && !first_note(format!("{who}\0{}\0{session}", call.agent.name()))
         {
             outcome.text.clear();
         }
     }
     record_hook_ms(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
-    let mut response = Json(call.render(&outcome)).into_response();
-    if let Some(reference) = failure.and_then(|error| error.correlation_id) {
-        response.headers_mut().insert(
-            "x-agentscm-correlation-id",
-            reference.parse().expect("Hub correlation header"),
-        );
-    }
-    Ok(response)
+    Ok(Json(call.render(&outcome)))
 }
 
 fn first_note(key: String) -> bool {
@@ -404,8 +365,32 @@ fn root_header(headers: &HeaderMap) -> Option<&str> {
         .then_some(root)
 }
 
-fn reason(error: HubError) -> ErrorEnvelope {
-    error_envelope::from_hub_error(&error)
+fn reason(error: HubError) -> &'static str {
+    match error {
+        HubError::Busy => "hub busy",
+        HubError::WorkCapacity(_) => "work storage capacity reached",
+        HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
+        HubError::WorkCoordinationRequired { .. } => {
+            "work scope needs coordination; inspect the agent inbox"
+        }
+        HubError::WorkOverlapIncomplete => {
+            "work overlap coverage is incomplete; no scope was claimed"
+        }
+        HubError::WorkPreflight(_) => "work preflight requires review; no scope was claimed",
+        HubError::WorkCheckpointSequenceConflict { .. } => {
+            "checkpoint sequence changed; inspect current Work"
+        }
+        HubError::Unauthorized => DENIED,
+        HubError::Invalid(detail) => {
+            // Debug-quoted so each message stays on one log line.
+            eprintln!("hub: hook rejected as invalid: {detail:?}");
+            "invalid hook payload"
+        }
+        HubError::Unavailable(detail) => {
+            eprintln!("hub error: {detail}");
+            "hub unavailable"
+        }
+    }
 }
 
 /// The inbox a touch read for this hook: who called, the touched session and its first page.
@@ -430,19 +415,16 @@ async fn authenticate(
     state: &HubState,
     token: Option<String>,
     repo: Option<String>,
-) -> Result<Principal, ErrorEnvelope> {
-    let digest = agent_token_digest(
-        &token.ok_or_else(|| error_envelope::from_code(ErrorCode::Unauthorized))?,
-    )
-    .map_err(|_| error_envelope::from_code(ErrorCode::Unauthorized))?;
+) -> Result<Principal, &'static str> {
+    let digest = agent_token_digest(&token.ok_or(DENIED)?).map_err(|_| DENIED)?;
     let store = state.store.clone();
     let principal = blocking(state, move || store.authenticate(&digest, unix_now()))
         .await
         .map_err(reason)?
         .filter(|principal| !principal.read_only) // a read-only token is as good as an unknown one
-        .ok_or_else(|| error_envelope::from_code(ErrorCode::Unauthorized))?;
+        .ok_or(DENIED)?;
     if repo.is_some_and(|repo| repo != principal.repository) {
-        return Err(error_envelope::from_code(ErrorCode::WrongRepository));
+        return Err("this token is for another repository");
     }
     Ok(principal)
 }
@@ -544,7 +526,7 @@ impl Call {
         headers: &HeaderMap,
         onboarding_epoch: u64,
         delivered: &mut Option<Delivered>,
-    ) -> Result<Outcome, ErrorEnvelope> {
+    ) -> Result<Outcome, &'static str> {
         let client = super::onboarding::client(headers);
         let completion_reporting = super::insights::completion_enabled(headers);
         let call = |paths: Vec<String>| SessionCall {
@@ -556,18 +538,15 @@ impl Call {
             report: self.reports(),
         };
         match self.kind {
-            Kind::Fail(reason) => Err(error_envelope::from_code(match reason {
-                "hub timed out" => ErrorCode::RequestTimeout,
-                "hook payload too large" => ErrorCode::RequestTooLarge,
-                _ => ErrorCode::InvalidRequest,
-            })),
+            Kind::Fail(reason) => Err(reason),
             // The coordination delivery after `run` reads the inbox; a prompt touches nothing.
             Kind::Ignore | Kind::Prompt => Ok(Outcome::clean()),
             Kind::Activity(phase) => {
                 // Best effort and silent: the touch renews the session's own leases, and a
                 // failure must not disturb the agent. An unnamed session renews nothing.
-                if self.session.is_some() {
-                    let principal = authenticate(state, token, repo).await?;
+                if self.session.is_some()
+                    && let Ok(principal) = authenticate(state, token, repo).await
+                {
                     let store = state.store.clone();
                     let heartbeat = call(Vec::new());
                     let heartbeat = SessionCall {
@@ -581,7 +560,7 @@ impl Call {
                     })
                     .await
                     {
-                        return Err(reason(error));
+                        eprintln!("hub: activity hook did not renew: {error}");
                     }
                 }
                 Ok(Outcome::clean())
@@ -625,13 +604,9 @@ impl Call {
                         *delivered = Some((principal.clone(), session, page));
                         advice
                     }
-                    Err(error)
-                        if matches!(&error, HubError::Invalid(_))
-                            || matches!(&error, HubError::Rejected(rejection) if rejection.code() == ErrorCode::LeaseLapsed) =>
-                    {
-                        let envelope = reason(error);
-                        let text = if envelope.code == "lease_lapsed" {
-                            let detail = &envelope.message;
+                    Err(HubError::Invalid(detail)) => {
+                        eprintln!("hub: edit hook not linked to work: {detail:?}");
+                        let text = if detail.starts_with(LEASE_LAPSED) {
                             let child = if self.child {
                                 " You are a subagent: do not start or take over Work from here; tell your parent, which holds the claim."
                             } else {
@@ -694,7 +669,7 @@ impl Call {
                     ) {
                         Ok(page) => Some(page),
                         Err(error) => {
-                            crate::hub::error_envelope::log_internal(&error);
+                            eprintln!("hub: durable catch-up for session start: {error}");
                             None
                         }
                     };

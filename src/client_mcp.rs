@@ -137,10 +137,6 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-fn rpc_hub_error(id: &Value, envelope: &agentscm::hub::error_envelope::ErrorEnvelope) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":envelope.render(),"data":envelope}})
-}
-
 fn json_content_type(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
@@ -408,57 +404,40 @@ async fn serve(
                     &activity_binding,
                     crate::client_activity::ActivityOutcome::Acknowledged,
                 );
-                let mut reply = reply;
-                // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
-                // start's conflict, coordination and recovery payload, reach the agent unchanged.
-                let bare_error = &reply["result"]["structuredContent"]["error"];
-                if reply["result"]["isError"] == true
-                    && bare_error.is_object()
-                    && bare_error["recovery"].is_null()
-                {
-                    reply["result"] =
-                        agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
-                } else if reply["error"].is_object() {
-                    let error = agentscm::hub::error_envelope::decode(400, &reply);
-                    let code = reply["error"]["code"].as_i64().unwrap_or(-32000);
-                    reply["error"] = json!({"code":code,"message":error.render(),"data":error});
-                }
                 write_json(writer, &reply)?;
             }
-            (Some(id), Ok((status @ (401 | 403), _, reply))) => {
+            (Some(id), Ok((401 | 403, _, _))) => {
                 report_activity(
                     &activity_binding,
                     crate::client_activity::ActivityOutcome::TokenRejected,
                 );
-                let error = agentscm::hub::error_envelope::decode(status, &reply);
-                eprintln!("AgentSCM MCP: {}", error.render());
-                write_json(writer, &rpc_hub_error(&id, &error))?;
+                eprintln!("AgentSCM MCP: Hub request failed");
+                write_json(
+                    writer,
+                    &rpc_error(&id, -32000, "AgentSCM Hub request failed"),
+                )?;
             }
-            (Some(id), Ok((status, _, reply))) => {
+            (Some(id), Ok(_)) => {
                 report_activity(
                     &activity_binding,
                     crate::client_activity::ActivityOutcome::InvalidResponse,
                 );
-                let error = if status >= 400 {
-                    agentscm::hub::error_envelope::decode(status, &reply)
-                } else {
-                    agentscm::hub::error_envelope::ErrorEnvelope::local(
-                        agentscm::hub::error_envelope::ErrorCode::InvalidResponse,
-                    )
-                };
-                eprintln!("AgentSCM MCP: {}", error.render());
-                write_json(writer, &rpc_hub_error(&id, &error))?;
+                eprintln!("AgentSCM MCP: Hub request failed");
+                write_json(
+                    writer,
+                    &rpc_error(&id, -32000, "AgentSCM Hub request failed"),
+                )?;
             }
             (Some(id), Err(_)) => {
                 report_activity(
                     &activity_binding,
                     crate::client_activity::ActivityOutcome::Unavailable,
                 );
-                let error = agentscm::hub::error_envelope::ErrorEnvelope::local(
-                    agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
-                );
-                eprintln!("AgentSCM MCP: {}", error.render());
-                write_json(writer, &rpc_hub_error(&id, &error))?;
+                eprintln!("AgentSCM MCP: Hub request failed");
+                write_json(
+                    writer,
+                    &rpc_error(&id, -32000, "AgentSCM Hub request failed"),
+                )?;
             }
         }
     }
@@ -701,43 +680,6 @@ mod tests {
                 .unwrap()
                 .starts_with("POST /mcp?repo=owner%2Frepo")
         );
-    }
-
-    #[tokio::test]
-    async fn connection_outage_service_failure_and_rejection_keep_distinct_envelopes() {
-        let input = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n";
-        for (status, code, action) in [
-            (401, "unauthorized", "sign_in"),
-            (403, "forbidden", "ask_owner"),
-            (503, "unavailable", "retry"),
-        ] {
-            let body = json!({"error":code}).to_string();
-            let (hub, request) = server(status, "application/json", &body);
-            let output = proxied(
-                input,
-                &saved(hub, "/checkout", "owner/repo"),
-                "synthetic-token",
-            )
-            .await;
-            let reply: Value = serde_json::from_str(&output).unwrap();
-            assert_eq!(reply["error"]["data"]["error"], code);
-            assert_eq!(reply["error"]["data"]["recovery"]["action"], action);
-            assert!(reply["error"]["data"].get("correlation_id").is_none());
-            request.recv().unwrap();
-        }
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let hub = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        let output = proxied(
-            input,
-            &saved(hub, "/checkout", "owner/repo"),
-            "synthetic-token",
-        )
-        .await;
-        let reply: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(reply["error"]["data"]["error"], "hub_unreachable");
-        assert_eq!(reply["error"]["data"]["recovery"]["action"], "reconnect");
-        assert!(reply["error"]["data"].get("correlation_id").is_none());
     }
 
     #[tokio::test]
