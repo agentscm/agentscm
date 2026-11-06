@@ -1694,10 +1694,15 @@ fn set_cookie(response: &reqwest::Response, name: &str) -> Option<String> {
 
 /// Runs a web-page sign-in for `user` up to the Hub's answer to the forge's callback.
 async fn callback_for(env: &Env, user: i64, purpose: &str) -> reqwest::Response {
+    callback_query(env, user, &format!("{purpose}=1")).await
+}
+
+/// `callback_for` with the sign-in's whole query, e.g. `web=1&return_to=%2Fnext%2F`.
+async fn callback_query(env: &Env, user: i64, query: &str) -> reqwest::Response {
     env.fake.lock().unwrap().approve = user;
     let http = browser();
     let start = http
-        .get(format!("{}/v1/hub/login/github?{purpose}=1", env.hub))
+        .get(format!("{}/v1/hub/login/github?{query}", env.hub))
         .send()
         .await
         .unwrap();
@@ -2485,6 +2490,32 @@ async fn a_web_session_asks_and_answers_file_handoffs_only_for_its_own_agents() 
 }
 
 #[tokio::test]
+async fn a_web_sign_in_returns_to_the_hub_page_that_asked_and_nowhere_else() {
+    let env = Env::start("github").await;
+    let done = callback_query(&env, ALICE, "web=1&return_to=%2Fnext%2F").await;
+    assert_eq!(done.status(), 302);
+    assert_eq!(done.headers()[header::LOCATION], "/next/#home");
+    assert!(set_cookie(&done, "__Host-agentscm_session").is_some());
+    // Another site, an API route or an odd path is refused before GitHub is asked.
+    for bad in [
+        "https%3A%2F%2Fevil.example%2F",
+        "%2F%2Fevil.example%2F",
+        "%2Fv1%2Fhub%2Fsession%2F",
+        "%2Fnext",
+    ] {
+        let start = browser()
+            .get(format!(
+                "{}/v1/hub/login/github?web=1&return_to={bad}",
+                env.hub
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), 400, "{bad}");
+    }
+}
+
+#[tokio::test]
 async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() {
     let env = Env::start("github").await;
     let cookie = web_sign_in(&env, ALICE).await;
@@ -2599,6 +2630,12 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
         "/ui/#/signed-in?status=refused&reason=user_disabled"
     );
     assert!(set_cookie(&refused, "__Host-agentscm_session").is_none());
+    // A page that asked to come back gets the refusal on itself.
+    let refused = callback_query(&env, ALICE, "web=1&return_to=%2Fnext%2F").await;
+    assert_eq!(
+        refused.headers()[header::LOCATION],
+        "/next/#/signed-in?status=refused&reason=user_disabled"
+    );
     env.store.set_user_disabled(&alice.id, false).unwrap();
     assert_eq!(session(cookie).await.0, 401);
 
