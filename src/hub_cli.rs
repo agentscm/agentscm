@@ -388,28 +388,9 @@ pub(crate) fn direct_client() -> reqwest::Result<reqwest::Client> {
 }
 
 pub(crate) fn map_hub_error(error: HubError) -> Error {
-    match error {
-        HubError::Invalid(message) => Error::Invalid(message),
-        HubError::WorkCheckpointSequenceConflict { current_seq } => Error::Conflict(format!(
-            "checkpoint sequence changed to {current_seq}; inspect Work before retry"
-        )),
-        HubError::Unauthorized => Error::Invalid("hub authentication required".into()),
-        HubError::Busy => Error::Invalid("hub busy".into()),
-        error @ HubError::WorkCapacity(_) => Error::Invalid(error.to_string()),
-        HubError::WorkOverlap(_) => {
-            Error::Invalid("declared work scope overlaps another assignment".into())
-        }
-        HubError::WorkCoordinationRequired { .. } => {
-            Error::Invalid("work scope needs coordination; inspect the agent inbox".into())
-        }
-        HubError::WorkOverlapIncomplete => {
-            Error::Invalid("work overlap coverage is incomplete; no scope was claimed".into())
-        }
-        HubError::WorkPreflight(_) => {
-            Error::Invalid("work preflight requires review; no scope was claimed".into())
-        }
-        HubError::Unavailable(message) => Error::Invalid(format!("hub unavailable: {message}")),
-    }
+    Error::Hub(Box::new(agentscm::hub::error_envelope::from_hub_error(
+        &error,
+    )))
 }
 
 fn invalid(message: &str) -> Error {
@@ -433,7 +414,25 @@ pub(crate) async fn call(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
     }
-    send(request, HUB_BODY_BYTES).await.map_err(map_hub_error)
+    let (status, body) = send(request, HUB_BODY_BYTES).await.map_err(|_| {
+        Error::Hub(Box::new(
+            agentscm::hub::error_envelope::ErrorEnvelope::local(
+                agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+            ),
+        ))
+    })?;
+    if status >= 400 {
+        let envelope = serde_json::to_value(agentscm::hub::error_envelope::decode(status, &body))?;
+        // Keep every field the Hub sent (conflicts, remedies); add the envelope fields it lacks.
+        let (Value::Object(mut kept), Value::Object(fields)) = (body, envelope.clone()) else {
+            return Ok((status, envelope));
+        };
+        for (key, value) in fields {
+            kept.entry(key).or_insert(value);
+        }
+        return Ok((status, Value::Object(kept)));
+    }
+    Ok((status, body))
 }
 
 /// The Hub for a command run without `--hub`.
@@ -599,11 +598,15 @@ pub(crate) async fn sign_in_with(
                 );
                 loopback_login(&client, hub, provider, open_host.is_some(), &device).await?
             }
-            404 => return Err(invalid("this hub does not offer that provider")),
+            404 => {
+                return Err(refusal_with_message(
+                    status,
+                    &started,
+                    "this hub does not offer that provider",
+                ));
+            }
             _ => {
-                return Err(invalid(&refusal_message(&started).unwrap_or_else(|| {
-                    "The Hub could not start the sign-in; try again in a minute".into()
-                })));
+                return Err(refusal_error(status, &started));
             }
         }
     };
@@ -810,12 +813,24 @@ fn civil(epoch: i64) -> (i64, i64, i64, i64) {
     (month, day, hour, minute)
 }
 
-/// The Hub's own sentence for any refusal kind that carries one (the reason and its one fix,
-/// such as `insufficient_role`); `None` when the reply has none. Bounded, one terminal line.
+/// The Hub's safe sentence and recovery, with registry defaults for older Hubs.
 pub(crate) fn refusal_message(reply: &Value) -> Option<String> {
-    reply["error"].as_str()?;
-    let message = clean(reply["message"].as_str()?);
-    Some(message.chars().take(300).collect())
+    let code = reply["error"].as_str()?;
+    let status =
+        agentscm::hub::error_envelope::ErrorCode::parse(code).map_or(400, |code| code.status());
+    Some(agentscm::hub::error_envelope::decode(status, reply).render())
+}
+
+pub(crate) fn refusal_error(status: u16, reply: &Value) -> Error {
+    Error::Hub(Box::new(agentscm::hub::error_envelope::decode(
+        status, reply,
+    )))
+}
+
+fn refusal_with_message(status: u16, reply: &Value, message: &'static str) -> Error {
+    let mut envelope = agentscm::hub::error_envelope::decode(status, reply);
+    envelope.message = message.into();
+    Error::Hub(Box::new(envelope))
 }
 
 /// Ends the saved session when it belongs to `hub`: the hub is told (best effort) and only
@@ -1056,11 +1071,15 @@ fn version_note(hub: &str) -> Option<&'static str> {
 
 /// A computer credential the Hub no longer accepts is forgotten, so this computer shows as
 /// signed out instead of failing on every call.
-fn signed_out(hub: &str, auth: &HubAuth) -> Error {
+fn signed_out(hub: &str, auth: &HubAuth, reply: &Value) -> Error {
     if let HubAuth::Device(secret) = auth {
         let _ = forget_device_if(hub, secret);
     }
-    invalid("this computer is signed out of the Hub; run agentscm hub login")
+    refusal_with_message(
+        401,
+        reply,
+        "this computer is signed out of the Hub; run agentscm hub login",
+    )
 }
 
 async fn devices(command: DeviceCommand) -> Result<()> {
@@ -1100,8 +1119,8 @@ async fn devices(command: DeviceCommand) -> Result<()> {
                     }
                     Ok(())
                 }
-                (401, _) => Err(signed_out(&hub, &auth)),
-                _ => Err(invalid("hub could not list computers")),
+                (401, reply) => Err(signed_out(&hub, &auth, &reply)),
+                (status, reply) => Err(refusal_error(status, &reply)),
             }
         }
         DeviceCommand::Rename { name, hub } => {
@@ -1118,8 +1137,13 @@ async fn devices(command: DeviceCommand) -> Result<()> {
                     eprintln!("renamed this computer on {hub}");
                     Ok(())
                 }
-                (401, _) => Err(signed_out(&hub, &auth)),
-                _ => Err(invalid("the name must be 1 to 64 printable characters")),
+                (401, reply) => Err(signed_out(&hub, &auth, &reply)),
+                (400, reply) => Err(refusal_with_message(
+                    400,
+                    &reply,
+                    "the name must be 1 to 64 printable characters",
+                )),
+                (status, reply) => Err(refusal_error(status, &reply)),
             }
         }
         DeviceCommand::Revoke { id, hub } => {
@@ -1146,9 +1170,13 @@ async fn devices(command: DeviceCommand) -> Result<()> {
                     eprintln!("signed {id} out of {hub}");
                     Ok(())
                 }
-                (401, _) => Err(signed_out(&hub, &auth)),
-                (404, _) => Err(invalid("no such computer of yours on this hub")),
-                _ => Err(invalid("hub could not revoke that computer")),
+                (401, reply) => Err(signed_out(&hub, &auth, &reply)),
+                (404, reply) => Err(refusal_with_message(
+                    404,
+                    &reply,
+                    "no such computer of yours on this hub",
+                )),
+                (status, reply) => Err(refusal_error(status, &reply)),
             }
         }
     }
@@ -1256,12 +1284,7 @@ fn older_hub(status: u16, reply: &Value) -> bool {
 
 /// The Hub's reason for a failed sign-in step, or a plain one from an older Hub.
 fn sign_in_failed(reply: &Value) -> Error {
-    invalid(&refusal_message(reply).unwrap_or_else(|| {
-        format!(
-            "Sign-in failed ({}); run the sign-in again",
-            clean(reply["error"].as_str().unwrap_or("no reason given"))
-        )
-    }))
+    refusal_error(400, reply)
 }
 
 async fn loopback_login(
@@ -2148,24 +2171,35 @@ async fn token(command: TokenCommand) -> Result<()> {
     )
     .await?;
     match (status, &command) {
-        (401, _) => Err(invalid(SESSION_EXPIRED)),
-        (403, _) if reply["error"] == "not_connected" => Err(invalid(
+        (401, _) => Err(refusal_with_message(status, &reply, SESSION_EXPIRED)),
+        (403, _) if reply["error"] == "not_connected" => Err(refusal_with_message(
+            status,
+            &reply,
             "connect the repository first: install the GitHub App on it, then run \
              `agentscm hub connections refresh <id>` (for a PAT or GitLab token connection: \
              `agentscm hub connections add-repo <id> <owner/name>`)",
         )),
-        (403, _) => Err(invalid(&refusal_message(&reply).unwrap_or_else(|| {
-            "your forge account can't see that repository, or it was renamed or moved; check the name and your access".to_owned()
-        }))),
-        (404, TokenCommand::Revoke { .. }) => Err(invalid("no such token of yours")),
+        // A bare `forbidden` has no reason of its own; every other refusal speaks for itself.
+        (403, _) if reply["error"] == "forbidden" => Err(refusal_with_message(
+            status,
+            &reply,
+            "your forge account can't see that repository, or it was renamed or moved; check the name and your access",
+        )),
+        (403, _) => Err(refusal_error(status, &reply)),
+        (404, TokenCommand::Revoke { .. }) => Err(refusal_with_message(
+            status,
+            &reply,
+            "no such token of yours",
+        )),
         (201, TokenCommand::Create { .. }) => {
             eprintln!(
                 "created {} for {} (expires {})",
                 clean(reply["id"].as_str().unwrap_or("?")),
                 clean(reply["repository"].as_str().unwrap_or("?")),
-                reply["expires_at"]
-                    .as_i64()
-                    .map_or_else(|| "at an unknown time".to_owned(), |at| when(at, unix_now()))
+                reply["expires_at"].as_i64().map_or_else(
+                    || "at an unknown time".to_owned(),
+                    |at| when(at, unix_now())
+                )
             );
             println!("{}", reply["token"].as_str().unwrap_or_default());
             Ok(())
@@ -2192,10 +2226,7 @@ async fn token(command: TokenCommand) -> Result<()> {
             eprintln!("revoked {id}");
             Ok(())
         }
-        _ => Err(Error::Invalid(format!(
-            "hub replied {status}: {}",
-            reply["error"].as_str().unwrap_or("error")
-        ))),
+        _ => Err(refusal_error(status, &reply)),
     }
 }
 
@@ -2207,7 +2238,9 @@ async fn admin_call(
     body: Option<Value>,
 ) -> Result<(u16, Value)> {
     match admin_request(hub, method, path, body).await? {
-        (404, _) => Err(invalid(
+        (404, reply) => Err(refusal_with_message(
+            404,
+            &reply,
             "no such connection (or GitHub is not configured on this hub)",
         )),
         reply => Ok(reply),
@@ -2232,8 +2265,10 @@ async fn admin_request(
     )
     .await?;
     match status {
-        401 => Err(invalid(SESSION_EXPIRED)),
-        403 => Err(invalid(
+        401 => Err(refusal_with_message(status, &reply, SESSION_EXPIRED)),
+        403 => Err(refusal_with_message(
+            status,
+            &reply,
             "refused: administrators only, or the connection cannot read that repository",
         )),
         _ => Ok((status, reply)),
@@ -2241,10 +2276,7 @@ async fn admin_request(
 }
 
 fn unexpected(status: u16, reply: &Value) -> Error {
-    Error::Invalid(format!(
-        "hub replied {status}: {}",
-        reply["error"].as_str().unwrap_or("error")
-    ))
+    refusal_error(status, reply)
 }
 
 fn connection_id(id: &str) -> Result<()> {
@@ -2270,20 +2302,22 @@ fn local_ci_device_id(id: &str) -> Result<()> {
 
 /// The route's own words: its error code, message and, for a stale change, the generation to retry with.
 fn local_ci_error(status: u16, reply: &Value) -> Error {
+    let mut envelope = agentscm::hub::error_envelope::decode(status, reply);
     let mut text = format!(
-        "hub replied {status}: {}",
-        clean(reply["error"].as_str().unwrap_or("error"))
+        "hub replied {status}: {}: {}",
+        envelope.code, envelope.message
     );
-    if let Some(message) = reply["message"].as_str() {
-        text.push_str(&format!(": {}", clean(message)));
-    }
     if let Some(reason) = reply["reason"].as_str() {
-        text.push_str(&format!(" (reason {})", clean(reason)));
+        text.push_str(&format!(
+            " (reason {})",
+            agentscm::hub::error_envelope::sanitize(reason)
+        ));
     }
     if let Some(generation) = reply["current_generation"].as_u64() {
         text.push_str(&format!(" (current generation {generation})"));
     }
-    Error::Invalid(text)
+    envelope.message = text;
+    Error::Hub(Box::new(envelope))
 }
 
 /// `--request` is the JSON `local-ci device enroll-request` printed. `--request-id` makes a
@@ -2578,11 +2612,11 @@ mod tests {
     fn a_refusal_shows_the_hub_sentence_without_control_characters() {
         let refusal = json!({"error": "insufficient_role",
             "message": "alice has Read on public repository acme/w;\u{1b}[2J ask for Triage"});
-        assert_eq!(
-            refusal_message(&refusal).as_deref(),
-            Some("alice has Read on public repository acme/w;[2J ask for Triage")
-        );
-        assert_eq!(refusal_message(&json!({"error": "forbidden"})), None);
+        let message = refusal_message(&refusal).unwrap();
+        assert!(message.contains("alice has Read on public repository"));
+        assert!(message.contains("ask for Triage"));
+        assert!(!message.contains("[2J"));
+        assert!(refusal_message(&json!({"error": "forbidden"})).is_some());
         assert_eq!(refusal_message(&json!({"message": "not a refusal"})), None);
     }
 
@@ -2702,7 +2736,10 @@ mod tests {
             "current_generation": 4});
         assert_eq!(
             local_ci_error(409, &stale).to_string(),
-            "invalid: hub replied 409: stale_generation: read it again (current generation 4)"
+            format!(
+                "hub replied 409: stale_generation: read it again (current generation 4); {}",
+                agentscm::hub::error_envelope::RecoveryAction::InspectWork.sentence()
+            )
         );
         let missing = json!({"error": "unknown_device", "message": "no such local CI device"});
         let text = local_ci_error(404, &missing).to_string();
@@ -2712,7 +2749,10 @@ mod tests {
             "reason": "sign_in_required"});
         assert_eq!(
             local_ci_error(503, &unavailable).to_string(),
-            "invalid: hub replied 503: role_check_unavailable: m (reason sign_in_required)"
+            format!(
+                "hub replied 503: role_check_unavailable: m (reason sign_in_required); {}",
+                agentscm::hub::error_envelope::RecoveryAction::Retry.sentence()
+            )
         );
     }
 

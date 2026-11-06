@@ -21,7 +21,9 @@ use crate::hub_cli::{HubAuth, Provider, call, has_session, load_session, map_hub
 mod computer;
 use crate::intent_cli::valid_repo;
 use crate::prompt::Ui;
-pub(crate) use computer::{attention, auto_connect_command, due, renew_command};
+pub(crate) use computer::{
+    RENEW_BEFORE_SECONDS, attention, auto_connect_command, due, renew_command,
+};
 // The local Hub page, quickstart and the macOS tray enroll from outside the client.
 #[cfg(unix)]
 pub(crate) use computer::enroll;
@@ -286,6 +288,18 @@ async fn status(args: StatusArgs) -> Result<()> {
             },
             hub_check_text(&connection.hub_check, now),
         );
+        println!("  connection: {}", connection.health.summary());
+        if let crate::client_status::HubCheck::Valid {
+            hub_build: Some(build),
+            ..
+        } = &connection.hub_check
+        {
+            println!("  Hub build: {}", build.label());
+        }
+        println!(
+            "  hook and MCP coverage: {}",
+            coverage_text(connection.coverage)
+        );
         if !connection.agents.is_empty() {
             println!("  configured agents: {}", connection.agents.join(", "));
         }
@@ -301,6 +315,16 @@ async fn status(args: StatusArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn coverage_text(coverage: crate::client_status::Coverage) -> &'static str {
+    use crate::client_status::Coverage;
+    match coverage {
+        Coverage::Verified => "verified by the Hub (MCP and native hook)",
+        Coverage::Partial => "partly verified; see the agent lines below",
+        Coverage::Unverified => "not verified; the Hub has seen neither the MCP nor a native hook",
+        Coverage::Unknown => "unknown; the Hub was not asked or did not answer",
+    }
 }
 
 /// A status enum's stable snake_case name, as the JSON form spells it.
@@ -658,25 +682,17 @@ pub(crate) fn read_token(path: &Path) -> Result<String> {
     Ok(token)
 }
 
+/// Saves a managed token durably: temp file, fsync, rename and a directory fsync, so a crash or
+/// a concurrent reader sees the whole token or none, never a partial file. Refuses an existing
+/// path (token paths are unique per server token) and never echoes the secret in an error.
 fn write_owned_token(path: &Path, token: &str) -> Result<()> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("managed token path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(path)
-        .map_err(|_| invalid("managed token path already exists or cannot be created"))?;
-    if let Err(error) = file.write_all(format!("{token}\n").as_bytes()) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(error.into());
+    if path.symlink_metadata().is_ok() {
+        return Err(invalid(
+            "managed token path already exists or cannot be created",
+        ));
     }
-    Ok(())
+    crate::hub_cli::write_private(path, &format!("{token}\n"))
+        .map_err(|_| invalid("managed token could not be saved durably"))
 }
 
 struct Verified {
@@ -1063,11 +1079,16 @@ async fn mint_agent_token(
         (403, Some("not_connected")) => Err(invalid(
             "this repository isn't connected to this Hub yet; ask a Hub admin to connect it",
         )),
-        (403, _) => Err(invalid(
-            &crate::hub_cli::refusal_message(&reply).unwrap_or_else(|| {
-                "your forge account can't see that repository, or it was renamed or moved; check the name and your access".to_owned()
-            }),
-        )),
+        (403, code) => {
+            let invisible = "your forge account can't see that repository, or it was renamed or moved; check the name and your access";
+            // A bare `forbidden` carries no reason of its own; every other refusal speaks for itself.
+            Err(invalid(
+                &match (code, crate::hub_cli::refusal_message(&reply)) {
+                    (Some("forbidden"), _) | (_, None) => invisible.to_owned(),
+                    (_, Some(message)) => message,
+                },
+            ))
+        }
         (401, _) => Err(invalid("Hub sign-in expired or was rejected")),
         (201, _) => minted_from(&reply, HubAuth::Session(session)),
         _ => Err(invalid("Hub could not create an agent token")),
@@ -1832,7 +1853,25 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
             "checkout root or origin changed; review client setup before reconnecting",
         ));
     }
-    verify(&connection).await?;
+    // One live check says whether the Hub accepts the saved token; a stored token alone is not
+    // evidence of coordination, so a refusal here stops the report with the reason and the fix.
+    let snapshot = crate::client_status::snapshot_for(true, Some(&root)).await?;
+    let status = snapshot
+        .connections
+        .iter()
+        .find(|status| status.root == root)
+        .ok_or_else(|| invalid("No Hub binding. Run client setup for this agent and Hub."))?;
+    println!("Connection: {}", status.health.summary());
+    match &status.hub_check {
+        crate::client_status::HubCheck::Valid { hub_build, .. } => println!(
+            "Hub build: {}",
+            hub_build.as_ref().map_or_else(
+                || "not reported by this Hub".to_owned(),
+                crate::client_status::HubBuild::label
+            )
+        ),
+        _ => return Err(invalid(&status.health.summary())),
+    }
     let token = read_token(&connection.token_file)?;
     let client_id = crate::client_config::onboarding_client(&root, &token);
     let client = forge_http::client().map_err(map_hub_error)?;
@@ -1910,6 +1949,26 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn a_managed_token_is_saved_whole_privately_and_never_over_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens").join("tok_new");
+        write_owned_token(&path, "synthetic-secret").unwrap();
+        assert_eq!(read_token(&path).unwrap(), "synthetic-secret");
+        // No temporary sibling is left behind for a reader to mistake for a token.
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("tok_new")]);
+        // A second write refuses, keeps the first token and does not echo either secret.
+        let error = write_owned_token(&path, "other-secret")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret"), "{error}");
+        assert_eq!(read_token(&path).unwrap(), "synthetic-secret");
+    }
 
     #[test]
     fn a_token_is_described_as_renewing_only_when_this_computer_can_renew_it() {
