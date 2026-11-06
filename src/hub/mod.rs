@@ -40,6 +40,7 @@ mod promise_http;
 pub mod provider_context;
 pub mod publish;
 mod repository_summary;
+mod retention;
 pub mod session;
 pub mod setup_attention;
 pub mod skill_workflow;
@@ -466,6 +467,7 @@ pub fn router(state: HubState) -> Router {
         .merge(slack::routes())
         .merge(change_record_http::routes())
         .merge(pr_context::routes())
+        .merge(retention::routes())
         .merge(continuity::routes())
         .merge(promise_http::routes())
         .merge(skills::routes())

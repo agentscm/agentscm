@@ -495,6 +495,8 @@ on no others:
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
 - `GET /v1/hub/repos/{repo}/pr-context?number=…` ([retained PR context](advanced/pr-context.md), no provider refresh)
+- `GET /v1/hub/repos/{repo}/retention` (the Hub's retention limits for the repository and the
+  stand-up bytes it holds now; see the [API](api.md#hub-retention))
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
   `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`, `agentscm_pr_context`,

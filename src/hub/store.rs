@@ -1227,6 +1227,9 @@ pub trait Store: Send + Sync {
     ) -> Result<super::work::WorkRepositoryRenameResult>;
     /// Every repository scope that retains Work items or coordination requests.
     fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>>;
+    /// Bytes of stand-up payload the repository retains now, against `WORK_PAYLOAD_CAPACITY_BYTES`.
+    /// A repository that never wrote reports 0.
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64>;
     /// Trusted workspace calls only: authorization is held across this transaction.
     fn promise_create(
         &self,
