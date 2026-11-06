@@ -826,7 +826,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
     );
     let valid = announce_body(1, &["a/b.rs"]);
     let (status, body) = hub.call(post.clone(), INTENTS, None, Some(&valid)).await;
-    crate::assert_hub_error!((status, body), (401, json!({"error": "unauthorized"})));
+    assert_eq!((status, body), (401, json!({"error": "unauthorized"})));
     assert_eq!(hub.call(get.clone(), NOTICES, None, None).await.0, 401);
     assert_eq!(
         hub.call(get.clone(), INTENTS, Some("bogus"), None).await.0,
@@ -842,7 +842,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
         "/v1/hub/repos/acme%2F..%2Fwidgets/intents",
     ] {
         let (status, body) = hub.call(get.clone(), path, Some(&alice), None).await;
-        crate::assert_hub_error!(
+        assert_eq!(
             (status, body),
             (404, json!({"error": "not_found"})),
             "{path}"
@@ -868,7 +868,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
         let (status, reply) = hub
             .call(post.clone(), INTENTS, Some(&alice), Some(&body.to_string()))
             .await;
-        crate::assert_hub_error!(
+        assert_eq!(
             (status, reply),
             (400, json!({"error": "invalid_request"})),
             "{body}"
@@ -881,7 +881,7 @@ async fn requests_are_authenticated_scoped_and_validated() {
     for query in ["wait=abc", "wait=26", "after=-1", "after=x", "foo=1"] {
         let url = format!("{NOTICES}?{query}");
         let (status, reply) = hub.call(get.clone(), &url, Some(&alice), None).await;
-        crate::assert_hub_error!(
+        assert_eq!(
             (status, reply),
             (400, json!({"error": "invalid_request"})),
             "{query}"
@@ -941,12 +941,12 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     let hub = Hub::start().await;
     let alice = hub.secret(1, "a");
     let get = reqwest::Method::GET;
-    crate::assert_hub_error!(
+    assert_eq!(
         hub.call(get.clone(), ACTIVITY, None, None).await,
         (401, json!({"error": "unauthorized"}))
     );
     let other = "/v1/hub/repos/acme%2Fother/activity";
-    crate::assert_hub_error!(
+    assert_eq!(
         hub.call(get.clone(), other, Some(&alice), None).await,
         (404, json!({"error": "not_found"}))
     );
@@ -962,7 +962,7 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     ] {
         let url = format!("{ACTIVITY}?{query}");
         let (status, reply) = hub.call(get.clone(), &url, Some(&alice), None).await;
-        crate::assert_hub_error!(
+        assert_eq!(
             (status, reply),
             (400, json!({"error": "invalid_request"})),
             "{query}"
@@ -1179,9 +1179,7 @@ async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    for key in ["error", "message", "refused_paths", "retryable", "recovery"] {
-        assert!(keys.contains(&key), "{key}: {keys:?}");
-    }
+    assert_eq!(keys, ["error", "message", "refused_paths"]);
     assert_eq!(reply["error"], "invalid_request");
     assert!(reply["message"].as_str().unwrap().contains(&started.id));
     assert_eq!(

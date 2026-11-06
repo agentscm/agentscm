@@ -649,23 +649,8 @@ impl WorkStart {
             + usize::from(self.request_key.is_some())
             != 1
         {
-            let problem =
-                if self.work_id.is_none() && self.source.is_none() && self.request_key.is_none() {
-                    super::error_envelope::FieldProblem::Missing
-                } else {
-                    super::error_envelope::FieldProblem::Conflict
-                };
-            return Err(HubError::Input(
-                ["work_id", "source", "request_key"]
-                    .into_iter()
-                    .filter_map(|name| {
-                        super::error_envelope::InputProblem::new(
-                            name,
-                            problem,
-                            "Provide exactly one of work_id, source or request_key.",
-                        )
-                    })
-                    .collect(),
+            return Err(invalid(
+                "exactly one of work_id, source or request_key is required",
             ));
         }
         if self.work_id.is_none() && self.role != WorkRole::Lead {

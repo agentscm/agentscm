@@ -280,7 +280,7 @@ fn the_default_session_joins_a_recent_hook_session(db: &Db) {
 
 fn assert_session_required<T: std::fmt::Debug>(result: Result<T, HubError>) {
     match result {
-        Err(HubError::Rejected(rejection)) => assert_eq!(rejection.message(), SESSION_REQUIRED),
+        Err(HubError::Invalid(message)) => assert_eq!(message, SESSION_REQUIRED),
         other => panic!("expected the session to be required, got {other:?}"),
     }
 }

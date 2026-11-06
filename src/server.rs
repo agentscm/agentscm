@@ -1216,9 +1216,7 @@ impl From<Error> for ApiError {
             Error::SourceDenied => StatusCode::FORBIDDEN,
             Error::SourceIndeterminate => StatusCode::SERVICE_UNAVAILABLE,
             Error::Conflict(_) => StatusCode::CONFLICT,
-            Error::Io(_) | Error::Json(_) | Error::Sql(_) | Error::Hub(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Error::Io(_) | Error::Json(_) | Error::Sql(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
             status,

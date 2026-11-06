@@ -211,7 +211,7 @@ async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
             missing["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("missing field `agent`"),
+                .ends_with("missing field `agent`"),
             "{missing}"
         );
         let (endpoint, edit, lifecycle) = match agent {
@@ -1013,9 +1013,10 @@ async fn change_record_is_a_read_only_bounded_projection() {
         )
         .await;
     assert_eq!(missing["isError"], true);
-    let text = missing["content"][0]["text"].as_str().unwrap();
-    assert!(text.starts_with("The resource was not found;"), "{text}");
-    assert_eq!(missing["structuredContent"]["error"]["code"], "not_found");
+    assert_eq!(
+        missing["content"][0]["text"],
+        "AgentSCM: coordination unknown (change record not found). Other agents' work on these files is not visible."
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1026,9 +1027,7 @@ async fn method_and_auth_rules() {
 
     for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
         let reply = hub.send(method, "/mcp", Some(&key), "").await;
-        assert_eq!(reply.status, 405);
-        let body: Value = serde_json::from_str(&reply.text).unwrap();
-        assert_eq!(body["error"], "method_not_allowed");
+        assert_eq!((reply.status, reply.text.as_str()), (405, ""));
         assert_eq!(reply.headers["allow"], "POST");
     }
     for secret in [None, Some("agt_not-a-token")] {
@@ -1285,10 +1284,7 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
         ("agentscm_handoff", json!({"path": file, "accept": "yes"})),
     ] {
         let (text, error) = call(&bob, name, arguments).await;
-        assert!(
-            error && text.contains("invalid arguments") && text.contains("ref cor_"),
-            "{text}"
-        );
+        assert!(error && text.contains("invalid arguments"), "{text}");
     }
 
     // Declining: the requester hears it on its next call.
@@ -1965,9 +1961,10 @@ async fn errors_are_tool_results_with_fixed_text() {
     for path in ["/mcp?repo=acme/other", "/mcp?repo=acme%2Fother"] {
         let (text, error) = hub.tool(&key, path, "agentscm_status", json!({})).await;
         assert!(error);
-        assert!(
-            text.starts_with("This token is for another repository;"),
-            "{text}"
+        assert_eq!(
+            text,
+            "AgentSCM: coordination unknown (this token is for another repository). \
+             Other agents' work on these files is not visible."
         );
     }
     let (_, error) = hub
@@ -2004,7 +2001,7 @@ async fn errors_are_tool_results_with_fixed_text() {
         let (text, error) = hub.tool(&key, "/mcp", name, arguments).await;
         assert!(error, "{name}");
         assert!(
-            text.contains("invalid arguments") && text.contains("ref cor_"),
+            text.starts_with(&format!("AgentSCM: invalid arguments for {name}: ")),
             "{text}"
         );
         assert!(!text.contains("sekrit"), "{text}");
@@ -2018,10 +2015,7 @@ async fn errors_are_tool_results_with_fixed_text() {
         )
         .await;
     assert!(error && !text.contains("sekrit"), "{text}");
-    assert!(
-        text.contains("path must be a repo-relative path") && text.contains("ref cor_"),
-        "{text}"
-    );
+    assert!(text.contains("invalid_or_changed"), "{text}");
 
     // An unknown tool or a call without a name is a protocol error.
     for params in [json!({"name": "nope"}), json!({}), json!("x")] {
@@ -2866,7 +2860,7 @@ async fn value_metrics_and_receipts_are_scoped_and_automatic_delivery_is_idempot
             json!({}),
         )
         .await;
-    assert!(error && foreign.contains("another repository"), "{foreign}");
+    assert!(error && foreign.contains("another repository"));
     // The typed MCP query must not allow an aggregate repository escape.
     let foreign = hub
         .tool_result(

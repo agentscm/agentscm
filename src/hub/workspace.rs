@@ -1392,7 +1392,27 @@ fn cookie_value(headers: &HeaderMap) -> Result<Option<String>> {
 }
 
 pub fn api_error(error: HubError) -> ApiError {
-    ApiError::from(error)
+    match &error {
+        HubError::Invalid(code) => match code.as_str() {
+            "workspace_forbidden" => ApiError::new(StatusCode::FORBIDDEN, "forbidden"),
+            "workspace_csrf" => ApiError::new(StatusCode::FORBIDDEN, "csrf_required"),
+            "workspace_generation_conflict" => {
+                ApiError::new(StatusCode::CONFLICT, "generation_conflict")
+            }
+            "workspace_idempotency_conflict" => {
+                ApiError::new(StatusCode::CONFLICT, "idempotency_conflict")
+            }
+            "workspace_native_conflict" => {
+                ApiError::new(StatusCode::CONFLICT, "native_subject_conflict")
+            }
+            "workspace_last_administrator" => {
+                ApiError::new(StatusCode::CONFLICT, "last_administrator")
+            }
+            "workspace_member_limit" => ApiError::new(StatusCode::CONFLICT, "member_limit"),
+            _ => ApiError::from(error),
+        },
+        _ => ApiError::from(error),
+    }
 }
 
 impl FromRequestParts<HubState> for WorkspaceActor {

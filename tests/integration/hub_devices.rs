@@ -1322,8 +1322,6 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     ]);
     assert!(ok, "{stderr}");
     assert!(doctor.contains("Connection verified"), "{doctor}");
-    assert!(doctor.contains("Connection: authenticated"), "{doctor}");
-    assert!(doctor.contains("Hub build: "), "{doctor}");
 
     // Renewal swaps the token before it ends and revokes the old one; a running MCP server
     // keeps working across it.

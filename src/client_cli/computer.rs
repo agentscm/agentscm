@@ -17,7 +17,7 @@ use super::{
     write_owned_token,
 };
 use crate::client_config::{Connection, load, origin_identity, owned_token_path, update};
-use crate::hub_cli::{self, HubAuth, SavedDevice, call};
+use crate::hub_cli::{self, HubAuth, SavedDevice, call, refusal_message};
 
 /// A computer's agent token is renewed when less than this is left of its 24 hours.
 pub(crate) const RENEW_BEFORE_SECONDS: i64 = 12 * 60 * 60;
@@ -40,32 +40,15 @@ pub(crate) fn refusal_text(kind: &str, repo: &str, forge: &str) -> String {
         "permission_unavailable" => format!(
             "{forge} didn't answer the Hub's access check; nothing changed, so try again in a minute"
         ),
-        _ => agentscm::hub::error_envelope::ErrorCode::parse(kind)
-            .unwrap_or(agentscm::hub::error_envelope::ErrorCode::SignInRequired)
-            .message()
-            .to_owned(),
+        "not_allowed" => {
+            "This Hub only lets in people its admins have allowed; ask a Hub admin to add you"
+                .to_owned()
+        }
+        "user_disabled" => {
+            "Your account is turned off on this Hub; ask a Hub admin to turn it back on".to_owned()
+        }
+        _ => "This computer isn't signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app or run agentscm hub login".to_owned(),
     }
-}
-
-fn refusal_reply(reply: &Value, repo: &str, forge: &str) -> String {
-    use agentscm::hub::error_envelope::{ErrorCode, decode};
-    let kind = reply["error"].as_str().unwrap_or("sign_in_required");
-    let code = ErrorCode::parse(kind).unwrap_or(ErrorCode::SignInRequired);
-    let mut envelope = decode(code.status(), reply);
-    if reply["message"].is_null()
-        || reply["message"].as_str() == Some(code.message())
-        || (matches!(
-            kind,
-            "not_connected"
-                | "insufficient_role"
-                | "no_repository_role"
-                | "access_check_unavailable"
-                | "permission_unavailable"
-        ) && envelope.message.contains("[redacted]"))
-    {
-        envelope.message = refusal_text(kind, repo, forge);
-    }
-    envelope.render()
 }
 
 /// Why a mint through this computer did not happen.
@@ -118,11 +101,13 @@ pub(super) async fn mint(
     };
     let refused = |reply: &Value| {
         let kind = reply["error"].as_str().unwrap_or_default();
-        let message = refusal_reply(
-            reply,
-            &connection.repo,
-            forge_of(provider, &connection.origin_host),
-        );
+        let message = refusal_message(reply).unwrap_or_else(|| {
+            refusal_text(
+                kind,
+                &connection.repo,
+                forge_of(provider, &connection.origin_host),
+            )
+        });
         match kind {
             "not_connected" => MintError::NotConnected(message),
             "permission_unavailable" => MintError::Unavailable(message),
@@ -198,11 +183,13 @@ pub(crate) async fn check(connection: &Connection) -> Option<std::result::Result
     let client = forge_http::client().ok()?;
     let hub = &connection.hub;
     let failed = |reply: &Value| {
-        Err(refusal_reply(
-            reply,
-            &connection.repo,
-            forge_of(None, &connection.origin_host),
-        ))
+        Err(refusal_message(reply).unwrap_or_else(|| {
+            refusal_text(
+                reply["error"].as_str().unwrap_or_default(),
+                &connection.repo,
+                forge_of(None, &connection.origin_host),
+            )
+        }))
     };
     let (status, me) = match call(
         &client,
@@ -344,16 +331,6 @@ pub(crate) enum Renewal {
     Unavailable,
 }
 
-/// True when `latest` is a concurrent renewal of `saved`: a different managed token that is not
-/// due yet.
-fn superseded(saved: &Connection, latest: &Connection, now: i64) -> bool {
-    latest.owned_token_id.is_some()
-        && latest.owned_token_id != saved.owned_token_id
-        && latest.hub == saved.hub
-        && latest.repo == saved.repo
-        && !due(latest, now)
-}
-
 /// Renews the checkout's managed token when it is due: mint a new one, save it, then revoke
 /// the old one, so a failure part way leaves a working token.
 async fn renew(root: &Path) -> Result<Renewal> {
@@ -397,20 +374,10 @@ async fn renew(root: &Path) -> Result<Renewal> {
     renewed.owned_token_id = Some(minted.id.clone());
     renewed.owned_token_expires_at = Some(verified.expires_at);
     let lifecycle = lifecycle_lock()?;
-    let latest = load()?
+    let unchanged = load()?
         .into_iter()
-        .find(|connection| connection.root == root);
-    // Another hook process renewed this checkout while we minted: its token is current, so ours
-    // is surplus. Reporting that as unavailable would show a working connection as failed.
-    if latest
-        .as_ref()
-        .is_some_and(|latest| superseded(&saved, latest, unix_now()))
-    {
-        drop(lifecycle);
-        revoke_minted(&saved, &minted).await;
-        return Ok(Renewal::Renewed);
-    }
-    let unchanged = latest.is_some_and(|latest| latest == saved);
+        .find(|connection| connection.root == root)
+        .is_some_and(|latest| latest == saved);
     let saved_new = unchanged
         && write_owned_token(&renewed.token_file, &minted.token).is_ok()
         && match update(root, Some(&saved), Some(renewed.clone())) {
@@ -622,26 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn a_concurrent_renewal_supersedes_ours_but_other_changes_do_not() {
-        let now = 1_000_000;
-        let stale = connection(Some("tok_old"), Some(now - 10));
-        let fresh = connection(Some("tok_new"), Some(now + 2 * RENEW_BEFORE_SECONDS));
-        assert!(superseded(&stale, &fresh, now));
-        // The same token, a renewal that is itself already due, or another repository is not.
-        assert!(!superseded(&stale, &stale, now));
-        assert!(!superseded(
-            &stale,
-            &connection(Some("tok_new"), Some(now)),
-            now
-        ));
-        let mut other = fresh.clone();
-        other.repo = "acme/other".into();
-        assert!(!superseded(&stale, &other, now));
-        // A binding switched to a supplied token is not a renewal either.
-        assert!(!superseded(&stale, &connection(None, None), now));
-    }
-
-    #[test]
     fn every_fallback_refusal_has_a_reason_and_a_fix() {
         for kind in [
             "not_connected",
@@ -655,25 +602,5 @@ mod tests {
             let text = refusal_text(kind, "acme/widgets", "GitHub");
             assert!(text.contains("; "), "{kind} has no fix: {text}");
         }
-    }
-
-    #[test]
-    fn old_hub_refusals_keep_repository_and_forge_guidance() {
-        for body in [
-            json!({"error":"permission_unavailable"}),
-            serde_json::to_value(agentscm::hub::error_envelope::decode(
-                503,
-                &json!({"error":"permission_unavailable"}),
-            ))
-            .unwrap(),
-        ] {
-            assert!(
-                refusal_reply(&body, "acme/widgets", "GitLab").contains("GitLab didn't answer")
-            );
-        }
-        assert!(
-            refusal_reply(&json!({"error":"not_connected"}), "acme/widgets", "GitHub")
-                .contains("acme/widgets isn't connected")
-        );
     }
 }
