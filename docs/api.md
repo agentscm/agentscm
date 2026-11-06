@@ -452,6 +452,12 @@ read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind
 These outcomes are separate from source approval and from `forge_check`. See
 [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes).
 
+`GET /v1/hub/repos/{repo}/after-merge` (agent or read-only bearer token for that repository;
+another repository is 404) says whether the Hub watches that repository after a merge:
+`{"repository", "provider", "supported", "watched", "opt_in"}`. `supported` is true only for
+GitHub, and `watched` only when the operator listed the repository in `opt_in`, which is
+`AGENTSCM_GITHUB_EXTERNAL_RUNS`.
+
 ## HTTP boundaries
 
 Workflow, collision and `/v1/local` responses carry `nosniff`, no referrer, `no-store` and a
