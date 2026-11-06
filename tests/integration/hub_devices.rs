@@ -2148,6 +2148,154 @@ async fn a_web_session_closes_a_request_only_once_its_requester_is_gone() {
     assert_eq!(kept.lead_token, lead);
 }
 
+const HOLD: &str = "/v1/hub/session/work/hold";
+const START_RULE: &str = "/v1/hub/session/start-rule";
+
+#[tokio::test]
+async fn a_person_pauses_work_and_limits_who_may_start_it() {
+    let env = Env::start("github").await;
+    let (alice, bob, admin) = (
+        page(&env, ALICE).await,
+        page(&env, BOB).await,
+        page(&env, ADMIN).await,
+    );
+    let now = unix_now();
+    let (lead, lead_secret) = agent_for(&env, &alice.id, "claude-code", false);
+    let (_, reader) = agent_for(&env, &alice.id, "status-page", true);
+    let start = work("held", "held-session");
+    let item = env.store.work_start(&lead, &start, now).unwrap().item;
+    let hold = |item: &agentscm::hub::work::WorkItem, held: bool| {
+        json!({"repository": REPO, "work_id": item.id, "expected_updated_seq": item.updated_seq,
+            "held": held, "reason": "synthetic freeze"})
+    };
+
+    // Only the owner (or an administrator) pauses, from the page with its CSRF token.
+    let (status, refused) = page_post(&env, &alice, false, HOLD, hold(&item, true)).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (status, refused) = page_post(&env, &bob, true, HOLD, hold(&item, true)).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_work")),
+        "{refused}"
+    );
+    let mut no_reason = hold(&item, true);
+    no_reason.as_object_mut().unwrap().remove("reason");
+    assert_eq!(page_post(&env, &alice, true, HOLD, no_reason).await.0, 400);
+    let (status, held) = page_post(&env, &alice, true, HOLD, hold(&item, true)).await;
+    assert_eq!(status, 200, "{held}");
+    assert_eq!(held["hold"]["login"], "alice");
+    assert_eq!(held["hold"]["reason"], "synthetic freeze");
+    // Asking again changes nothing.
+    let (status, again) = page_post(&env, &alice, true, HOLD, hold(&item, true)).await;
+    assert_eq!((status, &again["updated_seq"]), (200, &held["updated_seq"]));
+
+    // A read-only token sees the hold in the Work read.
+    let (status, read) = env
+        .get(&format!("/v1/hub/standup/work/{}", item.id), &reader)
+        .await;
+    assert_eq!(
+        (status, &read["hold"]["login"]),
+        (200, &json!("alice")),
+        "{read}"
+    );
+
+    // A new start on held Work is refused with who paused it and who can resume; the lead keeps it.
+    let refused = env
+        .store
+        .work_start(&lead, &start, now + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("start refused: "), "{refused}");
+    assert!(
+        refused.contains("paused by alice") && refused.contains("synthetic freeze"),
+        "{refused}"
+    );
+    let (status, body) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/standup/start",
+            Some(&lead_secret),
+            Some(serde_json::to_value(&start).unwrap()),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("start refused: "), "{body}");
+    let kept = env
+        .store
+        .work_get(&lead, &item.id, now + 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.lead_token, lead);
+
+    // A stale fence is refused; resuming admits starts again.
+    assert_eq!(
+        page_post(&env, &alice, true, HOLD, hold(&item, false))
+            .await
+            .0,
+        400
+    );
+    let current: agentscm::hub::work::WorkItem = serde_json::from_value(held).unwrap();
+    let (status, resumed) = page_post(&env, &alice, true, HOLD, hold(&current, false)).await;
+    assert_eq!(status, 200, "{resumed}");
+    assert!(resumed.get("hold").is_none(), "{resumed}");
+    env.store.work_start(&lead, &start, now + 2).unwrap();
+    let events = env.store.events_after(0, 1000).unwrap();
+    let holds: Vec<_> = events.iter().filter(|e| e.kind == "work_hold").collect();
+    assert_eq!(holds.len(), 2);
+    assert!(holds[0].data.contains("\"operation\":\"hold\""));
+    assert!(holds[1].data.contains("\"operation\":\"resume\""));
+
+    // Only an administrator sets the repository rule; a read-only token reads it.
+    let rule = json!({"repository": REPO, "rule": {"owners": ["Alice"]}});
+    assert_eq!(
+        page_post(&env, &bob, true, START_RULE, rule.clone())
+            .await
+            .0,
+        403
+    );
+    let (status, set) = page_post(&env, &admin, true, START_RULE, rule.clone()).await;
+    assert_eq!(status, 200, "{set}");
+    assert_eq!(set["rule"]["owners"], json!(["alice"]));
+    page_post(&env, &admin, true, START_RULE, rule).await;
+    let (status, read) = env.get("/v1/hub/standup/start-rule", &reader).await;
+    assert_eq!(
+        (status, &read["rule"]["owners"]),
+        (200, &json!(["alice"])),
+        "{read}"
+    );
+
+    // Bob's agent is refused a start; Alice's is admitted.
+    let (bob_agent, _) = agent_for(&env, &bob.id, "codex", false);
+    let mut other = work("bobs", "bob-session");
+    other.scope = vec!["src/other.rs".into()];
+    let refused = env
+        .store
+        .work_start(&bob_agent, &other, now + 3)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("only agents of alice") && refused.contains("bob's"),
+        "{refused}"
+    );
+    let mut alices = work("alices", "alice-other");
+    alices.scope = vec!["src/alice.rs".into()];
+    env.store.work_start(&lead, &alices, now + 3).unwrap();
+    let rules = env.store.events_after(0, 1000).unwrap();
+    assert_eq!(
+        rules
+            .iter()
+            .filter(|e| e.kind == "repository_start_rule")
+            .count(),
+        1
+    );
+
+    // Empty lists remove the restriction.
+    let open = json!({"repository": REPO, "rule": {"owners": [], "agent_kinds": []}});
+    assert_eq!(page_post(&env, &admin, true, START_RULE, open).await.0, 200);
+    env.store.work_start(&bob_agent, &other, now + 4).unwrap();
+}
+
 const TRANSITION: &str = "/v1/hub/session/work/transition";
 
 fn person_transition(item: &agentscm::hub::work::WorkItem, operation: &str, kind: &str) -> Value {

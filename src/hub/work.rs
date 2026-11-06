@@ -216,6 +216,9 @@ pub struct WorkItem {
     /// Current caller assertion, never provider-confirmed assignment.
     #[serde(default)]
     pub issue_link: Option<super::planned_issues::IssueIdentity>,
+    /// A person's pause: while set, no new start is admitted on this Work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<super::start_rules::WorkHold>,
     pub id: String,
     pub repository: String,
     pub owner: String,

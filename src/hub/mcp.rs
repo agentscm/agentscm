@@ -1287,7 +1287,8 @@ pub(super) fn hub_failure(error: &HubError) -> Value {
         HubError::Invalid(message)
             if message == SESSION_REQUIRED
                 || message.starts_with(LEAD_SESSION_MISMATCH)
-                || message.starts_with(LEASE_LAPSED) =>
+                || message.starts_with(LEASE_LAPSED)
+                || message.starts_with(super::start_rules::START_REFUSED) =>
         {
             message.as_str()
         }

@@ -13,6 +13,7 @@ fn plan(root: &std::path::Path) -> TransferPlan {
     let work = WorkItem {
         initial_issue_choice: Default::default(),
         issue_link: None,
+        hold: None,
         id: "work-test".into(),
         repository: "synthetic/project".into(),
         owner: "owner".into(),

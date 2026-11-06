@@ -50,6 +50,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/session/handoff/answer", post(person_answer))
         .route("/v1/hub/session/handoff/ask", post(person_ask))
         .merge(super::pickup::routes())
+        .merge(super::start_rules::routes())
 }
 
 #[derive(Deserialize)]

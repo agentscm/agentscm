@@ -46,6 +46,7 @@ pub mod skill_workflow;
 pub mod skills;
 pub mod slack;
 pub mod slack_protocol;
+pub mod start_rules;
 pub mod store;
 mod store_pg;
 mod store_sqlite;

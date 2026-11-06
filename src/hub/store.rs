@@ -819,6 +819,26 @@ pub trait Store: Send + Sync {
         update: &super::work_issues::WorkIssueLinkUpdate,
         now: i64,
     ) -> Result<WorkCheckpointResult>;
+    /// A person pauses or resumes one Work item on a repository whose read role the caller has
+    /// checked. Unchanged when the item is already in the requested state.
+    fn work_hold_set(
+        &self,
+        user: &User,
+        repository: &str,
+        repository_id: i64,
+        is_admin: bool,
+        request: &super::start_rules::WorkHoldRequest,
+        now: i64,
+    ) -> Result<WorkItem>;
+    /// A Hub administrator sets a repository's start rule; the setting and its event commit together.
+    fn start_rule_set(
+        &self,
+        user: &User,
+        repository: &str,
+        repository_id: i64,
+        rule: &super::start_rules::StartRule,
+        now: i64,
+    ) -> Result<super::start_rules::StoredStartRule>;
     /// Read the single explicit PR relationship; comparison statuses confer no approval.
     fn work_pr_link_get(
         &self,

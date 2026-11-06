@@ -469,6 +469,44 @@ status shown; clients show `message` as is.
   administrator-only credential): `GET /v1/hub/local-ci/devices?repository=host/owner/name` lists
   that person's own devices on the repository, and an unknown repository gives an empty list.
 
+## Start controls
+
+Two controls a person sets decide whether the Hub admits an agent's `agentscm_start`
+(`POST /v1/hub/standup/start`). Neither one stops a running session. A session already working on
+the Work keeps its claim, its edits, its checkpoints and its transitions. Only a new start is
+refused. A refused start answers 400 `invalid` with a `message` that begins
+`start refused: `, and MCP returns the same text. Nothing is claimed.
+
+- **Pause a Work item.** `POST /v1/hub/session/work/hold` (`repository`, `work_id`,
+  `expected_updated_seq`, `held`, plus `reason` when `held` is true; web sign-in and CSRF token, no
+  agent token). It is open to the Work's owner and to a Hub administrator. Anyone else gets 403
+  `not_your_work`. A stale `expected_updated_seq` is 400 with a message. Asking for the state the
+  item is already in changes nothing and records nothing. The reply is the Work item. Pausing sets
+  `hold` (`{by, login, reason, at}`) on the Work item, so `GET /v1/hub/standup/work/{id}` and every
+  other Work read show it, read-only tokens included. Resuming removes it. While `hold` is set, every
+  start that resolves to this item is refused, whether it is the lead asking again, a takeover or a
+  helper or reviewer joining. The message names the person who paused it, the reason, and who can
+  resume it. Each change appends a `work_hold` event (`operation` `hold` or `resume`, `author`,
+  `login`, `reason`, `admin` when an administrator changed someone else's Work, `"via": "hub"`) with
+  a new Work version. The named migration `work_holds` lets that history compact like other Work
+  events. This hold is separate from the `paused` Work state an agent reports with a pause
+  checkpoint.
+- **Allow only some agents in a repository.** `POST /v1/hub/session/start-rule` (`repository`,
+  `rule: {owners, agent_kinds}`; web sign-in and CSRF token; Hub administrators only, others get
+  403). `owners` are forge logins whose agents may start Work. `agent_kinds` are the `<agent>` of
+  the starting session's connected `hook:<agent>`, such as `claude` or `codex`. Each list holds at
+  most 50 entries, compared without case. An empty list does not restrict. When both lists are set,
+  a start must pass both. A session with no connected hook has no known kind, so a rule that lists
+  kinds refuses it. Sending empty lists removes the restriction. The reply is
+  `{rule, updated_at, updated_by}`. A change appends a `repository_start_rule` event (subject:
+  `start_rule:<provider>:<host>:<repository_id>`; data: `repository`, `repository_id`, `owners`,
+  `agent_kinds`, `author`, `login`, `"via": "hub"`), and an unchanged rule records nothing. The rule
+  is keyed by the forge repository id, so it survives a rename. `GET /v1/hub/standup/start-rule`
+  returns `{repository, rule, updated_at, updated_by}` for the token's repository, an open rule
+  when none is set, and read-only tokens may call it. The rule applies to every start in the
+  repository, the automatic session start included. A stored rule that cannot be read refuses
+  starts as 503 `unavailable`.
+
 ## Read-only tokens
 
 A read-only token (see [Identity model](#identity-model)) is accepted on exactly these routes, and
@@ -486,6 +524,7 @@ on no others:
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
   `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
   `GET /v1/hub/standup/inbox` for the token's repository
+- `GET /v1/hub/standup/start-rule`, the repository's [start rule](#start-controls)
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
