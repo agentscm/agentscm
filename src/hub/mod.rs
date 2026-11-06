@@ -378,7 +378,14 @@ pub fn open_objects(local: &Path) -> Result<Arc<dyn ImmutableBackend>> {
     let lookup = |name: &str| std::env::var(name).ok();
     Ok(match s3_config(&lookup)? {
         Some(config) => {
-            eprintln!("objects: s3");
+            eprintln!(
+                "objects: s3{}",
+                if config.is_ambient() {
+                    " (role credentials)"
+                } else {
+                    ""
+                }
+            );
             Arc::new(S3Backend::open(config)?)
         }
         None => {
@@ -397,7 +404,8 @@ const S3_SETTINGS: [&str; 5] = [
 ];
 
 /// `AGENTSCM_OBJECTS_URL=s3://bucket[/prefix]` plus `AGENTSCM_S3_*`. Secrets come
-/// from the environment or a file, never a flag; errors never echo values.
+/// from the environment or a file, never a flag; errors never echo values. Without any key
+/// setting the backend uses the process's AWS role credentials.
 fn s3_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<S3Config>> {
     // Fail closed: a blank URL or stray S3 settings must not silently mean local disk.
     let url = match lookup("AGENTSCM_OBJECTS_URL") {
@@ -417,7 +425,6 @@ fn s3_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<S3Config
         HubError::Invalid("AGENTSCM_OBJECTS_URL must be s3://bucket[/prefix]".into())
     })?;
     let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-    let region = lookup("AGENTSCM_S3_REGION").unwrap_or_else(|| "us-east-1".into());
     let secret_access_key = match (
         lookup("AGENTSCM_S3_SECRET_ACCESS_KEY_FILE"),
         lookup("AGENTSCM_S3_SECRET_ACCESS_KEY"),
@@ -427,22 +434,33 @@ fn s3_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<S3Config
                 "set only one of AGENTSCM_S3_SECRET_ACCESS_KEY_FILE and AGENTSCM_S3_SECRET_ACCESS_KEY".into(),
             ));
         }
-        (Some(path), None) => login::read_secret_file(&path, "AGENTSCM_S3_SECRET_ACCESS_KEY_FILE")?,
-        (None, Some(secret)) => secret,
-        (None, None) => {
+        (Some(path), None) => Some(login::read_secret_file(
+            &path,
+            "AGENTSCM_S3_SECRET_ACCESS_KEY_FILE",
+        )?),
+        (None, secret) => secret,
+    };
+    // No keys at all means the role the process runs with; half a pair is a mistake.
+    let (access_key_id, secret_access_key) = match (
+        lookup("AGENTSCM_S3_ACCESS_KEY_ID"),
+        secret_access_key,
+    ) {
+        (Some(id), Some(secret)) => (id, secret),
+        (None, None) => (String::new(), String::new()),
+        _ => {
             return Err(HubError::Invalid(
-                "AGENTSCM_S3_SECRET_ACCESS_KEY_FILE or AGENTSCM_S3_SECRET_ACCESS_KEY is required with AGENTSCM_OBJECTS_URL".into(),
-            ));
+                    "set AGENTSCM_S3_ACCESS_KEY_ID with AGENTSCM_S3_SECRET_ACCESS_KEY_FILE or AGENTSCM_S3_SECRET_ACCESS_KEY, or set none of them to use the process's AWS role credentials".into(),
+                ));
         }
     };
+    let ambient = access_key_id.is_empty();
+    let region = lookup("AGENTSCM_S3_REGION")
+        .or_else(|| lookup("AWS_REGION").filter(|_| ambient))
+        .unwrap_or_else(|| "us-east-1".into());
     let config = S3Config {
         endpoint: lookup("AGENTSCM_S3_ENDPOINT")
             .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
-        access_key_id: lookup("AGENTSCM_S3_ACCESS_KEY_ID").ok_or_else(|| {
-            HubError::Invalid(
-                "AGENTSCM_S3_ACCESS_KEY_ID is required with AGENTSCM_OBJECTS_URL".into(),
-            )
-        })?,
+        access_key_id,
         region,
         bucket: bucket.to_owned(),
         prefix: prefix.trim_end_matches('/').to_owned(),
@@ -651,6 +669,36 @@ mod tests {
         assert!(stray.to_string().contains("need AGENTSCM_OBJECTS_URL"));
         let blank = |name: &str| (name == "AGENTSCM_OBJECTS_URL").then(String::new);
         assert!(s3_config(&blank).is_err());
+    }
+
+    #[test]
+    fn no_key_settings_mean_role_credentials_and_the_ambient_region() {
+        let unset = [
+            ("AGENTSCM_S3_ACCESS_KEY_ID", ""),
+            ("AGENTSCM_S3_SECRET_ACCESS_KEY", ""),
+        ];
+        let roles = config(&unset).unwrap().unwrap();
+        assert!(roles.is_ambient());
+        assert_eq!(roles.region, "us-east-1");
+        let with_region = |extra: &[(&str, &str)]| {
+            let mut vars = unset.to_vec();
+            vars.extend_from_slice(extra);
+            config(&vars).unwrap().unwrap()
+        };
+        let ambient = with_region(&[("AWS_REGION", "eu-central-1")]);
+        assert_eq!(ambient.region, "eu-central-1");
+        assert_eq!(ambient.endpoint, "https://s3.eu-central-1.amazonaws.com");
+        let explicit = with_region(&[
+            ("AWS_REGION", "eu-central-1"),
+            ("AGENTSCM_S3_REGION", "eu-west-1"),
+        ]);
+        assert_eq!(explicit.region, "eu-west-1");
+        // Configured keys keep the earlier behavior: AWS_REGION is not consulted.
+        let keyed = self::config(&[("AWS_REGION", "eu-central-1")])
+            .unwrap()
+            .unwrap();
+        assert!(!keyed.is_ambient());
+        assert_eq!(keyed.region, "us-east-1");
     }
 
     #[test]

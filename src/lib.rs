@@ -9,6 +9,7 @@ pub const BUILD_COMMIT: &str = env!("AGENTSCM_BUILD_COMMIT");
 pub mod attached_worktree;
 pub mod authority;
 pub mod autopsy;
+pub(crate) mod aws_credentials;
 pub mod backend;
 pub mod backend_s3;
 pub mod candidate;
