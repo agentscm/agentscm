@@ -578,9 +578,9 @@ fn billing(key: &str, session: &str) -> Value {
 }
 
 /// A read-only token may run the exact-subject preflight, which reads: it names the Work already
-/// on the paths and creates nothing. Another repository's token is told nothing.
+/// on the paths, creates no Work and records no event. Another repository's token is told nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_read_only_token_runs_a_preflight_that_names_the_overlap_and_changes_nothing() {
+async fn a_read_only_token_runs_a_preflight_that_names_the_overlap_and_records_no_event() {
     let hub = Hub::start(None).await;
     let (_, lead) = hub.token(1, "acme/widgets", false).await;
     let (_, reader) = hub.token(2, "acme/widgets", true).await;
@@ -628,7 +628,7 @@ async fn a_read_only_token_runs_a_preflight_that_names_the_overlap_and_changes_n
     assert_eq!(status, 200, "{none}");
     assert!(none["scope_overlaps"].as_array().unwrap().is_empty());
 
-    // The reader saw it and wrote nothing: one Work, no new event.
+    // The reader saw it and changed no Work and recorded no event: one Work, no new event.
     let (_, overview) = hub
         .call(Method::GET, "/v1/hub/standup/overview", &reader, None)
         .await;
