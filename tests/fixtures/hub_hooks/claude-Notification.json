@@ -1,0 +1,9 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "transcript_path": "/work/.claude/projects/-work-acme-widgets/11111111-2222-3333-4444-555555555555.jsonl",
+  "cwd": "/work/acme-widgets",
+  "hook_event_name": "Notification",
+  "message": "Claude needs your permission to use Bash",
+  "title": "Permission needed",
+  "notification_type": "permission_prompt"
+}

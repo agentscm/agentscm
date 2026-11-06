@@ -30,6 +30,7 @@ use super::session::{
     SessionCall, Touched, announce_reading, check_name, count_fail_open, done_for,
     done_pausing_for, others_for, record_hook_ms,
 };
+use super::session_waiting::WaitReason;
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
 use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, LEASE_LAPSED};
@@ -123,9 +124,16 @@ enum Kind {
     /// Any other tool call: renews the lead session's lease, writes nothing else, says nothing.
     /// A shell call's start and end keep the lease live while it runs.
     Activity(CallPhase),
+    /// The session stopped to wait for its person; its next call ends the wait. Writes nothing
+    /// to the store and says nothing.
+    Waiting(WaitReason),
     Done,
     Fail(&'static str),
 }
+
+/// Claude Code's tool that puts a multiple-choice question to the person.
+const ASK_USER_QUESTION: &str = "AskUserQuestion";
+const MAX_ASKER_BYTES: usize = 128;
 
 /// Where and how the agent takes context back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +169,8 @@ struct Call {
     deny: bool,
     /// Made by a subagent (Claude Code sends `agent_id`), whose context ends when it returns.
     child: bool,
+    /// That subagent's id, when it is a usable one, to tell its wait from its siblings' work.
+    asker: Option<String>,
 }
 
 struct Outcome {
@@ -247,6 +257,18 @@ async fn hook(
         Ok(Err(reason)) => Outcome::unknown(reason),
         Err(_) => Outcome::unknown("hub timed out"),
     };
+    // The session is moving again, so its person no longer holds it up. Only a session that
+    // waits costs the authentication; another token's call cannot end it.
+    if let Some((native, all)) = call.ends_wait()
+        && state.onboarding.waiting().has_session(native)
+        && let Ok(Ok(principal)) =
+            timeout_at(deadline, authenticate(&state, token.clone(), repo.clone())).await
+    {
+        state
+            .onboarding
+            .waiting()
+            .clear(&principal.token_id, native, call.asker.as_deref(), all);
+    }
     if matches!(call.kind, Kind::Start | Kind::Prompt | Kind::Check)
         && let Some(token) = token
     {
@@ -441,6 +463,7 @@ impl Call {
             paths: Vec::new(),
             deny: false,
             child: false,
+            asker: None,
         }
     }
 
@@ -463,6 +486,26 @@ impl Call {
     fn child(mut self, child: bool) -> Self {
         self.child = child;
         self
+    }
+
+    fn asker(mut self, id: Option<&str>) -> Self {
+        self.asker = id
+            .filter(|id| {
+                (1..=MAX_ASKER_BYTES).contains(&id.len()) && !id.chars().any(char::is_control)
+            })
+            .map(str::to_owned);
+        self
+    }
+
+    /// The wait this call ends, if any: the session's, and whether the call ends every wait
+    /// there (the person typed, or the session started or ended) or only one its caller asked.
+    fn ends_wait(&self) -> Option<(&str, bool)> {
+        let all = match self.kind {
+            Kind::Start | Kind::Prompt | Kind::Done => true,
+            Kind::Check | Kind::Activity(_) => false,
+            Kind::Ignore | Kind::Waiting(_) | Kind::Fail(_) => return None,
+        };
+        Some((self.session.as_deref()?, all))
     }
 
     fn task(mut self, task: Option<&str>) -> Self {
@@ -561,6 +604,37 @@ impl Call {
                     .await
                     {
                         eprintln!("hub: activity hook did not renew: {error}");
+                    }
+                }
+                Ok(Outcome::clean())
+            }
+            Kind::Waiting(reason) => {
+                // Best effort and silent, like activity: a failure must not delay the prompt the
+                // person is about to see. A wait no session names could never be ended, so it is
+                // not kept.
+                if let Some(native) = self.session.clone()
+                    && let Ok(principal) = authenticate(state, token, repo).await
+                {
+                    let store = state.store.clone();
+                    let id = principal.token_id.clone();
+                    let requested = native.clone();
+                    let recorded = blocking(state, move || {
+                        store.session_name_for(&id, Some(&requested), unix_now())
+                    })
+                    .await
+                    .and_then(|session| {
+                        state.onboarding.waiting().record(
+                            &principal,
+                            &native,
+                            &session,
+                            self.via.strip_prefix("hook:").unwrap_or(""),
+                            reason,
+                            self.asker.as_deref(),
+                            unix_now(),
+                        )
+                    });
+                    if let Err(error) = recorded {
+                        eprintln!("hub: waiting hook not recorded: {error}");
                     }
                 }
                 Ok(Outcome::clean())
@@ -1152,14 +1226,34 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         Call::new(agent, kind, shape)
             .session(str_at(v, "session_id"))
             .child(v.get("agent_id").is_some())
+            .asker(str_at(v, "agent_id"))
     };
     let tool = str_at(v, "tool_name").unwrap_or_default();
+    let waiting = |reason| call(Kind::Waiting(reason), Shape::Silent);
     match str_at(v, "hook_event_name") {
         // The start prompt is never read: it would become a team-visible task.
         Some("SessionStart") => call(Kind::Start, Shape::Hook("SessionStart")),
         // Fires only where a person types, so it reaches the session they are talking to. The
         // prompt itself is never read; the client does not forward it.
         Some("UserPromptSubmit") => call(Kind::Prompt, Shape::Hook("UserPromptSubmit")),
+        // Only the facts of the wait are read: never the message, tool input or question.
+        Some("PreToolUse") if tool == ASK_USER_QUESTION => waiting(WaitReason::Question),
+        Some("PermissionRequest") => waiting(WaitReason::Permission),
+        Some("Notification") => match notified(str_at(v, "notification_type")) {
+            Some(reason) => waiting(reason),
+            None => call(Kind::Ignore, Shape::Silent),
+        },
+        // Paused on its own background work, which will resume it, not on the person.
+        // The client sends the count; a legacy hook sends Claude Code's own list.
+        Some("Stop")
+            if v["background_tasks"].as_u64().is_some_and(|n| n > 0)
+                || v["background_tasks"]
+                    .as_array()
+                    .is_some_and(|tasks| !tasks.is_empty()) =>
+        {
+            call(Kind::Ignore, Shape::Silent)
+        }
+        Some("Stop") => waiting(WaitReason::Idle),
         Some("PreToolUse") if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Hook("PreToolUse"))
@@ -1179,7 +1273,27 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
 /// the fields. Edits are checked on preToolUse, which can refuse but has no context field;
 /// every other tool event, postToolUse (it has a `toolResult`) included, is activity.
 fn copilot(v: &Value, scope: &Scope) -> Call {
-    let call = |kind, shape| Call::new(Agent::Copilot, kind, shape).session(str_at(v, "sessionId"));
+    let call = |kind, shape| {
+        Call::new(Agent::Copilot, kind, shape)
+            .session(str_at(v, "sessionId"))
+            .asker(str_at(v, "agentId"))
+    };
+    if v.get("toolName").is_none() {
+        // notification and agentStop; a subagent's own stop (subagentStop) is not a wait.
+        let reason = match notified(str_at(v, "notification_type")) {
+            Some(reason) => Some(reason),
+            None if v.get("stopReason").is_some() && v.get("agentId").is_none() => {
+                Some(WaitReason::Idle)
+            }
+            None => None,
+        };
+        if let Some(reason) = reason {
+            return call(Kind::Waiting(reason), Shape::Silent);
+        }
+        if v.get("notification_type").is_some() || v.get("stopReason").is_some() {
+            return call(Kind::Ignore, Shape::Silent);
+        }
+    }
     match str_at(v, "toolName") {
         Some(tool) if v.get("toolResult").is_none() && is_edit(tool) => {
             let args = match v.get("toolArgs") {
@@ -1220,12 +1334,29 @@ fn cursor(v: &Value, scope: &Scope) -> Call {
             call(Kind::Check, Shape::Snake).paths(edit_paths(tool, input), scope)
         }
         "postToolUse" => call(Kind::Activity(CallPhase::Tick), Shape::Silent),
+        // Cursor reports no permission prompt or question, only the end of a turn.
+        "stop" => call(Kind::Waiting(WaitReason::Idle), Shape::Silent),
         "sessionEnd" => call(Kind::Done, Shape::Silent),
         _ => call(Kind::Ignore, Shape::Silent),
     }
 }
 
-/// `{agent?, session?, event: start|check|activity|done, phase?: start|end, paths?, task?, cwd?}`.
+/// The wait a host notification reports. Claude Code and Copilot CLI share these names; other
+/// notifications (a sign-in, a finished background shell) are not waits.
+fn notified(kind: Option<&str>) -> Option<WaitReason> {
+    Some(match kind? {
+        "permission_prompt" => WaitReason::Permission,
+        "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input" => {
+            WaitReason::Question
+        }
+        "idle_prompt" | "agent_idle" => WaitReason::Idle,
+        _ => return None,
+    })
+}
+
+/// `{agent?, session?, event: start|check|activity|waiting|done, phase?: start|end,
+/// reason?: permission|question|idle, paths?, task?, cwd?}`. A `waiting` event with a reason
+/// this Hub does not know is ignored.
 fn generic(v: &Value, scope: &Scope) -> Call {
     let kind = match str_at(v, "event") {
         Some("start") => Kind::Start,
@@ -1235,6 +1366,10 @@ fn generic(v: &Value, scope: &Scope) -> Call {
             Some("end") => CallPhase::End,
             _ => CallPhase::Tick,
         }),
+        Some("waiting") => match str_at(v, "reason").and_then(WaitReason::from_code) {
+            Some(reason) => Kind::Waiting(reason),
+            None => Kind::Ignore,
+        },
         Some("done") => Kind::Done,
         _ => return Call::failed(Agent::Generic, "hook event not recognised"),
     };
@@ -1858,6 +1993,199 @@ mod tests {
             parse(Agent::Generic, &json!({"event": "bogus"})).kind,
             Kind::Fail(_)
         ));
+    }
+
+    #[test]
+    fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
+        use WaitReason::{Idle, Permission, Question};
+        let wait = |agent, v: Value| {
+            let call = parse(agent, &v);
+            assert_eq!(
+                call.shape,
+                if agent == Agent::Generic {
+                    Shape::Generic
+                } else {
+                    Shape::Silent
+                },
+                "{v}"
+            );
+            match call.kind {
+                Kind::Waiting(reason) => Some(reason),
+                Kind::Ignore => None,
+                other => panic!("{v}: {other:?}"),
+            }
+        };
+        let note = |kind: &str| json!({"hook_event_name":"Notification","session_id":"s","notification_type":kind,"message":"secret"});
+        for (agent, v, want) in [
+            (Agent::Claude, note("permission_prompt"), Some(Permission)),
+            (Agent::Claude, note("idle_prompt"), Some(Idle)),
+            (Agent::Claude, note("elicitation_dialog"), Some(Question)),
+            (Agent::Claude, note("auth_success"), None),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Notification","session_id":"s"}),
+                None,
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":"AskUserQuestion"}),
+                Some(Question),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}),
+                Some(Idle),
+            ),
+            // Paused for its own background work: the client's count and a legacy hook's list.
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","background_tasks":2}),
+                None,
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","background_tasks":[{"id":"b"}]}),
+                None,
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","background_tasks":0}),
+                Some(Idle),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"SubagentStop","session_id":"s","agent_id":"a"}),
+                None,
+            ),
+            (
+                Agent::Codex,
+                json!({"hook_event_name":"PermissionRequest","session_id":"s","tool_name":"Bash"}),
+                Some(Permission),
+            ),
+            (
+                Agent::Codex,
+                json!({"hook_event_name":"Stop","session_id":"s"}),
+                Some(Idle),
+            ),
+            (
+                Agent::Copilot,
+                json!({"hook_event_name":"Stop","session_id":"s"}),
+                Some(Idle),
+            ),
+            (
+                Agent::Cursor,
+                json!({"hook_event_name":"stop","conversation_id":"s","status":"completed"}),
+                Some(Idle),
+            ),
+            (
+                Agent::Copilot,
+                json!({"sessionId":"s","notification_type":"permission_prompt","message":"m"}),
+                Some(Permission),
+            ),
+            (
+                Agent::Copilot,
+                json!({"sessionId":"s","notification_type":"agent_idle"}),
+                Some(Idle),
+            ),
+            (
+                Agent::Copilot,
+                json!({"sessionId":"s","notification_type":"shell_completed"}),
+                None,
+            ),
+            (
+                Agent::Copilot,
+                json!({"sessionId":"s","stopReason":"end_turn"}),
+                Some(Idle),
+            ),
+            (
+                Agent::Copilot,
+                json!({"sessionId":"s","stopReason":"end_turn","agentId":"sub"}),
+                None,
+            ),
+            (
+                Agent::Generic,
+                json!({"event":"waiting","reason":"question","agent":"my-bot","session":"s"}),
+                Some(Question),
+            ),
+            (
+                Agent::Generic,
+                json!({"event":"waiting","reason":"later","session":"s"}),
+                None,
+            ),
+            (
+                Agent::Generic,
+                json!({"event":"waiting","session":"s"}),
+                None,
+            ),
+        ] {
+            assert_eq!(wait(agent, v.clone()), want, "{agent:?} {v}");
+        }
+        // A subagent's wait names it; the lead's does not.
+        let sub = parse(
+            Agent::Claude,
+            &json!({"hook_event_name":"PermissionRequest","session_id":"s","agent_id":"sub-1"}),
+        );
+        assert_eq!((sub.child, sub.asker.as_deref()), (true, Some("sub-1")));
+        let camel = parse(
+            Agent::Copilot,
+            &json!({"sessionId":"s","notification_type":"permission_prompt","agentId":"sub-2"}),
+        );
+        assert_eq!(camel.asker.as_deref(), Some("sub-2"));
+        let bad = parse(
+            Agent::Claude,
+            &json!({"hook_event_name":"Stop","session_id":"s","agent_id":"a\nb"}),
+        );
+        assert_eq!(bad.asker, None);
+        assert_eq!(
+            parse(
+                Agent::Claude,
+                &json!({"hook_event_name":"Stop","session_id":"s"})
+            )
+            .render(&Outcome::clean()),
+            json!({})
+        );
+        // What ends a wait: a prompt, start or end ends all of it; a tool call only its asker's.
+        let ends = |agent, v: Value| {
+            parse(agent, &v)
+                .ends_wait()
+                .map(|(s, all)| (s.to_owned(), all))
+        };
+        assert_eq!(
+            ends(
+                Agent::Claude,
+                json!({"hook_event_name":"UserPromptSubmit","session_id":"s"})
+            ),
+            Some(("s".into(), true))
+        );
+        assert_eq!(
+            ends(
+                Agent::Codex,
+                json!({"hook_event_name":"SessionEnd","session_id":"s"})
+            ),
+            Some(("s".into(), true))
+        );
+        assert_eq!(
+            ends(
+                Agent::Claude,
+                json!({"hook_event_name":"PostToolUse","session_id":"s","tool_name":"Read"})
+            ),
+            Some(("s".into(), false))
+        );
+        assert_eq!(
+            ends(
+                Agent::Cursor,
+                json!({"hook_event_name":"postToolUse","conversation_id":"s","tool_name":"Shell"})
+            ),
+            Some(("s".into(), false))
+        );
+        assert_eq!(ends(Agent::Claude, note("permission_prompt")), None);
+        assert_eq!(
+            ends(
+                Agent::Claude,
+                json!({"hook_event_name":"PostToolUse","tool_name":"Read"})
+            ),
+            None
+        );
     }
 
     #[test]

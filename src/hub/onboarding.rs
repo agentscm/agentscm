@@ -246,8 +246,14 @@ impl Row {
 }
 
 type Key = (String, String, Agent, String);
+/// Setup rows, their invalidation epoch, and the sessions waiting for their person (kept here
+/// because every shared-status read already holds these short-lived observations).
 #[derive(Default)]
-pub struct Observations(Mutex<BTreeMap<Key, Row>>, AtomicU64);
+pub struct Observations(
+    Mutex<BTreeMap<Key, Row>>,
+    AtomicU64,
+    super::session_waiting::Waiting,
+);
 
 /// Capture before authentication/body waits. A Hub-wide conservative fence rejects
 /// in-flight proof if any lifecycle/blocker invalidation occurred while it waited.
@@ -275,6 +281,9 @@ pub fn client(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl Observations {
+    pub(super) fn waiting(&self) -> &super::session_waiting::Waiting {
+        &self.2
+    }
     pub(super) fn epoch(&self) -> u64 {
         self.1.load(Ordering::SeqCst)
     }
@@ -538,7 +547,7 @@ impl Observations {
     }
 }
 
-fn same_repository(left: &Principal, right: &Principal) -> bool {
+pub(super) fn same_repository(left: &Principal, right: &Principal) -> bool {
     left.repository == right.repository
         && left.repository_id == right.repository_id
         && left.owner.identity.provider == right.owner.identity.provider

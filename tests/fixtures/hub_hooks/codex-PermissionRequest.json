@@ -1,0 +1,8 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "turn_id": "turn-1",
+  "cwd": "/work/acme-widgets",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {"command": "cargo publish", "description": "Publish the crate"}
+}

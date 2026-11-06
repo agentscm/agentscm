@@ -41,6 +41,7 @@ pub mod provider_context;
 pub mod publish;
 mod repository_summary;
 pub mod session;
+pub mod session_waiting;
 pub mod setup_attention;
 pub mod skill_workflow;
 pub mod skills;

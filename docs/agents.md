@@ -146,6 +146,21 @@ The Work projection shows which case applies to a lead session as `activity.cove
 
 An agent that is not wired, or wired with an older `client setup` that hooked only edits, renews only on edits, MCP calls and checkpoints; run `agentscm client setup` again to install the tool hooks.
 
+### Waiting for you in its session
+
+When an agent stops to wait for its person, it makes no tool calls, which otherwise looks the same as a crash. Where the host reports the moment, the hook tells the Hub that the session is waiting and why: a **permission** prompt, a **question** (a choice, or a form an MCP server opened) or the **end of its turn**. The wait is a `session_waiting` action in that person's shared status (Needs you, the menu bar app's count and attention notice, `agentscm work status`), never anyone else's. The hook only reports the wait. It never answers the prompt, and the prompt, question, message and tool input are not sent. The person answers in the session itself.
+
+| Agent | Permission | Question | End of turn | What it cannot tell |
+| --- | --- | --- | --- | --- |
+| Claude Code | `Notification` `permission_prompt` | `AskUserQuestion` (`PreToolUse`), `Notification` `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input` | `Stop` (not while background tasks run), `Notification` `idle_prompt` | whether a subagent asked, unless its hook names the subagent |
+| Codex CLI | `PermissionRequest` | none | `Stop` | a question asked in plain text |
+| Copilot CLI | `notification` `permission_prompt` | `notification` `elicitation_dialog` | `agentStop`, `notification` `agent_idle` | |
+| Cursor | none | none | `stop` | permission waits: Cursor reports none |
+| Gemini CLI | `Notification` `ToolPermission` | none | `AfterAgent` | |
+| Others | `agentscm hook generic` with `{"event": "waiting", "reason": "permission"\|"question"\|"idle", "agent", "session"}` | | | |
+
+The session's next tool call, edit check, prompt, start or end ends the wait. A tool call by a subagent ends only a wait that subagent asked, or one whose asker the host did not name, so a sibling working in parallel does not end it. A wait is shown only after 60 seconds, so someone at the keyboard never sees one. A permission prompt or question always needs you. The end of a turn needs you only while that session leads unfinished Work, because an open chat whose work is done waits on nobody. The Hub keeps waits in memory, at most 32 per agent token and for at most 24 hours. A Hub restart forgets them, and a session that waits through a restart reads as not known, not as not waiting. Run `agentscm client setup` again (or update the plugin) to install these hooks.
+
 ### Hooks fail open
 
 The command always exits 0. If anything goes wrong (no hub configured, no token, the hub is unreachable or slow, it rejects the token, or it sends something unusable) it prints the agent's valid "no information" reply, which for most events is `{}` and for a few events is a one-line `AgentSCM: coordination unknown (<reason>)` note, given once per agent session (a marker file under `~/.config/agentscm/hook-notes/`, removed after 2 days); later failures in that session print the no-op reply. A broken setup never stops an edit. The same holds on the hub side: its hook endpoint answers HTTP 200 in the agent's format even for a bad token.
@@ -170,7 +185,7 @@ These are not generated and not tested here. The shape is always the same:
 
 1. Add `https://<hub>/mcp` as a remote (streamable HTTP) MCP server with the header `Authorization: Bearer <agent token>`. Where the agent's config supports it, read the token from an environment variable instead of writing it into a checked-in file.
 2. Make sure the agent reads `AGENTS.md` (or paste the snippet from it into the agent's own instructions file).
-3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input.
+3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input. `{"event": "waiting", "reason": "permission"|"question"|"idle"}` reports that the session waits for its person (see [Waiting for you in its session](#waiting-for-you-in-its-session)).
 
 ### Other agents
 
@@ -193,7 +208,7 @@ None of these sends `agentscm hook generic` input directly. To wire one by hand:
    `--no-telemetry client mcp`. It uses the saved connection of the checkout it starts in, which
    `agentscm client connect --hub HUB` makes, and offers no tools in a checkout without one.
 2. Add a hook, or plugin, that maps the agent's event to
-   `{"event": "start"|"check"|"done", "agent": "NAME", "session": ID, "paths": [...], "cwd": DIR}`,
+   `{"event": "start"|"check"|"waiting"|"done", "agent": "NAME", "session": ID, "paths": [...], "cwd": DIR}` (a `waiting` event also carries `"reason"`),
    pipes it to `agentscm hook generic` with `AGENTSCM_HUB_URL` and `AGENTSCM_HUB_TOKEN` set, and
    maps the `{"status", "text"}` answer back to the agent's own output (for example Kiro adds a
    hook's standard output to the context, and Grok Build reads `hookSpecificOutput.additionalContext`).
