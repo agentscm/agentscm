@@ -30,6 +30,7 @@ use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked, HandoffView, Via};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
+use super::pickup::Pickup;
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1, PromiseHistoryPageV1,
     PromiseInputPageV1, PromiseInputReceiptV1, PromiseInputV1, PromiseInputViewV1, PromisePageV1,
@@ -436,6 +437,34 @@ pub trait Store: Send + Sync {
         now: i64,
         limit: usize,
     ) -> Result<Vec<HandoffView>>;
+    /// Records a person's hand-off in `repository`, then prunes that person's records older than
+    /// `pickup::PICKUP_RETAIN_SECONDS` and beyond the newest `pickup::MAX_PICKUPS_PER_OWNER`.
+    /// Repository names in pickup reads and matches compare without regard to case.
+    fn pickup_create(
+        &self,
+        owner: &str,
+        repository: &str,
+        work_id: Option<&str>,
+        title: Option<&str>,
+        now: i64,
+    ) -> Result<Pickup>;
+    /// Abandons `owner`'s waiting hand-off `id`; a picked-up, expired or abandoned one is
+    /// returned unchanged. `None` when `owner` has no such record in `repository`.
+    fn pickup_abandon(
+        &self,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Pickup>>;
+    /// `owner`'s newest hand-offs in `repository`, most recent first, at most `limit`.
+    fn pickups_of_owner(
+        &self,
+        owner: &str,
+        repository: &str,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<Pickup>>;
     /// Live intents in `repository`, ordered by id, at most `limit`.
     fn live_intents(&self, repository: &str, now: i64, limit: usize) -> Result<Vec<Intent>>;
     /// Live intents in the principal's repository and forge scope, ordered by id.

@@ -31,6 +31,7 @@ pub mod login;
 pub mod mcp;
 pub mod narrative;
 pub mod onboarding;
+pub mod pickup;
 #[cfg(unix)]
 pub mod pipeline_rules;
 pub mod planned_issues;

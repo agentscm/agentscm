@@ -58,6 +58,27 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
 | `GET /v1/hub/session/handoffs?repository=…` | The person's 50 newest file handoffs there, either side |
 
+### Hand-off pickups
+
+A person hands a task or a Work item to their own agent with one line, and the Hub shows when an
+agent picked it up. These routes take the same web sign-in cookie and, for a POST, `x-csrf-token`;
+they name no agent token, and each person sees only their own records.
+
+| Route | Effect |
+|---|---|
+| `POST /v1/hub/session/pickups` | Body `{"repository", "work_id"?, "title"?}`. Records a hand-off waiting for one hour, after the same repository checks a read-token mint makes. Without `work_id` the reply's `request_key` is the key the line gives `agentscm_start`; with it, `request_key` is `null` and a start that resumes or joins that Work picks it up. `work_id` must be a `wrk_` id (400 otherwise). Each create keeps the person's newest 200 records and prunes any older than seven days. Repository names match without regard to case |
+| `POST /v1/hub/session/pickups/abandon` | Body `{"repository", "id"}`. Abandons a waiting hand-off; any other one is returned unchanged. 404 when the person has no such record there |
+| `GET /v1/hub/session/pickups?repository=…` | `{"pickups": [...]}`, the person's 50 newest records there, newest first |
+
+Each record is `{"id", "repository", "request_key", "work_id", "title", "state", "created_at",
+"expires_at", "abandoned_at", "picked_up"}`. `state` is `waiting`, `picked_up`, `expired` or
+`abandoned`. `picked_up` is `null` until an `agentscm_start` (MCP or `POST /v1/hub/standup/start`)
+by one of the same person's agent tokens in the same repository, before expiry, carries the
+`request_key` or claims the `work_id` without a conflict; it is then `{"agent", "session",
+"work_id", "at"}`: the agent token's name, the session the start named, the Work it claimed and
+the Unix time. Another person's agent using the same key never picks it up. A start that the
+preflight or a conflict refused does not count.
+
 ## Hub: Work recovery
 
 The same recovery service for agents and people. A preview never writes; every apply re-checks

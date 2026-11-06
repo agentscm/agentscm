@@ -72,6 +72,7 @@ use super::intent::{
     finish, notice_events, plan, probe_set, validate_ttl,
 };
 use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
+use super::pickup::Pickup;
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1,
     PromiseCurrentAdmissionsV1, PromiseHistoryPageV1, PromiseInputPageV1, PromiseInputReceiptV1,
@@ -4121,6 +4122,52 @@ fn coordination_page(
         complete,
         retention_gap: after < retention_floor,
     })
+}
+
+fn pickup_row(row: &postgres::Row) -> super::pickup::PickupRow {
+    (
+        row.get(0),
+        row.get(1),
+        row.get(2),
+        row.get(3),
+        row.get(4),
+        row.get(5),
+        row.get(6),
+        row.get(7),
+        row.get(8),
+        row.get(9),
+        row.get(10),
+    )
+}
+
+/// Marks the starting person's waiting hand-off picked up when this start carries its
+/// `request_key` or claimed its `work_id`. A start that returned a conflict claimed nothing.
+fn pickup_in(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    result: &WorkStartResult,
+    now: i64,
+) -> Result<()> {
+    if result.conflict.is_some() {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE hub_work_pickups
+         SET picked_at = $1, picked_agent = $2, picked_session = $3, picked_work = $4
+         WHERE owner = $5 AND lower(repository) = lower($6) AND picked_at IS NULL AND abandoned_at IS NULL
+           AND expires_at > $1 AND ((work_id IS NULL AND id = $7) OR work_id = $4)",
+        &[
+            &now,
+            &who.agent,
+            &start.session,
+            &result.item.id,
+            &who.owner.id,
+            &who.repository,
+            &start.request_key,
+        ],
+    )?;
+    Ok(())
 }
 
 /// `named` is false when the caller named no session and `start.session` was resolved for it.
@@ -8368,6 +8415,105 @@ impl Store for PgStore {
         })
     }
 
+    fn pickup_create(
+        &self,
+        owner: &str,
+        repository: &str,
+        work_id: Option<&str>,
+        title: Option<&str>,
+        now: i64,
+    ) -> Result<Pickup> {
+        super::pickup::validate_new(repository, work_id, title)?;
+        let id = super::store::new_id("pku")?;
+        let expires_at = now + super::pickup::PICKUP_TTL_SECONDS;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            tx.execute(
+                "DELETE FROM hub_work_pickups WHERE owner = $1 AND created_at < $2",
+                &[&owner, &(now - super::pickup::PICKUP_RETAIN_SECONDS)],
+            )?;
+            tx.execute(
+                "INSERT INTO hub_work_pickups (id, owner, repository, work_id, title, created_at, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[&id, &owner, &repository, &work_id, &title, &now, &expires_at],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_work_pickups WHERE id IN (
+                    SELECT id FROM hub_work_pickups WHERE owner = $1
+                    ORDER BY created_at DESC, id DESC OFFSET $2)",
+                &[&owner, &super::pickup::MAX_PICKUPS_PER_OWNER],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(Pickup::stored(
+            (
+                id,
+                repository.to_owned(),
+                work_id.map(str::to_owned),
+                title.map(str::to_owned),
+                now,
+                expires_at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            now,
+        ))
+    }
+
+    fn pickup_abandon(
+        &self,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Pickup>> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            tx.execute(
+                "UPDATE hub_work_pickups SET abandoned_at = $4
+                 WHERE id = $1 AND owner = $2 AND lower(repository) = lower($3) AND picked_at IS NULL
+                   AND abandoned_at IS NULL AND expires_at > $4",
+                &[&id, &owner, &repository, &now],
+            )?;
+            let row = tx.query_opt(
+                &format!(
+                    "SELECT {} FROM hub_work_pickups WHERE id = $1 AND owner = $2 AND lower(repository) = lower($3)",
+                    super::pickup::PICKUP_COLUMNS
+                ),
+                &[&id, &owner, &repository],
+            )?;
+            tx.commit()?;
+            Ok(row.map(|row| Pickup::stored(pickup_row(&row), now)))
+        })
+    }
+
+    fn pickups_of_owner(
+        &self,
+        owner: &str,
+        repository: &str,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<Pickup>> {
+        self.run(true, |client| {
+            let rows = client.query(
+                &format!(
+                    "SELECT {} FROM hub_work_pickups WHERE owner = $1 AND lower(repository) = lower($2)
+                     ORDER BY created_at DESC, id LIMIT $3",
+                    super::pickup::PICKUP_COLUMNS
+                ),
+                &[&owner, &repository, &(limit as i64)],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|row| Pickup::stored(pickup_row(row), now))
+                .collect())
+        })
+    }
+
     fn handoffs_of_owner(
         &self,
         owner: &str,
@@ -10131,12 +10277,14 @@ impl Store for PgStore {
             if super::work_preflight::coordinates_active_scope_overlap(start, &preflight) {
                 let mut result = start_in(&mut tx, &who, start, named, now)?;
                 super::work_preflight::require_overlap_coordination(&result, &preflight)?;
+                pickup_in(&mut tx, &who, start, &result, now)?;
                 result.preflight = Some(preflight);
                 tx.commit()?;
                 return Ok(result);
             }
             require_clear_preflight(&who, start, &preflight)?;
             let mut result = start_in(&mut tx, &who, start, named, now)?;
+            pickup_in(&mut tx, &who, start, &result, now)?;
             result.preflight = Some(preflight);
             tx.commit()?;
             Ok(result)
