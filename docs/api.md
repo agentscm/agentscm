@@ -109,6 +109,7 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | Work relationship route | Contract |
 | --- | --- |
 | `GET /v1/hub/standup/status` | Repository-scoped reader, read-only tokens allowed; bounded shared states, named recipients, personal actions, reservations, evidence digests and explicit coverage; advisory non-atomic reads, no generated prose required |
+| `POST /v1/hub/standup/preflight` | Repository-scoped reader, read-only tokens allowed (pinned by a test); the exact-subject, declared-scope and merge-window check, which names overlapping Work in `scope_overlaps` and writes nothing |
 | `GET /v1/hub/standup/work/{id}/pr-link` | Repository-scoped reader; optional `expected_updated_seq` and `expected_head` comparisons |
 | `POST /v1/hub/standup/pr-link` | Current Work lead with generation/session/sequence fencing; explicit set or `link:null` removal, idempotent operation ID |
 | `POST /v1/hub/standup/issue-link` | Current native Work lead; fenced, idempotent set or explicit `link:null` removal of a caller-declared issue relationship |
