@@ -7,8 +7,6 @@ All notable changes are listed here, newest first. AgentSCM is alpha: any releas
 ### Added
 
 - *(hub)* Record hand-off pickups when the person's agent starts ([#390](https://github.com/agentscm/agentscm/pull/390))
-- *(client)* Report honest connection states and save renewed tokens durably ([#387](https://github.com/agentscm/agentscm/pull/387))
-- *(hub)* Return one actionable error envelope on every surface ([#388](https://github.com/agentscm/agentscm/pull/388))
 - *(hub)* Confirm the GitHub App owner and name on the setup page ([#299](https://github.com/agentscm/agentscm/pull/299))
 - *(hub)* Badge broken agent setup and expired agent tokens ([#362](https://github.com/agentscm/agentscm/pull/362))
 - *(hub)* Inspect, release and recover Work from agents and the Hub ([#366](https://github.com/agentscm/agentscm/pull/366))
