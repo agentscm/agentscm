@@ -2808,3 +2808,105 @@ async fn full_status_queue_retains_resolution_progress_without_crossing_reactiva
         0
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_token_reads_the_slack_setup_for_its_own_binding_only() {
+    let policy = json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
+        "escalation_user": "U2", "escalation_after_seconds": 3600, "send_resolution": true});
+    let f = Fixture::configured(Some(policy), false).await;
+    let url = format!("http://{}/v1/hub/repos/acme%2Fwidgets/slack", f.address);
+    let get = |secret: Option<String>| {
+        let url = url.clone();
+        async move {
+            let mut request = reqwest::Client::new().get(url);
+            if let Some(secret) = secret {
+                request = request.bearer_auth(secret);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            (status, response.text().await.unwrap())
+        }
+    };
+    let binding_token = |login: &str| fs::read_to_string(f.dir.path().join(login)).unwrap();
+
+    // Alice's binding has a reminder policy and an escalation; the reply names neither Slack user.
+    let (status, text) = get(Some(binding_token("alice"))).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let alice: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(alice["repository"], REPO);
+    assert_eq!(alice["configured"], true);
+    assert_eq!(alice["bound"], true);
+    assert_eq!(alice["mentions_answered"], true);
+    assert_eq!(
+        alice["events"],
+        json!([
+            "edit_repeated",
+            "handoff_decline",
+            "task_overlap",
+            "coordination_requested"
+        ])
+    );
+    assert_eq!(
+        alice["reminders"],
+        json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
+            "send_resolution": true, "escalation": {"after_seconds": 3600}})
+    );
+    for private in ["U1", "U2", "T123", "A123", "B123", "synthetic"] {
+        assert!(!text.contains(private), "{private} in {text}");
+    }
+
+    // Bob's binding has the default policy: off, with no escalation.
+    let (_, text) = get(Some(binding_token("bob"))).await;
+    let bob: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(bob["bound"], true);
+    assert_eq!(bob["reminders"]["enabled"], false);
+    assert!(bob["reminders"]["escalation"].is_null(), "{text}");
+
+    // A reader with no binding sees the setup but is not bound.
+    let store = f.state.store.clone();
+    let carol = {
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 3,
+                },
+                "carol",
+            )
+            .unwrap();
+        mint_bound_agent_token(&*store, &user.id, "slack", REPO, 101, 3600, true)
+            .unwrap()
+            .1
+            .expose()
+            .to_owned()
+    };
+    let (status, text) = get(Some(carol)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let carol: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(carol["configured"], true);
+    assert_eq!(carol["bound"], false);
+    assert_eq!(carol["mentions_answered"], false);
+    assert!(carol["reminders"].is_null(), "{text}");
+
+    // Signed out is refused; a token of another repository is told nothing of this one.
+    assert_eq!(get(None).await.0, StatusCode::UNAUTHORIZED);
+    let other = {
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 4,
+                },
+                "dave",
+            )
+            .unwrap();
+        mint_bound_agent_token(&*store, &user.id, "slack", "acme/private", 202, 3600, true)
+            .unwrap()
+            .1
+            .expose()
+            .to_owned()
+    };
+    assert_eq!(get(Some(other)).await.0, StatusCode::NOT_FOUND);
+}

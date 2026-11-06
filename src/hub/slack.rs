@@ -452,6 +452,35 @@ fn kept(block: &Value, hub_url: &str) -> Option<Value> {
 }
 
 impl Slack {
+    /// What the Hub's Slack direct messages do for `who` in their token's repository, for a
+    /// read-only reader: the event kinds it sends, whether `who` has a binding, and that
+    /// binding's reminder policy. Slack IDs, files and tokens never appear.
+    pub fn reader_view(&self, who: &Principal) -> Value {
+        let identity = &who.owner.identity;
+        let binding = self.bindings.iter().map(|b| &b.config).find(|c| {
+            c.provider == identity.provider
+                && c.host == identity.host
+                && c.forge_user_id == identity.user_id
+                && c.repository == who.repository
+                && Some(c.repository_id) == who.repository_id
+        });
+        json!({
+            "repository": who.repository,
+            "configured": true,
+            "events": KINDS,
+            "bound": binding.is_some(),
+            "mentions_answered": binding.is_some(),
+            "reminders": binding.map(|c| json!({
+                "enabled": c.reminders.enabled,
+                "interval_seconds": c.reminders.interval_seconds,
+                "max_reminders": c.reminders.max_reminders,
+                "send_resolution": c.reminders.send_resolution,
+                "escalation": c.reminders.escalation_user.as_ref()
+                    .map(|_| json!({"after_seconds": c.reminders.escalation_after_seconds})),
+            })),
+        })
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let config: SlackConfig =
             serde_json::from_slice(&private_file(path, 64 * 1024)?).map_err(|_| invalid())?;

@@ -39,6 +39,7 @@ pub mod promise;
 mod promise_http;
 pub mod provider_context;
 pub mod publish;
+mod repo_setup;
 mod repository_summary;
 pub mod session;
 pub mod setup_attention;
@@ -463,6 +464,7 @@ pub fn router(state: HubState) -> Router {
     let router = Router::new()
         .merge(http::routes())
         .merge(onboarding::routes())
+        .merge(repo_setup::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
         .merge(pr_context::routes())

@@ -479,6 +479,9 @@ on no others:
 - `GET /v1/hub/repos/{repo}/intents`
 - `GET /v1/hub/repos/{repo}/work`
 - `GET /v1/hub/repos/{repo}/activity`
+- `GET /v1/hub/repos/{repo}/forge-coordination` and `GET /v1/hub/repos/{repo}/slack` (what is
+  switched on for the repository, and the Hub's Slack direct messages for the token's owner; see
+  the [API](api.md#hub-repository-setup-reads))
 - `GET /v1/hub/health`, which needs no token
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
