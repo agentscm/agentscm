@@ -454,9 +454,12 @@ These outcomes are separate from source approval and from `forge_check`. See
 
 `GET /v1/hub/repos/{repo}/after-merge` (agent or read-only bearer token for that repository;
 another repository is 404) says whether the Hub watches that repository after a merge:
-`{"repository", "provider", "supported", "watched", "opt_in"}`. `supported` is true only for
-GitHub, and `watched` only when the operator listed the repository in `opt_in`, which is
-`AGENTSCM_GITHUB_EXTERNAL_RUNS`.
+`{"repository", "provider", "connected", "supported", "watched", "opt_in"}`. It decides as the
+watcher does, from the repository the Hub has connected (looked up by the token's repository id)
+and that repository's current name: `connected` says the Hub has a connection for it,
+`supported` is true only when that connection is GitHub, and `watched` only when it is also
+listed in `opt_in`, which is `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A listed repository the Hub is not
+connected to is not watched, and `provider` is then the token owner's.
 
 ## HTTP boundaries
 
