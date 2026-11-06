@@ -69,10 +69,15 @@ async fn slack(
     Path(repo): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     scope(&principal, &repo)?;
-    Ok(Json(match &state.slack {
-        None => json!({"repository": principal.repository, "configured": false}),
-        Some(slack) => slack.reader_view(&principal),
-    }))
+    let Some(slack) = state.slack.clone() else {
+        return Ok(Json(
+            json!({"repository": principal.repository, "configured": false}),
+        ));
+    };
+    let inner = state.clone();
+    Ok(Json(
+        blocking(&state, move || Ok(slack.reader_view(&inner, &principal))).await?,
+    ))
 }
 
 #[cfg(test)]

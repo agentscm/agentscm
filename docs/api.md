@@ -158,10 +158,13 @@ The shared status projection is also exposed as the authenticated read-only MCP 
 repository that connection has; `status_state` is always `success` and `is_gate` is `false`.
 
 `slack` replies `{"repository", "configured"}`, and when Slack is configured `events` (the kinds
-the Hub sends as direct messages; none has a switch of its own), `bound` and `mentions_answered`
-(whether the token's owner has a binding in this repository), and for a bound person
+the Hub sends as direct messages; none has a switch of its own), `bound`, and for a bound person
 `reminders` (`enabled`, `interval_seconds`, `max_reminders`, `send_resolution`, and `escalation`
-with `after_seconds`, or `null`). Slack user, team, app and bot IDs, files and tokens never appear.
+with `after_seconds`, or `null`). It answers as a send would: `configured` is false once Slack
+reports the app uninstalled or its tokens revoked, and `bound` is true only while the token
+owner's binding in this repository has a live read-only token for them (a revoked or expired
+binding token is not bound), which is also what makes the Hub answer their `@AgentSCM` mentions.
+Slack user, team, app and bot IDs, files and tokens never appear.
 
 ## Hub change-record routes
 

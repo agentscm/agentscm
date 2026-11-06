@@ -2810,13 +2810,12 @@ async fn full_status_queue_retains_resolution_progress_without_crossing_reactiva
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_read_only_token_reads_the_slack_setup_for_its_own_binding_only() {
+async fn a_read_only_token_reads_the_slack_setup_for_its_own_live_binding_only() {
     let policy = json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
         "escalation_user": "U2", "escalation_after_seconds": 3600, "send_resolution": true});
     let f = Fixture::configured(Some(policy), false).await;
-    let url = format!("http://{}/v1/hub/repos/acme%2Fwidgets/slack", f.address);
-    let get = |secret: Option<String>| {
-        let url = url.clone();
+    let get = |path: &'static str, secret: Option<String>| {
+        let url = format!("http://{}/v1/hub/repos/{path}/slack", f.address);
         async move {
             let mut request = reqwest::Client::new().get(url);
             if let Some(secret) = secret {
@@ -2827,16 +2826,43 @@ async fn a_read_only_token_reads_the_slack_setup_for_its_own_binding_only() {
             (status, response.text().await.unwrap())
         }
     };
+    const WIDGETS: &str = "acme%2Fwidgets";
     let binding_token = |login: &str| fs::read_to_string(f.dir.path().join(login)).unwrap();
+    let store = f.state.store.clone();
+    // A further read-only token of a person, so a binding's own token can be revoked apart.
+    let reader = |id: i64, login: &str, repository: &str, repository_id: i64| {
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: id,
+                },
+                login,
+            )
+            .unwrap();
+        mint_bound_agent_token(
+            &*store,
+            &user.id,
+            "reader",
+            repository,
+            repository_id,
+            3600,
+            true,
+        )
+        .unwrap()
+        .1
+        .expose()
+        .to_owned()
+    };
 
-    // Alice's binding has a reminder policy and an escalation; the reply names neither Slack user.
-    let (status, text) = get(Some(binding_token("alice"))).await;
+    // Alice's binding has a reminder policy and an escalation; the reply names no Slack user.
+    let (status, text) = get(WIDGETS, Some(binding_token("alice"))).await;
     assert_eq!(status, StatusCode::OK, "{text}");
     let alice: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(alice["repository"], REPO);
     assert_eq!(alice["configured"], true);
     assert_eq!(alice["bound"], true);
-    assert_eq!(alice["mentions_answered"], true);
     assert_eq!(
         alice["events"],
         json!([
@@ -2856,57 +2882,71 @@ async fn a_read_only_token_reads_the_slack_setup_for_its_own_binding_only() {
     }
 
     // Bob's binding has the default policy: off, with no escalation.
-    let (_, text) = get(Some(binding_token("bob"))).await;
+    let (_, text) = get(WIDGETS, Some(binding_token("bob"))).await;
     let bob: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(bob["bound"], true);
     assert_eq!(bob["reminders"]["enabled"], false);
     assert!(bob["reminders"]["escalation"].is_null(), "{text}");
 
     // A reader with no binding sees the setup but is not bound.
-    let store = f.state.store.clone();
-    let carol = {
-        let user = store
-            .upsert_user(
-                &ForgeIdentity {
-                    provider: "github".into(),
-                    host: "github.com".into(),
-                    user_id: 3,
-                },
-                "carol",
-            )
-            .unwrap();
-        mint_bound_agent_token(&*store, &user.id, "slack", REPO, 101, 3600, true)
-            .unwrap()
-            .1
-            .expose()
-            .to_owned()
-    };
-    let (status, text) = get(Some(carol)).await;
+    let (status, text) = get(WIDGETS, Some(reader(3, "carol", REPO, 101))).await;
     assert_eq!(status, StatusCode::OK, "{text}");
     let carol: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(carol["configured"], true);
     assert_eq!(carol["bound"], false);
-    assert_eq!(carol["mentions_answered"], false);
     assert!(carol["reminders"].is_null(), "{text}");
 
+    // Alice's own token for another repository is not her binding there.
+    let (status, text) = get(
+        "acme%2Fprivate",
+        Some(reader(1, "alice", "acme/private", 202)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let elsewhere: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(elsewhere["repository"], "acme/private");
+    assert_eq!(elsewhere["configured"], true);
+    assert_eq!(elsewhere["bound"], false);
+    assert!(elsewhere["reminders"].is_null(), "{text}");
+
     // Signed out is refused; a token of another repository is told nothing of this one.
-    assert_eq!(get(None).await.0, StatusCode::UNAUTHORIZED);
-    let other = {
-        let user = store
-            .upsert_user(
-                &ForgeIdentity {
-                    provider: "github".into(),
-                    host: "github.com".into(),
-                    user_id: 4,
-                },
-                "dave",
-            )
-            .unwrap();
-        mint_bound_agent_token(&*store, &user.id, "slack", "acme/private", 202, 3600, true)
-            .unwrap()
-            .1
-            .expose()
-            .to_owned()
-    };
-    assert_eq!(get(Some(other)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(get(WIDGETS, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get(WIDGETS, Some(reader(4, "dave", "acme/private", 202)))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Revoking the binding's own token stops the DMs, so Alice is no longer bound, though her
+    // other read-only token still reads and the configuration is unchanged.
+    let alice_reader = reader(1, "alice", REPO, 101);
+    let digest = agent_token_digest(&binding_token("alice")).unwrap();
+    let binding_id = store
+        .authenticate(&digest, unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    store.revoke_agent_token(&binding_id).unwrap();
+    let (status, text) = get(WIDGETS, Some(alice_reader.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let revoked: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(revoked["configured"], true);
+    assert_eq!(revoked["bound"], false);
+    assert!(revoked["reminders"].is_null(), "{text}");
+    // Bob's binding is untouched.
+    let (_, text) = get(WIDGETS, Some(binding_token("bob"))).await;
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["bound"], true);
+
+    // When Slack sends app_uninstalled the DMs stop for everyone: the Hub is no longer configured.
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE installation SET revoked=1 WHERE id=1", [])
+        .unwrap();
+    let (status, text) = get(WIDGETS, Some(alice_reader)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let gone: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(gone["configured"], false);
+    assert!(gone.get("bound").is_none(), "{text}");
 }
