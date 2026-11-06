@@ -2272,7 +2272,7 @@ async fn a_pat_connection_is_created_once_and_acts_as_its_owner() {
         let (status, body) = env
             .post(&path, Some(&admin), json!({"full_name": refused}))
             .await;
-        crate::assert_hub_error!(
+        assert_eq!(
             (status, body),
             (403, json!({"error": "forbidden"})),
             "{refused}"
@@ -2383,7 +2383,7 @@ async fn work_merges_intents_pulls_and_branches_for_the_tokens_repository() {
     let (status, body) = env
         .get("/v1/hub/repos/acme%2Fother/work", Some(&agent))
         .await;
-    crate::assert_hub_error!((status, body), (404, json!({"error": "not_found"})));
+    assert_eq!((status, body), (404, json!({"error": "not_found"})));
     assert_eq!(
         env.get("/v1/hub/repos/acme%2Fwidgets/work", None).await.0,
         401
@@ -3004,7 +3004,7 @@ async fn a_pat_that_changed_owner_stops_startup_and_a_shared_repository_stays_wi
             json!({"full_name": "acme/shared"}),
         )
         .await;
-    crate::assert_hub_error!((status, body), (409, json!({"error": "already_connected"})));
+    assert_eq!((status, body), (409, json!({"error": "already_connected"})));
 
     // A different account behind the same token: the label would be wrong.
     env.fake
@@ -3479,12 +3479,7 @@ async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
         )
         .await;
     assert_eq!(foreign["result"]["isError"], true);
-    // A token for another repository learns nothing but the refusal itself.
-    assert_eq!(
-        foreign["result"]["structuredContent"]["error"]["code"],
-        "wrong_repository"
-    );
-    assert!(foreign["result"]["structuredContent"]["work"].is_null());
+    assert!(foreign["result"]["structuredContent"].is_null());
     assert!(
         foreign["result"]["content"][0]["text"]
             .as_str()

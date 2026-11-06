@@ -199,7 +199,7 @@ impl Env {
                 json!({"handle": started["handle"]}),
             )
             .await;
-        crate::assert_hub_error!(
+        assert_eq!(
             (status, signed["admin"].clone()),
             (200, json!(true)),
             "{signed}"
@@ -549,11 +549,11 @@ async fn a_token_connection_is_created_once_and_adds_only_readable_projects() {
         .unwrap();
     assert_eq!(stored.node_id.as_deref(), Some("gid://gitlab/Project/100"));
     for refused in ["acme/secret", "acme/missing"] {
-        let (status, mut body) = env.add_repository(refused).await;
-        assert_eq!(status, 403, "{refused}");
-        assert_eq!(body["error"], "forbidden", "{refused}");
-        body.as_object_mut().unwrap().remove("correlation_id");
-        assert_eq!(body["recovery"]["action"], "ask_owner", "{refused}");
+        assert_eq!(
+            env.add_repository(refused).await,
+            (403, json!({"error": "forbidden"})),
+            "{refused}"
+        );
     }
     assert_eq!(env.add_repository("bad name").await.0, 400);
     let connection = env.connection();

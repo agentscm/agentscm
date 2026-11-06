@@ -49,6 +49,7 @@ pub fn routes() -> Router<HubState> {
         )
         .route("/v1/hub/session/handoff/answer", post(person_answer))
         .route("/v1/hub/session/handoff/ask", post(person_ask))
+        .merge(super::pickup::routes())
 }
 
 #[derive(Deserialize)]
@@ -225,6 +226,7 @@ async fn withdraw(
 fn person_error(error: HubError) -> ApiError {
     match error {
         HubError::Unauthorized => not_your_agent(),
+        HubError::Invalid(message) => ApiError::invalid().with_message(message),
         other => other.into(),
     }
 }

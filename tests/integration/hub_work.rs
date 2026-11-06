@@ -583,11 +583,10 @@ fn work_event_count(store: &dyn Store, kind: &str) -> usize {
 }
 
 fn assert_invalid<T>(result: Result<T, HubError>, message: &str) {
-    match result {
-        Err(HubError::Invalid(actual)) => assert_eq!(actual, message),
-        Err(HubError::Rejected(rejection)) => assert_eq!(rejection.message(), message),
-        _ => panic!("expected invalid {message:?}"),
-    }
+    assert!(
+        matches!(result, Err(HubError::Invalid(ref actual)) if actual == message),
+        "expected invalid {message:?}"
+    );
 }
 
 fn concurrent_forge_start_has_one_work_and_one_lead(db: &Db) {
@@ -2250,14 +2249,6 @@ fn lead_credential_carries_for_the_same_owner_and_session(db: &Db) {
         store.work_checkpoint(&outsider.token, &foreign, now + 3),
         "LEAD_SESSION_MISMATCH",
     );
-    let error = store
-        .work_checkpoint(&outsider.token, &foreign, now + 3)
-        .unwrap_err();
-    let envelope = agentscm::hub::error_envelope::from_hub_error(&error);
-    assert_eq!(envelope.code, "lead_session_mismatch");
-    assert_eq!(envelope.message, "LEAD_SESSION_MISMATCH");
-    assert!(!envelope.render().contains(&started.id));
-    assert!(!envelope.render().contains("replacement"));
     let after_foreign = store
         .work_get(&alice.token, &started.id, now + 3)
         .unwrap()
@@ -6306,7 +6297,7 @@ fn an_idle_lease_lapses_and_the_next_admission_clears_it(db: &Db) {
     for minute in 0..5 {
         assert!(matches!(
             store.touch_session(&alice.token, &edit, after + 2 + minute * 60),
-            Err(HubError::Invalid(_) | HubError::Rejected(_))
+            Err(HubError::Invalid(_))
         ));
     }
     // Resuming needs fresh admission, and the scope is held again.

@@ -1159,7 +1159,7 @@ impl From<TeamError> for ApiError {
                 Error::SourceIndeterminate => Self::new(StatusCode::CONFLICT, "indeterminate"),
                 Error::Conflict(_) => Self::new(StatusCode::CONFLICT, "conflict"),
                 Error::Limit(_) => Self::limit(),
-                Error::Hub(_) | Error::Io(_) | Error::Sql(_) => Self::internal(),
+                Error::Io(_) | Error::Sql(_) => Self::internal(),
             },
         }
     }
@@ -1184,16 +1184,6 @@ async fn not_found() -> ApiError {
 mod tests {
     use super::*;
     use crate::team::service::validate_origin;
-
-    #[test]
-    fn hub_storage_errors_stay_internal_to_team() {
-        let envelope = crate::hub::error_envelope::ErrorEnvelope::local(
-            crate::hub::error_envelope::ErrorCode::Forbidden,
-        );
-        let error = ApiError::from(TeamError::Storage(Error::Hub(Box::new(envelope))));
-        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(error.code, ApiError::internal().code);
-    }
 
     /// The full team router needs a fresh PostgreSQL 18; this serves its own capabilities
     /// route and request-limit middleware through the listener that `serve` uses.

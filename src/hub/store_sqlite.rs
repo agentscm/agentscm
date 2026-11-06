@@ -70,6 +70,7 @@ use super::intent::{
     finish, notice_events, plan, probe_set, validate_ttl,
 };
 use super::lead_credential::{KIND, LeadAccess, apply_carry, carry_notice, lead_access};
+use super::pickup::Pickup;
 use super::promise::{
     PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1,
     PromiseCurrentAdmissionsV1, PromiseHistoryPageV1, PromiseInputPageV1, PromiseInputReceiptV1,
@@ -85,9 +86,9 @@ use super::publish::{
     SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
-    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
-    SessionCall, SessionEnd, Touched, check, check_name, expiry_cause, guard, held,
-    plan as plan_touch,
+    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_REQUIRED, SESSION_TTL_SECONDS,
+    STALE_SESSION_SECONDS, SessionCall, SessionEnd, Touched, check, check_name, expiry_cause,
+    guard, held, plan as plan_touch,
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
@@ -4270,6 +4271,52 @@ fn coordination_page(
     })
 }
 
+fn pickup_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::pickup::PickupRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+/// Marks the starting person's waiting hand-off picked up when this start carries its
+/// `request_key` or claimed its `work_id`. A start that returned a conflict claimed nothing.
+fn pickup_in(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    result: &WorkStartResult,
+    now: i64,
+) -> Result<()> {
+    if result.conflict.is_some() {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE hub_work_pickups
+         SET picked_at = ?1, picked_agent = ?2, picked_session = ?3, picked_work = ?4
+         WHERE owner = ?5 AND lower(repository) = lower(?6) AND picked_at IS NULL AND abandoned_at IS NULL
+           AND expires_at > ?1 AND ((work_id IS NULL AND id = ?7) OR work_id = ?4)",
+        params![
+            now,
+            who.agent,
+            start.session,
+            result.item.id,
+            who.owner.id,
+            who.repository,
+            start.request_key
+        ],
+    )?;
+    Ok(())
+}
+
 /// `named` is false when the caller named no session and `start.session` was resolved for it.
 fn start_in(
     tx: &Transaction<'_>,
@@ -4401,7 +4448,7 @@ fn start_in(
             if !work_holds_reservation(tx, &item.id)?
                 && let Some(refusal) = lapsed_hold_refusal(tx, who, &start.session, Some(&item.id))?
             {
-                return Err(HubError::lease_lapsed(refusal));
+                return Err(HubError::Invalid(refusal));
             }
             if item.title != start.title
                 || item.scope != scope
@@ -4440,7 +4487,7 @@ fn start_in(
                 && let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)?
             {
                 if !named {
-                    return Err(HubError::lease_lapsed(lapsed_unheld_text(
+                    return Err(HubError::Invalid(lapsed_unheld_text(
                         &item.id,
                         renewed,
                         expired,
@@ -5716,7 +5763,7 @@ fn session_name(
     match kept.as_slice() {
         [] => Ok(DEFAULT_SESSION.to_owned()),
         [(only, true)] => Ok(only.clone()),
-        _ => Err(HubError::session_required()),
+        _ => Err(HubError::Invalid(SESSION_REQUIRED.into())),
     }
 }
 
@@ -5873,13 +5920,13 @@ fn guard_managed_touch(
         .collect::<Result<Vec<_>>>()?;
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
         if let Some(refusal) = lapsed_hold_refusal(tx, &work, name, None)? {
-            return Err(HubError::lease_lapsed(refusal));
+            return Err(HubError::Invalid(refusal));
         }
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
     // A lapsed lease no longer holds the scope, so editing under it needs fresh admission first.
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
-        return Err(HubError::lease_lapsed(lapsed_unheld_text(
+        return Err(HubError::Invalid(lapsed_unheld_text(
             &eligible[0].id,
             renewed,
             expired,
@@ -6259,7 +6306,7 @@ fn auto_ask(
             Ok(Asked::Requested { holder }) => requested.push((key.clone(), holder)),
             Ok(_) => {}
             Err(error) => {
-                crate::hub::error_envelope::log_internal(&error);
+                eprintln!("hub: handoff request for a refused edit: {error}");
                 let _ = tx.execute_batch("ROLLBACK TO auto_ask; RELEASE auto_ask");
             }
         }
@@ -7090,7 +7137,7 @@ fn work_checkpoint_in(
     let carry = match lead_access(&item, &who.owner.id, token, &who.agent, &checkpoint.session) {
         LeadAccess::Current => false,
         LeadAccess::Carry => true,
-        LeadAccess::Refuse { message } => return Err(HubError::lead_session_mismatch(message)),
+        LeadAccess::Refuse { message } => return Err(HubError::Invalid(message)),
     };
     let prior_basis = work_reservation_basis(tx, &item.id)?;
     let held = prior_basis.is_some();
@@ -8478,6 +8525,107 @@ impl Store for SqliteStore {
         } else {
             Answered::Declined { requester, session }
         })
+    }
+
+    fn pickup_create(
+        &self,
+        owner: &str,
+        repository: &str,
+        work_id: Option<&str>,
+        title: Option<&str>,
+        now: i64,
+    ) -> Result<Pickup> {
+        super::pickup::validate_new(repository, work_id, title)?;
+        let id = super::store::new_id("pku")?;
+        let expires_at = now + super::pickup::PICKUP_TTL_SECONDS;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM hub_work_pickups WHERE owner = ?1 AND created_at < ?2",
+            params![owner, now - super::pickup::PICKUP_RETAIN_SECONDS],
+        )?;
+        tx.execute(
+            "INSERT INTO hub_work_pickups (id, owner, repository, work_id, title, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, owner, repository, work_id, title, now, expires_at],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_work_pickups WHERE id IN (
+                SELECT id FROM hub_work_pickups WHERE owner = ?1
+                ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?2)",
+            params![owner, super::pickup::MAX_PICKUPS_PER_OWNER],
+        )?;
+        tx.commit()?;
+        Ok(Pickup::stored(
+            (
+                id,
+                repository.to_owned(),
+                work_id.map(str::to_owned),
+                title.map(str::to_owned),
+                now,
+                expires_at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            now,
+        ))
+    }
+
+    fn pickup_abandon(
+        &self,
+        owner: &str,
+        repository: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<Pickup>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE hub_work_pickups SET abandoned_at = ?4
+             WHERE id = ?1 AND owner = ?2 AND lower(repository) = lower(?3) AND picked_at IS NULL
+               AND abandoned_at IS NULL AND expires_at > ?4",
+            params![id, owner, repository, now],
+        )?;
+        let row = tx
+            .query_row(
+                &format!(
+                    "SELECT {} FROM hub_work_pickups WHERE id = ?1 AND owner = ?2 AND lower(repository) = lower(?3)",
+                    super::pickup::PICKUP_COLUMNS
+                ),
+                params![id, owner, repository],
+                pickup_row,
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(row.map(|row| Pickup::stored(row, now)))
+    }
+
+    fn pickups_of_owner(
+        &self,
+        owner: &str,
+        repository: &str,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<Pickup>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare_cached(&format!(
+            "SELECT {} FROM hub_work_pickups WHERE owner = ?1 AND lower(repository) = lower(?2)
+             ORDER BY created_at DESC, id LIMIT ?3",
+            super::pickup::PICKUP_COLUMNS
+        ))?;
+        let rows = statement
+            .query_map(
+                params![owner, repository, i64::try_from(limit).unwrap_or(i64::MAX)],
+                pickup_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|row| Pickup::stored(row, now))
+            .collect())
     }
 
     fn handoffs_of_owner(
@@ -10208,12 +10356,14 @@ impl Store for SqliteStore {
         if super::work_preflight::coordinates_active_scope_overlap(start, &preflight) {
             let mut result = start_in(&tx, &who, start, named, now)?;
             super::work_preflight::require_overlap_coordination(&result, &preflight)?;
+            pickup_in(&tx, &who, start, &result, now)?;
             result.preflight = Some(preflight);
             tx.commit()?;
             return Ok(result);
         }
         require_clear_preflight(&who, start, &preflight)?;
         let mut result = start_in(&tx, &who, start, named, now)?;
+        pickup_in(&tx, &who, start, &result, now)?;
         result.preflight = Some(preflight);
         tx.commit()?;
         Ok(result)
@@ -10415,7 +10565,7 @@ impl Store for SqliteStore {
         if request.transition == work_transition::WorkTransitionKind::Retain
             && let Some((renewed, expired)) = lapsed_at(&tx, &item.id, now)?
         {
-            return Err(HubError::lease_lapsed(lapsed_unheld_text(
+            return Err(HubError::Invalid(lapsed_unheld_text(
                 &item.id,
                 renewed,
                 expired,

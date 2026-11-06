@@ -770,13 +770,15 @@ mod unix {
         tokio::task::yield_now().await;
         drop(relay);
         let mut byte = [0];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), subscription.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
+        // Linux resets rather than ends a socket closed with unread input, such as the byte
+        // above if the relay had not read it yet; either way the subscription is closed.
+        match tokio::time::timeout(Duration::from_secs(1), subscription.read(&mut byte))
+            .await
+            .unwrap()
+        {
+            Ok(read) => assert_eq!(read, 0),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+        }
         assert!(transport::Listener::bind(&address).unwrap().is_none());
     }
 

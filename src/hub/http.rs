@@ -13,11 +13,13 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use super::error_envelope::{self, ErrorCode, ErrorEnvelope, InputProblem};
+use super::lead_credential::LEAD_SESSION_MISMATCH;
 use super::login::{Login, LoginConfig};
+use super::session::SESSION_REQUIRED;
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
 use super::store::{self, Principal, agent_token_digest, unix_now, web_read_token_digest};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
+use super::work_lifecycle::LEASE_LAPSED;
 use super::{HubError, HubState, Result, open_objects, router};
 
 pub struct HubConfig {
@@ -83,7 +85,7 @@ async fn lease_clock_loop(state: HubState) {
         ticker.tick().await;
         let store = state.store.clone();
         if let Err(error) = blocking(&state, move || store.observe_lease_clock(unix_now())).await {
-            crate::hub::error_envelope::log_internal(&error);
+            eprintln!("hub: lease clock observation failed: {error}");
         }
     }
 }
@@ -197,7 +199,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     }
     sync::start(&state).await?;
     if let Err(error) = sync::bootstrap(&state, signin, |name| std::env::var(name).ok()).await {
-        crate::hub::error_envelope::log_internal(&error);
+        eprintln!("hub: first-run setup link not created: {error}");
     }
     tokio::spawn(sync::poll_loop(state.clone(), config.poll_seconds));
     tokio::spawn(super::change_record_http::sweep_loop(state.clone()));
@@ -234,24 +236,14 @@ pub struct ApiError {
     code: &'static str,
     /// Fields added to the body: a `message` people read, and what the kind needs.
     detail: serde_json::Map<String, serde_json::Value>,
-    envelope: Box<ErrorEnvelope>,
 }
 
 impl ApiError {
-    pub fn envelope(&self) -> &ErrorEnvelope {
-        &self.envelope
-    }
-
     pub fn new(status: StatusCode, code: &'static str) -> Self {
-        let registered = ErrorCode::parse(code);
-        // A forgotten registry entry fails tests, but never panics a request handler in production.
-        debug_assert!(registered.is_some(), "unregistered Hub error code {code}");
-        let registered = registered.unwrap_or_else(|| ErrorCode::for_status(status.as_u16()));
         Self {
             status,
-            code: registered.as_str(),
+            code,
             detail: serde_json::Map::new(),
-            envelope: Box::new(error_envelope::from_code(registered)),
         }
     }
 
@@ -261,15 +253,11 @@ impl ApiError {
 
     /// A one-sentence reason and fix, shown to people as is.
     pub fn with_message(self, message: impl Into<String>) -> Self {
-        self.with_field(
-            "message",
-            serde_json::Value::String(error_envelope::server_message(&message.into())),
-        )
+        self.with_field("message", serde_json::Value::String(message.into()))
     }
 
     pub fn with_field(mut self, key: &str, value: serde_json::Value) -> Self {
-        self.detail
-            .insert(key.to_owned(), error_envelope::server_detail(&value));
+        self.detail.insert(key.to_owned(), value);
         self
     }
 
@@ -284,66 +272,124 @@ impl ApiError {
     }
 
     pub fn invalid() -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "invalid_request")
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_request",
+            detail: serde_json::Map::new(),
+        }
     }
 
     pub fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "not_found")
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            detail: serde_json::Map::new(),
+        }
     }
 
     pub fn read_only() -> Self {
-        Self::new(StatusCode::FORBIDDEN, "read_only")
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "read_only",
+            detail: serde_json::Map::new(),
+        }
     }
 
     pub fn forbidden() -> Self {
-        Self::new(StatusCode::FORBIDDEN, "forbidden")
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            detail: serde_json::Map::new(),
+        }
     }
 
     pub fn gone() -> Self {
-        Self::new(StatusCode::GONE, "gone")
+        Self {
+            status: StatusCode::GONE,
+            code: "gone",
+            detail: serde_json::Map::new(),
+        }
     }
 
     pub fn unauthorized() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, "unauthorized")
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            detail: serde_json::Map::new(),
+        }
     }
 }
 
 impl From<HubError> for ApiError {
     fn from(error: HubError) -> Self {
-        let envelope = error_envelope::from_hub_error(&error);
-        Self {
-            status: StatusCode::from_u16(envelope.status).expect("registered error status"),
-            code: ErrorCode::parse(&envelope.code)
-                .expect("registered error code")
-                .as_str(),
-            detail: serde_json::Map::new(),
-            envelope: Box::new(envelope),
+        match error {
+            HubError::Invalid(message)
+                if message == SESSION_REQUIRED
+                    || message.starts_with(LEAD_SESSION_MISMATCH)
+                    || message.starts_with(LEASE_LAPSED) =>
+            {
+                Self::invalid().with_message(message)
+            }
+            HubError::Invalid(detail) => {
+                eprintln!("hub: request rejected as invalid: {detail:?}");
+                Self::invalid()
+            }
+            HubError::WorkCheckpointSequenceConflict { current_seq } => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_checkpoint_sequence_conflict",
+                detail: serde_json::Map::from_iter([("current_seq".into(), json!(current_seq))]),
+            },
+            HubError::Unauthorized => Self::unauthorized(),
+            HubError::Busy => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "busy",
+                detail: serde_json::Map::new(),
+            },
+            HubError::WorkCapacity(capacity) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "work_storage_capacity",
+                detail: serde_json::Map::from_iter([(
+                    "limit".to_owned(),
+                    json!(capacity.limit.as_str()),
+                )]),
+            },
+            HubError::WorkOverlap(_) => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_scope_overlap",
+                detail: serde_json::Map::new(),
+            },
+            HubError::WorkCoordinationRequired { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_coordination_required",
+                detail: serde_json::Map::new(),
+            },
+            HubError::WorkOverlapIncomplete => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "work_overlap_incomplete",
+                detail: serde_json::Map::new(),
+            },
+            HubError::WorkPreflight(_) => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_preflight_required",
+                detail: serde_json::Map::new(),
+            },
+            HubError::Unavailable(detail) => {
+                eprintln!("hub error: {detail}");
+                Self {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "unavailable",
+                    detail: serde_json::Map::new(),
+                }
+            }
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut envelope = self.envelope;
-        if let Some(message) = self
-            .detail
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-        {
-            envelope.message = message.into();
-        }
-        envelope
-            .details
-            .extend(self.detail.into_iter().filter(|(key, _)| key != "message"));
-        let reference = envelope.correlation_id.clone();
-        let mut response = (self.status, Json(envelope)).into_response();
-        response.extensions_mut().insert(EnvelopedResponse);
-        if let Some(reference) = reference {
-            response.headers_mut().insert(
-                "x-agentscm-correlation-id",
-                HeaderValue::from_str(&reference).expect("correlation header"),
-            );
-        }
+        let mut body = self.detail;
+        body.insert("error".into(), json!(self.code));
+        let mut response = (self.status, Json(serde_json::Value::Object(body))).into_response();
         if self.status == StatusCode::UNAUTHORIZED {
             response
                 .headers_mut()
@@ -357,29 +403,6 @@ pub async fn not_found() -> ApiError {
     ApiError::not_found()
 }
 
-#[derive(Clone)]
-struct EnvelopedResponse;
-
-pub async fn envelope_response(response: Response) -> Response {
-    if (response.status().is_client_error() || response.status().is_server_error())
-        && !response.headers().contains_key("x-agentscm-correlation-id")
-        && response.extensions().get::<EnvelopedResponse>().is_none()
-    {
-        let mut envelope = ApiError::new(
-            response.status(),
-            ErrorCode::for_status(response.status().as_u16()).as_str(),
-        )
-        .into_response();
-        for (name, value) in response.headers() {
-            if name != header::CONTENT_TYPE && name != header::CONTENT_LENGTH {
-                envelope.headers_mut().insert(name.clone(), value.clone());
-            }
-        }
-        return envelope;
-    }
-    response
-}
-
 /// JSON request body; any failure is a 400 with a fixed body. Request types
 /// must use `#[serde(deny_unknown_fields)]`.
 pub struct JsonBody<T>(pub T);
@@ -391,17 +414,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
         Json::<T>::from_request(request, state)
             .await
             .map(|Json(value)| Self(value))
-            .map_err(|rejection: JsonRejection| {
-                let mut error = ApiError::invalid();
-                if let Some(field) = InputProblem::from_json_error(&rejection.body_text()) {
-                    error.envelope.message = format!(
-                        "Correct request field {}; use its documented name, presence and type.",
-                        field.name
-                    );
-                    error.envelope.fields = Some(vec![field]);
-                }
-                error
-            })
+            .map_err(|_: JsonRejection| ApiError::invalid())
     }
 }
 
@@ -488,9 +501,14 @@ async fn health(State(state): State<HubState>) -> Response {
             }
             Json(body).into_response()
         }
-        Err(error) => ApiError::from(error)
-            .with_field("status", json!("unavailable"))
-            .into_response(),
+        Err(error) => {
+            eprintln!("hub health check failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "unavailable"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -598,21 +616,6 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn missing_entropy_keeps_the_error_without_a_reference_or_rewrap() {
-        let mut error = ApiError::from(HubError::Busy);
-        error.envelope.correlation_id = None;
-        let response = envelope_response(error.into_response()).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!response.headers().contains_key("x-agentscm-correlation-id"));
-        let bytes = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], "busy");
-        assert!(body.get("correlation_id").is_none());
-    }
-
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Strict {
@@ -643,10 +646,10 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "work_checkpoint_sequence_conflict");
-        assert_eq!(body["current_seq"], 17);
-        assert_eq!(body["retryable"], false);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error":"work_checkpoint_sequence_conflict", "current_seq":17})
+        );
         let uncertain = ApiError::from(HubError::Invalid(
             "checkpoint receipt expired or work changed".into(),
         ))
@@ -655,9 +658,10 @@ mod tests {
         let body = axum::body::to_bytes(uncertain.into_body(), 1024)
             .await
             .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "invalid_request");
-        assert!(!body.to_string().contains("receipt expired"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error":"invalid_request"})
+        );
     }
 
     #[tokio::test]
@@ -671,9 +675,9 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "work_storage_capacity");
-        assert_eq!(body["limit"], "coordination_requests");
-        assert_eq!(body["recovery"]["action"], "contact_operator");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error": "work_storage_capacity", "limit": "coordination_requests"})
+        );
     }
 }
