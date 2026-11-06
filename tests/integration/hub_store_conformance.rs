@@ -3540,28 +3540,55 @@ fn hand_off_pickups(db: &Db) {
             .is_empty()
     );
 
-    // Old records are pruned on the next create, and the per-person bound holds.
+    // A start that a live claim refused claimed nothing, so the hand-off keeps waiting.
+    let held = store
+        .pickup_create(&alice.id, REPO, Some(&item.id), None, now)
+        .unwrap();
+    let refused = store
+        .work_start(
+            &alice_agent,
+            &start(None, Some(&item.id), "other", "src/a.rs"),
+            now,
+        )
+        .unwrap();
+    assert!(refused.conflict.is_some(), "{refused:?}");
+    assert_eq!(state(&held.id).state, PickupState::Waiting);
+
+    // Reads compare the repository name without regard to case.
+    assert!(
+        store
+            .pickups_of_owner(&alice.id, "ACME/Widgets", now, 50)
+            .unwrap()
+            .iter()
+            .any(|p| p.id == held.id)
+    );
+
+    // Old records are pruned on the next create, and only the newest bounded number stay.
     let old = now - agentscm::hub::pickup::PICKUP_RETAIN_SECONDS - 1;
     let stale = store
         .pickup_create(&alice.id, REPO, None, None, old)
         .unwrap();
     assert_eq!(stale.state, PickupState::Waiting);
-    for _ in 3..MAX_PICKUPS_PER_OWNER {
+    for _ in 0..MAX_PICKUPS_PER_OWNER {
         store
             .pickup_create(&alice.id, REPO, None, None, now)
             .unwrap();
     }
+    let newest = store
+        .pickup_create(&alice.id, REPO, None, None, now + 1)
+        .unwrap();
     let all = store.pickups_of_owner(&alice.id, REPO, now, 1000).unwrap();
     assert_eq!(all.len() as i64, MAX_PICKUPS_PER_OWNER);
     assert!(all.iter().all(|p| p.id != stale.id));
+    assert_eq!(all[0].id, newest.id);
     assert!(
         store
-            .pickup_create(&alice.id, REPO, None, None, now)
+            .pickup_create(&alice.id, "not a repo", None, None, now)
             .is_err()
     );
     assert!(
         store
-            .pickup_create(&alice.id, "not a repo", None, None, now)
+            .pickup_create(&alice.id, REPO, Some("W-12"), None, now)
             .is_err()
     );
 }

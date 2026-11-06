@@ -66,7 +66,7 @@ they name no agent token, and each person sees only their own records.
 
 | Route | Effect |
 |---|---|
-| `POST /v1/hub/session/pickups` | Body `{"repository", "work_id"?, "title"?}`. Records a hand-off waiting for one hour, after the same repository checks a read-token mint makes. Without `work_id` the reply's `request_key` is the key the line gives `agentscm_start`; with it, `request_key` is `null` and a start that resumes or joins that Work picks it up. At most 200 records are kept per person; records older than seven days are pruned |
+| `POST /v1/hub/session/pickups` | Body `{"repository", "work_id"?, "title"?}`. Records a hand-off waiting for one hour, after the same repository checks a read-token mint makes. Without `work_id` the reply's `request_key` is the key the line gives `agentscm_start`; with it, `request_key` is `null` and a start that resumes or joins that Work picks it up. `work_id` must be a `wrk_` id (400 otherwise). Each create keeps the person's newest 200 records and prunes any older than seven days. Repository names match without regard to case |
 | `POST /v1/hub/session/pickups/abandon` | Body `{"repository", "id"}`. Abandons a waiting hand-off; any other one is returned unchanged. 404 when the person has no such record there |
 | `GET /v1/hub/session/pickups?repository=…` | `{"pickups": [...]}`, the person's 50 newest records there, newest first |
 

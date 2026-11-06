@@ -437,8 +437,9 @@ pub trait Store: Send + Sync {
         now: i64,
         limit: usize,
     ) -> Result<Vec<HandoffView>>;
-    /// Records a person's hand-off in `repository`, pruning that person's records older than
-    /// `pickup::PICKUP_RETAIN_SECONDS`; refused past `pickup::MAX_PICKUPS_PER_OWNER`.
+    /// Records a person's hand-off in `repository`, then prunes that person's records older than
+    /// `pickup::PICKUP_RETAIN_SECONDS` and beyond the newest `pickup::MAX_PICKUPS_PER_OWNER`.
+    /// Repository names in pickup reads and matches compare without regard to case.
     fn pickup_create(
         &self,
         owner: &str,

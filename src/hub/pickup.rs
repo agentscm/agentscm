@@ -20,7 +20,7 @@ use super::{HubError, HubState, Result};
 pub const PICKUP_TTL_SECONDS: i64 = 60 * 60;
 /// Records older than this are pruned when the same person creates another.
 pub const PICKUP_RETAIN_SECONDS: i64 = 7 * 24 * 60 * 60;
-/// Retained records per person; a create beyond it is refused.
+/// Retained records per person; a create drops that person's oldest beyond it.
 pub const MAX_PICKUPS_PER_OWNER: i64 = 200;
 /// How many of a person's newest records the read returns.
 const PICKUP_PAGE: usize = 50;
@@ -125,18 +125,12 @@ pub(super) fn validate_new(
 ) -> Result<()> {
     validate_repository(repository)?;
     if let Some(work_id) = work_id {
-        text("work_id", work_id, MAX_ID_BYTES)?;
+        super::work::validate_id("work_id", work_id, "wrk")?;
     }
     if let Some(title) = title {
         text("title", title, MAX_TITLE_BYTES)?;
     }
     Ok(())
-}
-
-pub(super) fn too_many() -> HubError {
-    HubError::Invalid(format!(
-        "at most {MAX_PICKUPS_PER_OWNER} hand-offs are kept per person; wait for older ones to age out"
-    ))
 }
 
 pub fn routes() -> Router<HubState> {

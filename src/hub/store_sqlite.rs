@@ -4271,7 +4271,6 @@ fn coordination_page(
     })
 }
 
-/// `named` is false when the caller named no session and `start.session` was resolved for it.
 fn pickup_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::pickup::PickupRow> {
     Ok((
         row.get(0)?,
@@ -4303,7 +4302,7 @@ fn pickup_in(
     tx.execute(
         "UPDATE hub_work_pickups
          SET picked_at = ?1, picked_agent = ?2, picked_session = ?3, picked_work = ?4
-         WHERE owner = ?5 AND repository = ?6 AND picked_at IS NULL AND abandoned_at IS NULL
+         WHERE owner = ?5 AND lower(repository) = lower(?6) AND picked_at IS NULL AND abandoned_at IS NULL
            AND expires_at > ?1 AND ((work_id IS NULL AND id = ?7) OR work_id = ?4)",
         params![
             now,
@@ -4318,6 +4317,7 @@ fn pickup_in(
     Ok(())
 }
 
+/// `named` is false when the caller named no session and `start.session` was resolved for it.
 fn start_in(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -8544,18 +8544,16 @@ impl Store for SqliteStore {
             "DELETE FROM hub_work_pickups WHERE owner = ?1 AND created_at < ?2",
             params![owner, now - super::pickup::PICKUP_RETAIN_SECONDS],
         )?;
-        let kept: i64 = tx.query_row(
-            "SELECT count(*) FROM hub_work_pickups WHERE owner = ?1",
-            params![owner],
-            |row| row.get(0),
-        )?;
-        if kept >= super::pickup::MAX_PICKUPS_PER_OWNER {
-            return Err(super::pickup::too_many());
-        }
         tx.execute(
             "INSERT INTO hub_work_pickups (id, owner, repository, work_id, title, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, owner, repository, work_id, title, now, expires_at],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_work_pickups WHERE id IN (
+                SELECT id FROM hub_work_pickups WHERE owner = ?1
+                ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?2)",
+            params![owner, super::pickup::MAX_PICKUPS_PER_OWNER],
         )?;
         tx.commit()?;
         Ok(Pickup::stored(
@@ -8587,14 +8585,14 @@ impl Store for SqliteStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE hub_work_pickups SET abandoned_at = ?4
-             WHERE id = ?1 AND owner = ?2 AND repository = ?3 AND picked_at IS NULL
+             WHERE id = ?1 AND owner = ?2 AND lower(repository) = lower(?3) AND picked_at IS NULL
                AND abandoned_at IS NULL AND expires_at > ?4",
             params![id, owner, repository, now],
         )?;
         let row = tx
             .query_row(
                 &format!(
-                    "SELECT {} FROM hub_work_pickups WHERE id = ?1 AND owner = ?2 AND repository = ?3",
+                    "SELECT {} FROM hub_work_pickups WHERE id = ?1 AND owner = ?2 AND lower(repository) = lower(?3)",
                     super::pickup::PICKUP_COLUMNS
                 ),
                 params![id, owner, repository],
@@ -8614,7 +8612,7 @@ impl Store for SqliteStore {
     ) -> Result<Vec<Pickup>> {
         let conn = self.conn();
         let mut statement = conn.prepare_cached(&format!(
-            "SELECT {} FROM hub_work_pickups WHERE owner = ?1 AND repository = ?2
+            "SELECT {} FROM hub_work_pickups WHERE owner = ?1 AND lower(repository) = lower(?2)
              ORDER BY created_at DESC, id LIMIT ?3",
             super::pickup::PICKUP_COLUMNS
         ))?;

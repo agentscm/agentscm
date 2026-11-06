@@ -259,6 +259,14 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
     request past the 30-minute hold cap), `note`, `reply`, `created_at`, `decided_at`,
     `holder_told`, `requester_told`, `asked_via_hub`, `answered_via_hub`, `answered_via_slack` and the two sides
     (`agent`, `login`, `mine`); `token` and `session` appear only on the person's own side.
+  - Hand-off pickups name no agent token; each person reads and changes only their own records.
+    `POST /v1/hub/session/pickups` (`repository`, optional `work_id`, optional `title`) records a
+    hand-off that waits one hour for one of the person's agents in that repository: without
+    `work_id` the reply's `request_key` goes in the hand-off line for `agentscm_start`; with it,
+    a start that claims that Work picks it up. `POST /v1/hub/session/pickups/abandon`
+    (`repository`, `id`) abandons a waiting one. `GET /v1/hub/session/pickups?repository=owner/name`
+    lists the person's 50 newest. A start with a conflict does not pick a hand-off up. See
+    [Hand-off pickups](api.md#hand-off-pickups) for the record.
   There is no withdrawal of a reply or a file request: the store has no way to retract either, so
   the page offers none. The one close it offers is for a coordination request whose requesting
   agent is gone (see `POST /v1/hub/session/coordination/withdraw` below); a requester that can
