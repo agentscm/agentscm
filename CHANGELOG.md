@@ -2,6 +2,68 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.3.0](https://github.com/agentscm/agentscm/compare/v0.2.1...v0.3.0) - 2026-11-06
+
+### Added
+
+- *(hub)* Record hand-off pickups when the person's agent starts ([#390](https://github.com/agentscm/agentscm/pull/390))
+- *(client)* Report honest connection states and save renewed tokens durably ([#387](https://github.com/agentscm/agentscm/pull/387))
+- *(hub)* Return one actionable error envelope on every surface ([#388](https://github.com/agentscm/agentscm/pull/388))
+- *(hub)* Confirm the GitHub App owner and name on the setup page ([#299](https://github.com/agentscm/agentscm/pull/299))
+- *(hub)* Badge broken agent setup and expired agent tokens ([#362](https://github.com/agentscm/agentscm/pull/362))
+- *(hub)* Inspect, release and recover Work from agents and the Hub ([#366](https://github.com/agentscm/agentscm/pull/366))
+- *(hub)* End a session and pause its Work in one transaction ([#359](https://github.com/agentscm/agentscm/pull/359))
+- *(validation)* Prepare selected PR tests and merge-batch gate ([#374](https://github.com/agentscm/agentscm/pull/374))
+- *(local-validation)* Publish independent signed checks per PR ([#372](https://github.com/agentscm/agentscm/pull/372))
+- *(hub)* Message the person in Slack when work becomes blocked or offered ([#358](https://github.com/agentscm/agentscm/pull/358))
+- *(hub)* Report capacity refusals to the operator and match tray needs ([#351](https://github.com/agentscm/agentscm/pull/351))
+- *(hub)* Make default start and overview MCP replies compact ([#363](https://github.com/agentscm/agentscm/pull/363))
+- *(cli)* Suggest the merge order that needs the fewest new heads ([#356](https://github.com/agentscm/agentscm/pull/356))
+- *(hub)* show planned issues and link native Work ([#361](https://github.com/agentscm/agentscm/pull/361))
+- *(hub)* Show failed required checks and stopped gates in Needs you ([#348](https://github.com/agentscm/agentscm/pull/348))
+- *(hub)* Deliver required agent rules and link sessions to Work ([#344](https://github.com/agentscm/agentscm/pull/344))
+- *(hub)* Let a person close a request whose requester is gone ([#349](https://github.com/agentscm/agentscm/pull/349))
+- *(hub)* Name the holding session and keep hostnames out of labels ([#342](https://github.com/agentscm/agentscm/pull/342))
+- *(hub)* Lapse idle Work reservations on a server-timed lease ([#330](https://github.com/agentscm/agentscm/pull/330))
+- *(hub)* Share actionable status across work surfaces ([#340](https://github.com/agentscm/agentscm/pull/340))
+- *(hub)* Keep the Work lead across a token change ([#337](https://github.com/agentscm/agentscm/pull/337))
+- *(hub)* Reconcile PR evidence without hiding held Work ([#336](https://github.com/agentscm/agentscm/pull/336))
+- *(hub)* Report PR evidence and prerequisites for a Work item ([#332](https://github.com/agentscm/agentscm/pull/332))
+- *(hub)* Refuse ambiguous omitted sessions and free paused sessions ([#327](https://github.com/agentscm/agentscm/pull/327))
+- *(hub)* Separate durable Work outcomes from scope reservations ([#317](https://github.com/agentscm/agentscm/pull/317))
+- Enroll and revoke trusted local CI devices ([#307](https://github.com/agentscm/agentscm/pull/307))
+
+### Fixed
+
+- Build on Windows and expect the recovery tools for read-only tokens ([#385](https://github.com/agentscm/agentscm/pull/385))
+- *(skill-workflow)* Do not cancel a live action on lease contention ([#298](https://github.com/agentscm/agentscm/pull/298))
+- *(ui)* Drop Retry when the Hub has workspace sign-in off ([#297](https://github.com/agentscm/agentscm/pull/297))
+- *(validation)* Serialize heavy jobs with a visible FIFO ([#380](https://github.com/agentscm/agentscm/pull/380))
+- *(ci)* Call the Octokit method that lists a ref's commit statuses ([#377](https://github.com/agentscm/agentscm/pull/377))
+- *(hub)* Show other owners' sessions by digest in structured replies ([#350](https://github.com/agentscm/agentscm/pull/350))
+- *(cli)* Make doctor, usage errors and token messages readable ([#296](https://github.com/agentscm/agentscm/pull/296))
+- *(hub)* Let agents settle coordination instead of asking the user ([#326](https://github.com/agentscm/agentscm/pull/326))
+- *(hub)* Show coordination requests in the session the person types in ([#320](https://github.com/agentscm/agentscm/pull/320))
+- *(hub)* Stop MCP app views resizing in a loop ([#319](https://github.com/agentscm/agentscm/pull/319))
+- *(hub)* Log why requests are rejected as invalid ([#318](https://github.com/agentscm/agentscm/pull/318))
+
+### Other
+
+- *(hook-relay)* Accept a reset as a closed standby link on Linux ([#396](https://github.com/agentscm/agentscm/pull/396))
+- Back out #387 and #388 until they pass the full suite ([#395](https://github.com/agentscm/agentscm/pull/395))
+- *(roadmap)* Apply Roadmap lines merged since v0.2.1 ([#383](https://github.com/agentscm/agentscm/pull/383))
+- *(hook)* Reuse a pooled Hub connection for command hooks ([#384](https://github.com/agentscm/agentscm/pull/384))
+- *(local-validation)* Document a warm build cache for attestations ([#376](https://github.com/agentscm/agentscm/pull/376))
+- *(test)* Optimize dependencies and shorten deliberate test waits ([#373](https://github.com/agentscm/agentscm/pull/373))
+- *(process)* Update the roadmap once per release, not in every PR ([#354](https://github.com/agentscm/agentscm/pull/354))
+- *(validation)* Skip the Rust gate for Markdown-only changes ([#353](https://github.com/agentscm/agentscm/pull/353))
+- *(ci)* Move Hub qualification to local release checks ([#371](https://github.com/agentscm/agentscm/pull/371))
+- *(quickstart)* Find the doctor's Unverified line among its findings ([#357](https://github.com/agentscm/agentscm/pull/357))
+- Remove ci-extended as a routine pull request step ([#341](https://github.com/agentscm/agentscm/pull/341))
+- Reduce the local cost of validation and agent PR workflows ([#331](https://github.com/agentscm/agentscm/pull/331))
+- Lock attestations per machine and add interim agent merge rules ([#321](https://github.com/agentscm/agentscm/pull/321))
+- Add PR attest script and pin the verifier to a release ([#308](https://github.com/agentscm/agentscm/pull/308))
+
 ## [0.2.1](https://github.com/agentscm/agentscm/compare/v0.2.0...v0.2.1) - 2026-11-03
 
 ### Fixed
