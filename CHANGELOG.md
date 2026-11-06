@@ -2,6 +2,12 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## [0.4.0](https://github.com/agentscm/agentscm/compare/v0.3.0...v0.4.0) - 2026-11-06
+
+### Added
+
+- *(hub)* Let a Hub page ask the web sign-in to return to it ([#393](https://github.com/agentscm/agentscm/pull/393))
+
 ## [0.3.0](https://github.com/agentscm/agentscm/compare/v0.2.1...v0.3.0) - 2026-11-06
 
 ### Added
