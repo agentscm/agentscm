@@ -3819,8 +3819,6 @@ mod tests {
                 expires_at: None,
             },
             hub_check: HubCheck::Skipped,
-            health: crate::client_status::Health::Configured,
-            coverage: crate::client_status::Coverage::Unknown,
             recent_participation: vec![],
             capture_mode: mode,
             capture_mismatch: None,
@@ -3944,7 +3942,6 @@ mod tests {
             login: "member".into(),
             expires_at: 100,
             shared_conversation_retention_days: Some(45),
-            hub_build: None,
         };
         let identity = connection_identity(&connection);
         let mut snapshot = Snapshot {
@@ -3968,7 +3965,6 @@ mod tests {
                 login: "member".into(),
                 expires_at: 100,
                 shared_conversation_retention_days: None,
-                hub_build: None,
             },
         ] {
             snapshot.connections[0].hub_check = check;
@@ -4382,8 +4378,6 @@ mod tests {
                     expires_at: None,
                 },
                 hub_check: HubCheck::Skipped,
-                health: crate::client_status::Health::Configured,
-                coverage: crate::client_status::Coverage::Unknown,
                 recent_participation: vec![],
                 capture_mode: None,
                 capture_mismatch: None,
@@ -4430,8 +4424,6 @@ mod tests {
                 expires_at: None,
             },
             hub_check: HubCheck::Skipped,
-            health: crate::client_status::Health::Configured,
-            coverage: crate::client_status::Coverage::Unknown,
             recent_participation: vec![],
             capture_mode: None,
             capture_mismatch: None,
@@ -4665,7 +4657,6 @@ mod tests {
             login: "member".into(),
             expires_at,
             shared_conversation_retention_days: None,
-            hub_build: None,
         };
         assert!(hub_recently_verified(&check(40, 200), 100));
         assert!(!hub_recently_verified(&check(39, 200), 100));
@@ -4774,7 +4765,6 @@ mod tests {
             login: "member".into(),
             expires_at: 101,
             shared_conversation_retention_days: None,
-            hub_build: None,
         };
         assert!(hub_label(&check, 100).starts_with("authenticated as member"));
         assert_eq!(

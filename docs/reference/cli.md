@@ -415,25 +415,6 @@ also shows local hook and MCP transport outcomes observed while it is running; t
 stay in memory and expire. Missing or idle activity stays unknown. `--json` emits a versioned
 status contract, including separate onboarding and local-activity binding identifiers.
 
-A saved token is configuration, not proof of coordination. Each connection reports one
-`connection` state in text and as `health` in `--json`, from the strongest evidence available:
-
-| State | Meaning |
-| --- | --- |
-| `configured` | A token is saved and the Hub was not asked (no `--check`). |
-| `no_usable_token` | The saved token file is missing, unreadable or not private. |
-| `authenticated` | The Hub accepted the token during this check. |
-| `renewal_pending` | Accepted, but inside the renewal window and not yet renewed. |
-| `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
-| `expired` | The token ended and nothing renewed it. The Hub is not consulted. |
-| `revoked` | The Hub rejected a token that has not ended. |
-| `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
-
-`coverage` is separate: `verified` only when the Hub has seen both an agent's MCP and a native hook
-for the checkout; `partial`, `unverified` and `unknown` otherwise. A valid check also reports the
-Hub's deployed `hub_build` (version and commit) when the Hub states one; `client doctor` prints the
-same state and build, and stops with the reason when the Hub does not accept the token.
-
 Each connected checkout has **Agent Integrations** actions for Claude Code, Codex, Cursor,
 Copilot and Gemini. They reuse the existing owned hooks, MCP and skill installers with the saved
 connection and stable installed binary. **Reapply** repeats setup; it does not certify runtime
