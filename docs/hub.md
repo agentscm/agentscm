@@ -490,6 +490,8 @@ on no others:
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
   `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
   `GET /v1/hub/standup/inbox` for the token's repository
+- `POST /v1/hub/standup/preflight`, the exact-subject check: it changes no Work and records no
+  event, though it may store catch-up backfill and merge-observation rows
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
