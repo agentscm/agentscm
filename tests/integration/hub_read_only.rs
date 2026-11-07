@@ -62,6 +62,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/start-rule".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/operational".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/reconciliation".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work?q=x".into(), "".into(), Allowed);
@@ -147,6 +148,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/session".into(), "".into(), HumanOnly);
     row(&delete, "/v1/hub/session".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/session/work/transition".into(), "{}".into(), HumanOnly);
+    row(&post, "/v1/hub/session/work/hold".into(), "{}".into(), HumanOnly);
+    row(&post, "/v1/hub/session/start-rule".into(), "{}".into(), HumanOnly);
     row(&post, "/v1/hub/session/read-token".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/session/repositories".into(), "".into(), HumanOnly);
     row(&get, "/v1/hub/session/pickups?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);

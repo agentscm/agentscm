@@ -2672,7 +2672,7 @@ fn work_payload_bytes(
                FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
-                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_transition', 'work_lead_credential', 'reservation_lapsed')
+                AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_hold', 'work_transition', 'work_lead_credential', 'reservation_lapsed')
              UNION ALL
              SELECT length(CAST(r.proposed_scope AS BLOB))
                     + length(CAST(r.proposed_title AS BLOB)) + 256
@@ -4318,6 +4318,28 @@ fn pickup_in(
 }
 
 /// `named` is false when the caller named no session and `start.session` was resolved for it.
+/// Refuses a start the repository's start rule does not admit.
+fn start_admission(tx: &Transaction<'_>, who: &WorkWho, session: &str) -> Result<()> {
+    let rule: Option<String> = tx
+        .query_row(
+            "SELECT value FROM hub_settings WHERE key = ?1",
+            [super::start_rules::who_rule_key(who)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(rule) = rule else {
+        return Ok(());
+    };
+    let via: Option<String> = tx
+        .query_row(
+            "SELECT via FROM hub_sessions WHERE token = ?1 AND session = ?2",
+            params![who.token, session],
+            |row| row.get(0),
+        )
+        .optional()?;
+    super::start_rules::admit(Some(&rule), who, via.as_deref())
+}
+
 fn start_in(
     tx: &Transaction<'_>,
     who: &WorkWho,
@@ -4328,8 +4350,10 @@ fn start_in(
     if who.read_only {
         return Err(HubError::Unauthorized);
     }
+    start_admission(tx, who, &start.session)?;
     let scope = start.validate(who)?;
     if let Some(mut item) = resolve_work(tx, who, start, now)? {
+        super::start_rules::check_hold(&item)?;
         if start
             .issue_choice
             .as_ref()
@@ -4826,6 +4850,7 @@ fn start_in(
     };
     let mut item = WorkItem {
         initial_issue_choice: start.issue_choice.clone().unwrap_or_default(),
+        hold: None,
         issue_link: start
             .issue_choice
             .as_ref()
@@ -10402,6 +10427,7 @@ impl Store for SqliteStore {
         if who.read_only {
             return Err(HubError::Unauthorized);
         }
+        start_admission(&tx, &who, &start.session)?;
         if start.preflight.is_some() {
             sqlite_try_backfill_catchup_publications(&tx, &who, now)?;
         }
@@ -11258,6 +11284,83 @@ impl Store for SqliteStore {
             },
             reclaimed: Vec::new(),
         })
+    }
+
+    fn work_hold_set(
+        &self,
+        user: &User,
+        repository: &str,
+        repository_id: i64,
+        is_admin: bool,
+        request: &super::start_rules::WorkHoldRequest,
+        now: i64,
+    ) -> Result<WorkItem> {
+        if user.disabled {
+            return Err(HubError::Unauthorized);
+        }
+        let who = work_transition::person_who(user, repository, repository_id);
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut item = scoped_work(&tx, &who, &request.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
+        let Some(event) = super::start_rules::apply_hold(&mut item, &who, is_admin, request, now)?
+        else {
+            tx.commit()?;
+            return Ok(item);
+        };
+        let seq = append(&tx, &event)?;
+        item.updated_seq = seq;
+        let snapshot = save_work_version(&tx, &item, seq)?;
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        tx.commit()?;
+        Ok(item)
+    }
+
+    fn start_rule_set(
+        &self,
+        user: &User,
+        repository: &str,
+        repository_id: i64,
+        rule: &super::start_rules::StartRule,
+        now: i64,
+    ) -> Result<super::start_rules::StoredStartRule> {
+        let key = super::start_rules::rule_key(
+            &user.identity.provider,
+            &user.identity.host,
+            repository,
+            Some(repository_id),
+        );
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM hub_settings WHERE key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let (stored, change) = super::start_rules::rule_change(
+            previous.as_deref(),
+            user,
+            repository,
+            repository_id,
+            rule,
+            now,
+        )?;
+        if let Some((value, event)) = change {
+            tx.execute(
+                "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (key) DO UPDATE SET value = ?2, updated_at = ?3, updated_by = ?4",
+                params![key, value, now, user.id],
+            )?;
+            append(&tx, &event)?;
+        }
+        tx.commit()?;
+        Ok(stored)
     }
 
     fn work_pr_link_get(
@@ -14556,7 +14659,7 @@ impl Store for SqliteStore {
                  JOIN hub_work_items w ON w.id = e.subject
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at < ?5
-                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_transition', 'work_lead_credential')
+                   AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_hold', 'work_transition', 'work_lead_credential')
                    AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                    AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
                 params![
@@ -14574,7 +14677,7 @@ impl Store for SqliteStore {
                      JOIN hub_work_items w ON w.id = e.subject
                      WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                        AND w.repository_id IS ?4 AND e.at < ?5
-                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_transition', 'work_lead_credential')
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint', 'work_pr_link', 'work_issue_link', 'work_hold', 'work_transition', 'work_lead_credential')
                        AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
                        AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)
                  )",

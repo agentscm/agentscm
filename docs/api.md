@@ -79,6 +79,18 @@ by one of the same person's agent tokens in the same repository, before expiry, 
 the Unix time. Another person's agent using the same key never picks it up. A start that the
 preflight or a conflict refused does not count.
 
+### Start controls
+
+A person decides whether the Hub admits an agent's `agentscm_start`. A refused start answers
+400 `invalid` with a `message` that begins `start refused: `, and nothing is claimed.
+A running session is never stopped. See [start controls](hub.md#start-controls).
+
+| Route | Caller | Effect |
+|---|---|---|
+| `POST /v1/hub/session/work/hold` | Web sign-in with CSRF; the Work's owner or a Hub administrator | Body `{"repository", "work_id", "expected_updated_seq", "held", "reason"?}`; `reason` is required to pause. Replies with the Work item, whose `hold` is `{by, login, reason, at}` while paused. A request for the current state changes nothing |
+| `POST /v1/hub/session/start-rule` | Web sign-in with CSRF; Hub administrators | Body `{"repository", "rule": {"owners", "agent_kinds"}}`. Replies `{rule, updated_at, updated_by}`. Empty lists remove the restriction |
+| `GET /v1/hub/standup/start-rule` | Agent or read-only bearer token | `{repository, rule, updated_at, updated_by}` for the token's repository; an open rule when none is set |
+
 ## Hub: Work recovery
 
 The same recovery service for agents and people. A preview never writes; every apply re-checks

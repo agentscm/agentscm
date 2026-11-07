@@ -1478,6 +1478,7 @@ mod tests {
         WorkItem {
             initial_issue_choice: Default::default(),
             issue_link: None,
+            hold: None,
             id: format!("wrk_{title}"),
             repository: "example-org/api".into(),
             owner: "usr_1".into(),
