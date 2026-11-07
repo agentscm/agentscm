@@ -145,6 +145,27 @@ Work store. The relationship records caller-reported identity, not provider appr
 
 The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, and an `idle` wait is listed only while that session leads unfinished Work; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds.
 
+## Hub repository setup reads
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/forge-coordination` | Agent or read-only bearer token for that repository (another repository is 404); read-only |
+| `GET /v1/hub/repos/{repo}/slack` | Same; what the Hub's Slack direct messages do for the token's owner there |
+
+`forge-coordination` replies `{"repository", "connected"}`, and when connected `forge`
+(`provider`, `host`, `connection_status`) and `outbound` (`enabled`, `switch`, `status_context`,
+`status_state`, `is_gate`). The switch belongs to the forge connection, so `enabled` covers every
+repository that connection has; `status_state` is always `success` and `is_gate` is `false`.
+
+`slack` replies `{"repository", "configured"}`, and when Slack is configured `events` (the kinds
+the Hub sends as direct messages; none has a switch of its own), `bound`, and for a bound person
+`reminders` (`enabled`, `interval_seconds`, `max_reminders`, `send_resolution`, and `escalation`
+with `after_seconds`, or `null`). It answers as a send would: `configured` is false once Slack
+reports the app uninstalled or its tokens revoked, and `bound` is true only while the token
+owner's binding in this repository has a live read-only token for them (a revoked or expired
+binding token is not bound), which is also what makes the Hub answer their `@AgentSCM` mentions.
+Slack user, team, app and bot IDs, files and tokens never appear.
+
 ## Hub change-record routes
 
 These routes belong to `agentscm hub serve`, not the unauthenticated local `serve` API above. They
