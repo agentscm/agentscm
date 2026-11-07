@@ -95,6 +95,15 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
+    // The Hub ends a wait on the session's next tool call, so that call must reach it.
+    if waits(agent, &payload)
+        && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())
+    {
+        let _ = std::fs::remove_file(marker_path(
+            &config,
+            &activity_marker(agent, session, &payload),
+        ));
+    }
     if let Some(key) = activity_key(agent, &payload)
         && let Ok(config) = config_dir()
     {
@@ -1473,11 +1482,13 @@ fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<Route
 fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
     // `agent_id` marks a subagent's call, so the hub can keep requests for the lead session.
+    // `notification_type` says which wait a notification reports; its message is never sent.
     for (key, max) in [
         ("hook_event_name", 64),
         ("session_id", 1024),
         ("tool_name", 128),
         ("agent_id", 128),
+        ("notification_type", 64),
     ] {
         if let Some(value) = payload[key]
             .as_str()
@@ -1485,6 +1496,10 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         {
             out.insert(key.into(), json!(value));
         }
+    }
+    // A stop that background work will resume is not a wait; only the count leaves.
+    if let Some(tasks) = payload["background_tasks"].as_array() {
+        out.insert("background_tasks".into(), json!(tasks.len()));
     }
     if normalized.is_none() {
         if let Some(cwd) = payload["cwd"]
@@ -1547,7 +1562,13 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
         }
         "copilot" => {
             let mut out = serde_json::Map::new();
-            for (key, max) in [("sessionId", 1024), ("toolName", 128)] {
+            for (key, max) in [
+                ("sessionId", 1024),
+                ("toolName", 128),
+                ("agentId", 128),
+                ("notification_type", 64),
+                ("stopReason", 64),
+            ] {
                 if let Some(value) = bounded_string(&payload[key], max) {
                     out.insert(key.into(), json!(value));
                 }
@@ -1577,10 +1598,20 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
                 Some("SessionStart") => "start",
                 Some("BeforeTool") if !paths.is_empty() => "check",
                 Some("BeforeTool" | "AfterTool") => "activity",
+                Some("Notification" | "AfterAgent") => "waiting",
                 Some("SessionEnd") => "done",
                 _ => return Err("hook event not recognised".into()),
             };
             let mut out = json!({"agent":"gemini", "event":event});
+            // Without a reason the Hub ignores the wait (a notification Gemini adds later).
+            match (
+                payload["hook_event_name"].as_str(),
+                payload["notification_type"].as_str(),
+            ) {
+                (Some("AfterAgent"), _) => out["reason"] = json!("idle"),
+                (_, Some("ToolPermission")) => out["reason"] = json!("permission"),
+                _ => {}
+            }
             if event == "activity"
                 && agentscm::hub::hook::is_shell_tool(payload["tool_name"].as_str().unwrap_or(""))
             {
@@ -1703,7 +1734,9 @@ fn is_pre_tool(payload: &Value) -> bool {
 /// end, which the Hub counts so a long call stays live. None without a session.
 fn activity_key(agent: &str, payload: &Value) -> Option<String> {
     let session = session_of(payload)?;
-    if agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0) {
+    if waits(agent, payload)
+        || agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0)
+    {
         return None;
     }
     // A path that cannot be read is sent on, so the Hub decides.
@@ -1718,7 +1751,35 @@ fn activity_key(agent: &str, payload: &Value) -> Option<String> {
         }
         _ => false,
     };
-    renews.then(|| format!("activity\0{agent}\0{session}"))
+    renews.then(|| activity_marker(agent, session, payload))
+}
+
+/// Kept per subagent, so a sibling's work cannot use up the call that ends another's wait.
+fn activity_marker(agent: &str, session: &str, payload: &Value) -> String {
+    match ["agent_id", "agentId"]
+        .into_iter()
+        .find_map(|key| payload[key].as_str())
+    {
+        Some(asker) => format!("activity\0{agent}\0{session}\0{asker}"),
+        None => format!("activity\0{agent}\0{session}"),
+    }
+}
+
+/// A report that the session stopped for its person: a permission prompt, a question or the end
+/// of a turn. The Hub reads which; this says only that the session's next call ends it.
+fn waits(agent: &str, payload: &Value) -> bool {
+    match payload["hook_event_name"].as_str() {
+        Some("Notification" | "PermissionRequest" | "Stop" | "AfterAgent") => true,
+        Some("stop") => agent == "cursor",
+        Some("PreToolUse") => payload["tool_name"] == "AskUserQuestion",
+        Some(_) => false,
+        None => {
+            agent == "copilot"
+                && payload.get("toolName").is_none()
+                && (payload.get("notification_type").is_some()
+                    || payload.get("stopReason").is_some())
+        }
+    }
 }
 
 /// The agent name is argv, so keep it to a safe single path segment.
@@ -1918,6 +1979,72 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_sends_only_its_facts_and_its_next_call_is_never_skipped() {
+        let note = json!({"hook_event_name":"Notification","session_id":"s","cwd":"/r",
+            "notification_type":"permission_prompt","title":"t",
+            "message":"Claude needs your permission to use Bash"});
+        assert_eq!(
+            sanitized_codex(&note, Some(&[])).unwrap(),
+            json!({"hook_event_name":"Notification","session_id":"s",
+                "notification_type":"permission_prompt"})
+        );
+        let stop = json!({"hook_event_name":"Stop","session_id":"s",
+            "last_assistant_message":"private","background_tasks":[{"command":"npm test"}]});
+        assert_eq!(
+            sanitized_codex(&stop, Some(&[])).unwrap(),
+            json!({"hook_event_name":"Stop","session_id":"s","background_tasks":1})
+        );
+        let camel = json!({"sessionId":"s","notification_type":"permission_prompt",
+            "message":"m","agentId":"sub"});
+        assert_eq!(
+            sanitized_client("copilot", &camel, &[]).unwrap(),
+            json!({"sessionId":"s","agentId":"sub","notification_type":"permission_prompt"})
+        );
+        let gemini = |v: Value| sanitized_client("gemini", &v, &[]).unwrap();
+        assert_eq!(
+            gemini(json!({"hook_event_name":"Notification","session_id":"s",
+                "notification_type":"ToolPermission","message":"m","details":{"tool":"x"}})),
+            json!({"agent":"gemini","event":"waiting","reason":"permission","session":"s"})
+        );
+        assert_eq!(
+            gemini(json!({"hook_event_name":"AfterAgent","session_id":"s",
+                "prompt":"private","prompt_response":"private"})),
+            json!({"agent":"gemini","event":"waiting","reason":"idle","session":"s"})
+        );
+        // A notification Gemini adds later goes without a reason, which the Hub ignores.
+        assert_eq!(
+            gemini(json!({"hook_event_name":"Notification","session_id":"s",
+                "notification_type":"Other"})),
+            json!({"agent":"gemini","event":"waiting","session":"s"})
+        );
+        assert!(waits("claude", &note) && waits("cursor", &json!({"hook_event_name":"stop"})));
+        assert!(!waits("claude", &json!({"hook_event_name":"stop"})));
+        assert!(waits(
+            "copilot",
+            &json!({"sessionId":"s","stopReason":"end_turn"})
+        ));
+        assert!(!waits(
+            "copilot",
+            &json!({"sessionId":"s","toolName":"bash"})
+        ));
+        // A question shown before the tool runs reaches the Hub, not the activity rate limit.
+        let ask = json!({"hook_event_name":"PreToolUse","session_id":"s",
+            "tool_name":"AskUserQuestion"});
+        assert!(waits("claude", &ask) && activity_key("claude", &ask).is_none());
+        // Each subagent keeps its own activity marker, so a sibling cannot use up its call.
+        let read = |extra: Value| {
+            let mut v = json!({"hook_event_name":"PostToolUse","session_id":"s",
+                "tool_name":"Read"});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            activity_key("claude", &v).unwrap()
+        };
+        assert_eq!(read(json!({})), "activity\0claude\0s");
+        assert_ne!(read(json!({"agent_id":"a"})), read(json!({"agent_id":"b"})));
+    }
 
     #[test]
     fn only_tool_events_that_check_no_edit_are_rate_limited_activity() {

@@ -234,11 +234,14 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
     };
     Ok(match agent {
         // Every tool call keeps the session's hold live, so the tool hooks match every tool; the
-        // Hub checks only the edits.
+        // Hub checks only the edits. The notification and stop hooks tell the Hub the session
+        // waits for its person (a prompt, a question, the end of a turn); they never answer.
         Agent::Claude => vec![
             ("SessionStart", vec![nested(5, None)]),
             ("PreToolUse", vec![nested(5, None)]),
             ("PostToolUse", vec![nested(3, None)]),
+            ("Notification", vec![nested(3, None)]),
+            ("Stop", vec![nested(3, None)]),
             ("SessionEnd", vec![nested(3, None)]),
         ],
         Agent::Cursor => {
@@ -246,6 +249,7 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
             vec![
                 ("sessionStart", vec![hook(5)]),
                 ("postToolUse", vec![hook(5)]),
+                ("stop", vec![hook(3)]),
                 ("sessionEnd", vec![hook(3)]),
             ]
         }
@@ -255,6 +259,8 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
                 ("sessionStart", vec![hook(5)]),
                 ("preToolUse", vec![hook(5)]),
                 ("postToolUse", vec![hook(3)]),
+                ("notification", vec![hook(3)]),
+                ("agentStop", vec![hook(3)]),
                 ("sessionEnd", vec![hook(3)]),
             ]
         }
@@ -269,6 +275,11 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
                     vec![nested(5000, Some("AgentSCM edit coordination"))],
                 ),
                 ("AfterTool", vec![nested(3000, Some("AgentSCM activity"))]),
+                (
+                    "Notification",
+                    vec![nested(3000, Some("AgentSCM waiting for you"))],
+                ),
+                ("AfterAgent", vec![nested(3000, Some("AgentSCM turn end"))]),
                 (
                     "SessionEnd",
                     vec![nested(3000, Some("AgentSCM session end"))],

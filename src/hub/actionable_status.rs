@@ -585,6 +585,7 @@ fn read_scoped(
     actions.extend(checks);
     limits.extend(check_limits);
     actions.extend(setup_actions(store, setup, principal, &items, now)?);
+    actions.extend(waiting_actions(setup, principal, &items, now)?);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -722,6 +723,68 @@ fn setup_actions(
             })
             .collect(),
     )
+}
+
+/// The viewer's own sessions that stopped for them: a permission prompt or a question always
+/// needs them; the end of a turn only while that session leads unfinished Work, since a finished
+/// chat left open is not waiting on anyone. Its id is `waiting:<reason>:<key>` and its semantic
+/// version the time the wait began. Answering stays in the session.
+fn waiting_actions(
+    setup: &Observations,
+    principal: &Principal,
+    items: &BTreeMap<String, WorkItem>,
+    now: i64,
+) -> Result<Vec<StatusAction>> {
+    use crate::hub::session_waiting::WaitReason;
+    let viewer = StatusRecipient {
+        kind: RecipientKind::Person,
+        owner: Some(principal.owner.id.clone()),
+        login: Some(principal.owner.login.clone()),
+        agent: None,
+    };
+    let mut actions = Vec::new();
+    for wait in setup.waiting().owned(principal, now)? {
+        let led = items
+            .values()
+            .filter(|i| {
+                i.lead_token == wait.token
+                    && i.lead_session == wait.session
+                    && matches!(i.state, WorkState::Active | WorkState::Blocked)
+            })
+            .collect::<Vec<_>>();
+        if wait.reason == WaitReason::Idle && led.is_empty() {
+            continue;
+        }
+        let brand = match wait.agent.as_str() {
+            "" | "generic" => String::new(),
+            agent => format!(" ({})", crate::hub::advice::agent_name(agent)),
+        };
+        let on = led
+            .first()
+            .map(|i| format!(" on “{}”", crate::hub::advice::sanitize(&i.title, 80)))
+            .unwrap_or_default();
+        let asker = if wait.subagent {
+            " A subagent asked; the whole session waits on your answer."
+        } else {
+            ""
+        };
+        actions.push(StatusAction {
+            id: format!("waiting:{}:{}", wait.reason.code(), wait.key),
+            kind: "session_waiting".into(),
+            work_ids: led.iter().map(|i| i.id.clone()).collect(),
+            recipients: vec![viewer.clone()],
+            needs_you: true,
+            action: format!(
+                "Your agent {}{brand} {}{on}.{asker} Answer it in that session; the Hub cannot answer it for you.",
+                crate::hub::advice::sanitize(&wait.name, 64),
+                wait.reason.what(),
+            ),
+            updated_seq: 0,
+            semantic_version: Some(wait.since.to_string()),
+            limits: vec![],
+        });
+    }
+    Ok(actions)
 }
 
 /// Deterministic text used by agent-facing clients; generated prose is optional.
@@ -1918,6 +1981,126 @@ mod tests {
     #[test]
     fn setup_problems_reach_only_their_owner_on_postgres() {
         on_postgres(setup_contract);
+    }
+
+    /// A session waiting for its person reaches only that person, after the grace: a prompt or
+    /// question always, the end of a turn only while the session leads unfinished Work.
+    fn waiting_contract(store: &dyn Store) {
+        use crate::hub::onboarding::Observations;
+        use crate::hub::session_waiting::{GRACE_SECONDS, WaitReason};
+        let now = crate::hub::store::unix_now();
+        let person = |user_id: i64, login: &str| {
+            store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: "github.com".into(),
+                        user_id,
+                    },
+                    login,
+                )
+                .unwrap()
+        };
+        let token = |user: &crate::hub::store::User, name: &str| {
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, name, "acme/widgets", 101, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let viewer = token(&person(601, "viewer"), "viewer-laptop");
+        let other = token(&person(602, "other"), "other-laptop");
+        let request: WorkStart = serde_json::from_value(json!({
+            "request_key": "fix-login", "title": "Fix login", "session": "working",
+            "scope": ["src/login.rs"]
+        }))
+        .unwrap();
+        let work = store
+            .work_start(&viewer.token_id, &request, now)
+            .unwrap()
+            .item;
+        let observations = Observations::default();
+        let wait = |who: &Principal, session: &str, reason, at| {
+            observations
+                .waiting()
+                .record(who, session, session, "claude", reason, None, at)
+                .unwrap();
+        };
+        let waits = |who: &Principal, at| {
+            super::read(store, &observations, who, at)
+                .unwrap()
+                .actions
+                .into_iter()
+                .filter(|a| a.kind == "session_waiting")
+                .collect::<Vec<_>>()
+        };
+        let earlier = now - GRACE_SECONDS;
+        wait(&viewer, "working", WaitReason::Idle, earlier);
+        wait(&viewer, "chatting", WaitReason::Idle, earlier);
+        wait(&viewer, "asking", WaitReason::Permission, earlier);
+        wait(&viewer, "fresh", WaitReason::Question, now);
+        wait(&other, "theirs", WaitReason::Permission, earlier);
+        let mine = waits(&viewer, now);
+        // The open chat with no Work, the fresh question and the other person's prompt are not here.
+        assert_eq!(mine.len(), 2, "{mine:?}");
+        assert!(mine.iter().all(|a| {
+            a.needs_you
+                && a.recipients.len() == 1
+                && a.recipients[0].owner.as_deref() == Some(viewer.owner.id.as_str())
+                && a.semantic_version.as_deref() == Some(earlier.to_string().as_str())
+                && a.action
+                    .ends_with("Answer it in that session; the Hub cannot answer it for you.")
+        }));
+        let idle = mine
+            .iter()
+            .find(|a| a.id.starts_with("waiting:idle:"))
+            .unwrap();
+        assert_eq!(idle.work_ids, vec![work.id.clone()]);
+        assert!(
+            idle.action
+                .contains("viewer-laptop (Claude Code) finished its turn"),
+            "{}",
+            idle.action
+        );
+        assert!(idle.action.contains("on “Fix login”"), "{}", idle.action);
+        let asking = mine
+            .iter()
+            .find(|a| a.id.starts_with("waiting:permission:"))
+            .unwrap();
+        assert!(asking.work_ids.is_empty());
+        assert!(
+            !asking.id.contains("asking"),
+            "the session ID is not exposed"
+        );
+        let status = super::read(store, &observations, &viewer, now).unwrap();
+        assert!(status.counts.needs_you >= 2);
+        assert!(super::render_text(&status).contains("for your permission to use a tool"));
+        assert_eq!(waits(&other, now).len(), 1);
+        // Ending the wait removes it, and the attention digest moves with it.
+        observations
+            .waiting()
+            .clear(&viewer.token_id, "asking", None, false);
+        let after = super::read(store, &observations, &viewer, now).unwrap();
+        assert_eq!(waits(&viewer, now).len(), 1);
+        assert_ne!(after.digest, status.digest);
+    }
+
+    #[test]
+    fn sqlite_waiting_sessions_reach_only_their_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        waiting_contract(&*store);
+    }
+
+    #[test]
+    fn waiting_sessions_reach_only_their_owner_on_postgres() {
+        on_postgres(waiting_contract);
     }
 
     #[test]
