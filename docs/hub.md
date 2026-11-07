@@ -484,6 +484,8 @@ on no others:
 - `GET /v1/hub/repos/{repo}/work`
 - `GET /v1/hub/repos/{repo}/activity`
 - `GET /v1/hub/health`, which needs no token
+- `GET /v1/hub/repos/{repo}/after-merge` (whether the Hub watches the repository's CI and
+  deployments after a merge)
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - `GET /v1/hub/standup/briefing`, `GET /v1/hub/standup/overview`, `GET /v1/hub/standup/work?q=`
