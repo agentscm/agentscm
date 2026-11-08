@@ -340,6 +340,13 @@ impl HubState {
         self
     }
 
+    /// Revokes every connected-app credential whose app the apps file no longer registers, with
+    /// the tokens each minted. Run at start, after the login configuration is loaded.
+    pub fn revoke_dropped_apps(&self) -> Result<usize> {
+        self.store
+            .revoke_unregistered_apps(&self.login.app_ids(), "hub", store::unix_now())
+    }
+
     pub fn with_slack(mut self, slack: slack::Slack) -> Self {
         self.slack = Some(Arc::new(slack));
         self

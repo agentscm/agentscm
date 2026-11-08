@@ -200,7 +200,7 @@ export interface CoordinationResponse {
   kind: CoordinationResponseKind
   note: string | null
   /** `hub` when the person who owns the responding agent answered for it on the Hub's web pages; `responder` is still the agent. */
-  via: 'hub' | null
+  via: 'hub' | 'slack' | null
   created_at: number
   seq: number
 }
@@ -662,7 +662,7 @@ function coordinationRequest(value: unknown): CoordinationRequest {
       target_generation: safeInteger(response['target_generation'], 'coordination.request.response.target_generation'),
       kind: enumValue(response['kind'], COORDINATION_RESPONSE_KINDS, 'coordination.request.response.kind'),
       note: nullableText(response['note'], 'coordination.request.response.note'),
-      via: response['via'] === 'hub' ? ('hub' as const) : null,
+      via: response['via'] === 'hub' || response['via'] === 'slack' ? (response['via'] as 'hub' | 'slack') : null,
       created_at: timestamp(response['created_at'], 'coordination.request.response.created_at'),
       seq: safeInteger(response['seq'], 'coordination.request.response.seq'),
     }

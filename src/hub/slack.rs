@@ -172,7 +172,8 @@ pub fn slack_id(value: &str, prefix: char) -> bool {
 }
 
 /// Config and credentials are trusted operator inputs, never selected by Slack payloads.
-fn private_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+/// Connected apps read their config file the same way.
+pub(super) fn private_file(path: &Path, max: u64) -> Result<Vec<u8>> {
     if !path.is_absolute() || fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(invalid());
     }
@@ -213,7 +214,7 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn secret(path: &Path) -> Result<String> {
+pub(super) fn secret(path: &Path) -> Result<String> {
     let bytes = private_file(path, 4096)?;
     let value = std::str::from_utf8(&bytes).map_err(|_| invalid())?.trim();
     if value.is_empty() || value.chars().any(char::is_whitespace) {

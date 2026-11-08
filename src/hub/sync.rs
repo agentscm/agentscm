@@ -2513,7 +2513,7 @@ pub async fn bootstrap(
     Ok(Some(path))
 }
 
-fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
