@@ -384,12 +384,14 @@ async fn mcp(
         return Err(ApiError::read_only());
     }
     let outcome = match method {
-        "initialize" => Ok(initialize(
-            params,
-            principal.read_only,
-            &settings,
-            all_tools,
-        )),
+        "initialize" => Ok({
+            super::agent_messages::note_initialize(
+                &principal.token_id,
+                super::onboarding::client(&headers),
+                params,
+            );
+            initialize(params, principal.read_only, &settings, all_tools)
+        }),
         "ping" => Ok(json!({})),
         "tools/list" => {
             // The skill tools matter only where the repository adopted skills. A failed read
@@ -1174,6 +1176,12 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         promise_history,
         promise_propose,
         promise_report,
+        {"name": "agentscm_hub_message",
+         "description": "Answers a \"Message from <person> in the Hub\" that a tool result or hook context carried: your own person's request. Report accepted or declined (Manual mode: only after your person said yes or no in this session), then done when finished.",
+         "inputSchema": schema(json!({
+             "id": {"type": "string", "description": "The message id (msg_...)."},
+             "status": {"type": "string", "enum": ["accepted", "declined", "done"]},
+             "session": session}), &["id", "status"])},
         {"name": "agentscm_view_settings",
          "description": "Reads or changes your own setting for inline views (MCP Apps) of work overview and coordination inbox. It affects only your own agents, not other users; your choice wins over the hub default, which a workspace administrator changes in the hub UI. Omit all arguments to read. Returns effective, hub_default and override.",
          "inputSchema": schema(json!({
@@ -1536,6 +1544,25 @@ async fn call(
             }
         }
     }
+    // What the session's own person sent it from the Hub page rides on its next tool call.
+    if !principal.read_only {
+        let requested = params
+            .and_then(|p| p["arguments"]["session"].as_str())
+            .map(str::to_owned);
+        let install = super::onboarding::client(headers).map(str::to_owned);
+        let (store, scope) = (state.store.clone(), principal.clone());
+        if let Ok(Some(text)) = blocking(state, move || {
+            let now = unix_now();
+            let session = store.session_name_for(&scope.token_id, requested.as_deref(), now)?;
+            super::agent_messages::note_mcp(&scope.token_id, install.as_deref(), &session, now);
+            super::agent_messages::take(&*store, &scope, &session, "mcp", now)
+        })
+        .await
+            && let Some(content) = value["content"].as_array_mut()
+        {
+            content.push(json!({"type": "text", "text": text}));
+        }
+    }
     Ok(value)
 }
 
@@ -1837,6 +1864,7 @@ async fn call_inner(
             | "agentscm_work_usage"
             | "agentscm_coordination_inbox"
             | "agentscm_view_settings"
+            | "agentscm_hub_message"
             | "agentscm_coordination_ack"
             | "agentscm_coordination_reply"
             | "agentscm_coordination_resolve"
@@ -1995,6 +2023,32 @@ async fn call_inner(
                 work_failure(&error)
             }
         });
+    }
+    if name == "agentscm_hub_message" {
+        let args = match try_args::<super::agent_messages::AnswerArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        let (store, scope, id) = (state.store.clone(), principal.clone(), args.id.clone());
+        return Ok(
+            match blocking(state, move || {
+                let now = unix_now();
+                let session =
+                    store.session_name_for(&scope.token_id, args.session.as_deref(), now)?;
+                super::agent_messages::answer(&*store, &scope, &session, &args.id, args.status, now)
+            })
+            .await
+            {
+                Ok(next) => result(
+                    &format!(
+                        "AgentSCM: Hub message {id} is now {}; your person sees it in the Hub.",
+                        json!(next).as_str().unwrap_or_default()
+                    ),
+                    false,
+                ),
+                Err(error) => hub_failure(&error),
+            },
+        );
     }
     if name == "agentscm_view_settings" {
         let change = match try_args::<ViewSettingsArgs>(arguments) {

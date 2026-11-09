@@ -3828,3 +3828,191 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
         (403, Some("insufficient_role"))
     );
 }
+
+const AGENT_MESSAGES: &str = "/v1/hub/session/agent-messages";
+
+async fn mcp_call(env: &Env, token: &str, method: &str, params: Value) -> Value {
+    let (status, reply) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/mcp",
+            Some(token),
+            Some(json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params})),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    reply["result"].clone()
+}
+
+fn texts(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn a_person_messages_only_their_own_session_which_answers_with_receipts() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (alice_token, alice_secret) = agent_for(&env, &alice.id, "laptop", false);
+    let (bob_token, bob_secret) = agent_for(&env, &bob.id, "desk", false);
+    let list = format!("{AGENT_MESSAGES}?repository={REPO}");
+    let read = || {
+        let (hub, cookie, list) = (env.hub.clone(), alice.cookie.clone(), list.clone());
+        async move { with_cookie(&hub, Method::GET, &list, &cookie, None).await.1 }
+    };
+    let page0 = read().await;
+    assert_eq!(page0["mode"], "manual", "{page0}");
+    assert_eq!(page0["sessions"], json!([]));
+
+    // An MCP-only client: its initialize names it, its first call names its session.
+    mcp_call(
+        &env,
+        &alice_secret,
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"gemini-cli","version":"0.9.0"}}),
+    )
+    .await;
+    let status_call = json!({"name":"agentscm_status","arguments":{"session":"s1"}});
+    mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await;
+    let seen = read().await;
+    let session = seen["sessions"][0].clone();
+    assert_eq!(session["tier"], "mcp", "{seen}");
+    assert_eq!(session["name"], "gemini-cli");
+    assert_eq!(session["token_name"], "laptop");
+    let s1 = session["session"].as_str().unwrap().to_owned();
+
+    let send = |token: &str, session: &str, note: &str| json!({"repository": REPO, "token": token, "session": session, "note": note});
+    // Never to another person's token, and never without the page's CSRF token.
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&bob_token, &s1, "x"),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        false,
+        AGENT_MESSAGES,
+        send(&alice_token, &s1, "x"),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, message) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &s1, "Please release the stale Work"),
+    )
+    .await;
+    assert_eq!(status, 201, "{message}");
+    assert_eq!(message["state"], "queued");
+    let id = message["id"].as_str().unwrap().to_owned();
+
+    // Delivered once, in the next tool result, under the person's mode.
+    let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(text.contains("Message from"), "{text}");
+    assert!(
+        text.contains(&id) && text.contains("wait for their yes"),
+        "{text}"
+    );
+    let again = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(!again.contains(&id), "{again}");
+    assert_eq!(read().await["messages"][0]["state"], "delivered");
+    assert_eq!(read().await["messages"][0]["via"], "mcp");
+
+    // Only the receiving session answers.
+    let answer = |status: &str| {
+        json!({"name":"agentscm_hub_message",
+            "arguments":{"id": id, "status": status, "session": "s1"}})
+    };
+    let refused = mcp_call(&env, &bob_secret, "tools/call", answer("accepted")).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let ok = mcp_call(&env, &alice_secret, "tools/call", answer("accepted")).await;
+    assert_eq!(ok["isError"], false, "{ok}");
+    mcp_call(&env, &alice_secret, "tools/call", answer("done")).await;
+    assert_eq!(read().await["messages"][0]["state"], "done");
+
+    // A hook client gets it in the next prompt's added context, with no tool call.
+    let hook = |session: &str| {
+        let (hub, secret) = (env.hub.clone(), alice_secret.clone());
+        let body = json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        async move {
+            let response = browser()
+                .post(format!("{hub}/v1/hub/hook/claude"))
+                .bearer_auth(secret)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
+        }
+    };
+    hook("h1").await;
+    let h1 = read().await["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["hook"] == "hook:claude")
+        .cloned()
+        .unwrap();
+    assert_eq!(h1["tier"], "hook", "{h1}");
+    let h1 = h1["session"].as_str().unwrap().to_owned();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &h1, "Auto please"),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let reply = hook("h1").await;
+    let context = reply["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(context.contains("Auto please"), "{reply}");
+    assert_eq!(read().await["messages"][0]["via"], "hook:claude");
+
+    // Ignore holds everything: sending is refused.
+    let mode = |mode: Value| json!({"repository": REPO, "this_repository": true, "mode": mode});
+    let response = browser()
+        .put(format!("{}{AGENT_MESSAGES}/mode", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", alice.cookie),
+        )
+        .header("x-csrf-token", &alice.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(mode(json!("ignore")).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let page = read().await;
+    assert_eq!(
+        (page["mode"].clone(), page["repository_mode"].clone()),
+        (json!("ignore"), json!("ignore"))
+    );
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &s1, "held"),
+    )
+    .await;
+    assert_eq!(status, 400);
+}
