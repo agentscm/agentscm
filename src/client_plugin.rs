@@ -135,7 +135,13 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
         "PostToolUse":[{"hooks":[hook(3)]}],
         "Notification":[{"hooks":[hook(3)]}],
         "Stop":[{"hooks":[hook(3)]}],
-        "SessionEnd":[{"hooks":[hook(3)]}]
+        "SessionEnd":[{"hooks":[hook(3)]}],
+        // Only change capture uses these, for checkouts whose Hub shares agent conversations.
+        "PostToolUseFailure":[{"hooks":[hook(3)]}],
+        "MessageDisplay":[{"hooks":[hook(3)]}],
+        "PreCompact":[{"hooks":[hook(3)]}],
+        "SubagentStart":[{"hooks":[hook(3)]}],
+        "SubagentStop":[{"hooks":[hook(3)]}]
     }});
     // Like the hooks, it inherits the agent's environment. The server's working directory is
     // not documented, so it takes the project directory, when Claude Code substitutes it.

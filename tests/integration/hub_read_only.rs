@@ -91,6 +91,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&put, format!("{REPO}/publications/{id}/blobs/{hash}"), "x".into(), AgentOnly);
     row(&post, format!("{REPO}/publications/{id}/run"), "{}".into(), AgentOnly);
     row(&get, format!("{REPO}/change-records/current?session_id=session-1"), "".into(), AgentOnly);
+    row(&get, format!("{REPO}/conversation-sharing"), "".into(), Allowed);
+    row(&put, format!("{REPO}/conversation-sharing/me"), r#"{"notified":true}"#.into(), AgentOnly);
     row(&post, format!("{REPO}/change-records/events"), "{}".into(), AgentOnly);
     row(&post, format!("{REPO}/change-records/actions/start"), "{}".into(), AgentOnly);
     row(&post, format!("{REPO}/change-records/actions/finish"), "{}".into(), AgentOnly);
@@ -153,6 +155,10 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/session/dismissals?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
     row(&put, "/v1/hub/session/dismissals".into(), r#"{"repository":"acme/widgets","key":"k","fingerprint":"f"}"#.into(), HumanOnly);
     row(&delete, "/v1/hub/session/dismissals?repository=acme%2Fwidgets&key=k".into(), "".into(), HumanOnly);
+    row(&get, "/v1/hub/session/conversation-sharing?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
+    row(&put, "/v1/hub/session/conversation-sharing".into(), r#"{"repository":"acme/widgets","enabled":true}"#.into(), HumanOnly);
+    row(&put, "/v1/hub/session/conversation-sharing/me".into(), r#"{"repository":"acme/widgets","opted_out":true}"#.into(), HumanOnly);
+    row(&put, "/v1/hub/session/conversation-sharing/default".into(), r#"{"enabled":true}"#.into(), HumanOnly);
     row(&post, "/v1/hub/session/pickups".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&post, "/v1/hub/session/pickups/abandon".into(), r#"{"repository":"acme/widgets","id":"pku_x"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/device/repositories".into(), "".into(), HumanOnly);

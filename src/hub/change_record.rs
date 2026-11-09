@@ -112,6 +112,8 @@ impl SharedBodyRow {
             size_bytes: self.size_bytes,
             availability: self.availability_at(now),
             expires_at: self.expires_at,
+            // The user id; the read swaps in the login (`conversation_page`).
+            author: Some(self.author.clone()),
         })
     }
 }

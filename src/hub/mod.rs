@@ -9,6 +9,7 @@ pub mod change_record_http;
 mod compact;
 pub mod connection;
 pub mod continuity;
+pub mod conversation_sharing;
 pub mod coordination;
 mod coordination_http;
 pub mod device;

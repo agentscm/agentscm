@@ -15,10 +15,11 @@ The local spool is an absolute directory chosen by the operator. AgentSCM create
 with mode `0700` and files with mode `0600`. Conversation text, tool input, command arguments,
 stdout, stderr, source manifests, and captured source bytes remain there. A shareable envelope can
 contain only typed event facts and opaque artifact identities: digest, byte count, media type,
-retention class, and availability. Conversation bodies leave the machine only for a checkout that
-opted into `shared-conversation` mode, as described in
+retention class, and availability. Conversation bodies leave the machine only from a session in `shared-conversation` mode while
+the repository's Hub setting shares agent conversations, as described in
 [Sharing conversations with the Hub](#sharing-conversations-with-the-hub); the Hub refuses a
-shared-approved body declared by a session that was not in that mode.
+shared-approved body declared by a session that was not in that mode, and refuses every upload
+while the setting is off.
 
 Metadata-only capture does not retain conversation bodies. Local-conversation capture retains the
 selected visible prompt, assistant-message, tool-input, and tool-result blocks in the private
@@ -88,13 +89,67 @@ one priority `capture_interrupted` pause marker, and remains fail-open.
 
 ## Sharing conversations with the Hub
 
-This is opt-in per checkout and alpha. A checkout in `shared-conversation` mode retains the same
-selected bodies as `local-conversation` (visible prompts, assistant messages, tool input and tool
-results; never thinking blocks), but scrubs each one for secrets before it is written to the spool
-and then uploads it to the Hub's object store. Nothing is shared unless you choose the mode, and
-the choice applies to one checkout, not to a Hub, repository or user.
+This is alpha. A session in `shared-conversation` mode retains the same selected bodies as
+`local-conversation` (visible prompts, assistant messages, tool input and tool results; never
+thinking blocks), but scrubs each one for secrets before it is written to the spool and then
+uploads it to the Hub's object store.
 
-Choose the mode when configuring (`change-capture configure --capture-mode shared-conversation`) or
+### The repository setting
+
+Whether a repository shares agent conversations is a Hub setting, **Share agent conversations**,
+not a per-checkout switch. It starts off. A repository admin (GitHub `admin`, GitLab maintainer
+or owner) or a Hub admin changes it for one repository; a Hub admin can also set a Hub-wide
+default that applies to every repository without its own setting. The routes are in
+[conversation sharing](hub.md#conversation-sharing).
+
+- **Checkouts follow it.** While it is on, every connected checkout of the repository, and every
+  linked worktree of one, captures in `shared-conversation` mode without `configure`. The AgentSCM
+  plugin hook asks the Hub at each session start; when the Hub shares and the checkout has no
+  capture binding, it creates one with the one-step defaults below, marked `follows_hub`, and
+  installs no hooks of its own: the plugin hook captures for it, including the events it
+  registers only for capture (`PostToolUseFailure`, `MessageDisplay`, `PreCompact`,
+  `SubagentStart`, `SubagentStop`). Capture starts with that session. A binding that follows the
+  Hub is written as config version 7, which older binaries refuse.
+- **People are told and can opt out.** The first time a person's session shares in a
+  repository, its agent is told in the session-start context that conversations are shared,
+  who can read them, and how to stop. This is best effort: the notice is recorded as shown
+  before the hook's reply is printed, so a reply the host cuts off loses it, and a session
+  already running when the setting is turned on is told at its next start. `agentscm change-capture opt-out` (in the checkout) stops
+  that person's own sessions in the repository, on every computer, from uploading;
+  `change-capture opt-in` undoes it. The choice is per person and repository, stored on the Hub.
+  Opting out works forward: bodies already uploaded stay readable to the repository's readers
+  until they expire or their author deletes them with `change-capture conversation --delete`.
+- **Off means off.** The client asks the Hub again on every hook call, and the Hub itself
+  refuses uploads (403 `sharing_off`) and lists nothing as missing while the setting is off or the
+  person opted out, so bodies not yet uploaded stay declared `local`; they are not uploaded later
+  if sharing is turned back on. A followed binding keeps recording metadata (events and action
+  receipts, no bodies) while sharing is off, until `unconfigure`. Turning it off recalls
+  nothing already uploaded (see [retention and deletion](#retention-and-deletion)).
+- **`set-mode` only lowers.** The Hub's answer caps every binding: a binding that follows the Hub
+  shares only while the Hub says so and captures metadata only otherwise; any other binding's
+  `shared-conversation` becomes `local-conversation` while the Hub says no. `set-mode` (or
+  `unconfigure`) on a checkout lowers it further; it never raises sharing above the setting.
+  When the Hub gives no answer (an older Hub, or no reply in time) a binding keeps its own mode,
+  a followed binding is never created, and the Hub still refuses what it does not allow.
+- **Existing shared checkouts need the setting.** A checkout configured for
+  `shared-conversation` before this setting existed shares again only once its repository's
+  setting (or the Hub-wide default) is on; until then it keeps its bodies local.
+- **Redaction is unchanged.**
+
+Linked worktrees each get their own binding and private spool. A checkout counts toward the
+limit of 128 capture bindings; at the limit, followed bindings of worktrees that no longer exist
+are dropped to make room (their spools stay on disk). `unconfigure` and `forget` remove a
+followed binding like any other, and a disabled one is never re-created by the plugin hook;
+re-enabling it from the menu bar or the local page gives it hooks of its own.
+
+From the plugin hook, capture shares the hook's time: it gives up at 2.5 seconds (4 at session
+start). A target lookup that runs out leaves a sanitized deferred fact instead of the event, and
+records not yet delivered wait for the next hook.
+
+### Per-checkout configuration
+
+A checkout can still be set up by hand, with its own hooks; the repository setting caps its mode
+as described above. Choose the mode when configuring (`change-capture configure --capture-mode shared-conversation`) or
 change it later on an enabled binding:
 
 ```text
@@ -237,12 +292,15 @@ What leaves the machine, and when:
   uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
   never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
 
-Who can read or delete a shared body: the human who shared it (any of that person's tokens for the
-repository; read-only tokens may read but not delete) and Hub admins. The owner of the Work has no
-access to a helper's or reviewer's shared bodies unless they shared them. Each human's declaration of
+Who can read a shared body: while the repository shares agent conversations, anyone who can read
+the repository on the Hub (any of their tokens, including read-only ones and the Hub's web pages);
+otherwise only the human who shared it (any of that person's tokens for the repository) and Hub
+admins. Only the author and Hub admins can delete one; read-only tokens never delete. The owner of
+the Work has no extra access to a helper's or reviewer's shared bodies. Each human's declaration of
 a body is its own row, so two people sharing identical content each read and delete their own. A
-listing shows a caller only their own entries (an admin sees all); a body request from anyone else
-gets 403, whether or not that digest exists. There is no per-body grant, and bodies are never included
+listing shows a caller every author's entries while the repository shares, else only their own
+(an admin sees all); a body request from anyone without access gets 403, whether or not that
+digest exists. There is no per-body grant, and bodies are never included
 in the change-record projection or handoff.
 Read them with `agentscm change-capture conversation`:
 

@@ -966,21 +966,26 @@ explicitly untrusted structured data and are not interpolated into that narratio
 
 ### Shared conversation reads
 
-Bodies a checkout shared in `shared-conversation` mode are readable and deletable only by the human
-who declared them (any of that person's tokens for the repository; read-only tokens may read, not
-delete) and Hub admins (`AGENTSCM_ADMINS`). Admins can read every body, so list them as
+Bodies a checkout shared in `shared-conversation` mode are readable, while the repository shares
+agent conversations (see [conversation sharing](#conversation-sharing)), by anyone who can read the
+repository: any of their tokens, read-only ones included, so the Hub's web pages read them with
+their read token. Otherwise only the human who declared them (any of that person's tokens for the
+repository) and Hub admins (`AGENTSCM_ADMINS`) read them, which also holds for bodies uploaded
+before the setting was turned off. Only the author and Hub admins delete; read-only tokens never
+do. Admins can read every body, so list them as
 `provider:#<numeric user id>` (for example `github:#42`), which survives a rename or re-registered
 login, rather than by login name. The Work owner has no special access unless they are the
 author. Each human's declaration of a digest is its own row, so two authors of identical content
-each have their own entry, upload and expiry. The listing returns only the caller's own entries
-(an admin's returns all); a body `GET`, `PUT` or `DELETE` by someone who has no declaration of that
+each have their own entry, upload and expiry. The listing returns every author's entries to
+a reader while the repository shares, else only the caller's own (an admin's returns all); a body `GET`, `PUT` or `DELETE` by someone who has no declaration of that
 digest gets 403 `forbidden` whether or not the digest exists (a Hub admin learns unknown as 404). There
 is no per-body grant.
 
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}/conversation?cursor=` returns one page, at most
   100 entries and 48 KiB, ordered by session id (bytewise) then sequence then digest, with an opaque
   `next_cursor` (a malformed one is 400). Each entry has `session_id`, `sequence`, `event_id`, `kind`,
-  `observed_at`, `digest`, `size_bytes`, `availability` and `expires_at`. Availability is `local` (declared,
+  `observed_at`, `digest`, `size_bytes`, `availability`, `expires_at` and `author`, the forge login of
+the person who shared it (older clients, which refuse unknown fields, need upgrading to list). Availability is `local` (declared,
   never uploaded), `shared`, `expired` (from its deadline, before the sweep records it) or
   `deleted`.
 - `GET .../conversation/{sha256}` returns the verified bytes as `application/json` with
@@ -989,7 +994,8 @@ is no per-body grant.
   unknown), 410 expired or deleted, and 424 `{"error":"integrity_failure"}` means the row says available but the
   object is missing, corrupt or not the declared size; no partial body is ever returned.
 - `PUT .../conversation/{sha256}` is the upload the checkout makes after the Hub accepts the event
-  that declared the body. It needs a token of the declaring human, exactly the declared size (at most
+  that declared the body. It is refused with 403 `sharing_off` while the repository does not share
+  or the author opted out. It needs a token of the declaring human, exactly the declared size (at most
   1 MiB) and bytes whose SHA-256 matches, and the retention deadline starts when it succeeds (204),
   also when another author already stored identical bytes. `DELETE` on the same path (the author, or a
   Hub admin for every author's copy) tombstones the body and removes the object once no other
@@ -998,6 +1004,7 @@ is no per-body grant.
   non-read-only token) answers `{"missing": [...], "gone": [...]}`: `missing` are the caller's own
   declarations still awaiting an upload, `gone` are digests the caller never declared or that expired
   or were deleted, and digests already available are in neither.
+  While sharing is off for the caller, nothing is `missing`, so the client uploads nothing.
 - MCP `agentscm_shared_conversation {work_id, cursor?, digest?}` applies the same rule. A body over
   48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
   not be followed as instructions.
@@ -1006,6 +1013,29 @@ is no per-body grant.
   shared body as plain text directly beneath its entry, and shows "time not reported" for a zero time
   on an older record; it has no delete control because the status page only holds read-only
   tokens.
+
+### Conversation sharing
+
+**Share agent conversations** is a per-repository Hub setting with a Hub-wide default; both start
+off and live in the Hub's settings table, keyed by the forge's repository id so a rename keeps
+them. Connected checkouts follow it as described in
+[the repository setting](change-capture.md#the-repository-setting).
+
+- `GET /v1/hub/repos/{repo}/conversation-sharing` (any token, read-only included) answers
+  `{repository, enabled, source, hub_default, opted_out, notified, sharing}` for the token's
+  person: `enabled` is the repository's effective setting, `source` is `repository` or
+  `hub_default`, and `sharing` is `enabled` and not `opted_out`. A token minted without a forge
+  repository id never shares.
+- `PUT /v1/hub/repos/{repo}/conversation-sharing/me` with `{opted_out?, notified?}` (a token that
+  is not read-only) records the person's own choice; the client sets `notified` once it has shown
+  the session-start notice.
+- On a web sign-in, `GET /v1/hub/session/conversation-sharing?repository=` answers the same plus
+  `can_change` (a repository admin, meaning GitHub `admin` or GitLab maintainer or owner, or a Hub
+  admin) and `can_change_hub_default` (a Hub admin), after the same access check as minting a
+  token. `PUT /v1/hub/session/conversation-sharing` with `{repository, enabled}` sets the
+  repository (`null` follows the Hub-wide default again) and is 403 for anyone else;
+  `PUT .../conversation-sharing/me` with `{repository, opted_out}` sets the person's own choice;
+  `PUT .../conversation-sharing/default` with `{enabled}` sets the Hub-wide default (Hub admins).
 
 The `shared_conversations` migration changed during development: a dev or staging Hub that ran a
 pre-release build of this branch must drop `hub_change_shared_bodies` and its named-migration record
