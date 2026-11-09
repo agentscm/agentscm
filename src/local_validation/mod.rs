@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+pub mod bundle;
 pub mod checks;
 pub mod comment;
 #[cfg(unix)]

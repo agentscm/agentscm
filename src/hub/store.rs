@@ -206,6 +206,33 @@ pub enum PromiseInputScope<'a> {
 pub trait Store: Send + Sync {
     fn backend(&self) -> &'static str;
     fn ping(&self) -> Result<()>;
+    /// Trusted administrator/controller API. Never expose directly to an agent token.
+    /// The selected connection must own the connected repository.
+    fn configure_validation_summary(
+        &self,
+        config: &super::validation_evidence::ValidationSummaryConfig,
+    ) -> Result<()>;
+    fn validation_summary_config(
+        &self,
+        repository: &str,
+    ) -> Result<Option<super::validation_evidence::ValidationSummaryConfig>>;
+    /// Rechecks the token and repository binding in the receipt transaction.
+    fn receive_validation_evidence(
+        &self,
+        token: &str,
+        proposal: i64,
+        bundle: &super::validation_evidence::DurableValidationBundle,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidenceReceipt>;
+    fn validation_evidence_history(
+        &self,
+        token: &str,
+        repository: &str,
+        proposal: i64,
+        after: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidencePage>;
     /// Insert, or update the cached login of an existing identity. Never changes the id.
     fn upsert_user(&self, identity: &ForgeIdentity, login: &str) -> Result<User>;
     /// Replace the cached profile name (`None` clears it). A display value, not an audited

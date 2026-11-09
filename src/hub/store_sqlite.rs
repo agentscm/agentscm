@@ -136,6 +136,7 @@ use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
 mod repository_rename;
+mod validation_evidence;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -7388,6 +7389,39 @@ fn work_checkpoint_in(
 }
 
 impl Store for SqliteStore {
+    fn configure_validation_summary(
+        &self,
+        config: &super::validation_evidence::ValidationSummaryConfig,
+    ) -> Result<()> {
+        validation_evidence::configure(self, config)
+    }
+    fn validation_summary_config(
+        &self,
+        repository: &str,
+    ) -> Result<Option<super::validation_evidence::ValidationSummaryConfig>> {
+        validation_evidence::config(self, repository)
+    }
+    fn receive_validation_evidence(
+        &self,
+        token: &str,
+        proposal: i64,
+        bundle: &super::validation_evidence::DurableValidationBundle,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidenceReceipt> {
+        validation_evidence::receive(self, token, proposal, bundle, now)
+    }
+    fn validation_evidence_history(
+        &self,
+        token: &str,
+        repository: &str,
+        proposal: i64,
+        after: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidencePage> {
+        validation_evidence::history(self, token, repository, proposal, after, limit, now)
+    }
+
     fn backend(&self) -> &'static str {
         "sqlite"
     }
