@@ -2427,18 +2427,30 @@ fn validation_bundle_exact_bytes_bounds_and_identity() {
 
 #[test]
 fn validation_evidence_durable_receipts_pagination_and_revocation() {
+    let temp = tempfile::tempdir().unwrap();
+    validation_store_conformance(
+        &format!("sqlite://{}", temp.path().join("hub.db").display()),
+        &temp,
+    );
+}
+
+#[test]
+fn validation_evidence_durable_receipts_and_publication_on_postgres() {
+    let Some(pg) = crate::hub_pg::PgSchema::create() else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    validation_store_conformance(&pg.url, &temp);
+}
+
+fn validation_store_conformance(db: &str, temp: &tempfile::TempDir) {
     use agentscm::hub::connection::NewConnection;
     use agentscm::hub::store::{self, ForgeIdentity, NewAgentToken};
     use agentscm::hub::validation_evidence::{
         ValidationSummaryConfig, persist_bundle, read_bundle,
     };
     use agentscm::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
-    let temp = tempfile::tempdir().unwrap();
-    let store = store::open(&format!(
-        "sqlite://{}",
-        temp.path().join("hub.db").display()
-    ))
-    .unwrap();
+    let store = store::open(db).unwrap();
     let identity = ForgeIdentity {
         provider: "github".into(),
         host: "github.example".into(),
@@ -2587,7 +2599,7 @@ fn validation_evidence_durable_receipts_pagination_and_revocation() {
     // Independent database connections, as used by independent Hub processes, race one CAS.
     let contenders: Vec<_> = (0..4)
         .map(|_| {
-            let db = format!("sqlite://{}", temp.path().join("hub.db").display());
+            let db = db.to_owned();
             let repo = repo.id.clone();
             let next = preparing.clone();
             std::thread::spawn(move || {
@@ -2679,6 +2691,19 @@ fn validation_evidence_durable_receipts_pagination_and_revocation() {
         store.validation_publication(&repo.id, 1).unwrap(),
         Some(recovered.clone())
     );
+    let proposals = store
+        .validation_publication_proposals(&repo.id, 0, None, 1)
+        .unwrap();
+    assert_eq!(proposals.proposals, vec![1]);
+    assert_eq!(proposals.through, 1);
+    assert!(
+        store
+            .validation_publication_proposals(&repo.id, 1, Some(1), 1)
+            .unwrap()
+            .proposals
+            .is_empty()
+    );
+    assert_eq!(store.validation_fence(&repo.id, 1).unwrap().generation, 2);
     let mut stale = recovered.clone();
     stale.revision = 4;
     stale.phase = PublicationPhase::Preparing;
@@ -2754,12 +2779,13 @@ fn validation_evidence_durable_receipts_pagination_and_revocation() {
             .receive_validation_evidence(&token, 1, &durable, now)
             .is_err()
     );
-    let raw = rusqlite::Connection::open(temp.path().join("hub.db")).unwrap();
-    raw.execute(
-        "DELETE FROM hub_validation_evidence WHERE repository=?1 AND proposal=1 AND generation=1",
-        [&repo.id],
-    )
-    .unwrap();
+    if db.starts_with("sqlite:") {
+        let raw = rusqlite::Connection::open(temp.path().join("hub.db")).unwrap();
+        raw.execute("DELETE FROM hub_validation_evidence WHERE repository=?1 AND proposal=1 AND generation=1", [&repo.id]).unwrap();
+    } else {
+        let mut raw = postgres::Client::connect(db, postgres::NoTls).unwrap();
+        raw.execute("DELETE FROM hub_validation_evidence WHERE repository=$1 AND proposal=1 AND generation=1", &[&repo.id]).unwrap();
+    }
     assert!(matches!(
         store.validation_snapshot(&repo.id, 1, 1000),
         Err(agentscm::hub::HubError::Unavailable(_))

@@ -23,6 +23,9 @@ use serde_json::json;
 use crate::agent_task_cli::{public_hex, read_signing_key, validate_private_directory_metadata};
 use crate::client_cli::read_token;
 
+#[path = "local_validation_migrate.rs"]
+mod migrate;
+
 const MAX_INPUT_BYTES: u64 = 2 * 1024 * 1024;
 /// Comment pages (of 100) read when looking for an earlier post.
 const MAX_COMMENT_PAGES: u32 = 10;
@@ -46,6 +49,8 @@ pub enum LocalValidationCommand {
     Post(PostArgs),
     /// Submit retained evidence to an explicitly selected Hub; never falls back to a forge.
     Submit(SubmitArgs),
+    /// Archive signed legacy GitHub comments to a Hub; cleanup requires --delete-legacy.
+    Migrate(migrate::MigrateArgs),
     /// Set the `agentscm/local-validation` status of every open pull request on `--base` from its
     /// signed attestation comments; with policy `exempt_paths`, a pull request that changes only
     /// exempt paths passes without one. Exit 0 when all were handled, 1 on any error or unread input,
@@ -232,6 +237,7 @@ pub async fn run(command: LocalValidationCommand) -> Result<i32> {
         LocalValidationCommand::Verify(args) => verify(args),
         LocalValidationCommand::Post(args) => post(args).await,
         LocalValidationCommand::Submit(args) => submit(args).await,
+        LocalValidationCommand::Migrate(args) => migrate::run(args).await,
         LocalValidationCommand::Reconcile(args) => reconcile(args).await,
     }
 }
@@ -756,6 +762,14 @@ async fn post(args: PostArgs) -> Result<i32> {
 /// Pending is retained before transport. Lost responses retry the same canonical bundle;
 /// the Hub returns the original receipt, and no forge publication is attempted here.
 async fn submit(args: SubmitArgs) -> Result<i32> {
+    let receipt = submit_retained(args).await?;
+    println!("{}", serde_json::to_string(&receipt)?);
+    Ok(0)
+}
+
+async fn submit_retained(
+    args: SubmitArgs,
+) -> Result<agentscm::hub::validation_evidence::ValidationEvidenceReceipt> {
     use agentscm::hub::forge_http;
     use agentscm::hub::validation_evidence::ValidationEvidenceReceipt;
     use agentscm::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
@@ -851,8 +865,7 @@ async fn submit(args: SubmitArgs) -> Result<i32> {
         _ => {}
     }
     File::open(&args.state_dir)?.sync_all()?;
-    println!("{}", serde_json::to_string(&receipt)?);
-    Ok(0)
+    Ok(receipt)
 }
 
 // Unique temporary names allow simultaneous deterministic retries without deleting another

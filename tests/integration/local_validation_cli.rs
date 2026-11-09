@@ -1002,3 +1002,279 @@ fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
         .count();
     assert_eq!(pending, 1);
 }
+
+#[derive(Clone)]
+struct MigrationFake {
+    state: std::sync::Arc<std::sync::Mutex<MigrationState>>,
+}
+struct MigrationState {
+    registry: Vec<u8>,
+    body: Option<String>,
+    author: String,
+    scenario: &'static str,
+    bundle: Option<Value>,
+    events: Vec<String>,
+}
+async fn migration_reply(
+    axum::extract::State(fake): axum::extract::State<MigrationFake>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use serde_json::json;
+    let mut s = fake.state.lock().unwrap();
+    let path = uri.path();
+    let mut status = 200;
+    let value = if path == "/repos/acme/widget" {
+        json!({"full_name":"acme/widget", "default_branch":"main"})
+    } else if path == "/repos/acme/widget/git/ref/heads/main" {
+        json!({"ref":"refs/heads/main", "object":{"sha":"a".repeat(40)}})
+    } else if path.contains("/contents/") {
+        assert!(
+            uri.query()
+                .unwrap()
+                .contains(&format!("ref={}", "a".repeat(40)))
+        );
+        json!({"type":"file", "encoding":"base64", "size":s.registry.len(), "content":STANDARD.encode(&s.registry)})
+    } else if path == "/user" {
+        json!({"id":7, "login":"synthetic"})
+    } else if path == "/repos/acme/widget/issues/1/comments" {
+        s.events.push("discover".into());
+        let mut values = s.body.as_ref().map(|body| vec![json!({"id":42,"body":body,"user":{"login":s.author}}),
+            json!({"id":43,"body":"<!-- agentscm-validation-summary:v1 untouched -->","user":{"login":"app[bot]"}})])
+            .unwrap_or_default();
+        if s.scenario == "second_refused" {
+            let mut second = values[0].clone();
+            second["id"] = json!(44);
+            values.push(second);
+        }
+        if s.scenario == "malformed" {
+            json!({"unexpected":"object"})
+        } else {
+            json!(values)
+        }
+    } else if path == "/repos/acme/widget/issues/comments/42" {
+        if method == axum::http::Method::DELETE {
+            assert!(
+                s.events.iter().any(|e| e == "readback"),
+                "delete before durable readback"
+            );
+            s.events.push("delete".into());
+            s.body = None;
+            if s.scenario == "lost" {
+                status = 500;
+            } else {
+                status = 204;
+            }
+            json!({})
+        } else {
+            s.events.push("live".into());
+            if let Some(body) = &s.body {
+                json!({"id":42, "user":{"login":s.author}, "body": if s.scenario == "changed" {format!("{body}\nedited")} else {body.clone()}})
+            } else {
+                status = 404;
+                json!({})
+            }
+        }
+    } else if path.ends_with("/validation-evidence/1") && method == axum::http::Method::POST {
+        s.events.push("archive".into());
+        if s.scenario == "refused"
+            || (s.scenario == "second_refused"
+                && s.events.iter().filter(|e| *e == "archive").count() == 2)
+        {
+            status = 403;
+            json!({})
+        } else {
+            let bundle =
+                agentscm::local_validation::bundle::ValidationBundleV1::from_slice(&body).unwrap();
+            let digest = agentscm::store::digest(&bundle.to_bytes().unwrap());
+            let value = serde_json::from_slice(&body).unwrap();
+            if let Some(old) = &s.bundle {
+                assert_eq!(old, &value);
+            }
+            s.bundle = Some(value);
+            if s.scenario == "archive_lost"
+                && s.events.iter().filter(|e| *e == "archive").count() == 1
+            {
+                status = 500;
+            }
+            json!({"repository":format!("rep_{}","1".repeat(32)), "proposal":1,"generation":1,
+                "bundle_sha256":digest,"received_at":1,"received_by":"synthetic","state":"received_unverified"})
+        }
+    } else if path.ends_with("/validation-evidence/1/1") {
+        s.events.push("readback".into());
+        s.bundle.clone().unwrap()
+    } else {
+        panic!("unexpected migration request {method} {uri}")
+    };
+    let mut reply = (
+        axum::http::StatusCode::from_u16(status).unwrap(),
+        axum::Json(value),
+    )
+        .into_response();
+    if s.scenario == "truncated" && path == "/repos/acme/widget/issues/1/comments" {
+        reply.headers_mut().insert(
+            "link",
+            "<http://127.0.0.1/comments?page=31>; rel=\"next\""
+                .parse()
+                .unwrap(),
+        );
+    }
+    reply
+}
+
+async fn migration_case(scenario: &'static str, expected_success: bool) {
+    let f = ok_fixture();
+    for name in ["registry.json", "policy.json"] {
+        let path = f.root().join(name);
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["repository"] = serde_json::json!("github.com/acme/widget");
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let envelope_path = f.state().join(format!("{sha}.envelope.json"));
+    let mut envelope = fs::read(envelope_path).unwrap();
+    if scenario == "forged" {
+        let mut value: Value = serde_json::from_slice(&envelope).unwrap();
+        value["signature_hex"] = serde_json::json!("0".repeat(128));
+        envelope = serde_json::to_vec(&value).unwrap();
+    }
+    if matches!(scenario, "otherkind" | "otherrequirement") {
+        let mut parsed = agentscm::evidence::EvidenceEnvelope::from_slice(&envelope).unwrap();
+        if scenario == "otherkind" {
+            parsed.payload.check_kind = "model_review/v1".into();
+        } else {
+            parsed.payload.requirement_id = "other-requirement".into();
+        }
+        envelope = serde_json::to_vec(
+            &agentscm::evidence::sign_evidence(parsed.payload, &SigningKey::from_bytes(&[7; 32]))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    let record = fs::read(f.state().join(format!("{sha}.record.json"))).unwrap();
+    let fake = MigrationFake {
+        state: std::sync::Arc::new(std::sync::Mutex::new(MigrationState {
+            registry: fs::read(f.root().join("registry.json")).unwrap(),
+            body: Some(comment::render(&envelope, &record).unwrap()),
+            author: if scenario == "foreign" {
+                "other"
+            } else {
+                "synthetic"
+            }
+            .into(),
+            scenario,
+            bundle: None,
+            events: Vec::new(),
+        })),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new()
+        .fallback(migration_reply)
+        .with_state(fake.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let token_path = f.root().join("migration-token");
+    fs::write(&token_path, "synthetic-migration-secret").unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let out = tokio::task::spawn_blocking(move || {
+        let run = || {
+            f.cli(&[
+                "migrate",
+                "--state-dir",
+                f.state().to_str().unwrap(),
+                "--github-repo",
+                "acme/widget",
+                "--proposal",
+                "1",
+                "--github-token-file",
+                token_path.to_str().unwrap(),
+                "--hub-token-file",
+                token_path.to_str().unwrap(),
+                "--hub-url",
+                &base,
+                "--repository-id",
+                &format!("rep_{}", "1".repeat(32)),
+                "--api-url",
+                &base,
+                "--delete-legacy",
+            ])
+        };
+        let first = run();
+        let first = if scenario == "archive_lost" {
+            assert!(!first.status.success());
+            run()
+        } else {
+            first
+        };
+        if expected_success {
+            assert!(
+                first.status.success(),
+                "{}",
+                String::from_utf8_lossy(&first.stderr)
+            );
+            let again = run();
+            assert!(
+                again.status.success(),
+                "{}",
+                String::from_utf8_lossy(&again.stderr)
+            );
+            let journals: Vec<_> = fs::read_dir(f.state())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("migration-")
+                })
+                .collect();
+            assert_eq!(journals.len(), 1);
+            let journal: Value = serde_json::from_slice(&fs::read(&journals[0]).unwrap()).unwrap();
+            assert_eq!(journal["comment_id"], 42);
+            assert_eq!(journal["state"], "deleted_or_absent");
+        }
+        first
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        out.status.success(),
+        expected_success,
+        "scenario {scenario}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("synthetic-migration-secret"));
+    let state = fake.state.lock().unwrap();
+    if expected_success {
+        assert_eq!(state.events.iter().filter(|e| *e == "delete").count(), 1);
+    } else {
+        assert!(!state.events.iter().any(|e| e == "delete"));
+        assert!(state.body.is_some());
+    }
+    server.abort();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_archives_before_cleanup_and_retries_lost_delete_reply() {
+    migration_case("ok", true).await;
+    migration_case("lost", true).await;
+    migration_case("archive_lost", true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_refuses_destructive_effects_for_unsafe_or_incomplete_inputs() {
+    for scenario in [
+        "changed",
+        "foreign",
+        "forged",
+        "otherkind",
+        "otherrequirement",
+        "second_refused",
+        "refused",
+        "truncated",
+        "malformed",
+    ] {
+        migration_case(scenario, false).await;
+    }
+}

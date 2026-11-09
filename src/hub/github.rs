@@ -1111,12 +1111,13 @@ impl Api {
         max_pages: u32,
     ) -> Gh<Vec<(i64, String, String)>> {
         let page = self
-            .paged(
+            .paged_with(
                 token,
                 &format!("/repos/{full_name}/issues/{number}/comments"),
                 None,
                 max_pages,
                 None,
+                true,
             )
             .await?
             .ok_or_else(|| GhError::Failed("validation comment inventory unavailable".into()))?;
@@ -1178,6 +1179,23 @@ impl Api {
             return Ok(false);
         }
         reply.ok("repos").map(|_| true)
+    }
+
+    /// Explicit legacy migration cleanup only. A lost reply is uncertain; callers must
+    /// read the exact comment again before deciding that deletion completed.
+    pub async fn delete_validation_comment(
+        &self,
+        token: &str,
+        full_name: &str,
+        comment: i64,
+    ) -> Gh<()> {
+        let url = format!("{}/repos/{full_name}/issues/comments/{comment}", self.base);
+        let reply = self.call(token, Method::DELETE, &url, None, None).await?;
+        if matches!(reply.status, 204 | 404) {
+            Ok(())
+        } else {
+            Err(GhError::Failed("legacy comment deletion refused".into()))
+        }
     }
 
     // ---- publishing: git data and pull request writes ----
