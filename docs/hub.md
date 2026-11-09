@@ -284,6 +284,10 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   responses and `asked_via_hub` / `answered_via_hub` to handoffs, and the named migration
   `handoff_answered_via_slack` adds `answered_via_slack`; rows and events from an agent's
   own call keep their old shape.
+  - `GET`, `PUT` and `DELETE /v1/hub/session/dismissals` keep a person's own dismissed and snoozed
+    attention items per repository, each an opaque `key` with a state `fingerprint` and an optional
+    `until`. A page hides an item while its fingerprint matches, so it returns when the item
+    changes; a snooze also ends at `until`. No one else reads them; see [the API](api.md).
   - `POST /v1/hub/session/work/transition` (`repository`, `work_id`, `operation_id`, `generation`,
     `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
     token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may

@@ -3731,3 +3731,100 @@ async fn a_hand_off_is_picked_up_only_by_its_own_persons_agent_start() {
     let found = pickup(&env, &alice, &json!(expired.id)).await;
     assert_eq!(found["state"], "expired");
 }
+
+const DISMISSALS: &str = "/v1/hub/session/dismissals";
+
+/// A PUT from a web page with its CSRF token.
+async fn page_put(env: &Env, page: &Page, body: Value) -> (u16, Value) {
+    let response = browser()
+        .put(format!("{}{DISMISSALS}", env.hub))
+        .header(
+            header::COOKIE,
+            format!("__Host-agentscm_session={}", page.cookie),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-csrf-token", &page.csrf)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let list = format!("{DISMISSALS}?repository={REPO}");
+    let read = |page: &Page| {
+        let (hub, cookie, list) = (env.hub.clone(), page.cookie.clone(), list.clone());
+        async move { with_cookie(&hub, Method::GET, &list, &cookie, None).await }
+    };
+    assert_eq!(read(&alice).await.1, json!({"dismissals": []}));
+
+    let dismiss = json!({"repository": REPO, "key": "stale:wrk_1", "fingerprint": "abc"});
+    let (status, page) = page_put(&env, &alice, dismiss.clone()).await;
+    assert_eq!(status, 200, "{page}");
+    let until = unix_now() + 86_400;
+    let snooze =
+        json!({"repository": REPO, "key": "pr:12", "fingerprint": "head1", "until": until});
+    assert_eq!(page_put(&env, &alice, snooze).await.0, 200);
+    // A second dismissal of the same key replaces the first.
+    let mut changed = dismiss.clone();
+    changed["fingerprint"] = json!("def");
+    let (_, page) = page_put(&env, &alice, changed).await;
+    let rows = page["dismissals"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{page}");
+    assert_eq!(rows[1]["key"], "stale:wrk_1");
+    assert_eq!(rows[1]["fingerprint"], "def");
+    assert_eq!(rows[1]["until"], Value::Null);
+    assert_eq!(rows[0]["until"], json!(until));
+    assert_eq!(read(&alice).await.1, page);
+
+    // They are Alice's own; Bob reads none, and a person who cannot read the repository is refused.
+    assert_eq!(read(&bob).await.1, json!({"dismissals": []}));
+    // Without the page's CSRF token, signed out, or with bad values, nothing changes.
+    let remove = format!("{DISMISSALS}?repository={REPO}&key=pr%3A12");
+    assert_eq!(
+        with_cookie(&env.hub, Method::DELETE, &remove, &alice.cookie, None)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        with_cookie(&env.hub, Method::GET, &list, "nope", None)
+            .await
+            .0,
+        401
+    );
+    for bad in [
+        json!({"repository": REPO, "key": "", "fingerprint": "f"}),
+        json!({"repository": REPO, "key": "k".repeat(201), "fingerprint": "f"}),
+        json!({"repository": REPO, "key": "k", "fingerprint": "f".repeat(129)}),
+        json!({"repository": REPO, "key": "k", "fingerprint": "f", "until": 1}),
+        json!({"repository": REPO, "key": "k", "fingerprint": "f", "extra": 1}),
+    ] {
+        assert_eq!(page_put(&env, &alice, bad.clone()).await.0, 400, "{bad}");
+    }
+
+    let (status, page) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        &remove,
+        &alice.cookie,
+        Some(&alice.csrf),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["dismissals"].as_array().unwrap().len(), 1);
+    assert_eq!(page["dismissals"][0]["key"], "stale:wrk_1");
+
+    env.drop_role(BOB);
+    let (status, refused) = read(&bob).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+}

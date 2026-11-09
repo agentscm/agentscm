@@ -12,6 +12,7 @@ pub mod continuity;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
+pub mod dismissals;
 pub mod external_runs;
 pub mod forge_api;
 #[cfg(unix)]

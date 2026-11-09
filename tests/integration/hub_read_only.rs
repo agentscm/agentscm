@@ -150,6 +150,9 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, "/v1/hub/session/read-token".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/session/repositories".into(), "".into(), HumanOnly);
     row(&get, "/v1/hub/session/pickups?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
+    row(&get, "/v1/hub/session/dismissals?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
+    row(&put, "/v1/hub/session/dismissals".into(), r#"{"repository":"acme/widgets","key":"k","fingerprint":"f"}"#.into(), HumanOnly);
+    row(&delete, "/v1/hub/session/dismissals?repository=acme%2Fwidgets&key=k".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/session/pickups".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&post, "/v1/hub/session/pickups/abandon".into(), r#"{"repository":"acme/widgets","id":"pku_x"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/device/repositories".into(), "".into(), HumanOnly);
