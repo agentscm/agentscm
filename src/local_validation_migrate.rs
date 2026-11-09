@@ -174,16 +174,11 @@ pub async fn run(args: MigrateArgs) -> Result<i32> {
     let mut legacy = Vec::new();
     // Finish the entire bounded discovery and signature preflight before any deletion.
     for (id, author, body) in comments {
-        if !body.contains(comment::MARKER_PREFIX) {
+        if !body.starts_with(comment::MARKER_PREFIX) {
             continue;
         }
         let (envelope, record) = comment::parse(&body)?;
         validate_pair(&envelope, &record, &registry, clock)?;
-        if args.delete_legacy && !author.eq_ignore_ascii_case(&login) {
-            return Err(Error::Invalid(format!(
-                "legacy comment {id} belongs to another author; unresolved, cleanup requires that author's own migration"
-            )));
-        }
         legacy.push((id, author, body, envelope, record));
     }
     let base = forge_http::check_base_url(&args.hub_url)
@@ -258,6 +253,9 @@ pub async fn run(args: MigrateArgs) -> Result<i32> {
     if args.delete_legacy {
         // A live edit since discovery refuses the entire cleanup before the first delete.
         for (id, author, body, _, _) in &legacy {
+            if !author.eq_ignore_ascii_case(&login) {
+                continue;
+            }
             if let Some((live_author, live_body)) = api
                 .validation_comment(&token, &args.github_repo, *id)
                 .await
@@ -272,6 +270,9 @@ pub async fn run(args: MigrateArgs) -> Result<i32> {
             }
         }
         for ((id, author, body, _, _), (name, mut journal)) in legacy.iter().zip(archived) {
+            if !author.eq_ignore_ascii_case(&login) {
+                continue;
+            }
             // Check immediately before this deletion too. Writers must remain stopped:
             // GitHub DELETE has no atomic condition on the observed body.
             let live = api
@@ -311,13 +312,14 @@ pub async fn run(args: MigrateArgs) -> Result<i32> {
             .validation_comments(&token, &args.github_repo, args.proposal, 30)
             .await
             .map_err(github_error)?;
-        if remaining
+        let remaining = remaining
             .iter()
-            .any(|(_, _, body)| body.contains(comment::MARKER_PREFIX))
-        {
-            return Err(Error::Conflict(
-                "legacy comments remain; migration unresolved".into(),
-            ));
+            .filter(|(_, _, body)| body.starts_with(comment::MARKER_PREFIX))
+            .count();
+        if remaining > 0 {
+            return Err(Error::Conflict(format!(
+                "{remaining} legacy comments remain; other authors must clean up their own comments"
+            )));
         }
     }
     println!(

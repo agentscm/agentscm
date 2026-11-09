@@ -1008,6 +1008,8 @@ struct MigrationFake {
     state: std::sync::Arc<std::sync::Mutex<MigrationState>>,
 }
 struct MigrationState {
+    other_body: Option<String>,
+    login: String,
     registry: Vec<u8>,
     body: Option<String>,
     author: String,
@@ -1038,12 +1040,18 @@ async fn migration_reply(
         );
         json!({"type":"file", "encoding":"base64", "size":s.registry.len(), "content":STANDARD.encode(&s.registry)})
     } else if path == "/user" {
-        json!({"id":7, "login":"synthetic"})
+        json!({"id":7, "login":s.login})
     } else if path == "/repos/acme/widget/issues/1/comments" {
         s.events.push("discover".into());
         let mut values = s.body.as_ref().map(|body| vec![json!({"id":42,"body":body,"user":{"login":s.author}}),
             json!({"id":43,"body":"<!-- agentscm-validation-summary:v1 untouched -->","user":{"login":"app[bot]"}})])
             .unwrap_or_default();
+        if let Some(body) = &s.other_body {
+            values.push(json!({"id":44,"body":body,"user":{"login":"other"}}));
+        }
+        if s.scenario == "quoted" {
+            values.push(json!({"id":45,"body":"A discussion quoting <!-- agentscm-local-validation:v1 example -->", "user":{"login":"reader"}}));
+        }
         if s.scenario == "second_refused" {
             let mut second = values[0].clone();
             second["id"] = json!(44);
@@ -1053,6 +1061,21 @@ async fn migration_reply(
             json!({"unexpected":"object"})
         } else {
             json!(values)
+        }
+    } else if path == "/repos/acme/widget/issues/comments/44" {
+        assert_eq!(s.scenario, "mixed");
+        if method == axum::http::Method::DELETE {
+            assert_eq!(s.login, "other");
+            assert!(s.events.iter().any(|e| e == "readback"));
+            s.events.push("delete".into());
+            s.other_body = None;
+            status = 204;
+            json!({})
+        } else if let Some(body) = &s.other_body {
+            json!({"id":44,"user":{"login":"other"},"body":body})
+        } else {
+            status = 404;
+            json!({})
         }
     } else if path == "/repos/acme/widget/issues/comments/42" {
         if method == axum::http::Method::DELETE {
@@ -1157,6 +1180,8 @@ async fn migration_case(scenario: &'static str, expected_success: bool) {
     let record = fs::read(f.state().join(format!("{sha}.record.json"))).unwrap();
     let fake = MigrationFake {
         state: std::sync::Arc::new(std::sync::Mutex::new(MigrationState {
+            other_body: (scenario == "mixed").then(|| comment::render(&envelope, &record).unwrap()),
+            login: "synthetic".into(),
             registry: fs::read(f.root().join("registry.json")).unwrap(),
             body: Some(comment::render(&envelope, &record).unwrap()),
             author: if scenario == "foreign" {
@@ -1179,6 +1204,7 @@ async fn migration_case(scenario: &'static str, expected_success: bool) {
     let token_path = f.root().join("migration-token");
     fs::write(&token_path, "synthetic-migration-secret").unwrap();
     fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let task_fake = fake.clone();
     let out = tokio::task::spawn_blocking(move || {
         let run = || {
             f.cli(&[
@@ -1203,7 +1229,18 @@ async fn migration_case(scenario: &'static str, expected_success: bool) {
             ])
         };
         let first = run();
-        let first = if scenario == "archive_lost" {
+        let first = if scenario == "mixed" {
+            assert!(!first.status.success());
+            assert!(String::from_utf8_lossy(&first.stderr).contains("1 legacy comments remain"));
+            {
+                let mut state = task_fake.state.lock().unwrap();
+                assert!(state.body.is_none());
+                assert!(state.other_body.is_some());
+                assert_eq!(state.events.iter().filter(|e| *e == "archive").count(), 2);
+                state.login = "other".into();
+            }
+            run()
+        } else if scenario == "archive_lost" {
             assert!(!first.status.success());
             run()
         } else {
@@ -1231,10 +1268,15 @@ async fn migration_case(scenario: &'static str, expected_success: bool) {
                         .starts_with("migration-")
                 })
                 .collect();
-            assert_eq!(journals.len(), 1);
-            let journal: Value = serde_json::from_slice(&fs::read(&journals[0]).unwrap()).unwrap();
-            assert_eq!(journal["comment_id"], 42);
-            assert_eq!(journal["state"], "deleted_or_absent");
+            assert_eq!(journals.len(), if scenario == "mixed" { 2 } else { 1 });
+            for path in journals {
+                let journal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert!(
+                    journal["comment_id"] == 42
+                        || (scenario == "mixed" && journal["comment_id"] == 44)
+                );
+                assert_eq!(journal["state"], "deleted_or_absent");
+            }
         }
         first
     })
@@ -1249,7 +1291,10 @@ async fn migration_case(scenario: &'static str, expected_success: bool) {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("synthetic-migration-secret"));
     let state = fake.state.lock().unwrap();
     if expected_success {
-        assert_eq!(state.events.iter().filter(|e| *e == "delete").count(), 1);
+        assert_eq!(
+            state.events.iter().filter(|e| *e == "delete").count(),
+            if scenario == "mixed" { 2 } else { 1 }
+        );
     } else {
         assert!(!state.events.iter().any(|e| e == "delete"));
         assert!(state.body.is_some());
@@ -1277,4 +1322,10 @@ async fn migration_refuses_destructive_effects_for_unsafe_or_incomplete_inputs()
     ] {
         migration_case(scenario, false).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_allows_each_author_to_clean_up_and_ignores_quoted_markers() {
+    migration_case("mixed", true).await;
+    migration_case("quoted", true).await;
 }
