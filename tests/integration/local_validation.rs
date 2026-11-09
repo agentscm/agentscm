@@ -1417,6 +1417,13 @@ mod scoped {
         let (d, b, h) = repo(|p| write(p, "src/a.rs"));
         let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
         assert_eq!(selected[0].filters, ["test(/^a_files::/)"]);
+        // A shared input outside the command's paths still keeps the full command.
+        let (d, b, h) = repo(|p| {
+            write(p, "src/a.rs");
+            write(p, "Cargo.lock");
+        });
+        let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
+        assert_eq!(selected[0].reason, SelectionReason::SharedInput);
         // An added file under a prefix rule still keeps the full command.
         let (d, b, h) = repo(|p| write(p, "src/b/new.rs"));
         let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();

@@ -173,6 +173,29 @@ pub fn command_selections(
         return Ok(Vec::new());
     }
     let trust_changed = changed(repo, merge_base, head, trust)? > 0;
+    // Shared inputs feed every test, so they count wherever they sit relative to command paths.
+    let shared = git(
+        repo,
+        &[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            merge_base,
+            head,
+            "--",
+        ],
+        GIT_OUTPUT,
+    )?
+    .split(|b| *b == 0)
+    .any(|p| {
+        p.starts_with(b"Cargo.")
+            || p == b"build.rs"
+            || p.starts_with(b".config/")
+            || p.starts_with(b"tests/integration/common/")
+            || p == b"tests/integration/main.rs"
+    });
     let required = required_commands(repo, merge_base, head, recipe, trust)?;
     let mut result = Vec::new();
     for command in recipe.commands.iter().filter(|c| required.contains(&c.id)) {
@@ -213,13 +236,6 @@ pub fn command_selections(
         }
         let paths: Vec<String> = paths.into_iter().collect();
         let mut filters = std::collections::BTreeSet::new();
-        let shared = paths.iter().any(|p| {
-            p.starts_with("Cargo.")
-                || p == "build.rs"
-                || p.starts_with(".config/")
-                || p.starts_with("tests/integration/common/")
-                || p == "tests/integration/main.rs"
-        });
         let mut reason = if trust_changed {
             TrustInput
         } else if shared {
