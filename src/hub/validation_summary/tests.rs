@@ -1076,6 +1076,54 @@ async fn new_receipt_before_attempting_cas_invalidates_prior_green() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_before_reservation_or_unchanged_return_invalidates_prior_green() {
+    for changed in [false, true] {
+        let f = Fixture::new().await;
+        f.submit(0, Fixture::now(), false);
+        f.submit(1, Fixture::now(), false);
+        f.run().await.unwrap();
+        let counts = f.counts();
+        if changed {
+            f.submit(0, Fixture::now() + 1, false);
+        }
+        let mut bundle = ValidationBundleV1 {
+            version: 1,
+            entries: Vec::new(),
+        };
+        // Use a valid new signed archive, captured from the existing snapshot, with
+        // a distinct carrier digest by including both checks.
+        let entries = f
+            .hub
+            .store
+            .validation_snapshot(&f.repo.id, 1, MAX_RECEIPTS)
+            .unwrap()
+            .entries;
+        for receipt in &entries[..2] {
+            bundle
+                .entries
+                .extend(read_bundle(&*f.hub.objects, receipt).unwrap().entries);
+        }
+        let durable =
+            persist_bundle(&*f.hub.objects, &f.repo.id, &f.registry.repository, &bundle).unwrap();
+        let agent = f.agent.clone();
+        TEST_BEFORE_RESERVATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |hub| {
+                hub.store
+                    .receive_validation_evidence(
+                        &agent,
+                        1,
+                        &durable,
+                        super::super::store::unix_now(),
+                    )
+                    .unwrap();
+            }))
+        });
+        f.run().await.unwrap();
+        f.assert_pending_without_summary_update(counts);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_preparing_recovery_invalidates_prior_green_in_same_sweep() {
     for drift in [false, true] {
         let f = Fixture::new().await;
@@ -1288,4 +1336,37 @@ async fn unavailable_evidence_exemption_still_rechecks_trusted_configuration() {
                 .all(|(_, v)| v["state"] == "pending")
         )
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reservation_race_preserves_another_attempting_owner() {
+    for changed in [false, true] {
+        let f = Fixture::new().await;
+        f.submit(0, Fixture::now(), false);
+        f.submit(1, Fixture::now(), false);
+        f.run().await.unwrap();
+        let counts = f.counts();
+        if changed {
+            f.submit(0, Fixture::now() + 1, false);
+        }
+        let repo = f.repo.id.clone();
+        TEST_BEFORE_RESERVATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |hub| {
+                let old = hub.store.validation_publication(&repo, 1).unwrap().unwrap();
+                let mut next = old.clone();
+                next.revision += 1;
+                next.evidence_generation = hub.store.validation_fence(&repo, 1).unwrap().generation;
+                next.operation_id = digest("competing-operation");
+                next.phase = PublicationPhase::Preparing;
+                assert!(cas(&*hub.store, &repo, 1, Some(&old), &next).unwrap());
+                let preparing = next.clone();
+                next.revision += 1;
+                next.phase = PublicationPhase::Attempting;
+                assert!(cas(&*hub.store, &repo, 1, Some(&preparing), &next).unwrap());
+            }));
+        });
+        f.run().await.unwrap();
+        assert_eq!(f.journal().phase, PublicationPhase::Attempting);
+        assert_eq!(f.counts(), counts);
+    }
 }

@@ -119,6 +119,7 @@ fn trusted(fetch: &FetchContext<'_>, commit: &str) -> crate::Result<Trusted> {
 type PreparationHook = Box<dyn FnOnce(&HubState)>;
 #[cfg(test)]
 thread_local! {
+    static TEST_BEFORE_RESERVATION: std::cell::RefCell<Option<PreparationHook>> = const { std::cell::RefCell::new(None) };
     static TEST_PREPARING: std::cell::RefCell<Option<PreparationHook>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_ATTEMPT: std::cell::RefCell<Option<PreparationHook>> = const { std::cell::RefCell::new(None) };
     static TEST_CLOCKS: std::cell::RefCell<std::collections::VecDeque<EvaluationClock>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
@@ -910,6 +911,10 @@ async fn reconcile_pull_inner(
         head.base_ref
     ));
     let body_digest = digest(&body);
+    #[cfg(test)]
+    if let Some(hook) = TEST_BEFORE_RESERVATION.with(|hook| hook.borrow_mut().take()) {
+        hook(hub);
+    }
     if old.as_ref().is_some_and(|p| {
         p.body_sha256 == body_digest
             && p.source_sha256 == source
@@ -917,6 +922,23 @@ async fn reconcile_pull_inner(
     }) && owned.first().is_some_and(|c| {
         c.2.strip_prefix(&marker(&old.as_ref().unwrap().operation_id)) == Some(body.as_str())
     }) {
+        let current = api
+            .pull_head(token, &repo.full_name, number, &mut HashMap::new())
+            .await?
+            .ok_or_else(|| failed("pull unavailable before unchanged summary"))?;
+        let source_current = same_head(&head, &current)
+            && (!evaluated_source
+                || configuration_current(api, token, repo, default.as_deref(), fetch.as_ref())
+                    .await?);
+        let fresh = plan.fresh();
+        let fence = store_call(|| hub.store.validation_fence(&repo.id, number))?;
+        if !source_current
+            || !fresh
+            || fence.generation != snapshot.generation
+            || fence.config != snapshot.config
+        {
+            return invalidate_idle(hub, conn, repo, token, api, number).await;
+        }
         return Ok(());
     }
     let mut slots = old
@@ -943,7 +965,7 @@ async fn reconcile_pull_inner(
         status_slots: slots,
     };
     if !cas(&*hub.store, &repo.id, number, old.as_ref(), &next)? {
-        return Ok(());
+        return invalidate_idle(hub, conn, repo, token, api, number).await;
     }
     #[cfg(test)]
     if let Some(hook) = TEST_PREPARING.with(|hook| hook.borrow_mut().take()) {
