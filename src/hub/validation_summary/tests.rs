@@ -55,6 +55,13 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_key_expiry(i64::MAX as u64, 3600, None).await
+    }
+    async fn with_key_expiry(
+        key_expiry: u64,
+        max_age_seconds: u64,
+        revoked_at_ms: Option<u64>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -79,8 +86,8 @@ impl Fixture {
                     key_id: issuer_key_id(&public).unwrap(),
                     public_key_hex: public,
                     not_before_ms: 0,
-                    not_after_ms: i64::MAX as u64,
-                    revoked_at_ms: None,
+                    not_after_ms: key_expiry,
+                    revoked_at_ms,
                 }],
             }],
         };
@@ -106,7 +113,7 @@ impl Fixture {
                     postgres: false,
                     s3: false,
                 },
-                max_age_seconds: 3600,
+                max_age_seconds,
                 epoch: 1,
                 exempt_paths: None,
                 check_id: Some((*id).into()),
@@ -245,6 +252,15 @@ impl Fixture {
         }
     }
     fn submit(&self, check: usize, issued: u64, wrong_signature: bool) {
+        self.submit_with_artifact_expiry(check, issued, wrong_signature, None);
+    }
+    fn submit_with_artifact_expiry(
+        &self,
+        check: usize,
+        issued: u64,
+        wrong_signature: bool,
+        artifact_expiry: Option<u64>,
+    ) {
         let key = SigningKey::from_bytes(&[7; 32]);
         let record = ValidationRecord {
             subject: GitValidationSubject {
@@ -290,8 +306,9 @@ impl Fixture {
             issuer_registry_sha256: &registry_digest,
             dependencies: &[],
         };
-        let (payload, record) =
+        let (mut payload, record) =
             evidence_payload(&record, &self.recipe, &self.policies[check], &issuance).unwrap();
+        payload.artifacts[0].expires_at_ms = artifact_expiry;
         let mut envelope = crate::evidence::sign_evidence(payload, &key).unwrap();
         if wrong_signature {
             envelope.signature_hex = "a".repeat(128);
@@ -760,4 +777,178 @@ async fn truncated_outer_pull_inventory_invalidates_known_idle_journals() {
                 .all(|(_, v)| v["state"] == "pending")
         )
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_outer_inventory_invalidates_prior_green() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.run().await.unwrap();
+    f.forge.with(|s| s.arrayless_path = Some("/pulls".into()));
+    assert!(
+        reconcile_repo(&f.hub, &f.conn, &f.repo, "synthetic-token", None)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    f.forge.with(|s| {
+        assert!(
+            s.repos[&42]
+                .statuses
+                .iter()
+                .rev()
+                .take(2)
+                .all(|(_, v)| v["state"] == "pending")
+        )
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_later_inventory_page_cannot_hide_shared_head() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.forge.with(|s| {
+        let repo = s.repos.get_mut(&42).unwrap();
+        for number in 2..=101 {
+            let mut pull = fake::Pull::new(number, "other", &[]);
+            pull.head_sha = f.head.clone();
+            repo.pulls.insert(number, pull);
+        }
+        s.arrayless_query = Some("pulls?state=open&per_page=100&page=2".into());
+    });
+    assert!(f.run().await.is_err());
+    assert_eq!(f.counts(), (0, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expiry_after_preparation_or_success_invalidates_and_releases() {
+    for kind in [
+        "envelope",
+        "policy",
+        "key",
+        "revoked",
+        "artifact",
+        "uncertain",
+    ] {
+        for passed_guards in 0..=2 {
+            let now = Fixture::now();
+            let f = Fixture::with_key_expiry(
+                if kind == "key" {
+                    now + 1000
+                } else {
+                    i64::MAX as u64
+                },
+                if kind == "envelope" { 172800 } else { 3600 },
+                (kind == "revoked").then_some(now + 1000),
+            )
+            .await;
+            f.submit_with_artifact_expiry(
+                0,
+                now,
+                false,
+                (kind == "artifact").then_some(now + 1000),
+            );
+            f.submit_with_artifact_expiry(
+                1,
+                now,
+                false,
+                (kind == "artifact").then_some(now + 1000),
+            );
+            let later = match kind {
+                "envelope" => EvaluationClock::Known {
+                    unix_ms: now + 86_400_001,
+                },
+                "policy" => EvaluationClock::Known {
+                    unix_ms: now + 3_600_001,
+                },
+                "key" | "revoked" | "artifact" => EvaluationClock::Known {
+                    unix_ms: now + 1001,
+                },
+                _ => EvaluationClock::Uncertain,
+            };
+            TEST_CLOCKS.with(|clocks| {
+                let mut clocks = clocks.borrow_mut();
+                clocks.clear();
+                clocks.extend(std::iter::repeat_n(
+                    EvaluationClock::Known { unix_ms: now },
+                    2 + 2 * passed_guards,
+                ));
+                clocks.push_back(later);
+            });
+            assert!(f.run().await.is_err(), "{kind}/{passed_guards}");
+            assert_eq!(f.journal().phase, PublicationPhase::Idle);
+            assert_eq!(f.counts().0, 0);
+            f.forge.with(|s| {
+                let statuses = &s.repos[&42].statuses;
+                assert_eq!(
+                    statuses
+                        .iter()
+                        .filter(|(_, v)| v["state"] == "success")
+                        .count(),
+                    passed_guards
+                );
+                assert!(
+                    statuses
+                        .iter()
+                        .rev()
+                        .take(2)
+                        .all(|(_, v)| v["state"] == "pending")
+                );
+            });
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_identity_owns_and_updates_one_summary() {
+    let mut f = Fixture::new().await;
+    f.conn.kind = "app".into();
+    f.conn.app_slug = Some(fake::APP_SLUG.into());
+    f.forge.with(|s| {
+        s.installations.push(fake::Installation {
+            id: 99,
+            account: "acme".into(),
+            repos: vec![42],
+        });
+        s.installation_tokens.insert("synthetic-token".into(), 99);
+    });
+    f.submit(0, Fixture::now(), false);
+    f.run().await.unwrap();
+    let id = f.journal().comment_id;
+    f.submit(1, Fixture::now(), false);
+    f.run().await.unwrap();
+    assert_eq!(f.journal().comment_id, id);
+    assert_eq!(f.counts().0, 1);
+    f.forge.with(|s| {
+        assert_eq!(
+            s.repos[&42].comments[&1][0].author,
+            format!("{}[bot]", fake::APP_SLUG)
+        )
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_inventory_entry_cannot_hide_shared_head() {
+    for sha in [String::new(), "A".repeat(40)] {
+        let f = Fixture::new().await;
+        f.submit(0, Fixture::now(), false);
+        f.run().await.unwrap();
+        f.forge.with(|s| {
+            let mut pull = fake::Pull::new(2, "other", &[]);
+            pull.head_sha = sha;
+            s.repos.get_mut(&42).unwrap().pulls.insert(2, pull);
+        });
+        assert!(f.run().await.is_err());
+        assert_eq!(f.journal().phase, PublicationPhase::Idle);
+        f.forge.with(|s| {
+            assert!(
+                s.repos[&42]
+                    .statuses
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .all(|(_, v)| v["state"] == "pending")
+            )
+        });
+    }
 }

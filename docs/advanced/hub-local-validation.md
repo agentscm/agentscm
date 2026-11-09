@@ -6,7 +6,7 @@ title: "Hub local-validation summaries"
 
 The opt-in Hub mode retains exact signed validation evidence and maintains one informational summary comment per GitHub pull request through the connected forge identity. Every configured requirement has its own result, commit, freshness and omissions. Independent verification of the archive publishes the statuses; the rendered comment grants no authority. Self-hosted Hubs have the same implementation and enrollment rules; there is no hosted-service entitlement or paywall.
 
-This is an alpha, Unix-only, canonical github.com profile. The GitHub App path has synthetic qualification; token connections are accepted by the runtime but remain unqualified for this mode. GitLab, Forgejo, GitHub Enterprise and combined merge-group validation are unsupported here. Synthetic Git, forge, HTTP and database tests cover the protocol; a live multi-requirement, multi-revision publish → update → fetch → verify → status lifecycle has not been qualified. Do not interpret a green product PR as live forge or Hub container end-to-end qualification.
+This is an alpha, Unix-only, canonical github.com profile. Synthetic runtime tests cover PAT and App-owned summary identities; actual installation permissions and live operation remain unqualified. GitLab, Forgejo, GitHub Enterprise and combined merge-group validation are unsupported here. Synthetic Git, forge, HTTP and database tests cover the protocol; a live multi-requirement, multi-revision publish → update → fetch → verify → status lifecycle has not been qualified. Do not interpret a green product PR as live forge or Hub container end-to-end qualification.
 
 ## Choose one publication mode
 

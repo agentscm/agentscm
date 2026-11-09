@@ -351,6 +351,7 @@ pub struct FakeState {
     pub arrayless_external_lists: bool,
     /// Answer every GET whose path contains this with 200 and an empty object, no array.
     pub arrayless_path: Option<String>,
+    pub arrayless_query: Option<String>,
     /// Store the next created comment, then answer 502 with no body.
     pub lose_next_comment_reply: bool,
     pub requests: Vec<Request>,
@@ -1016,6 +1017,15 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
     if let Some(path) = &state.arrayless_path
         && method == Method::GET
         && uri.path().contains(path.as_str())
+    {
+        return json_reply(200, json!({}));
+    }
+
+    if method == Method::GET
+        && state
+            .arrayless_query
+            .as_ref()
+            .is_some_and(|path| path_and_query.contains(path))
     {
         return json_reply(200, json!({}));
     }

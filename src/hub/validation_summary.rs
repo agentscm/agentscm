@@ -118,7 +118,16 @@ fn trusted(fetch: &FetchContext<'_>, commit: &str) -> crate::Result<Trusted> {
         )?)?,
     })
 }
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCKS: std::cell::RefCell<std::collections::VecDeque<EvaluationClock>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
 fn clock() -> EvaluationClock {
+    #[cfg(test)]
+    if let Some(clock) = TEST_CLOCKS.with(|clocks| clocks.borrow_mut().pop_front()) {
+        return clock;
+    }
+
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -138,6 +147,28 @@ fn status_state(state: VerdictState) -> StatusState {
 struct Plan {
     rows: Vec<Row>,
     statuses: Vec<(ValidationStatusSlot, StatusState, String)>,
+    freshness: Vec<Box<dyn Fn(EvaluationClock) -> bool + Send>>,
+    success_windows: Vec<(u64, u64)>,
+}
+impl Plan {
+    fn fresh(&self) -> bool {
+        let before = clock();
+        if !tokio::task::block_in_place(|| self.freshness.iter().all(|check| check(before))) {
+            return false;
+        }
+        // Verification can be expensive. Sample again after it, checking cheap
+        // exclusive bounds before dispatch, including the policy's inclusive age.
+        let (EvaluationClock::Known { unix_ms: before }, EvaluationClock::Known { unix_ms: after }) =
+            (before, clock())
+        else {
+            return false;
+        };
+        after >= before
+            && self
+                .success_windows
+                .iter()
+                .all(|(issued, expires)| after >= *issued && after < *expires)
+    }
 }
 fn evaluate(
     state: &HubState,
@@ -195,7 +226,11 @@ fn evaluate(
     let mut plan = Plan {
         rows: Vec::new(),
         statuses: Vec::new(),
+        freshness: Vec::new(),
+        success_windows: Vec::new(),
     };
+    let pairs = std::sync::Arc::new(pairs);
+    let evaluated_at = clock();
     for check in trusted.checks {
         let required = validation::run::required_commands(
             git,
@@ -227,9 +262,79 @@ fn evaluate(
                 required: &required,
                 selections: &selections,
             },
-            clock(),
+            evaluated_at,
         );
+        if verdict.state == VerdictState::Success
+            || verdict
+                .constituents
+                .iter()
+                .any(|v| v.state == VerdictState::Success)
+        {
+            let envelope = pairs
+                .iter()
+                .find(|(e, _)| digest(e) == verdict.envelope_sha256)
+                .and_then(|(e, _)| crate::evidence::EvidenceEnvelope::from_slice(e).ok())
+                .ok_or_else(|| failed("selected validation envelope unavailable"))?;
+            let payload = &envelope.payload;
+            let key = trusted
+                .registry
+                .key_record(&payload.issuer_id, &payload.key_id)
+                .map_err(|_| failed("selected issuer unavailable"))?
+                .ok_or_else(|| failed("selected issuer unavailable"))?;
+            let expires = payload
+                .expires_at_ms
+                .min(key.not_after_ms)
+                .min(key.revoked_at_ms.unwrap_or(u64::MAX))
+                .min(
+                    payload
+                        .artifacts
+                        .iter()
+                        .filter_map(|a| a.expires_at_ms)
+                        .min()
+                        .unwrap_or(u64::MAX),
+                )
+                .min(
+                    payload
+                        .issued_at_ms
+                        .saturating_add(check.policy.max_age_seconds.saturating_mul(1000))
+                        .saturating_add(1),
+                );
+            plan.success_windows.push((payload.issued_at_ms, expires));
+        }
         let omissions = selected_omissions(&pairs, &verdict);
+        // Cache the exact authenticated inputs and observed Git bindings. No IO may
+        // intervene between this pure clock re-evaluation and the corresponding send.
+        let expected = verdict.clone();
+        let recipe = check.recipe.clone();
+        let policy = check.policy.clone();
+        let registry = trusted.registry.clone();
+        let pairs = pairs.clone();
+        let canonical = canonical.clone();
+        let cached_head = head.clone();
+        let tree = observed.tree.clone();
+        let merge_base = observed.merge_base.clone();
+        plan.freshness.push(Box::new(move |clock| {
+            if matches!(clock, EvaluationClock::Uncertain) {
+                return false;
+            }
+            validation::select_pairs(
+                pairs.iter().map(|(e, r)| (e, r)),
+                &recipe,
+                &registry,
+                &policy,
+                Observed {
+                    repository: &canonical,
+                    commit: &cached_head.head_sha,
+                    tree: &tree,
+                    base_ref: &format!("refs/heads/{}", cached_head.base_ref),
+                    merge_base: &merge_base,
+                    required: &required,
+                    selections: &selections,
+                },
+                clock,
+            ) == expected
+        }));
+
         plan.statuses.push((
             ValidationStatusSlot {
                 head: head.head_sha.clone(),
@@ -334,10 +439,7 @@ pub(super) async fn reconcile_repo(
         let numbers = if let Some(number) = only {
             vec![number]
         } else {
-            let page = api
-                .open_pulls(token, &repo.full_name, None)
-                .await?
-                .ok_or_else(|| failed("open pull inventory unavailable"))?;
+            let page = api.validation_open_pulls(token, &repo.full_name).await?;
             if page.unread != 0 {
                 return Err(failed("open pull inventory incomplete"));
             }
@@ -580,10 +682,7 @@ async fn reconcile_pull_inner(
     if head.base_repo_id != repo.repository_id as u64 {
         return Err(failed("validation base repository identity changed"));
     }
-    let pulls = api
-        .open_pulls(token, &repo.full_name, None)
-        .await?
-        .ok_or_else(|| failed("open pull inventory unavailable"))?;
+    let pulls = api.validation_open_pulls(token, &repo.full_name).await?;
     if pulls.unread != 0 {
         return Err(failed("open pull inventory incomplete"));
     }
@@ -617,6 +716,8 @@ async fn reconcile_pull_inner(
             Plan {
                 rows: Vec::new(),
                 statuses: Vec::new(),
+                freshness: Vec::new(),
+                success_windows: Vec::new(),
             },
             Some("configuration, source or evidence unavailable"),
         ),
@@ -726,10 +827,7 @@ async fn reconcile_pull_inner(
                 hub.store
                     .validation_snapshot(&repo.id, number, MAX_RECEIPTS)
             })?;
-            let pulls = api
-                .open_pulls(token, &repo.full_name, None)
-                .await?
-                .ok_or_else(|| failed("pull inventory unavailable during publication"))?;
+            let pulls = api.validation_open_pulls(token, &repo.full_name).await?;
             let shared_now = pulls
                 .items
                 .iter()
@@ -746,7 +844,7 @@ async fn reconcile_pull_inner(
             )
         }
         .await;
-        if !matches!(current, Ok(true)) {
+        if !matches!(current, Ok(true)) || !plan.fresh() {
             abort_attempt(hub, api, token, repo, number, &next).await?;
             return Err(failed(
                 "validation changed during publication; statuses invalidated",
@@ -778,7 +876,7 @@ async fn reconcile_pull_inner(
         )
     }
     .await;
-    if !matches!(current, Ok(true)) {
+    if !matches!(current, Ok(true)) || !plan.fresh() {
         abort_attempt(hub, api, token, repo, number, &next).await?;
         return Err(failed(
             "validation changed before summary; statuses invalidated",

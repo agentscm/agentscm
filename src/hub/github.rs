@@ -587,6 +587,32 @@ impl Api {
         self.paged(token, &path, None, MAX_PULL_PAGES, etag).await
     }
 
+    /// Strict inventory for hosted validation: malformed pages or entries cannot hide
+    /// another proposal sharing a status-bearing head.
+    pub async fn validation_open_pulls(&self, token: &str, full_name: &str) -> Gh<Paged> {
+        let path = format!("/repos/{full_name}/pulls?state=open");
+        let page = self
+            .paged_with(token, &path, None, MAX_PULL_PAGES, None, true)
+            .await?
+            .ok_or_else(|| GhError::Failed("unexpected 304 from pulls".into()))?;
+        if page.unread != 0
+            || page.items.iter().any(|p| {
+                p["number"].as_i64().is_none_or(|n| n <= 0)
+                    || !p["head"]["sha"].as_str().is_some_and(|sha| {
+                        sha.len() == 40
+                            && sha
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+            })
+        {
+            return Err(GhError::Failed(
+                "incomplete or malformed validation pull inventory".into(),
+            ));
+        }
+        Ok(page)
+    }
+
     /// Open issue inventory by immutable repository identity. Pull requests are filtered by
     /// the typed decoder. Unread pages remain an explicit coverage gap.
     pub async fn open_issues(&self, token: &str, repository_id: i64) -> Gh<Paged> {
