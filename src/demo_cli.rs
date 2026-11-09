@@ -411,6 +411,16 @@ async fn scenario(
         .ok_or_else(|| {
             Error::Invalid(format!("the demo hub did not refuse the edit: {refusal}"))
         })?;
+    // The simulated agents declare no Work, so the refusal leads with the one-time request to
+    // declare it; the demo shows the part about the file another agent holds.
+    let undeclared = format!(
+        "AgentSCM: {}: ",
+        crate::hub::work_lifecycle::WORK_UNDECLARED
+    );
+    let reason = match reason.split_once('\n') {
+        Some((head, rest)) if head.starts_with(&undeclared) => rest,
+        _ => reason,
+    };
     let repeat = driver.hook(&sam, Event::Edit(&files[0])).await?;
     if is_denied(&repeat) {
         return Err(Error::Invalid(format!(

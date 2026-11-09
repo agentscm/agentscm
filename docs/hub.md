@@ -929,7 +929,8 @@ Sessions write `session_started`, `session_connected` (a new connection mode),
 `idle` or `cap`, written when the session next calls) events, subject the token
 id; their intents write the usual intent events. `GET /v1/hub/health` adds
 `"coordination": {"denied", "repeated", "rate_limited", "fail_open",
-"hook_p95_ms"}`, counted by this hub process since it started (p95 over the
+"undeclared", "hook_p95_ms"}` (`undeclared`: sessions told once to declare their Work,
+refused or noted), counted by this hub process since it started (p95 over the
 last 1024 hook calls). Session rows untouched for 7 days are pruned.
 
 ## Change-record capture and handoff
