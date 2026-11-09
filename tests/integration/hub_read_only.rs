@@ -62,6 +62,10 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/digest".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/digest/settings".into(), "".into(), Allowed);
+    row(&put, "/v1/hub/standup/digest/settings".into(), r#"{"enabled":true}"#.into(), AgentOnly);
+    row(&put, "/v1/hub/standup/digest/settings/me".into(), r#"{"opted_out":true}"#.into(), AgentOnly);
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/operational".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/reconciliation".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work?q=x".into(), "".into(), Allowed);
