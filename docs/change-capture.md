@@ -504,7 +504,21 @@ checkpoints.
 
 When exact current Work resolution is unavailable or returns no authorized target, the hook keeps
 only a bounded sanitized local fact. It strips prompt text, tool input/output, error, and cwd even
-in local-conversation mode. Every deferred occurrence reserves a replay-stable sequence, including
+in local-conversation mode. One exception keeps a session's opening prompt: while the repository
+shares conversations, a prompt submitted before the session claims Work is also held in a private
+file under the config directory (the first 8 prompts of up to 64 KiB each; a file older than 24
+hours is deleted when next read). When the
+same session next resolves its claimed Work, the held prompts are captured first, under that Work,
+and the file is removed; when the session's pinned mode is not shared, they are discarded.
+
+A reply a `MessageDisplay` hook did not deliver (for example because the host stopped the hook) is
+recovered at the turn's `Stop`: the hook reads the session's transcript on from where the previous
+`Stop` stopped (at most 8 MiB per turn) and captures each assistant text no `MessageDisplay`
+delivered, matched by its whole text (fragments of one message are joined, whitespace ignored), as
+a `MessageDisplay` keyed by its transcript entry, so a repeat is a duplicate. Recovery starts where
+the session claimed Work, or where this build first saw the session: replies before that are never
+recovered. The texts already seen and the read offset are kept per session in the same private
+directory, under a lock, and a session start removes files there untouched for 7 days. Every deferred occurrence reserves a replay-stable sequence, including
 events with provider identities. An unresolved `PreToolUse` also captures the source and canonical
 recipe digest at that time when possible. If that observed session already had an exact authorized
 target, the deferred record copies that target and the next reachable hook makes the outage visible

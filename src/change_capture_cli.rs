@@ -499,9 +499,25 @@ async fn capture_claude(
         ),
     };
     let live_mode = change_capture_client::mode_under_hub(binding, sharing);
+    let event = payload.get("hook_event_name").and_then(Value::as_str);
+    let session_start = event == Some("SessionStart");
+    if session_start {
+        sweep_session_files();
+    }
+    let replies = session_file(binding, &format!("replies\0{session_id}"));
     let target = match target {
         Ok(Some(target)) => target,
         Ok(None) => {
+            // A session's opening prompt comes before it claims Work. With sharing on, keep the
+            // prompt locally so it reaches the Work this session claims next.
+            if live_mode == CaptureModeV1::SharedConversation
+                && payload.get("hook_event_name").and_then(Value::as_str)
+                    == Some("UserPromptSubmit")
+            {
+                hold_prompt(&session_file(binding, &session_id), input);
+            }
+            // Replies before the claim are not the Work's: recovery starts after them.
+            skip_transcript(&replies, payload, false);
             let retained = claude_code::deferred_native_hook(
                 input,
                 DeferredReasonV1::NoCurrentAuthorizedWork,
@@ -518,7 +534,8 @@ async fn capture_claude(
                     "AgentSCM local capture warning: native session has no current authorized work; a sanitized fact remains unassociated"
                 );
             }
-            return None;
+            return session_start
+                .then(|| sharing_state(live_mode == CaptureModeV1::SharedConversation));
         }
         Err(_) => {
             let retained = claude_code::deferred_native_hook(
@@ -537,7 +554,8 @@ async fn capture_claude(
                     "AgentSCM local capture warning: current authorized work could not be resolved; a sanitized fact remains unassociated"
                 );
             }
-            return None;
+            return session_start
+                .then(|| sharing_state(live_mode == CaptureModeV1::SharedConversation));
         }
     };
     let live_parent = payload
@@ -567,12 +585,26 @@ async fn capture_claude(
         operation_prefix: "hook".into(),
         work_id: target.work_id,
         generation: target.generation,
-        observed_session_id: session_id,
+        observed_session_id: session_id.clone(),
         canonical_session_id: target.session_id,
         parent_session_id,
         capture_mode,
         live_capture_mode: live_mode,
     };
+    // Prompts held before the claim come first, and only into a shared conversation.
+    let held = take_held_prompts(&session_file(binding, &session_id));
+    if capture_mode == CaptureModeV1::SharedConversation {
+        for prompt in held {
+            if claude_code::capture_native_hook(&prompt, &request, &actions, spool).is_err() {
+                eprintln!("AgentSCM local capture warning: a prompt held before the claim was not retained");
+            }
+        }
+    }
+    // A session first seen with Work (or on an older build) recovers only replies from now on.
+    skip_transcript(&replies, payload, true);
+    if event == Some("MessageDisplay") {
+        note_fragment(&replies, payload);
+    }
     match claude_code::capture_native_hook(input, &request, &actions, spool) {
         Ok(report) => {
             for warning in report.warnings {
@@ -580,6 +612,21 @@ async fn capture_claude(
             }
         }
         Err(_) => eprintln!("AgentSCM local capture warning: native event was not retained"),
+    }
+    if event == Some("Stop")
+        && let Some(transcript) = payload.get("transcript_path").and_then(Value::as_str)
+    {
+        for (hash, reply) in
+            missed_replies(&replies, std::path::Path::new(transcript), &session_id)
+        {
+            if claude_code::capture_native_hook(&reply, &request, &actions, spool).is_ok() {
+                note_replies(&replies, |seen| {
+                    seen.hashes.insert(hash);
+                });
+            } else {
+                eprintln!("AgentSCM local capture warning: a reply recovered from the transcript was not retained");
+            }
+        }
     }
     if let (Some(history_root), Some(transcript_path)) = (
         binding.claude_history_root.as_deref(),
@@ -618,7 +665,7 @@ async fn capture_claude(
     if payload.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
         return None;
     }
-    let mut context = Vec::new();
+    let mut context = vec![sharing_state(capture_mode == CaptureModeV1::SharedConversation)];
     if capture_mode == CaptureModeV1::SharedConversation
         && let (Some(answer), Some(hub)) = (sharing, hub)
         && answer.sharing
@@ -644,6 +691,298 @@ async fn capture_claude(
         }
     }
     (!context.is_empty()).then(|| context.join("\n\n"))
+}
+
+/// Prompts a session may hold before it claims Work, the size of each, and how long they keep.
+const HELD_PROMPTS: usize = 8;
+const HELD_PROMPT_BYTES: usize = 64 * 1024;
+const HELD_PROMPT_SECONDS: u64 = 24 * 60 * 60;
+
+/// A private file per checkout and session (held prompts, seen replies); its name reveals neither.
+fn session_file(
+    binding: &change_capture_client::CaptureBinding,
+    session_id: &str,
+) -> Option<PathBuf> {
+    use sha2::Digest;
+    let key = sha2::Sha256::digest(format!("{}\0{session_id}", binding.root.display()));
+    let name: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(
+        crate::hub_cli::config_dir()
+            .ok()?
+            .join("agentscm")
+            .join("capture-sessions")
+            .join(name),
+    )
+}
+
+/// Session files untouched this long are removed at a session start.
+const SESSION_FILE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+fn sweep_session_files() {
+    let Some(directory) = crate::hub_cli::config_dir()
+        .ok()
+        .map(|dir| dir.join("agentscm").join("capture-sessions"))
+    else {
+        return;
+    };
+    for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age.as_secs() >= SESSION_FILE_SECONDS);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Runs `change` holding the session file's lock: separate hook processes of one session may
+/// update it at once. Without the lock the change still runs (fail open).
+fn locked<T>(path: &std::path::Path, change: impl FnOnce() -> T) -> T {
+    let lock = path.with_extension("lock");
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&lock).ok();
+    let held = file.as_ref().is_some_and(|file| file.lock().is_ok());
+    let result = change();
+    if held {
+        let _ = file.as_ref().map(File::unlock);
+    }
+    result
+}
+
+/// Keeps the first prompts only: the opening prompt matters most, and the bound keeps a session
+/// that never claims from growing the file.
+fn hold_prompt(path: &Option<PathBuf>, input: &[u8]) {
+    let (Some(path), Ok(text)) = (path, std::str::from_utf8(input)) else {
+        return;
+    };
+    if input.len() > HELD_PROMPT_BYTES {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    locked(path, || {
+        let mut held = read_held(path);
+        if held.len() >= HELD_PROMPTS {
+            return;
+        }
+        held.push(text.to_owned());
+        if let Ok(text) = serde_json::to_string(&held) {
+            let _ = crate::hub_cli::write_private(path, &text);
+        }
+    });
+}
+
+fn read_held(path: &std::path::Path) -> Vec<String> {
+    let fresh = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < HELD_PROMPT_SECONDS);
+    if !fresh {
+        let _ = fs::remove_file(path);
+        return Vec::new();
+    }
+    fs::read(path)
+        .ok()
+        .filter(|bytes| bytes.len() <= HELD_PROMPTS * HELD_PROMPT_BYTES * 2)
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// The held prompts, removed from disk whatever happens to them next.
+fn take_held_prompts(path: &Option<PathBuf>) -> Vec<Vec<u8>> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    locked(path, || {
+        let held = read_held(path);
+        let _ = fs::remove_file(path);
+        held.into_iter().map(String::into_bytes).collect()
+    })
+}
+
+/// Replies already captured in a session, by text, and how far its transcript has been read.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SeenReplies {
+    offset: u64,
+    hashes: std::collections::BTreeSet<String>,
+    /// Fragments of replies still being displayed, by message id, joined until the final one.
+    #[serde(default)]
+    partial: std::collections::BTreeMap<String, String>,
+}
+
+/// Replies being assembled at once, and the size of each.
+const PARTIAL_REPLIES: usize = 64;
+const PARTIAL_REPLY_BYTES: usize = 1 << 20;
+
+/// Transcript bytes read per Stop, and replies remembered per session.
+const TRANSCRIPT_READ_BYTES: u64 = 8 << 20;
+const SEEN_REPLIES: usize = 4096;
+
+/// Ignores whitespace: the transcript joins a reply's text blocks differently from the hooks.
+fn text_hash(text: &str) -> String {
+    use sha2::Digest;
+    let text: String = text.split_whitespace().collect();
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Updates the session's seen replies; `change` gets the saved state, or None for a new session.
+fn update_replies(path: &Option<PathBuf>, change: impl FnOnce(Option<SeenReplies>) -> Option<SeenReplies>) {
+    let Some(path) = path else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    locked(path, || {
+        let saved = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let Some(mut seen) = change(saved) else { return };
+        while seen.hashes.len() > SEEN_REPLIES {
+            let first = seen.hashes.iter().next().cloned();
+            first.map(|first| seen.hashes.remove(&first));
+        }
+        while seen.partial.len() > PARTIAL_REPLIES {
+            let first = seen.partial.keys().next().cloned();
+            first.map(|first| seen.partial.remove(&first));
+        }
+        if let Ok(text) = serde_json::to_string(&seen) {
+            let _ = crate::hub_cli::write_private(path, &text);
+        }
+    });
+}
+
+fn note_replies(path: &Option<PathBuf>, change: impl FnOnce(&mut SeenReplies)) {
+    update_replies(path, |seen| {
+        let mut seen = seen.unwrap_or_default();
+        change(&mut seen);
+        Some(seen)
+    });
+}
+
+/// Records a displayed reply fragment; the final one marks the whole reply as seen.
+fn note_fragment(path: &Option<PathBuf>, payload: &Value) {
+    let (Some(id), Some(delta)) = (
+        payload.get("message_id").and_then(Value::as_str),
+        payload.get("delta").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let last = payload.get("final") == Some(&Value::Bool(true));
+    note_replies(path, |seen| {
+        let mut text = seen.partial.remove(id).unwrap_or_default();
+        if text.len() + delta.len() <= PARTIAL_REPLY_BYTES {
+            text.push_str(delta);
+        }
+        if last {
+            seen.hashes.insert(text_hash(&text));
+        } else {
+            seen.partial.insert(id.to_owned(), text);
+        }
+    });
+}
+
+/// Moves transcript recovery to the transcript's end: always (`only_new` false), or only for a
+/// session with no saved state yet.
+fn skip_transcript(path: &Option<PathBuf>, payload: &Value, only_new: bool) {
+    let Some(length) = payload
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .and_then(|transcript| fs::metadata(transcript).ok())
+        .map(|metadata| metadata.len())
+    else {
+        return;
+    };
+    update_replies(path, |saved| match saved {
+        Some(_) if only_new => None,
+        saved => {
+            let mut seen = saved.unwrap_or_default();
+            seen.offset = length;
+            Some(seen)
+        }
+    });
+}
+
+/// The session's assistant replies in its transcript that no MessageDisplay hook delivered (a
+/// hook the host stopped loses its reply), as MessageDisplay inputs keyed by transcript entry, so
+/// a repeat is a duplicate. Reads on from where the last Stop stopped.
+fn missed_replies(
+    seen_path: &Option<PathBuf>,
+    transcript: &std::path::Path,
+    session_id: &str,
+) -> Vec<(String, Vec<u8>)> {
+    use std::io::{BufRead, Seek};
+    let mut found = Vec::new();
+    note_replies(seen_path, |seen| {
+        let Ok(mut file) = File::open(transcript) else {
+            return;
+        };
+        let length = file.metadata().map_or(0, |metadata| metadata.len());
+        // A shorter transcript is another file: read it from the start.
+        if seen.offset > length {
+            seen.offset = 0;
+        }
+        if file.seek(std::io::SeekFrom::Start(seen.offset)).is_err() {
+            return;
+        }
+        let mut reader = BufReader::new(file.take(TRANSCRIPT_READ_BYTES));
+        let mut line = Vec::new();
+        while let Ok(read) = reader.read_until(b'\n', &mut line) {
+            // Only whole lines count; a line still being written is read next time.
+            if read == 0 || line.last() != Some(&b'\n') {
+                break;
+            }
+            seen.offset += read as u64;
+            if let Ok(entry) = serde_json::from_slice::<Value>(&line) {
+                let text = (entry["type"] == "assistant" && entry["isSidechain"] != true)
+                    .then(|| entry["message"]["content"].as_array())
+                    .flatten()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|block| block["type"] == "text")
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n")
+                    })
+                    .filter(|text| !text.trim().is_empty());
+                if let (Some(text), Some(uuid)) = (text, entry["uuid"].as_str())
+                    && !seen.hashes.contains(&text_hash(&text))
+                {
+                    let reply = json!({
+                        "hook_event_name": "MessageDisplay",
+                        "session_id": session_id,
+                        "message_id": format!("transcript:{uuid}"),
+                        "timestamp": entry["timestamp"],
+                        "delta": text,
+                        "index": 0,
+                        "final": true,
+                    });
+                    found.extend(serde_json::to_vec(&reply).map(|reply| (text_hash(&text), reply)));
+                }
+            }
+            line.clear();
+        }
+    });
+    found
+}
+
+/// Said at every session start, beside where the session coordinates.
+fn sharing_state(shared: bool) -> String {
+    if shared {
+        "AgentSCM: conversation sharing is on for this session.".into()
+    } else {
+        "AgentSCM: conversation sharing is off for this session; only sanitized activity facts are recorded.".into()
+    }
 }
 
 /// Told once per person and repository, in the agent's session context.
@@ -1062,6 +1401,62 @@ fn capture_error(error: agentscm::change_capture::CaptureError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{recipe_exit_status, session_start_output};
+
+    #[test]
+    fn stop_recovers_only_replies_no_hook_delivered_and_reads_each_line_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Some(dir.path().join("seen"));
+        let transcript = dir.path().join("t.jsonl");
+        let line = |uuid: &str, texts: &[&str]| {
+            let blocks: Vec<_> = texts
+                .iter()
+                .map(|text| serde_json::json!({"type": "text", "text": text}))
+                .collect();
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "assistant", "uuid": uuid, "timestamp": "2026-11-09T10:00:00Z",
+                    "message": {"content": blocks}})
+            )
+        };
+        let shown = |delta: &str, last: bool| {
+            super::note_fragment(
+                &seen,
+                &serde_json::json!({"message_id": "m1", "delta": delta, "final": last}),
+            )
+        };
+        // "delivered" arrived through MessageDisplay in two fragments; "lost" did not.
+        std::fs::write(&transcript, line("old", &["before this build"])).unwrap();
+        let payload = serde_json::json!({"transcript_path": transcript});
+        super::skip_transcript(&seen, &payload, true);
+        shown("Deliv", false);
+        shown("ered.", true);
+        let mut text = std::fs::read_to_string(&transcript).unwrap();
+        text += &(line("a", &["Deliv", "ered."]) + &line("b", &["lost"]) + "{\"type\":\"user\"}\n" + "{\"partial");
+        std::fs::write(&transcript, text).unwrap();
+        // State saved already: skipping only for a new session leaves it alone.
+        super::skip_transcript(&seen, &payload, true);
+        let replies = super::missed_replies(&seen, &transcript, "s");
+        assert_eq!(replies.len(), 1);
+        let reply: serde_json::Value = serde_json::from_slice(&replies[0].1).unwrap();
+        assert_eq!(reply["hook_event_name"], "MessageDisplay");
+        assert_eq!(reply["delta"], "lost");
+        assert_eq!(reply["message_id"], "transcript:b");
+        assert!(super::missed_replies(&seen, &transcript, "s").is_empty());
+    }
+
+    #[test]
+    fn held_prompts_keep_the_first_few_and_are_taken_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Some(dir.path().join("held").join("session"));
+        for n in 0..super::HELD_PROMPTS + 2 {
+            super::hold_prompt(&path, format!("{{\"prompt\":\"{n}\"}}").as_bytes());
+        }
+        super::hold_prompt(&path, &vec![b'x'; super::HELD_PROMPT_BYTES + 1]);
+        let taken = super::take_held_prompts(&path);
+        assert_eq!(taken.len(), super::HELD_PROMPTS);
+        assert_eq!(taken[0], br#"{"prompt":"0"}"#);
+        assert!(super::take_held_prompts(&path).is_empty());
+    }
     use agentscm::change_capture::ObservedStop;
     use agentscm::change_record::ActionOutcomeV1;
 

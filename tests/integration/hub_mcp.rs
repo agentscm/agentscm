@@ -1061,7 +1061,7 @@ async fn two_agents_round_trip_to_a_stop() {
         .await;
     assert!(!error);
     assert!(
-        text.contains("no other agents are working in acme/widgets"),
+        text.contains("no other agent sessions are live in acme/widgets"),
         "{text}"
     );
     assert!(!text.contains("already working"));

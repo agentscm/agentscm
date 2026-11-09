@@ -1282,7 +1282,8 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     // The next session connects the checkout and says so in one line, writing no file in it.
     let reply = machine.session_start("s1");
     assert!(
-        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO}.")),
+        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO} at "))
+            && context(&reply).contains("This checkout was just connected."),
         "{reply}"
     );
     let connection = machine.connection();

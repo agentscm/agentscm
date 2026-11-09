@@ -2485,7 +2485,13 @@ impl LocalSpool {
         }
         let digest = sha256(bytes);
         let path = self.root.join("artifacts").join(&digest);
-        let _lock = self.lock()?;
+        // Artifacts are installed by rename and never rewritten, so one already retained is
+        // verified without the lock; a source snapshot retains hundreds per hook.
+        let _lock = if path.exists() {
+            None
+        } else {
+            Some(self.lock()?)
+        };
         if path.exists() {
             let existing = read_bounded(&path, self.limits.max_artifact_bytes)?;
             if existing != bytes {
@@ -3676,7 +3682,9 @@ impl LocalSpool {
                 "spool_v4_identity_mismatch: capture spool identity commit changed".into(),
             ));
         }
-        validate_private_authority_layout(directory, true)?;
+        // Opening the spool checks every retained file; each lock re-checks the root and its
+        // directories only. Rescanning every file per lock made one hook O(locks x files).
+        validate_private_authority_layout(directory, false)?;
         Ok(())
     }
 

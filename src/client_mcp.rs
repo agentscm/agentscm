@@ -74,7 +74,23 @@ fn current_token(
     verified: &mut Option<(Connection, Instant)>,
 ) -> Result<String> {
     let changed = || invalid("client connection changed; restart the AgentSCM MCP server");
-    let saved = selected(&connection.root, &load()?)?;
+    let connections = load()?;
+    let saved = match selected(&connection.root, &connections) {
+        Ok(saved) => saved,
+        // The connection this server started with is gone (removed, or its token expired).
+        // The checkout's current one keeps the server running when it reaches the same Hub and
+        // repository, so a worktree session survives its main checkout reconnecting.
+        Err(_) => {
+            let (current, _) = connection_for_checkout(&connections, checkout).ok_or_else(changed)?;
+            if current.hub != connection.hub
+                || current.repo != connection.repo
+                || !is_current_in(current, checkout)
+            {
+                return Err(changed());
+            }
+            return read_token(&current.token_file);
+        }
+    };
     let renewed = renewed_in_place(&saved, connection);
     let fresh = verified
         .as_ref()
@@ -600,6 +616,64 @@ mod tests {
         // A supplied token is managed elsewhere and never counts as renewed.
         let supplied = saved("https://one.example".into(), "/one", "owner/one");
         assert!(!renewed_in_place(&supplied, &supplied));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_keeps_working_when_its_connection_moves_to_the_main_checkout() {
+        crate::client_config::in_isolated_config_home(|home| {
+            use std::os::unix::fs::PermissionsExt;
+            let git = |dir: &Path, args: &[&str]| {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .output()
+                    .unwrap();
+                assert!(status.status.success(), "git {args:?}");
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("main");
+            std::fs::create_dir(&main).unwrap();
+            git(&main, &["init", "--quiet"]);
+            git(&main, &["remote", "add", "origin", "https://github.com/acme/widgets.git"]);
+            git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "--allow-empty", "-m", "t"]);
+            let linked = dir.path().join("linked");
+            git(&main, &["worktree", "add", "--quiet", "--detach", linked.to_str().unwrap()]);
+            let (main, linked) = (main.canonicalize().unwrap(), linked.canonicalize().unwrap());
+            let token = |name: &str, value: &str| {
+                let path = home.join(name);
+                std::fs::write(&path, value).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                path
+            };
+            let bound = |root: PathBuf, repo: &str, file: PathBuf| Connection {
+                origin_host: "github.com".into(),
+                token_file: file,
+                ..saved("https://hub.example".into(), root.to_str().unwrap(), repo)
+            };
+            let own = bound(linked.clone(), "acme/widgets", token("own", "own-token"));
+            let write = |connections: &[Connection]| {
+                let dir = home.join("agentscm");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("connections.json"),
+                    serde_json::to_string(&json!({"version": 1, "connections": connections}))
+                        .unwrap(),
+                )
+                .unwrap();
+            };
+            // The worktree's own connection was removed; the main checkout's serves the same
+            // Hub and repository, so the server switches to its token instead of stopping.
+            write(&[bound(main.clone(), "acme/widgets", token("main", "main-token"))]);
+            let mut verified = None;
+            assert_eq!(
+                current_token(&own, &linked, "own-token", &mut verified).unwrap(),
+                "main-token"
+            );
+            // Another repository's connection is never taken over.
+            write(&[bound(main.clone(), "acme/other", token("other", "other-token"))]);
+            assert!(current_token(&own, &linked, "own-token", &mut verified).is_err());
+        });
     }
 
     #[test]
