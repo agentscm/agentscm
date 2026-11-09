@@ -395,8 +395,11 @@ impl ValidationRecipe {
                 let mut paths = HashSet::new();
                 for rule in &selection.rules {
                     // A trailing '*' makes the rule match every path starting with the rest.
-                    let path = rule.path.strip_suffix('*').unwrap_or(&rule.path);
-                    validate_dependency_path(path.strip_suffix('/').unwrap_or(path))?;
+                    let path = match rule.path.strip_suffix('*') {
+                        Some(prefix) => prefix.strip_suffix('/').unwrap_or(prefix),
+                        None => &rule.path,
+                    };
+                    validate_dependency_path(path)?;
                     text("test filter", &rule.filter)?;
                     if !paths.insert(&rule.path) {
                         return Err(Error::Invalid("duplicate test selection path".into()));
