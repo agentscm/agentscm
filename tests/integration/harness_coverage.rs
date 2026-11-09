@@ -283,9 +283,7 @@ fn says_nothing(reply: &Value) {
 /// Session end is reported: the file the session announced is held, and the end releases it.
 fn end_releases(bench: &Bench, agent: &str, end: &Value) {
     assert!(
-        bench
-            .held_through(agent)
-            .contains(&"src/own.rs".to_owned()),
+        bench.held_through(agent).contains(&"src/own.rs".to_owned()),
         "{agent}"
     );
     bench.hook(agent, end);
@@ -319,9 +317,7 @@ fn claude_code_gets_what_its_row_says() {
         Some(&json!("deny")),
         "{refused}"
     );
-    assert!(
-        text(&refused, "/hookSpecificOutput/permissionDecisionReason").contains("src/held.rs")
-    );
+    assert!(text(&refused, "/hookSpecificOutput/permissionDecisionReason").contains("src/held.rs"));
     // Waiting is reported for a permission prompt and for the end of a turn.
     let mut prompt = pascal(&bench.root, "Notification");
     prompt["notification_type"] = json!("permission_prompt");
@@ -343,8 +339,7 @@ fn claude_code_gets_what_its_row_says() {
     );
     let held = bench.hook("claude", &edit(&bench, LED));
     assert!(
-        text(&held, "/hookSpecificOutput/permissionDecisionReason")
-            .contains("needs your response"),
+        text(&held, "/hookSpecificOutput/permissionDecisionReason").contains("needs your response"),
         "{held}"
     );
     // A subagent's call carries its parent's session: its edit is checked under the parent's
@@ -388,9 +383,7 @@ fn codex_gets_what_its_row_says() {
         Some(&json!("deny")),
         "{refused}"
     );
-    assert!(
-        text(&refused, "/hookSpecificOutput/permissionDecisionReason").contains("src/held.rs")
-    );
+    assert!(text(&refused, "/hookSpecificOutput/permissionDecisionReason").contains("src/held.rs"));
     // Waiting is reported for an approval request and for the end of a turn.
     says_nothing(&bench.hook("codex", &pascal(&bench.root, "PermissionRequest")));
     says_nothing(&bench.hook("codex", &pascal(&bench.root, "Stop")));
@@ -405,8 +398,7 @@ fn codex_gets_what_its_row_says() {
     assert!(text(&started, HOOK_CONTEXT).contains(&request), "{started}");
     let held = bench.hook("codex", &edit(&bench, LED));
     assert!(
-        text(&held, "/hookSpecificOutput/permissionDecisionReason")
-            .contains("needs your response"),
+        text(&held, "/hookSpecificOutput/permissionDecisionReason").contains("needs your response"),
         "{held}"
     );
     // A call that names a subagent is handled as Claude Code's is. Whether Codex sends that
@@ -553,7 +545,10 @@ fn gemini_cli_gets_what_its_row_says() {
     bench.other_holds("src/held.rs");
     let refused = bench.hook("gemini", &edit(&bench, "src/held.rs"));
     assert_eq!(refused["decision"], "deny", "{refused}");
-    assert!(text(&refused, "/reason").contains("src/held.rs"), "{refused}");
+    assert!(
+        text(&refused, "/reason").contains("src/held.rs"),
+        "{refused}"
+    );
     // Waiting is reported for a tool permission prompt and for the end of a turn.
     let mut prompt = pascal(&bench.root, "Notification");
     prompt["notification_type"] = json!("ToolPermission");
@@ -594,7 +589,10 @@ fn a_client_with_no_hooks_gets_what_its_row_says() {
         agentscm::hub::agent_rules::carries_all(instructions),
         "{reply}"
     );
-    assert!(!instructions.contains("AgentSCM native session ID"), "{reply}");
+    assert!(
+        !instructions.contains("AgentSCM native session ID"),
+        "{reply}"
+    );
 
     // Nothing is checked unless the agent asks: what it learns comes back in its own tool calls.
     bench.tool(
@@ -611,7 +609,11 @@ fn a_client_with_no_hooks_gets_what_its_row_says() {
         started.contains("1 other agent") && started.contains("fix billing"),
         "{started}"
     );
-    let checked = bench.tool(&bench.own, "agentscm_check", json!({"paths": ["docs/a.md"]}));
+    let checked = bench.tool(
+        &bench.own,
+        "agentscm_check",
+        json!({"paths": ["docs/a.md"]}),
+    );
     assert_eq!(
         checked,
         "AgentSCM: nothing new about these files since this session's last report."

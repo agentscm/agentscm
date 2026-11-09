@@ -104,6 +104,8 @@ mod guided_cli;
 #[cfg(unix)]
 mod guided_service;
 #[cfg(unix)]
+mod harness_coverage;
+#[cfg(unix)]
 mod history;
 mod hook_cli;
 mod hook_end_to_end;
