@@ -756,6 +756,9 @@ fn user_files(agent: Agent) -> Result<Vec<PathBuf>> {
             home.join(".gemini").join(skill),
         ],
         Agent::Copilot => {
+            // Copilot CLI and VS Code's Copilot sessions read these same two user locations,
+            // so no VS Code profile `mcp.json` is written: VS Code forwards that file's servers
+            // into the same sessions, which would start this server twice.
             let copilot = copilot_home()?;
             vec![
                 copilot.join("mcp-config.json"),
@@ -1853,5 +1856,61 @@ mod tests {
         .unwrap();
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), after);
+    }
+
+    /// The hook events behind the coverage table in docs/agents.md, for the agents set up from
+    /// configuration files. Claude Code and Codex get theirs from their plugins.
+    #[test]
+    fn file_configured_agents_are_wired_for_the_events_their_coverage_names() {
+        let events = |agent| -> Vec<&'static str> {
+            hook_groups(agent, Path::new("/opt/agentscm"))
+                .unwrap()
+                .into_iter()
+                .map(|(event, _)| event)
+                .collect()
+        };
+        assert_eq!(
+            events(Agent::Cursor),
+            ["sessionStart", "postToolUse", "stop", "sessionEnd"]
+        );
+        assert_eq!(
+            events(Agent::Copilot),
+            [
+                "sessionStart",
+                "preToolUse",
+                "postToolUse",
+                "notification",
+                "agentStop",
+                "sessionEnd"
+            ]
+        );
+        assert_eq!(
+            events(Agent::Gemini),
+            [
+                "SessionStart",
+                "BeforeTool",
+                "AfterTool",
+                "Notification",
+                "AfterAgent",
+                "SessionEnd"
+            ]
+        );
+        assert!(events(Agent::Codex).is_empty());
+    }
+
+    /// The default Copilot setup writes the user locations that Copilot CLI and VS Code's
+    /// Copilot sessions both read, under `COPILOT_HOME` or `~/.copilot`.
+    #[cfg(unix)]
+    #[test]
+    fn copilot_user_setup_writes_the_locations_copilot_cli_and_vs_code_read() {
+        let base = copilot_home().unwrap();
+        let files = user_files(Agent::Copilot).unwrap();
+        assert_eq!(
+            files[..2],
+            [
+                base.join("mcp-config.json"),
+                base.join("hooks/agentscm-client.json")
+            ]
+        );
     }
 }

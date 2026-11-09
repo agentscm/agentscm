@@ -8,7 +8,7 @@ title: "Coding agents: what is supported"
 
 AgentSCM warns an agent when another agent already holds a file it is about to edit. How well that works depends on how the agent connects to the [hub](hub.md). There are two ways, and most agents can use both:
 
-- **Hooked.** The agent runs a hook before each edit and the hub's answer is put in front of the model without the agent having to choose to ask. This is the more reliable path (see [Support tiers](#support-tiers)). Where the hook can refuse a tool call (Claude Code, Codex, Copilot), the first edit in a session to a file another agent holds is refused once, with a factual reason naming the other agent and the options: do other work, ask the user, or repeat the edit. Repeating it passes while that holder keeps the file; if the file changes hands, the next attempt is refused again. The refusal also asks the holder to hand the file over, and says so (naming the session it asked, such as `bob's Claude Code session 3f2a1b9c`, when it asked one); the same request can be made with the `agentscm_ask` MCP tool. The holder sees the request on its next call and answers with `agentscm_handoff` ([handoff](hub.md#handoff)). Handoff is experimental ([handoff](hub.md#handoff)).
+- **Hooked.** The agent runs a hook before each edit and the hub's answer is put in front of the model without the agent having to choose to ask. This is the more reliable path (see [Support tiers](#support-tiers)). Where the hook can refuse a tool call (Claude Code, Codex, Copilot, Gemini CLI), the first edit in a session to a file another agent holds is refused once, with a factual reason naming the other agent and the options: do other work, ask the user, or repeat the edit. Repeating it passes while that holder keeps the file; if the file changes hands, the next attempt is refused again. The refusal also asks the holder to hand the file over, and says so (naming the session it asked, such as `bob's Claude Code session 3f2a1b9c`, when it asked one); the same request can be made with the `agentscm_ask` MCP tool. The holder sees the request on its next call and answers with `agentscm_handoff` ([handoff](hub.md#handoff)). Handoff is experimental ([handoff](hub.md#handoff)).
 - **Advisory (MCP).** The hub serves coordination [MCP](https://modelcontextprotocol.io) tools at `POST /mcp`: `agentscm_start`, `agentscm_check`, `agentscm_status` and `agentscm_done` for advice, and `agentscm_ask` and `agentscm_handoff` for the experimental handoff. The agent calls them because its instructions (`AGENTS.md`) tell it to. A model can forget or skip them, so treat this as a best effort.
 
 The read-only `agentscm_workflow_status` MCP tool inspects a retained native skill workflow when the operator has configured a repository mapping. It preserves recorded outcomes, current source applicability and unavailable capabilities as separate facts. See [skill workflows in the hub](advanced/skill-workflow-hub.md).
@@ -22,6 +22,52 @@ are fixed at startup and cannot be supplied by a tool call. See
 The [asynchronous stand-up](standup.md) adds durable engineering work and checkpoint handovers alongside file intents. Its agent-authenticated CLI and MCP surfaces can retrieve current unfinished work and a bounded catch-up before a task, then create or reuse an explicit work item and report meaningful changes. `agentscm_work_briefing` reads the briefing; `agentscm_start` resolves and claims explicit work; `agentscm_work_checkpoint` records a meaningful change; and `agentscm_work_ack` deliberately advances a completely delivered writer briefing. A supported session-start hook can render the bounded briefing, and a safely linked end hook can record pause or handover. Hooks do not create a goal, acknowledge delivery, infer decisions or meaningful progress, or claim completion as accepted or landed. The durable workflow also provides a session-specific catch-up cursor and a directed coordination inbox with explicit receipts, replies and validated resolution. Requests appear in later MCP calls and supported hooks; disconnected clients catch up through the inbox. A model can also skip an MCP call. A reported checkpoint is coordination context, not trusted execution or landing evidence.
 
 Nothing is locked: a refusal happens once per session, file and hold, a repeat passes while the same hold keeps the file, and any failure lets the edit through. The exceptions are edits under managed Work: a lead whose hold lapsed gets `LEASE_LAPSED`, and an edit not linked to a current assignment of its session gets `EDIT_UNLINKED` (see [required rules](#required-rules-and-the-session-id)); both repeat on every retry until a start or checkpoint changes the Work. Cursor's hook cannot refuse, so Cursor gets a note just after the edit, and an agent that only has MCP gets advice only. Details: [warn once](hub.md#warn-once).
+
+## What each agent gets
+
+What one session of each agent gets once `agentscm client setup` has wired it, the host has
+loaded the hooks and the Hub answers. The first five rows are the agents `client setup` wires;
+the last is any client that has only the Hub's MCP server.
+
+| Agent | Rules at session start | Edit check | An edit can be refused | Session end reported | Waiting for you reported | Subagents under the parent's session | Messages from the Hub |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Claude Code | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | Yes | At session start, on each prompt, and at an edit, which is held until the session answers |
+| Codex | Yes, with the session ID | Before the write (`apply_patch`) | Yes | Yes | Approval request, end of turn | Not checked: a call that names a subagent is handled as Claude Code's, but whether Codex names one was not verified | At session start, and at an edit, which is held until the session answers |
+| Cursor | Yes, with the session ID | Just after the write | No | Yes | End of turn only | No | At session start and just after an edit |
+| GitHub Copilot | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | No; only a subagent's own wait is told apart from its parent's | At session start; before an edit only as the refusal that holds it |
+| Gemini CLI | Yes, with the session ID | Before the write (`write_file`, `replace`) | Yes | Yes | Tool permission prompt, end of turn | No | At session start; before an edit as Gemini CLI's `systemMessage`, which does not hold the edit |
+| A client with no hooks (MCP only) | In the MCP server's instructions, when the client shows them; no session ID | Only when the agent calls `agentscm_check` | No | Only when the agent calls `agentscm_done` | No | No | Only in the replies to its own AgentSCM tool calls |
+
+What the columns mean:
+
+- **Rules at session start.** The [required rules](#required-rules-and-the-session-id), and for
+  a wired agent its native session ID, are the first thing in the session's context.
+- **Edit check.** When the Hub is asked about an edit made with the agent's file-edit tools.
+  No agent's hook sees a file written by a shell command.
+- **An edit can be refused.** The hook's answer can stop the write: a file another agent holds
+  ([once per hold](hub.md#warn-once)), `LEASE_LAPSED`, `EDIT_UNLINKED` or, in Claude Code, Codex
+  and Copilot, a coordination request the session has not answered. Where it cannot, the same
+  text arrives as a note.
+- **Session end reported.** Setup installs a session-end hook for all five wired agents
+  (`SessionEnd`; `sessionEnd` for Cursor and Copilot). When it runs, the Hub releases the
+  session's file intents and pauses its unfinished Work, without recording that Work as finished.
+  A session that is killed sends no end; its hold lapses with its lease
+  ([holds stay live](#holds-stay-live-while-the-agent-works)).
+- **Waiting for you reported.** See [waiting for you](#waiting-for-you-in-its-session). In VS
+  Code, Copilot documents no notification event, so only the end of a turn is reported there.
+- **Subagents under the parent's session.** A subagent's hook calls carry its parent's session,
+  so its edits are checked under the parent's Work and requests are pointed at the lead session.
+- **Messages from the Hub.** Coordination requests addressed to the session. Before an edit,
+  Copilot's hook takes a refusal but no note, and Claude Code shows a note only after the tool
+  ran, which is why a request the session must answer holds the edit where the hook can refuse.
+
+Each row has a test in `tests/integration/harness_coverage.rs` that runs the installed hook
+command with that host's payloads against a real Hub, and the hook events setup installs are
+pinned by tests in `src/client_setup.rs` and `src/client_plugin.rs`. The payloads are fixtures
+written from the vendors' documentation, not captures from live sessions, so the table states
+what AgentSCM does with what each host is documented to send (see [Support tiers](#support-tiers)).
+A recorded wait is shown only after 60 seconds, so the tests check that a wait is accepted and
+never answered; what the Hub records for it is covered by the Hub's own hook tests.
 
 ## Support tiers
 
@@ -170,7 +216,7 @@ The cost is that failures are quiet. If warnings never appear, run `agentscm int
 ## Limits
 
 - A warning appears only for edits the agent makes through its file-edit tools. Files written by shell commands are not announced.
-- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so the Cursor hook is wired as `postToolUse` instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
+- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Gemini CLI's `BeforeTool` hook refuses the same way (`decision: deny`), and any other note before an edit goes to its `systemMessage`. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so the Cursor hook is wired as `postToolUse` instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
 - Claude Code's HTTP hook cannot tell the hub where the repository root is (the project directory is not available to HTTP-hook headers), so the hub makes paths relative to the directory the agent was started in. Start Claude Code at the repository root; from a subdirectory its edits are announced under shorter paths and may not match other agents' paths. The command hooks (`agentscm hook`) send the Git root and do not have this limit.
 - Codex hooks run only when the project is trusted, and Codex asks the developer to review new or changed hooks in `/hooks` once; changed hooks ask again.
 - Claude Code asks each developer to approve the project's MCP server and trust the folder before project hooks run.

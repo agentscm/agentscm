@@ -224,6 +224,7 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
             )
             .await?;
             offer_instructions(&root);
+            report_unwired(&root, &configured_agents(&root));
             Ok(())
         }
         ClientCommand::List => list(),
@@ -244,12 +245,25 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
 /// Onboarding's last step after `client setup` or `client connect`: the checkout's agent
 /// instructions, previewed and offered for the agents set up here.
 fn offer_instructions(root: &Path) {
-    let agents = load()
+    crate::init_cli::offer_after_setup(root, &configured_agents(root));
+}
+
+/// The agents set up in the checkout at `root`, as its saved connection records them.
+fn configured_agents(root: &Path) -> Vec<String> {
+    load()
         .ok()
         .and_then(|saved| saved.into_iter().find(|connection| connection.root == root))
         .map(|connection| connection.agents)
-        .unwrap_or_default();
-    crate::init_cli::offer_after_setup(root, &agents);
+        .unwrap_or_default()
+}
+
+/// Says which coding agents are installed on this computer without an AgentSCM setup, so an
+/// agent installed after setup does not stay unconnected unnoticed.
+#[cfg(unix)]
+fn report_unwired(root: &Path, configured: &[String]) {
+    for line in crate::quickstart::detect::unwired_notice(root, configured) {
+        println!("{line}");
+    }
 }
 
 async fn status(args: StatusArgs) -> Result<()> {
@@ -1778,6 +1792,8 @@ async fn check(args: RootArgs) -> Result<()> {
     println!(
         "This checks only the Hub binding. Use client doctor and agentscm_setup_status in your native MCP client to verify hooks and MCP."
     );
+    #[cfg(unix)]
+    report_unwired(&root, &connection.agents);
     Ok(())
 }
 
