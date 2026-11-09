@@ -172,9 +172,15 @@ pub fn command_selections(
     if !recipe.commands.iter().any(|c| c.test_selection.is_some()) {
         return Ok(Vec::new());
     }
-    let bytes = git(
-        repo,
-        &[
+    let trust_changed = changed(repo, merge_base, head, trust)? > 0;
+    let required = required_commands(repo, merge_base, head, recipe, trust)?;
+    let mut result = Vec::new();
+    for command in recipe.commands.iter().filter(|c| required.contains(&c.id)) {
+        let Some(selection) = &command.test_selection else {
+            continue;
+        };
+        // Only paths the command's own pathspecs cover can require it, so only they decide it.
+        let mut args = vec![
             "diff-tree",
             "-r",
             "--name-status",
@@ -183,35 +189,29 @@ pub fn command_selections(
             merge_base,
             head,
             "--",
-        ],
-        GIT_OUTPUT,
-    )?;
-    let parts: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
-    if !parts.len().is_multiple_of(2) {
-        return Err(Error::Invalid("invalid Git path status output".into()));
-    }
-    let mut paths = std::collections::BTreeSet::new();
-    let mut modified_only = true;
-    for pair in parts.chunks_exact(2) {
-        modified_only &= pair[0] == b"M";
-        let path = std::str::from_utf8(pair[1])
-            .map_err(|_| Error::Invalid("test selection cannot represent non-UTF8 paths".into()))?;
-        paths.insert(path.to_owned());
-    }
-    // Refuse unrepresentable evidence rather than silently omitting observed paths.
-    if paths.len() > 256 || paths.iter().map(String::len).sum::<usize>() > 8192 {
-        return Err(Error::Limit(
-            "test selection path evidence exceeds bounds".into(),
-        ));
-    }
-    let paths: Vec<String> = paths.into_iter().collect();
-    let trust_changed = changed(repo, merge_base, head, trust)? > 0;
-    let required = required_commands(repo, merge_base, head, recipe, trust)?;
-    let mut result = Vec::new();
-    for command in recipe.commands.iter().filter(|c| required.contains(&c.id)) {
-        let Some(selection) = &command.test_selection else {
-            continue;
-        };
+        ];
+        args.extend(command.paths.iter().flatten().map(String::as_str));
+        let bytes = git(repo, &args, GIT_OUTPUT)?;
+        let parts: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|p| !p.is_empty()).collect();
+        if !parts.len().is_multiple_of(2) {
+            return Err(Error::Invalid("invalid Git path status output".into()));
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        let mut modified_only = true;
+        for pair in parts.chunks_exact(2) {
+            modified_only &= pair[0] == b"M";
+            let path = std::str::from_utf8(pair[1]).map_err(|_| {
+                Error::Invalid("test selection cannot represent non-UTF8 paths".into())
+            })?;
+            paths.insert(path.to_owned());
+        }
+        // Refuse unrepresentable evidence rather than silently omitting observed paths.
+        if paths.len() > 256 || paths.iter().map(String::len).sum::<usize>() > 8192 {
+            return Err(Error::Limit(
+                "test selection path evidence exceeds bounds".into(),
+            ));
+        }
+        let paths: Vec<String> = paths.into_iter().collect();
         let mut filters = std::collections::BTreeSet::new();
         let shared = paths.iter().any(|p| {
             p.starts_with("Cargo.")
@@ -233,7 +233,15 @@ pub fn command_selections(
         };
         if reason == Selected {
             for path in &paths {
-                match selection.rules.iter().find(|r| &r.path == path) {
+                // An exact rule, else the longest directory rule (ending in '/') containing it.
+                let rule = selection
+                    .rules
+                    .iter()
+                    .filter(|r| {
+                        r.path == *path || (r.path.ends_with('/') && path.starts_with(&r.path))
+                    })
+                    .max_by_key(|r| r.path.len());
+                match rule {
                     Some(rule) => {
                         filters.insert(rule.filter.clone());
                     }
