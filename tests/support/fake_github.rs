@@ -372,6 +372,8 @@ pub struct FakeState {
     pub reject_status_contexts: HashMap<String, u16>,
     /// After recording the next commit status, move the first branch's tip to this sha.
     pub advance_base_after_status: Option<String>,
+    /// Move the base after the repository has recorded this many statuses.
+    pub advance_base_after_status_count: Option<(usize, String)>,
     /// Leave `head.repo` and `base.repo` out of pull request JSON.
     pub omit_pull_repos: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
@@ -1502,6 +1504,28 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .record_status(sha, status.clone(), &creator);
                     if let Some(tip) = state.advance_base_after_status.take() {
                         state.repos.get_mut(&id).unwrap().branches[0].sha = tip;
+                    }
+                    if state
+                        .advance_base_after_status_count
+                        .as_ref()
+                        .is_some_and(|(count, _)| state.repos[&id].statuses.len() == *count)
+                    {
+                        let (_, tip) = state.advance_base_after_status_count.take().unwrap();
+                        let repo = state.repos.get_mut(&id).unwrap();
+                        repo.branches[0].sha = tip.clone();
+                        if let Some(dir) = &repo.git {
+                            git(
+                                dir,
+                                &[
+                                    "update-ref",
+                                    &format!("refs/heads/{}", repo.branches[0].name),
+                                    &tip,
+                                ],
+                                &[],
+                                None,
+                            )
+                            .unwrap();
+                        }
                     }
                     if std::mem::take(&mut state.lose_next_status_reply) {
                         return reply(502, &[], None);

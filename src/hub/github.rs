@@ -1074,6 +1074,72 @@ impl Api {
         Ok((comments, truncated))
     }
 
+    /// Exact comment lookup for ownership and definite-deletion recovery. A malformed
+    /// reply is never absence; only a 404 permits recreation after complete discovery.
+    pub async fn validation_comment(
+        &self,
+        token: &str,
+        full_name: &str,
+        id: i64,
+    ) -> Gh<Option<(String, String)>> {
+        let reply = self
+            .get(token, &format!("/repos/{full_name}/issues/comments/{id}"))
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let value = reply.ok("comments")?;
+        if value["id"].as_i64() != Some(id) {
+            return Err(GhError::Failed("unreadable comment identity".into()));
+        }
+        let author = value["user"]["login"]
+            .as_str()
+            .ok_or_else(|| GhError::Failed("unreadable comment author".into()))?;
+        let body = value["body"]
+            .as_str()
+            .ok_or_else(|| GhError::Failed("unreadable comment body".into()))?;
+        Ok(Some((author.into(), body.into())))
+    }
+
+    /// Complete, strict discovery for the canonical validation publisher. Unknown or
+    /// malformed entries cannot disappear through the generic display decoder.
+    pub async fn validation_comments(
+        &self,
+        token: &str,
+        full_name: &str,
+        number: i64,
+        max_pages: u32,
+    ) -> Gh<Vec<(i64, String, String)>> {
+        let page = self
+            .paged(
+                token,
+                &format!("/repos/{full_name}/issues/{number}/comments"),
+                None,
+                max_pages,
+                None,
+            )
+            .await?
+            .ok_or_else(|| GhError::Failed("validation comment inventory unavailable".into()))?;
+        if page.unread != 0 {
+            return Err(GhError::Failed(
+                "validation comment inventory incomplete".into(),
+            ));
+        }
+        page.items
+            .iter()
+            .map(|value| {
+                let bad = || GhError::Failed("malformed validation comment inventory".into());
+                let id = value["id"].as_i64().filter(|id| *id > 0).ok_or_else(bad)?;
+                let author = value["user"]["login"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(bad)?;
+                let body = value["body"].as_str().ok_or_else(bad)?;
+                Ok((id, author.into(), body.into()))
+            })
+            .collect()
+    }
+
     pub async fn create_comment(
         &self,
         token: &str,

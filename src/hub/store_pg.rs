@@ -7251,6 +7251,22 @@ impl Store for PgStore {
     ) -> Result<super::validation_evidence::ValidationSnapshot> {
         validation_evidence::snapshot(self, repository, proposal, limit)
     }
+    fn validation_fence(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<super::validation_evidence::ValidationFence> {
+        validation_evidence::fence(self, repository, proposal)
+    }
+    fn validation_publication_proposals(
+        &self,
+        repository: &str,
+        after: i64,
+        through: Option<i64>,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationProposalPage> {
+        validation_evidence::publication_proposals(self, repository, after, through, limit)
+    }
     fn validation_publication(
         &self,
         repository: &str,

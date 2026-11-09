@@ -106,6 +106,21 @@ pub struct ValidationSnapshot {
     pub entries: Vec<ValidationEvidenceReceipt>,
 }
 
+/// Publication fencing only. This contains no evidence inventory and cannot qualify a check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationFence {
+    pub config: Option<ValidationSummaryConfig>,
+    pub generation: i64,
+}
+
+/// Controller-only journal discovery with a fixed proposal-number high-water.
+/// Page membership conveys no evidence or source qualification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationProposalPage {
+    pub through: i64,
+    pub proposals: Vec<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationPhase {
@@ -122,12 +137,13 @@ pub struct ValidationStatusSlot {
     pub context: String,
 }
 
-/// Controller publication journal, never signed evidence. An Attempting operation has
-/// exactly one remote send. An uncertain reply leaves it here until exact operation-marker
-/// readback proves application. Absence, timeouts and lease expiry cannot authorize a resend.
-/// Preparing forbids a summary write until a successful CAS to Attempting. Every worker must
-/// use that CAS immediately before its one send; this also fences an abandoned preparation.
-/// This journal records comment publication only, never proof of status-write completion.
+/// Controller publication journal, never signed evidence. Only the caller winning the
+/// Preparing-to-Attempting CAS may send its status sequence and final summary comment.
+/// An uncertain mutation leaves it here until exact final-operation-marker readback
+/// proves the summary and all preceding status replies completed. Absence, timeouts and
+/// lease expiry cannot authorize a resend. A definite read failure may instead invalidate
+/// all retained slots and finish Idle, provided every invalidation definitely succeeded.
+/// Preparing performs no remote writes, so a CAS abort safely fences a slow preparation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationPublication {
@@ -209,7 +225,11 @@ pub(crate) fn publication_transition(
         return Err(invalid());
     }
     if old.phase == Idle && next.phase == Preparing {
-        if next.operation_id == old.operation_id || next.comment_id != old.comment_id {
+        // Clearing a retained ID is controller-only definite-404 recovery after complete
+        // owned discovery. A different nonempty ID can never be adopted in preparation.
+        if next.operation_id == old.operation_id
+            || (next.comment_id.is_some() && next.comment_id != old.comment_id)
+        {
             return Err(invalid());
         }
         return Ok(true);

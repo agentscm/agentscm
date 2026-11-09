@@ -552,6 +552,34 @@ thread_local! {
     static TEST_STATE: RefCell<Option<TestState>> = const { RefCell::new(None) };
 }
 
+/// Test-only transport injection, absent from production builds and environment parsing.
+#[cfg(test)]
+pub(crate) struct HostedTestTransport;
+#[cfg(test)]
+impl HostedTestTransport {
+    pub(crate) fn enter(remote: &Path) -> Self {
+        TEST_STATE.with(|state| {
+            assert!(
+                state
+                    .replace(Some(TestState {
+                        remote_override: Some(remote.to_string_lossy().into_owned()),
+                        commands: Vec::new()
+                    }))
+                    .is_none()
+            )
+        });
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for HostedTestTransport {
+    fn drop(&mut self) {
+        TEST_STATE.with(|state| {
+            state.replace(None);
+        });
+    }
+}
+
 #[cfg(test)]
 fn test_remote_override(remote: &str, authenticated: bool) -> String {
     if !authenticated {

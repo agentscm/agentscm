@@ -199,6 +199,39 @@ pub(super) fn history(
     Ok(page(entries, limit))
 }
 
+pub(super) fn fence(
+    store: &SqliteStore,
+    repository: &str,
+    proposal: i64,
+) -> Result<crate::hub::validation_evidence::ValidationFence> {
+    crate::hub::validation_evidence::validate_snapshot_limit(proposal, 1)?;
+    let mut conn = store.conn();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let config = tx
+        .query_row(
+            "SELECT connection,enabled FROM hub_validation_summary_config WHERE repository=?1",
+            params![repository],
+            |row| {
+                Ok(ValidationSummaryConfig {
+                    repository: repository.into(),
+                    connection: row.get(0)?,
+                    enabled: row.get::<_, i64>(1)? != 0,
+                })
+            },
+        )
+        .optional()?;
+    let generation = tx
+        .query_row(
+            "SELECT generation FROM hub_validation_proposals WHERE repository=?1 AND proposal=?2",
+            params![repository, proposal],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    tx.commit()?;
+    Ok(crate::hub::validation_evidence::ValidationFence { config, generation })
+}
+
 pub(super) fn snapshot(
     store: &SqliteStore,
     repository: &str,
@@ -258,6 +291,41 @@ pub(super) fn snapshot(
         generation,
         entries,
     })
+}
+
+pub(super) fn publication_proposals(
+    store: &SqliteStore,
+    repository: &str,
+    after: i64,
+    through: Option<i64>,
+    limit: usize,
+) -> Result<crate::hub::validation_evidence::ValidationProposalPage> {
+    validate_page(1, after, limit)?;
+    if through.is_some_and(|n| n < 0 || n < after) {
+        return Err(HubError::Invalid(
+            "invalid validation journal cursor".into(),
+        ));
+    }
+    let mut conn = store.conn();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let through = match through {
+        Some(n) => n,
+        None => tx.query_row(
+            "SELECT COALESCE(MAX(proposal),0) FROM hub_validation_publication WHERE repository=?1",
+            params![repository],
+            |row| row.get::<_, i64>(0),
+        )?,
+    };
+    let proposals = {
+        let mut query=tx.prepare("SELECT proposal FROM hub_validation_publication WHERE repository=?1 AND proposal>?2 AND proposal<=?3 ORDER BY proposal LIMIT ?4")?;
+        query
+            .query_map(params![repository, after, through, limit as i64], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    tx.commit()?;
+    Ok(crate::hub::validation_evidence::ValidationProposalPage { through, proposals })
 }
 
 pub(super) fn publication(

@@ -167,6 +167,22 @@ pub(super) fn history(
     })
 }
 
+pub(super) fn fence(
+    store: &PgStore,
+    repository: &str,
+    proposal: i64,
+) -> Result<crate::hub::validation_evidence::ValidationFence> {
+    crate::hub::validation_evidence::validate_snapshot_limit(proposal, 1)?;
+    store.run(false, |client| {
+        let mut tx = client.transaction()?;
+        super::lock_repository(&mut tx, repository)?;
+        let config = tx.query_opt("SELECT connection,enabled FROM hub_validation_summary_config WHERE repository=$1", &[&repository])?.map(|row|ValidationSummaryConfig {repository:repository.into(),connection:row.get(0),enabled:row.get::<_,i64>(1)!=0});
+        let generation = tx.query_opt("SELECT generation FROM hub_validation_proposals WHERE repository=$1 AND proposal=$2", &[&repository,&proposal])?.map_or(0,|row|row.get::<_,i64>(0));
+        tx.commit()?;
+        Ok(crate::hub::validation_evidence::ValidationFence {config,generation})
+    })
+}
+
 pub(super) fn snapshot(
     store: &PgStore,
     repository: &str,
@@ -185,6 +201,27 @@ pub(super) fn snapshot(
         crate::hub::validation_evidence::validate_snapshot_inventory(generation, &entries)?;
         tx.commit()?;
         Ok(ValidationSnapshot {config,generation,entries})
+    })
+}
+
+pub(super) fn publication_proposals(
+    store: &PgStore,
+    repository: &str,
+    after: i64,
+    through: Option<i64>,
+    limit: usize,
+) -> Result<crate::hub::validation_evidence::ValidationProposalPage> {
+    validate_page(1, after, limit)?;
+    if through.is_some_and(|n| n < 0 || n < after) {
+        return Err(HubError::Invalid(
+            "invalid validation journal cursor".into(),
+        ));
+    }
+    store.run(false,|client| {
+        let mut tx=client.transaction()?; super::lock_repository(&mut tx,repository)?;
+        let through=match through {Some(n)=>n,None=>tx.query_one("SELECT COALESCE(MAX(proposal),0) FROM hub_validation_publication WHERE repository=$1",&[&repository])?.get::<_,i64>(0)};
+        let proposals=tx.query("SELECT proposal FROM hub_validation_publication WHERE repository=$1 AND proposal>$2 AND proposal<=$3 ORDER BY proposal LIMIT $4",&[&repository,&after,&through,&(limit as i64)])?.iter().map(|row|row.get::<_,i64>(0)).collect();
+        tx.commit()?; Ok(crate::hub::validation_evidence::ValidationProposalPage {through,proposals})
     })
 }
 

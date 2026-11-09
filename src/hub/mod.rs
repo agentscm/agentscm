@@ -56,6 +56,8 @@ pub mod sync;
 pub mod ui;
 pub mod validation_evidence;
 pub mod validation_evidence_http;
+#[cfg(unix)]
+mod validation_summary;
 pub mod value_metrics;
 pub mod view_settings;
 pub mod viewer;

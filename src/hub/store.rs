@@ -240,6 +240,19 @@ pub trait Store: Send + Sync {
         proposal: i64,
         limit: usize,
     ) -> Result<super::validation_evidence::ValidationSnapshot>;
+    /// Config/generation only, for invalidating statuses when the complete inventory fails.
+    fn validation_fence(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<super::validation_evidence::ValidationFence>;
+    fn validation_publication_proposals(
+        &self,
+        repository: &str,
+        after: i64,
+        through: Option<i64>,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationProposalPage>;
     fn validation_publication(
         &self,
         repository: &str,
