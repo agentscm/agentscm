@@ -1,4 +1,4 @@
-//! Hosted local-validation controller. Signed archives, never the comment, decide statuses.
+//! Hosted local-validation controller. Trusted policy and source/evidence decide statuses.
 //! A durable CAS owns a whole status sequence; the summary is its final completion marker.
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -49,8 +49,7 @@ struct Row {
     requirement: String,
     state: VerdictState,
     reason: String,
-    head: String,
-    envelope: String,
+    head: Option<String>,
     omissions: Vec<String>,
 }
 fn render(rows: &[Row], snapshot: &ValidationSnapshot, problem: Option<&str>) -> Gh<String> {
@@ -68,11 +67,9 @@ fn render(rows: &[Row], snapshot: &ValidationSnapshot, problem: Option<&str>) ->
             escape(&row.requirement),
             row.state.as_str(),
             escape(&row.reason),
-            if row.envelope.is_empty() {
-                "none for current head".into()
-            } else {
-                escape(&row.head)
-            },
+            row.head
+                .as_deref()
+                .map_or_else(|| "none for current head".into(), escape),
             escape(&row.omissions.join(", "))
         )
         .expect("string write");
@@ -119,7 +116,11 @@ fn trusted(fetch: &FetchContext<'_>, commit: &str) -> crate::Result<Trusted> {
     })
 }
 #[cfg(test)]
+type PreparationHook = Box<dyn FnOnce(&HubState)>;
+#[cfg(test)]
 thread_local! {
+    static TEST_PREPARING: std::cell::RefCell<Option<PreparationHook>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_ATTEMPT: std::cell::RefCell<Option<PreparationHook>> = const { std::cell::RefCell::new(None) };
     static TEST_CLOCKS: std::cell::RefCell<std::collections::VecDeque<EvaluationClock>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 fn clock() -> EvaluationClock {
@@ -149,8 +150,54 @@ struct Plan {
     statuses: Vec<(ValidationStatusSlot, StatusState, String)>,
     freshness: Vec<Box<dyn Fn(EvaluationClock) -> bool + Send>>,
     success_windows: Vec<(u64, u64)>,
+    requires_inventory: bool,
+    problem: Option<&'static str>,
 }
 impl Plan {
+    fn source_decision(
+        &mut self,
+        check: &LoadedCheck,
+        head: &PullHead,
+        state: VerdictState,
+        reason: &str,
+        applies_to_head: bool,
+    ) {
+        self.statuses.push((
+            ValidationStatusSlot {
+                head: head.head_sha.clone(),
+                context: check.policy.status_context(),
+            },
+            status_state(state),
+            reason.into(),
+        ));
+        if let Some(groups) = &check.recipe.constituents {
+            for group in groups {
+                self.statuses.push((
+                    ValidationStatusSlot {
+                        head: head.head_sha.clone(),
+                        context: check.policy.constituent_status_context(&group.id),
+                    },
+                    status_state(state),
+                    reason.into(),
+                ));
+            }
+        }
+        // These source-only decisions use no signed envelope or expiry window.
+        // Exact Git/policy/evidence fences are rechecked before every send.
+        self.freshness.push(Box::new(|clock| {
+            matches!(clock, EvaluationClock::Known { .. })
+        }));
+        self.rows.push(Row {
+            requirement: check
+                .name
+                .clone()
+                .unwrap_or_else(|| "Local validation".into()),
+            state,
+            reason: reason.into(),
+            head: applies_to_head.then(|| head.head_sha.clone()),
+            omissions: Vec::new(),
+        });
+    }
     fn fresh(&self) -> bool {
         let before = clock();
         if !tokio::task::block_in_place(|| self.freshness.iter().all(|check| check(before))) {
@@ -174,6 +221,7 @@ fn evaluate(
     state: &HubState,
     repo: &ConnectedRepository,
     snapshot: &ValidationSnapshot,
+    inventory_available: bool,
     fetch: &FetchContext<'_>,
     commit: &str,
     head: &PullHead,
@@ -189,29 +237,35 @@ fn evaluate(
     {
         return Err(failed("validation policy repository differs"));
     }
-    let mut pairs = Vec::new();
-    let mut bytes = 0_usize;
-    for receipt in &snapshot.entries {
-        let bundle = read_bundle(&*state.objects, receipt)
-            .map_err(|_| failed("validation archive unavailable"))?;
-        bundle
-            .validate_repository(&canonical)
-            .map_err(|_| failed("validation archive repository differs"))?;
-        for pair in bundle.entries {
-            let decoded = pair
-                .decode()
-                .map_err(|_| failed("validation archive invalid"))?;
-            bytes = bytes
-                .saturating_add(decoded.0.len())
-                .saturating_add(decoded.1.len());
-            if bytes > MAX_VERIFICATION_BYTES {
-                return Err(failed(
-                    "validation verification inventory exceeds byte limit",
-                ));
-            }
-            pairs.push(decoded);
+    let pairs = (|| {
+        if !inventory_available {
+            return Err(failed("validation evidence inventory unavailable"));
         }
-    }
+        let mut pairs = Vec::new();
+        let mut bytes = 0_usize;
+        for receipt in &snapshot.entries {
+            let bundle = read_bundle(&*state.objects, receipt)
+                .map_err(|_| failed("validation archive unavailable"))?;
+            bundle
+                .validate_repository(&canonical)
+                .map_err(|_| failed("validation archive repository differs"))?;
+            for pair in bundle.entries {
+                let decoded = pair
+                    .decode()
+                    .map_err(|_| failed("validation archive invalid"))?;
+                bytes = bytes
+                    .saturating_add(decoded.0.len())
+                    .saturating_add(decoded.1.len());
+                if bytes > MAX_VERIFICATION_BYTES {
+                    return Err(failed(
+                        "validation verification inventory exceeds byte limit",
+                    ));
+                }
+                pairs.push(decoded);
+            }
+        }
+        Ok(std::sync::Arc::new(pairs))
+    })();
     let git = fetch.repository_path();
     let observed = validation::run::observe(
         git,
@@ -228,10 +282,51 @@ fn evaluate(
         statuses: Vec::new(),
         freshness: Vec::new(),
         success_windows: Vec::new(),
+        requires_inventory: false,
+        problem: pairs
+            .as_ref()
+            .err()
+            .map(|_| "signed validation evidence unavailable"),
     };
-    let pairs = std::sync::Arc::new(pairs);
     let evaluated_at = clock();
     for check in trusted.checks {
+        let exempt = check
+            .policy
+            .exempt_paths
+            .as_ref()
+            .map(|paths| {
+                validation::run::only_exempt(
+                    git,
+                    &observed.merge_base,
+                    &head.head_sha,
+                    paths,
+                    &trust,
+                )
+            })
+            .transpose()
+            .map_err(|_| failed("exempt source inventory unavailable"))?
+            .unwrap_or(false);
+        if exempt {
+            plan.source_decision(
+                &check,
+                head,
+                VerdictState::Success,
+                "not required: only exempt paths changed",
+                true,
+            );
+            continue;
+        }
+        let Ok(pairs) = &pairs else {
+            plan.source_decision(
+                &check,
+                head,
+                VerdictState::Pending,
+                "signed validation evidence unavailable",
+                false,
+            );
+            continue;
+        };
+        plan.requires_inventory = true;
         let required = validation::run::required_commands(
             git,
             &observed.merge_base,
@@ -301,7 +396,7 @@ fn evaluate(
                 );
             plan.success_windows.push((payload.issued_at_ms, expires));
         }
-        let omissions = selected_omissions(&pairs, &verdict);
+        let omissions = selected_omissions(pairs, &verdict);
         // Cache the exact authenticated inputs and observed Git bindings. No IO may
         // intervene between this pure clock re-evaluation and the corresponding send.
         let expected = verdict.clone();
@@ -360,12 +455,7 @@ fn evaluate(
             requirement: check.name.unwrap_or_else(|| "Local validation".into()),
             state: verdict.state,
             reason: format!("{}; {}", verdict.reason, verdict.detail),
-            head: head.head_sha.clone(),
-            envelope: if verdict.applies_to_head {
-                verdict.envelope_sha256
-            } else {
-                String::new()
-            },
+            head: verdict.applies_to_head.then(|| head.head_sha.clone()),
             omissions,
         });
     }
@@ -493,7 +583,7 @@ pub(super) async fn reconcile_repo(
 }
 
 /// A failed forge inventory is not an empty repository. Discover prior journals
-/// independently of the forge and invalidate only definite Idle owners.
+/// independently of the forge; fence unsent preparations and invalidate Idle owners.
 async fn invalidate_known(
     hub: &HubState,
     conn: &Connection,
@@ -543,7 +633,8 @@ async fn reconcile_pull(
     let result = reconcile_pull_inner(hub, conn, repo, token, api, identity, number).await;
     if result.is_err() {
         // Discovery/setup/read errors cannot preserve earlier green statuses. This
-        // path only reserves Idle journals; an ambiguous Attempting write is untouched.
+        // path fences unsent preparations and reserves Idle journals; an ambiguous
+        // Attempting write is untouched.
         invalidate_idle(hub, conn, repo, token, api, number).await?;
     }
     result
@@ -560,28 +651,86 @@ async fn invalidate_idle(
     let Some(old) = store_call(|| hub.store.validation_publication(&repo.id, number))? else {
         return Ok(());
     };
-    if old.phase != PublicationPhase::Idle || old.connection != conn.id {
+    if old.phase == PublicationPhase::Attempting || old.connection != conn.id {
         return Ok(());
     }
-    let fence = store_call(|| hub.store.validation_fence(&repo.id, number))?;
-    let mut next = old.clone();
-    next.revision += 1;
-    next.phase = PublicationPhase::Preparing;
-    next.evidence_generation = fence.generation;
-    next.operation_id = digest(super::store::new_id("validation")?);
-    // An unpublished failure body forces reevaluation even if the recovered source
-    // would otherwise match the last visible comment after pending invalidations.
-    next.body_sha256 = digest(format!("unavailable:{}", next.operation_id));
-    if !cas(&*hub.store, &repo.id, number, Some(&old), &next)? {
-        return Ok(());
+    if old.phase == PublicationPhase::Preparing {
+        return abort_preparation(hub, repo, token, api, number, &old).await;
     }
-    let preparing = next.clone();
-    next.revision += 1;
-    next.phase = PublicationPhase::Attempting;
-    if !cas(&*hub.store, &repo.id, number, Some(&preparing), &next)? {
-        return Ok(());
+    invalidate_publication(hub, repo, token, api, number, &old).await
+}
+
+/// Fence only this preparation. A lost CAS may belong to an in-flight worker;
+/// never invalidate or release that worker's Attempting operation.
+async fn abort_preparation(
+    hub: &HubState,
+    repo: &ConnectedRepository,
+    token: &str,
+    api: &Api,
+    number: i64,
+    preparing: &ValidationPublication,
+) -> Gh<()> {
+    if let Some(idle) = release_preparation(hub, repo, number, preparing)? {
+        invalidate_publication(hub, repo, token, api, number, &idle).await?;
     }
-    abort_attempt(hub, api, token, repo, number, &next).await
+    Ok(())
+}
+
+fn release_preparation(
+    hub: &HubState,
+    repo: &ConnectedRepository,
+    number: i64,
+    preparing: &ValidationPublication,
+) -> Gh<Option<ValidationPublication>> {
+    debug_assert_eq!(preparing.phase, PublicationPhase::Preparing);
+    let mut idle = preparing.clone();
+    idle.revision += 1;
+    idle.phase = PublicationPhase::Idle;
+    Ok(cas(&*hub.store, &repo.id, number, Some(preparing), &idle)?.then_some(idle))
+}
+
+async fn invalidate_publication(
+    hub: &HubState,
+    repo: &ConnectedRepository,
+    token: &str,
+    api: &Api,
+    number: i64,
+    old: &ValidationPublication,
+) -> Gh<()> {
+    let mut old = old.clone();
+    // Only unsent journal reservations may be retried. Bound contention from
+    // incoming receipts; a remote mutation is never retried after an uncertain reply.
+    for _ in 0..3 {
+        let fence = store_call(|| hub.store.validation_fence(&repo.id, number))?;
+        let mut next = old.clone();
+        next.revision += 1;
+        next.phase = PublicationPhase::Preparing;
+        next.evidence_generation = fence.generation;
+        next.operation_id = digest(super::store::new_id("validation")?);
+        // Force reevaluation even if source matches the last visible summary.
+        next.body_sha256 = digest(format!("unavailable:{}", next.operation_id));
+        if !cas(&*hub.store, &repo.id, number, Some(&old), &next)? {
+            if store_call(|| hub.store.validation_publication(&repo.id, number))?.as_ref()
+                == Some(&old)
+            {
+                continue;
+            }
+            return Ok(());
+        }
+        let preparing = next.clone();
+        next.revision += 1;
+        next.phase = PublicationPhase::Attempting;
+        if cas(&*hub.store, &repo.id, number, Some(&preparing), &next)? {
+            return abort_attempt(hub, api, token, repo, number, &next).await;
+        }
+        // A receipt may change the generation without changing the journal. Fence
+        // only our unsent preparation; never release another worker's operation.
+        let Some(idle) = release_preparation(hub, repo, number, &preparing)? else {
+            return Ok(());
+        };
+        old = idle;
+    }
+    Err(failed("validation invalidation fence repeatedly changed"))
 }
 
 async fn reconcile_pull_inner(
@@ -628,11 +777,7 @@ async fn reconcile_pull_inner(
         }
         if previous.phase == Preparing {
             // No remote write may occur in Preparing. Abort fences a crashed or slower worker.
-            let mut idle = previous.clone();
-            idle.revision += 1;
-            idle.phase = Idle;
-            cas(&*hub.store, &repo.id, number, old.as_ref(), &idle)?;
-            return Ok(());
+            return abort_preparation(hub, repo, token, api, number, previous).await;
         }
     }
     // Never adopt a marker-only comment. A new journal cannot prove who created it.
@@ -701,23 +846,37 @@ async fn reconcile_pull_inner(
         .and_then(|(fetch, default)| {
             tokio::task::block_in_place(|| fetch.pin_default_branch(default)).ok()
         });
-    let evaluated = tokio::task::block_in_place(|| {
-        match (inventory_available, fetch.as_ref(), commit.as_ref()) {
-            (true, Some(fetch), Some(commit)) => fetch
-                .fetch_pull(&head.base_ref, number, &head.head_sha)
-                .map_err(|_| failed("pull source unavailable"))
-                .and_then(|()| evaluate(hub, repo, &snapshot, fetch, commit, &head)),
-            _ => Err(failed("configuration, source or evidence unavailable")),
-        }
+    let evaluated = tokio::task::block_in_place(|| match (fetch.as_ref(), commit.as_ref()) {
+        (Some(fetch), Some(commit)) => fetch
+            .fetch_pull(&head.base_ref, number, &head.head_sha)
+            .map_err(|_| failed("pull source unavailable"))
+            .and_then(|()| {
+                evaluate(
+                    hub,
+                    repo,
+                    &snapshot,
+                    inventory_available,
+                    fetch,
+                    commit,
+                    &head,
+                )
+            }),
+        _ => Err(failed("configuration, source or evidence unavailable")),
     });
+    let evaluated_source = evaluated.is_ok();
     let (mut plan, problem) = match evaluated {
-        Ok(plan) => (plan, None),
+        Ok(plan) => {
+            let problem = plan.problem;
+            (plan, problem)
+        }
         Err(_) => (
             Plan {
                 rows: Vec::new(),
                 statuses: Vec::new(),
                 freshness: Vec::new(),
                 success_windows: Vec::new(),
+                requires_inventory: false,
+                problem: None,
             },
             Some("configuration, source or evidence unavailable"),
         ),
@@ -730,7 +889,7 @@ async fn reconcile_pull_inner(
         for row in &mut plan.rows {
             row.state = VerdictState::Pending;
             row.reason = "head shared by multiple pull requests".into();
-            row.envelope.clear();
+            row.head = None;
         }
     }
     let migration_pending = comments
@@ -786,22 +945,30 @@ async fn reconcile_pull_inner(
     if !cas(&*hub.store, &repo.id, number, old.as_ref(), &next)? {
         return Ok(());
     }
+    #[cfg(test)]
+    if let Some(hook) = TEST_PREPARING.with(|hook| hook.borrow_mut().take()) {
+        hook(hub);
+    }
     // All source/configuration/evidence reads precede ownership of remote sends.
     let current = api
         .pull_head(token, &repo.full_name, number, &mut HashMap::new())
         .await?
         .ok_or_else(|| failed("pull unavailable on recheck"))?;
     if !same_head(&head, &current)
-        || (problem.is_none()
+        || (evaluated_source
             && !configuration_current(api, token, repo, default.as_deref(), fetch.as_ref()).await?)
     {
         return Err(failed("validation source changed before publication"));
+    }
+    #[cfg(test)]
+    if let Some(hook) = TEST_BEFORE_ATTEMPT.with(|hook| hook.borrow_mut().take()) {
+        hook(hub);
     }
     let preparing = next.clone();
     next.revision += 1;
     next.phase = Attempting;
     if !cas(&*hub.store, &repo.id, number, Some(&preparing), &next)? {
-        return Ok(());
+        return abort_preparation(hub, repo, token, api, number, &preparing).await;
     }
     // Stop on every uncertain or refused reply. The nonce comment is always LAST.
     for slot in &next.status_slots {
@@ -823,10 +990,14 @@ async fn reconcile_pull_inner(
                 .pull_head(token, &repo.full_name, number, &mut HashMap::new())
                 .await?
                 .ok_or_else(|| failed("pull unavailable during publication"))?;
-            let now = store_call(|| {
-                hub.store
-                    .validation_snapshot(&repo.id, number, MAX_RECEIPTS)
-            })?;
+            let fence = store_call(|| hub.store.validation_fence(&repo.id, number))?;
+            let evidence_current = fence.generation == snapshot.generation
+                && fence.config == snapshot.config
+                && (!plan.requires_inventory
+                    || store_call(|| {
+                        hub.store
+                            .validation_snapshot(&repo.id, number, MAX_RECEIPTS)
+                    })? == snapshot);
             let pulls = api.validation_open_pulls(token, &repo.full_name).await?;
             let shared_now = pulls
                 .items
@@ -838,7 +1009,7 @@ async fn reconcile_pull_inner(
                 same_head(&head, &current)
                     && pulls.unread == 0
                     && shared_now == shared_head
-                    && now == snapshot
+                    && evidence_current
                     && configuration_current(api, token, repo, default.as_deref(), fetch.as_ref())
                         .await?,
             )
@@ -870,7 +1041,7 @@ async fn reconcile_pull_inner(
             same_head(&head, &current)
                 && fence.generation == snapshot.generation
                 && fence.config == snapshot.config
-                && (problem.is_some()
+                && (!evaluated_source
                     || configuration_current(api, token, repo, default.as_deref(), fetch.as_ref())
                         .await?),
         )

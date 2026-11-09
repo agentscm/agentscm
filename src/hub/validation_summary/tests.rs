@@ -62,6 +62,22 @@ impl Fixture {
         max_age_seconds: u64,
         revoked_at_ms: Option<u64>,
     ) -> Self {
+        Self::with_options(
+            key_expiry,
+            max_age_seconds,
+            revoked_at_ms,
+            [None, None],
+            Some("change"),
+        )
+        .await
+    }
+    async fn with_options(
+        key_expiry: u64,
+        max_age_seconds: u64,
+        revoked_at_ms: Option<u64>,
+        exemptions: [Option<Vec<String>>; 2],
+        changed_path: Option<&str>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -106,7 +122,8 @@ impl Fixture {
         };
         let policies: Vec<_> = ["unit", "static"]
             .iter()
-            .map(|id| ValidationPolicy {
+            .enumerate()
+            .map(|(index, id)| ValidationPolicy {
                 repository: registry.repository.clone(),
                 recipe_sha256: recipe.sha256().unwrap(),
                 required_services: Services {
@@ -115,7 +132,7 @@ impl Fixture {
                 },
                 max_age_seconds,
                 epoch: 1,
-                exempt_paths: None,
+                exempt_paths: exemptions[index].clone(),
                 check_id: Some((*id).into()),
             })
             .collect();
@@ -143,9 +160,13 @@ impl Fixture {
         git(&source, &["add", "."]);
         git(&source, &["commit", "-qm", "base"]);
         let base = git(&source, &["rev-parse", "HEAD"]);
-        fs::write(source.join("change"), "first").unwrap();
+        if let Some(path) = changed_path {
+            let path = source.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "first").unwrap();
+        }
         git(&source, &["add", "."]);
-        git(&source, &["commit", "-qm", "head"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "head"]);
         let head = git(&source, &["rev-parse", "HEAD"]);
         let remote = fake::bare_clone(root.path(), &source);
         git(&remote, &["update-ref", "refs/heads/main", &base]);
@@ -357,6 +378,31 @@ impl Fixture {
             )
         })
     }
+
+    fn assert_pending_without_summary_update(&self, previous: (usize, usize)) {
+        assert_eq!(self.journal().phase, PublicationPhase::Idle);
+        assert_eq!(self.counts(), (previous.0, previous.1 + 2));
+        self.forge.with(|s| {
+            assert!(
+                s.repos[&42]
+                    .statuses
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .all(|(_, v)| v["state"] == "pending")
+            );
+        });
+    }
+    fn reserve_preparation(&self) -> ValidationPublication {
+        let old = self.journal();
+        let mut preparing = old.clone();
+        preparing.revision += 1;
+        preparing.phase = PublicationPhase::Preparing;
+        preparing.operation_id = digest("synthetic-reservation");
+        preparing.body_sha256 = digest("unpublished");
+        assert!(cas(&*self.hub.store, &self.repo.id, 1, Some(&old), &preparing).unwrap());
+        preparing
+    }
     fn now() -> u64 {
         super::super::store::unix_now() as u64 * 1000
     }
@@ -563,8 +609,7 @@ fn renderer_bounds_history_and_escapes_requirement_text() {
             requirement: "<script>|".into(),
             state: VerdictState::Pending,
             reason: "missing".into(),
-            head: "a".repeat(40),
-            envelope: String::new(),
+            head: None,
             omissions: vec![],
         }],
         &snapshot,
@@ -951,4 +996,296 @@ async fn malformed_inventory_entry_cannot_hide_shared_head() {
             )
         });
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preparation_recheck_failure_or_change_invalidates_prior_green() {
+    for kind in ["read", "source", "configuration", "configuration_read"] {
+        let f = Fixture::new().await;
+        f.submit(0, Fixture::now(), false);
+        f.submit(1, Fixture::now(), false);
+        f.run().await.unwrap();
+        let counts = f.counts();
+        // New evidence makes an otherwise identical completed plan publish again.
+        f.submit(0, Fixture::now() + 1, false);
+        let forge = f.forge.state.clone();
+        TEST_PREPARING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                let mut state = forge.lock().unwrap();
+                match kind {
+                    "read" => state.arrayless_path = Some("/pulls/1".into()),
+                    "source" => {
+                        state
+                            .repos
+                            .get_mut(&42)
+                            .unwrap()
+                            .pulls
+                            .get_mut(&1)
+                            .unwrap()
+                            .head_sha = "a".repeat(40)
+                    }
+                    "configuration" => {
+                        state.repos.get_mut(&42).unwrap().default_branch = Some("other".into())
+                    }
+                    _ => state.repos.get_mut(&42).unwrap().default_branch = None,
+                }
+            }))
+        });
+        assert!(f.run().await.is_err(), "{kind}");
+        f.assert_pending_without_summary_update(counts);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_receipt_before_attempting_cas_invalidates_prior_green() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.submit(1, Fixture::now(), false);
+    f.run().await.unwrap();
+    let counts = f.counts();
+    f.submit(0, Fixture::now() + 1, false);
+    let mut bundle = ValidationBundleV1 {
+        version: 1,
+        entries: Vec::new(),
+    };
+    // Use a valid new signed archive, captured from the existing snapshot, with
+    // a distinct carrier digest by including both checks.
+    let entries = f
+        .hub
+        .store
+        .validation_snapshot(&f.repo.id, 1, MAX_RECEIPTS)
+        .unwrap()
+        .entries;
+    for receipt in &entries[..2] {
+        bundle
+            .entries
+            .extend(read_bundle(&*f.hub.objects, receipt).unwrap().entries);
+    }
+    let durable =
+        persist_bundle(&*f.hub.objects, &f.repo.id, &f.registry.repository, &bundle).unwrap();
+    let agent = f.agent.clone();
+    TEST_BEFORE_ATTEMPT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |hub| {
+            hub.store
+                .receive_validation_evidence(&agent, 1, &durable, super::super::store::unix_now())
+                .unwrap();
+        }))
+    });
+    f.run().await.unwrap();
+    f.assert_pending_without_summary_update(counts);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persisted_preparing_recovery_invalidates_prior_green_in_same_sweep() {
+    for drift in [false, true] {
+        let f = Fixture::new().await;
+        f.submit(0, Fixture::now(), false);
+        f.submit(1, Fixture::now(), false);
+        f.run().await.unwrap();
+        let counts = f.counts();
+        f.reserve_preparation();
+        if drift {
+            f.submit(0, Fixture::now() + 1, false);
+        }
+        f.run().await.unwrap();
+        f.assert_pending_without_summary_update(counts);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_preparation_cas_does_not_reset_or_invalidate_attempting_owner() {
+    let f = Fixture::new().await;
+    f.submit(0, Fixture::now(), false);
+    f.run().await.unwrap();
+    let counts = f.counts();
+    let preparing = f.reserve_preparation();
+    let mut attempt = preparing.clone();
+    attempt.revision += 1;
+    attempt.phase = PublicationPhase::Attempting;
+    assert!(cas(&*f.hub.store, &f.repo.id, 1, Some(&preparing), &attempt).unwrap());
+    abort_preparation(
+        &f.hub,
+        &f.repo,
+        "synthetic-token",
+        f.hub.sync.api().unwrap(),
+        1,
+        &preparing,
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.journal(), attempt);
+    assert_eq!(f.counts(), counts);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsigned_exempt_source_is_not_required_per_requirement() {
+    for (exemptions, expected) in [
+        (
+            [Some(vec!["docs/**".into()]), Some(vec!["docs/**".into()])],
+            ["success", "success"],
+        ),
+        ([Some(vec!["docs/**".into()]), None], ["success", "pending"]),
+        ([None, None], ["pending", "pending"]),
+    ] {
+        let f = Fixture::with_options(
+            i64::MAX as u64,
+            3600,
+            None,
+            exemptions,
+            Some("docs/guide.md"),
+        )
+        .await;
+        f.run().await.unwrap();
+        f.forge.with(|s| {
+            let repo = &s.repos[&42];
+            for (index, state) in expected.iter().enumerate() {
+                assert_eq!(repo.statuses[2 + index].1["state"], *state);
+            }
+            let body = &repo.comments[&1][0].body;
+            if expected.contains(&"success") {
+                assert!(body.contains("not required&#x3a; only exempt paths changed"));
+                assert!(body.contains(&f.head));
+                assert!(body.contains("0 submitted generations"));
+            }
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_inputs_empty_diff_and_shared_head_never_exempt() {
+    for path in [
+        Some(".github/local-validation/new.json"),
+        Some(DEFAULT_VERIFIER_WORKFLOW),
+        None,
+        Some("docs/guide.md"),
+    ] {
+        let f = Fixture::with_options(
+            i64::MAX as u64,
+            3600,
+            None,
+            [Some(vec!["**".into()]), Some(vec!["**".into()])],
+            path,
+        )
+        .await;
+        if path == Some("docs/guide.md") {
+            f.forge.with(|s| {
+                let repo = s.repos.get_mut(&42).unwrap();
+                let mut pull = repo.pulls[&1].clone();
+                pull.number = 2;
+                repo.pulls.insert(2, pull);
+            });
+        }
+        f.run().await.unwrap();
+        f.forge.with(|s| {
+            assert!(
+                s.repos[&42]
+                    .statuses
+                    .iter()
+                    .all(|(_, v)| v["state"] == "pending")
+            )
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exempt_source_change_before_verdict_cannot_pass() {
+    let f = Fixture::with_options(
+        i64::MAX as u64,
+        3600,
+        None,
+        [Some(vec!["docs/**".into()]), Some(vec!["docs/**".into()])],
+        Some("docs/guide.md"),
+    )
+    .await;
+    f.forge
+        .with(|s| s.advance_base_after_status_count = Some((2, f.head.clone())));
+    assert!(f.run().await.is_err());
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    assert_eq!(f.counts().0, 0);
+    f.forge.with(|s| {
+        assert!(
+            s.repos[&42]
+                .statuses
+                .iter()
+                .all(|(_, v)| v["state"] == "pending")
+        )
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_archives_do_not_suppress_independent_source_exemptions() {
+    for inventory_missing in [false, true] {
+        for mixed in [false, true] {
+            let f = Fixture::with_options(
+                i64::MAX as u64,
+                3600,
+                None,
+                [
+                    Some(vec!["docs/**".into()]),
+                    (!mixed).then(|| vec!["docs/**".into()]),
+                ],
+                Some("docs/guide.md"),
+            )
+            .await;
+            f.submit(0, Fixture::now(), false);
+            if inventory_missing {
+                let db = rusqlite::Connection::open(f.root.path().join("hub.sqlite")).unwrap();
+                db.execute("DELETE FROM hub_validation_evidence", [])
+                    .unwrap();
+            } else {
+                fs::remove_dir_all(f.root.path().join("objects")).unwrap();
+            }
+            f.run().await.unwrap();
+            assert_eq!(f.journal().phase, PublicationPhase::Idle);
+            f.forge.with(|s| {
+                let repo = &s.repos[&42];
+                assert_eq!(repo.statuses[2].1["state"], "success");
+                assert_eq!(
+                    repo.statuses[3].1["state"],
+                    if mixed { "pending" } else { "success" }
+                );
+                let body = &repo.comments[&1][0].body;
+                assert!(body.contains("Verification unavailable"));
+                assert!(body.contains("not required&#x3a; only exempt paths changed"));
+                assert!(body.contains(&f.head));
+            });
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_evidence_exemption_still_rechecks_trusted_configuration() {
+    let f = Fixture::with_options(
+        i64::MAX as u64,
+        3600,
+        None,
+        [Some(vec!["docs/**".into()]), Some(vec!["docs/**".into()])],
+        Some("docs/guide.md"),
+    )
+    .await;
+    f.submit(0, Fixture::now(), false);
+    fs::remove_dir_all(f.root.path().join("objects")).unwrap();
+    let forge = f.forge.state.clone();
+    TEST_PREPARING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            forge
+                .lock()
+                .unwrap()
+                .repos
+                .get_mut(&42)
+                .unwrap()
+                .default_branch = Some("other".into());
+        }))
+    });
+    assert!(f.run().await.is_err());
+    assert_eq!(f.journal().phase, PublicationPhase::Idle);
+    assert_eq!(f.counts().0, 0);
+    f.forge.with(|s| {
+        assert!(
+            s.repos[&42]
+                .statuses
+                .iter()
+                .all(|(_, v)| v["state"] == "pending")
+        )
+    });
 }
