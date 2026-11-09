@@ -1087,6 +1087,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "depends_on": {"type": "array", "items": {"type": "string"}},
              "related_work": {"type": "array", "items": {"type": "string"}},
              "takeover_generation": {"type": "integer", "minimum": 1},
+             "new_work": {"type": "boolean", "default": false, "description": "Start new Work although you have unfinished Work over these paths that holds nothing now; the start names that Work when this is needed."},
              "issue_choice": issue_choice_schema,
              "preflight": source_preflight_schema,
              "detail": detail("compact returns the decision, your Work, bounded conflict and preflight evidence, and counts with the paged reads for the overview, briefing and catch-up; full embeds them all, the earlier shape.")
@@ -3925,6 +3926,24 @@ mod tests {
                 .unwrap()
                 .contains("awaiting a named party")
         );
+    }
+
+    #[test]
+    fn start_declares_new_work_so_clients_can_send_it() {
+        let tools = super::tools(false, &super::ViewSettings::default(), true, true);
+        let start = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "agentscm_start")
+            .unwrap();
+        assert_eq!(
+            start["inputSchema"]["properties"]["new_work"]["type"],
+            "boolean"
+        );
+        let args: super::StartArgs =
+            serde_json::from_value(serde_json::json!({"task": "t", "new_work": true})).unwrap();
+        assert!(args.new_work);
     }
 
     #[test]
