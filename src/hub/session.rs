@@ -27,7 +27,7 @@ pub const SESSION_REQUIRED: &str = "session is required: this agent token has mo
 const MAX_SESSION_BYTES: usize = 128;
 /// Session rows untouched this long are pruned; their intents expired long before.
 pub(super) const STALE_SESSION_SECONDS: i64 = 7 * 86_400;
-const DEFAULT_TASK: &str = "task unknown";
+pub(super) const DEFAULT_TASK: &str = "task unknown";
 /// Files one session holds; a call's own paths always stay.
 pub const MAX_SESSION_PATHS: usize = 50;
 /// An intent never outlives this since it was created, however often its session is touched.

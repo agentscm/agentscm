@@ -859,7 +859,7 @@ fn attention_revision(
                 a.updated_seq,
                 &a.semantic_version,
                 &a.recipients,
-                &a.action,
+                &super::super::work_http::actionable_status::steady(a).action,
             ))
             .expect("action version serializes")
         }))
@@ -1404,6 +1404,24 @@ mod tests {
             .unwrap();
         let first = read();
         let revision = attention_revision(&first, "synthetic-key");
+        // How long ago the holder was last active is in the row's text, never in the revision:
+        // a clock that moved is no new attention.
+        let later = actionable_status::read(&*store, &setup, &who, now + 300).unwrap();
+        let text = |status: &actionable_status::ActionableStatus| {
+            let row = status.actions.iter().find(|a| a.kind == "pr_overlap");
+            row.unwrap().action.clone()
+        };
+        assert!(
+            text(&first).contains(", last active just now, "),
+            "{}",
+            text(&first)
+        );
+        assert!(
+            text(&later).contains(", last active 5 min ago, "),
+            "{}",
+            text(&later)
+        );
+        assert_eq!(revision, attention_revision(&later, "synthetic-key"));
         store
             .observe(&repo.id, "pull_request", "1", &pull.to_string(), 2000)
             .unwrap();
