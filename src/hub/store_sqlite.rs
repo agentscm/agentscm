@@ -3263,6 +3263,20 @@ fn unfinished_for_session(
         .transpose()
 }
 
+/// The title of the unfinished Work this session leads that was updated last.
+fn lead_title(tx: &Transaction<'_>, token: &str, session: &str) -> Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT title FROM hub_work_items
+             WHERE lead_token = ?1 AND lead_session = ?2
+               AND state IN ('active', 'paused', 'blocked')
+             ORDER BY updated_at DESC, id LIMIT 1",
+            params![token, session],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 /// The paused Work this session leads that was updated last.
 fn paused_for_session(
     tx: &Transaction<'_>,
@@ -5461,7 +5475,7 @@ fn announce_in(
             )?;
             append(tx, &Event::intent_renewed(&intent.id, expires_at)?)?;
         }
-        Plan::Write { .. } => {
+        Plan::Write { announce, .. } => {
             tx.execute(
                 "INSERT INTO hub_intents (id, repository, token, task, branch, base, machine,
                      paths, expires_at, created_at, updated_at)
@@ -5497,17 +5511,19 @@ fn announce_in(
                     serde_json::json!(keys).to_string()
                 ],
             )?;
-            append(
-                tx,
-                &Event::intent_announced(who, intent, &paths, expires_at)?,
-            )?;
+            let event = if *announce {
+                Event::intent_announced(who, intent, &paths, expires_at)?
+            } else {
+                Event::intent_paths_changed(&intent.id, &paths, expires_at)?
+            };
+            append(tx, &event)?;
         }
     }
     let mut ids = probe(tx, who, &intent.id, keys, now)?;
     ids.insert(intent.id.clone());
     let ids: Vec<String> = ids.into_iter().collect();
     let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
-    if let Plan::Write { previous } = &plan {
+    if let Plan::Write { previous, .. } = &plan {
         for event in notice_events(who, intent, (session, via), previous, &announced)? {
             append(tx, &event)?;
         }
@@ -6043,6 +6059,17 @@ fn touch_in(
             row = session_row(tx, token, &name)?;
         }
     }
+    // The row's task goes with the row (a session end, a prune); the Work it leads keeps its title.
+    let led;
+    let call = if call.task.is_none() && row.as_ref().is_none_or(|row| row.task.is_none()) {
+        led = Checked {
+            task: lead_title(tx, token, &name)?,
+            ..call.clone()
+        };
+        &led
+    } else {
+        call
+    };
     let (current, lapsed) = match row.as_ref().and_then(|row| row.intent.as_deref()) {
         Some(id) => tx
             .query_row(
