@@ -679,10 +679,10 @@ pub async fn start(state: &HubState) -> Result<()> {
         if conn.kind == "app"
             && let Err(error) = sync.load_app(&conn.id)
         {
-            eprintln!(
+            crate::hub::error_envelope::log_internal(&format!(
                 "hub: credentials of GitHub connection {} unavailable: {error}",
                 conn.id
-            );
+            ));
         }
     }
     if let Some(pat) = &config.pat {
@@ -714,10 +714,10 @@ async fn ensure_pat(
         }
         // A blip at startup must not keep the hub down; a restart will create the connection.
         Err(error) => {
-            eprintln!(
+            crate::hub::error_envelope::log_internal(&format!(
                 "hub: {who} {what} not checked: {}",
                 forge_to_hub(who, error)
-            );
+            ));
             return Ok(());
         }
     };
@@ -761,7 +761,7 @@ async fn ensure_pat(
 pub async fn poll_loop(state: HubState, seconds: u64) {
     loop {
         if let Err(error) = poll_once(&state).await {
-            eprintln!("hub: poll failed: {error}");
+            crate::hub::error_envelope::log_internal(&error);
         }
         tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
     }
@@ -834,7 +834,7 @@ async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
 pub(super) async fn failed(
     state: &HubState,
     conn: &Connection,
-    what: &str,
+    _what: &str,
     error: GhError,
 ) -> Result<bool> {
     match error {
@@ -855,7 +855,7 @@ pub(super) async fn failed(
             Ok(true)
         }
         GhError::Failed(detail) | GhError::TooLarge(detail) => {
-            eprintln!("hub: {} sync of {what}: {detail}", conn.provider);
+            crate::hub::error_envelope::log_internal(&detail);
             Ok(false)
         }
     }
@@ -1171,7 +1171,7 @@ async fn read_repo(
         if matches!(error, GhError::Auth(_) | GhError::Limited(_)) {
             return Err(error);
         }
-        eprintln!("hub: merge catch-up observation failed: {error:?}");
+        crate::hub::error_envelope::log_internal(&error);
     }
 
     if conn.outbound {
@@ -1489,7 +1489,7 @@ async fn reread_pull(
             super::catchup_sync::observe(state, conn, repo, token, number, pull).await
     {
         super::catchup_sync::unavailable(state, conn, repo).await?;
-        eprintln!("hub: merge catch-up observation failed: {error:?}");
+        crate::hub::error_envelope::log_internal(&error);
     }
     let data = match &pull {
         None => json!({"number": number, "state": "gone", "merged": false}),
@@ -1946,10 +1946,10 @@ async fn outbound_repo(
             .collect();
         match outbound_pull(state, conn, repo, token, number, &pull, &overlapping).await {
             Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                eprintln!(
+                crate::hub::error_envelope::log_internal(&format!(
                     "hub: {} outbound for {}#{number}: {detail}",
                     conn.provider, repo.full_name
-                );
+                ));
             }
             other => other?,
         }
@@ -2214,7 +2214,7 @@ impl Drop for PendingJob {
 
 async fn webhook_job(state: HubState, conn: Connection, event: String, payload: Value) {
     if let Err(error) = webhook_work(&state, &conn, &event, &payload).await {
-        eprintln!("hub: {} webhook {event}: {error}", conn.provider);
+        crate::hub::error_envelope::log_internal(&error);
     }
 }
 

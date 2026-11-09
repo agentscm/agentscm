@@ -40,6 +40,11 @@ pub(crate) struct ConnectionStatus {
     pub(crate) binding: BindingStatus,
     pub(crate) credential: CredentialStatus,
     pub(crate) hub_check: HubCheck,
+    /// What the saved token, its renewal and the Hub's answer together support saying about this
+    /// connection. A stored token alone is only `configured`, never live coordination.
+    pub(crate) health: Health,
+    /// Whether any agent's hook and MCP use was verified by the Hub; separate from `health`.
+    pub(crate) coverage: Coverage,
     pub(crate) recent_participation: Vec<Participation>,
     /// Capture mode of this checkout's enabled change-capture binding. Absent when the checkout
     /// has no enabled binding or the capture config cannot be read.
@@ -113,6 +118,10 @@ pub(crate) enum HubCheck {
         /// older Hub, so callers must not assume a number.
         #[serde(skip_serializing_if = "Option::is_none")]
         shared_conversation_retention_days: Option<i64>,
+        /// The Hub's deployed version and commit, for diagnosis. Absent from an older Hub or
+        /// when its health route did not answer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub_build: Option<HubBuild>,
     },
     Rejected {
         checked_at: i64,
@@ -123,6 +132,155 @@ pub(crate) enum HubCheck {
     InvalidResponse {
         checked_at: i64,
     },
+}
+
+/// How far a connection can be trusted, from the strongest evidence available. Order of
+/// precedence: an ended token, a Hub that refused it, a Hub that did not answer, then a valid
+/// answer qualified by the renewal state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum Health {
+    /// A token is saved and nothing has asked the Hub, so coordination is not established.
+    Configured,
+    /// The saved token file is missing, unreadable or not private.
+    NoUsableToken,
+    /// The Hub accepted the token just now.
+    Authenticated,
+    /// Accepted, but within the renewal window and not yet renewed.
+    RenewalPending,
+    /// The last renewal was refused: the token still works until it ends, then coordination stops.
+    RenewalFailed { message: String },
+    /// The token's end passed and nothing renewed it.
+    Expired,
+    /// The Hub rejected a token that has not ended: revoked, or for another repository or user.
+    Revoked,
+    /// The Hub did not answer, or answered something unreadable; the token's state is unknown.
+    Unreachable,
+}
+
+impl Health {
+    /// One line for a person: the state and, when there is one, what to do about it.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::Configured => "configured; not checked with the Hub, so live coordination is not shown (pass --check)".into(),
+            Self::NoUsableToken => "the saved token cannot be read; run client setup again".into(),
+            Self::Authenticated => "authenticated; the Hub accepted the token".into(),
+            Self::RenewalPending => "authenticated; the token is due for renewal, which the next hook call starts".into(),
+            Self::RenewalFailed { message } => format!("authenticated but renewal failed: {message}"),
+            Self::Expired => "expired; the next hook call tries to renew it, or run client renew".into(),
+            Self::Revoked => "the Hub rejected the token (revoked or no longer valid); run client setup again".into(),
+            Self::Unreachable => "the Hub did not answer; hooks fail open and coordination is unknown until it does".into(),
+        }
+    }
+}
+
+/// Whether the Hub has seen an agent's hook and MCP in this checkout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Coverage {
+    /// An agent's MCP and native hook were both verified.
+    Verified,
+    /// Some proof, not both.
+    Partial,
+    /// The Hub answered and has seen neither.
+    Unverified,
+    /// The Hub was not asked or did not answer.
+    Unknown,
+}
+
+pub(crate) fn health(
+    credential: &CredentialStatus,
+    renewal_failure: Option<String>,
+    hub_check: &HubCheck,
+    now: i64,
+) -> Health {
+    let managed = matches!(credential.kind, CredentialKind::Managed);
+    if matches!(credential.state, CredentialState::Unknown) {
+        return Health::NoUsableToken;
+    }
+    if matches!(credential.state, CredentialState::Expired) {
+        return match renewal_failure.filter(|_| managed) {
+            Some(message) => Health::RenewalFailed { message },
+            None => Health::Expired,
+        };
+    }
+    match hub_check {
+        HubCheck::Rejected { .. } => Health::Revoked,
+        HubCheck::Unavailable { .. } | HubCheck::InvalidResponse { .. } => Health::Unreachable,
+        HubCheck::Valid { .. } => {
+            match (renewal_failure.filter(|_| managed), credential.expires_at) {
+                (Some(message), _) => Health::RenewalFailed { message },
+                (None, Some(expires))
+                    if expires - now < crate::client_cli::RENEW_BEFORE_SECONDS =>
+                {
+                    Health::RenewalPending
+                }
+                _ => Health::Authenticated,
+            }
+        }
+        HubCheck::Skipped => Health::Configured,
+    }
+}
+
+pub(crate) fn coverage(hub_check: &HubCheck, rows: &[Participation]) -> Coverage {
+    if !matches!(hub_check, HubCheck::Valid { .. }) {
+        Coverage::Unknown
+    } else if rows
+        .iter()
+        .any(|row| row.mcp_verified && row.native_verified)
+    {
+        Coverage::Verified
+    } else if rows
+        .iter()
+        .any(|row| row.mcp_verified || row.native_verified)
+    {
+        Coverage::Partial
+    } else {
+        Coverage::Unverified
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct HubBuild {
+    pub(crate) version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) commit: Option<String>,
+}
+
+impl HubBuild {
+    /// "0.1.0 (3f9c2a1b4d5e)", or the version alone when the Hub gave no commit.
+    pub(crate) fn label(&self) -> String {
+        match self.commit.as_deref().and_then(|commit| commit.get(..12)) {
+            Some(short) => format!("{} ({short})", self.version),
+            None => self.version.clone(),
+        }
+    }
+}
+
+/// The Hub's build from its public health route; None when it does not say. Both fields are
+/// bounded and restricted to version and hex characters, because the Hub is not trusted to
+/// send terminal text.
+pub(crate) async fn hub_build(client: &reqwest::Client, hub: &str) -> Option<HubBuild> {
+    let (status, reply) = send(
+        client.request(Method::GET, format!("{hub}/v1/hub/health")),
+        REPLY_BYTES,
+    )
+    .await
+    .ok()?;
+    (status == 200).then_some(())?;
+    Some(HubBuild {
+        version: plain_build_text(reply["version"].as_str()?)?,
+        commit: reply["commit"].as_str().and_then(plain_build_text),
+    })
+}
+
+fn plain_build_text(text: &str) -> Option<String> {
+    (!text.is_empty()
+        && text.len() <= 64
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c)))
+    .then(|| text.to_owned())
 }
 
 #[derive(Debug, Serialize)]
@@ -285,6 +443,8 @@ fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
             activity_generation: None,
         },
         credential,
+        health: Health::Unreachable,
+        coverage: Coverage::Unknown,
         hub_check: HubCheck::Unavailable {
             checked_at: unix_now(),
         },
@@ -322,6 +482,13 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
         return unresolved_status(connection, now);
     }
     let (capture_mode, capture_mismatch) = capture_for(&connection);
+    let health = health(
+        &credential,
+        crate::client_cli::attention(&connection.root),
+        &hub_check,
+        now,
+    );
+    let coverage = coverage(&hub_check, &recent_participation);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -338,6 +505,8 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
         },
         credential,
         hub_check,
+        health,
+        coverage,
         recent_participation,
         capture_mode,
         capture_mismatch,
@@ -489,7 +658,7 @@ pub(crate) async fn check_hub(
     let retention_days = reply["shared_conversation_retention_days"]
         .as_i64()
         .filter(|days| (1..=3650).contains(days));
-    finalize_hub_check(
+    let (mut check, participation) = finalize_hub_check(
         expires_at,
         unix_now(),
         provider,
@@ -497,7 +666,14 @@ pub(crate) async fn check_hub(
         login,
         retention_days,
         participation,
-    )
+    );
+    if let HubCheck::Valid {
+        hub_build: slot, ..
+    } = &mut check
+    {
+        *slot = hub_build(&client, &connection.hub).await;
+    }
+    (check, participation)
 }
 
 fn finalize_hub_check(
@@ -521,6 +697,7 @@ fn finalize_hub_check(
             login: crate::hub_cli::clean(login),
             expires_at,
             shared_conversation_retention_days,
+            hub_build: None,
         },
         participation,
     )
@@ -617,6 +794,7 @@ mod tests {
                 login: "synthetic".into(),
                 expires_at: 2,
                 shared_conversation_retention_days: None,
+                hub_build: None,
             };
             (root, status)
         });
@@ -718,5 +896,149 @@ mod tests {
         ));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].expires_at, 11);
+    }
+
+    fn managed(state: CredentialState, expires_at: Option<i64>) -> CredentialStatus {
+        CredentialStatus {
+            kind: CredentialKind::Managed,
+            state,
+            expires_at,
+        }
+    }
+
+    fn valid(expires_at: i64) -> HubCheck {
+        HubCheck::Valid {
+            checked_at: 0,
+            provider: "github".into(),
+            host: "github.com".into(),
+            login: "synthetic".into(),
+            expires_at,
+            shared_conversation_retention_days: None,
+            hub_build: None,
+        }
+    }
+
+    #[test]
+    fn eight_saved_connections_with_mixed_validity_are_each_described_honestly() {
+        let now = 1_000_000;
+        let day = 24 * 60 * 60;
+        let down = HubCheck::Unavailable { checked_at: now };
+        let refused = HubCheck::Rejected { checked_at: now };
+        let failed = || Some("the Hub refused to renew".to_owned());
+        let rows = [
+            // Stored token, never asked: configured, not authenticated.
+            (
+                managed(CredentialState::Available, Some(now + day)),
+                None,
+                HubCheck::Skipped,
+                Health::Configured,
+            ),
+            (
+                managed(CredentialState::Available, Some(now + day)),
+                None,
+                valid(now + day),
+                Health::Authenticated,
+            ),
+            (
+                managed(CredentialState::Available, Some(now + 60)),
+                None,
+                valid(now + 60),
+                Health::RenewalPending,
+            ),
+            (
+                managed(CredentialState::Available, Some(now + 60)),
+                failed(),
+                valid(now + 60),
+                Health::RenewalFailed {
+                    message: "the Hub refused to renew".into(),
+                },
+            ),
+            // The token ended and nothing renewed it; the Hub is not consulted.
+            (
+                managed(CredentialState::Expired, Some(now - 1)),
+                None,
+                HubCheck::Unavailable { checked_at: now },
+                Health::Expired,
+            ),
+            (
+                managed(CredentialState::Available, Some(now + day)),
+                None,
+                refused,
+                Health::Revoked,
+            ),
+            (
+                managed(CredentialState::Available, Some(now + day)),
+                None,
+                down,
+                Health::Unreachable,
+            ),
+            (
+                managed(CredentialState::Unknown, None),
+                None,
+                HubCheck::Skipped,
+                Health::NoUsableToken,
+            ),
+        ];
+        for (credential, attention, check, expected) in rows {
+            assert_eq!(health(&credential, attention, &check, now), expected);
+        }
+    }
+
+    #[test]
+    fn a_supplied_token_never_reports_a_renewal_state() {
+        let external = CredentialStatus {
+            kind: CredentialKind::External,
+            state: CredentialState::Available,
+            expires_at: None,
+        };
+        // A stale renewal refusal recorded for the checkout does not describe a token this
+        // computer does not renew.
+        assert_eq!(
+            health(&external, Some("old refusal".into()), &valid(10), 0),
+            Health::Authenticated
+        );
+    }
+
+    #[test]
+    fn coverage_needs_the_hub_to_have_seen_both_the_mcp_and_a_native_hook() {
+        let mut both = participation(10);
+        let mut mcp_only = participation(10);
+        mcp_only.native_verified = false;
+        let mut none = participation(10);
+        none.mcp_verified = false;
+        none.native_verified = false;
+        both.mcp_verified = true;
+        assert_eq!(coverage(&valid(10), &[both]), Coverage::Verified);
+        assert_eq!(coverage(&valid(10), &[mcp_only]), Coverage::Partial);
+        assert_eq!(coverage(&valid(10), &[none]), Coverage::Unverified);
+        // Rows from an unchecked or unreachable Hub are not evidence.
+        assert_eq!(
+            coverage(&HubCheck::Skipped, &[participation(10)]),
+            Coverage::Unknown
+        );
+    }
+
+    #[test]
+    fn a_hub_build_is_taken_only_when_it_is_plain_version_text() {
+        let build = HubBuild {
+            version: "0.3.0".into(),
+            commit: Some("0123456789abcdef".into()),
+        };
+        assert_eq!(build.label(), "0.3.0 (0123456789ab)");
+        assert_eq!(
+            HubBuild {
+                version: "0.3.0".into(),
+                commit: None
+            }
+            .label(),
+            "0.3.0"
+        );
+        assert_eq!(
+            plain_build_text("0.3.0-rc.1+abc").as_deref(),
+            Some("0.3.0-rc.1+abc")
+        );
+        for hostile in ["", "1.0\u{1b}[31m", "a b", &"x".repeat(65)] {
+            assert_eq!(plain_build_text(hostile), None, "{hostile:?}");
+        }
     }
 }

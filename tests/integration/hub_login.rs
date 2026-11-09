@@ -900,7 +900,7 @@ async fn device_poll_keeps_the_handle_through_a_forge_outage() {
         .post("/v1/hub/login/github/device", None, json!({}))
         .await;
     let handle = started["handle"].clone();
-    assert_eq!(
+    crate::assert_hub_error!(
         poll(&env, &handle).await,
         (503, json!({"error": "unavailable"}))
     );
@@ -994,7 +994,7 @@ async fn on_a_public_repository_only_people_who_can_write_get_in() {
     // The refusal names who lacks which role where, and the one fix.
     let (_, signed_in) = env.get("/v1/hub/session", Some(&session)).await;
     let login = signed_in["user"]["login"].as_str().unwrap().to_owned();
-    assert_eq!(
+    crate::assert_hub_error!(
         env.create_token(&session, "acme/readonly").await,
         (
             403,
@@ -1103,7 +1103,7 @@ async fn gitlab_sign_in_and_minting_need_developer_on_non_private_projects() {
         .unwrap()
         .repos
         .insert((7, "grp/unconnected".into()), 26);
-    assert_eq!(
+    crate::assert_hub_error!(
         env.create_token(&session, "grp/unconnected").await,
         (403, json!({"error": "not_connected"}))
     );
@@ -1297,7 +1297,7 @@ async fn token_minting_rechecks_forge_access() {
     for repo in ["acme/private", "acme/widgets/extra"] {
         assert_ne!(env.create_token(&session, repo).await.0, 201);
     }
-    assert_eq!(
+    crate::assert_hub_error!(
         env.create_token(&session, "acme/private").await,
         (403, json!({"error": "forbidden"}))
     );
@@ -1342,7 +1342,7 @@ async fn minting_needs_the_repository_connected_under_the_same_id() {
         .repos
         .insert((7, "acme/loose".into()), 321);
     let events = env.kinds().len();
-    assert_eq!(
+    crate::assert_hub_error!(
         env.create_token(&session, "acme/loose").await,
         (403, json!({"error": "not_connected"}))
     );
@@ -1353,7 +1353,7 @@ async fn minting_needs_the_repository_connected_under_the_same_id() {
         .unwrap()
         .repos
         .insert((7, "acme/reused".into()), 9);
-    assert_eq!(
+    crate::assert_hub_error!(
         env.create_token(&session, "acme/reused").await,
         (403, json!({"error": "forbidden"}))
     );
@@ -1525,7 +1525,7 @@ async fn sessions_and_agent_tokens_are_not_interchangeable() {
     let agent = token["token"].as_str().unwrap();
     for path in ["/v1/hub/session", "/v1/hub/tokens", "/v1/hub/users"] {
         let (status, body) = env.get(path, Some(agent)).await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, body),
             (401, json!({"error": "unauthorized"})),
             "{path}"
@@ -1549,7 +1549,7 @@ async fn admins_disable_and_enable_users() {
     let admin = secret(&admin_signed);
     assert_eq!(admin_signed["admin"], true);
 
-    assert_eq!(
+    crate::assert_hub_error!(
         env.get("/v1/hub/users", Some(&alice)).await,
         (403, json!({"error": "forbidden"}))
     );
@@ -1573,7 +1573,7 @@ async fn admins_disable_and_enable_users() {
     );
     // An administrator cannot lock themselves out.
     let own = format!("/v1/hub/users/{admin_id}/disable");
-    assert_eq!(
+    crate::assert_hub_error!(
         env.post(&own, Some(&admin), json!({})).await,
         (400, json!({"error": "invalid_request"}))
     );
