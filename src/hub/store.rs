@@ -827,6 +827,13 @@ pub trait Store: Send + Sync {
         query: &WorkPrLinkQuery,
         now: i64,
     ) -> Result<Option<WorkPrLinkView>>;
+    /// Scoped read of the explicit PR target alone, for person and agent readers alike.
+    fn work_pr_target_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_links::WorkPrLinkTarget>>;
     /// Set or remove a caller-asserted relationship, fenced by current Work ownership.
     fn work_pr_link_set(
         &self,

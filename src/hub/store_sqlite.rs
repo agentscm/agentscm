@@ -11322,6 +11322,46 @@ impl Store for SqliteStore {
         Ok(Some(view))
     }
 
+    fn work_pr_target_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<work_links::WorkPrLinkTarget>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => {
+                if owner.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(owner, repository, *repository_id)
+            }
+        };
+        if scoped_work(&tx, &who, id, now)?.is_none() {
+            return Ok(None);
+        }
+        let snapshot: Option<String> = tx
+            .query_row(
+                "SELECT snapshot FROM hub_work_pr_links WHERE work=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let target = snapshot
+            .as_deref()
+            .map(json_value::<WorkPrLink>)
+            .transpose()?
+            .map(|link| link.target);
+        tx.commit()?;
+        Ok(target)
+    }
+
     fn work_pr_link_set(
         &self,
         token: &str,

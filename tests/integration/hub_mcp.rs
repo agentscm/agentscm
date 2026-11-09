@@ -3584,3 +3584,89 @@ async fn recovery_resolves_existing_work_before_a_duplicate_and_matches_http() {
     let denied = hub.rpc(&reader, &body).await;
     assert_ne!(denied.status, 200, "{}", denied.text);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr_overlap_skips_the_work_that_opened_the_pull_request() {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::session::SessionCall;
+    use agentscm::hub::work::WorkStart;
+    let hub = Hub::start().await;
+    let now = unix_now();
+    // One person's MCP and hook tokens share a native session, as a client with both does.
+    let (mcp, secret) = hub.secret_with_id(1, "author-mcp");
+    let (hook, _) = hub.secret_with_id(1, "author-hook");
+    let start: WorkStart = serde_json::from_value(json!({"request_key": "self-pr",
+        "title": "Open the pull request", "session": "native-1", "scope": ["src/a.rs"],
+        "branch": "feature/self"}))
+    .unwrap();
+    hub.store.work_start(&mcp, &start, now).unwrap();
+    let touch = |token: &str, session: &str, path: &str| {
+        hub.store
+            .touch_session(
+                token,
+                &SessionCall {
+                    session: Some(session.into()),
+                    via: "hook:claude".into(),
+                    task: Some("Edit".into()),
+                    paths: vec![path.into()],
+                    deny: false,
+                    report: false,
+                },
+                now,
+            )
+            .unwrap();
+    };
+    touch(&hook, "native-1", "src/a.rs");
+    let owner = hub.store.user_for_identity(&ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 1,
+    });
+    let connection = hub
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: format!("con_{}", "e".repeat(32)),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("user1".into()),
+            },
+            &owner.unwrap().unwrap().id,
+        )
+        .unwrap();
+    let repo = hub
+        .store
+        .upsert_repository(&connection.id, "github.com", 77, REPO, None, None)
+        .unwrap();
+    let pull = json!({"number": 7, "state": "open", "head_ref": "feature/self",
+        "head_sha": "a".repeat(40), "files": ["src/a.rs", "src/b.rs"], "files_truncated": false});
+    hub.store
+        .observe(&repo.id, "pull_request", "7", &pull.to_string(), now * 1000)
+        .unwrap();
+    let overlap = || async {
+        let status = hub
+            .tool_result(&secret, "agentscm_work_status", json!({}))
+            .await;
+        status["structuredContent"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["kind"] == "pr_overlap")
+            .cloned()
+    };
+    assert_eq!(overlap().await, None);
+    // Another agent holding one of the pull request's files still raises it, naming only them.
+    let (other, _) = hub.secret_with_id(2, "other-hook");
+    touch(&other, "native-2", "src/b.rs");
+    let row = overlap().await.expect("another holder raises pr_overlap");
+    let logins: Vec<&str> = row["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["login"].as_str())
+        .collect();
+    assert_eq!(logins, ["user2"]);
+}

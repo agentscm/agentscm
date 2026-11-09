@@ -11259,6 +11259,43 @@ impl Store for PgStore {
         })
     }
 
+    fn work_pr_target_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<work_links::WorkPrLinkTarget>> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
+            if scoped_work(&mut tx, &who, id, now, false)?.is_none() {
+                return Ok(None);
+            }
+            let target = tx
+                .query_opt(
+                    "SELECT snapshot FROM hub_work_pr_links WHERE work=$1",
+                    &[&id],
+                )?
+                .map(|row| json_value::<WorkPrLink>(&row.get::<_, String>(0)))
+                .transpose()?
+                .map(|link| link.target);
+            tx.commit()?;
+            Ok(target)
+        })
+    }
+
     fn work_pr_link_set(
         &self,
         token: &str,
