@@ -388,9 +388,13 @@ pub(crate) fn direct_client() -> reqwest::Result<reqwest::Client> {
 }
 
 pub(crate) fn map_hub_error(error: HubError) -> Error {
-    Error::Hub(Box::new(agentscm::hub::error_envelope::from_hub_error(
-        &error,
-    )))
+    match error {
+        // A local command's own input or configuration: the operator reads why.
+        HubError::Invalid(message) => Error::Invalid(message),
+        error => Error::Hub(Box::new(agentscm::hub::error_envelope::from_hub_error(
+            &error,
+        ))),
+    }
 }
 
 fn invalid(message: &str) -> Error {

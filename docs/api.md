@@ -589,6 +589,7 @@ Registered codes:
 | `device_exists` | 409 | no | `inspect_work` |
 | `stale_generation` | 409 | no | `inspect_work` |
 | `request_conflict` | 409 | no | `inspect_work` |
+| `sharing_off` | 403 | no | `ask_owner` |
 | `duplicate_key` | 409 | no | `provide_field` |
 | `owner_role_missing` | 409 | no | `ask_owner` |
 | `role_check_unavailable` | 503 | yes | `retry` |

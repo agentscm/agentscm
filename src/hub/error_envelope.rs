@@ -197,6 +197,7 @@ error_codes! {
     UnknownDevice => ("unknown_device", 404, false, None, "The device was not found; check its identifier."),
     DeviceExists => ("device_exists", 409, false, InspectWork, "This device is already enrolled; inspect its current enrollment."),
     StaleGeneration => ("stale_generation", 409, false, InspectWork, "The device generation changed; read it again before sending a new request."),
+    SharingOff => ("sharing_off", 403, false, AskOwner, "Conversation sharing is off for this repository or person; nothing was stored."),
     RequestConflict => ("request_conflict", 409, false, InspectWork, "The request id already identifies a different request; inspect the retained result."),
     DuplicateKey => ("duplicate_key", 409, false, ProvideField, "This key was already enrolled; use a new device key."),
     OwnerRoleMissing => ("owner_role_missing", 409, false, AskOwner, "The owner lacks the required repository role; ask an authorized owner to enroll."),

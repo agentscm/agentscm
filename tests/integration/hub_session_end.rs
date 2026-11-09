@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use agentscm::hub::HubError;
 use agentscm::hub::connection::NewConnection;
+use agentscm::hub::error_envelope::ErrorCode;
 use agentscm::hub::session::{SESSION_REQUIRED, SessionCall, Touched};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_bound_agent_token, new_connection_id, unix_now,
@@ -528,12 +529,13 @@ fn an_unnamed_end_resolves_the_session_like_end_session(db: &Db) {
     // A second hook session makes an omitted name ambiguous, and nothing is written.
     touch(&*store, &alice, "s-b", "docs/guide.md", now + 2);
     let seen = events(&*store).len();
-    let Err(HubError::Invalid(message)) =
+    let Err(HubError::Rejected(rejection)) =
         store.end_session_pausing(&alice.token, None, "mcp", now + 3)
     else {
         panic!("an ambiguous session must be refused");
     };
-    assert_eq!(message, SESSION_REQUIRED);
+    assert_eq!(rejection.code(), ErrorCode::SessionRequired);
+    assert_eq!(rejection.message(), SESSION_REQUIRED);
     assert_eq!(events(&*store).len(), seen);
     assert_eq!(
         work(&*store, &alice, &first.id, now + 3).state,

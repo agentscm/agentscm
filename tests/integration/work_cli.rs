@@ -739,7 +739,11 @@ fn reconcile_cli_prints_the_report_and_fails_for_unknown_work() {
 
     let missing = run("wrk_00000000000000000000000000000001");
     let error = cli_error(&missing);
-    assert_eq!(error["error"], "invalid: hub error 404", "{error}");
+    assert_eq!(
+        (error["code"].as_str(), error["error_kind"].as_str()),
+        (Some("not_found"), Some("nonexistent")),
+        "{error}"
+    );
 }
 
 #[test]

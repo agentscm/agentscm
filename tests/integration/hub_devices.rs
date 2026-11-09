@@ -1773,6 +1773,8 @@ async fn with_cookie(
     let response = request.send().await.unwrap();
     let status = response.status().as_u16();
     let text = response.text().await.unwrap();
+    // Each refusal carries its own error reference; blank it so equal refusals compare equal.
+    let text = crate::hub_error_assert::blank_references(&text);
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
@@ -3545,12 +3547,10 @@ async fn a_capacity_refusal_reaches_the_operator_with_what_to_run() {
             Some(start(MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN)),
         )
         .await;
-    assert_eq!(
-        (status, refused),
-        (
-            503,
-            json!({"error": "work_storage_capacity", "limit": "coordination_requests"})
-        )
+    assert_eq!(status, 503, "{refused}");
+    crate::assert_hub_error!(
+        refused,
+        json!({"error": "work_storage_capacity", "limit": "coordination_requests"})
     );
 
     // The admin sees which repository and limit, counted, with the remedy.

@@ -88,7 +88,10 @@ async fn mcp_tool(env: &workspace_hub::Env, token: &str, name: &str, arguments: 
     )
     .await;
     assert_eq!(status, 200, "{reply}");
-    reply["result"].clone()
+    serde_json::from_str(&crate::hub_error_assert::blank_references(
+        &reply["result"].to_string(),
+    ))
+    .unwrap()
 }
 
 async fn reopen_with_forge_binding(
@@ -385,7 +388,10 @@ async fn cli_reads_exact_versions_and_keeps_agent_inputs_advisory() {
     let hidden_reply = cli(&env, token, &["show", hidden_id]);
     let unknown_reply = cli(&env, token, &["show", "prm_unknown"]);
     assert!(!hidden_reply.status.success());
-    assert_eq!(hidden_reply.stderr, unknown_reply.stderr);
+    assert_eq!(
+        crate::hub_error_assert::blank_references(&String::from_utf8_lossy(&hidden_reply.stderr)),
+        crate::hub_error_assert::blank_references(&String::from_utf8_lossy(&unknown_reply.stderr))
+    );
 
     let list_tool = mcp_tool(&env, token, "agentscm_promises_list", json!({})).await;
     assert_eq!(list_tool["isError"], false);

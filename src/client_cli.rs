@@ -1861,16 +1861,19 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
         .iter()
         .find(|status| status.root == root)
         .ok_or_else(|| invalid("No Hub binding. Run client setup for this agent and Hub."))?;
-    println!("Connection: {}", status.health.summary());
-    match &status.hub_check {
-        crate::client_status::HubCheck::Valid { hub_build, .. } => println!(
+    let crate::client_status::HubCheck::Valid { hub_build, .. } = &status.hub_check else {
+        return Err(invalid(&status.health.summary()));
+    };
+    // --json stays one JSON document; the connection lines are for a person.
+    if !args.json {
+        println!("Connection: {}", status.health.summary());
+        println!(
             "Hub build: {}",
             hub_build.as_ref().map_or_else(
                 || "not reported by this Hub".to_owned(),
                 crate::client_status::HubBuild::label
             )
-        ),
-        _ => return Err(invalid(&status.health.summary())),
+        );
     }
     let token = read_token(&connection.token_file)?;
     let client_id = crate::client_config::onboarding_client(&root, &token);

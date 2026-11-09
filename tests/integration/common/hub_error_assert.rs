@@ -50,8 +50,9 @@ macro_rules! assert_hub_error {
     };
 }
 
-/// The text with every `cor_<32 hex>` error reference blanked, so two answers to the same
-/// refused request can be compared apart from the reference each carries.
+/// The text with every `cor_<32 hex>` error reference replaced by the all-zero reference, so two
+/// answers to the same refused request compare equal apart from the reference each carries, and
+/// a blanked reply still carries a well-formed reference.
 pub fn blank_references(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -59,7 +60,7 @@ pub fn blank_references(text: &str) -> String {
         out.push_str(&rest[..at]);
         let tail = &rest[at + 4..];
         let hex = tail.bytes().take_while(u8::is_ascii_hexdigit).count();
-        out.push_str("cor_<ref>");
+        out.push_str("cor_00000000000000000000000000000000");
         rest = &tail[hex..];
     }
     out.push_str(rest);

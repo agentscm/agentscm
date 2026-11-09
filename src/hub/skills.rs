@@ -177,7 +177,9 @@ impl IntoResponse for Failure {
     fn into_response(self) -> Response {
         match self {
             Self::Hub(error) => ApiError::from(error).into_response(),
-            Self::Refused(status, code, _) => ApiError::new(status, code).into_response(),
+            Self::Refused(status, code, message) => ApiError::new(status, code)
+                .with_message(message)
+                .into_response(),
         }
     }
 }
@@ -810,7 +812,11 @@ fn tool_result(text: String, structured: Value, is_error: bool) -> Value {
 fn refusal_result(failure: Failure) -> Value {
     match failure {
         Failure::Hub(error) => hub_failure(&error),
-        Failure::Refused(status, code, _) => ApiError::new(status, code).envelope().mcp(),
+        Failure::Refused(status, code, message) => {
+            let mut envelope = ApiError::new(status, code).envelope().clone();
+            envelope.message = super::error_envelope::server_message(&message);
+            envelope.mcp()
+        }
     }
 }
 

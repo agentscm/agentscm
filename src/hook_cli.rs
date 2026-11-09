@@ -2101,7 +2101,13 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
                 error.hook_note()
             } else {
                 use agentscm::hub::error_envelope::{ErrorCode, RecoveryAction, sanitize};
-                let reason = sanitize(reason);
+                // An auto-connect refusal is the Hub's sentence, already cleaned when decoded; it
+                // names the repository, so path redaction would hide the one fact it carries.
+                let reason = if reason.starts_with(AUTO_CONNECT_REFUSED) {
+                    reason.to_owned()
+                } else {
+                    sanitize(reason)
+                };
                 let recovery = match reason.as_str() {
                     "no token" => ErrorCode::Unauthorized.action(),
                     "bad reply" => ErrorCode::InvalidResponse.action(),
