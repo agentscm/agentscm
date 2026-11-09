@@ -947,7 +947,8 @@ fn plan_enable(
                 configured_recipes: saved.configured_recipes.clone(),
                 claude_history_root: saved.claude_history_root.clone(),
                 spool_limits: saved.spool_limits,
-                follows_hub: saved.follows_hub,
+                // Re-enabled by the person, so it gets hooks of its own again.
+                follows_hub: false,
             }
         }
         None => {
@@ -1726,7 +1727,12 @@ pub(crate) fn followed_binding(
     }
     let _connections = client_config::lock_connections()?;
     let _lock = acquire_lock()?;
-    let bindings = load()?;
+    let mut bindings = load()?;
+    // Worktrees come and go; at the binding limit, followed bindings of deleted ones make room.
+    // Their spools stay on disk, like `forget`.
+    if bindings.len() >= MAX_BINDINGS {
+        bindings.retain(|binding| !binding.follows_hub || binding.root.exists());
+    }
     if bindings.iter().any(|binding| binding.root == root)
         || !client_config::is_current_in(connection, &root)
     {

@@ -1271,6 +1271,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn administers_is_github_admin_or_gitlab_maintainer_and_owner() {
+        assert!(administers(false, &json!({"permission": "admin"})));
+        assert!(!administers(
+            false,
+            &json!({"permission": "write", "role_name": "maintain"})
+        ));
+        assert!(administers(true, &json!({"access_level": 40})));
+        assert!(administers(true, &json!({"access_level": 50})));
+        assert!(!administers(true, &json!({"access_level": 30})));
+    }
+
+    #[test]
     fn attention_revision_ignores_provider_poll_time_but_tracks_actions_and_recipients() {
         use crate::hub::work_http::actionable_status::{ActionableStatus, StatusReconciliation};
         let mut status: ActionableStatus =

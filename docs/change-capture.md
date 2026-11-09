@@ -112,12 +112,18 @@ default that applies to every repository without its own setting. The routes are
   Hub is written as config version 7, which older binaries refuse.
 - **People are told and can opt out.** The first time a person's session shares in a
   repository, its agent is told in the session-start context that conversations are shared,
-  who can read them, and how to stop. `agentscm change-capture opt-out` (in the checkout) stops
+  who can read them, and how to stop. This is best effort: the notice is recorded as shown
+  before the hook's reply is printed, so a reply the host cuts off loses it, and a session
+  already running when the setting is turned on is told at its next start. `agentscm change-capture opt-out` (in the checkout) stops
   that person's own sessions in the repository, on every computer, from uploading;
   `change-capture opt-in` undoes it. The choice is per person and repository, stored on the Hub.
+  Opting out works forward: bodies already uploaded stay readable to the repository's readers
+  until they expire or their author deletes them with `change-capture conversation --delete`.
 - **Off means off.** The client asks the Hub again on every hook call, and the Hub itself
   refuses uploads (403 `sharing_off`) and lists nothing as missing while the setting is off or the
-  person opted out, so bodies not yet uploaded stay declared `local`. Turning it off recalls
+  person opted out, so bodies not yet uploaded stay declared `local`; they are not uploaded later
+  if sharing is turned back on. A followed binding keeps recording metadata (events and action
+  receipts, no bodies) while sharing is off, until `unconfigure`. Turning it off recalls
   nothing already uploaded (see [retention and deletion](#retention-and-deletion)).
 - **`set-mode` only lowers.** The Hub's answer caps every binding: a binding that follows the Hub
   shares only while the Hub says so and captures metadata only otherwise; any other binding's
@@ -125,11 +131,20 @@ default that applies to every repository without its own setting. The routes are
   `unconfigure`) on a checkout lowers it further; it never raises sharing above the setting.
   When the Hub gives no answer (an older Hub, or no reply in time) a binding keeps its own mode,
   a followed binding is never created, and the Hub still refuses what it does not allow.
+- **Existing shared checkouts need the setting.** A checkout configured for
+  `shared-conversation` before this setting existed shares again only once its repository's
+  setting (or the Hub-wide default) is on; until then it keeps its bodies local.
 - **Redaction is unchanged.**
 
 Linked worktrees each get their own binding and private spool. A checkout counts toward the
-limit of 128 capture bindings; `unconfigure` and `forget` remove a followed binding like any
-other, and a disabled one is never re-created by the plugin hook.
+limit of 128 capture bindings; at the limit, followed bindings of worktrees that no longer exist
+are dropped to make room (their spools stay on disk). `unconfigure` and `forget` remove a
+followed binding like any other, and a disabled one is never re-created by the plugin hook;
+re-enabling it from the menu bar or the local page gives it hooks of its own.
+
+From the plugin hook, capture shares the hook's time: it gives up at 2.5 seconds (4 at session
+start). A target lookup that runs out leaves a sanitized deferred fact instead of the event, and
+records not yet delivered wait for the next hook.
 
 ### Per-checkout configuration
 

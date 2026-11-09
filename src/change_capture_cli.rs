@@ -362,7 +362,9 @@ async fn hook_claude() -> Result<i32> {
         return Ok(0);
     }
     let hub = change_capture_client::CaptureHub::new(connection).ok();
-    if let Some(context) = capture_claude(&input, &payload, &binding, &spool, hub.as_ref()).await {
+    if let Some(context) =
+        capture_claude(&input, &payload, &binding, &spool, hub.as_ref(), None).await
+    {
         println!("{}", session_start_output(context)?);
     }
     Ok(0)
@@ -385,6 +387,7 @@ pub(crate) async fn plugin_capture(
     payload: &Value,
     checkout: std::path::PathBuf,
     connection: crate::client_config::Connection,
+    deadline: tokio::time::Instant,
 ) -> Option<String> {
     if !captures_claude_event(payload) {
         return None;
@@ -394,8 +397,10 @@ pub(crate) async fn plugin_capture(
         payload.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart");
     // Only a session start creates a binding, so a session keeps the mode it started under.
     let create = session_start
-        && change_capture_client::hub_sharing(&hub)
+        && tokio::time::timeout_at(deadline, change_capture_client::hub_sharing(&hub))
             .await
+            .ok()
+            .flatten()
             .is_some_and(|answer| answer.sharing);
     let found = tokio::task::spawn_blocking(move || {
         change_capture_client::followed_binding(&checkout, &connection, create)
@@ -412,18 +417,24 @@ pub(crate) async fn plugin_capture(
             return None;
         }
     };
-    capture_claude(input, payload, &binding, &spool, Some(&hub)).await
+    capture_claude(input, payload, &binding, &spool, Some(&hub), Some(deadline)).await
 }
 
 /// Records one native hook event for `binding` and delivers what is pending. Fails open: every
-/// problem is a warning. Returns the session-start context, if any.
+/// problem is a warning. Returns the session-start context, if any. Past `deadline` a Hub call is
+/// given up: an unresolved target leaves a sanitized deferred fact, and pending records wait for
+/// the next hook.
 async fn capture_claude(
     input: &[u8],
     payload: &Value,
     binding: &change_capture_client::CaptureBinding,
     spool: &LocalSpool,
     hub: Option<&change_capture_client::CaptureHub>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Option<String> {
+    // A hook without its own deadline keeps the host's (20 seconds for the capture hook).
+    let deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(18));
     let session_id = match payload
         .get("session_id")
         .and_then(serde_json::Value::as_str)
@@ -456,19 +467,32 @@ async fn capture_claude(
     };
     let deliver = || async {
         match hub {
-            Some(hub) => {
-                change_capture_client::deliver_pending_with(&binding.root, spool, hub).await
-            }
+            // Delivery leaves time for the session-start notice and the reply.
+            Some(hub) => tokio::time::timeout_at(
+                deadline - Duration::from_millis(400),
+                change_capture_client::deliver_pending_with(&binding.root, spool, hub),
+            )
+            .await
+            .unwrap_or_else(|_| Err(Error::Invalid("capture delivery ran out of time".into()))),
             None => Err(Error::Invalid("capture Hub client unavailable".into())),
         }
     };
     let (target, sharing) = match hub {
-        Some(hub) => {
+        Some(hub) => tokio::time::timeout_at(deadline, async {
             tokio::join!(
                 change_capture_client::resolve_target_with(binding, hub, &session_id),
                 change_capture_client::hub_sharing(hub)
             )
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                Err(Error::Invalid(
+                    "capture target lookup ran out of time".into(),
+                )),
+                None,
+            )
+        }),
         None => (
             Err(Error::Invalid("capture Hub client unavailable".into())),
             None,
@@ -601,10 +625,12 @@ async fn capture_claude(
         && !answer.notified
     {
         context.push(sharing_notice(&binding.repository));
-        if change_capture_client::mark_sharing_notified(hub)
-            .await
-            .is_err()
-        {
+        // Best effort: a reply cut off after this point loses a notice recorded as shown.
+        if !matches!(
+            tokio::time::timeout_at(deadline, change_capture_client::mark_sharing_notified(hub))
+                .await,
+            Ok(Ok(()))
+        ) {
             eprintln!(
                 "AgentSCM local capture warning: the sharing notice was not recorded as shown"
             );

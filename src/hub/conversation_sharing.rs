@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::login::HumanSession;
 use super::store::{Store, validate_repository};
-use super::{HubError, HubState, Result};
+use super::{HubState, Result};
 
 const HUB_DEFAULT_KEY: &str = "conversation_sharing:default";
 
@@ -22,18 +22,17 @@ fn repository_key(repository_id: i64) -> String {
     format!("conversation_sharing:repo:{repository_id}")
 }
 
-fn person_key(user_id: &str, repository_id: i64) -> String {
-    format!("conversation_sharing:person:{user_id}:{repository_id}")
+/// A person's own choice for one repository, each under its own key so the session-start
+/// notice and an opt-out never overwrite each other.
+fn person_key(choice: &str, user_id: &str, repository_id: i64) -> String {
+    format!("conversation_sharing:{choice}:{user_id}:{repository_id}")
 }
 
 /// A person's own choices for one repository.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Person {
-    #[serde(default)]
     opted_out: bool,
     /// Their agent has shown the one-time notice that sharing is on.
-    #[serde(default)]
     notified: bool,
 }
 
@@ -66,11 +65,23 @@ fn flag(store: &dyn Store, key: &str) -> Result<Option<bool>> {
     })
 }
 
+/// An unreadable value opts the person out rather than in.
 fn person(store: &dyn Store, user_id: &str, repository_id: i64) -> Result<Person> {
-    Ok(store
-        .get_setting(&person_key(user_id, repository_id))?
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default())
+    let choice = |name| -> Result<bool> {
+        Ok(
+            match store
+                .get_setting(&person_key(name, user_id, repository_id))?
+                .as_deref()
+            {
+                None | Some("0") => false,
+                Some(_) => true,
+            },
+        )
+    };
+    Ok(Person {
+        opted_out: choice("opt_out")?,
+        notified: choice("notified")?,
+    })
 }
 
 /// The repository's effective setting. A token without a forge repository id (minted before ids
@@ -91,8 +102,10 @@ pub(super) fn person_shares(
     user_id: &str,
     repository_id: Option<i64>,
 ) -> Result<bool> {
-    Ok(repository_shares(store, repository_id)?
-        && repository_id.is_some_and(|id| person(store, user_id, id).is_ok_and(|p| !p.opted_out)))
+    let Some(id) = repository_id else {
+        return Ok(false);
+    };
+    Ok(repository_shares(store, repository_id)? && !person(store, user_id, id)?.opted_out)
 }
 
 fn view(
@@ -134,17 +147,13 @@ fn update_person(
     repository_id: i64,
     change: &PersonChange,
 ) -> Result<()> {
-    // shortcut: read-modify-write of one small value is last-writer-wins; only this person writes it.
-    let mut mine = person(store, user_id, repository_id)?;
-    if let Some(opted_out) = change.opted_out {
-        mine.opted_out = opted_out;
+    for (name, value) in [("opt_out", change.opted_out), ("notified", change.notified)] {
+        if let Some(value) = value {
+            let key = person_key(name, user_id, repository_id);
+            store.set_setting(&key, if value { "1" } else { "0" }, user_id)?;
+        }
     }
-    if let Some(notified) = change.notified {
-        mine.notified = notified;
-    }
-    let raw = serde_json::to_string(&mine)
-        .map_err(|_| HubError::Unavailable("sharing choice encoding failed".into()))?;
-    store.set_setting(&person_key(user_id, repository_id), &raw, user_id)
+    Ok(())
 }
 
 fn on_off(enabled: Option<bool>) -> &'static str {
@@ -246,10 +255,21 @@ async fn session_scope(
 ) -> std::result::Result<(String, String, i64, bool, bool), ApiError> {
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
+    let hub_admin = state.login.is_admin_user(&user);
+    // A Hub admin changes any connected repository's setting, with or without a forge role.
+    if hub_admin {
+        let (store, host, named) = (
+            state.store.clone(),
+            user.identity.host.clone(),
+            repository.to_owned(),
+        );
+        if let Some(repo) = blocking(state, move || store.repository_named(&host, &named)).await? {
+            return Ok((user.id, repo.full_name, repo.repository_id, true, true));
+        }
+    }
     let (repo, repository_admin) =
         super::login::devices::mint_access(state, &user, repository, "conversation_sharing")
             .await?;
-    let hub_admin = state.login.is_admin_user(&user);
     Ok((
         user.id,
         repo.full_name,

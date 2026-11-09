@@ -210,7 +210,21 @@ pub(super) async fn conversation_page(
     let repository_id = principal.repository_id;
     let entries = blocking(state, move || {
         let all = admin || super::conversation_sharing::repository_shares(&*store, repository_id)?;
-        store.shared_conversation_page(&token, &work_id, cursor.as_deref(), all, unix_now())
+        let mut entries =
+            store.shared_conversation_page(&token, &work_id, cursor.as_deref(), all, unix_now())?;
+        // Each entry names who shared it by login; a page holds at most a few authors.
+        let mut logins = std::collections::HashMap::new();
+        for entry in entries.iter_mut().flatten() {
+            let Some(id) = entry.author.take() else {
+                continue;
+            };
+            if !logins.contains_key(&id) {
+                let login = store.user_by_id(&id)?.map(|user| user.login);
+                logins.insert(id.clone(), login);
+            }
+            entry.author = logins[&id].clone();
+        }
+        Ok(entries)
     })
     .await?
     .ok_or_else(ApiError::not_found)?;

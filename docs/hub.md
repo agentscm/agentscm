@@ -984,7 +984,8 @@ is no per-body grant.
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}/conversation?cursor=` returns one page, at most
   100 entries and 48 KiB, ordered by session id (bytewise) then sequence then digest, with an opaque
   `next_cursor` (a malformed one is 400). Each entry has `session_id`, `sequence`, `event_id`, `kind`,
-  `observed_at`, `digest`, `size_bytes`, `availability` and `expires_at`. Availability is `local` (declared,
+  `observed_at`, `digest`, `size_bytes`, `availability`, `expires_at` and `author`, the forge login of
+the person who shared it (older clients, which refuse unknown fields, need upgrading to list). Availability is `local` (declared,
   never uploaded), `shared`, `expired` (from its deadline, before the sweep records it) or
   `deleted`.
 - `GET .../conversation/{sha256}` returns the verified bytes as `application/json` with

@@ -95,10 +95,18 @@ async fn hook(
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
-    let capture = (client_connection
+    let session_start = is_session_start(agent, &payload);
+    let wants_capture = client_connection
         && agent == "claude"
-        && crate::change_capture_cli::captures_claude_event(&payload))
-    .then(|| {
+        && crate::change_capture_cli::captures_claude_event(&payload);
+    // Capture stops in time for the reply to be printed before the host's hook timeout.
+    let budget = started
+        + if session_start {
+            CAPTURE_SESSION_START_BUDGET
+        } else {
+            CAPTURE_BUDGET
+        };
+    let spawn_capture = || {
         let (body, payload) = (body.clone(), std::sync::Arc::clone(&payload));
         tokio::spawn(async move {
             let routed = route_client("claude", &payload).ok()?;
@@ -107,12 +115,17 @@ async fn hook(
                 &payload,
                 routed.checkout,
                 routed.connection,
+                budget.into(),
             )
             .await
         })
-    });
+    };
+    // At session start coordination may connect the checkout first, so capture follows it there
+    // and runs beside it otherwise.
+    let early = (wants_capture && !session_start).then(spawn_capture);
     // Events only capture needs never reach the Hub's hook.
-    let reply = if CAPTURE_ONLY_EVENTS.contains(&payload["hook_event_name"].as_str().unwrap_or(""))
+    let reply = if client_connection
+        && CAPTURE_ONLY_EVENTS.contains(&payload["hook_event_name"].as_str().unwrap_or(""))
     {
         fail_open(agent, &payload, None)
     } else {
@@ -122,27 +135,27 @@ async fn hook(
             repo,
             client_connection,
             destination_args,
-            body,
+            body.clone(),
             std::sync::Arc::clone(&payload),
             started,
         )
         .await
     };
-    let Some(capture) = capture else {
+    let Some(capture) = early.or_else(|| (wants_capture && session_start).then(spawn_capture))
+    else {
         return reply;
     };
-    let limit = if is_session_start(agent, &payload) {
-        SESSION_START_LIMIT
-    } else {
-        LIMIT
-    };
-    // Capture fails open: past the hook's deadline its retained records wait for the next hook.
-    let remaining = (started + limit).saturating_duration_since(Instant::now());
+    let remaining = budget.saturating_duration_since(Instant::now());
     match tokio::time::timeout(remaining, capture).await {
-        Ok(Ok(Some(context))) => with_note(reply, agent, &payload, &context),
+        Ok(Ok(Some(context))) => within_context_limit(with_note(reply, agent, &payload, &context)),
         _ => reply,
     }
 }
+
+/// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
+/// (5 at session start), and the reply still has to be printed.
+const CAPTURE_BUDGET: Duration = Duration::from_millis(2500);
+const CAPTURE_SESSION_START_BUDGET: Duration = Duration::from_millis(4000);
 
 /// Claude Code events the plugin registers only so capture sees them.
 const CAPTURE_ONLY_EVENTS: [&str; 5] = [

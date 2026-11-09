@@ -2303,6 +2303,11 @@ mod shared_bodies {
         let (status, page) = f.list(&f.member_secret, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        let author = page["entries"][0]["author"].as_str().unwrap();
+        assert!(
+            !author.is_empty() && !author.starts_with("usr_"),
+            "a login: {author}"
+        );
         let response = f.read(&f.member_secret, &f.sha).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap().as_ref(), f.body.as_slice());
@@ -2456,7 +2461,8 @@ mod shared_bodies {
             json!({
                 "session_id": SESSION, "sequence": 1, "event_id": "http-setup-event",
                 "kind": "session_started", "observed_at": 100, "digest": f.sha,
-                "size_bytes": f.body.len(), "availability": "local", "expires_at": null
+                "size_bytes": f.body.len(), "availability": "local", "expires_at": null,
+                "author": "owner"
             })
         );
         // Declared but never uploaded: nothing to read.
