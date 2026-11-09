@@ -512,7 +512,14 @@ pub(super) async fn reconcile_repo(
     token: &str,
     only: Option<i64>,
 ) -> Gh<()> {
-    let config = store_call(|| hub.store.validation_summary_config(&repo.id))?;
+    // This hook also runs in existing callers that have not enabled validation.
+    // Read enrollment on a blocking worker before entering the controller, so a
+    // single-threaded caller can safely take the disabled path (including PostgreSQL).
+    let store = hub.store.clone();
+    let repository = repo.id.clone();
+    let config = tokio::task::spawn_blocking(move || store.validation_summary_config(&repository))
+        .await
+        .map_err(|_| failed("validation enrollment read task failed"))??;
     if !config.is_some_and(|c| c.enabled && c.connection == conn.id) {
         return Ok(());
     }
