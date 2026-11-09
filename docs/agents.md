@@ -73,6 +73,29 @@ An edit the Hub cannot link to a current assignment of its session is refused wi
 
 A Claude Code subagent's hook calls carry its parent's `session_id`, with `agent_id` and `agent_type` added, so its edits are checked under the parent's Work with no join or takeover. The rules tell the parent to give a subagent its session ID for AgentSCM calls and tell the subagent not to start or take over Work; where a host does not report the parent's session for a subagent's edits, edits stay in the session that holds the claim. Evidence: Claude Code's hook and subagent documentation and, on one machine (Claude Code 2.1.310, 2026-11-05), transcript records of a subagent that carry the parent session ID. A live capture of a subagent's hook input was not possible in that run, and the Hub behaviour is tested with fixture payloads. How Codex, Copilot, Cursor and Gemini report subagent sessions was not checked.
 
+The checkout's MCP server (`agentscm client mcp`) also fills in `session` on a call that leaves it out, for the tools that take one, so linking a start to its edits does not depend on the model copying the ID:
+
+1. An agent's start hook records its native session ID under the agent host process that ran the hook: one small owner-only file per host and session, in `agent-hosts` under the AgentSCM config directory. The file is removed when the session ends, and at a later session start once its host has exited. The MCP server looks through its own ancestor processes for that host and uses the recorded ID.
+2. When the host has several conversations open at once, the server cannot tell whose call it is and leaves `session` out. It also leaves it out when it finds no record and the MCP client named itself as one of the hooked agents, or did not name itself. The Hub then places the call as described above.
+3. Any other client runs no hooks, so the server gives it one generated name for the life of the process (`<client name>-<8 hex digits>`). Two such clients on one checkout no longer share the token's `default` session.
+
+A `session` the agent passes itself is never changed. The Hub's `SESSION_REQUIRED` refusal is unchanged and still answers callers of `POST /mcp` that do not go through this server. Step 1 reads the process table with `ps`, so it works on macOS and Linux only.
+
+### Calls reach the repository whose files they name
+
+The checkout's MCP server starts in one checkout and uses that checkout's connection by default. A session often edits a second repository on the same computer, and edit hooks route each edit by the file's path. Tool calls route the same way, so Work is declared in the repository whose files change:
+
+- An absolute path in `paths` or `path` sends the call to the connection of the checkout that contains it. The server rewrites the path repo-relative before forwarding.
+- `root`, which the server adds to every tool, names another checkout by its absolute path; a path inside the checkout works too. Relative paths are then read against that checkout. Use it for calls that carry no path, such as `agentscm_work_checkpoint`, `agentscm_done` and the reads. The server takes `root` out before forwarding, so a Hub never receives a local path.
+- `worktree`, on the tools that have it, routes the call when it is the absolute path of a connected checkout. It is still forwarded as the Work's label.
+- Any other call goes to the checkout the server started in, and relative paths are read against that checkout.
+
+`root` is used before `worktree`, and `worktree` before paths. A call whose paths are in two repositories is refused with a message that says to call once per repository, and so is a call that mixes relative paths with another repository's absolute paths. A path or `root` in a checkout with no connection is refused with a message that names `agentscm client connect`. The server answers these refusals itself and sends nothing. Each repository keeps its own agent token; the server reads the token of the repository a call is for when the call is made. A reply from a repository other than the default ends with a line that names the repository and its checkout and says to pass `root` on later calls about that Work.
+
+When the checkout the server started in has no connection, or the server started outside any checkout, a call that names a connected checkout this way still goes through. Any other call says why the start checkout is not connected.
+
+The SessionStart context names the other repositories connected on this computer (at most six, without connections whose managed token has expired), so an agent knows that a second repository is covered.
+
 ### Choose source at task start and when dependencies grow
 
 The generated instructions also teach selective source use in native and Git workflows:
@@ -177,6 +200,8 @@ The cost is that failures are quiet. If warnings never appear, run `agentscm int
 - Where the edited file path sits in Cursor, Copilot and Codex payloads is only partly documented; the hub reads the fields that vendor documents and ignores the rest.
 - The hub is trusted. Its replies go into each agent's context, and the URL that decides which hub that is sits in hook and MCP config: a hook's `--hub-url` and the MCP server URL. Whoever controls that URL controls the text the agents using the config see, and receives their token and hook payloads. Review changes to those files, and treat the hub as trusted.
 - Coverage depends on every agent on the team being wired. An unwired agent is invisible. A pull-request check as a backstop is planned, not built.
+- The MCP server finds the hook's session through the process tree, on macOS and Linux only. On Windows, in a host that keeps several conversations in one process, or when the start hook did not run, a hooked agent's call without `session` is left for the Hub to place, as before. An MCP client started from another agent's shell, with no record of its own, gets that outer agent's session. The generic hook (`agentscm hook generic`) records no session.
+- A call reaches another repository only through `root`, an absolute `worktree` or absolute paths. A call without them goes to the checkout the session started in, so later calls about Work declared elsewhere must pass `root`.
 - Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim is a freshness label, not a release. A reservation blocks only while its lease is live; once it lapses it blocks nobody, and the next admission over its scope clears it and fences the old lead. Inspect the work and use the explicit takeover or reopen flow instead of assuming it is available.
 
 ## Recipes for other agents
@@ -206,7 +231,10 @@ None of these sends `agentscm hook generic` input directly. To wire one by hand:
 
 1. Add the user-level MCP server with command `agentscm` and arguments
    `--no-telemetry client mcp`. It uses the saved connection of the checkout it starts in, which
-   `agentscm client connect --hub HUB` makes, and offers no tools in a checkout without one.
+   `agentscm client connect --hub HUB` makes, and of any other connected checkout that a call
+   names ([routing](#calls-reach-the-repository-whose-files-they-name)). In a checkout without a
+   connection it lists the tools, and a call for that checkout says why it cannot run. A client
+   with no AgentSCM hook gets one session name per server process.
 2. Add a hook, or plugin, that maps the agent's event to
    `{"event": "start"|"check"|"waiting"|"done", "agent": "NAME", "session": ID, "paths": [...], "cwd": DIR}` (a `waiting` event also carries `"reason"`),
    pipes it to `agentscm hook generic` with `AGENTSCM_HUB_URL` and `AGENTSCM_HUB_TOKEN` set, and
