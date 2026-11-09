@@ -198,3 +198,124 @@ pub(super) fn history(
     tx.commit()?;
     Ok(page(entries, limit))
 }
+
+pub(super) fn snapshot(
+    store: &SqliteStore,
+    repository: &str,
+    proposal: i64,
+    limit: usize,
+) -> Result<crate::hub::validation_evidence::ValidationSnapshot> {
+    use crate::hub::validation_evidence::{ValidationSnapshot, validate_snapshot_limit};
+    validate_snapshot_limit(proposal, limit)?;
+    let mut conn = store.conn();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let config = tx
+        .query_row(
+            "SELECT connection,enabled FROM hub_validation_summary_config WHERE repository=?1",
+            params![repository],
+            |row| {
+                Ok(ValidationSummaryConfig {
+                    repository: repository.into(),
+                    connection: row.get(0)?,
+                    enabled: row.get::<_, i64>(1)? != 0,
+                })
+            },
+        )
+        .optional()?;
+    let generation = tx
+        .query_row(
+            "SELECT generation FROM hub_validation_proposals WHERE repository=?1 AND proposal=?2",
+            params![repository, proposal],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let entries = {
+        let mut query = tx.prepare("SELECT generation,bundle_sha256,received_at,received_by FROM hub_validation_evidence WHERE repository=?1 AND proposal=?2 ORDER BY generation LIMIT ?3")?;
+        query
+            .query_map(params![repository, proposal, limit as i64 + 1], |row| {
+                Ok(ValidationEvidenceReceipt {
+                    repository: repository.into(),
+                    proposal,
+                    generation: row.get(0)?,
+                    bundle_sha256: row.get(1)?,
+                    received_at: row.get(2)?,
+                    received_by: row.get(3)?,
+                    state: "received_unverified".into(),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if entries.len() > limit {
+        return Err(HubError::Invalid(
+            "validation snapshot exceeds receipt limit".into(),
+        ));
+    }
+    crate::hub::validation_evidence::validate_snapshot_inventory(generation, &entries)?;
+    tx.commit()?;
+    Ok(ValidationSnapshot {
+        config,
+        generation,
+        entries,
+    })
+}
+
+pub(super) fn publication(
+    store: &SqliteStore,
+    repository: &str,
+    proposal: i64,
+) -> Result<Option<crate::hub::validation_evidence::ValidationPublication>> {
+    crate::hub::validation_evidence::validate_snapshot_limit(proposal, 1)?;
+    let conn = store.conn();
+    let state = conn
+        .query_row(
+            "SELECT state FROM hub_validation_publication WHERE repository=?1 AND proposal=?2",
+            params![repository, proposal],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    state
+        .map(|s| {
+            serde_json::from_str(&s)
+                .map_err(|_| HubError::Unavailable("validation publication journal corrupt".into()))
+        })
+        .transpose()
+}
+
+pub(super) fn compare_publication(
+    store: &SqliteStore,
+    repository: &str,
+    proposal: i64,
+    expected_revision: i64,
+    next: &crate::hub::validation_evidence::ValidationPublication,
+) -> Result<bool> {
+    use crate::hub::validation_evidence::{
+        ValidationPublication, publication_transition, validate_snapshot_limit,
+    };
+    validate_snapshot_limit(proposal, 1)?;
+    let mut conn = store.conn();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let state = tx.query_row("SELECT revision,state FROM hub_validation_publication WHERE repository=?1 AND proposal=?2", params![repository,proposal], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?))).optional()?;
+    if state.as_ref().map_or(0, |s| s.0) != expected_revision {
+        return Ok(false);
+    }
+    let old: Option<ValidationPublication> = state
+        .map(|s| {
+            serde_json::from_str(&s.1)
+                .map_err(|_| HubError::Unavailable("validation publication journal corrupt".into()))
+        })
+        .transpose()?;
+    let fence = publication_transition(old.as_ref(), expected_revision, next)?;
+    if fence {
+        let config = tx.query_row("SELECT s.connection,s.enabled FROM hub_validation_summary_config s JOIN hub_repositories r ON r.id=s.repository AND r.connection=s.connection WHERE s.repository=?1",params![repository], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?))).optional()?;
+        let generation = tx.query_row("SELECT generation FROM hub_validation_proposals WHERE repository=?1 AND proposal=?2",params![repository,proposal],|row|row.get::<_,i64>(0)).optional()?.unwrap_or(0);
+        if config != Some((next.connection.clone(), 1)) || generation != next.evidence_generation {
+            return Ok(false);
+        }
+    }
+    let bytes = serde_json::to_string(next)
+        .map_err(|_| HubError::Invalid("invalid validation publication".into()))?;
+    tx.execute("INSERT INTO hub_validation_publication(repository,proposal,revision,state) VALUES(?1,?2,?3,?4) ON CONFLICT(repository,proposal) DO UPDATE SET revision=excluded.revision,state=excluded.state",params![repository,proposal,next.revision,bytes])?;
+    tx.commit()?;
+    Ok(true)
+}

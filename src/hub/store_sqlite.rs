@@ -7421,6 +7421,36 @@ impl Store for SqliteStore {
     ) -> Result<super::validation_evidence::ValidationEvidencePage> {
         validation_evidence::history(self, token, repository, proposal, after, limit, now)
     }
+    fn validation_snapshot(
+        &self,
+        repository: &str,
+        proposal: i64,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationSnapshot> {
+        validation_evidence::snapshot(self, repository, proposal, limit)
+    }
+    fn validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<Option<super::validation_evidence::ValidationPublication>> {
+        validation_evidence::publication(self, repository, proposal)
+    }
+    fn compare_validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+        expected_revision: i64,
+        next: &super::validation_evidence::ValidationPublication,
+    ) -> Result<bool> {
+        validation_evidence::compare_publication(
+            self,
+            repository,
+            proposal,
+            expected_revision,
+            next,
+        )
+    }
 
     fn backend(&self) -> &'static str {
         "sqlite"

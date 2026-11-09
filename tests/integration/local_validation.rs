@@ -732,6 +732,67 @@ fn known(bodies: &[&str]) -> Verdict {
 }
 
 #[test]
+fn exact_pairs_preserve_selection_and_allow_evidence_beyond_comment_limit() {
+    use agentscm::local_validation::select_pairs;
+    let mut older = pass();
+    older.issued_at_ms = NOW - 1;
+    let mut newest = fail();
+    newest.issued_at_ms = NOW;
+    let old_body = older.body();
+    let new_body = newest.body();
+    let old = comment::parse(&old_body).unwrap();
+    let new = comment::parse(&new_body).unwrap();
+    let observe = || Observed {
+        repository: "repo-1",
+        commit: COMMIT,
+        tree: TREE,
+        base_ref: "refs/heads/main",
+        merge_base: BASE,
+        required: &[],
+        selections: &[],
+    };
+    let required = ["test".to_string()];
+    let run = |pairs: Vec<(&[u8], &[u8])>| {
+        let mut observed = observe();
+        observed.required = &required;
+        select_pairs(
+            pairs,
+            &recipe(),
+            &registry(),
+            &policy(),
+            observed,
+            EvaluationClock::Known { unix_ms: NOW },
+        )
+    };
+    let expected = known(&[&old_body, &new_body]);
+    assert_eq!(run(vec![(&old.0, &old.1), (&new.0, &new.1)]), expected);
+    assert_eq!(run(vec![(&new.0, &new.1), (&old.0, &old.1)]), expected);
+    let mut tampered = new.0.clone();
+    tampered[0] = b'x';
+    assert_eq!(
+        run(vec![(&tampered, &new.1), (&old.0, &old.1)]).state,
+        VerdictState::Success
+    );
+    // Whitespace is part of the exact signed artifact commitment. The signed payload
+    // remains valid even when carrying it in a base64 comment would exceed 60 KiB.
+    let (original_envelope, mut record) = comment_bytes();
+    let mut payload = agentscm::evidence::EvidenceEnvelope::from_slice(&original_envelope)
+        .unwrap()
+        .payload;
+    record.extend(std::iter::repeat_n(b' ', 50_000));
+    payload.terminal_record_sha256 = agentscm::store::digest(&record);
+    for artifact in &mut payload.artifacts {
+        if artifact.artifact_id == "record" {
+            artifact.sha256 = agentscm::store::digest(&record);
+            artifact.bytes = record.len() as u64;
+        }
+    }
+    let envelope = serde_json::to_vec(&sign_evidence(payload, &signing_key()).unwrap()).unwrap();
+    assert!(comment::render(&envelope, &record).is_err());
+    assert_eq!(run(vec![(&envelope, &record)]).state, VerdictState::Success);
+}
+
+#[test]
 fn applies_to_head_only_for_the_observed_commit() {
     assert!(pass().run().applies_to_head);
     assert!(fail().run().applies_to_head);
@@ -2503,6 +2564,64 @@ fn validation_evidence_durable_receipts_pagination_and_revocation() {
         read_bundle(&backend, &first).unwrap().to_bytes().unwrap(),
         bundle.to_bytes().unwrap()
     );
+    use agentscm::hub::validation_evidence::{
+        PublicationPhase, ValidationPublication, ValidationStatusSlot,
+    };
+    let snapshot = store.validation_snapshot(&repo.id, 1, 1).unwrap();
+    assert_eq!(snapshot.generation, 1);
+    assert_eq!(snapshot.entries, vec![first.clone()]);
+    let preparing = ValidationPublication {
+        revision: 1,
+        evidence_generation: 1,
+        connection: connection.id.clone(),
+        phase: PublicationPhase::Preparing,
+        operation_id: "a".repeat(64),
+        body_sha256: "b".repeat(64),
+        source_sha256: "c".repeat(64),
+        comment_id: None,
+        status_slots: vec![ValidationStatusSlot {
+            head: "d".repeat(40),
+            context: "agentscm/local-validation".into(),
+        }],
+    };
+    // Independent database connections, as used by independent Hub processes, race one CAS.
+    let contenders: Vec<_> = (0..4)
+        .map(|_| {
+            let db = format!("sqlite://{}", temp.path().join("hub.db").display());
+            let repo = repo.id.clone();
+            let next = preparing.clone();
+            std::thread::spawn(move || {
+                store::open(&db)
+                    .unwrap()
+                    .compare_validation_publication(&repo, 1, 0, &next)
+                    .unwrap()
+            })
+        })
+        .collect();
+    assert_eq!(
+        contenders
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count(),
+        1
+    );
+    let mut attempting = preparing.clone();
+    attempting.revision = 2;
+    attempting.phase = PublicationPhase::Attempting;
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 1, &attempting)
+            .unwrap()
+    );
+    let mut forbidden = attempting.clone();
+    forbidden.revision = 3;
+    forbidden.operation_id = "e".repeat(64);
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 2, &forbidden)
+            .is_err()
+    );
     let mut second_envelope = envelope.clone();
     second_envelope.push(b' ');
     let second_bundle = ValidationBundleV1 {
@@ -2538,10 +2657,79 @@ fn validation_evidence_durable_receipts_pagination_and_revocation() {
             .validation_evidence_history(&token, &repo.id, 1, 0, 101, now)
             .is_err()
     );
+    assert!(store.validation_snapshot(&repo.id, 1, 1).is_err());
+    assert_eq!(
+        store
+            .validation_snapshot(&repo.id, 1, 2)
+            .unwrap()
+            .generation,
+        2
+    );
+    // New receipts must not strand an uncertain operation: exact-op recovery still completes.
+    let mut recovered = attempting.clone();
+    recovered.revision = 3;
+    recovered.phase = PublicationPhase::Idle;
+    recovered.comment_id = Some(123);
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 2, &recovered)
+            .unwrap()
+    );
+    assert_eq!(
+        store.validation_publication(&repo.id, 1).unwrap(),
+        Some(recovered.clone())
+    );
+    let mut stale = recovered.clone();
+    stale.revision = 4;
+    stale.phase = PublicationPhase::Preparing;
+    stale.operation_id = "e".repeat(64);
+    assert!(
+        !store
+            .compare_validation_publication(&repo.id, 1, 3, &stale)
+            .unwrap()
+    );
+    stale.evidence_generation = 2;
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 3, &stale)
+            .unwrap()
+    );
+    let mut retired = stale.clone();
+    retired.revision = 5;
+    retired.phase = PublicationPhase::Idle;
+    retired.status_slots.clear();
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 4, &retired)
+            .is_err()
+    );
+    retired.status_slots = stale.status_slots.clone();
     let wrong = persist_bundle(&backend, &repo.id, "other.example/acme/widget", &bundle);
     assert!(wrong.is_err());
     config.enabled = false;
     store.configure_validation_summary(&config).unwrap();
+    // Disable fences a new attempt but preserves old contexts and permits pre-send abort.
+    let mut disabled_attempt = stale.clone();
+    disabled_attempt.revision = 5;
+    disabled_attempt.phase = PublicationPhase::Attempting;
+    assert!(
+        !store
+            .compare_validation_publication(&repo.id, 1, 4, &disabled_attempt)
+            .unwrap()
+    );
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 4, &retired)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .validation_publication(&repo.id, 1)
+            .unwrap()
+            .unwrap()
+            .status_slots,
+        preparing.status_slots
+    );
     assert!(
         store
             .receive_validation_evidence(&token, 1, &durable, now)
@@ -2566,6 +2754,16 @@ fn validation_evidence_durable_receipts_pagination_and_revocation() {
             .receive_validation_evidence(&token, 1, &durable, now)
             .is_err()
     );
+    let raw = rusqlite::Connection::open(temp.path().join("hub.db")).unwrap();
+    raw.execute(
+        "DELETE FROM hub_validation_evidence WHERE repository=?1 AND proposal=1 AND generation=1",
+        [&repo.id],
+    )
+    .unwrap();
+    assert!(matches!(
+        store.validation_snapshot(&repo.id, 1, 1000),
+        Err(agentscm::hub::HubError::Unavailable(_))
+    ));
     std::fs::remove_dir_all(temp.path().join("objects")).unwrap();
     assert!(read_bundle(&backend, &first).is_err());
 }

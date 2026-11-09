@@ -233,6 +233,27 @@ pub trait Store: Send + Sync {
         limit: usize,
         now: i64,
     ) -> Result<super::validation_evidence::ValidationEvidencePage>;
+    /// Trusted internal worker API, with a complete bounded receipt inventory.
+    fn validation_snapshot(
+        &self,
+        repository: &str,
+        proposal: i64,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationSnapshot>;
+    fn validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<Option<super::validation_evidence::ValidationPublication>>;
+    /// Atomic cross-process exclusion. `false` means revision, evidence or config changed.
+    /// Recovery of the same Attempting operation is allowed after new evidence or disable.
+    fn compare_validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+        expected_revision: i64,
+        next: &super::validation_evidence::ValidationPublication,
+    ) -> Result<bool>;
     /// Insert, or update the cached login of an existing identity. Never changes the id.
     fn upsert_user(&self, identity: &ForgeIdentity, login: &str) -> Result<User>;
     /// Replace the cached profile name (`None` clears it). A display value, not an audited

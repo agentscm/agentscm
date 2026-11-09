@@ -32,7 +32,8 @@ struct Authentication<'a> {
 
 /// One isolated transport context reused for every fetch in a reconcile run.
 pub struct FetchContext<'a> {
-    repo: &'a Path,
+    repo: PathBuf,
+    bootstrap: Option<TempDir>,
     remote_url: String,
     object_dir: PathBuf,
     temporary: TempDir,
@@ -41,14 +42,14 @@ pub struct FetchContext<'a> {
 
 impl<'a> FetchContext<'a> {
     /// Uses the checkout's direct `remote.origin.url` without any credential configuration.
-    pub fn anonymous(repo: &'a Path) -> Result<Self> {
+    pub fn anonymous(repo: &Path) -> Result<Self> {
         Self::new(repo, None, None, None)
     }
 
     /// Reuses `token` only for a canonical HTTPS GitHub transport matching both repository
     /// identities. The caller must separately restrict the GitHub API to its production URL.
     pub fn authenticated(
-        repo: &'a Path,
+        repo: &Path,
         github_repo: &str,
         policy_repository: &str,
         token: &'a str,
@@ -65,7 +66,7 @@ impl<'a> FetchContext<'a> {
     }
 
     fn new(
-        repo: &'a Path,
+        repo: &Path,
         authenticated_repo: Option<&str>,
         token: Option<&'a str>,
         canonical_url: Option<String>,
@@ -117,12 +118,116 @@ impl<'a> FetchContext<'a> {
             _ => return Err(invalid("incomplete authenticated fetch configuration")),
         };
         Ok(Self {
-            repo,
+            repo: repo.to_path_buf(),
+            bootstrap: None,
             remote_url: canonical_url.unwrap_or(remote_url),
             object_dir,
             temporary,
             authentication,
         })
+    }
+
+    /// Creates a private bare object store for the hosted GitHub verifier. No checkout,
+    /// ambient origin, hooks, credential helper or user Git configuration is consulted.
+    pub fn hosted_github(github_repo: &str, token: &'a str) -> Result<Self> {
+        if !valid_github_repo(github_repo) {
+            return Err(invalid("GitHub repository must be OWNER/NAME"));
+        }
+        let bootstrap = tempfile::tempdir()?;
+        fs::set_permissions(bootstrap.path(), fs::Permissions::from_mode(0o700))?;
+        let repo = bootstrap.path().join("repository.git");
+        let template = bootstrap.path().join("template");
+        fs::create_dir(&template)?;
+        let mut init = isolated_command(bootstrap.path());
+        init.args(["init", "--bare", "--quiet", "--template"])
+            .arg(template)
+            .arg(&repo);
+        run(&mut init, GIT_TIMEOUT, "hosted init")?;
+        let mut origin = local_command(&repo, bootstrap.path());
+        origin
+            .args(["config", "--local", "remote.origin.url"])
+            .arg(format!("https://github.com/{github_repo}.git"));
+        run(&mut origin, GIT_TIMEOUT, "hosted origin")?;
+        let mut context = Self::authenticated(
+            &repo,
+            github_repo,
+            &format!("github.com/{github_repo}"),
+            token,
+        )?;
+        context.bootstrap = Some(bootstrap);
+        Ok(context)
+    }
+
+    /// Bare object store for the read-only Git observation helpers.
+    pub fn repository_path(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Fetches trusted default-branch data and pins HEAD for configuration rechecks.
+    /// The branch name comes from the authenticated forge repository response.
+    pub fn pin_default_branch(&self, branch: &str) -> Result<String> {
+        self.fetch_base(branch)?;
+        let commit = self.temporary_rev("refs/agentscm/local-validation-base")?;
+        let mut update = local_command(&self.repo, self.temporary.path());
+        update
+            .args(["-c", "core.hooksPath=/dev/null", "update-ref", "HEAD"])
+            .arg(&commit);
+        run(&mut update, GIT_TIMEOUT, "pin default branch")?;
+        Ok(commit)
+    }
+
+    /// Reads a regular file at an exact commit without checkout or symlink traversal.
+    /// A missing path is NotFound (for the optional checks manifest); malformed, oversized,
+    /// non-file and inaccessible objects remain errors. At most 2 MiB per file.
+    pub fn read_file(&self, commit: &str, path: &Path, limit: usize) -> Result<Vec<u8>> {
+        use std::path::Component;
+        if !is_oid(commit)
+            || !(1..=2 * 1024 * 1024).contains(&limit)
+            || path.as_os_str().is_empty()
+            || !path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return Err(invalid("invalid trusted Git file read"));
+        }
+        let mut tree = local_command(&self.repo, self.temporary.path());
+        tree.args(["--literal-pathspecs", "ls-tree", "-z", commit, "--"])
+            .arg(path);
+        let entry = run(&mut tree, GIT_TIMEOUT, "trusted file mode")?;
+        if entry.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "trusted Git file missing",
+            )
+            .into());
+        }
+        let header = entry.split(|b| *b == b'\t').next().unwrap_or_default();
+        let header =
+            std::str::from_utf8(header).map_err(|_| invalid("invalid trusted tree entry"))?;
+        let mut fields = header.split(' ');
+        let mode = fields.next();
+        let kind = fields.next();
+        let oid = fields.next().unwrap_or_default();
+        if !matches!(mode, Some("100644" | "100755")) || kind != Some("blob") || !is_oid(oid) {
+            return Err(invalid("trusted Git path must be a regular file"));
+        }
+        let mut size = local_command(&self.repo, self.temporary.path());
+        size.args(["cat-file", "-s", oid]);
+        let bytes = run(&mut size, GIT_TIMEOUT, "trusted file size")?;
+        let length = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .ok_or_else(|| invalid("invalid trusted file size"))?;
+        if length > limit {
+            return Err(Error::Limit("trusted Git file too large".into()));
+        }
+        let mut read = local_command(&self.repo, self.temporary.path());
+        read.args(["cat-file", "blob", oid]);
+        let bytes = run(&mut read, GIT_TIMEOUT, "trusted file read")?;
+        if bytes.len() != length {
+            return Err(invalid("trusted Git file size changed"));
+        }
+        Ok(bytes)
     }
 
     fn git_dir(&self) -> PathBuf {
@@ -132,7 +237,7 @@ impl<'a> FetchContext<'a> {
     fn fetch(&self, refspec: &str) -> Result<()> {
         let mut command = isolated_command(self.temporary.path());
         command
-            .current_dir(self.repo)
+            .current_dir(&self.repo)
             .env("GIT_OBJECT_DIRECTORY", &self.object_dir)
             .arg("--git-dir")
             .arg(self.git_dir())
@@ -223,7 +328,7 @@ impl<'a> FetchContext<'a> {
         ))?;
         let commit = self.temporary_rev("refs/agentscm/local-validation-base")?;
         let reference = format!("refs/remotes/origin/{base}");
-        let mut command = local_command(self.repo, self.temporary.path());
+        let mut command = local_command(&self.repo, self.temporary.path());
         command
             .args(["-c", "core.hooksPath=/dev/null", "update-ref"])
             .arg(reference)
@@ -249,13 +354,36 @@ impl<'a> FetchContext<'a> {
     /// Re-fetches the base through the same isolated context and compares `dir` with checkout
     /// `HEAD`. A missing directory at the base means it changed.
     pub fn config_dir_unchanged(&self, base: &str, dir: &str) -> Result<bool> {
+        if self.bootstrap.is_some()
+            && (dir.is_empty()
+                || !Path::new(dir)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_))))
+        {
+            return Err(invalid(
+                "hosted configuration path must be repository relative",
+            ));
+        }
         self.fetch_base(base)?;
         let tip = format!("refs/remotes/origin/{base}");
-        rev(self.repo, &tip, "^{commit}")?;
-        let Ok(theirs) = rev(self.repo, &tip, &format!(":./{dir}")) else {
+        rev(&self.repo, &tip, "^{commit}")?;
+        // :./path is relative to a worktree prefix and is unavailable in a bare store.
+        // Hosted stores always address repository-root paths; checkout mode retains its
+        // original relative-path behavior for callers below the checkout root.
+        let suffix = if self.bootstrap.is_some() {
+            format!(":{dir}")
+        } else {
+            format!(":./{dir}")
+        };
+        let Ok(theirs) = rev(&self.repo, &tip, &suffix) else {
             return Ok(false);
         };
-        Ok(config_dir_tree(self.repo, dir)? == theirs)
+        let ours = if self.bootstrap.is_some() {
+            rev(&self.repo, "HEAD", &suffix)?
+        } else {
+            config_dir_tree(&self.repo, dir)?
+        };
+        Ok(ours == theirs)
     }
 
     #[cfg(test)]
@@ -603,6 +731,85 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn hosted_bootstrap_reads_exact_regular_files_without_checkout_or_credentials() {
+        let fixture = Fixture::new("https://github.com/o/r.git");
+        let _scope = TestScope::enter(&fixture.origin);
+        let token = "synthetic-hosted-token-do-not-persist";
+        let context = FetchContext::hosted_github("o/r", token).unwrap();
+        let default = context.pin_default_branch("main").unwrap();
+        assert_eq!(
+            git(
+                context.repository_path(),
+                &["rev-parse", "--is-bare-repository"]
+            ),
+            "true"
+        );
+        assert_eq!(
+            context
+                .read_file(&default, Path::new("cfg/policy.json"), 2)
+                .unwrap(),
+            b"{}"
+        );
+        assert!(
+            matches!(context.read_file(&default, Path::new("missing.json"), 2), Err(Error::Io(e)) if e.kind()==std::io::ErrorKind::NotFound)
+        );
+        for path in ["cfg/../base", "/cfg/policy.json", "cfg"] {
+            assert!(context.read_file(&default, Path::new(path), 32).is_err());
+        }
+        assert!(matches!(
+            context.read_file(&default, Path::new("cfg/policy.json"), 1),
+            Err(Error::Limit(_))
+        ));
+        context.fetch_pull("main", 1, &fixture.head).unwrap();
+        assert_eq!(
+            super::super::run::observe(context.repository_path(), &fixture.head, "origin/main")
+                .unwrap()
+                .commit,
+            fixture.head
+        );
+        assert!(context.config_dir_unchanged("main", "cfg").unwrap());
+        assert!(context.config_dir_unchanged("main", "../cfg").is_err());
+        assert!(context.config_dir_unchanged("main", "/cfg").is_err());
+        std::os::unix::fs::symlink("policy.json", fixture.checkout.join("cfg/link.json")).unwrap();
+        std::os::unix::fs::symlink("cfg", fixture.checkout.join("linked")).unwrap();
+        git(&fixture.checkout, &["add", "."]);
+        git(&fixture.checkout, &["commit", "-q", "-m", "links"]);
+        git(
+            &fixture.checkout,
+            &[
+                "push",
+                "-q",
+                fixture.origin.to_str().unwrap(),
+                "HEAD:refs/heads/main",
+            ],
+        );
+        assert!(!context.config_dir_unchanged("main", "cfg").unwrap());
+        let changed = context.pin_default_branch("main").unwrap();
+        assert!(
+            context
+                .read_file(&changed, Path::new("cfg/link.json"), 100)
+                .is_err()
+        );
+        assert!(
+            context
+                .read_file(&changed, Path::new("linked/policy.json"), 100)
+                .is_err()
+        );
+        assert!(!files_contain(context.temporary_path(), token));
+        assert!(!files_contain(
+            context.bootstrap.as_ref().unwrap().path(),
+            token
+        ));
+        let commands = TEST_STATE.with(|state| state.borrow().as_ref().unwrap().commands.clone());
+        assert!(commands.iter().any(|command| command.authenticated));
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.argv.iter().all(|arg| !arg.contains(token)))
+        );
     }
 
     #[test]
