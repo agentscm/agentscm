@@ -15,13 +15,34 @@ pub const MAX_PROJECTED_COORDINATION_UPDATES: i64 = 128;
 pub const MAX_COORDINATION_REASONS_PER_TARGET: usize = 4;
 const MAX_NOTE_BYTES: usize = 500;
 
+/// The prefix of a provisional Work item's request key. The Hub opens such an item, unnamed, for a
+/// session that edits without declaring Work, and keeps it until the session names it or ends.
+pub(super) const PROVISIONAL_KEY_PREFIX: &str = "prov";
+
+/// Excludes provisional Work rows from a query over `hub_work_items w`. Its prefix is
+/// `PROVISIONAL_KEY_PREFIX` and an underscore.
+pub(super) const NOT_PROVISIONAL_SQL: &str =
+    "(w.request_key IS NULL OR substr(w.request_key, 1, 5) <> 'prov_')";
+
+/// A key the Hub made with `new_id(prefix)`: the prefix, `_`, then 32 lowercase hex digits.
+fn is_generated_key(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(|suffix| {
+            suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 pub(super) fn is_automatic_request_key(value: &str) -> bool {
-    value.strip_prefix("req_").is_some_and(|suffix| {
-        suffix.len() == 32
-            && suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
+    is_generated_key(value, "req")
+}
+
+pub(super) fn is_provisional_request_key(value: &str) -> bool {
+    is_generated_key(value, PROVISIONAL_KEY_PREFIX)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

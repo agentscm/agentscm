@@ -1037,6 +1037,13 @@ impl WorkItem {
     pub(super) fn lead_idle(&self) -> bool {
         self.state == WorkState::Paused || self.claim_status != ClaimStatus::Active
     }
+
+    /// The unnamed item the Hub opened for a session that edits without declaring Work. People's
+    /// views leave it out until the session names it.
+    pub(super) fn is_provisional(&self) -> bool {
+        matches!(&self.source, WorkSource::Native { request_key }
+            if super::coordination::is_provisional_request_key(request_key))
+    }
 }
 
 /// A lead's claim is active while its token is valid and it checked in recently.
