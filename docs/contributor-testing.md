@@ -68,7 +68,7 @@ Any later change invalidates the evidence for affected checks. Rerun those check
 
 ## Heavy-job queue helper
 
-`tools/attest-pr.sh --queue` shows the per-user local FIFO shared by attestations and `--with-lock` commands. Use `tools/attest-pr.sh --with-lock --kind focused COMMAND [ARG...]` to admit a resource-intensive focused check alongside other queued work. Kind labels do not change order. See [local admission and recovery](advanced/local-validation.md#run-verify-and-post) for thresholds, dependencies, status fields and rollout limits.
+`tools/attest-pr.sh --queue` shows the per-user local FIFO shared by attestations and `--with-lock` commands. Use `tools/attest-pr.sh --with-lock --kind focused COMMAND [ARG...]` to admit a resource-intensive focused check alongside other queued work. Kind labels do not change order. Before queueing an attestation, the script checks each `npm ci` the default branch's recipe selects for the change against the Node and npm on `PATH`, offline and without installing. It refuses at once and names the required version, rather than failing after a queued run. Sessions keep the `PATH` they started with, so put the newer Node first on `PATH` for that command. See [local admission and recovery](advanced/local-validation.md#run-verify-and-post) for thresholds, dependencies, status fields and rollout limits.
 
 The standalone `tools/heavy-job-queue.rs` tests are outside Cargo and are not selected by the active attestation recipe. After changing the helper, compile and run its process tests explicitly from the repository root:
 
