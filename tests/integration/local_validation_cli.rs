@@ -929,3 +929,76 @@ fn selected_cli_evidence_round_trips_and_tampering_is_rejected() {
     fs::write(&body, comment::render(&envelope, &record).unwrap()).unwrap();
     assert_ne!(f.verify(&body, "repo-1").0, 0);
 }
+
+#[test]
+fn hub_submit_retains_pending_and_never_automatically_posts_to_forge() {
+    let f = ok_fixture();
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let token = f.root().join("hub-token");
+    fs::write(&token, "synthetic-hub-secret").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let repo = format!("rep_{}", "1".repeat(32));
+    // Drop the response after reading the complete request, twice: each retry must submit
+    // the exact same body and retain a retryable pending journal without exposing secrets.
+    let server = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|x| x == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        bodies.push(request[end + 4..].to_vec());
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(bodies[0], bodies[1]);
+    });
+    for _ in 0..2 {
+        let out = f.cli(&[
+            "submit",
+            "--state-dir",
+            f.state().to_str().unwrap(),
+            "--attestation",
+            &sha,
+            "--hub-url",
+            &base,
+            "--repository-id",
+            &repo,
+            "--proposal",
+            "1",
+            "--token-file",
+            token.to_str().unwrap(),
+        ]);
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("synthetic-hub-secret"));
+    }
+    server.join().unwrap();
+    let pending = fs::read_dir(f.state())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".pending.json"))
+        .count();
+    assert_eq!(pending, 1);
+}

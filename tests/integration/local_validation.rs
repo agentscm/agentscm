@@ -2569,3 +2569,215 @@ fn validation_evidence_durable_receipts_pagination_and_revocation() {
     std::fs::remove_dir_all(temp.path().join("objects")).unwrap();
     assert!(read_bundle(&backend, &first).is_err());
 }
+
+#[tokio::test]
+async fn validation_evidence_http_scopes_retries_and_unavailable_objects() {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::store::{self, ForgeIdentity, NewAgentToken};
+    use agentscm::hub::validation_evidence::ValidationSummaryConfig;
+    use agentscm::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
+    let temp = tempfile::tempdir().unwrap();
+    let store = store::open(&format!(
+        "sqlite://{}",
+        temp.path().join("hub.db").display()
+    ))
+    .unwrap();
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.example".into(),
+        user_id: 123,
+    };
+    let user = store.upsert_user(&identity, "synthetic").unwrap();
+    let connection = NewConnection {
+        id: format!("con_{}", "1".repeat(32)),
+        provider: identity.provider.clone(),
+        host: identity.host.clone(),
+        kind: "app".into(),
+        app_id: Some(1),
+        app_slug: Some("synthetic".into()),
+        acts_as: None,
+    };
+    store.insert_connection(&connection, "synthetic").unwrap();
+    let repo = store
+        .upsert_repository(
+            &connection.id,
+            &identity.host,
+            77,
+            "acme/widget",
+            None,
+            Some(1),
+        )
+        .unwrap();
+    let now = agentscm::hub::store::unix_now();
+    let token = store
+        .insert_agent_token(&NewAgentToken {
+            owner: user.id.clone(),
+            name: "synthetic".into(),
+            repository: repo.full_name.clone(),
+            digest: store::agent_token_digest(&"a".repeat(64)).unwrap(),
+            expires_at: now + 3600,
+            repository_id: Some(77),
+            read_only: false,
+        })
+        .unwrap();
+    let backend = std::sync::Arc::new(
+        agentscm::backend::LocalBackend::open(temp.path().join("objects")).unwrap(),
+    );
+    let mut case = Case::new();
+    case.record.subject.repository = "github.example/acme/widget".into();
+    case.policy.repository = case.record.subject.repository.clone();
+    case.registry.repository = case.record.subject.repository.clone();
+    let (envelope, record) = comment::parse(&case.body()).unwrap();
+    let bundle = ValidationBundleV1 {
+        version: 1,
+        entries: vec![EvidencePairV1::new(&envelope, &record)],
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = agentscm::hub::router(agentscm::hub::HubState::new(store.clone(), backend.clone()));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let url = format!("{base}/v1/hub/repos/{}/validation-evidence/1", repo.id);
+    let bytes = bundle.to_bytes().unwrap();
+    let send = |url: String, secret: String| {
+        client
+            .post(url)
+            .bearer_auth(secret)
+            .header("content-type", "application/json")
+            .body(bytes.clone())
+    };
+    assert_eq!(
+        send(url.clone(), "bad".into())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let admin_url = format!("{base}/v1/hub/admin/repos/{}/validation-summary", repo.id);
+    assert_eq!(
+        client
+            .post(&admin_url)
+            .bearer_auth("a".repeat(64))
+            .header("content-type", "application/json")
+            .body(r#"{"enabled":true}"#)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert!(
+        !send(url.clone(), "a".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    store
+        .configure_validation_summary(&ValidationSummaryConfig {
+            repository: repo.id.clone(),
+            connection: connection.id.clone(),
+            enabled: true,
+        })
+        .unwrap();
+    let first = send(url.clone(), "a".repeat(64)).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    let receipt: serde_json::Value = serde_json::from_slice(&first.bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &send(url.clone(), "a".repeat(64))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        receipt
+    );
+    let read = client
+        .get(format!("{url}/1"))
+        .bearer_auth("a".repeat(64))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+    let recovered = ValidationBundleV1::from_slice(&read.bytes().await.unwrap()).unwrap();
+    assert_eq!(recovered.entries[0].decode().unwrap(), (envelope, record));
+    assert_eq!(
+        client
+            .get(format!("{url}/2"))
+            .bearer_auth("a".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let foreign = format!(
+        "{base}/v1/hub/repos/rep_{}/validation-evidence/1",
+        "f".repeat(32)
+    );
+    assert_eq!(
+        send(foreign, "a".repeat(64)).send().await.unwrap().status(),
+        401
+    );
+    let readonly = store
+        .insert_agent_token(&NewAgentToken {
+            owner: user.id.clone(),
+            name: "read".into(),
+            repository: repo.full_name.clone(),
+            digest: store::agent_token_digest(&"b".repeat(64)).unwrap(),
+            expires_at: now + 3600,
+            repository_id: Some(77),
+            read_only: true,
+        })
+        .unwrap();
+    assert_eq!(
+        send(url.clone(), "b".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert!(
+        client
+            .get(&url)
+            .bearer_auth("b".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    store.revoke_agent_token(&token).unwrap();
+    assert_eq!(
+        send(url.clone(), "a".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    // Remove only the synthetic local objects; retained receipt must not imply availability.
+    std::fs::remove_dir_all(temp.path().join("objects")).unwrap();
+    assert!(
+        !client
+            .get(format!("{url}/1"))
+            .bearer_auth("b".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    store.revoke_agent_token(&readonly).unwrap();
+    task.abort();
+}

@@ -55,6 +55,7 @@ mod store_sqlite;
 pub mod sync;
 pub mod ui;
 pub mod validation_evidence;
+pub mod validation_evidence_http;
 pub mod value_metrics;
 pub mod view_settings;
 pub mod viewer;
@@ -469,6 +470,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
         .merge(continuity::routes())
         .merge(promise_http::routes())
