@@ -98,9 +98,15 @@ impl ForgeApi<'_> {
         repo: &Repo,
         number: i64,
     ) -> Gh<(Vec<String>, bool)> {
-        match self {
+        let read = match self {
             Self::Github(api) => api.pull_files(token, &repo.full_name, number).await,
             Self::Gitlab(api) => api.pull_files(token, repo.repository_id, number).await,
+        };
+        // The file list carries each diff, so a large change can pass the reply cap. Its paths
+        // are then unknown, as past the page cap; failing would stop every later merge read.
+        match read {
+            Err(GhError::TooLarge(_)) => Ok((Vec::new(), true)),
+            read => read,
         }
     }
 
@@ -327,5 +333,34 @@ impl ForgeApi<'_> {
                     .await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::forge_http::serve_once;
+
+    #[tokio::test]
+    async fn an_oversize_file_list_reads_as_unknown_paths() {
+        let big = format!("[\"{}\"]", "x".repeat(github::API_BODY_BYTES));
+        let (base, server) = serve_once(200, "", big);
+        let api = github::Api::new(&base, &base).unwrap();
+        let repo = Repo {
+            id: format!("rep_{}", "0".repeat(32)),
+            connection: "c".into(),
+            host: "github.com".into(),
+            repository_id: 42,
+            full_name: "o/r".into(),
+            node_id: None,
+            installation_id: None,
+            pulls_etag: None,
+        };
+        let read = ForgeApi::Github(&api).pull_files("t", &repo, 7).await;
+        assert!(
+            matches!(&read, Ok((paths, true)) if paths.is_empty()),
+            "{read:?}"
+        );
+        server.join().unwrap();
     }
 }
