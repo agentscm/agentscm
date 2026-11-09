@@ -185,7 +185,10 @@ repeat of an end that committed changes nothing. A session with no Work still re
 `agentscm_done` with `outcome: complete` first applies the `complete` transition to the unfinished
 Work the session leads (active, blocked or paused), fenced by the generation and sequence the Hub
 reads just before, with operation id `mcp-done-complete-<work>-<generation>` so a retry replays.
-The release then finds no Work to pause.
+The `summary` becomes the reason as one line of at most 500 bytes. The release then finds no Work
+to pause. If the completion fails, the release still runs and pauses the Work, and the call returns
+the completion's error, so the files are never left held; a retry completes the paused Work. After
+a completion, the session's next edit needs a new `agentscm_start`, and the reply says so.
 
 ## 6. The WorkOperationalV1 projection
 

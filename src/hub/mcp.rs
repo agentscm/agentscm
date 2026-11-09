@@ -3227,23 +3227,44 @@ async fn done(
                 summary,
                 completion_reporting,
             )
-            .await?,
+            .await,
         ),
         DoneOutcome::Pause => None,
     };
+    // The files are released even when the completion failed: the Work is then paused, and a
+    // retry of this call completes it.
     let end = done_pausing_for(state, principal, session, "mcp", completion_reporting).await?;
     let released = released_text(&end);
+    let tail = released.strip_prefix("AgentSCM: ").unwrap_or(released);
     Ok(match completed {
         None => released.into(),
-        Some(head) => {
-            let head = match head {
-                Some(title) => format!("completed “{}”", crate::hub::advice::sanitize(&title, 120)),
-                None => "nothing to complete: this session leads no unfinished Work".into(),
-            };
-            let tail = released.strip_prefix("AgentSCM: ").unwrap_or(released);
-            format!("AgentSCM: {head}; {tail}")
+        Some(Err(error)) => return Err(error),
+        Some(Ok(Some(title))) => format!(
+            "AgentSCM: completed “{}”; {tail} Before editing again, start new Work with agentscm_start.",
+            crate::hub::advice::sanitize(&title, 120)
+        ),
+        Some(Ok(None)) => {
+            format!("AgentSCM: nothing to complete: this session leads no unfinished Work; {tail}")
         }
     })
+}
+
+/// The `summary` as a transition reason: one line, within 500 bytes, never empty.
+fn done_reason(summary: Option<String>) -> String {
+    let line = summary
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut line = crate::hub::advice::sanitize(&line, 500);
+    while line.len() > 500 {
+        line.pop();
+    }
+    if line.is_empty() {
+        "Its lead session reported the task done.".into()
+    } else {
+        line
+    }
 }
 
 /// `agentscm_done` with `outcome: complete`: completes the unfinished Work this session leads.
@@ -3274,9 +3295,7 @@ async fn complete_led(
             expected_updated_seq: item.updated_seq,
             session: Some(name.clone()),
             transition: super::work_lifecycle::WorkTransitionKind::Complete,
-            reason: summary
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "Its lead session reported the task done.".into()),
+            reason: done_reason(summary),
             superseded_by: None,
         };
         let result =

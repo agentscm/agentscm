@@ -1623,16 +1623,22 @@ async fn done_with_outcome_complete_finishes_the_led_work_without_fences() {
         .await;
     assert!(paused.contains("paused"), "{paused}");
 
+    // A multi-line summary past the reason's 500 bytes still completes: it becomes one line.
+    let summary = format!("Merged the billing fix.\n\n{}", "Details. ".repeat(80));
     let (done, error) = hub
         .tool(
             &alice,
             "/mcp",
             "agentscm_done",
-            json!({"session": "s1", "outcome": "complete", "summary": "Merged the billing fix."}),
+            json!({"session": "s1", "outcome": "complete", "summary": summary}),
         )
         .await;
     assert!(!error, "{done}");
     assert!(done.starts_with("AgentSCM: completed “billing”;"), "{done}");
+    assert!(
+        done.ends_with("Before editing again, start new Work with agentscm_start."),
+        "{done}"
+    );
     let after = hub
         .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
         .await;
