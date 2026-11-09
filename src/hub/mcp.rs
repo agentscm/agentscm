@@ -1177,7 +1177,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         promise_propose,
         promise_report,
         {"name": "agentscm_hub_message",
-         "description": "Answers a \"Message from <person> in the Hub\" that a tool result or hook context carried: your own person's request. Report accepted or declined (Manual mode: only after your person said yes or no in this session), then done when finished.",
+         "description": "Checks and answers an \"AgentSCM Hub message\" from your own person. Call it with status accepted before acting: it succeeds only for a real message to this session, and its reply carries the note and the mode to act on. Answer declined if your person says no in Manual mode, and done when finished.",
          "inputSchema": schema(json!({
              "id": {"type": "string", "description": "The message id (msg_...)."},
              "status": {"type": "string", "enum": ["accepted", "declined", "done"]},
@@ -1523,7 +1523,7 @@ async fn call(
         Ok(page) if !page.requests.is_empty() || !page.complete => {
             let page = shown(page, &principal.owner.id);
             let notices = page.requests.iter().filter(|request| !matches!(request.status, CoordinationStatus::Resolved | CoordinationStatus::Withdrawn))
-                .map(|request| json!({"request_id":request.id,"title":request.proposal.title,
+                .map(|request| json!({"request_id":request.id,"title":super::advice::sanitize(&request.proposal.title, 120),
                     "status":request.status,"updated_seq":request.updated_seq,
                     "affected_agent_count":request.targets.len(),
                     "affected_agents_complete":request.targets.len() <= 3,
@@ -1544,17 +1544,24 @@ async fn call(
             }
         }
     }
-    // What the session's own person sent it from the Hub page rides on its next tool call.
-    if !principal.read_only {
-        let requested = params
+    // What the session's own person sent it from the Hub page rides on its next tool call. Only a
+    // call naming its own session takes it: without one the Hub would guess the token's recent hook
+    // session. A session whose hook carries context takes it there, where subagents are excluded;
+    // an MCP call cannot say whether a subagent made it.
+    if !principal.read_only
+        && let Some(requested) = params
             .and_then(|p| p["arguments"]["session"].as_str())
-            .map(str::to_owned);
+            .map(str::to_owned)
+    {
         let install = super::onboarding::client(headers).map(str::to_owned);
         let (store, scope) = (state.store.clone(), principal.clone());
         if let Ok(Some(text)) = blocking(state, move || {
             let now = unix_now();
-            let session = store.session_name_for(&scope.token_id, requested.as_deref(), now)?;
+            let session = store.session_name_for(&scope.token_id, Some(requested.as_str()), now)?;
             super::agent_messages::note_mcp(&scope.token_id, install.as_deref(), &session, now);
+            if super::agent_messages::hook_delivers(&scope.token_id, &session) {
+                return Ok(None);
+            }
             super::agent_messages::take(&*store, &scope, &session, "mcp", now)
         })
         .await
@@ -2039,13 +2046,7 @@ async fn call_inner(
             })
             .await
             {
-                Ok(next) => result(
-                    &format!(
-                        "AgentSCM: Hub message {id} is now {}; your person sees it in the Hub.",
-                        json!(next).as_str().unwrap_or_default()
-                    ),
-                    false,
-                ),
+                Ok(answered) => result(&answered.text(&id), false),
                 Err(error) => hub_failure(&error),
             },
         );

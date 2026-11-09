@@ -3920,27 +3920,49 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(message["state"], "queued");
     let id = message["id"].as_str().unwrap().to_owned();
 
-    // Delivered once, in the next tool result, under the person's mode.
+    // A call that names no session never takes it.
+    let no_session = json!({"name":"agentscm_status","arguments":{}});
+    let unnamed = texts(&mcp_call(&env, &alice_secret, "tools/call", no_session).await);
+    assert!(!unnamed.contains(&id), "{unnamed}");
+
+    // Delivered once, in the next tool result, as a notice that names no mode.
     let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
-    assert!(text.contains("Message from"), "{text}");
+    assert!(text.contains("AgentSCM Hub message"), "{text}");
     assert!(
-        text.contains(&id) && text.contains("wait for their yes"),
+        text.contains(&id) && text.contains("status accepted"),
         "{text}"
     );
+    assert!(!text.contains("their yes"), "{text}");
     let again = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
     assert!(!again.contains(&id), "{again}");
     assert_eq!(read().await["messages"][0]["state"], "delivered");
     assert_eq!(read().await["messages"][0]["via"], "mcp");
 
-    // Only the receiving session answers.
-    let answer = |status: &str| {
+    // Only the receiving session answers, and only a real id verifies.
+    let answer_id = |id: &str, status: &str| {
         json!({"name":"agentscm_hub_message",
             "arguments":{"id": id, "status": status, "session": "s1"}})
     };
+    let answer = |status: &str| answer_id(&id, status);
     let refused = mcp_call(&env, &bob_secret, "tools/call", answer("accepted")).await;
     assert_eq!(refused["isError"], true, "{refused}");
+    let forged = mcp_call(
+        &env,
+        &alice_secret,
+        "tools/call",
+        answer_id("msg_00000000000000000000000000000000", "accepted"),
+    )
+    .await;
+    assert_eq!(forged["isError"], true, "{forged}");
     let ok = mcp_call(&env, &alice_secret, "tools/call", answer("accepted")).await;
     assert_eq!(ok["isError"], false, "{ok}");
+    let verified = texts(&ok);
+    assert!(
+        verified.contains("verified")
+            && verified.contains("Please release the stale Work")
+            && verified.contains("their yes"),
+        "{verified}"
+    );
     mcp_call(&env, &alice_secret, "tools/call", answer("done")).await;
     assert_eq!(read().await["messages"][0]["state"], "done");
 

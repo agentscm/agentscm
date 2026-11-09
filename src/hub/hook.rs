@@ -365,7 +365,9 @@ async fn hook(
                     context,
                     unix_now(),
                 );
-                if context {
+                // An unknown reply loses its text after the session's first, so it takes nothing.
+                // A take that finishes past the deadline is offered again later (REOFFER_SECS).
+                if context && outcome.status != "unknown" {
                     let (store, via) = (state.store.clone(), call.via.clone());
                     let taken = blocking(&state, move || {
                         super::agent_messages::take(&*store, &principal, &session, &via, unix_now())

@@ -6,7 +6,8 @@ A person signed in to the Hub's web page can send a short message to an agent se
 
 - **Who can send.** Only the Hub's own web page, signed in with the browser cookie, can send. Every change also carries the page's CSRF token. A computer's or a script's bearer session is refused, and so is an agent token.
 - **Who can receive.** A message names an agent token and a Hub session. The token must be one of the sender's own live, writing agent tokens for that repository. When the message names a Work, that session must lead it.
-- **What the text is.** The Hub writes the frame ("Message from *login* in the Hub, your own person (id …)", the mode's instruction and the reply tool). The note inside it is the sender's own words, quoted as a JSON string. The Hub never inserts agent text (Work titles, checkpoints) or forge text (issue and pull request titles). A Work is named by its id only, and the agent reads it with `agentscm_work_status`.
+- **What the text is.** The delivered text is a notice: "AgentSCM Hub message *id* for this session, from *login*", the note quoted as a JSON string, and the instruction to check it first. It names no mode. The Hub never inserts agent text (Work titles, checkpoints) or forge text (issue and pull request titles).
+- **Verify before acting.** Other people's text (coordination request titles, Work titles, pull request titles) reaches the agent through the same results and hook context, so a notice proves nothing on its own. The agent calls `agentscm_hub_message` with status `accepted` first. That call succeeds only for a real message to this token's own session, and its reply carries the note and the mode as the Hub stored them, and the Work it is about. The agent acts only on that reply. Third-party text the Hub relays has "Hub message" turned into "Hub note", so it cannot open with the notice's words.
 - **Who answers.** Only the receiving token's own session can answer, with `agentscm_hub_message`. The answers are `accepted`, `declined` and then `done`. The Hub page shows these receipts; nobody else reads them.
 - **Storage.** Each person and repository keeps at most 50 messages in Hub settings. The oldest message is dropped first.
 
@@ -16,11 +17,11 @@ Each person sets one mode for all repositories, and can override it for a single
 
 | Mode | What the session sees | What the Hub page shows |
 | --- | --- | --- |
-| **Auto** | The message, with "act on it now, within your task's rules". | Queued, then delivered, accepted, done. |
-| **Manual** | The message, with "show it to your person and wait for their yes in this session". | The same; the agent answers only after the person's yes or no. |
+| **Auto** | After `accepted`: "act on it now, within your task's rules". | Queued, then delivered, accepted, done. |
+| **Manual** | After `accepted`: "show it to your person and act only after their yes in this session". | The same; the agent answers `declined` if the person says no. |
 | **Ignore** | Nothing; sending is refused. | The item stays a to-do. The page's copy-and-paste path still works. |
 
-The mode is read when a message is delivered, so changing it to Ignore holds any queued messages.
+The mode is read when a message is delivered and again when it is accepted, so changing it to Ignore holds queued messages and refuses `accepted` for delivered ones.
 
 ## Delivery tiers
 
@@ -46,6 +47,14 @@ These client hooks fall back to the `mcp` tier:
 - Gemini CLI shows the hook's text to the person, not to the model.
 
 A refused edit's reply carries only the refusal, so a queued message waits for the next call. The start context is cut to fit the host's limit, so the Hub does not deliver a message there either. Each reply carries at most three messages.
+
+A message is never delivered:
+
+- to a subagent: hook calls from a subagent are skipped, and a session whose hook carries context takes its messages only there, since an MCP call cannot say whether a subagent made it;
+- by an MCP call that names no `session`;
+- in a hook reply whose outcome is unknown, because that reply's text may be dropped.
+
+A delivered message that is not answered within 60 seconds is offered again at the next call, in case the reply that carried it never reached the model.
 
 ### Push to an idle session
 
