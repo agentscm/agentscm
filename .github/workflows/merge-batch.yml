@@ -18,7 +18,7 @@ jobs:
   full-suite:
     name: Merge batch gate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45 # Clippy adds a second compile
     services:
       postgres: # hub store conformance runs against this
         image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
@@ -47,6 +47,11 @@ jobs:
         with:
           tool: nextest@0.9.148
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Interim: formatting and Clippy run here while the signed local check is optional evidence.
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Generate throwaway S3 credentials
         run: |
           access=$(openssl rand -hex 10)
