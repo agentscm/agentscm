@@ -123,7 +123,7 @@ The hooks written by `client setup` run `agentscm hook <agent> --client-connecti
 
 - The token comes from `AGENTSCM_HUB_TOKEN`, else the file named by `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`. It is never a command-line argument.
 - The hub URL comes from `AGENTSCM_HUB_URL`, else `--hub-url`, else `hub.json`. A token stored in `hub.json` is only ever sent to the hub that file names, so a `--hub-url` in a hook command cannot redirect it; to use a different hub, set `AGENTSCM_HUB_TOKEN`.
-- `--repo OWNER/NAME` adds `?repo=` to the hook URL. If the token belongs to another repository the hub answers "coordination unknown" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
+- `--repo OWNER/NAME` adds `?repo=` to the hook URL. If the token belongs to another repository the hub answers "coordination unknown (This token is for another repository; ...)" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
 - It sends the Git root of the agent's working directory as `X-Agentscm-Root` so the hub can make edited paths repository-relative.
 - It gives up after 3 seconds.
 - `AGENTSCM_HUB_TOKEN` is sent to whatever hub URL the command carries, because you set it for this purpose. AgentSCM no longer commits hook configuration; if you commit a hook command by hand, treat a change to its `--hub-url` like a change to your CI secrets: review it.
@@ -163,7 +163,7 @@ The session's next tool call, edit check, prompt, start or end ends the wait. A 
 
 ### Hooks fail open
 
-The command always exits 0. If anything goes wrong (no hub configured, no token, the hub is unreachable or slow, it rejects the token, or it sends something unusable) it prints the agent's valid "no information" reply, which for most events is `{}` and for a few events is a one-line `AgentSCM: coordination unknown (<reason>)` note, given once per agent session (a marker file under `~/.config/agentscm/hook-notes/`, removed after 2 days); later failures in that session print the no-op reply. A broken setup never stops an edit. The same holds on the hub side: its hook endpoint answers HTTP 200 in the agent's format even for a bad token.
+The command always exits 0. If anything goes wrong (no hub configured, no token, the hub is unreachable or slow, it rejects the token, or it sends something unusable) it prints the agent's valid "no information" reply, which for most events is `{}` and for a few events is a one-line `AgentSCM: coordination unknown (<reason>; <recovery>; ref cor_...)` note (no `ref` when the hub was unreachable), given once per agent session and failure code (a marker file under `~/.config/agentscm/hook-notes/`, removed after 2 days); a session start, resume or replay always repeats it, and other later failures of the same kind print the no-op reply. The fields are described under [Hub errors](api.md#hub-errors). A broken setup never stops an edit. The same holds on the hub side: its hook endpoint answers HTTP 200 in the agent's format even for a bad token.
 
 The cost is that failures are quiet. If warnings never appear, run `agentscm intent start` in the repository, or check the token, the URL and that the hub is up.
 

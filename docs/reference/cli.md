@@ -10,7 +10,7 @@ title: "Native CLI reference"
 
 ## Commands
 
-Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no-telemetry` flag disables product usage telemetry for that invocation. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...,"error_kind":...}`) on standard error with a nonzero exit on failure. When standard error is a terminal, a failure is one plain `error: ...` line instead, without `error_kind`; scripts and agents that read standard error through a pipe keep the JSON. A usage error (an unknown flag or a missing argument) is never JSON: it prints the parser's plain usage text, and exits 2 (1 for the Stop hook), whether or not standard error is a terminal. The exceptions are:
+Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no-telemetry` flag disables product usage telemetry for that invocation. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...,"error_kind":...}`) on standard error with a nonzero exit on failure. When standard error is a terminal, a failure is one plain `error: ...` line instead, without `error_kind`; a failure that came from the Hub also carries `code`, `retryable`, `recovery` and `correlation_id` in the JSON form, and the plain line adds the recovery and `ref cor_...` (see [Hub errors](../api.md#hub-errors)); scripts and agents that read standard error through a pipe keep the JSON. A usage error (an unknown flag or a missing argument) is never JSON: it prints the parser's plain usage text, and exits 2 (1 for the Stop hook), whether or not standard error is a terminal. The exceptions are:
 
 - `--help` and `--version` print plain text.
 - `serve`, `hub serve` and `team serve` print nothing on standard output; they log to standard error.
@@ -414,6 +414,25 @@ Hub reads and reports recent participation recorded by the existing native integ
 also shows local hook and MCP transport outcomes observed while it is running; these observations
 stay in memory and expire. Missing or idle activity stays unknown. `--json` emits a versioned
 status contract, including separate onboarding and local-activity binding identifiers.
+
+A saved token is configuration, not proof of coordination. Each connection reports one
+`connection` state in text and as `health` in `--json`, from the strongest evidence available:
+
+| State | Meaning |
+| --- | --- |
+| `configured` | A token is saved and the Hub was not asked (no `--check`). |
+| `no_usable_token` | The saved token file is missing, unreadable or not private. |
+| `authenticated` | The Hub accepted the token during this check. |
+| `renewal_pending` | Accepted, but inside the renewal window and not yet renewed. |
+| `renewal_failed` | The last renewal was refused (the Hub's reason is included); coordination stops when the token ends. |
+| `expired` | The token ended and nothing renewed it. The Hub is not consulted. |
+| `revoked` | The Hub rejected a token that has not ended. |
+| `unreachable` | The Hub did not answer; hooks fail open, so coordination is unknown. |
+
+`coverage` is separate: `verified` only when the Hub has seen both an agent's MCP and a native hook
+for the checkout; `partial`, `unverified` and `unknown` otherwise. A valid check also reports the
+Hub's deployed `hub_build` (version and commit) when the Hub states one; `client doctor` prints the
+same state and build, and stops with the reason when the Hub does not accept the token.
 
 Each connected checkout has **Agent Integrations** actions for Claude Code, Codex, Cursor,
 Copilot and Gemini. They reuse the existing owned hooks, MCP and skill installers with the saved

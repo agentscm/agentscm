@@ -132,13 +132,7 @@ fn hex(bytes: &[u8]) -> String {
 fn refuse((status, reply): (u16, Value)) -> Result<Value> {
     match status {
         200..=299 => Ok(reply),
-        401 => Err(invalid(
-            "the agent token was rejected (expired or revoked; mint a new one)",
-        )),
-        _ => Err(Error::Invalid(format!(
-            "hub refused ({status}): {}",
-            reply["error"].as_str().unwrap_or("error")
-        ))),
+        _ => Err(crate::hub_cli::refusal_error(status, &reply)),
     }
 }
 
@@ -153,11 +147,13 @@ async fn call(hub: &Hub, method: Method, path: &str, body: Option<Value>) -> Res
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
     }
-    refuse(
-        send(request, BODY_BYTES)
-            .await
-            .map_err(|_| invalid("hub unreachable"))?,
-    )
+    refuse(send(request, BODY_BYTES).await.map_err(|_| {
+        Error::Hub(Box::new(
+            agentscm::hub::error_envelope::ErrorEnvelope::local(
+                agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+            ),
+        ))
+    })?)
 }
 
 async fn upload_and_run(

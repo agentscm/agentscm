@@ -1,6 +1,7 @@
 use std::fmt;
 #[derive(Debug)]
 pub enum Error {
+    Hub(Box<crate::hub::error_envelope::ErrorEnvelope>),
     Invalid(String),
     UnsupportedGitVersion {
         minimum: &'static str,
@@ -20,6 +21,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Hub(envelope) => envelope.fmt(f),
             Self::Invalid(s) => write!(f, "invalid: {s}"),
             Self::UnsupportedGitVersion { minimum, found } => match found {
                 Some(found) => write!(

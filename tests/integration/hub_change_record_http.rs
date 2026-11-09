@@ -481,7 +481,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
     );
     let (status, body) = hub.get(&missing, Some(&reader)).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body, json!({"error":"not_found"}));
+    crate::assert_hub_error!(body, json!({"error":"not_found"}));
 
     let wrong_repo = path.replace(REPOSITORY_PATH, "acme%2Fother");
     assert_eq!(
@@ -2549,7 +2549,7 @@ mod shared_bodies {
             .unwrap();
         let response = f.read(&f.owner_secret, &f.sha).await;
         assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
-        assert_eq!(
+        crate::assert_hub_error!(
             json_of(response).await,
             json!({"error": "integrity_failure"})
         );

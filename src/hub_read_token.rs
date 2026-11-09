@@ -502,11 +502,15 @@ mod tests {
         for (reply, expected) in [
             (
                 json!({"error": "not_connected"}),
-                OpenError::RepositoryNotConnected(None),
+                OpenError::RepositoryNotConnected(Some(
+                    "The repository is not connected to this Hub; ask a Hub admin to connect it; Ask the repository owner or Hub administrator for access".into(),
+                )),
             ),
             (
                 json!({"error": "server-private-material"}),
-                OpenError::AccessDenied(None),
+                OpenError::AccessDenied(Some(
+                    "This operation is not allowed; ask the owner or Hub administrator for access; Ask the repository owner or Hub administrator for access".into(),
+                )),
             ),
         ] {
             let (hub, requests) = fake_hub(vec![(403, reply)]);
