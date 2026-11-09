@@ -262,8 +262,12 @@ pub(super) enum Plan {
     Unchanged,
     /// Identical and still live: only the expiry moves.
     Renew,
-    /// New or changed: write it, and notify overlaps with the keys not in `previous`.
-    Write { previous: BTreeSet<String> },
+    /// New or changed: write it, and notify overlaps with the keys not in `previous`. `announce`
+    /// is false when only the paths of a live intent changed: no new announce to show.
+    Write {
+        previous: BTreeSet<String>,
+        announce: bool,
+    },
 }
 
 pub(super) fn plan(
@@ -274,10 +278,12 @@ pub(super) fn plan(
     expires_at: i64,
     now: i64,
 ) -> Result<Plan> {
+    let fresh = Plan::Write {
+        previous: BTreeSet::new(),
+        announce: true,
+    };
     let Some(old) = existing else {
-        return Ok(Plan::Write {
-            previous: BTreeSet::new(),
-        });
+        return Ok(fresh);
     };
     if old.token != token {
         return Err(invalid("intent id is in use"));
@@ -286,16 +292,13 @@ pub(super) fn plan(
         return Err(invalid("intent was released"));
     }
     if old.expires_at <= now {
-        return Ok(Plan::Write {
-            previous: BTreeSet::new(),
-        });
+        return Ok(fresh);
     }
-    if old.task == new.task
-        && old.branch == new.branch
-        && old.base == new.base
-        && old.machine == new.machine
-        && old.paths == paths_json
-    {
+    let announce = old.task != new.task
+        || old.branch != new.branch
+        || old.base != new.base
+        || old.machine != new.machine;
+    if !announce && old.paths == paths_json {
         return Ok(if old.expires_at == expires_at {
             Plan::Unchanged
         } else {
@@ -309,6 +312,7 @@ pub(super) fn plan(
             .iter()
             .map(|spec| key_of(spec).to_owned())
             .collect(),
+        announce,
     })
 }
 
@@ -360,6 +364,20 @@ impl Event {
             "owner": who.owner.id, "agent": who.agent, "task": new.task, "branch": new.branch,
             "base": new.base, "machine": new.machine, "paths": paths, "expires_at": expires_at});
         Self::new("intent_announced", &new.id, data)
+    }
+
+    /// Only the paths of a live intent changed. Not an activity kind: a session adds a file per
+    /// edit, and its announce already shows; the event still moves `seq` for change markers.
+    pub(super) fn intent_paths_changed(
+        intent: &str,
+        paths: &[String],
+        expires_at: i64,
+    ) -> Result<Self> {
+        Self::new(
+            "intent_paths_changed",
+            intent,
+            json!({"expires_at": expires_at, "paths": paths}),
+        )
     }
 
     pub(super) fn intent_renewed(intent: &str, expires_at: i64) -> Result<Self> {

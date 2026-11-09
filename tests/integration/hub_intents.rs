@@ -406,6 +406,14 @@ fn events_are_appended_once(db: &Db) {
         ..intent(2, &["e/f"])
     };
     store.announce_intent(&b.token, &same, T0 + 6).unwrap();
+    // A change of only the paths, wider or narrower, is no new announce; a new branch is.
+    announce(&*store, &b, 2, &["e/f", "e/g"], T0 + 6);
+    announce(&*store, &b, 2, &["e/f"], T0 + 6);
+    let moved = NewIntent {
+        branch: Some("other".into()),
+        ..intent(2, &["e/f"])
+    };
+    store.announce_intent(&b.token, &moved, T0 + 6).unwrap();
     assert!(store.release_intent(&a.token, &id(1), T0 + 7).unwrap());
     let kinds: Vec<(&str, String)> = vec![
         ("intent_announced", id(1)),
@@ -413,6 +421,10 @@ fn events_are_appended_once(db: &Db) {
         ("intent_notice", id(1)),
         ("intent_renewed", id(1)),
         ("intent_renewed", id(2)),
+        ("intent_paths_changed", id(2)),
+        ("intent_notice", id(1)),
+        ("intent_paths_changed", id(2)),
+        ("intent_announced", id(2)),
         ("intent_released", id(1)),
     ];
     let got = intent_events(&*store);

@@ -559,7 +559,10 @@ body or query string is a 400 with a fixed body.
   idempotent: it writes no event and sends no notice (only the expiry moves, as
   a renewal, if `ttl_s` gives a different one). A changed announce of the same
   id replaces it and notices only the intents that overlap a path added by the
-  change. An id held by another token, or one that was released, is a 400; a released id also carries the `message` "intent was released". An announce is also a 400 with a `message` that names the Work and says to resume it when a path lies in the scope of unfinished Work that the token no longer holds (see [stand-up](standup.md)). When a Work is released, finished or abandoned, the Hub releases the live intents of its participant sessions and, if the Work held a reservation, the token's session-less intents that overlap its scope, except those another Work with an eligible session of the token covers. Work that held no reservation releases no session-less intent, and a session that is eligible on other Work keeps its whole intent, including paths of the ended Work. A refused announce lists the refused paths in `refused_paths` (sorted, at most 32); the `agentscm intent` hook drops them and announces the others once. A token with more than 100 unfinished Work items that declare a scope is refused with `work_overlap_incomplete` (a 503; the `agentscm intent` hook shows that reason). Work with an empty scope does not count, and releasing, finishing or abandoning Work never fails on this bound.
+  change. A change of only the paths of a live intent writes an `intent_paths_changed` event
+  (`{paths, expires_at}`), which the activity route does not list; a new or expired id, or a
+  changed task, branch, base or machine, writes `intent_announced`. A session that adds one
+  file per edit therefore shows one announce. An id held by another token, or one that was released, is a 400; a released id also carries the `message` "intent was released". An announce is also a 400 with a `message` that names the Work and says to resume it when a path lies in the scope of unfinished Work that the token no longer holds (see [stand-up](standup.md)). When a Work is released, finished or abandoned, the Hub releases the live intents of its participant sessions and, if the Work held a reservation, the token's session-less intents that overlap its scope, except those another Work with an eligible session of the token covers. Work that held no reservation releases no session-less intent, and a session that is eligible on other Work keeps its whole intent, including paths of the ended Work. A refused announce lists the refused paths in `refused_paths` (sorted, at most 32); the `agentscm intent` hook drops them and announces the others once. A token with more than 100 unfinished Work items that declare a scope is refused with `work_overlap_incomplete` (a 503; the `agentscm intent` hook shows that reason). Work with an empty scope does not count, and releasing, finishing or abandoning Work never fails on this bound.
 - `GET /v1/hub/repos/{repo}/intents` returns `{"intents": [I...], "truncated":
   bool}`: the live intents, by id, at most 1000.
 - `POST /v1/hub/repos/{repo}/intents/{id}/renew` with `{ttl_s}` returns
@@ -682,8 +685,10 @@ Lockfiles (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `go.sum`, any
 minified and generated files (`*.min.js`, `*.min.css`, `*.pb.go`,
 `*_pb2.py`, `*.generated.*`), anything under `node_modules`, `.git` or
 `__pycache__`, and anything under a top-level `dist`, `build`, `target` or
-`vendor` directory are never held, refused or warned about. An intent without a task from `agentscm_start` reads `task
-unknown`.
+`vendor` directory are never held, refused or warned about. A session with no task of its own,
+because no call gave one or its session row was removed (by a session end or a prune), takes the
+title of the unfinished (active, paused or blocked) Work it leads, the one updated last. An intent
+with neither reads `task unknown`.
 
 ### Warn once
 

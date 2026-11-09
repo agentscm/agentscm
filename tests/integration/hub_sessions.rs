@@ -159,6 +159,63 @@ fn paths_accumulate_in_one_intent(db: &Db) {
     );
 }
 
+/// A hook session adds one file per edit: one announce, then a quiet change of paths per file.
+fn a_session_announces_its_intent_once_however_many_files_it_adds(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1, "a");
+    let bob = agent(&*store, 2, "b");
+    let held = intent_id(&touch(&*store, &bob, &["src/c.rs"], T0));
+    let edit = |session: SessionCall, now: i64| store.touch_session(&alice.token, &session, now);
+    let files = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"];
+    let mut own = String::new();
+    for (now, file) in (T0 + 1..).zip(files) {
+        own = intent_id(&edit(call("hook:claude", Some("s"), &[file]), now).unwrap());
+    }
+    let kinds_of = |id: &str| -> Vec<String> {
+        let events = store.events_after(0, 1000).unwrap();
+        events
+            .into_iter()
+            .filter(|event| event.subject == id && event.kind.starts_with("intent_"))
+            .map(|event| event.kind)
+            .collect()
+    };
+    let mut expected = vec!["intent_announced".to_owned()];
+    expected.extend(vec!["intent_paths_changed".to_owned(); files.len() - 1]);
+    assert_eq!(kinds_of(&own), expected);
+    let changed = event_data(&*store, "intent_paths_changed");
+    assert_eq!(changed.last().unwrap()["paths"], serde_json::json!(files));
+    assert_eq!(
+        changed.last().unwrap()["expires_at"],
+        T0 + 4 + SESSION_TTL_SECONDS
+    );
+    // The holder of a file is noticed when it is added, and only then.
+    let notices = store.notices_after(&bob.token, 0, 100).unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].subject, held);
+    let notice: serde_json::Value = serde_json::from_str(&notices[0].data).unwrap();
+    assert_eq!(notice["their_paths"], serde_json::json!(["src/c.rs"]));
+    // The activity page lists the one announce and none of the path changes.
+    let shown = store
+        .repository_events(&principal(&*store, &alice), None, 100)
+        .unwrap();
+    let announces = shown
+        .iter()
+        .filter(|e| e.event.subject == own && e.event.kind == "intent_announced")
+        .count();
+    assert_eq!(announces, 1);
+    assert!(shown.iter().all(|e| e.event.kind != "intent_paths_changed"));
+    // A new task is a new announce.
+    let named = SessionCall {
+        task: Some("fix billing".into()),
+        ..call("hook:claude", Some("s"), &[])
+    };
+    edit(named, T0 + 10).unwrap();
+    assert_eq!(kinds_of(&own).last().unwrap(), "intent_announced");
+    let announced = event_data(&*store, "intent_announced");
+    assert_eq!(announced.last().unwrap()["task"], "fix billing");
+    assert_eq!(announced.last().unwrap()["paths"], serde_json::json!(files));
+}
+
 fn only_new_specs_are_added_and_reported_once(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1, "a");
@@ -1048,6 +1105,7 @@ macro_rules! conformance {
 
 conformance!(
     paths_accumulate_in_one_intent,
+    a_session_announces_its_intent_once_however_many_files_it_adds,
     only_new_specs_are_added_and_reported_once,
     heartbeat_renews_the_expiry,
     expired_intent_is_not_revived,
