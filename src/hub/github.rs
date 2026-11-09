@@ -587,6 +587,32 @@ impl Api {
         self.paged(token, &path, None, MAX_PULL_PAGES, etag).await
     }
 
+    /// Strict inventory for hosted validation: malformed pages or entries cannot hide
+    /// another proposal sharing a status-bearing head.
+    pub async fn validation_open_pulls(&self, token: &str, full_name: &str) -> Gh<Paged> {
+        let path = format!("/repos/{full_name}/pulls?state=open");
+        let page = self
+            .paged_with(token, &path, None, MAX_PULL_PAGES, None, true)
+            .await?
+            .ok_or_else(|| GhError::Failed("unexpected 304 from pulls".into()))?;
+        if page.unread != 0
+            || page.items.iter().any(|p| {
+                p["number"].as_i64().is_none_or(|n| n <= 0)
+                    || !p["head"]["sha"].as_str().is_some_and(|sha| {
+                        sha.len() == 40
+                            && sha
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+            })
+        {
+            return Err(GhError::Failed(
+                "incomplete or malformed validation pull inventory".into(),
+            ));
+        }
+        Ok(page)
+    }
+
     /// Open issue inventory by immutable repository identity. Pull requests are filtered by
     /// the typed decoder. Unread pages remain an explicit coverage gap.
     pub async fn open_issues(&self, token: &str, repository_id: i64) -> Gh<Paged> {
@@ -1074,6 +1100,73 @@ impl Api {
         Ok((comments, truncated))
     }
 
+    /// Exact comment lookup for ownership and definite-deletion recovery. A malformed
+    /// reply is never absence; only a 404 permits recreation after complete discovery.
+    pub async fn validation_comment(
+        &self,
+        token: &str,
+        full_name: &str,
+        id: i64,
+    ) -> Gh<Option<(String, String)>> {
+        let reply = self
+            .get(token, &format!("/repos/{full_name}/issues/comments/{id}"))
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let value = reply.ok("comments")?;
+        if value["id"].as_i64() != Some(id) {
+            return Err(GhError::Failed("unreadable comment identity".into()));
+        }
+        let author = value["user"]["login"]
+            .as_str()
+            .ok_or_else(|| GhError::Failed("unreadable comment author".into()))?;
+        let body = value["body"]
+            .as_str()
+            .ok_or_else(|| GhError::Failed("unreadable comment body".into()))?;
+        Ok(Some((author.into(), body.into())))
+    }
+
+    /// Complete, strict discovery for the canonical validation publisher. Unknown or
+    /// malformed entries cannot disappear through the generic display decoder.
+    pub async fn validation_comments(
+        &self,
+        token: &str,
+        full_name: &str,
+        number: i64,
+        max_pages: u32,
+    ) -> Gh<Vec<(i64, String, String)>> {
+        let page = self
+            .paged_with(
+                token,
+                &format!("/repos/{full_name}/issues/{number}/comments"),
+                None,
+                max_pages,
+                None,
+                true,
+            )
+            .await?
+            .ok_or_else(|| GhError::Failed("validation comment inventory unavailable".into()))?;
+        if page.unread != 0 {
+            return Err(GhError::Failed(
+                "validation comment inventory incomplete".into(),
+            ));
+        }
+        page.items
+            .iter()
+            .map(|value| {
+                let bad = || GhError::Failed("malformed validation comment inventory".into());
+                let id = value["id"].as_i64().filter(|id| *id > 0).ok_or_else(bad)?;
+                let author = value["user"]["login"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(bad)?;
+                let body = value["body"].as_str().ok_or_else(bad)?;
+                Ok((id, author.into(), body.into()))
+            })
+            .collect()
+    }
+
     pub async fn create_comment(
         &self,
         token: &str,
@@ -1112,6 +1205,23 @@ impl Api {
             return Ok(false);
         }
         reply.ok("repos").map(|_| true)
+    }
+
+    /// Explicit legacy migration cleanup only. A lost reply is uncertain; callers must
+    /// read the exact comment again before deciding that deletion completed.
+    pub async fn delete_validation_comment(
+        &self,
+        token: &str,
+        full_name: &str,
+        comment: i64,
+    ) -> Gh<()> {
+        let url = format!("{}/repos/{full_name}/issues/comments/{comment}", self.base);
+        let reply = self.call(token, Method::DELETE, &url, None, None).await?;
+        if matches!(reply.status, 204 | 404) {
+            Ok(())
+        } else {
+            Err(GhError::Failed("legacy comment deletion refused".into()))
+        }
     }
 
     // ---- publishing: git data and pull request writes ----

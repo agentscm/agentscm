@@ -1178,7 +1178,13 @@ async fn read_repo(
         outbound_repo(state, conn, repo, token).await?;
     }
     #[cfg(unix)]
-    super::forge_check::reconcile_repo(state, conn, repo, token, None).await?;
+    {
+        let validation =
+            super::validation_summary::reconcile_repo(state, conn, repo, token, None).await;
+        let native = super::forge_check::reconcile_repo(state, conn, repo, token, None).await;
+        validation?;
+        native?;
+    }
     super::external_runs::reconcile_repo(state, conn, repo, token).await?;
     reconcile_provider_context(state, conn, repo, token).await?;
     if sync.skill_read_due(&repo.id) {
@@ -2253,7 +2259,10 @@ async fn webhook_work(
         }
         return Ok(());
     }
-    if !matches!(event, "pull_request" | "push" | "merge_group") {
+    if !matches!(
+        event,
+        "pull_request" | "push" | "merge_group" | "issue_comment"
+    ) {
         return Ok(());
     }
     let Some(repository_id) = payload["repository"]["id"].as_i64() else {
@@ -2277,6 +2286,24 @@ async fn webhook_work(
         let token = sync.token(conn, repo.installation_id).await?;
         let reads = async {
             match event {
+                "issue_comment" => {
+                    // Only an authenticated delivery's repository/PR identifiers are hints.
+                    // Reconciliation re-reads the head, inventory and owned comment body.
+                    #[cfg(unix)]
+                    if payload["issue"]["pull_request"].is_object()
+                        && let Some(number) = payload["issue"]["number"].as_i64().filter(|n| *n > 0)
+                    {
+                        super::validation_summary::reconcile_repo(
+                            state,
+                            conn,
+                            &repo,
+                            &token,
+                            Some(number),
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
                 // A merge queue group is judged on its own commit; no pull request or branch
                 // read stands in for it.
                 "merge_group" => {
@@ -2318,7 +2345,13 @@ async fn webhook_work(
                     })
                     .flatten();
                 if event != "pull_request" || only.is_some() {
-                    super::forge_check::reconcile_repo(state, conn, &repo, &token, only).await?;
+                    let validation =
+                        super::validation_summary::reconcile_repo(state, conn, &repo, &token, only)
+                            .await;
+                    let native =
+                        super::forge_check::reconcile_repo(state, conn, &repo, &token, only).await;
+                    validation?;
+                    native?;
                 }
             }
             Ok(())
@@ -2525,11 +2558,12 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
         "callback_urls": [format!("{public}/v1/hub/login/github/callback")],
         "public": false,
         "default_permissions": {"contents": "read", "metadata": "read",
-            "pull_requests": "write", "statuses": "write", "merge_queues": "read"}});
+            "pull_requests": "write", "statuses": "write", "merge_queues": "read", "issues": "read"}});
     if webhook_reachable(public) {
         manifest["hook_attributes"] =
             json!({"url": format!("{public}/v1/hub/webhooks/github/{connection}")});
-        manifest["default_events"] = json!(["pull_request", "push", "merge_group"]);
+        manifest["default_events"] =
+            json!(["pull_request", "push", "merge_group", "issue_comment"]);
     }
     manifest
 }
@@ -3002,8 +3036,9 @@ mod tests {
         );
         assert_eq!(
             public["default_events"],
-            json!(["pull_request", "push", "merge_group"])
+            json!(["pull_request", "push", "merge_group", "issue_comment"])
         );
+        assert_eq!(public["default_permissions"]["issues"], "read");
         for url in [
             "http://127.0.0.1:7332",
             "http://[::1]:7332",

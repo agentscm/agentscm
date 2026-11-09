@@ -103,6 +103,10 @@ Try to replace avoidable manual checks with synthetic fixtures or existing local
 
 ## Phase 8: PR gate and final report
 
+Treat a development issue as resolved when its requested behavior is implemented and appropriate automated tests pass. Use `Closes #<issue>` in the implementing PR so merge closes it. Deployment, repository activation, operator configuration, release qualification and unavailable live-service checks do not by themselves keep a development issue open, even when listed as qualification steps. Record what remains unverified in the PR and document concrete operational follow-ups separately; reuse or file a focused follow-up issue when work needs an owner. Do not create generic process tickets merely to justify closure.
+
+An issue whose primary deliverable is deployment, activation or live qualification remains open until that deliverable is complete. Missing implementation, failing relevant tests and unresolved correctness defects also remain blockers. Issue resolution does not waive required PR checks, attestations, branch protections or release gates, and does not establish production readiness.
+
 Confirm the branch is clean and summarize:
 
 - implemented behavior and commits;

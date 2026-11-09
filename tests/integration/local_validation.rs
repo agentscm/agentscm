@@ -732,6 +732,67 @@ fn known(bodies: &[&str]) -> Verdict {
 }
 
 #[test]
+fn exact_pairs_preserve_selection_and_allow_evidence_beyond_comment_limit() {
+    use agentscm::local_validation::select_pairs;
+    let mut older = pass();
+    older.issued_at_ms = NOW - 1;
+    let mut newest = fail();
+    newest.issued_at_ms = NOW;
+    let old_body = older.body();
+    let new_body = newest.body();
+    let old = comment::parse(&old_body).unwrap();
+    let new = comment::parse(&new_body).unwrap();
+    let observe = || Observed {
+        repository: "repo-1",
+        commit: COMMIT,
+        tree: TREE,
+        base_ref: "refs/heads/main",
+        merge_base: BASE,
+        required: &[],
+        selections: &[],
+    };
+    let required = ["test".to_string()];
+    let run = |pairs: Vec<(&[u8], &[u8])>| {
+        let mut observed = observe();
+        observed.required = &required;
+        select_pairs(
+            pairs,
+            &recipe(),
+            &registry(),
+            &policy(),
+            observed,
+            EvaluationClock::Known { unix_ms: NOW },
+        )
+    };
+    let expected = known(&[&old_body, &new_body]);
+    assert_eq!(run(vec![(&old.0, &old.1), (&new.0, &new.1)]), expected);
+    assert_eq!(run(vec![(&new.0, &new.1), (&old.0, &old.1)]), expected);
+    let mut tampered = new.0.clone();
+    tampered[0] = b'x';
+    assert_eq!(
+        run(vec![(&tampered, &new.1), (&old.0, &old.1)]).state,
+        VerdictState::Success
+    );
+    // Whitespace is part of the exact signed artifact commitment. The signed payload
+    // remains valid even when carrying it in a base64 comment would exceed 60 KiB.
+    let (original_envelope, mut record) = comment_bytes();
+    let mut payload = agentscm::evidence::EvidenceEnvelope::from_slice(&original_envelope)
+        .unwrap()
+        .payload;
+    record.extend(std::iter::repeat_n(b' ', 50_000));
+    payload.terminal_record_sha256 = agentscm::store::digest(&record);
+    for artifact in &mut payload.artifacts {
+        if artifact.artifact_id == "record" {
+            artifact.sha256 = agentscm::store::digest(&record);
+            artifact.bytes = record.len() as u64;
+        }
+    }
+    let envelope = serde_json::to_vec(&sign_evidence(payload, &signing_key()).unwrap()).unwrap();
+    assert!(comment::render(&envelope, &record).is_err());
+    assert_eq!(run(vec![(&envelope, &record)]).state, VerdictState::Success);
+}
+
+#[test]
 fn applies_to_head_only_for_the_observed_commit() {
     assert!(pass().run().applies_to_head);
     assert!(fail().run().applies_to_head);
@@ -2306,4 +2367,641 @@ fn absent_selection_preserves_legacy_serialization() {
             .unwrap()
             .contains("selections")
     );
+}
+
+#[test]
+fn validation_bundle_exact_bytes_bounds_and_identity() {
+    use agentscm::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
+    let (envelope, record) = comment::parse(&Case::new().body()).unwrap();
+    let mut spaced = envelope.clone();
+    spaced.push(b' ');
+    let first = EvidencePairV1::new(&envelope, &record);
+    let second = EvidencePairV1::new(&spaced, &record);
+    let bundle = ValidationBundleV1 {
+        version: 1,
+        entries: vec![first.clone(), second.clone()],
+    };
+    let bytes = bundle.to_bytes().unwrap();
+    assert_eq!(
+        bytes,
+        ValidationBundleV1 {
+            version: 1,
+            entries: vec![second, first.clone()]
+        }
+        .to_bytes()
+        .unwrap()
+    );
+    let decoded = ValidationBundleV1::from_slice(&bytes).unwrap();
+    assert!(
+        decoded
+            .entries
+            .iter()
+            .any(|pair| pair.decode().unwrap().0 == spaced)
+    );
+    assert!(
+        decoded
+            .validate_repository("other.example/acme/widget")
+            .is_err()
+    );
+    assert!(
+        ValidationBundleV1 {
+            version: 1,
+            entries: vec![first.clone(), first]
+        }
+        .to_bytes()
+        .is_err()
+    );
+    assert!(ValidationBundleV1::from_slice(br#"{"version":2,"entries":[]}"#).is_err());
+    assert!(
+        ValidationBundleV1::from_slice(br#"{"version":1,"entries":[],"unknown":true}"#).is_err()
+    );
+    let mut corrupt = record.clone();
+    corrupt.push(b' ');
+    assert!(EvidencePairV1::new(&envelope, &corrupt).decode().is_err());
+    assert!(
+        EvidencePairV1::new(&envelope, &record[..record.len() - 1])
+            .decode()
+            .is_err()
+    );
+}
+
+#[test]
+fn validation_evidence_durable_receipts_pagination_and_revocation() {
+    let temp = tempfile::tempdir().unwrap();
+    validation_store_conformance(
+        &format!("sqlite://{}", temp.path().join("hub.db").display()),
+        &temp,
+    );
+}
+
+#[test]
+fn validation_evidence_durable_receipts_and_publication_on_postgres() {
+    let Some(pg) = crate::hub_pg::PgSchema::create() else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    validation_store_conformance(&pg.url, &temp);
+}
+
+fn validation_store_conformance(db: &str, temp: &tempfile::TempDir) {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::store::{self, ForgeIdentity, NewAgentToken};
+    use agentscm::hub::validation_evidence::{
+        ValidationSummaryConfig, persist_bundle, read_bundle,
+    };
+    use agentscm::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
+    let store = store::open(db).unwrap();
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.example".into(),
+        user_id: 123,
+    };
+    let user = store.upsert_user(&identity, "synthetic").unwrap();
+    let connection = NewConnection {
+        id: format!("con_{}", "1".repeat(32)),
+        provider: identity.provider.clone(),
+        host: identity.host.clone(),
+        kind: "app".into(),
+        app_id: Some(1),
+        app_slug: Some("synthetic".into()),
+        acts_as: None,
+    };
+    store.insert_connection(&connection, "synthetic").unwrap();
+    let repo = store
+        .upsert_repository(
+            &connection.id,
+            &identity.host,
+            77,
+            "acme/widget",
+            None,
+            Some(1),
+        )
+        .unwrap();
+    let now = agentscm::hub::store::unix_now();
+    let token = store
+        .insert_agent_token(&NewAgentToken {
+            owner: user.id.clone(),
+            name: "synthetic".into(),
+            repository: repo.full_name.clone(),
+            digest: store::agent_token_digest(&"a".repeat(64)).unwrap(),
+            expires_at: now + 3600,
+            repository_id: Some(77),
+            read_only: false,
+        })
+        .unwrap();
+    let backend = agentscm::backend::LocalBackend::open(temp.path().join("objects")).unwrap();
+    let mut case = Case::new();
+    case.record.subject.repository = "github.example/acme/widget".into();
+    case.policy.repository = case.record.subject.repository.clone();
+    case.registry.repository = case.record.subject.repository.clone();
+    let (envelope, record) = comment::parse(&case.body()).unwrap();
+    let bundle = ValidationBundleV1 {
+        version: 1,
+        entries: vec![EvidencePairV1::new(&envelope, &record)],
+    };
+    let durable =
+        persist_bundle(&backend, &repo.id, "github.example/acme/widget", &bundle).unwrap();
+    assert!(
+        store
+            .receive_validation_evidence(&token, 1, &durable, now)
+            .is_err()
+    );
+    let mut config = ValidationSummaryConfig {
+        repository: repo.id.clone(),
+        connection: connection.id.clone(),
+        enabled: true,
+    };
+    store.configure_validation_summary(&config).unwrap();
+    assert_eq!(
+        store.validation_summary_config(&repo.id).unwrap(),
+        Some(config.clone())
+    );
+    assert!(
+        store
+            .receive_validation_evidence(&token, 0, &durable, now)
+            .is_err()
+    );
+    let first = store
+        .receive_validation_evidence(&token, 1, &durable, now)
+        .unwrap();
+    assert_eq!(first.state, "received_unverified");
+    assert_eq!(first.generation, 1);
+    let concurrent: Vec<_> = (0..4)
+        .map(|_| {
+            let store = store.clone();
+            let token = token.clone();
+            let durable = durable.clone();
+            std::thread::spawn(move || {
+                store
+                    .receive_validation_evidence(&token, 1, &durable, now)
+                    .unwrap()
+            })
+        })
+        .collect();
+    for worker in concurrent {
+        assert_eq!(worker.join().unwrap(), first);
+    }
+    let reader = store
+        .insert_agent_token(&NewAgentToken {
+            owner: user.id.clone(),
+            name: "reader".into(),
+            repository: repo.full_name.clone(),
+            digest: store::agent_token_digest(&"b".repeat(64)).unwrap(),
+            expires_at: now + 3600,
+            repository_id: Some(77),
+            read_only: true,
+        })
+        .unwrap();
+    assert!(
+        store
+            .receive_validation_evidence(&reader, 1, &durable, now)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .validation_evidence_history(&reader, &repo.id, 1, 0, 10, now)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+
+    assert_eq!(
+        first,
+        store
+            .receive_validation_evidence(&token, 1, &durable, now + 1)
+            .unwrap()
+    );
+    assert_eq!(
+        read_bundle(&backend, &first).unwrap().to_bytes().unwrap(),
+        bundle.to_bytes().unwrap()
+    );
+    use agentscm::hub::validation_evidence::{
+        PublicationPhase, ValidationPublication, ValidationStatusSlot,
+    };
+    let snapshot = store.validation_snapshot(&repo.id, 1, 1).unwrap();
+    assert_eq!(snapshot.generation, 1);
+    assert_eq!(snapshot.entries, vec![first.clone()]);
+    let preparing = ValidationPublication {
+        revision: 1,
+        evidence_generation: 1,
+        connection: connection.id.clone(),
+        phase: PublicationPhase::Preparing,
+        operation_id: "a".repeat(64),
+        body_sha256: "b".repeat(64),
+        source_sha256: "c".repeat(64),
+        comment_id: None,
+        status_slots: vec![ValidationStatusSlot {
+            head: "d".repeat(40),
+            context: "agentscm/local-validation".into(),
+        }],
+    };
+    // Independent database connections, as used by independent Hub processes, race one CAS.
+    let contenders: Vec<_> = (0..4)
+        .map(|_| {
+            let db = db.to_owned();
+            let repo = repo.id.clone();
+            let next = preparing.clone();
+            std::thread::spawn(move || {
+                store::open(&db)
+                    .unwrap()
+                    .compare_validation_publication(&repo, 1, 0, &next)
+                    .unwrap()
+            })
+        })
+        .collect();
+    assert_eq!(
+        contenders
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count(),
+        1
+    );
+    let mut attempting = preparing.clone();
+    attempting.revision = 2;
+    attempting.phase = PublicationPhase::Attempting;
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 1, &attempting)
+            .unwrap()
+    );
+    let mut forbidden = attempting.clone();
+    forbidden.revision = 3;
+    forbidden.operation_id = "e".repeat(64);
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 2, &forbidden)
+            .is_err()
+    );
+    let mut second_envelope = envelope.clone();
+    second_envelope.push(b' ');
+    let second_bundle = ValidationBundleV1 {
+        version: 1,
+        entries: vec![EvidencePairV1::new(&second_envelope, &record)],
+    };
+    let second = persist_bundle(
+        &backend,
+        &repo.id,
+        "github.example/acme/widget",
+        &second_bundle,
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .receive_validation_evidence(&token, 1, &second, now)
+            .unwrap()
+            .generation,
+        2
+    );
+    let page = store
+        .validation_evidence_history(&token, &repo.id, 1, 0, 1, now)
+        .unwrap();
+    assert_eq!(page.entries, vec![first.clone()]);
+    assert_eq!(page.next_after, Some(1));
+    let next = store
+        .validation_evidence_history(&token, &repo.id, 1, 1, 1, now)
+        .unwrap();
+    assert_eq!(next.entries[0].generation, 2);
+    assert_eq!(next.next_after, None);
+    assert!(
+        store
+            .validation_evidence_history(&token, &repo.id, 1, 0, 101, now)
+            .is_err()
+    );
+    assert!(store.validation_snapshot(&repo.id, 1, 1).is_err());
+    assert_eq!(
+        store
+            .validation_snapshot(&repo.id, 1, 2)
+            .unwrap()
+            .generation,
+        2
+    );
+    // New receipts must not strand an uncertain operation: exact-op recovery still completes.
+    let mut recovered = attempting.clone();
+    recovered.revision = 3;
+    recovered.phase = PublicationPhase::Idle;
+    recovered.comment_id = Some(123);
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 2, &recovered)
+            .unwrap()
+    );
+    assert_eq!(
+        store.validation_publication(&repo.id, 1).unwrap(),
+        Some(recovered.clone())
+    );
+    let proposals = store
+        .validation_publication_proposals(&repo.id, 0, None, 1)
+        .unwrap();
+    assert_eq!(proposals.proposals, vec![1]);
+    assert_eq!(proposals.through, 1);
+    assert!(
+        store
+            .validation_publication_proposals(&repo.id, 1, Some(1), 1)
+            .unwrap()
+            .proposals
+            .is_empty()
+    );
+    assert_eq!(store.validation_fence(&repo.id, 1).unwrap().generation, 2);
+    let mut stale = recovered.clone();
+    stale.revision = 4;
+    stale.phase = PublicationPhase::Preparing;
+    stale.operation_id = "e".repeat(64);
+    assert!(
+        !store
+            .compare_validation_publication(&repo.id, 1, 3, &stale)
+            .unwrap()
+    );
+    stale.evidence_generation = 2;
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 3, &stale)
+            .unwrap()
+    );
+    let mut retired = stale.clone();
+    retired.revision = 5;
+    retired.phase = PublicationPhase::Idle;
+    retired.status_slots.clear();
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 4, &retired)
+            .is_err()
+    );
+    retired.status_slots = stale.status_slots.clone();
+    let wrong = persist_bundle(&backend, &repo.id, "other.example/acme/widget", &bundle);
+    assert!(wrong.is_err());
+    config.enabled = false;
+    store.configure_validation_summary(&config).unwrap();
+    // Disable fences a new attempt but preserves old contexts and permits pre-send abort.
+    let mut disabled_attempt = stale.clone();
+    disabled_attempt.revision = 5;
+    disabled_attempt.phase = PublicationPhase::Attempting;
+    assert!(
+        !store
+            .compare_validation_publication(&repo.id, 1, 4, &disabled_attempt)
+            .unwrap()
+    );
+    assert!(
+        store
+            .compare_validation_publication(&repo.id, 1, 4, &retired)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .validation_publication(&repo.id, 1)
+            .unwrap()
+            .unwrap()
+            .status_slots,
+        preparing.status_slots
+    );
+    assert!(
+        store
+            .receive_validation_evidence(&token, 1, &durable, now)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .validation_evidence_history(&token, &repo.id, 1, 0, 10, now)
+            .unwrap()
+            .entries
+            .len(),
+        2
+    );
+    store.revoke_agent_token(&token).unwrap();
+    assert!(
+        store
+            .validation_evidence_history(&token, &repo.id, 1, 0, 10, now)
+            .is_err()
+    );
+    assert!(
+        store
+            .receive_validation_evidence(&token, 1, &durable, now)
+            .is_err()
+    );
+    if db.starts_with("sqlite:") {
+        let raw = rusqlite::Connection::open(temp.path().join("hub.db")).unwrap();
+        raw.execute("DELETE FROM hub_validation_evidence WHERE repository=?1 AND proposal=1 AND generation=1", [&repo.id]).unwrap();
+    } else {
+        let mut raw = postgres::Client::connect(db, postgres::NoTls).unwrap();
+        raw.execute("DELETE FROM hub_validation_evidence WHERE repository=$1 AND proposal=1 AND generation=1", &[&repo.id]).unwrap();
+    }
+    assert!(matches!(
+        store.validation_snapshot(&repo.id, 1, 1000),
+        Err(agentscm::hub::HubError::Unavailable(_))
+    ));
+    std::fs::remove_dir_all(temp.path().join("objects")).unwrap();
+    assert!(read_bundle(&backend, &first).is_err());
+}
+
+#[tokio::test]
+async fn validation_evidence_http_scopes_retries_and_unavailable_objects() {
+    use agentscm::hub::connection::NewConnection;
+    use agentscm::hub::store::{self, ForgeIdentity, NewAgentToken};
+    use agentscm::hub::validation_evidence::ValidationSummaryConfig;
+    use agentscm::local_validation::bundle::{EvidencePairV1, ValidationBundleV1};
+    let temp = tempfile::tempdir().unwrap();
+    let store = store::open(&format!(
+        "sqlite://{}",
+        temp.path().join("hub.db").display()
+    ))
+    .unwrap();
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.example".into(),
+        user_id: 123,
+    };
+    let user = store.upsert_user(&identity, "synthetic").unwrap();
+    let connection = NewConnection {
+        id: format!("con_{}", "1".repeat(32)),
+        provider: identity.provider.clone(),
+        host: identity.host.clone(),
+        kind: "app".into(),
+        app_id: Some(1),
+        app_slug: Some("synthetic".into()),
+        acts_as: None,
+    };
+    store.insert_connection(&connection, "synthetic").unwrap();
+    let repo = store
+        .upsert_repository(
+            &connection.id,
+            &identity.host,
+            77,
+            "acme/widget",
+            None,
+            Some(1),
+        )
+        .unwrap();
+    let now = agentscm::hub::store::unix_now();
+    let token = store
+        .insert_agent_token(&NewAgentToken {
+            owner: user.id.clone(),
+            name: "synthetic".into(),
+            repository: repo.full_name.clone(),
+            digest: store::agent_token_digest(&"a".repeat(64)).unwrap(),
+            expires_at: now + 3600,
+            repository_id: Some(77),
+            read_only: false,
+        })
+        .unwrap();
+    let backend = std::sync::Arc::new(
+        agentscm::backend::LocalBackend::open(temp.path().join("objects")).unwrap(),
+    );
+    let mut case = Case::new();
+    case.record.subject.repository = "github.example/acme/widget".into();
+    case.policy.repository = case.record.subject.repository.clone();
+    case.registry.repository = case.record.subject.repository.clone();
+    let (envelope, record) = comment::parse(&case.body()).unwrap();
+    let bundle = ValidationBundleV1 {
+        version: 1,
+        entries: vec![EvidencePairV1::new(&envelope, &record)],
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = agentscm::hub::router(agentscm::hub::HubState::new(store.clone(), backend.clone()));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let url = format!("{base}/v1/hub/repos/{}/validation-evidence/1", repo.id);
+    let bytes = bundle.to_bytes().unwrap();
+    let send = |url: String, secret: String| {
+        client
+            .post(url)
+            .bearer_auth(secret)
+            .header("content-type", "application/json")
+            .body(bytes.clone())
+    };
+    assert_eq!(
+        send(url.clone(), "bad".into())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let admin_url = format!("{base}/v1/hub/admin/repos/{}/validation-summary", repo.id);
+    assert_eq!(
+        client
+            .post(&admin_url)
+            .bearer_auth("a".repeat(64))
+            .header("content-type", "application/json")
+            .body(r#"{"enabled":true}"#)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert!(
+        !send(url.clone(), "a".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    store
+        .configure_validation_summary(&ValidationSummaryConfig {
+            repository: repo.id.clone(),
+            connection: connection.id.clone(),
+            enabled: true,
+        })
+        .unwrap();
+    let first = send(url.clone(), "a".repeat(64)).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    let receipt: serde_json::Value = serde_json::from_slice(&first.bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &send(url.clone(), "a".repeat(64))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        receipt
+    );
+    let read = client
+        .get(format!("{url}/1"))
+        .bearer_auth("a".repeat(64))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+    let recovered = ValidationBundleV1::from_slice(&read.bytes().await.unwrap()).unwrap();
+    assert_eq!(recovered.entries[0].decode().unwrap(), (envelope, record));
+    assert_eq!(
+        client
+            .get(format!("{url}/2"))
+            .bearer_auth("a".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let foreign = format!(
+        "{base}/v1/hub/repos/rep_{}/validation-evidence/1",
+        "f".repeat(32)
+    );
+    assert_eq!(
+        send(foreign, "a".repeat(64)).send().await.unwrap().status(),
+        401
+    );
+    let readonly = store
+        .insert_agent_token(&NewAgentToken {
+            owner: user.id.clone(),
+            name: "read".into(),
+            repository: repo.full_name.clone(),
+            digest: store::agent_token_digest(&"b".repeat(64)).unwrap(),
+            expires_at: now + 3600,
+            repository_id: Some(77),
+            read_only: true,
+        })
+        .unwrap();
+    assert_eq!(
+        send(url.clone(), "b".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert!(
+        client
+            .get(&url)
+            .bearer_auth("b".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    store.revoke_agent_token(&token).unwrap();
+    assert_eq!(
+        send(url.clone(), "a".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    // Remove only the synthetic local objects; retained receipt must not imply availability.
+    std::fs::remove_dir_all(temp.path().join("objects")).unwrap();
+    assert!(
+        !client
+            .get(format!("{url}/1"))
+            .bearer_auth("b".repeat(64))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    store.revoke_agent_token(&readonly).unwrap();
+    task.abort();
 }

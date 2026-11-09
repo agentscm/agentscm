@@ -136,6 +136,7 @@ use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
 mod repository_rename;
+mod validation_evidence;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -7398,6 +7399,85 @@ fn work_checkpoint_in(
 }
 
 impl Store for SqliteStore {
+    fn configure_validation_summary(
+        &self,
+        config: &super::validation_evidence::ValidationSummaryConfig,
+    ) -> Result<()> {
+        validation_evidence::configure(self, config)
+    }
+    fn validation_summary_config(
+        &self,
+        repository: &str,
+    ) -> Result<Option<super::validation_evidence::ValidationSummaryConfig>> {
+        validation_evidence::config(self, repository)
+    }
+    fn receive_validation_evidence(
+        &self,
+        token: &str,
+        proposal: i64,
+        bundle: &super::validation_evidence::DurableValidationBundle,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidenceReceipt> {
+        validation_evidence::receive(self, token, proposal, bundle, now)
+    }
+    fn validation_evidence_history(
+        &self,
+        token: &str,
+        repository: &str,
+        proposal: i64,
+        after: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidencePage> {
+        validation_evidence::history(self, token, repository, proposal, after, limit, now)
+    }
+    fn validation_snapshot(
+        &self,
+        repository: &str,
+        proposal: i64,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationSnapshot> {
+        validation_evidence::snapshot(self, repository, proposal, limit)
+    }
+    fn validation_fence(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<super::validation_evidence::ValidationFence> {
+        validation_evidence::fence(self, repository, proposal)
+    }
+    fn validation_publication_proposals(
+        &self,
+        repository: &str,
+        after: i64,
+        through: Option<i64>,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationProposalPage> {
+        validation_evidence::publication_proposals(self, repository, after, through, limit)
+    }
+    fn validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<Option<super::validation_evidence::ValidationPublication>> {
+        validation_evidence::publication(self, repository, proposal)
+    }
+    fn compare_validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+        expected_revision: i64,
+        next: &super::validation_evidence::ValidationPublication,
+    ) -> Result<bool> {
+        validation_evidence::compare_publication(
+            self,
+            repository,
+            proposal,
+            expected_revision,
+            next,
+        )
+    }
+
     fn backend(&self) -> &'static str {
         "sqlite"
     }
