@@ -1390,17 +1390,18 @@ mod scoped {
     }
 
     #[test]
-    fn selected_tests_use_directory_rules_and_the_commands_own_paths() {
+    fn selected_tests_use_prefix_rules_and_the_commands_own_paths() {
         use agentscm::local_validation::run::command_selections;
+        let rule = |path: &str, filter: &str| TestSelectionRule {
+            path: path.into(),
+            filter: filter.into(),
+        };
         let mut r = selection_recipe();
         let rules = &mut r.commands[0].test_selection.as_mut().unwrap().rules;
         rules.remove(1);
-        rules.push(TestSelectionRule {
-            path: "src/".into(),
-            filter: "test(/^dir::/)".into(),
-        });
+        rules.push(rule("src/*", "test(/^dir::/)"));
         r.commands[0].paths = Some(vec!["src".into()]);
-        // The exact rule beats the directory rule; README.md and the added docs file lie outside
+        // The exact rule beats the prefix rule; README.md and the added docs file lie outside
         // the command's paths, so they neither widen the run nor count as unmapped.
         let (d, b, h) = repo(|p| {
             write(p, "src/a.rs");
@@ -1411,21 +1412,19 @@ mod scoped {
         assert_eq!(selected[0].reason, SelectionReason::Selected);
         assert_eq!(selected[0].paths, ["src/a.rs"]);
         assert_eq!(selected[0].filters, ["test(/^a::/)"]);
-        r.commands[0]
-            .test_selection
-            .as_mut()
-            .unwrap()
-            .rules
-            .remove(0);
+        let rules = &mut r.commands[0].test_selection.as_mut().unwrap().rules;
+        rules[0] = rule("src/a*", "test(/^a_files::/)");
         let (d, b, h) = repo(|p| write(p, "src/a.rs"));
         let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
-        assert_eq!(selected[0].filters, ["test(/^dir::/)"]);
-        // An added file under a directory rule still keeps the full command.
+        assert_eq!(selected[0].filters, ["test(/^a_files::/)"]);
+        // An added file under a prefix rule still keeps the full command.
         let (d, b, h) = repo(|p| write(p, "src/b/new.rs"));
         let selected = command_selections(d.path(), &b, &h, &r, &trust()).unwrap();
         assert_eq!(selected[0].reason, SelectionReason::NonModifiedPath);
-        r.commands[0].test_selection.as_mut().unwrap().rules[0].path = "/".into();
-        assert!(r.validate().is_err());
+        for path in ["*", "/*", "src/"] {
+            r.commands[0].test_selection.as_mut().unwrap().rules[0].path = path.into();
+            assert!(r.validate().is_err(), "{path}");
+        }
     }
 
     fn scoped_recipe() -> ValidationRecipe {

@@ -233,14 +233,15 @@ pub fn command_selections(
         };
         if reason == Selected {
             for path in &paths {
-                // An exact rule, else the longest directory rule (ending in '/') containing it.
+                // An exact rule, else the longest prefix rule (ending in '*') matching it.
                 let rule = selection
                     .rules
                     .iter()
-                    .filter(|r| {
-                        r.path == *path || (r.path.ends_with('/') && path.starts_with(&r.path))
+                    .filter(|r| match r.path.strip_suffix('*') {
+                        Some(prefix) => path.starts_with(prefix),
+                        None => r.path == *path,
                     })
-                    .max_by_key(|r| r.path.len());
+                    .max_by_key(|r| (!r.path.ends_with('*'), r.path.len()));
                 match rule {
                     Some(rule) => {
                         filters.insert(rule.filter.clone());

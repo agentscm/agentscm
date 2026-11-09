@@ -112,7 +112,7 @@ pub struct ValidationRecipe {
     pub constituents: Option<Vec<Constituent>>,
 }
 
-/// Reviewed nextest expressions for exact paths or directories (a path ending in '/'),
+/// Reviewed nextest expressions for exact paths or path prefixes (a path ending in '*'),
 /// independent of forge scheduling.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -394,8 +394,9 @@ impl ValidationRecipe {
                 }
                 let mut paths = HashSet::new();
                 for rule in &selection.rules {
-                    // A trailing '/' makes the rule cover that directory.
-                    validate_dependency_path(rule.path.strip_suffix('/').unwrap_or(&rule.path))?;
+                    // A trailing '*' makes the rule match every path starting with the rest.
+                    let path = rule.path.strip_suffix('*').unwrap_or(&rule.path);
+                    validate_dependency_path(path.strip_suffix('/').unwrap_or(path))?;
                     text("test filter", &rule.filter)?;
                     if !paths.insert(&rule.path) {
                         return Err(Error::Invalid("duplicate test selection path".into()));
