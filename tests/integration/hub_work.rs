@@ -5021,6 +5021,31 @@ fn abandoned_work_is_not_a_reported_completion(db: &Db) {
         agentscm::hub::work::WorkOutcomeKind::Completion
     );
     assert_eq!(rows[0].item.state, WorkState::Finished);
+    let ended = rows[0].ended.as_ref().expect("transition row has ended");
+    assert_eq!(ended.transition, "complete");
+    assert_eq!(ended.reason, "synthetic reason");
+    assert_eq!(
+        ended.by.kind,
+        agentscm::hub::work_lifecycle::WorkActorKind::Lead
+    );
+    assert_eq!(ended.by.via, agentscm::hub::work_lifecycle::ActorVia::Agent);
+    assert_eq!(ended.superseded_by, None);
+    assert!(
+        overview
+            .recent
+            .iter()
+            .filter(|outcome| outcome.item.id == finished.id)
+            .all(|outcome| outcome.ended.is_none())
+    );
+    let sup = overview
+        .recent
+        .iter()
+        .find(|o| o.item.id == superseded.id)
+        .unwrap();
+    assert_eq!(
+        sup.ended.as_ref().unwrap().superseded_by.as_deref(),
+        Some(completed.id.as_str())
+    );
     // Pre-existing finished Work with no stored outcome reads as unstated.
     db.sql(&format!(
         "UPDATE hub_work_items SET terminal_outcome = NULL WHERE id = '{}'",

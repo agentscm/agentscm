@@ -106,7 +106,7 @@ use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
+    WorkConflictKind, WorkEnded, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
@@ -6848,7 +6848,7 @@ impl PgStore {
 
             let mut recent = tx
                 .query(
-                    "SELECT v.event_seq, e.at, v.snapshot FROM hub_work_versions v
+                    "SELECT v.event_seq, e.at, v.snapshot, e.kind, e.data FROM hub_work_versions v
                      JOIN hub_work_items w ON w.id = v.work
                      JOIN hub_events e ON e.seq = v.event_seq
                      WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
@@ -6887,6 +6887,11 @@ impl PgStore {
                         at: row.get(1),
                         kind,
                         item,
+                        ended: WorkEnded::from_event(
+                            &row.get::<_, String>(3),
+                            &row.get::<_, String>(4),
+                            row.get(1),
+                        ),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
