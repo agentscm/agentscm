@@ -4961,22 +4961,91 @@ fn abandoned_work_is_not_a_reported_completion(db: &Db) {
         assert_eq!(insight.state, WorkState::Finished);
         assert_eq!(insight.reported_finished, reported, "{}", item.title);
     }
-    // Recent outcomes stay checkpoint-only: a transition leaves `current` unchanged and carries
-    // no actor, so listing it would show a stale summary under the lead's name. Only the finish
-    // checkpoint is listed; abandoned, superseded and transition-completed Work are not (the
-    // latter is visible through history and the operational projection).
+    // Recent outcomes list Work ended by any transition once, as a completion from the finished
+    // snapshot; a finish checkpoint followed by a complete transition is not counted twice.
     let overview = store
         .work_overview(&alice.token, &Default::default(), now + 3)
         .unwrap();
-    let recent: Vec<_> = overview
+    let ids: Vec<_> = overview
         .recent
         .iter()
         .map(|outcome| outcome.item.id.as_str())
         .collect();
-    assert!(recent.contains(&finished.id.as_str()));
-    assert!(!recent.contains(&abandoned.id.as_str()));
-    assert!(!recent.contains(&superseded.id.as_str()));
-    assert!(!recent.contains(&completed.id.as_str()));
+    for item in [&finished, &abandoned, &superseded, &completed] {
+        assert_eq!(
+            ids.iter().filter(|id| **id == item.id).count(),
+            1,
+            "{}",
+            item.title
+        );
+    }
+    for outcome in &overview.recent {
+        if outcome.item.id == completed.id {
+            assert_eq!(
+                outcome.kind,
+                agentscm::hub::work::WorkOutcomeKind::Completion
+            );
+            assert_eq!(outcome.item.state, WorkState::Finished);
+        }
+    }
+    // A decision checkpoint followed by a complete transition lists one completion, not the
+    // decision row with its active snapshot.
+    let decided = make("d", "d/**");
+    let decision = lead_checkpoint(
+        &*store,
+        &alice,
+        &decided,
+        "dec",
+        "s-d",
+        CheckpointKind::Decision,
+        now + 4,
+    );
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&decision.item, "x", Complete, Some("s-d")),
+            now + 5,
+        )
+        .unwrap();
+    let overview = store
+        .work_overview(&alice.token, &Default::default(), now + 6)
+        .unwrap();
+    let rows: Vec<_> = overview
+        .recent
+        .iter()
+        .filter(|outcome| outcome.item.id == decided.id)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].kind,
+        agentscm::hub::work::WorkOutcomeKind::Completion
+    );
+    assert_eq!(rows[0].item.state, WorkState::Finished);
+    let ended = rows[0].ended.as_ref().expect("transition row has ended");
+    assert_eq!(ended.transition, "complete");
+    assert_eq!(ended.reason, "synthetic reason");
+    assert_eq!(
+        ended.by.kind,
+        agentscm::hub::work_lifecycle::WorkActorKind::Lead
+    );
+    assert_eq!(ended.by.via, agentscm::hub::work_lifecycle::ActorVia::Agent);
+    assert_eq!(ended.superseded_by, None);
+    assert!(
+        overview
+            .recent
+            .iter()
+            .filter(|outcome| outcome.item.id == finished.id)
+            .all(|outcome| outcome.ended.is_none())
+    );
+    let sup = overview
+        .recent
+        .iter()
+        .find(|o| o.item.id == superseded.id)
+        .unwrap();
+    assert_eq!(
+        sup.ended.as_ref().unwrap().superseded_by.as_deref(),
+        Some(completed.id.as_str())
+    );
     // Pre-existing finished Work with no stored outcome reads as unstated.
     db.sql(&format!(
         "UPDATE hub_work_items SET terminal_outcome = NULL WHERE id = '{}'",

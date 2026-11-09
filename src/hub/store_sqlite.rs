@@ -104,7 +104,7 @@ use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
+    WorkConflictKind, WorkEnded, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
@@ -7011,13 +7011,20 @@ impl SqliteStore {
 
         let recent_rows = {
             let mut statement = tx.prepare(
-                "SELECT v.event_seq, e.at, v.snapshot FROM hub_work_versions v
+                "SELECT v.event_seq, e.at, v.snapshot, e.kind, e.data FROM hub_work_versions v
                  JOIN hub_work_items w ON w.id = v.work
                  JOIN hub_events e ON e.seq = v.event_seq
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at >= ?5 AND e.at <= ?6
-                   AND e.kind = 'work_checkpoint'
-                   AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish')
+                   AND ((e.kind = 'work_checkpoint'
+                         AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish'))
+                        OR (e.kind = 'work_transition' AND v.state = 'finished'))
+                   AND NOT (EXISTS (
+                       SELECT 1 FROM hub_work_versions v2 JOIN hub_events e2 ON e2.seq = v2.event_seq
+                       WHERE v2.work = v.work AND v2.event_seq > v.event_seq AND v2.state = 'finished'
+                         AND e2.at <= ?6
+                         AND (e2.kind = 'work_transition'
+                              OR json_extract(v2.snapshot, '$.current.kind') = 'finish')))
                  ORDER BY v.event_seq DESC LIMIT ?7",
             )?;
             statement
@@ -7036,6 +7043,8 @@ impl SqliteStore {
                             row.get::<_, i64>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     },
                 )?
@@ -7043,7 +7052,7 @@ impl SqliteStore {
         };
         let mut recent = recent_rows
             .into_iter()
-            .map(|(seq, at, snapshot)| {
+            .map(|(seq, at, snapshot, event_kind, data)| {
                 let item: WorkItem = json_value(&snapshot)?;
                 let kind = if item.state == WorkState::Finished {
                     WorkOutcomeKind::Completion
@@ -7055,6 +7064,7 @@ impl SqliteStore {
                     at,
                     kind,
                     item,
+                    ended: WorkEnded::from_event(&event_kind, &data, at),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
