@@ -35,14 +35,10 @@ impl PgSchema {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
-        Client::connect(&base, NoTls)
-            .unwrap()
-            .batch_execute(&format!("CREATE DATABASE {schema}"))
-            .expect("the test role must be able to create databases");
         let mut database = reqwest::Url::parse(&base).unwrap();
         database.set_path(&format!("/{schema}"));
         let separator = if database.query().is_some() { '&' } else { '?' };
-        // Built before CREATE SCHEMA, so that its Drop removes the database if that fails.
+        // Built before CREATE DATABASE, so that its Drop removes the database whatever fails later.
         let pg = Self {
             url: format!(
                 "{database}{separator}options=-c%20search_path%3D{schema}&application_name={schema}"
@@ -50,6 +46,10 @@ impl PgSchema {
             schema,
             base,
         };
+        Client::connect(&pg.base, NoTls)
+            .unwrap()
+            .batch_execute(&format!("CREATE DATABASE {}", pg.schema))
+            .expect("the test role must be able to create databases");
         Client::connect(database.as_str(), NoTls)
             .unwrap()
             .batch_execute(&format!("CREATE SCHEMA {}", pg.schema))
