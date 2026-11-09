@@ -4464,6 +4464,8 @@ fn start_in(
             {
                 return Err(HubError::Invalid(refusal));
             }
+            // The description is set when the Work is created; a later start's is not compared, so a lead
+            // resuming Work made before descriptions existed is not refused for adding one.
             if item.title != start.title
                 || item.scope != scope
                 || item.branch != start.branch
@@ -4851,6 +4853,7 @@ fn start_in(
         owner_login: who.owner.login.clone(),
         source,
         title: start.title.clone(),
+        description: start.description.clone(),
         state: WorkState::Active,
         claim_status: ClaimStatus::Active,
         last_checkin_at: now,

@@ -133,6 +133,7 @@ struct McpQuery {
 struct StartArgs {
     issue_choice: Option<super::work_issues::WorkIssueChoice>,
     task: String,
+    description: Option<String>,
     #[serde(default)]
     paths: Vec<String>,
     session: Option<String>,
@@ -602,10 +603,15 @@ fn initialize(
         "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
         "instructions": match (read_only, all_tools) {
             (true, _) => READ_ONLY_INSTRUCTIONS.to_owned(),
-            (false, false) => format!("{} {AGENT_INSTRUCTIONS}", super::agent_rules::prose()),
+            (false, false) => format!(
+                "{} {AGENT_INSTRUCTIONS} {}",
+                super::agent_rules::prose(),
+                super::agent_rules::WORK_TEXT
+            ),
             (false, true) => format!(
-                "{} {AGENT_INSTRUCTIONS}{ALL_TOOLS_INSTRUCTIONS}",
-                super::agent_rules::prose()
+                "{} {AGENT_INSTRUCTIONS} {}{ALL_TOOLS_INSTRUCTIONS}",
+                super::agent_rules::prose(),
+                super::agent_rules::WORK_TEXT
             ),
         },
     })
@@ -1005,7 +1011,8 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "expected_updated_seq": {"type": "integer", "minimum": 1, "description": "Required compare-and-set fence from the last observed work item. An exact retained request returns its stored receipt before this fence is compared."},
              "session": {"type": "string"},
              "kind": {"type": "string", "enum": ["progress", "decision", "blocker", "pause", "finish", "handover"]},
-             "summary": {"type": "string"}, "next_action": {"type": "string"},
+             "summary": {"type": "string", "description": "One or two plain sentences a teammate can read: what happened and what is next. Give hashes, test counts and tool names only when they matter."},
+             "next_action": {"type": "string"},
              "scope": {"type": "array", "items": {"type": "string"}},
              "branch": {"type": "string"}, "worktree": {"type": "string"},
              "resolve_blocker": {"type": "boolean", "default": false},
@@ -1059,18 +1066,12 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
                  },
                  "required": ["work_id", "operation_id", "generation", "expected_updated_seq", "transition", "reason"]}}
          }), &["session", "items"])});
-    let mut listed = json!([
-        {"name": "agentscm_setup_status",
-         "description": "Verify onboarding through native MCP using the actual native hook session ID. Reports MCP and native edit-hook evidence separately, with the next setup step. Optional blocker reports describe observed login, trust, quota or unsupported-account errors; never send raw diagnostics or credentials. CLI/config checks do not verify native hooks.",
-         "inputSchema": schema(json!({
-             "agent": {"type":"string", "enum":["claude","codex","cursor","copilot","gemini"]},
-             "session": {"type":"string", "minLength":1, "maxLength":128},
-             "blocker": {"type":"string", "enum":["login","trust","quota","unsupported","unknown"]}
-         }), &["agent", "session"])},
-        {"name": "agentscm_start",
+    // Its own binding: inside the list below it would pass serde_json's macro recursion limit.
+    let start = json!({"name": "agentscm_start",
          "description": "Call before editing. Reads a durable catch-up delivery, then atomically rechecks an explicitly supplied source relation, fixed merge high-water and declared scope before claiming or joining the task. A changed or incomplete explicit preflight refuses a new claim with structured evidence. Missing preflight stays compatibility-only and returns unknown/not ready. Exact already-owned work_id retries and generation-checked resumes remain available. Titles are never used as identity. For native Work inspect issue_advice first and supply issue_choice; exact references only are candidates, never ownership decisions. Missing planning coverage remains unknown.",
          "inputSchema": schema(json!({
-             "task": {"type": "string", "description": "What you are about to do, in one line."},
+             "task": {"type": "string", "description": "The Work's title: a short plain phrase, under about 70 characters, naming what changes. No file paths, issue-number lists or design notes; those go in description."},
+             "description": {"type": "string", "description": "What this Work changes and why, in two or three plain sentences for a teammate who was not there. Set by the start that creates the Work; a later start does not change it."},
              "paths": paths("Repo-relative files you expect to edit."),
              "session": session,
              "work_id": {"type": "string", "description": "Existing durable work to resume or join."},
@@ -1089,7 +1090,16 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
              "issue_choice": issue_choice_schema,
              "preflight": source_preflight_schema,
              "detail": detail("compact returns the decision, your Work, bounded conflict and preflight evidence, and counts with the paged reads for the overview, briefing and catch-up; full embeds them all, the earlier shape.")
-         }), &["task"])},
+         }), &["task"])});
+    let mut listed = json!([
+        {"name": "agentscm_setup_status",
+         "description": "Verify onboarding through native MCP using the actual native hook session ID. Reports MCP and native edit-hook evidence separately, with the next setup step. Optional blocker reports describe observed login, trust, quota or unsupported-account errors; never send raw diagnostics or credentials. CLI/config checks do not verify native hooks.",
+         "inputSchema": schema(json!({
+             "agent": {"type":"string", "enum":["claude","codex","cursor","copilot","gemini"]},
+             "session": {"type":"string", "minLength":1, "maxLength":128},
+             "blocker": {"type":"string", "enum":["login","trust","quota","unsupported","unknown"]}
+         }), &["agent", "session"])},
+        start,
         {"name": "agentscm_check",
          "description": "Call before editing a file you have not edited yet in this session; not needed in Claude Code, Codex or Copilot with AgentSCM hooks, which check each edit. Says when another agent is already working on those files.",
          "inputSchema": schema(json!({
@@ -2812,6 +2822,7 @@ async fn work_preflight(
     let StartArgs {
         issue_choice,
         task,
+        description,
         paths,
         session,
         work_id,
@@ -2847,6 +2858,7 @@ async fn work_preflight(
                 source,
                 request_key,
                 title: task,
+                description,
                 session,
                 role,
                 scope: paths,
@@ -3235,6 +3247,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let StartArgs {
         issue_choice,
         task,
+        description,
         paths,
         session,
         work_id,
@@ -3351,6 +3364,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             source,
             request_key,
             title,
+            description,
             session: resolved.clone(),
             role,
             scope: paths.clone(),

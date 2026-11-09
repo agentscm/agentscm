@@ -165,6 +165,7 @@ fn start(key: &str, scope: &str, depends_on: &[&WorkItem]) -> WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: format!("Synthetic {key}"),
+        description: None,
         session: format!("session-{key}"),
         role: WorkRole::Lead,
         scope: vec![scope.into()],

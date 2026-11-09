@@ -52,6 +52,9 @@ pub struct WorkStart {
     pub source: Option<ForgeWorkRef>,
     pub request_key: Option<String>,
     pub title: String,
+    /// What the new Work changes and why, for a teammate; set only when Work is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub session: String,
     #[serde(default)]
     pub role: WorkRole,
@@ -222,6 +225,9 @@ pub struct WorkItem {
     pub owner_login: String,
     pub source: WorkSource,
     pub title: String,
+    /// What this Work changes and why, from the start that created it; absent when it had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub state: WorkState,
     /// A request-time projection. Stale and unknown claims remain claimed.
     pub claim_status: ClaimStatus,
@@ -666,6 +672,7 @@ impl WorkStart {
             label("request_key", key)?;
         }
         text("title", &self.title, MAX_TEXT_BYTES)?;
+        option_text("description", &self.description, MAX_TEXT_BYTES)?;
         label("session", &self.session)?;
         option_text("next_action", &self.next_action, MAX_TEXT_BYTES)?;
         option_label("worktree", &self.worktree)?;
@@ -1159,5 +1166,37 @@ mod tests {
         let payload = (WORK_DELIVERY_RESERVATION_BYTES - WORK_PAYLOAD_ROW_BYTES) as usize;
         assert!(check_work_delivery_page(&"x".repeat(payload)).is_ok());
         assert!(check_work_delivery_page(&"x".repeat(payload + 1)).is_err());
+    }
+
+    #[test]
+    fn a_snapshot_stored_before_descriptions_still_decodes() {
+        let mut snapshot = serde_json::json!({
+            "id": "wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "repository": "acme/widgets",
+            "owner": "usr_alice", "owner_login": "alice",
+            "source": {"kind": "native", "request_key": "synthetic"},
+            "title": "Synthetic", "state": "active", "claim_status": "active",
+            "last_checkin_at": 1, "generation": 1, "lead_token": "tok_alice",
+            "lead_agent": "agent", "lead_session": "session",
+            "participants": [{"owner": "usr_alice", "login": "alice", "token": "tok_alice",
+                "agent": "agent", "session": "session", "role": "lead"}],
+            "scope": [], "branch": null, "worktree": null, "next_action": null,
+            "current": null, "blocker": null, "depends_on": [], "related_work": [],
+            "created_at": 1, "updated_at": 1, "created_seq": 1, "updated_seq": 1
+        });
+        let old: super::WorkItem = serde_json::from_value(snapshot.clone()).unwrap();
+        assert_eq!(old.description, None);
+        // Work without a description keeps the snapshot shape older readers decode.
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("description")
+                .is_none()
+        );
+        snapshot["description"] = "Says what the Work changes and why.".into();
+        let described: super::WorkItem = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(
+            described.description.as_deref(),
+            Some("Says what the Work changes and why.")
+        );
     }
 }

@@ -1719,6 +1719,7 @@ mod tests {
                 request_key: "synthetic".into(),
             },
             title: "Synthetic Work".into(),
+            description: None,
             state: WorkState::Active,
             claim_status: ClaimStatus::Active,
             last_checkin_at: 90,

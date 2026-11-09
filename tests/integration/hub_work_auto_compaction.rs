@@ -117,6 +117,7 @@ fn start(key: &str, session: &str) -> WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: format!("auto compaction {key}"),
+        description: None,
         session: session.into(),
         role: WorkRole::Lead,
         scope: vec!["src/**".into()],

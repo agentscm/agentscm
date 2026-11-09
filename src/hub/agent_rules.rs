@@ -16,6 +16,10 @@ pub const REQUIRED_RULES: [&str; 6] = [
 /// Ends every hook refusal: edit hooks see only file-edit tools, so another tool is a bypass.
 pub const NO_BYPASS: &str = "Making the same change through another tool, such as a shell command or script, bypasses coordination: do not.";
 
+/// How to word the Work text people read on the Hub, for the MCP instructions and the skill.
+/// Guidance only: the Hub keeps its byte limits and refuses no title for its length.
+pub const WORK_TEXT: &str = "People read Work text on the Hub. Give `agentscm_start` a `task` that is a short plain title, under about 70 characters, naming what changes, and a `description` of two or three plain sentences saying what the Work changes and why, for a teammate who was not there; file paths, issue-number lists and design notes go in the description, not the title. Write each `agentscm_work_checkpoint` `summary` as one or two plain sentences saying what happened and what is next, with hashes, test counts and tool names only when they matter.";
+
 /// The rules as Markdown bullets, for instruction files and skills.
 pub fn markdown() -> String {
     REQUIRED_RULES

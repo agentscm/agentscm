@@ -859,7 +859,7 @@ Tools:
 
 | Tool | Arguments | Use |
 |---|---|---|
-| `agentscm_start` | `task`, `paths?`, `session?` | Once at the start of a task: records the task, returns who else is working in the repository. In a hook-connected session it says that edits are checked automatically. |
+| `agentscm_start` | `task`, `description?`, `paths?`, `session?` | Once at the start of a task: records the task (a short plain title) and, for new Work, a description of what it changes and why ([details](standup.md#work-identity-and-claims)); returns who else is working in the repository. In a hook-connected session it says that edits are checked automatically. |
 | `agentscm_check` | `paths` (1 to 50), `session?` | Before editing a file not yet edited in this session: who else is working on it, as a note. It never refuses. |
 | `agentscm_status` | `session?` | The other agents and the repository's open pull requests. |
 | `agentscm_done` | `session?` | Releases the session's files and, in the same step, pauses the active Work the session leads. |

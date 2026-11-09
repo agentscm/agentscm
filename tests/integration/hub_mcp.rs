@@ -1606,6 +1606,7 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
     let bob = hub.secret(2, "bob-agent");
     let start = json!({
         "task": "implement durable stand-up",
+        "description": "Keeps each goal across sessions so a later agent can pick it up.",
         "session": "session-a",
         "paths": ["src/a.rs"],
         "branch": "feat/standup",
@@ -1630,6 +1631,10 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
     assert_eq!(item["scope"], json!(["src/a.rs"]));
     assert_eq!(item["branch"], "feat/standup");
     assert_eq!(item["worktree"], "standup-wt");
+    assert_eq!(
+        item["description"],
+        "Keeps each goal across sessions so a later agent can pick it up."
+    );
 
     // A lost reply retried in the same session resolves the same durable work.
     let retry = hub.tool_result(&alice, "agentscm_start", start).await;
@@ -1829,6 +1834,11 @@ async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() 
         .await;
     assert_eq!(takeover["isError"], false, "{takeover}");
     assert_eq!(takeover["structuredContent"]["work"]["took_over"], true);
+    // A takeover keeps the description its creating start gave.
+    assert_eq!(
+        takeover["structuredContent"]["work"]["item"]["description"],
+        "Keeps each goal across sessions so a later agent can pick it up."
+    );
 
     // A lost old-generation result remains resolvable by exact operation retry after takeover.
     let post_takeover_retry = hub
