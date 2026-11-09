@@ -89,12 +89,82 @@ async fn hook(
     client_connection: bool,
     destination_args: bool,
 ) -> Value {
-    let mut deadline = Instant::now() + LIMIT;
+    let started = Instant::now();
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
     let Ok(Ok(Some(body))) = read else {
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
+    let capture = (client_connection
+        && agent == "claude"
+        && crate::change_capture_cli::captures_claude_event(&payload))
+    .then(|| {
+        let (body, payload) = (body.clone(), std::sync::Arc::clone(&payload));
+        tokio::spawn(async move {
+            let routed = route_client("claude", &payload).ok()?;
+            crate::change_capture_cli::plugin_capture(
+                &body,
+                &payload,
+                routed.checkout,
+                routed.connection,
+            )
+            .await
+        })
+    });
+    // Events only capture needs never reach the Hub's hook.
+    let reply = if CAPTURE_ONLY_EVENTS.contains(&payload["hook_event_name"].as_str().unwrap_or(""))
+    {
+        fail_open(agent, &payload, None)
+    } else {
+        coordinate(
+            agent,
+            flag_url,
+            repo,
+            client_connection,
+            destination_args,
+            body,
+            std::sync::Arc::clone(&payload),
+            started,
+        )
+        .await
+    };
+    let Some(capture) = capture else {
+        return reply;
+    };
+    let limit = if is_session_start(agent, &payload) {
+        SESSION_START_LIMIT
+    } else {
+        LIMIT
+    };
+    // Capture fails open: past the hook's deadline its retained records wait for the next hook.
+    let remaining = (started + limit).saturating_duration_since(Instant::now());
+    match tokio::time::timeout(remaining, capture).await {
+        Ok(Ok(Some(context))) => with_note(reply, agent, &payload, &context),
+        _ => reply,
+    }
+}
+
+/// Claude Code events the plugin registers only so capture sees them.
+const CAPTURE_ONLY_EVENTS: [&str; 5] = [
+    "PostToolUseFailure",
+    "MessageDisplay",
+    "PreCompact",
+    "SubagentStart",
+    "SubagentStop",
+];
+
+#[allow(clippy::too_many_arguments)]
+async fn coordinate(
+    agent: &str,
+    flag_url: Option<String>,
+    repo: Option<String>,
+    client_connection: bool,
+    destination_args: bool,
+    body: Vec<u8>,
+    payload: std::sync::Arc<Value>,
+    started: Instant,
+) -> Value {
+    let mut deadline = started + LIMIT;
     // The Hub ends a wait on the session's next tool call, so that call must reach it.
     if waits(agent, &payload)
         && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())

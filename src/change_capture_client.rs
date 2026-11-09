@@ -38,6 +38,9 @@ const CONFIG_VERSION: u8 = 5;
 /// recorded Claude settings path), so users who never opt in keep a config those binaries still
 /// read. Older binaries refuse a version 6 file instead of silently dropping a field.
 const EXTENDED_CONFIG_VERSION: u8 = 6;
+/// Written while a binding follows the Hub's repository conversation sharing; older binaries
+/// refuse it instead of capturing a checkout they would not know to stop.
+const FOLLOWED_CONFIG_VERSION: u8 = 7;
 const CONFIG_BYTES: u64 = 256 * 1024;
 const RECIPE_BYTES: u64 = 64 * 1024;
 const MAX_BINDINGS: usize = 128;
@@ -62,6 +65,11 @@ const CLAUDE_EVENTS: [&str; 11] = [
     "SubagentStop",
     "SessionEnd",
 ];
+
+/// Whether capture records this Claude Code hook event.
+pub(crate) fn is_claude_capture_event(name: &str) -> bool {
+    CLAUDE_EVENTS.contains(&name)
+}
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
@@ -199,6 +207,11 @@ pub struct CaptureBinding {
     pub configured_recipes: Vec<ConfiguredRecipeV1>,
     #[serde(default)]
     pub spool_limits: SpoolLimits,
+    /// Created by the plugin hook because the Hub shares this repository's agent conversations:
+    /// no hooks of its own (the plugin hook captures), and the Hub's answer sets its mode, with
+    /// `capture_mode` only able to lower it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub follows_hub: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -274,7 +287,7 @@ fn load() -> Result<Vec<CaptureBinding>> {
     };
     let config: CaptureConfig =
         serde_json::from_str(&text).map_err(|_| invalid("change capture config is not valid"))?;
-    if !matches!(config.version, 2..=EXTENDED_CONFIG_VERSION)
+    if !matches!(config.version, 2..=FOLLOWED_CONFIG_VERSION)
         || config.bindings.len() > MAX_BINDINGS
     {
         return Err(invalid("change capture config is not valid"));
@@ -291,7 +304,9 @@ fn save(bindings: &[CaptureBinding]) -> Result<()> {
             || binding.claude_settings.is_some()
     });
     let text = serde_json::to_string(&CaptureConfig {
-        version: if extended {
+        version: if bindings.iter().any(|binding| binding.follows_hub) {
+            FOLLOWED_CONFIG_VERSION
+        } else if extended {
             EXTENDED_CONFIG_VERSION
         } else {
             CONFIG_VERSION
@@ -932,6 +947,7 @@ fn plan_enable(
                 configured_recipes: saved.configured_recipes.clone(),
                 claude_history_root: saved.claude_history_root.clone(),
                 spool_limits: saved.spool_limits,
+                follows_hub: saved.follows_hub,
             }
         }
         None => {
@@ -951,6 +967,7 @@ fn plan_enable(
                 claude_history_root: None,
                 spool_limits: SpoolLimits::default(),
                 root: root.to_owned(),
+                follows_hub: false,
             }
         }
     };
@@ -1023,6 +1040,7 @@ struct BindingSpec {
     settings: PathBuf,
     claude_history_root: Option<PathBuf>,
     spool_limits: SpoolLimits,
+    follows_hub: bool,
 }
 
 pub fn configure(args: ConfigureArgs) -> Result<Value> {
@@ -1059,6 +1077,7 @@ pub fn configure(args: ConfigureArgs) -> Result<Value> {
         configured_recipes,
         claude_history_root,
         spool_limits,
+        follows_hub: false,
     };
     let locked = lock_checkout(&root, None)?;
     install_binding(&locked.bindings, &locked.connection, spec)
@@ -1083,6 +1102,7 @@ fn install_binding(
         settings,
         claude_history_root,
         spool_limits,
+        follows_hub,
     } = spec;
     spool_limits
         .validate_action_capture()
@@ -1160,8 +1180,14 @@ fn install_binding(
         action_rules,
         configured_recipes,
         spool_limits,
+        follows_hub,
     };
-    commit_binding(old_bindings, binding, Some(&settings))?;
+    // A binding that follows the Hub has no hooks of its own: the plugin hook captures for it.
+    commit_binding(
+        old_bindings,
+        binding,
+        (!follows_hub).then_some(settings.as_path()),
+    )?;
     Ok(json!({"configured": true, "root": root, "settings": settings}))
 }
 
@@ -1586,6 +1612,146 @@ pub async fn resolve_target_with(
     }
 }
 
+/// What the Hub says about agent conversation sharing for this checkout's repository and person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub struct HubSharing {
+    /// The repository shares and this person has not opted out.
+    pub sharing: bool,
+    /// This person's agent has already shown the one-time notice.
+    pub notified: bool,
+}
+
+/// The Hub's conversation sharing answer, or `None` when the Hub did not give one (an older Hub
+/// without the setting, or no answer in time). `None` never starts sharing.
+pub async fn hub_sharing(hub: &CaptureHub) -> Option<HubSharing> {
+    let request = hub
+        .client
+        .get(format!(
+            "{}/v1/hub/repos/{}/conversation-sharing",
+            hub.connection.hub,
+            encode_path_segment(&hub.connection.repo)
+        ))
+        .bearer_auth(&hub.token)
+        .timeout(Duration::from_secs(2));
+    match send(request, REPLY_BYTES).await {
+        Ok((200, body)) => serde_json::from_value(body).ok(),
+        _ => None,
+    }
+}
+
+/// Records this person's choices for the repository: opting out of sharing, or having been told.
+async fn put_sharing_choice(hub: &CaptureHub, choice: Value) -> Result<Value> {
+    let request = hub
+        .client
+        .put(format!(
+            "{}/v1/hub/repos/{}/conversation-sharing/me",
+            hub.connection.hub,
+            encode_path_segment(&hub.connection.repo)
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .bearer_auth(&hub.token)
+        .timeout(Duration::from_secs(5))
+        .body(choice.to_string());
+    match send(request, REPLY_BYTES)
+        .await
+        .map_err(|_| invalid("the Hub is unreachable"))?
+    {
+        (200, body) => Ok(body),
+        (404, _) => Err(invalid(
+            "this Hub has no conversation sharing setting; upgrade the Hub",
+        )),
+        (status, _) => Err(invalid(format!("the Hub answered status {status}"))),
+    }
+}
+
+pub(crate) async fn mark_sharing_notified(hub: &CaptureHub) -> Result<()> {
+    put_sharing_choice(hub, json!({"notified": true}))
+        .await
+        .map(drop)
+}
+
+/// `change-capture opt-out|opt-in`: this person's sessions in the checkout's repository, on every
+/// computer, stop (or resume) uploading conversation bodies while the repository shares them.
+pub async fn set_sharing_opt_out(root: &Path, opted_out: bool) -> Result<Value> {
+    let root = client_config::canonical_root(root)?;
+    let connections = client_config::load()?;
+    let (connection, _) = client_config::connection_for_checkout(&connections, &root)
+        .ok_or_else(|| invalid("no client connection for this checkout"))?;
+    let hub = CaptureHub::new(connection.clone())?;
+    put_sharing_choice(&hub, json!({"opted_out": opted_out})).await
+}
+
+/// The mode a session captures in now. The Hub's answer can only lower the binding's mode: a
+/// binding that follows the Hub shares nothing unless the Hub says to, and any other binding's
+/// sharing becomes local while the Hub says no. No answer leaves the binding's mode, because
+/// the Hub refuses uploads it does not allow.
+pub(crate) fn mode_under_hub(binding: &CaptureBinding, hub: Option<HubSharing>) -> CaptureModeV1 {
+    match (hub, binding.capture_mode) {
+        (Some(HubSharing { sharing: false, .. }), _) if binding.follows_hub => {
+            CaptureModeV1::MetadataOnly
+        }
+        (Some(HubSharing { sharing: false, .. }), CaptureModeV1::SharedConversation) => {
+            CaptureModeV1::LocalConversation
+        }
+        (_, mode) => mode,
+    }
+}
+
+/// The binding the plugin hook captures for in `checkout`, a connected checkout or a linked
+/// worktree of one, routed to `connection`. `None` when the checkout has a binding with hooks of
+/// its own (that hook captures), a disabled one, or one saved for another repository or Hub.
+/// Without a binding, one that follows the Hub is created when `create` (the Hub shares this
+/// repository): the documented one-step defaults with `shared-conversation` as its ceiling and no
+/// hooks of its own.
+pub(crate) fn followed_binding(
+    checkout: &Path,
+    connection: &client_config::Connection,
+    create: bool,
+) -> Result<Option<(CaptureBinding, LocalSpool)>> {
+    let root = client_config::canonical_root(checkout)?;
+    let usable = |binding: &CaptureBinding| {
+        binding.follows_hub
+            && binding.enabled
+            && binding.repository == connection.repo
+            && binding.hub == connection.hub
+    };
+    let find = |bindings: Vec<CaptureBinding>| bindings.into_iter().find(|b| b.root == root);
+    if let Some(binding) = find(load()?) {
+        return usable(&binding)
+            .then(|| ensure_spool_namespace(&binding).map(|spool| (binding, spool)))
+            .transpose();
+    }
+    if !create {
+        return Ok(None);
+    }
+    let _connections = client_config::lock_connections()?;
+    let _lock = acquire_lock()?;
+    let bindings = load()?;
+    if bindings.iter().any(|binding| binding.root == root)
+        || !client_config::is_current_in(connection, &root)
+    {
+        return Ok(None);
+    }
+    let spools = hub_cli::config_dir()?
+        .join("agentscm")
+        .join("capture-spools");
+    let Some(mut spec) = plan_enable(
+        &bindings,
+        connection,
+        &root,
+        CaptureModeV1::SharedConversation,
+        &spools,
+    )?
+    else {
+        return Ok(None);
+    };
+    spec.follows_hub = true;
+    install_binding(&bindings, connection, spec)?;
+    let binding = find(load()?).ok_or_else(|| invalid("capture binding was not saved"))?;
+    let spool = ensure_spool_namespace(&binding)?;
+    Ok(Some((binding, spool)))
+}
+
 pub async fn fetch_change_record(root: &Path, work_id: &str) -> Result<ChangeRecordResponseV1> {
     if !is_identifier(work_id, "wrk_") {
         return Err(invalid("work_id must be a durable work identity"));
@@ -1648,7 +1814,7 @@ fn conversation_request(
 fn conversation_status_error(status: u16) -> Error {
     match status {
         403 => invalid(
-            "only the person who shared it and Hub admins can read or delete this conversation",
+            "only the person who shared it and Hub admins can delete this conversation, or read it while the repository does not share agent conversations",
         ),
         404 => invalid("no such shared conversation body"),
         410 => invalid("this conversation body has expired or been deleted"),
@@ -2120,12 +2286,13 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureBinding, CaptureSetting, ExpectedTarget, ForgetArgs, HOOK_MARKER, UnconfigureArgs,
-        acquire_lock, capture_setting, deliver_pending, disable_binding, enable_capture, forget,
-        install_hooks, is_digest, is_identifier, load, load_recipe_file, load_recipe_from_file,
-        lock_checkout, managed_recipe_invocations, parse_rule, plan_enable, release_excludes,
-        remove_owned_hooks, save, session_start_context, set_capture_mode, setting_in, unconfigure,
-        validate_binding, validate_binding_update,
+        CaptureBinding, CaptureSetting, ExpectedTarget, ForgetArgs, HOOK_MARKER, HubSharing,
+        UnconfigureArgs, acquire_lock, capture_setting, deliver_pending, disable_binding,
+        enable_capture, followed_binding, forget, install_hooks, is_digest, is_identifier, load,
+        load_recipe_file, load_recipe_from_file, lock_checkout, managed_recipe_invocations,
+        mode_under_hub, parse_rule, plan_enable, release_excludes, remove_owned_hooks, save,
+        session_start_context, set_capture_mode, setting_in, unconfigure, validate_binding,
+        validate_binding_update,
     };
     use crate::client_config;
     use crate::client_status::CaptureMismatch;
@@ -2176,6 +2343,7 @@ mod tests {
             }],
             configured_recipes: recipes,
             spool_limits: SpoolLimits::default(),
+            follows_hub: false,
         }
     }
 
@@ -2645,6 +2813,73 @@ mod tests {
             save(&[binding]).unwrap();
             drop(lock);
             assert_eq!(reader.join().unwrap().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn the_hub_answer_only_lowers_the_mode() {
+        let off = Some(HubSharing {
+            sharing: false,
+            notified: false,
+        });
+        let on = Some(HubSharing {
+            sharing: true,
+            notified: true,
+        });
+        let mut binding = recipe_binding(vec![]);
+        binding.capture_mode = CaptureModeV1::SharedConversation;
+        assert_eq!(
+            mode_under_hub(&binding, off),
+            CaptureModeV1::LocalConversation
+        );
+        assert_eq!(
+            mode_under_hub(&binding, on),
+            CaptureModeV1::SharedConversation
+        );
+        assert_eq!(
+            mode_under_hub(&binding, None),
+            CaptureModeV1::SharedConversation
+        );
+        binding.follows_hub = true;
+        assert_eq!(mode_under_hub(&binding, off), CaptureModeV1::MetadataOnly);
+        // `set-mode` lowers a followed binding below what the Hub allows.
+        binding.capture_mode = CaptureModeV1::LocalConversation;
+        assert_eq!(
+            mode_under_hub(&binding, on),
+            CaptureModeV1::LocalConversation
+        );
+    }
+
+    #[test]
+    fn a_followed_binding_is_created_once_with_no_hooks_and_never_replaces_another() {
+        client_config::in_isolated_config_home(|config| {
+            let (root, agentscm) = connected_checkout(config);
+            let connection = widgets_at("http://127.0.0.1:9", &root);
+            assert!(
+                followed_binding(&root, &connection, false)
+                    .unwrap()
+                    .is_none()
+            );
+            let (binding, _) = followed_binding(&root, &connection, true).unwrap().unwrap();
+            assert!(binding.follows_hub && binding.enabled);
+            assert_eq!(binding.capture_mode, CaptureModeV1::SharedConversation);
+            assert!(
+                !root.join(".claude/settings.local.json").exists(),
+                "no hooks"
+            );
+            let saved = std::fs::read_to_string(agentscm.join("change-capture.json")).unwrap();
+            assert!(saved.contains("\"version\":7"), "{saved}");
+            let (again, _) = followed_binding(&root, &connection, true).unwrap().unwrap();
+            assert_eq!(again.worktree_id, binding.worktree_id);
+            // A person's own `unconfigure` is kept: nothing is created again.
+            let mut bindings = load().unwrap();
+            disable_binding(&mut bindings, &root);
+            save(&bindings).unwrap();
+            assert!(
+                followed_binding(&root, &connection, true)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 

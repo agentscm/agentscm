@@ -2989,7 +2989,7 @@ async fn shared_conversation(
     let refusal = |error: super::http::ApiError| {
         refused(match error.code() {
             "forbidden" => {
-                "only the person who shared this conversation and Hub admins can read it"
+                "only the person who shared this conversation and Hub admins can read it while the repository does not share agent conversations"
             }
             "not_found" => "shared conversation not found",
             "gone" => "this conversation body has expired or been deleted",

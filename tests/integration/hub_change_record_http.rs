@@ -1724,6 +1724,10 @@ mod shared_bodies {
             let owner = user(&*store, 10, "owner");
             let member = user(&*store, 11, "member");
             let admin = user(&*store, 900, "hub-admin");
+            // Uploads need the repository to share agent conversations.
+            store
+                .set_setting("conversation_sharing:repo:77", "on", "test")
+                .unwrap();
             let (owner_token, owner_secret) = token(&*store, &owner, "writer", false);
             let (_, sibling_secret) = token(&*store, &owner, "sibling", false);
             let (_, read_only_secret) = token(&*store, &owner, "reader", true);
@@ -1833,6 +1837,17 @@ mod shared_bodies {
                 .change_ingest(&token, &fixture.batch("shared-declare"), unix_now())
                 .unwrap();
             fixture
+        }
+
+        /// The repository's conversation sharing setting.
+        fn share(&self, on: bool) {
+            self.store
+                .set_setting(
+                    "conversation_sharing:repo:77",
+                    if on { "on" } else { "off" },
+                    "test",
+                )
+                .unwrap();
         }
 
         fn url(&self, sha: &str) -> String {
@@ -2284,6 +2299,15 @@ mod shared_bodies {
             f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
             StatusCode::NO_CONTENT
         );
+        // While the repository shares, anyone who can read it reads the body.
+        let (status, page) = f.list(&f.member_secret, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        let response = f.read(&f.member_secret, &f.sha).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), f.body.as_slice());
+        // Once it stops, what was uploaded stays readable only by its author and Hub admins.
+        f.share(false);
         // The author's writer, sibling and read-only tokens and the admin all read.
         for secret in [
             &f.owner_secret,
@@ -2349,6 +2373,75 @@ mod shared_bodies {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_means_off_for_the_repository_and_for_a_person_who_opts_out() {
+        let f = Fixture::start().await;
+        let sharing = |secret: &str| {
+            f.client
+                .get(format!(
+                    "{}/v1/hub/repos/{REPOSITORY_PATH}/conversation-sharing",
+                    f.base
+                ))
+                .bearer_auth(secret.to_owned())
+                .send()
+        };
+        let answer: Value = sharing(&f.read_only_secret)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .parse::<Value>()
+            .unwrap();
+        assert_eq!(answer["sharing"], true);
+        assert_eq!(answer["source"], "repository");
+        f.share(false);
+        // Nothing is missing, so a client sends nothing, and a direct upload is refused.
+        let (status, answer) = f
+            .missing(Some(&f.owner_secret), json!({"digests": [f.sha]}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["missing"], json!([]));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        f.share(true);
+        // Opting out is per person and stops that person's uploads on every token.
+        let opt_out = f
+            .client
+            .put(format!(
+                "{}/v1/hub/repos/{REPOSITORY_PATH}/conversation-sharing/me",
+                f.base
+            ))
+            .bearer_auth(&f.sibling_secret)
+            .header("content-type", "application/json")
+            .body(json!({"opted_out": true}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opt_out.status(), StatusCode::OK);
+        let mine: Value = serde_json::from_str(&opt_out.text().await.unwrap()).unwrap();
+        assert_eq!(
+            (mine["enabled"].clone(), mine["sharing"].clone()),
+            (json!(true), json!(false))
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        let other: Value = sharing(&f.member_secret)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .parse::<Value>()
+            .unwrap();
+        assert_eq!(other["sharing"], true, "another person still shares");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2470,6 +2563,8 @@ mod shared_bodies {
             f.read(&f.owner_secret, &f.sha).await.status(),
             StatusCode::OK
         );
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // A caller without access is refused before the backend is consulted.
         assert_eq!(
             f.read(&f.member_secret, &f.sha).await.status(),
@@ -2534,6 +2629,8 @@ mod shared_bodies {
         }
         let (status, _) = f.list(&f.owner_secret, "?other=1").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // A valid cursor gives another member nothing to see.
         let (status, page) = f.list(&f.member_secret, &format!("?cursor={cursor}")).await;
         assert_eq!(status, StatusCode::OK);
@@ -2589,6 +2686,8 @@ mod shared_bodies {
         assert!(text.contains("not truncated"), "{text}");
         assert!(!text.contains("xxxx"));
 
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // Another member lists nothing and is refused the body.
         let none = f.mcp(&f.member_secret, json!({"work_id": f.work_id})).await;
         assert_eq!(none["isError"], false);
@@ -2604,6 +2703,7 @@ mod shared_bodies {
         assert!(text.contains("only the person who shared"), "{text}");
         assert!(!text.contains("synthetic"));
         // The Work owner who is not the author is refused the same way.
+        f.share(true);
         let helper_sha = f.declare_as(
             &f.token_of(&f.helper_secret),
             HELPER_SESSION,
@@ -2620,6 +2720,7 @@ mod shared_bodies {
             .await,
             StatusCode::NO_CONTENT
         );
+        f.share(false);
         let refused = f
             .mcp(
                 &f.owner_secret,
@@ -2737,6 +2838,8 @@ mod shared_bodies {
             f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
             StatusCode::NO_CONTENT
         );
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // The Work owner uploads nothing for the helper's declaration.
         assert_eq!(
             f.put(&f.owner_secret, &sha, body.clone()).await,
@@ -2826,6 +2929,7 @@ mod shared_bodies {
             f.row_of(&f.helper_secret, &f.sha).state,
             SharedBodyState::Available
         );
+        f.share(false);
         for secret in [&f.owner_secret, &f.helper_secret] {
             let (_, page) = f.list(secret, "").await;
             assert_eq!(digests_of(&page), vec![f.sha.clone()]);
