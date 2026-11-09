@@ -182,6 +182,10 @@ pause is the checkpoint a lead would write: the reservation keeps its basis, so 
 stays `retained`. If the pause fails, nothing is written: the intent stays held and the end can be
 repeated. Blocked Work stays blocked, and paused, handed-over and finished Work are not found, so a
 repeat of an end that committed changes nothing. A session with no Work still releases its intent.
+`agentscm_done` with `outcome: complete` first applies the `complete` transition to the unfinished
+Work the session leads (active, blocked or paused), fenced by the generation and sequence the Hub
+reads just before, with operation id `mcp-done-complete-<work>-<generation>` so a retry replays.
+The release then finds no Work to pause.
 
 ## 6. The WorkOperationalV1 projection
 
