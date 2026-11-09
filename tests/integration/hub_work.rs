@@ -20,7 +20,7 @@ use agentscm::hub::store::{
 use agentscm::hub::work::{
     BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, CheckpointKind, ClaimStatus, ForgeWorkRef,
     SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint,
-    WorkConflictKind, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
+    WorkConflictKind, WorkOverviewQuery, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
 use agentscm::hub::work_lifecycle::LEASE_SECONDS as LEASE;
 use agentscm::hub::work_links::{
@@ -496,6 +496,7 @@ fn start_with(
         source: None,
         request_key: request_key.map(str::to_owned),
         title: title.into(),
+        description: None,
         session: session.into(),
         role,
         scope: vec!["src/**".into()],
@@ -700,6 +701,86 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
         .unwrap();
     assert!(other_session.created);
     assert_ne!(other_session.item.id, auto_first.item.id);
+    assert_eq!(work_event_count(&*store, "work_started"), 3);
+}
+
+fn a_description_is_kept_from_creation_and_read_back(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let text = "Adds a plain description to Work so a teammate can tell what it changes and why.";
+    let mut described = native_start("described", "Describe Work", "described-session");
+    described.description = Some(text.into());
+    let created = store.work_start(&alice.token, &described, now).unwrap();
+    assert!(created.created);
+    assert_eq!(created.item.description.as_deref(), Some(text));
+    let id = created.item.id.clone();
+
+    let read = store.work_get(&alice.token, &id, now + 1).unwrap().unwrap();
+    assert_eq!(read.description.as_deref(), Some(text));
+    let overview = store
+        .work_overview(&alice.token, &WorkOverviewQuery::default(), now + 1)
+        .unwrap();
+    let listed = overview.current.iter().find(|item| item.id == id).unwrap();
+    assert_eq!(listed.description.as_deref(), Some(text));
+    let briefing = store
+        .work_briefing(&alice.token, &BriefingQuery::default(), now + 1)
+        .unwrap();
+    assert!(
+        briefing
+            .events
+            .iter()
+            .any(|event| event.work_id == id && event.item.description.as_deref() == Some(text))
+    );
+
+    // A later start by the lead is not refused for a changed or missing description, and the one
+    // from creation stays, so Work made before descriptions existed can still be resumed.
+    let retry = store.work_start(&alice.token, &described, now + 2).unwrap();
+    assert!(!retry.created && retry.conflict.is_none());
+    for changed in [None, Some("Something else.".to_owned())] {
+        let mut start = described.clone();
+        start.description = changed;
+        let result = store.work_start(&alice.token, &start, now + 3).unwrap();
+        assert!(result.conflict.is_none());
+        assert_eq!(result.item.description.as_deref(), Some(text));
+    }
+
+    // A task-only start keeps it the same way.
+    let mut automatic = automatic_start("Describe automatic Work", "auto-session");
+    automatic.scope = vec!["automatic/**".into()];
+    automatic.description = Some(text.into());
+    let auto_first = store
+        .work_start_auto(&alice.token, &automatic, now + 4)
+        .unwrap();
+    assert_eq!(auto_first.item.description.as_deref(), Some(text));
+    automatic.description = Some("Something else.".into());
+    let auto_changed = store
+        .work_start_auto(&alice.token, &automatic, now + 5)
+        .unwrap();
+    assert!(auto_changed.conflict.is_none());
+    assert_eq!(auto_changed.item.description.as_deref(), Some(text));
+
+    // Without one, the Work has none and its JSON has no key.
+    let mut plain = native_start("plain", "Plain Work", "plain-session");
+    plain.scope = vec!["plain/**".into()];
+    let plain = store.work_start(&alice.token, &plain, now + 6).unwrap();
+    assert!(plain.created && plain.item.description.is_none());
+    assert!(
+        serde_json::to_value(&plain.item)
+            .unwrap()
+            .get("description")
+            .is_none()
+    );
+
+    for refused in ["x".repeat(501), "line\nbreak".into(), String::new()] {
+        let mut start = native_start("refused", "Refused Work", "refused-session");
+        start.scope = vec!["refused/**".into()];
+        start.description = Some(refused);
+        assert_invalid(
+            store.work_start(&alice.token, &start, now + 7),
+            "description must be 1-500 bytes without control characters",
+        );
+    }
     assert_eq!(work_event_count(&*store, "work_started"), 3);
 }
 
@@ -2386,6 +2467,7 @@ conformance!(
     concurrent_pr_link_updates_fence_and_replay,
     concurrent_forge_start_has_one_work_and_one_lead,
     native_and_automatic_starts_have_explicit_retry_rules,
+    a_description_is_kept_from_creation_and_read_back,
     authorization_and_claim_projection_keep_old_claims_visible,
     repository_namespaces_fence_work_and_relations,
     intent_provenance_refs_require_exact_same_work_versions_and_replay,

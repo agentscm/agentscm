@@ -1131,6 +1131,7 @@ async fn a_refused_announce_names_directory_paths_in_the_form_they_were_sent() {
                 source: None,
                 request_key: Some("w".into()),
                 title: "Synthetic work".into(),
+                description: None,
                 session: "w".into(),
                 role: WorkRole::Lead,
                 scope: vec!["src/**".into()],

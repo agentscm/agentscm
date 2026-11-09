@@ -126,6 +126,7 @@ fn direct_start(
         source: None,
         request_key: Some(request_key.into()),
         title: title.into(),
+        description: None,
         session: session.into(),
         role: WorkRole::Lead,
         scope: scope.iter().map(|path| (*path).into()).collect(),

@@ -1058,6 +1058,7 @@ mod tests {
                 request_key: "key".to_owned(),
             },
             title: "Synthetic".to_owned(),
+            description: None,
             state,
             claim_status: ClaimStatus::Active,
             last_checkin_at: 10,

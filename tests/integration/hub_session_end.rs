@@ -174,6 +174,7 @@ fn start(key: &str, session: &str, scope: &str) -> WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: key.into(),
+        description: None,
         session: session.into(),
         role: WorkRole::Lead,
         scope: vec![scope.into()],
