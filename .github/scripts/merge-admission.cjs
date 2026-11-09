@@ -56,11 +56,14 @@ async function admit({github, context, validateTitle}) {
     const trustedLocal = local?.creator?.id === ACTIONS_BOT;
     const trustedTitle = title?.app?.id === ACTIONS_APP;
     const currentTitleValid = validateTitle(pull.title);
+    // Interim: the signed local check is optional evidence while every batch runs fmt, Clippy
+    // and the full suite. Only a signed failure refuses; missing, pending or error does not.
+    const localState = trustedLocal ? local.state : 'none';
     let conclusion;
-    if (!currentTitleValid || (trustedLocal && ['failure', 'error'].includes(local.state)) ||
+    if (!currentTitleValid || localState === 'failure' ||
         (trustedTitle && title.status === 'completed' && title.conclusion !== 'success')) {
       conclusion = 'failure';
-    } else if (trustedLocal && local.state === 'success' && trustedTitle && title.status === 'completed' && title.conclusion === 'success') {
+    } else if (trustedTitle && title.status === 'completed' && title.conclusion === 'success') {
       conclusion = 'success';
     }
     // Re-read after the API sweep. Never certify an obsolete head/base/title snapshot.
@@ -72,7 +75,7 @@ async function admit({github, context, validateTitle}) {
       ...(conclusion ? {conclusion} : {}),
       output: {
         title: conclusion === 'success' ? 'PR admitted; batch tests still required' : 'PR admission blocked',
-        summary: `Exact head ${head}. Local validation and current Conventional PR title must pass from GitHub Actions. Missing, untrusted or pending results remain pending. Batch qualification is a separate merge-group run.`,
+        summary: `Exact head ${head}. The current Conventional PR title must pass from GitHub Actions; a missing, untrusted or pending title check remains pending. Signed local validation: ${localState} (optional for now; only a signed failure refuses). Batch qualification is a separate merge-group run with fmt, Clippy and the full test suite.`,
       },
     });
     } catch (error) { errors.push(error); }

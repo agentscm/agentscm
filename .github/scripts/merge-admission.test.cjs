@@ -39,18 +39,24 @@ test('exact trusted success admits only the PR head', async () => {
   assert.match(f.writes[1].output.title, /batch tests still required/);
 });
 
-test('latest failed or pending status defeats earlier success', async () => {
+test('only a latest signed failure refuses; pending, error or no local validation admits', async () => {
   for (const state of ['pending', 'failure', 'error']) {
     const f = fixture();
     f.statuses.unshift({...f.statuses[0], state});
     await admit(f.args);
-    assert.equal(f.writes[1].conclusion, state === 'pending' ? undefined : 'failure');
+    assert.equal(f.writes[1].conclusion, state === 'failure' ? 'failure' : 'success');
+    assert.match(f.writes[1].output.summary, new RegExp(`Signed local validation: ${state}`));
+  }
+  for (const alter of [f => f.statuses.splice(0), f => f.statuses[0].creator.id = 1]) {
+    const f = fixture(); alter(f); f.statuses[0] && (f.statuses[0].state = 'failure');
+    await admit(f.args);
+    assert.equal(f.writes[1].conclusion, 'success');
+    assert.match(f.writes[1].output.summary, /Signed local validation: none/);
   }
 });
 
-test('missing and wrong identity never admit', async () => {
-  for (const alter of [f => f.statuses.splice(0), f => f.statuses[0].creator.id = 1,
-      f => f.checks[0].app.id = 1, f => f.checks.splice(0)]) {
+test('missing or wrong-identity title check never admits', async () => {
+  for (const alter of [f => f.checks[0].app.id = 1, f => f.checks.splice(0)]) {
     const f = fixture(); alter(f);
     await admit(f.args);
     assert.equal(f.writes[1].status, 'in_progress');
