@@ -1182,7 +1182,9 @@ observation is not an event.
 
 What is read. Per connected repository, on every poll and on webhooks:
 open pull requests (at most 300, three pages; more is reported, never silent),
-their changed files (at most 300 files, then `files_truncated`), branches whose
+their changed files (at most 300 files, then `files_truncated`; a file list whose reply
+passes the 1 MiB cap, because it carries every diff, is `files_truncated` with no paths),
+branches whose
 tip commit is within `--activity-days` (GraphQL; at most 200), and the branches
 live intents name (at most 50 looked up per poll; one that is gone is
 `branch_deleted`). A tracked branch that is neither recent nor named any more is
