@@ -104,7 +104,7 @@ use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
+    WorkConflictKind, WorkEnded, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
@@ -136,6 +136,7 @@ use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
 mod repository_rename;
+mod validation_evidence;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -7011,13 +7012,20 @@ impl SqliteStore {
 
         let recent_rows = {
             let mut statement = tx.prepare(
-                "SELECT v.event_seq, e.at, v.snapshot FROM hub_work_versions v
+                "SELECT v.event_seq, e.at, v.snapshot, e.kind, e.data FROM hub_work_versions v
                  JOIN hub_work_items w ON w.id = v.work
                  JOIN hub_events e ON e.seq = v.event_seq
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                    AND w.repository_id IS ?4 AND e.at >= ?5 AND e.at <= ?6
-                   AND e.kind = 'work_checkpoint'
-                   AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish')
+                   AND ((e.kind = 'work_checkpoint'
+                         AND json_extract(v.snapshot, '$.current.kind') IN ('decision', 'finish'))
+                        OR (e.kind = 'work_transition' AND v.state = 'finished'))
+                   AND NOT (EXISTS (
+                       SELECT 1 FROM hub_work_versions v2 JOIN hub_events e2 ON e2.seq = v2.event_seq
+                       WHERE v2.work = v.work AND v2.event_seq > v.event_seq AND v2.state = 'finished'
+                         AND e2.at <= ?6
+                         AND (e2.kind = 'work_transition'
+                              OR json_extract(v2.snapshot, '$.current.kind') = 'finish')))
                  ORDER BY v.event_seq DESC LIMIT ?7",
             )?;
             statement
@@ -7036,6 +7044,8 @@ impl SqliteStore {
                             row.get::<_, i64>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     },
                 )?
@@ -7043,7 +7053,7 @@ impl SqliteStore {
         };
         let mut recent = recent_rows
             .into_iter()
-            .map(|(seq, at, snapshot)| {
+            .map(|(seq, at, snapshot, event_kind, data)| {
                 let item: WorkItem = json_value(&snapshot)?;
                 let kind = if item.state == WorkState::Finished {
                     WorkOutcomeKind::Completion
@@ -7055,6 +7065,7 @@ impl SqliteStore {
                     at,
                     kind,
                     item,
+                    ended: WorkEnded::from_event(&event_kind, &data, at),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -7388,6 +7399,85 @@ fn work_checkpoint_in(
 }
 
 impl Store for SqliteStore {
+    fn configure_validation_summary(
+        &self,
+        config: &super::validation_evidence::ValidationSummaryConfig,
+    ) -> Result<()> {
+        validation_evidence::configure(self, config)
+    }
+    fn validation_summary_config(
+        &self,
+        repository: &str,
+    ) -> Result<Option<super::validation_evidence::ValidationSummaryConfig>> {
+        validation_evidence::config(self, repository)
+    }
+    fn receive_validation_evidence(
+        &self,
+        token: &str,
+        proposal: i64,
+        bundle: &super::validation_evidence::DurableValidationBundle,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidenceReceipt> {
+        validation_evidence::receive(self, token, proposal, bundle, now)
+    }
+    fn validation_evidence_history(
+        &self,
+        token: &str,
+        repository: &str,
+        proposal: i64,
+        after: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidencePage> {
+        validation_evidence::history(self, token, repository, proposal, after, limit, now)
+    }
+    fn validation_snapshot(
+        &self,
+        repository: &str,
+        proposal: i64,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationSnapshot> {
+        validation_evidence::snapshot(self, repository, proposal, limit)
+    }
+    fn validation_fence(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<super::validation_evidence::ValidationFence> {
+        validation_evidence::fence(self, repository, proposal)
+    }
+    fn validation_publication_proposals(
+        &self,
+        repository: &str,
+        after: i64,
+        through: Option<i64>,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationProposalPage> {
+        validation_evidence::publication_proposals(self, repository, after, through, limit)
+    }
+    fn validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<Option<super::validation_evidence::ValidationPublication>> {
+        validation_evidence::publication(self, repository, proposal)
+    }
+    fn compare_validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+        expected_revision: i64,
+        next: &super::validation_evidence::ValidationPublication,
+    ) -> Result<bool> {
+        validation_evidence::compare_publication(
+            self,
+            repository,
+            proposal,
+            expected_revision,
+            next,
+        )
+    }
+
     fn backend(&self) -> &'static str {
         "sqlite"
     }
@@ -11320,6 +11410,46 @@ impl Store for SqliteStore {
         let view = work_links::view(&item, repository_id, link, query);
         tx.commit()?;
         Ok(Some(view))
+    }
+
+    fn work_pr_target_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<work_links::WorkPrLinkTarget>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = match reader {
+            WorkLifecycleReader::Token(token) => work_who(&tx, token, now)?,
+            WorkLifecycleReader::Person {
+                owner,
+                repository,
+                repository_id,
+            } => {
+                if owner.disabled {
+                    return Err(HubError::Unauthorized);
+                }
+                work_transition::person_who(owner, repository, *repository_id)
+            }
+        };
+        if scoped_work(&tx, &who, id, now)?.is_none() {
+            return Ok(None);
+        }
+        let snapshot: Option<String> = tx
+            .query_row(
+                "SELECT snapshot FROM hub_work_pr_links WHERE work=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let target = snapshot
+            .as_deref()
+            .map(json_value::<WorkPrLink>)
+            .transpose()?
+            .map(|link| link.target);
+        tx.commit()?;
+        Ok(target)
     }
 
     fn work_pr_link_set(

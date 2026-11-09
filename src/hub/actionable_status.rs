@@ -577,7 +577,7 @@ fn read_scoped(
         actions.retain(|a| a.kind != "directed_request");
     }
     let (conflicts, conflict_limits, conflict_evidence_digest) =
-        conflicts::read(store, principal, now)?;
+        conflicts::read(store, principal, reader, &items, now)?;
     actions.extend(conflicts);
     limits.extend(conflict_limits);
     let (checks, check_limits, check_evidence_digest) =

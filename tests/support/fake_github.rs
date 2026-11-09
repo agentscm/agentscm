@@ -351,6 +351,7 @@ pub struct FakeState {
     pub arrayless_external_lists: bool,
     /// Answer every GET whose path contains this with 200 and an empty object, no array.
     pub arrayless_path: Option<String>,
+    pub arrayless_query: Option<String>,
     /// Store the next created comment, then answer 502 with no body.
     pub lose_next_comment_reply: bool,
     pub requests: Vec<Request>,
@@ -372,6 +373,8 @@ pub struct FakeState {
     pub reject_status_contexts: HashMap<String, u16>,
     /// After recording the next commit status, move the first branch's tip to this sha.
     pub advance_base_after_status: Option<String>,
+    /// Move the base after the repository has recorded this many statuses.
+    pub advance_base_after_status_count: Option<(usize, String)>,
     /// Leave `head.repo` and `base.repo` out of pull request JSON.
     pub omit_pull_repos: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
@@ -1018,6 +1021,15 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
         return json_reply(200, json!({}));
     }
 
+    if method == Method::GET
+        && state
+            .arrayless_query
+            .as_ref()
+            .is_some_and(|path| path_and_query.contains(path))
+    {
+        return json_reply(200, json!({}));
+    }
+
     let segments: Vec<String> = uri
         .path()
         .split('/')
@@ -1502,6 +1514,28 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .record_status(sha, status.clone(), &creator);
                     if let Some(tip) = state.advance_base_after_status.take() {
                         state.repos.get_mut(&id).unwrap().branches[0].sha = tip;
+                    }
+                    if state
+                        .advance_base_after_status_count
+                        .as_ref()
+                        .is_some_and(|(count, _)| state.repos[&id].statuses.len() == *count)
+                    {
+                        let (_, tip) = state.advance_base_after_status_count.take().unwrap();
+                        let repo = state.repos.get_mut(&id).unwrap();
+                        repo.branches[0].sha = tip.clone();
+                        if let Some(dir) = &repo.git {
+                            git(
+                                dir,
+                                &[
+                                    "update-ref",
+                                    &format!("refs/heads/{}", repo.branches[0].name),
+                                    &tip,
+                                ],
+                                &[],
+                                None,
+                            )
+                            .unwrap();
+                        }
                     }
                     if std::mem::take(&mut state.lose_next_status_reply) {
                         return reply(502, &[], None);
