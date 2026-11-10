@@ -1403,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn pr_attention_revision_tracks_semantics_across_real_store_polls() {
+    fn pr_overlap_version_tracks_semantics_across_real_store_polls() {
         use crate::hub::{
             connection::NewConnection,
             intent::NewIntent,
@@ -1480,9 +1480,16 @@ mod tests {
             .observe(&repo.id, "pull_request", "1", &pull.to_string(), 1000)
             .unwrap();
         let first = read();
-        let revision = attention_revision(&first, "synthetic-key");
-        // How long ago the holder was last active is in the row's text, never in the revision:
-        // a clock that moved is no new attention.
+        // An overlap is for the holding agents and asks no person, so the attention revision never
+        // moves for it. Its own semantic version is what follows the pull request.
+        let attention = attention_revision(&first, "synthetic-key");
+        let version = |status: &actionable_status::ActionableStatus| {
+            let row = status.actions.iter().find(|a| a.kind == "pr_overlap");
+            row.unwrap().semantic_version.clone()
+        };
+        let revision = version(&first);
+        // How long ago the holder was last active is in the row's text, never in the version:
+        // a clock that moved is no new fact.
         let later = actionable_status::read(&*store, &setup, &who, now + 300).unwrap();
         let text = |status: &actionable_status::ActionableStatus| {
             let row = status.actions.iter().find(|a| a.kind == "pr_overlap");
@@ -1498,7 +1505,7 @@ mod tests {
             "{}",
             text(&later)
         );
-        assert_eq!(revision, attention_revision(&later, "synthetic-key"));
+        assert_eq!(revision, version(&later));
         store
             .observe(&repo.id, "pull_request", "1", &pull.to_string(), 2000)
             .unwrap();
@@ -1507,18 +1514,18 @@ mod tests {
             first.digest, second.digest,
             "full source version retains provider read time"
         );
-        assert_eq!(revision, attention_revision(&second, "synthetic-key"));
+        assert_eq!(revision, version(&second));
         pull["files"] = json!(["src/b.rs", "src/a.rs"]);
         store
             .observe(&repo.id, "pull_request", "1", &pull.to_string(), 3000)
             .unwrap();
-        assert_eq!(revision, attention_revision(&read(), "synthetic-key"));
+        assert_eq!(revision, version(&read()));
         for (field, value) in [
             ("head_sha", json!("second-head")),
             ("files", json!(["src/a.rs", "src/c.rs"])),
             ("files_truncated", json!(true)),
         ] {
-            let before = attention_revision(&read(), "synthetic-key");
+            let before = version(&read());
             pull[field] = value;
             store
                 .observe(
@@ -1529,9 +1536,9 @@ mod tests {
                     store.observation_floor(&repo.id).unwrap() + 1000,
                 )
                 .unwrap();
-            assert_ne!(before, attention_revision(&read(), "synthetic-key"));
+            assert_ne!(before, version(&read()));
         }
-        let before = attention_revision(&read(), "synthetic-key");
+        let before = version(&read());
         let other = store
             .upsert_user(
                 &ForgeIdentity {
@@ -1568,7 +1575,9 @@ mod tests {
             )
             .unwrap();
         let after = read();
-        assert_ne!(before, attention_revision(&after, "synthetic-key"));
+        assert_ne!(before, version(&after));
+        assert_eq!(attention, attention_revision(&after, "synthetic-key"));
+        assert_eq!(after.counts.needs_you, 0);
         assert_ne!(
             first
                 .actions

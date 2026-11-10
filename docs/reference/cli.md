@@ -398,12 +398,12 @@ process from recent hook/MCP sightings, whose live task state is unknown. Existi
 attention appears with an action to use its tray menu. When a saved Hub sign-in permits it, the
 tray checks connected checkouts about once a minute with short-lived read-only tokens and
 counts what needs you from the same shared status projection as the Hub's **Needs you** badge:
-blockers and reassessments on Work your agent leads; handovers and still-held reservations on
-paused, quiet or merged Work you own; requests to your idle Work; live tasks whose declared
-scopes overlap yours; files you and another agent hold; open pull requests touching files you
-hold; required checks failing on your open pull requests; and `pr-gate` runs blocked at a gate
-after their agent stopped. Another person's
-blocker or request is listed but not counted. The Hub badge also leaves out needs hidden in that
+your own agents waiting for you; blockers and reassessments on Work your agent leads; handovers
+of Work you own; required checks failing on your open pull requests; `pr-gate` runs blocked at a
+gate after their agent stopped; and agent setup problems. What agents settle between themselves
+is listed but not counted: paused, quiet or merged Work, live tasks whose declared scopes
+overlap, files two agents hold, open pull requests touching held files and requests from one
+agent to another. Another person's blocker is listed but not counted. The Hub badge also leaves out needs hidden in that
 browser, which the tray cannot see. It refreshes the cross-repository list about every two
 minutes. A newly observed need opens a small attention notice, or marks **New attention** when
 the Now card is fully visible; a partial read may reveal an older one later. The summary marks

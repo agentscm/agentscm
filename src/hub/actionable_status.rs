@@ -2848,7 +2848,7 @@ mod tests {
             )
             .collect::<Vec<_>>();
         personal.sort();
-        assert_eq!(personal, [blocked.id.clone()]);
+        assert_eq!(personal, std::slice::from_ref(&blocked.id));
         // The request to the viewer's paused Work is still listed, for its lead agent.
         let request = format!(
             "request:{}:{}",
