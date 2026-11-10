@@ -230,7 +230,6 @@ pub fn project_work(
     viewer: &str,
 ) -> StatusWork {
     let mut limits = BTreeSet::new();
-    let held = operational.reservation.status == ReservationStatus::Held;
     // A session that reported a wait is there, however long ago its Work checked in. One whose
     // wait this Hub may have lost is not known to be quiet.
     let freshness = match (wait, item.claim_status) {
@@ -243,8 +242,9 @@ pub fn project_work(
     if quiet && wait == LeadWait::Unknown {
         limits.insert("lead_wait_unknown".to_owned());
     }
-    // Set where the row does not ask the person named by its recipient: their own action asks
-    // them already, or their agent settles it.
+    // A row asks a person only for what no agent settles: a handover, a reported blocker or its
+    // reassessment. Set where it does not ask the person its recipient names: their own action
+    // asks them already, or their agent settles it.
     let mut not_the_persons = false;
     let consistent = item.generation == operational.generation
         && item.updated_seq == operational.updated_seq
@@ -325,20 +325,15 @@ pub fn project_work(
             lead(item),
             "Reassess the reported blocker against current prerequisite evidence.",
         )
-    } else if operational.merge.hidden_by_merged_pr && held {
-        (
-            StatusState::ReassessmentNeeded,
-            owner(item),
-            "Decide whether to retain, release or finish the held reservation; merge alone does not complete Work.",
-        )
     } else if operational.merge.hidden_by_merged_pr {
-        // With nothing held only the close is left, and it is the lead's. The Hub does not
-        // complete it: Work may span several pull requests, and an outcome records who stated it.
+        // Only the close is left, and it is the lead's: a hold still held lapses by itself. The
+        // Hub does not complete it: Work may span several pull requests, and an outcome records
+        // who stated it.
         not_the_persons = true;
         (
             StatusState::ReassessmentNeeded,
             lead(item),
-            "Its pull request merged and it holds no files: its lead completes it, or resumes it if work remains. A merge alone does not complete Work.",
+            "Its pull request merged: its lead completes it, or resumes it if work remains. A merge alone does not complete Work.",
         )
     } else if item.state == WorkState::Blocked {
         (
@@ -366,13 +361,10 @@ pub fn project_work(
                 "Whether its lead session waits is not known: the Hub restarted or dropped waits after that session's last call. A quiet claim proves nothing.",
             )
         } else {
+            // Nobody is asked, held or not: a hold its lead no longer renews lapses by itself.
             (
                 StatusState::ReassessmentNeeded,
-                if held {
-                    owner(item)
-                } else {
-                    StatusRecipient::none()
-                },
+                StatusRecipient::none(),
                 "Review the unfinished Work; a quiet claim does not prove failure or completion.",
             )
         }
@@ -637,7 +629,12 @@ fn read_scoped(
             limits.insert("request_target_work_not_read".into());
         }
     }
-    let mut actions = request_actions(&requests, &items, &principal.owner.id);
+    let holding = work
+        .iter()
+        .filter(|w| w.operational.reservation.status == ReservationStatus::Held)
+        .map(|w| w.work_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut actions = request_actions(&requests, &items, &holding);
     for overlap in &overview.overlaps {
         let ids = [&overlap.left.id, &overlap.right.id];
         let pair = ids
@@ -652,18 +649,17 @@ fn read_scoped(
         {
             continue;
         }
-        let recipients = pair.iter().map(|i| owner(i)).collect::<Vec<_>>();
+        // Two live leads settle an overlap between themselves; it asks no person.
+        let recipients = pair.iter().map(|i| lead(i)).collect::<Vec<_>>();
         let mut work_ids = ids.iter().map(|id| (*id).clone()).collect::<Vec<_>>();
         work_ids.sort();
         actions.push(StatusAction {
             id: format!("overlap:{}:{}", work_ids[0], work_ids[1]),
             kind: "scope_overlap".into(),
             work_ids,
-            needs_you: recipients
-                .iter()
-                .any(|r| r.owner.as_deref() == Some(&principal.owner.id)),
+            needs_you: false,
             recipients,
-            action: "Resolve the overlapping declared scopes with the named owners.".into(),
+            action: "Resolve the overlapping declared scopes between the named leads.".into(),
             semantic_version: None,
             updated_seq: pair.iter().map(|i| i.updated_seq).max().unwrap_or(0),
             limits: vec![],
@@ -1025,10 +1021,13 @@ pub fn render_text(status: &ActionableStatus) -> String {
     lines.join("\n")
 }
 
+/// Requests still waiting for an answer from the lead agent they were sent to. An answer is
+/// that agent's to give, never its person's, and `holding` is the Work that still holds its
+/// scope: once the target holds nothing the asker's next start takes the scope, so nothing waits.
 fn request_actions(
     inbox: &CoordinationInbox,
     items: &BTreeMap<String, WorkItem>,
-    viewer: &str,
+    holding: &BTreeSet<&str>,
 ) -> Vec<StatusAction> {
     let mut actions = Vec::new();
     for request in &inbox.requests {
@@ -1045,6 +1044,7 @@ fn request_actions(
             // A request against an old lead/generation is not a current obligation. Never use a
             // stale response or incomplete response page as proof an answer is still missing.
             if !request.responses_complete
+                || !holding.contains(target.work_id.as_str())
                 || target.generation != item.generation
                 || target.lead.token != item.lead_token
                 || target.lead.session != item.lead_session
@@ -1059,14 +1059,12 @@ fn request_actions(
             }) {
                 continue;
             }
-            let idle = item.state == WorkState::Paused || item.claim_status != ClaimStatus::Active;
-            let recipient = if idle { lead_person(item) } else { lead(item) };
             actions.push(StatusAction {
                 id: format!("request:{}:{}", request.id, target.work_id),
                 kind: "directed_request".into(),
                 work_ids: vec![target.work_id.clone()],
-                needs_you: idle && recipient.owner.as_deref() == Some(viewer),
-                recipients: vec![recipient],
+                needs_you: false,
+                recipients: vec![lead(item)],
                 action: "Answer the outstanding directed coordination request.".into(),
                 updated_seq: request.updated_seq,
                 semantic_version: None,
@@ -1202,9 +1200,13 @@ mod tests {
     #[test]
     fn merge_does_not_retire_a_held_reservation_and_finished_does() {
         let item = item(WorkState::Active);
-        let row = project_work(&item, op(&item, true, true), None, NotWaiting, "usr_owner");
-        assert_eq!(row.state, StatusState::ReassessmentNeeded);
-        assert!(row.needs_you);
+        // Unfinished, and its lead agent's to close: no person is asked while a hold lapses.
+        for viewer in ["usr_owner", "usr_lead"] {
+            let row = project_work(&item, op(&item, true, true), None, NotWaiting, viewer);
+            assert_eq!(row.state, StatusState::ReassessmentNeeded);
+            assert_eq!(row.recipient.kind, RecipientKind::LeadAgent);
+            assert!(!row.needs_you);
+        }
         let mut finished = item;
         finished.state = WorkState::Finished;
         let row = project_work(
@@ -1410,10 +1412,16 @@ mod tests {
         let row = |item: &WorkItem, held, wait, viewer| {
             project_work(item, op(item, held, false), None, wait, viewer)
         };
-        // Held and quiet with no wait on record: its owner is told to review it.
-        let quiet = row(&item, true, NotWaiting, "usr_owner");
-        assert_eq!(quiet.state, StatusState::ReassessmentNeeded);
-        assert!(quiet.needs_you);
+        // Held and quiet with no wait on record: nobody is asked, because the hold lapses by
+        // itself. Paused Work whose session just ended its turn reads the same way.
+        for state in [WorkState::Active, WorkState::Paused] {
+            item.state = state;
+            let quiet = row(&item, true, NotWaiting, "usr_owner");
+            assert_eq!(quiet.state, StatusState::ReassessmentNeeded);
+            assert_eq!(quiet.recipient.kind, RecipientKind::None);
+            assert!(!quiet.needs_you);
+        }
+        item.state = WorkState::Active;
         // Waiting for its person: every reader sees who it waits on, and that person's own
         // `session_waiting` action asks them, so the row does not count for them again.
         for viewer in ["usr_lead", "usr_viewer"] {
@@ -1506,7 +1514,7 @@ mod tests {
             now: 100 + LEASE_SECONDS,
         });
         assert_eq!(lapsed.reservation.status, ReservationStatus::Lapsed);
-        for operational in [lapsed, op(&item, false, true)] {
+        for operational in [lapsed, op(&item, false, true), op(&item, true, true)] {
             // Its lead agent is named to close it; no person is asked for what an agent settles.
             for viewer in ["usr_owner", "usr_lead"] {
                 let row = project_work(&item, operational.clone(), None, NotWaiting, viewer);
@@ -2517,7 +2525,8 @@ mod tests {
         let (quiet, asked) = read(&observations);
         assert_eq!(quiet.state, StatusState::ReassessmentNeeded);
         assert_eq!(quiet.freshness, ClaimStatus::Stale);
-        assert!(quiet.needs_you);
+        // Quiet with a live hold asks nobody: the hold lapses by itself.
+        assert!(!quiet.needs_you);
         observations
             .waiting()
             .record(
@@ -2537,7 +2546,7 @@ mod tests {
         assert_eq!(waiting.recipient.login.as_deref(), Some("waiter"));
         // One wait is one thing to do: its action asks the person, the row does not ask again.
         assert!(!waiting.needs_you);
-        assert_eq!(asked_waiting, asked);
+        assert_eq!(asked_waiting, asked + 1);
         // A Hub that restarted after the session's last call holds no wait for it.
         let restarted = Observations::default();
         restarted.waiting().lost_before(later);
@@ -2546,7 +2555,7 @@ mod tests {
         assert_eq!(unknown.freshness, ClaimStatus::Unknown);
         assert_eq!(unknown.recipient.kind, RecipientKind::None);
         assert!(unknown.limits.contains(&"lead_wait_unknown".into()));
-        assert_eq!(asked_unknown, asked - 1);
+        assert_eq!(asked_unknown, asked);
         // A claim follows reports only. A session that works on without reporting still calls,
         // and its calls say it is there: neither quiet nor unknown, whatever the Hub lost.
         store
@@ -2568,7 +2577,7 @@ mod tests {
             assert_eq!(working.state, StatusState::Active);
             assert_eq!(working.freshness, ClaimStatus::Active);
             assert!(!working.needs_you);
-            assert_eq!(asked_working, asked - 1);
+            assert_eq!(asked_working, asked);
         }
     }
 
@@ -2662,30 +2671,44 @@ mod tests {
             .unwrap();
             store.work_start(&who.token_id, &request, now).unwrap()
         };
+        let report = |item: &WorkItem, kind, name: &str| {
+            store
+                .work_checkpoint(
+                    &viewer.token_id,
+                    &WorkCheckpoint {
+                        work_id: item.id.clone(),
+                        operation_id: format!("synthetic-{name}"),
+                        generation: item.generation,
+                        session: item.lead_session.clone(),
+                        expected_updated_seq: Some(item.updated_seq),
+                        kind,
+                        summary: format!("Synthetic {name}"),
+                        next_action: None,
+                        scope: None,
+                        branch: None,
+                        worktree: None,
+                        resolve_blocker: false,
+                        source_refs: vec![],
+                        depends_on: vec![],
+                        related_work: vec![],
+                    },
+                    now,
+                )
+                .unwrap();
+        };
         let paused = start(&viewer, "Paused own work", "src/paused.rs").item;
-        store
-            .work_checkpoint(
-                &viewer.token_id,
-                &WorkCheckpoint {
-                    work_id: paused.id.clone(),
-                    operation_id: "synthetic-pause".into(),
-                    generation: paused.generation,
-                    session: paused.lead_session.clone(),
-                    expected_updated_seq: Some(paused.updated_seq),
-                    kind: CheckpointKind::Pause,
-                    summary: "Synthetic pause".into(),
-                    next_action: None,
-                    scope: None,
-                    branch: None,
-                    worktree: None,
-                    resolve_blocker: false,
-                    source_refs: vec![],
-                    depends_on: vec![],
-                    related_work: vec![],
-                },
-                now,
-            )
-            .unwrap();
+        report(&paused, CheckpointKind::Pause, "pause");
+        // The one thing here that asks a person: Work its agent reported blocked.
+        let blocked: WorkStart = serde_json::from_value(json!({
+            "request_key": "Blocked own work-viewer", "title": "Blocked own work",
+            "session": "viewer-blocked", "scope": ["src/blocked.rs"]
+        }))
+        .unwrap();
+        let blocked = store
+            .work_start(&viewer.token_id, &blocked, now)
+            .unwrap()
+            .item;
+        report(&blocked, CheckpointKind::Blocker, "blocker");
         let to_viewer = start(&other, "Other asks viewer", "src/paused.rs");
         assert!(to_viewer.coordination_request.is_some());
         start(&third, "Third's work", "src/third.rs");
@@ -2772,7 +2795,9 @@ mod tests {
             text
         };
         assert_eq!(overlap_text(&status), overlap_text(&fixture));
-        assert_eq!(status.counts.needs_you, 4);
+        // The paused Work, the request to it, the shared file and the pull request over a held
+        // file are for agents to settle, so none of them counts.
+        assert_eq!(status.counts.needs_you, 1);
         assert_eq!(status.counts.needs_you, fixture.counts.needs_you);
         let mut personal = status
             .work
@@ -2788,23 +2813,27 @@ mod tests {
             )
             .collect::<Vec<_>>();
         personal.sort();
-        let mut expected = vec![
-            paused.id.clone(),
-            format!(
-                "request:{}:{}",
-                to_viewer.coordination_request.unwrap().id,
-                paused.id
-            ),
-            "file:src/shared.rs".into(),
-            format!("pr:{}:7", repo.id),
-        ];
-        expected.sort();
-        assert_eq!(personal, expected);
+        assert_eq!(personal, [blocked.id.clone()]);
+        // The request to the viewer's paused Work is still listed, for its lead agent.
+        let request = format!(
+            "request:{}:{}",
+            to_viewer.coordination_request.unwrap().id,
+            paused.id
+        );
+        let listed = status.actions.iter().find(|a| a.id == request).unwrap();
+        assert_eq!(listed.recipients[0].kind, RecipientKind::LeadAgent);
+        assert!(status.actions.iter().any(|a| {
+            a.id == format!("pr:{}:7", repo.id) && a.recipients[0].kind == RecipientKind::LeadAgent
+        }));
         assert_eq!(
             read(store, &third, later).unwrap().counts.needs_you,
-            4,
-            "the third person's own Work, request, file and pull request count for them instead"
+            0,
+            "the third person's quiet Work, request, file and pull request ask nobody"
         );
+        // Once the paused Work's hold has lapsed nothing waits on the request to it.
+        let lapsed = now + crate::hub::work_lifecycle::LEASE_SECONDS + 1;
+        let after = read(store, &viewer, lapsed).unwrap();
+        assert!(after.actions.iter().all(|a| a.kind != "directed_request"));
     }
 
     #[test]
@@ -2851,13 +2880,17 @@ mod tests {
             complete: true,
             retention_gap: false,
         };
-        let actions = request_actions(&inbox(request.clone()), &items, "usr_lead");
+        let id = request.targets[0].work_id.clone();
+        let holding = BTreeSet::from([id.as_str()]);
+        // The answer is the lead agent's to give, however quiet it is: its person is not asked.
+        let actions = request_actions(&inbox(request.clone()), &items, &holding);
         assert_eq!(actions.len(), 1);
-        assert!(actions[0].needs_you);
-        assert_eq!(actions[0].recipients[0].kind, RecipientKind::Person);
-        assert!(!request_actions(&inbox(request.clone()), &items, "usr_requester")[0].needs_you);
+        assert!(!actions[0].needs_you);
+        assert_eq!(actions[0].recipients[0].kind, RecipientKind::LeadAgent);
+        // Once the target holds nothing the asker's next start takes the scope: nothing waits.
+        assert!(request_actions(&inbox(request.clone()), &items, &BTreeSet::new()).is_empty());
         request.targets[0].generation = 2;
-        assert!(request_actions(&inbox(request.clone()), &items, "usr_lead").is_empty());
+        assert!(request_actions(&inbox(request.clone()), &items, &holding).is_empty());
         request.targets[0].generation = 1;
         request
             .responses
@@ -2873,7 +2906,7 @@ mod tests {
                 created_at: 100,
                 seq: 2,
             });
-        assert!(request_actions(&inbox(request), &items, "usr_lead").is_empty());
+        assert!(request_actions(&inbox(request), &items, &holding).is_empty());
     }
 
     #[tokio::test]
@@ -3246,7 +3279,15 @@ mod tests {
                 holder("bob's bob-one", "Bob's refactor"),
             )
         );
-        assert!(row(&status, 2).needs_you);
+        // It is the holders' agents' to weigh, so it asks none of their people.
+        assert!(!row(&status, 2).needs_you);
+        assert!(
+            row(&status, 2)
+                .recipients
+                .iter()
+                .all(|r| r.kind == RecipientKind::LeadAgent)
+        );
+        assert_eq!(status.counts.needs_you, 0);
         // Only the clock moved: the text says so, the digest does not.
         let later = read(store, &bob, now + 300).unwrap();
         assert!(
@@ -3349,14 +3390,16 @@ mod tests {
         store
             .announce_intent(&other.token_id, &request('b', "src/a.rs"), now)
             .unwrap();
+        // Two agents on one file settle it between themselves: the row names them, for them.
         let own = read(&*store, &owner, now).unwrap();
         assert_eq!(
             own.actions
                 .iter()
-                .filter(|a| a.kind == "file_conflict" && a.needs_you)
+                .filter(|a| a.kind == "file_conflict" && !a.needs_you)
                 .count(),
             1
         );
+        assert_eq!(own.counts.needs_you, 0);
         assert_eq!(read(&*store, &outsider, now).unwrap().counts.needs_you, 0);
         assert!(read(&*store, &foreign, now).unwrap().actions.is_empty());
         let before = read(&*store, &outsider, now).unwrap().digest;
