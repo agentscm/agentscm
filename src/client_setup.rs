@@ -9,11 +9,19 @@ use serde_json::{Map, Value, json};
 const CONFIG_BYTES: u64 = 256 * 1024;
 const BEGIN: &str = "# agentscm:client-begin";
 const END: &str = "# agentscm:client-end";
+/// The second required rule as the earlier skills below rendered it, before `agentscm_done` took
+/// an outcome. They are rebuilt from the current rules, so this keeps them exact.
+const PREVIOUS_DONE_RULE: &str = "Call `agentscm_start` with the task and expected paths before editing shared files, and `agentscm_done` when finished.";
+
 /// Exact earlier generated text, retained so setup can upgrade it without replacing local edits.
 static PREVIOUS_RULED_SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "---\nname: coordinate-edits\ndescription: Coordinate shared repository work and edits through AgentSCM.\n---\n\n# AgentSCM coordination\n\n## Required rules\n\n{}\n\n## Details\n\nRead agentscm_work_overview and agentscm_work_briefing before planning shared work. Start or join explicit work with agentscm_start before editing. Keep an independent catch-up cursor per session. Follow coordination requests by changing the actual work, then report checkpoints and resolution.\n\nWhen a start is refused or Work looks stuck, read agentscm_work_recovery with the paths or the work_id instead of searching: it lists what is active, what needs you and what can resume, why each still exists, and every remedy as permitted or refused for you with the exact call. Preview with agentscm_work_recovery_preview, then send its apply call. Resume your owner's released or lapsed Work rather than starting a duplicate. Release or end only your owner's obsolete Work; its next action and blocker stay. Never take over another owner's live hold: ask its lead. Ask your user only when two owners need the same paths for incompatible goals, or when whether unfinished Work is still wanted is theirs to decide.\n\nTrusted native hooks check supported edit tools. Cursor reports just after an edit; use agentscm_check before editing there. Use agentscm_handoff to answer a handoff request. Installation does not prove runtime coverage or enable analytics. Read agentscm_work_insights or agentscm_work_insight for reported work measurements. When structured usage is available for an explicitly associated work attempt, submit it once with agentscm_work_usage using a stable observation_id. Use null for unavailable counts or cost and unknown for unavailable agent, provider or model labels. Never infer a bill or submit prompts, transcripts or credentials.\n",
-        agentscm::hub::agent_rules::markdown()
+        agentscm::hub::agent_rules::markdown().replacen(
+            agentscm::hub::agent_rules::REQUIRED_RULES[1],
+            PREVIOUS_DONE_RULE,
+            1
+        )
     )
 });
 
@@ -29,14 +37,23 @@ static PREVIOUS_PLANNED_SKILL: std::sync::LazyLock<String> = std::sync::LazyLock
     )
 });
 
-/// The coordination skill: the required rules, then how the hooks and tools fit together.
-pub(crate) static SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+/// The generated skill before `agentscm_done` took an outcome, retained so setup can upgrade it.
+static PREVIOUS_WORK_TEXT_SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     PREVIOUS_PLANNED_SKILL.replacen(
         "## Details\n\n",
         &format!(
             "## Details\n\n{}\n\n",
             agentscm::hub::agent_rules::WORK_TEXT
         ),
+        1,
+    )
+});
+
+/// The coordination skill: the required rules, then how the hooks and tools fit together.
+pub(crate) static SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    PREVIOUS_WORK_TEXT_SKILL.replacen(
+        PREVIOUS_DONE_RULE,
+        agentscm::hub::agent_rules::REQUIRED_RULES[1],
         1,
     )
 });
@@ -558,6 +575,7 @@ fn check_skill(before: Option<&str>) -> Result<()> {
 
 fn generated_skill(text: &str) -> bool {
     text == SKILL.as_str()
+        || text == PREVIOUS_WORK_TEXT_SKILL.as_str()
         || text == PREVIOUS_PLANNED_SKILL.as_str()
         || text == PREVIOUS_RULED_SKILL.as_str()
         || PREVIOUS_SKILLS.contains(&text)
@@ -1410,6 +1428,7 @@ mod tests {
             for previous in PREVIOUS_SKILLS.into_iter().chain([
                 PREVIOUS_RULED_SKILL.as_str(),
                 PREVIOUS_PLANNED_SKILL.as_str(),
+                PREVIOUS_WORK_TEXT_SKILL.as_str(),
             ]) {
                 let (_dir, root) = repo();
                 let path = root.join(relative);
@@ -1433,6 +1452,9 @@ mod tests {
         assert!(!PREVIOUS_RULED_SKILL.contains(PLANNED_ISSUE_GUIDANCE));
         assert!(SKILL.contains(agentscm::hub::agent_rules::WORK_TEXT));
         assert!(!PREVIOUS_PLANNED_SKILL.contains(agentscm::hub::agent_rules::WORK_TEXT));
+        // The earlier skills keep the rule as they rendered it, so an installed copy still matches.
+        assert!(PREVIOUS_WORK_TEXT_SKILL.contains(PREVIOUS_DONE_RULE));
+        assert!(!SKILL.contains(PREVIOUS_DONE_RULE));
     }
 
     #[test]

@@ -172,6 +172,8 @@ struct Call {
     child: bool,
     /// That subagent's id, when it is a usable one, to tell its wait from its siblings' work.
     asker: Option<String>,
+    /// What a wait asks of its person, as the hook client excerpted it. Kept only on a wait.
+    asks: Option<String>,
 }
 
 struct Outcome {
@@ -482,6 +484,7 @@ impl Call {
             deny: false,
             child: false,
             asker: None,
+            asks: None,
         }
     }
 
@@ -503,6 +506,12 @@ impl Call {
 
     fn child(mut self, child: bool) -> Self {
         self.child = child;
+        self
+    }
+
+    /// Bounded and cleaned when the wait is recorded.
+    fn asks(mut self, text: Option<&str>) -> Self {
+        self.asks = text.map(str::to_owned);
         self
     }
 
@@ -651,6 +660,7 @@ impl Call {
                             self.via.strip_prefix("hook:").unwrap_or(""),
                             reason,
                             self.asker.as_deref(),
+                            self.asks.as_deref(),
                             unix_now(),
                         )
                     });
@@ -1254,7 +1264,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
             .asker(str_at(v, "agent_id"))
     };
     let tool = str_at(v, "tool_name").unwrap_or_default();
-    let waiting = |reason| call(Kind::Waiting(reason), Shape::Silent);
+    let waiting = |reason| call(Kind::Waiting(reason), Shape::Silent).asks(str_at(v, "asks"));
     match str_at(v, "hook_event_name") {
         // The start prompt is never read: it would become a team-visible task.
         Some("SessionStart") => call(Kind::Start, Shape::Hook("SessionStart")),
@@ -1408,6 +1418,7 @@ fn generic(v: &Value, scope: &Scope) -> Call {
         .unwrap_or("generic");
     let mut call = Call::new(Agent::Generic, kind, Shape::Generic)
         .session(str_at(v, "session"))
+        .asks(str_at(v, "asks"))
         .task(str_at(v, "task"))
         .paths(
             v.get("paths")

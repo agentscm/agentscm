@@ -21,6 +21,12 @@ There is no token to paste and no address to enter.
 (`npx agentscm --hub-url <url>` connects it and signs you in), and this computer must be signed in to that Hub
 (`agentscm hub login --hub <url>`).
 
+To have a coding agent connect itself instead, paste the
+[setup prompt](team-member-onboarding.md#or-paste-one-prompt-into-your-agent) into it. The agent
+runs `client setup` for itself, you approve the browser sign-in, and after a restart the same
+prompt verifies the agent's hooks with one edit to a disposable file. The prompt forbids commits,
+pushes and edits to `AGENTS.md` or `CLAUDE.md`.
+
 ## Sign in once per computer
 
 `agentscm hub login` (or **Sign In with GitHub…** in the menu bar app) signs this computer in to
