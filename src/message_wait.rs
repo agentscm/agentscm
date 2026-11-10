@@ -12,6 +12,10 @@
 //! person's mode is `ignore`, or when the Hub refuses, lacks the route or stays unreachable.
 //! Every failure exits 0, so the session is never woken by an error. On Windows it exits at once:
 //! it cannot tell there when its session has ended.
+//!
+//! `agentscm hook-wait codex` is the same waiter for a Codex chat, run as an `async` hook. A
+//! finished background hook starts no turn in Codex, so on a notice it queues the notice into
+//! the chat with `codex queue`, which starts it as a turn once the chat is idle, and exits 0.
 use std::fs::{DirBuilder, File, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,7 +37,8 @@ const STDIN_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, clap::Args)]
 pub struct HookWaitArgs {
-    /// The agent whose hook this is; only `claude` has a background hook that wakes its session.
+    /// The agent whose hook this is: `claude` (woken by exit 2) or `codex` (woken through
+    /// `codex queue`); any other waits for nothing.
     pub agent: String,
     /// SessionEnd: tell this session's waiter to leave, then exit at once.
     #[arg(long)]
@@ -51,18 +56,61 @@ pub async fn run(args: HookWaitArgs) -> ! {
         }
         std::process::exit(0)
     }
-    let found = if args.agent == "claude" && cfg!(unix) {
-        waited().await
+    let codex = args.agent == "codex";
+    // Without a runnable `codex` a notice could not be queued, so this chat is not waited for.
+    let found = if ((codex && runs("codex")) || args.agent == "claude") && cfg!(unix) {
+        waited(codex).await
     } else {
         None
     };
-    std::process::exit(finish(found, &mut std::io::stderr()))
+    std::process::exit(match found {
+        Some((session, text)) if codex => queue(&session, &text),
+        found => finish(found.map(|(_, text)| text), &mut std::io::stderr()),
+    })
+}
+
+/// The Hub's own framed notices: a message, or a coordination request to the session's Work.
+fn framed(text: &str) -> bool {
+    text.starts_with(FRAME) || text.starts_with(REQUEST_FRAME)
+}
+
+fn runs(program: &str) -> bool {
+    std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `codex queue` for the chat; the `=` forms keep a value from being read as an option.
+fn queue_args(session: &str, text: &str) -> [String; 3] {
+    [
+        "queue".into(),
+        format!("--thread={session}"),
+        format!("--message={text}"),
+    ]
+}
+
+/// Queues the Hub's framed notice into Codex chat `session`, which Codex starts as a turn once
+/// the chat is idle; anything else is dropped. Always 0: a background hook's exit wakes nothing.
+fn queue(session: &str, text: &str) -> i32 {
+    if framed(text) {
+        let _ = std::process::Command::new("codex")
+            .args(queue_args(session, text))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    0
 }
 
 /// Writes the notice and returns 2 only for the Hub's framed notice (a message, or a coordination
 /// request to the session's Work); anything else is 0, silent.
 fn finish(found: Option<String>, err: &mut impl Write) -> i32 {
-    match found.filter(|text| text.starts_with(FRAME) || text.starts_with(REQUEST_FRAME)) {
+    match found.filter(|text| framed(text)) {
         Some(text) => {
             // A write error still wakes the session; the notice is then empty.
             let _ = writeln!(err, "{text}");
@@ -114,7 +162,9 @@ fn marker(dir: &Path, session: &str) -> PathBuf {
     dir.join(format!("{}.ended", file_name(session)))
 }
 
-async fn waited() -> Option<String> {
+/// The session and the Hub's notice, once one comes. `codex` tells the Hub the notice goes into
+/// a Codex chat's own queue, so a hook reply never offers it again.
+async fn waited(codex: bool) -> Option<(String, String)> {
     let payload = input()?;
     let session = session_of(&payload)?;
     let cwd = Path::new(payload["cwd"].as_str()?);
@@ -138,17 +188,22 @@ async fn waited() -> Option<String> {
     let started = parent();
     let request = Wait {
         client: &client,
-        url: format!("{}/v1/hub/agent-messages/wait", connection.hub),
+        url: format!(
+            "{}/v1/hub/agent-messages/wait{}",
+            connection.hub,
+            if codex { "?agent=codex" } else { "" }
+        ),
         body: serde_json::json!({ "session": session }).to_string(),
         token_file: &connection.token_file,
     };
-    request
+    let text = request
         .until(
             MAX_LIFE,
             || parent() == started && !ended.exists(),
             Duration::from_secs(5),
         )
-        .await
+        .await?;
+    Some((session, text))
 }
 
 /// The Hub's answer when a message came.
@@ -309,6 +364,20 @@ mod tests {
         assert_eq!(finish(None, &mut err), 0);
         assert_eq!(finish(Some("something else".into()), &mut err), 0);
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn a_codex_notice_is_queued_for_its_chat_as_values_never_options() {
+        assert_eq!(
+            queue_args("019a7c-thread", "--remote=ws://elsewhere"),
+            [
+                "queue".to_owned(),
+                "--thread=019a7c-thread".to_owned(),
+                "--message=--remote=ws://elsewhere".to_owned()
+            ]
+        );
+        // Only the Hub's framed notice is queued: anything else runs nothing and exits 0.
+        assert_eq!(queue("019a7c-thread", "something else"), 0);
     }
 
     /// A Hub that answers each request with the next of `replies` (status, body).
