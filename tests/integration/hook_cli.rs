@@ -621,11 +621,11 @@ fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
         assert_eq!(
             body.as_object().unwrap().keys().collect::<Vec<_>>(),
             [
-                "complete",
                 "content_hidden",
                 "display",
                 "folder",
                 "input_hash",
+                "missing",
                 "session",
                 "summary",
                 "tool"
@@ -634,7 +634,11 @@ fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
         assert_eq!(body["summary"], "run a shell command");
         assert_eq!(body["folder"], "repo");
         assert_eq!(body["display"], "deploy --token [REDACTED:flag_value]");
-        assert_eq!(body["complete"], false, "a redacted request is deny-only");
+        assert_eq!(
+            body["missing"],
+            json!({"cut_from": null, "redacted": 1, "unshown": []}),
+            "the person is told a secret was replaced"
+        );
         assert!(
             seen.iter()
                 .all(|seen| !String::from_utf8_lossy(&seen.body).contains("hunter2")),

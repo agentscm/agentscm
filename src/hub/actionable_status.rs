@@ -2434,7 +2434,7 @@ mod tests {
                     summary: None,
                     folder: None,
                     display: "ls".into(),
-                    complete: true,
+                    missing: Default::default(),
                     content_hidden: false,
                     input_hash: "0".repeat(64),
                 },
