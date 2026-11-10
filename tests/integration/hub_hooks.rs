@@ -927,7 +927,10 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
     let reason = reason_of(&codex, "/hookSpecificOutput/permissionDecisionReason", &key);
     // Protects: the holder's refusal names only the contested file, not the patch's uncontested
     // one (the one-time WORK_UNDECLARED line ahead of it lists every path, for the start call).
-    assert!(!warn_once_part(&reason).contains("src/gadget.rs"), "{reason}");
+    assert!(
+        !warn_once_part(&reason).contains("src/gadget.rs"),
+        "{reason}"
+    );
     assert_eq!(codex["hookSpecificOutput"]["permissionDecision"], "deny");
     assert_eq!(codex["hookSpecificOutput"]["hookEventName"], "PreToolUse");
     assert!(
