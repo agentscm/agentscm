@@ -2390,11 +2390,11 @@ mod tests {
         let db = Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
         assert_eq!(
-            db.pragma_query_value(None, "user_version", |row| row.get::<_, u64>(0))
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
             5
         );
-        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('workflow_intent_work','workflow_intent_operations')", [], |row| row.get::<_, u64>(0)).unwrap(), 0);
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('workflow_intent_work','workflow_intent_operations')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         drop(db);
         assert_eq!(std::fs::read(&database).unwrap(), before);
         service.create(&create).unwrap();
@@ -2402,7 +2402,7 @@ mod tests {
         assert_eq!(
             journal
                 .connection
-                .pragma_query_value(None, "user_version", |row| row.get::<_, u64>(0))
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
             6
         );
