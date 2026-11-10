@@ -719,7 +719,7 @@ async fn onboarding(
         let Ok((200, reply)) = send(request, REPLY_BYTES).await else {
             continue;
         };
-        let Ok(rows) = serde_json::from_value::<Vec<OnboardingRow>>(reply) else {
+        let Ok(rows) = agentscm::hub::reply::decode::<Vec<OnboardingRow>>(&reply) else {
             continue;
         };
         let now = unix_now();

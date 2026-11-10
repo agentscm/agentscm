@@ -1,0 +1,31 @@
+# Client source files that can send an HTTP request and still call `serde_json::from_*`.
+#
+# A Hub reply is read with `agentscm::hub::reply`, never with `serde_json`: the types carry the
+# strictness the Hub applies to requests, and one new field in a reply would then break every
+# installed client. The calls counted here read something else, named on each line.
+# `client_code_reads_hub_replies_only_through_the_lenient_reader` (tests/integration/
+# client_replies.rs) counts the calls outside each file's test module and fails when a count
+# differs from this list.
+#
+# Lines: count, path, what the calls read.
+
+1 src/agent_task_cli.rs               the caller's task JSON file
+3 src/change_capture_client.rs        the capture config file, the recipe file, the agent's settings file as untyped JSON
+1 src/client_cli/computer.rs          the local attention file as untyped JSON
+1 src/client_config.rs                connections.json
+2 src/client_mcp.rs                   JSON-RPC messages as untyped JSON, passed on unchanged
+2 src/continuity.rs                   rows of the local continuity database
+3 src/demo_cli.rs                     Hub replies and the health file as untyped JSON
+1 src/git_export/remote/network.rs    the Git credential file
+4 src/hook_cli.rs                     the agent's hook input and tool arguments as untyped JSON, the local advisory snapshot file, a helper process's answer
+2 src/hook_relay.rs                   frames between the hook and the local relay; the Hub's reply inside stays untyped JSON
+1 src/hosted_workflow_client.rs       the client's own journal file
+3 src/hub_cli.rs                      the session file, a request file
+3 src/intent_cli.rs                   the agent's hook input as untyped JSON, hub.json, the local intent state file
+1 src/pipeline_cli.rs                 an operator's input file
+1 src/promise_cli.rs                  the caller's request file, strict because it becomes a request
+1 src/publish_cli.rs                  the manifest this client built, checked before it is sent
+2 src/skill_cli.rs                    a command-line argument, the caller's detail file
+1 src/telemetry.rs                    the telemetry config file
+2 src/work_cli.rs                     a command-line argument, the caller's request file, strict because it becomes a request
+18 src/workflow_library.rs            rows of the local workflow library database, an action declaration
