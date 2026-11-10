@@ -340,9 +340,10 @@ Observed evidence counts for a gate only when the gate's own rule accepts it: gr
 required label is not the observed fact, whatever a report says about the label.
 
 **The skill status.** A per-repository Hub setting, off by default and stored in
-`hub_settings` like conversation sharing (keyed by the forge's repository id), turns it on: a
-repository admin or a Hub admin sets it on the Hub's web pages
-(`GET`/`PUT /v1/hub/session/skill-forge-status`), and agents read it at
+`hub_settings` like conversation sharing (keyed by the forge's repository id), turns it on. A
+repository admin or a Hub admin changes it from a signed-in web session through the API
+(`GET`/`PUT /v1/hub/session/skill-forge-status`, with the page's CSRF token); there is no
+control in the Hub UI yet. Agent and read-only tokens cannot change it; they read it at
 `GET /v1/hub/repos/{repo}/skills/forge-status`. Then the Hub posts `agentscm/skill/<name>` on each
 open pull request head after reading it, with the state in the `forge_status` row of section 2.5.
 `success` needs, for every gate before merge that the forge can show (CI and approval), accepted

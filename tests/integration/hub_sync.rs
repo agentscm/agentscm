@@ -3588,6 +3588,37 @@ async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed(
     env.store.skill_adoption_clear(REPO, None).unwrap();
     env.poll().await;
     assert_eq!(last(&env)["state"], "error");
+
+    // Adopted again, then pinned at a sha256 no catalog knows: that pin is not adopted
+    // (`unknown_version`), so its success is retired the same way.
+    use agentscm::hub::skills::SkillAdoption;
+    use agentscm::skill_workflow::supported::{SkillLock, SkillPin, catalog_entry};
+    let pinned = |sha: Option<&str>| {
+        let mut pin = SkillPin::first_party(catalog_entry("pr-gate", 1).unwrap(), None);
+        if let Some(sha) = sha {
+            pin.sha256 = sha.into();
+        }
+        SkillAdoption {
+            repository: REPO.into(),
+            source: "default_branch".into(),
+            lock_json: serde_json::to_string(&SkillLock {
+                version: 1,
+                skills: vec![pin],
+            })
+            .unwrap(),
+            default_branch: Some("main".into()),
+            observed_at: unix_now(),
+            reported_by: None,
+        }
+    };
+    env.store.skill_adoption_put(&pinned(None)).unwrap();
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "success");
+    env.store
+        .skill_adoption_put(&pinned(Some(&"0".repeat(64))))
+        .unwrap();
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "error");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
