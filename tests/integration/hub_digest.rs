@@ -376,11 +376,14 @@ async fn call(
         .request(method, format!("{base}{path}"))
         .bearer_auth(secret);
     if let Some(body) = body {
-        request = request.json(&body);
+        request = request
+            .header("content-type", "application/json")
+            .body(body.to_string());
     }
     let response = request.send().await.unwrap();
     let status = response.status().as_u16();
-    (status, response.json().await.unwrap_or(Value::Null))
+    let bytes = response.bytes().await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
