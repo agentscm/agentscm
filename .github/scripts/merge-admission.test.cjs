@@ -7,8 +7,9 @@ function fixture() {
   const statuses = [{context: 'agentscm/local-validation', state: 'success', creator: {id: 41898282}}];
   const checks = [{id: 4, name: 'Conventional PR title', status: 'completed', conclusion: 'success', app: {id: 15368}}];
   const writes = [];
+  const statusWrites = [];
   let reads = 0;
-  const f = {pull, statuses, checks, writes};
+  const f = {pull, statuses, checks, writes, statusWrites};
   f.args = {
     context: {repo: {owner: 'synthetic', repo: 'example'}, payload: {repository: {default_branch: 'main'}, pull_request: pull}},
     validateTitle: title => title.startsWith('fix: '),
@@ -17,10 +18,16 @@ function fixture() {
         get: async () => ({data: {...pull, head: {sha: ++reads === 2 && f.moved ? 'b'.repeat(40) : pull.head.sha}}}),
         list: async () => ({data: [pull]}),
       },
-      repos: {listCommitStatusesForRef: async () => {
-        if (f.apiError) throw Error('unavailable');
-        return {data: statuses};
-      }},
+      repos: {
+        listCommitStatusesForRef: async () => {
+          if (f.apiError) throw Error('unavailable');
+          return {data: statuses};
+        },
+        createCommitStatus: async value => {
+          statusWrites.push(value);
+          statuses.unshift({context: value.context, state: value.state, description: value.description, creator: {id: 41898282}});
+        },
+      },
       checks: {
         listForRef: async () => ({data: {check_runs: checks}}),
         create: async value => {writes.push(value); return {data: {id: 90}};},
@@ -37,6 +44,36 @@ test('exact trusted success admits only the PR head', async () => {
   assert.equal(f.writes[0].head_sha, f.pull.head.sha);
   assert.equal(f.writes[1].conclusion, 'success');
   assert.match(f.writes[1].output.title, /batch tests still required/);
+});
+
+test('own event reports pending, then the outcome, as a commit status on the head', async () => {
+  const f = fixture();
+  await admit(f.args);
+  assert.deepEqual(f.statusWrites.map(s => [s.sha, s.context, s.state, s.description]), [
+    [f.pull.head.sha, 'Merge batch gate', 'pending', 'PR admission pending'],
+    [f.pull.head.sha, 'Merge batch gate', 'success', 'PR admitted; batch tests still required'],
+  ]);
+  const g = fixture(); g.pull.title = 'invalid title';
+  await admit(g.args);
+  assert.equal(g.statusWrites.at(-1).state, 'failure');
+  assert.equal(g.statusWrites.at(-1).description, 'PR admission blocked');
+});
+
+test('a failing status API never stops the check run from completing', async () => {
+  const f = fixture();
+  f.args.github.rest.repos.createCommitStatus = async () => { throw Error('statuses unavailable'); };
+  await assert.rejects(admit(f.args), /Admission refresh failed/);
+  assert.equal(f.writes[1].conclusion, 'success');
+});
+
+test('a sweep writes only a changed final status, never a pending one', async () => {
+  const f = fixture(); delete f.args.context.payload.pull_request;
+  await admit(f.args);
+  await admit(f.args);
+  assert.deepEqual(f.statusWrites.map(s => s.state), ['success']);
+  f.checks[0].conclusion = 'failure';
+  await admit(f.args);
+  assert.deepEqual(f.statusWrites.map(s => s.state), ['success', 'failure']);
 });
 
 test('only a latest signed failure refuses; pending, error or no local validation admits', async () => {
@@ -106,6 +143,7 @@ test('prerequisite start invalidates prior green without reading old success', a
     await admit(f.args);
     assert.equal(f.writes.length, 1);
     assert.equal(f.writes[0].status, 'in_progress');
+    assert.equal(f.statusWrites.length, 0);
   }
 });
 
