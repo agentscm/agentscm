@@ -32,7 +32,7 @@ function Context({ repo, token, pr }: { repo: string; token: string; pr: PullReq
   if (poll.kind === 'loading') return <Skeleton rows={3} />
   if (poll.kind === 'error' || poll.refreshError) return <Notice tone="warn" title="PR context is unavailable" action={<button className="btn btn-sm btn-outline-secondary" onClick={poll.retry}>Try again</button>}>{poll.kind === 'error' ? poll.message : poll.refreshError} Previous context is hidden until access and data can be checked again.</Notice>
   const data = poll.value
-  if (data.availability !== 'available') return <Empty icon="git" title={data.availability === 'not_connected' ? 'No forge connection' : 'This PR is not in the retained mirror'}>Open GitHub to check its current state, or <button className="btn btn-link p-0" onClick={poll.retry}>refresh the retained context</button>.{(data.coverage?.last_sync_partial || data.coverage?.retained_pr_scan_saturated) && <span className="d-block mt-2">The retained scan or last sync is incomplete; this PR may be missing because of that gap.</span>}</Empty>
+  if (data.availability !== 'available') return <Empty icon="git" title={data.availability === 'not_connected' ? 'No forge connection' : data.availability === 'merged' ? 'This PR merged; its open-PR context is no longer kept' : 'This PR is not in the retained mirror'}>Open GitHub to check its current state, or <button className="btn btn-link p-0" onClick={poll.retry}>refresh the retained context</button>.{(data.coverage?.last_sync_partial || data.coverage?.retained_pr_scan_saturated) && <span className="d-block mt-2">The retained scan or last sync is incomplete; this PR may be missing because of that gap.</span>}</Empty>
   return <ContextFacts data={data} refresh={poll.retry} />
 }
 

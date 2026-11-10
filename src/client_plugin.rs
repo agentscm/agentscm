@@ -1407,4 +1407,48 @@ mod tests {
             4
         );
     }
+
+    /// The hook events behind the coverage table in docs/agents.md, for the two agents whose
+    /// hooks come from a plugin.
+    #[test]
+    fn plugins_are_wired_for_the_events_their_coverage_names() {
+        let events = |files: Vec<(&'static str, Vec<u8>)>| -> Vec<String> {
+            let (_, hooks) = files
+                .into_iter()
+                .find(|(path, _)| *path == "agentscm/hooks/hooks.json")
+                .unwrap();
+            let hooks: Value = serde_json::from_slice(&hooks).unwrap();
+            let mut events: Vec<String> = hooks["hooks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            events.sort();
+            events
+        };
+        let claude = events(claude_files_with_version("/opt/agentscm", "1"));
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert!(claude.iter().any(|wired| wired == event), "{event}");
+        }
+        assert_eq!(
+            events(codex_package_files("/opt/agentscm")),
+            [
+                "PermissionRequest",
+                "PostToolUse",
+                "PreToolUse",
+                "SessionEnd",
+                "SessionStart",
+                "Stop"
+            ]
+        );
+    }
 }

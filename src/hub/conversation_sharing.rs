@@ -247,11 +247,14 @@ struct RepositoryQuery {
     repository: String,
 }
 
-/// The signed-in person, a repository they can read now, and who may change what.
-async fn session_scope(
+/// The signed-in person, a repository they can read now, and who may change what:
+/// `(user id, full name, repository id, repository or Hub admin, Hub admin)`. `via` names the
+/// setting the read is for.
+pub(super) async fn session_scope(
     state: &HubState,
     human: &HumanSession,
     repository: &str,
+    via: &'static str,
 ) -> std::result::Result<(String, String, i64, bool, bool), ApiError> {
     let user = human.web_user()?.clone();
     validate_repository(repository)?;
@@ -268,8 +271,7 @@ async fn session_scope(
         }
     }
     let (repo, repository_admin) =
-        super::login::devices::mint_access(state, &user, repository, "conversation_sharing")
-            .await?;
+        super::login::devices::mint_access(state, &user, repository, via).await?;
     Ok((
         user.id,
         repo.full_name,
@@ -286,7 +288,7 @@ async fn session_view(
 ) -> std::result::Result<Json<Sharing>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
     let (user, name, id, can_change, hub_admin) =
-        session_scope(&state, &human, &query.repository).await?;
+        session_scope(&state, &human, &query.repository, "conversation_sharing").await?;
     let store = state.store.clone();
     let mut sharing = blocking(&state, move || view(&*store, &name, Some(id), &user)).await?;
     sharing.can_change = Some(can_change);
@@ -308,7 +310,7 @@ async fn session_set(
     JsonBody(body): JsonBody<SetRepository>,
 ) -> std::result::Result<Json<Sharing>, ApiError> {
     let (user, name, id, can_change, hub_admin) =
-        session_scope(&state, &human, &body.repository).await?;
+        session_scope(&state, &human, &body.repository, "conversation_sharing").await?;
     if !can_change {
         return Err(ApiError::forbidden()
             .with_message("Only a repository admin or a Hub admin changes conversation sharing"));
@@ -337,7 +339,7 @@ async fn session_person(
     JsonBody(body): JsonBody<SetPerson>,
 ) -> std::result::Result<Json<Sharing>, ApiError> {
     let (user, name, id, can_change, hub_admin) =
-        session_scope(&state, &human, &body.repository).await?;
+        session_scope(&state, &human, &body.repository, "conversation_sharing").await?;
     let store = state.store.clone();
     let change = PersonChange {
         opted_out: Some(body.opted_out),

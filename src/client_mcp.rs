@@ -1,20 +1,24 @@
-//! Checkout-bound stdio MCP transport for the stateless Hub endpoint.
+//! Stdio MCP transport for the stateless Hub endpoint. The server starts in one checkout, whose
+//! connection is its default; a tool call that names another connected checkout goes to that
+//! repository's connection instead.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use reqwest::header::CONTENT_TYPE;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use agentscm::hub::forge_http::{self, send_full};
 use agentscm::{Error, Result};
 
 use crate::client_cli::read_token;
 use crate::client_config::{
-    Connection, canonical_root, connection_for_checkout, is_current_in, load,
+    AGENTS, Connection, canonical_root, connection_for_checkout, is_current_in, load, relative,
 };
+use crate::client_session::{self, Process, Recorded};
 use crate::hub_cli::map_hub_error;
 
 const REQUEST_BYTES: usize = 1024 * 1024;
@@ -74,7 +78,24 @@ fn current_token(
     verified: &mut Option<(Connection, Instant)>,
 ) -> Result<String> {
     let changed = || invalid("client connection changed; restart the AgentSCM MCP server");
-    let saved = selected(&connection.root, &load()?)?;
+    let connections = load()?;
+    let saved = match selected(&connection.root, &connections) {
+        Ok(saved) => saved,
+        // The connection this server started with is gone (removed, or its token expired).
+        // The checkout's current one keeps the server running when it reaches the same Hub and
+        // repository, so a worktree session survives its main checkout reconnecting.
+        Err(_) => {
+            let (current, _) =
+                connection_for_checkout(&connections, checkout).ok_or_else(changed)?;
+            if current.hub != connection.hub
+                || current.repo != connection.repo
+                || !is_current_in(current, checkout)
+            {
+                return Err(changed());
+            }
+            return read_token(&current.token_file);
+        }
+    };
     let renewed = renewed_in_place(&saved, connection);
     let fresh = verified
         .as_ref()
@@ -139,6 +160,21 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
 
 fn rpc_hub_error(id: &Value, envelope: &agentscm::hub::error_envelope::ErrorEnvelope) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":envelope.render(),"data":envelope}})
+}
+
+/// A tool result the server gives itself, when a call cannot be sent to any Hub.
+fn refused(reason: &str) -> Value {
+    json!({"content": [{"type": "text", "text": reason}], "isError": true})
+}
+
+fn refuse(id: Option<&Value>, reason: &str, writer: &mut impl Write) -> Result<()> {
+    match id {
+        Some(id) => write_json(
+            writer,
+            &json!({"jsonrpc": "2.0", "id": id, "result": refused(reason)}),
+        ),
+        None => Ok(()),
+    }
 }
 
 fn json_content_type(headers: &reqwest::header::HeaderMap) -> bool {
@@ -206,17 +242,408 @@ fn why_not_connected(root: Option<&Path>) -> String {
     }
 }
 
+/// The server's own argument, on every tool: the checkout a call is about. It chooses the
+/// connection here and is taken out before the call is forwarded, so a Hub never sees it.
+const ROOT: &str = "root";
+const ROOT_HELP: &str = "Absolute path of another checkout connected on this computer, when the call is about that repository and not the one this session started in. Absolute paths choose it without `root`.";
+const NOT_SENT: &str = "The call was not sent.";
+const CONNECT: &str = "Run `agentscm client connect` in that checkout, then call again.";
+
+/// Lists `root` on every tool. Only the two calls made before editing explain it; the rest
+/// name it, so the tool list stays short.
+fn with_root(tools: &mut Value) {
+    for tool in tools.as_array_mut().into_iter().flatten() {
+        let explained = matches!(
+            tool["name"].as_str(),
+            Some("agentscm_start" | "agentscm_check")
+        );
+        if let Some(properties) = tool
+            .pointer_mut("/inputSchema/properties")
+            .and_then(Value::as_object_mut)
+        {
+            let mut root = json!({"type": "string"});
+            if explained {
+                root["description"] = json!(ROOT_HELP);
+            }
+            properties.insert(ROOT.into(), root);
+        }
+    }
+}
+
+/// The tools that take `session`.
+fn session_tools(tools: &Value) -> HashSet<String> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool.pointer("/inputSchema/properties/session").is_some())
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn same_repository(one: &Connection, other: &Connection) -> bool {
+    one.hub == other.hub && one.repo.eq_ignore_ascii_case(&other.repo)
+}
+
+/// The connected checkout a call's arguments name: `root`, else a `worktree` that is a
+/// checkout's absolute path, else absolute `paths`, the way an edit hook routes by the file.
+/// `None` means the default: the checkout the server started in, `start`, which relative paths
+/// are read against. Absolute paths are rewritten repo-relative, as every Hub expects them.
+/// `Err` is why the call cannot be sent anywhere, in words for the agent.
+fn route(
+    arguments: &mut Map<String, Value>,
+    start: &Path,
+    default: Option<&Connection>,
+) -> std::result::Result<Option<(Connection, PathBuf)>, String> {
+    let root = match arguments.remove(ROOT) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(root)) if !root.is_empty() => Some(start.join(root)),
+        Some(_) => {
+            return Err(format!(
+                "AgentSCM: `root` must be a checkout's path. {NOT_SENT}"
+            ));
+        }
+    };
+    let absolute = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|path| Path::new(path).is_absolute())
+    };
+    let worktree = arguments
+        .get("worktree")
+        .filter(|worktree| absolute(worktree))
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let listed = |arguments: &Map<String, Value>| {
+        arguments.get("path").is_some_and(absolute)
+            || arguments
+                .get("paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| paths.iter().any(absolute))
+    };
+    if root.is_none() && worktree.is_none() && !listed(arguments) {
+        return Ok(None);
+    }
+    let connections =
+        load().map_err(|_| format!("AgentSCM: client connections are unavailable. {NOT_SENT}"))?;
+    let find = |path: &Path| {
+        connection_for_checkout(&connections, path)
+            .map(|(connection, checkout)| (connection.clone(), checkout))
+    };
+    let unconnected = |path: &Path| {
+        format!(
+            "AgentSCM: {} is not in a repository connected on this computer. {NOT_SENT} {CONNECT}",
+            path.display()
+        )
+    };
+    let two = |one: &Connection, other: &Connection| {
+        format!(
+            "AgentSCM: this call names files in two repositories ({} and {}). {NOT_SENT} Call once per repository.",
+            one.repo, other.repo
+        )
+    };
+    let mut target = match (&root, &worktree) {
+        (Some(root), _) => Some(find(root).ok_or_else(|| unconnected(root))?),
+        // A checkout with no connection is refused; any other text is only the Work's label.
+        (None, Some(worktree)) => match find(worktree) {
+            None if crate::intent_cli::repo_root(worktree).is_some() => {
+                return Err(unconnected(worktree));
+            }
+            found => found,
+        },
+        (None, None) => None,
+    };
+    let anchored = target.is_some();
+    let mut relative_paths = false;
+    let mut place = |value: &mut Value| -> std::result::Result<(), String> {
+        let Some(path) = value.as_str().map(PathBuf::from) else {
+            return Ok(());
+        };
+        if !path.is_absolute() {
+            relative_paths = true;
+            return Ok(());
+        }
+        let (connection, checkout) = find(&path).ok_or_else(|| unconnected(&path))?;
+        if let Some((chosen, _)) = &target
+            && !same_repository(chosen, &connection)
+        {
+            return Err(two(chosen, &connection));
+        }
+        *value = json!(relative(&checkout, &path).ok_or_else(|| unconnected(&path))?);
+        if target.is_none() {
+            target = Some((connection, checkout));
+        }
+        Ok(())
+    };
+    if let Some(path) = arguments.get_mut("path") {
+        place(path)?;
+    }
+    for path in arguments
+        .get_mut("paths")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        place(path)?;
+    }
+    let Some((connection, checkout)) = target else {
+        return Ok(None);
+    };
+    let here = default.is_some_and(|default| same_repository(default, &connection));
+    if relative_paths && !anchored && !here {
+        return Err(format!(
+            "AgentSCM: this call mixes absolute paths in {} with relative paths, which are read against the checkout this session started in ({}). {NOT_SENT} Call once per repository, or pass `root` so relative paths are read against that checkout.",
+            connection.repo,
+            start.display()
+        ));
+    }
+    Ok((!here).then_some((connection, checkout)))
+}
+
+/// The token of another repository's connection, after the checks the default connection gets.
+fn open(connection: &Connection, checkout: &Path) -> std::result::Result<String, String> {
+    let stale = || {
+        format!(
+            "AgentSCM: the saved connection for {} cannot be used from {}. {NOT_SENT} {CONNECT}",
+            connection.repo,
+            checkout.display()
+        )
+    };
+    if !is_current_in(connection, checkout) {
+        return Err(stale());
+    }
+    read_token(&connection.token_file).map_err(|_| stale())
+}
+
+/// Whether an MCP client's name is one of the agents that run AgentSCM hooks. A client that
+/// never said its name counts too: only a client known to have no hooks gets a made-up session.
+fn hooked(client: Option<&str>) -> bool {
+    client.is_none_or(|name| {
+        let name = name.to_ascii_lowercase();
+        AGENTS.iter().any(|agent| name.contains(agent))
+            || name.contains("visual studio code")
+            || name.contains("vscode")
+    })
+}
+
+/// A session name for one client process without hooks: its own name and eight random digits.
+fn own_session(client: &str) -> String {
+    let mut name: String = client
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(32)
+        .collect();
+    if name.trim_matches('-').is_empty() {
+        name = "mcp".into();
+    }
+    let mut random = [0_u8; 4];
+    // Without a random source the process id still tells two clients on this computer apart.
+    if getrandom::fill(&mut random).is_err() {
+        random = std::process::id().to_be_bytes();
+    }
+    format!("{name}-{:08x}", u32::from_be_bytes(random))
+}
+
+/// Where one request goes.
+struct Sent<'a> {
+    connection: &'a Connection,
+    token: &'a str,
+    activity_binding: &'a str,
+}
+
+/// What the server knows about the agent it serves, apart from its default connection.
+struct Client {
+    http: reqwest::Client,
+    /// Where the server started. Relative paths are read against it.
+    start: PathBuf,
+    /// `clientInfo.name` from `initialize`.
+    name: Option<String>,
+    /// This process's ancestors, read once, by the first call that names no session.
+    ancestors: Option<Vec<Process>>,
+    /// The session of a client without hooks, made once so it is the same for every call.
+    own_session: Option<String>,
+    /// The tools that take `session`, from the last `tools/list`.
+    session_tools: HashSet<String>,
+}
+
+impl Client {
+    fn new(start: PathBuf) -> Result<Self> {
+        Ok(Self {
+            http: forge_http::client().map_err(map_hub_error)?,
+            start,
+            name: None,
+            ancestors: None,
+            own_session: None,
+            session_tools: session_tools(&agentscm::hub::mcp::agent_tools()),
+        })
+    }
+
+    /// The session for a call that names none: the native one the agent's start hook recorded
+    /// for this process tree; one name for the whole process when the client has no hooks; and
+    /// nothing when a hooked agent's session cannot be told, so the Hub decides as before.
+    fn session(&mut self) -> Option<String> {
+        let config = crate::hub_cli::config_dir().ok()?;
+        let ancestors = self.ancestors.get_or_insert_with(client_session::ancestors);
+        match client_session::recorded(&config, ancestors) {
+            Recorded::One(session) => Some(session),
+            Recorded::Several => None,
+            Recorded::None if hooked(self.name.as_deref()) => None,
+            Recorded::None => {
+                let name = self.name.as_deref().unwrap_or_default();
+                Some(
+                    self.own_session
+                        .get_or_insert_with(|| own_session(name))
+                        .clone(),
+                )
+            }
+        }
+    }
+
+    /// Completes a tool call: routes it, and names its session when it names none. Returns the
+    /// other repository the call is for, or `None` for the default connection.
+    fn prepare(
+        &mut self,
+        message: &mut Value,
+        default: Option<&Connection>,
+    ) -> std::result::Result<Option<(Connection, PathBuf)>, String> {
+        let tool = message["params"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let mut arguments = match message.pointer("/params/arguments") {
+            Some(Value::Object(arguments)) => arguments.clone(),
+            None | Some(Value::Null) => Map::new(),
+            // Anything else is for the Hub to refuse.
+            Some(_) => return Ok(None),
+        };
+        let target = route(&mut arguments, &self.start, default)?;
+        if !arguments.contains_key("session")
+            && self.session_tools.contains(&tool)
+            && let Some(session) = self.session()
+        {
+            arguments.insert("session".into(), json!(session));
+        }
+        if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut)
+            && (!arguments.is_empty() || params.contains_key("arguments"))
+        {
+            params.insert("arguments".into(), Value::Object(arguments));
+        }
+        Ok(target)
+    }
+
+    /// Reads a request that arrives while the start checkout has no connection: remembers the
+    /// client's name, and says whether a tool call names another checkout that has one.
+    fn look(&mut self, message: &Value) -> std::result::Result<bool, String> {
+        match message["method"].as_str() {
+            Some("initialize") => {
+                self.name = message["params"]["clientInfo"]["name"]
+                    .as_str()
+                    .map(str::to_owned);
+                Ok(false)
+            }
+            Some("tools/call") => {
+                let mut arguments = message
+                    .pointer("/params/arguments")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                route(&mut arguments, &self.start, None).map(|target| target.is_some())
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Sends one request to the repository it is for and writes the client the reply.
+    async fn send(
+        &mut self,
+        mut message: Value,
+        mut body: Vec<u8>,
+        default: Option<&Sent<'_>>,
+        writer: &mut impl Write,
+    ) -> Result<()> {
+        let id = response_id(&message);
+        let method = message["method"].as_str().unwrap_or_default().to_owned();
+        if method == "initialize" {
+            self.name = message["params"]["clientInfo"]["name"]
+                .as_str()
+                .map(str::to_owned);
+        }
+        let mut elsewhere = None;
+        if method == "tools/call" {
+            match self.prepare(&mut message, default.map(|sent| sent.connection)) {
+                Ok(target) => {
+                    elsewhere = target;
+                    body = serde_json::to_vec(&message)?;
+                }
+                Err(reason) => return refuse(id.as_ref(), &reason, writer),
+            }
+        }
+        let reply = match (&elsewhere, default) {
+            (Some((connection, checkout)), _) => {
+                let token = match open(connection, checkout) {
+                    Ok(token) => token,
+                    Err(reason) => return refuse(id.as_ref(), &reason, writer),
+                };
+                let activity_binding = crate::client_activity::activity_binding(connection, &token);
+                let sent = Sent {
+                    connection,
+                    token: &token,
+                    activity_binding: &activity_binding,
+                };
+                exchange(&self.http, &sent, body, id.clone(), writer).await?
+            }
+            (None, Some(default)) => {
+                exchange(&self.http, default, body, id.clone(), writer).await?
+            }
+            (None, None) => return refuse(id.as_ref(), STILL_CONNECTING, writer),
+        };
+        let Some(mut reply) = reply else {
+            return Ok(());
+        };
+        if method == "tools/list"
+            && let Some(tools) = reply.pointer_mut("/result/tools")
+        {
+            self.session_tools = session_tools(tools);
+            with_root(tools);
+        }
+        // A call that left the default repository says so: a later call about the same Work
+        // names no path, and needs `root` to follow it.
+        if let Some((connection, checkout)) = &elsewhere
+            && let Some(content) = reply
+                .pointer_mut("/result/content")
+                .and_then(Value::as_array_mut)
+        {
+            content.push(json!({"type": "text", "text": format!(
+                "AgentSCM: this call went to {}, the repository of the checkout at {}, not the one this session started in. Pass `root` set to that path on later calls about this Work.",
+                connection.repo,
+                checkout.display()
+            )}));
+        }
+        write_json(writer, &reply)
+    }
+}
+
 /// Answers locally until `find` sees a connection. `tools/list` already names every tool, so an
 /// agent's first session can see them; a call explains why it cannot run yet. When a connection
 /// appears, from a request or from the `poll` timer, announces the tools changed and returns it
 /// with the request to forward. A user-scope MCP entry starts in every project, and most are not
 /// connected; an agent's start-up hook may connect this one while it runs.
+///
+/// `look` sees every request first. `Ok(true)` hands a tool call back to the caller, which sends
+/// it to the other connected checkout it names; `Err` is why that call cannot be sent.
 fn unconnected<T>(
     reader: &mut (impl BufRead + Send),
     writer: &mut impl Write,
     mut find: impl FnMut() -> std::result::Result<T, String>,
     poll: Duration,
-) -> Result<Option<(T, Vec<u8>)>> {
+    mut look: impl FnMut(&Value) -> std::result::Result<bool, String>,
+) -> Result<Option<Waited<T>>> {
     let changed = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
     std::thread::scope(|scope| {
         // The reader thread reads one line per request, so none is pending once a connection is found
@@ -246,7 +673,7 @@ fn unconnected<T>(
                         write_json(writer, &changed)?;
                         // The read already under way is the first request to forward.
                         return match lines.recv() {
-                            Ok(Ok(Some(line))) => Ok(Some((found, line))),
+                            Ok(Ok(Some(line))) => Ok(Some(Waited::Connected(found, line))),
                             Ok(Err(error)) => Err(error),
                             Ok(Ok(None)) | Err(_) => Ok(None),
                         };
@@ -257,12 +684,18 @@ fn unconnected<T>(
             let reason = match find() {
                 Ok(found) => {
                     write_json(writer, &changed)?;
-                    return Ok(Some((found, line)));
+                    return Ok(Some(Waited::Connected(found, line)));
                 }
                 Err(why) => why,
             };
+            let message = serde_json::from_slice::<Value>(&line).ok();
+            let looked = message.as_ref().map_or(Ok(false), &mut look);
+            if looked == Ok(true) {
+                // No read is under way, so the reader is free when the scope ends.
+                return Ok(Some(Waited::Elsewhere(line)));
+            }
             let _ = want.send(());
-            let Ok(message) = serde_json::from_slice::<Value>(&line) else {
+            let Some(message) = message else {
                 write_json(writer, &rpc_error(&Value::Null, -32700, "parse error"))?;
                 continue;
             };
@@ -281,10 +714,12 @@ fn unconnected<T>(
                     ),
                 }),
                 Some("ping") => json!({}),
-                Some("tools/list") => json!({"tools": agentscm::hub::mcp::agent_tools()}),
-                Some("tools/call") => {
-                    json!({"content": [{"type": "text", "text": reason}], "isError": true})
+                Some("tools/list") => {
+                    let mut tools = agentscm::hub::mcp::agent_tools();
+                    with_root(&mut tools);
+                    json!({"tools": tools})
                 }
+                Some("tools/call") => refused(looked.as_ref().err().unwrap_or(&reason)),
                 _ => {
                     write_json(
                         writer,
@@ -301,6 +736,126 @@ fn unconnected<T>(
     })
 }
 
+/// How the wait for the start checkout's connection ended.
+#[derive(Debug, PartialEq)]
+enum Waited<T> {
+    /// It connected; the request is the first to forward.
+    Connected(T, Vec<u8>),
+    /// Still unconnected, but this tool call names another checkout that has a connection.
+    Elsewhere(Vec<u8>),
+}
+
+/// Forwards one request. A well-formed reply is returned for the caller to finish and write;
+/// every other outcome is reported to the client here.
+async fn exchange(
+    http: &reqwest::Client,
+    sent: &Sent<'_>,
+    body: Vec<u8>,
+    id: Option<Value>,
+    writer: &mut impl Write,
+) -> Result<Option<Value>> {
+    let &Sent {
+        connection,
+        token,
+        activity_binding,
+    } = sent;
+    let client_id = crate::client_config::onboarding_client(&connection.root, token);
+    let forwarded = forward(
+        http,
+        &endpoint(connection)?,
+        token,
+        body,
+        &client_id,
+        connection.report_completion,
+    )
+    .await;
+    match (id, forwarded) {
+        (None, Ok((202 | 204, _, _))) => report_activity(
+            activity_binding,
+            crate::client_activity::ActivityOutcome::Acknowledged,
+        ),
+        (None, Ok((401 | 403, _, _))) => {
+            report_activity(
+                activity_binding,
+                crate::client_activity::ActivityOutcome::TokenRejected,
+            );
+            eprintln!("AgentSCM MCP: Hub notification failed");
+        }
+        (None, Ok(_)) => {
+            report_activity(
+                activity_binding,
+                crate::client_activity::ActivityOutcome::InvalidResponse,
+            );
+            eprintln!("AgentSCM MCP: Hub notification failed");
+        }
+        (None, Err(_)) => {
+            report_activity(
+                activity_binding,
+                crate::client_activity::ActivityOutcome::Unavailable,
+            );
+            eprintln!("AgentSCM MCP: Hub notification failed");
+        }
+        (Some(id), Ok((200, true, reply))) if valid_reply(&reply, &id) => {
+            report_activity(
+                activity_binding,
+                crate::client_activity::ActivityOutcome::Acknowledged,
+            );
+            let mut reply = reply;
+            // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
+            // start's conflict, coordination and recovery payload, reach the agent unchanged.
+            let bare_error = &reply["result"]["structuredContent"]["error"];
+            if reply["result"]["isError"] == true
+                && bare_error.is_object()
+                && bare_error["recovery"].is_null()
+            {
+                reply["result"] =
+                    agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
+            } else if reply["error"].is_object() {
+                let error = agentscm::hub::error_envelope::decode(400, &reply);
+                let code = reply["error"]["code"].as_i64().unwrap_or(-32000);
+                reply["error"] = json!({"code":code,"message":error.render(),"data":error});
+            }
+            return Ok(Some(reply));
+        }
+        (Some(id), Ok((status @ (401 | 403), _, reply))) => {
+            report_activity(
+                activity_binding,
+                crate::client_activity::ActivityOutcome::TokenRejected,
+            );
+            let error = agentscm::hub::error_envelope::decode(status, &reply);
+            eprintln!("AgentSCM MCP: {}", error.render());
+            write_json(writer, &rpc_hub_error(&id, &error))?;
+        }
+        (Some(id), Ok((status, _, reply))) => {
+            report_activity(
+                activity_binding,
+                crate::client_activity::ActivityOutcome::InvalidResponse,
+            );
+            let error = if status >= 400 {
+                agentscm::hub::error_envelope::decode(status, &reply)
+            } else {
+                agentscm::hub::error_envelope::ErrorEnvelope::local(
+                    agentscm::hub::error_envelope::ErrorCode::InvalidResponse,
+                )
+            };
+            eprintln!("AgentSCM MCP: {}", error.render());
+            write_json(writer, &rpc_hub_error(&id, &error))?;
+        }
+        (Some(id), Err(_)) => {
+            report_activity(
+                activity_binding,
+                crate::client_activity::ActivityOutcome::Unavailable,
+            );
+            let error = agentscm::hub::error_envelope::ErrorEnvelope::local(
+                agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+            );
+            eprintln!("AgentSCM MCP: {}", error.render());
+            write_json(writer, &rpc_hub_error(&id, &error))?;
+        }
+    }
+    Ok(None)
+}
+
 async fn serve(
     connection: &Connection,
     token: &str,
@@ -308,13 +863,12 @@ async fn serve(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     mut current_token: impl FnMut() -> Result<String>,
+    client: &mut Client,
 ) -> Result<()> {
-    let client = forge_http::client().map_err(map_hub_error)?;
     let _relay = crate::hub_cli::config_dir()
         .ok()
         .and_then(|dir| agentscm::hook_relay::Address::new(&dir, &connection.hub).ok())
         .map(agentscm::hook_relay::Relay::spawn);
-    let url = endpoint(connection)?;
     let mut token = token.to_owned();
     let mut activity_binding = crate::client_activity::activity_binding(connection, &token);
     loop {
@@ -343,8 +897,6 @@ async fn serve(
             write_json(writer, &rpc_error(&Value::Null, -32600, "invalid request"))?;
             continue;
         }
-        let id = response_id(&message);
-        drop(message);
         let checked = current_token();
         if let Ok(current) = &checked
             && *current != token
@@ -357,7 +909,7 @@ async fn serve(
                 &activity_binding,
                 crate::client_activity::ActivityOutcome::BindingChanged,
             );
-            if let Some(id) = id {
+            if let Some(id) = response_id(&message) {
                 write_json(
                     writer,
                     &rpc_error(&id, -32000, "AgentSCM connection changed; restart MCP"),
@@ -367,100 +919,12 @@ async fn serve(
                 "client connection changed; restart the AgentSCM MCP server",
             ));
         }
-        let client_id = crate::client_config::onboarding_client(&connection.root, &token);
-        let forwarded = forward(
-            &client,
-            &url,
-            &token,
-            line,
-            &client_id,
-            connection.report_completion,
-        )
-        .await;
-        match (id, forwarded) {
-            (None, Ok((202 | 204, _, _))) => report_activity(
-                &activity_binding,
-                crate::client_activity::ActivityOutcome::Acknowledged,
-            ),
-            (None, Ok((401 | 403, _, _))) => {
-                report_activity(
-                    &activity_binding,
-                    crate::client_activity::ActivityOutcome::TokenRejected,
-                );
-                eprintln!("AgentSCM MCP: Hub notification failed");
-            }
-            (None, Ok(_)) => {
-                report_activity(
-                    &activity_binding,
-                    crate::client_activity::ActivityOutcome::InvalidResponse,
-                );
-                eprintln!("AgentSCM MCP: Hub notification failed");
-            }
-            (None, Err(_)) => {
-                report_activity(
-                    &activity_binding,
-                    crate::client_activity::ActivityOutcome::Unavailable,
-                );
-                eprintln!("AgentSCM MCP: Hub notification failed");
-            }
-            (Some(id), Ok((200, true, reply))) if valid_reply(&reply, &id) => {
-                report_activity(
-                    &activity_binding,
-                    crate::client_activity::ActivityOutcome::Acknowledged,
-                );
-                let mut reply = reply;
-                // Only an older Hub's bare error is upgraded. A current Hub's envelope, and a refused
-                // start's conflict, coordination and recovery payload, reach the agent unchanged.
-                let bare_error = &reply["result"]["structuredContent"]["error"];
-                if reply["result"]["isError"] == true
-                    && bare_error.is_object()
-                    && bare_error["recovery"].is_null()
-                {
-                    reply["result"] =
-                        agentscm::hub::error_envelope::decode(200, &reply["result"]).mcp();
-                } else if reply["error"].is_object() {
-                    let error = agentscm::hub::error_envelope::decode(400, &reply);
-                    let code = reply["error"]["code"].as_i64().unwrap_or(-32000);
-                    reply["error"] = json!({"code":code,"message":error.render(),"data":error});
-                }
-                write_json(writer, &reply)?;
-            }
-            (Some(id), Ok((status @ (401 | 403), _, reply))) => {
-                report_activity(
-                    &activity_binding,
-                    crate::client_activity::ActivityOutcome::TokenRejected,
-                );
-                let error = agentscm::hub::error_envelope::decode(status, &reply);
-                eprintln!("AgentSCM MCP: {}", error.render());
-                write_json(writer, &rpc_hub_error(&id, &error))?;
-            }
-            (Some(id), Ok((status, _, reply))) => {
-                report_activity(
-                    &activity_binding,
-                    crate::client_activity::ActivityOutcome::InvalidResponse,
-                );
-                let error = if status >= 400 {
-                    agentscm::hub::error_envelope::decode(status, &reply)
-                } else {
-                    agentscm::hub::error_envelope::ErrorEnvelope::local(
-                        agentscm::hub::error_envelope::ErrorCode::InvalidResponse,
-                    )
-                };
-                eprintln!("AgentSCM MCP: {}", error.render());
-                write_json(writer, &rpc_hub_error(&id, &error))?;
-            }
-            (Some(id), Err(_)) => {
-                report_activity(
-                    &activity_binding,
-                    crate::client_activity::ActivityOutcome::Unavailable,
-                );
-                let error = agentscm::hub::error_envelope::ErrorEnvelope::local(
-                    agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
-                );
-                eprintln!("AgentSCM MCP: {}", error.render());
-                write_json(writer, &rpc_hub_error(&id, &error))?;
-            }
-        }
+        let default = Sent {
+            connection,
+            token: &token,
+            activity_binding: &activity_binding,
+        };
+        client.send(message, line, Some(&default), writer).await?;
     }
 }
 
@@ -478,21 +942,39 @@ pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
     let mut reader = std::io::BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
+    let cwd = std::env::current_dir()?;
+    let mut client = Client::new(root.map_or_else(|| cwd.clone(), |root| cwd.join(root)))?;
     let ((connection, checkout, token), first) = match connection(root) {
         Ok(found) => (found, None),
         Err(why) => {
-            eprintln!("AgentSCM MCP: {why}; tool calls fail until this checkout is connected");
-            let find = || connection(root).map_err(|_| why_not_connected(root));
-            match unconnected(&mut reader, &mut writer, find, POLL)? {
-                Some((found, line)) => (found, Some(line)),
-                None => return Ok(()),
+            eprintln!(
+                "AgentSCM MCP: {why}; tool calls for this checkout fail until it is connected"
+            );
+            loop {
+                let find = || connection(root).map_err(|_| why_not_connected(root));
+                let look = |message: &Value| client.look(message);
+                match unconnected(&mut reader, &mut writer, find, POLL, look)? {
+                    Some(Waited::Connected(found, line)) => break (found, Some(line)),
+                    Some(Waited::Elsewhere(line)) => {
+                        let message = serde_json::from_slice(&line)?;
+                        client.send(message, line, None, &mut writer).await?;
+                    }
+                    None => return Ok(()),
+                }
             }
         }
     };
+    client.start.clone_from(&checkout);
     let mut verified = None;
-    serve(&connection, &token, first, &mut reader, &mut writer, || {
-        current_token(&connection, &checkout, &token, &mut verified)
-    })
+    serve(
+        &connection,
+        &token,
+        first,
+        &mut reader,
+        &mut writer,
+        || current_token(&connection, &checkout, &token, &mut verified),
+        &mut client,
+    )
     .await
 }
 
@@ -561,15 +1043,36 @@ mod tests {
         (format!("http://{address}"), receiver)
     }
 
-    async fn proxied(input: &str, connection: &Connection, token: &str) -> String {
+    fn client(start: &Path) -> Client {
+        Client::new(start.to_owned()).unwrap()
+    }
+
+    async fn proxied_as(
+        input: &str,
+        connection: &Connection,
+        token: &str,
+        client: &mut Client,
+    ) -> String {
         let mut reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
-        serve(connection, token, None, &mut reader, &mut output, || {
-            Ok(token.to_owned())
-        })
+        let current = || Ok(token.to_owned());
+        serve(
+            connection,
+            token,
+            None,
+            &mut reader,
+            &mut output,
+            current,
+            client,
+        )
         .await
         .unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    async fn proxied(input: &str, connection: &Connection, token: &str) -> String {
+        let mut client = client(Path::new("/checkout"));
+        proxied_as(input, connection, token, &mut client).await
     }
 
     #[test]
@@ -600,6 +1103,330 @@ mod tests {
         // A supplied token is managed elsewhere and never counts as renewed.
         let supplied = saved("https://one.example".into(), "/one", "owner/one");
         assert!(!renewed_in_place(&supplied, &supplied));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_keeps_working_when_its_connection_moves_to_the_main_checkout() {
+        crate::client_config::in_isolated_config_home(|home| {
+            use std::os::unix::fs::PermissionsExt;
+            let git = |dir: &Path, args: &[&str]| {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .output()
+                    .unwrap();
+                assert!(status.status.success(), "git {args:?}");
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("main");
+            std::fs::create_dir(&main).unwrap();
+            git(&main, &["init", "--quiet"]);
+            git(
+                &main,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/acme/widgets.git",
+                ],
+            );
+            git(
+                &main,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "t",
+                ],
+            );
+            let linked = dir.path().join("linked");
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                ],
+            );
+            let (main, linked) = (main.canonicalize().unwrap(), linked.canonicalize().unwrap());
+            let token = |name: &str, value: &str| {
+                let path = home.join(name);
+                std::fs::write(&path, value).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                path
+            };
+            let bound = |root: PathBuf, repo: &str, file: PathBuf| Connection {
+                origin_host: "github.com".into(),
+                token_file: file,
+                ..saved("https://hub.example".into(), root.to_str().unwrap(), repo)
+            };
+            let own = bound(linked.clone(), "acme/widgets", token("own", "own-token"));
+            let write = |connections: &[Connection]| {
+                let dir = home.join("agentscm");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("connections.json"),
+                    serde_json::to_string(&json!({"version": 1, "connections": connections}))
+                        .unwrap(),
+                )
+                .unwrap();
+            };
+            // The worktree's own connection was removed; the main checkout's serves the same
+            // Hub and repository, so the server switches to its token instead of stopping.
+            write(&[bound(
+                main.clone(),
+                "acme/widgets",
+                token("main", "main-token"),
+            )]);
+            let mut verified = None;
+            assert_eq!(
+                current_token(&own, &linked, "own-token", &mut verified).unwrap(),
+                "main-token"
+            );
+            // Another repository's connection is never taken over.
+            write(&[bound(
+                main.clone(),
+                "acme/other",
+                token("other", "other-token"),
+            )]);
+            assert!(current_token(&own, &linked, "own-token", &mut verified).is_err());
+        });
+    }
+
+    /// Three checkouts under one directory: `widgets` and `gadgets` connected to the given
+    /// Hubs with tokens `token-widgets` and `token-gadgets`, and `loose` with no connection.
+    #[cfg(unix)]
+    fn checkouts(config: &Path, hubs: [&str; 2]) -> (tempfile::TempDir, [PathBuf; 3]) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let roots = ["widgets", "gadgets", "loose"].map(|name| {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            let origin = format!("https://github.com/acme/{name}.git");
+            for args in [
+                vec!["init", "--quiet"],
+                vec!["remote", "add", "origin", &origin],
+            ] {
+                let git = std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&root)
+                    .output()
+                    .unwrap();
+                assert!(git.status.success(), "git {args:?}");
+            }
+            root.canonicalize().unwrap()
+        });
+        let connections: Vec<Connection> = (0..2)
+            .map(|index| {
+                let name = ["widgets", "gadgets"][index];
+                let token_file = config.join(format!("token-{name}"));
+                std::fs::write(&token_file, format!("token-{name}")).unwrap();
+                std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                Connection {
+                    token_file,
+                    ..saved(
+                        hubs[index].to_owned(),
+                        roots[index].to_str().unwrap(),
+                        &format!("acme/{name}"),
+                    )
+                }
+            })
+            .collect();
+        std::fs::create_dir_all(config.join("agentscm")).unwrap();
+        std::fs::write(
+            config.join("agentscm").join("connections.json"),
+            json!({"version": 1, "connections": connections}).to_string(),
+        )
+        .unwrap();
+        (dir, roots)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_goes_to_the_repository_its_paths_or_root_name_under_that_token() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let answer =
+                r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // A start with a file of the other repository, then a read that names it by root.
+            for (tool, arguments, forwarded) in [
+                (
+                    "agentscm_start",
+                    json!({"task": "t", "session": "s", "paths": ["{gadgets}/src/lib.rs"]}),
+                    json!({"task": "t", "session": "s", "paths": ["src/lib.rs"]}),
+                ),
+                (
+                    "agentscm_work_status",
+                    json!({"root": "{gadgets}"}),
+                    json!({}),
+                ),
+            ] {
+                let (widgets_hub, widgets_seen) = server(200, "application/json", answer);
+                let (gadgets_hub, gadgets_seen) = server(200, "application/json", answer);
+                let (_dir, [widgets, gadgets, _]) = checkouts(config, [&widgets_hub, &gadgets_hub]);
+                let default = selected(&widgets, &load().unwrap()).unwrap();
+                let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments}})
+                .to_string()
+                .replace("{gadgets}", gadgets.to_str().unwrap());
+                let output = runtime.block_on(proxied_as(
+                    &format!("{call}\n"),
+                    &default,
+                    "token-widgets",
+                    &mut client(&widgets),
+                ));
+                let request = gadgets_seen.recv().unwrap();
+                assert!(
+                    request.starts_with("POST /mcp?repo=acme%2Fgadgets HTTP/1.1"),
+                    "{request}"
+                );
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer token-gadgets")
+                );
+                let body: Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                assert_eq!(body["params"]["arguments"], forwarded);
+                // The reply says where the call went, so the next call can follow it.
+                let reply: Value = serde_json::from_str(&output).unwrap();
+                let note = reply["result"]["content"][1]["text"].as_str().unwrap();
+                assert!(
+                    note.contains("acme/gadgets") && note.contains(gadgets.to_str().unwrap()),
+                    "{note}"
+                );
+                assert!(widgets_seen.try_recv().is_err());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_across_two_repositories_or_into_an_unconnected_one_is_refused() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let hub = "https://hub.example";
+            let (_dir, [widgets, gadgets, loose]) = checkouts(config, [hub, hub]);
+            let default = selected(&widgets, &load().unwrap()).unwrap();
+            let mut client = client(&widgets);
+            // The repository a call is routed to (none: the default) and what is forwarded.
+            let mut call = |arguments: Value| {
+                let mut message = json!({"method": "tools/call",
+                    "params": {"name": "agentscm_work_status", "arguments": arguments}});
+                let target = client.prepare(&mut message, Some(&default))?;
+                Ok::<_, String>((
+                    target.map(|(connection, _)| connection.repo),
+                    message["params"]["arguments"].take(),
+                ))
+            };
+            let both = call(json!({"paths": [widgets.join("a.rs"), gadgets.join("b.rs")]}));
+            let both = both.unwrap_err();
+            assert!(
+                both.contains("acme/widgets and acme/gadgets")
+                    && both.contains("Call once per repository"),
+                "{both}"
+            );
+            // A relative path is the start checkout's, so it cannot ride with another's file.
+            let mixed = call(json!({"paths": ["a.rs", gadgets.join("b.rs")]})).unwrap_err();
+            assert!(mixed.contains("Call once per repository"), "{mixed}");
+            for arguments in [
+                json!({"paths": [loose.join("c.rs")]}),
+                json!({"root": loose}),
+                json!({"worktree": loose}),
+            ] {
+                let refusal = call(arguments).unwrap_err();
+                assert!(refusal.contains("`agentscm client connect`"), "{refusal}");
+            }
+            // The default repository's own absolute paths stay there, made repo-relative, and
+            // `root` is never forwarded.
+            assert_eq!(
+                call(json!({"root": widgets, "paths": [widgets.join("src/a.rs")]})).unwrap(),
+                (None, json!({"paths": ["src/a.rs"]}))
+            );
+            // With `root`, relative paths are that checkout's. A worktree that is only a label
+            // routes nothing; one that is a connected checkout's path does.
+            assert_eq!(
+                call(json!({"root": gadgets, "path": "src/b.rs", "worktree": "feature"})).unwrap(),
+                (
+                    Some("acme/gadgets".into()),
+                    json!({"path": "src/b.rs", "worktree": "feature"})
+                )
+            );
+            let routed = call(json!({"worktree": gadgets})).unwrap();
+            assert_eq!(routed.0.as_deref(), Some("acme/gadgets"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_omitted_session_is_the_hooks_native_id_or_one_name_for_a_client_without_hooks() {
+        crate::client_config::in_isolated_config_home(|config| {
+            let host = Process {
+                pid: 300,
+                started: "Mon Nov  9 09:00:01 2026".into(),
+                name: "agent".into(),
+            };
+            let records = client_session::directory(config);
+            let named = |name: &str, ancestors: &[Process]| {
+                let mut client = client(Path::new("/checkout"));
+                client.name = Some(name.to_owned());
+                client.ancestors = Some(ancestors.to_vec());
+                client
+            };
+            // The session a start is forwarded with.
+            let session = |client: &mut Client, arguments: Value| {
+                let mut message = json!({"method": "tools/call",
+                    "params": {"name": "agentscm_start", "arguments": arguments}});
+                client.prepare(&mut message, None).unwrap();
+                message["params"]["arguments"]["session"].take()
+            };
+
+            let mut hooked = named("claude-code", std::slice::from_ref(&host));
+            // Before its start hook ran, a hooked agent's call is left for the Hub to place.
+            assert_eq!(session(&mut hooked, json!({"task": "t"})), Value::Null);
+            client_session::record_under(&records, &host, "native-1").unwrap();
+            assert_eq!(session(&mut hooked, json!({"task": "t"})), "native-1");
+            // A session the agent names itself stands, and a tool that takes none gets none.
+            assert_eq!(
+                session(&mut hooked, json!({"task": "t", "session": "mine"})),
+                "mine"
+            );
+            let mut status =
+                json!({"method": "tools/call", "params": {"name": "agentscm_work_status"}});
+            hooked.prepare(&mut status, None).unwrap();
+            assert_eq!(status["params"].get("arguments"), None);
+            // A host with two conversations open cannot say whose call this is.
+            client_session::record_under(&records, &host, "native-2").unwrap();
+            assert_eq!(session(&mut hooked, json!({"task": "t"})), Value::Null);
+
+            // A client that runs no hooks keeps one name of its own for the whole process.
+            let mut plain = named("Plain Editor", &[]);
+            let first = session(&mut plain, json!({"task": "t"}));
+            assert!(
+                first.as_str().unwrap().starts_with("plain-editor-"),
+                "{first}"
+            );
+            assert_eq!(session(&mut plain, json!({"task": "t"})), first);
+            assert_ne!(
+                session(&mut named("Plain Editor", &[]), json!({"task": "t"})),
+                first
+            );
+            // A client that never named itself may be a hooked agent, so it gets no name.
+            let mut unnamed = client(Path::new("/checkout"));
+            unnamed.ancestors = Some(Vec::new());
+            assert_eq!(session(&mut unnamed, json!({"task": "t"})), Value::Null);
+        });
     }
 
     #[test]
@@ -637,7 +1464,8 @@ mod tests {
                     None,
                     &mut reader,
                     &mut output,
-                    || Err(invalid("changed"))
+                    || Err(invalid("changed")),
+                    &mut client(Path::new("/checkout"))
                 )
                 .await
                 .is_err()
@@ -810,39 +1638,51 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"agentscm_setup_status\"}}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"refused\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"elsewhere\"}}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\"}\n",
         );
         let mut reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
         let mut calls = 0;
-        let found = unconnected(
-            &mut reader,
-            &mut output,
-            || {
-                calls += 1;
-                if calls == 6 {
-                    Ok("connection")
-                } else {
-                    Err("still connecting".to_owned())
-                }
-            },
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        let (connection, line) = found.unwrap();
+        let mut find = || {
+            calls += 1;
+            if calls == 8 {
+                Ok("connection")
+            } else {
+                Err("still connecting".to_owned())
+            }
+        };
+        // What `Client::look` decides from a call's arguments, here from its tool name.
+        let look = |message: &Value| match message["params"]["name"].as_str() {
+            Some("refused") => Err("names an unconnected checkout".to_owned()),
+            Some("elsewhere") => Ok(true),
+            _ => Ok(false),
+        };
+        let wait = Duration::from_secs(60);
+        // A call that names another connected checkout is handed back to be sent there.
+        let found = unconnected(&mut reader, &mut output, &mut find, wait, look).unwrap();
+        let Some(Waited::Elsewhere(line)) = found else {
+            panic!("{found:?}");
+        };
+        assert!(String::from_utf8(line).unwrap().contains("\"id\":7"));
+        // The wait goes on with the next request, until the start checkout connects.
+        let found = unconnected(&mut reader, &mut output, &mut find, wait, look).unwrap();
+        let Some(Waited::Connected(connection, line)) = found else {
+            panic!("{found:?}");
+        };
         assert_eq!(connection, "connection");
         assert!(String::from_utf8(line).unwrap().contains("\"id\":4"));
         let replies = replies(output);
-        assert_eq!(replies.len(), 5);
+        assert_eq!(replies.len(), 6);
         assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(
             replies[0]["result"]["capabilities"]["tools"]["listChanged"],
             true
         );
-        assert_eq!(
-            replies[1]["result"]["tools"],
-            agentscm::hub::mcp::agent_tools()
-        );
+        let mut tools = agentscm::hub::mcp::agent_tools();
+        with_root(&mut tools);
+        assert_eq!(replies[1]["result"]["tools"], tools);
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], true);
         assert_eq!(
@@ -850,18 +1690,39 @@ mod tests {
             "still connecting"
         );
         assert_eq!(replies[3]["error"]["code"], -32601);
-        assert_eq!(replies[4]["method"], "notifications/tools/list_changed");
+        // A call that names a checkout with no connection says so, not why this one waits.
+        assert_eq!(
+            replies[4]["result"]["content"][0]["text"],
+            "names an unconnected checkout"
+        );
+        assert_eq!(replies[5]["method"], "notifications/tools/list_changed");
         let mut ended = Cursor::new(&b""[..]);
         assert!(
             unconnected(
                 &mut ended,
                 &mut Vec::new(),
                 || Err::<(), _>(String::new()),
-                Duration::from_secs(60)
+                Duration::from_secs(60),
+                |_| Ok(false)
             )
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn every_listed_tool_takes_a_root_and_only_the_first_calls_explain_it() {
+        let mut tools = agentscm::hub::mcp::agent_tools();
+        let sessions = session_tools(&tools);
+        assert!(sessions.contains("agentscm_start") && !sessions.contains("agentscm_work_status"));
+        with_root(&mut tools);
+        for tool in tools.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let root = &tool["inputSchema"]["properties"][ROOT];
+            assert_eq!(root["type"], "string", "{name}");
+            let explained = ["agentscm_start", "agentscm_check"].contains(&name);
+            assert_eq!(root["description"].is_string(), explained, "{name}");
+        }
     }
 
     /// A reader that stays silent until released, like a client waiting for list_changed.
@@ -898,6 +1759,7 @@ mod tests {
                         }
                     },
                     Duration::from_millis(20),
+                    |_| Ok(false),
                 )
             });
             // The announcement is written while the client is still silent.
@@ -907,7 +1769,9 @@ mod tests {
                 .unwrap();
             handle.join().unwrap()
         });
-        let (value, line) = found.unwrap().unwrap();
+        let Some(Waited::Connected(value, line)) = found.unwrap() else {
+            panic!("not connected");
+        };
         assert_eq!(value, 7);
         assert!(String::from_utf8(line).unwrap().contains("tools/list"));
         let replies = replies(output);

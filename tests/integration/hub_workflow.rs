@@ -1634,16 +1634,17 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
                 .is_some_and(|reason| reason.starts_with("AgentSCM: EDIT_UNLINKED: "))
     };
 
-    // Another conversation of the token is its own session once the default Work is adopted, so
-    // it meets the ordinary warn-once refusal of a file another session holds, not a link
-    // refusal, and its repeat passes as its own session's edit.
+    // Another conversation of the token is its own session once the default Work is adopted. Its
+    // first edit with no Work of its own is refused once with the start call, and the ordinary
+    // warn-once note of a file another session holds rides in that same refusal, not a link
+    // refusal; its repeat passes as its own session's edit.
     let second_unknown_session = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     let second_edit = edit(
         second_unknown_session,
         "src/native-hook.rs",
         "second-unknown-session",
     );
-    let (status, second_unknown) = hub
+    let (status, undeclared) = hub
         .call(
             Method::POST,
             hook_path,
@@ -1651,13 +1652,18 @@ async fn native_hook_adopts_default_work_and_enforces_its_lifecycle() {
             Some(second_edit.clone()),
         )
         .await;
-    assert_eq!(status, 200, "{second_unknown}");
-    let reason = second_unknown["hookSpecificOutput"]["permissionDecisionReason"]
+    assert_eq!(status, 200, "{undeclared}");
+    let reason = undeclared["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap_or_default();
     assert!(
-        reason.contains("another agent is working on that file") && !denied(&second_unknown),
-        "{second_unknown}"
+        reason.starts_with("AgentSCM: WORK_UNDECLARED: ")
+            && reason.contains(&format!("session \"{second_unknown_session}\""))
+            && reason.contains("[\"src/native-hook.rs\"]")
+            && reason.contains("this refusal happens once per session")
+            && reason.contains("another agent is working on that file")
+            && !denied(&undeclared),
+        "{undeclared}"
     );
     let (status, second_repeat) = hub
         .call(Method::POST, hook_path, &original, Some(second_edit))

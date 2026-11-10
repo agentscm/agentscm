@@ -62,15 +62,22 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/digest".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/digest/settings".into(), "".into(), Allowed);
+    row(&put, "/v1/hub/standup/digest/settings".into(), r#"{"enabled":true}"#.into(), AgentOnly);
+    row(&put, "/v1/hub/standup/digest/settings/me".into(), r#"{"opted_out":true}"#.into(), AgentOnly);
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/operational".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/reconciliation".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work?q=x".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/why?path=src/x.rs".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/why?path=../x".into(), "".into(), Status(400));
     row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
     row(&get, format!("{REPO}/activity?before=5"), "".into(), Allowed);
     for tool in ["agentscm_work_search", "agentscm_publications_list", "agentscm_workflow_runs_list"] {
         row(&post, "/mcp".into(), format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"q":"x"}}}}}}"#), Allowed);
     }
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_why","arguments":{"commit":"0000000000000000000000000000000000000000"}}}"#.into(), Allowed);
     for path in ["start", "checkpoint", "ack", "work-transition"] {
         row(&post, format!("/v1/hub/standup/{path}"), "{}".into(), AgentOnly);
     }
@@ -105,6 +112,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/skills/runs/missing"), "".into(), Status(404));
     row(&put, format!("{REPO}/skills/adoption"), "{}".into(), AgentOnly);
     row(&post, format!("{REPO}/skills/evidence"), "{}".into(), AgentOnly);
+    row(&get, format!("{REPO}/skills/forge-status"), "".into(), Allowed);
     // /mcp: negotiation and the repository-scoped workflow read are side-effect-free.
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.into(), Allowed);
@@ -159,6 +167,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&put, "/v1/hub/session/conversation-sharing".into(), r#"{"repository":"acme/widgets","enabled":true}"#.into(), HumanOnly);
     row(&put, "/v1/hub/session/conversation-sharing/me".into(), r#"{"repository":"acme/widgets","opted_out":true}"#.into(), HumanOnly);
     row(&put, "/v1/hub/session/conversation-sharing/default".into(), r#"{"enabled":true}"#.into(), HumanOnly);
+    row(&get, "/v1/hub/session/skill-forge-status?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
+    row(&put, "/v1/hub/session/skill-forge-status".into(), r#"{"repository":"acme/widgets","enabled":true}"#.into(), HumanOnly);
     row(&post, "/v1/hub/session/pickups".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&post, "/v1/hub/session/pickups/abandon".into(), r#"{"repository":"acme/widgets","id":"pku_x"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/device/repositories".into(), "".into(), HumanOnly);

@@ -5342,3 +5342,41 @@ fn outside_a_repository_every_found_agent_is_set_up_and_uninstall_takes_it_back(
     assert_eq!(json_file(&settings), json!({"model": "kept"}));
     assert!(!machine.config().join("quickstart.json").exists());
 }
+
+/// Setup wires the agents it is run for. An agent installed afterwards is named by
+/// `client check`, with the command that sets it up, until a later quickstart sets it up.
+#[test]
+fn an_agent_installed_after_setup_is_named_until_a_later_run_sets_it_up() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let quickstart = |extra: &[&str]| {
+        let mut args = vec!["--no-collisions"];
+        args.extend(extra);
+        ok(&machine.run(repo.path(), &quick(&hub.url, &token, &args)))
+    };
+    let check = || ok(&machine.run(repo.path(), &["--no-telemetry", "client", "check"]));
+    quickstart(&["--agent", "cursor"]);
+    let said = check();
+    assert!(!said.contains("no AgentSCM setup was found"), "{said}");
+
+    // Gemini CLI is installed later: its configuration directory appears.
+    std::fs::create_dir(machine.home.path().join(".gemini")).unwrap();
+    let said = check();
+    assert!(
+        said.contains(
+            "Gemini CLI is installed on this computer and no AgentSCM setup was found for it"
+        ) && said.contains("`agentscm client setup --agent gemini`"),
+        "{said}"
+    );
+    assert!(!said.contains("Cursor is installed"), "{said}");
+
+    // A later quickstart sets up every agent it finds, the new one included.
+    quickstart(&[]);
+    assert_eq!(
+        machine.connections()[0]["agents"],
+        json!(["cursor", "gemini"])
+    );
+    let said = check();
+    assert!(!said.contains("no AgentSCM setup was found"), "{said}");
+}

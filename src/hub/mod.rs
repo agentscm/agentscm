@@ -1,5 +1,6 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
+pub mod agent_messages;
 pub mod agent_rules;
 pub mod capacity;
 pub mod catchup;
@@ -13,6 +14,8 @@ pub mod conversation_sharing;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
+pub mod digest;
+pub mod digest_http;
 pub mod dismissals;
 pub mod error_envelope;
 pub mod external_runs;
@@ -33,6 +36,7 @@ pub mod login;
 pub mod mcp;
 pub mod narrative;
 pub mod onboarding;
+mod overlap_detail;
 pub mod pickup;
 #[cfg(unix)]
 pub mod pipeline_rules;
@@ -42,6 +46,7 @@ pub mod promise;
 mod promise_http;
 pub mod provider_context;
 pub mod publish;
+pub mod reply;
 mod repository_summary;
 pub mod session;
 pub mod session_waiting;
@@ -62,6 +67,7 @@ mod validation_summary;
 pub mod value_metrics;
 pub mod view_settings;
 pub mod viewer;
+pub mod why;
 pub mod work;
 pub mod work_http;
 pub mod work_issues;
@@ -145,8 +151,14 @@ impl fmt::Display for HubError {
             Self::Busy => write!(f, "busy"),
             Self::WorkCapacity(capacity) => write!(
                 f,
-                "capacity reached: {}; operator action required",
-                capacity.limit.what()
+                "capacity reached: {} (limit {}; {})",
+                capacity.limit.what(),
+                capacity.limit.as_str(),
+                if capacity.limit.agent_remedy().is_some() {
+                    "the refused agent can clear it"
+                } else {
+                    "operator action required"
+                }
             ),
             Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
             Self::WorkCoordinationRequired { .. } => {
@@ -211,8 +223,9 @@ const WORK_COMPACTION_BUSY_ATTEMPTS: usize = 12;
 
 /// Applies the operator `work compact` to every repository scope with history older than
 /// [`WORK_AUTO_COMPACTION_AGE_SECONDS`], with that command's own guards. Returns the applied
-/// results and how many scopes were skipped: refused by a guard, such as an unacknowledged
-/// delivery, or the store stayed busy. Each scope is a separate bounded store call.
+/// results and how many scopes were skipped: refused by a guard or the store stayed busy. An open
+/// delivery the pass would cut is ended, not a reason to skip, so a busy repository still
+/// compacts. Each scope is a separate bounded store call.
 pub async fn compact_work_history(
     state: &HubState,
     now: i64,
@@ -480,6 +493,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(digest_http::routes())
         .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
         .merge(continuity::routes())

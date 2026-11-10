@@ -51,6 +51,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/session/handoff/ask", post(person_ask))
         .merge(super::pickup::routes())
         .merge(super::dismissals::routes())
+        .merge(super::agent_messages::routes())
         .merge(super::conversation_sharing::routes())
 }
 

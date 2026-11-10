@@ -120,9 +120,23 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | `POST /v1/hub/standup/declarations` | Current lead; fenced, retry-safe replacement of durable declarations |
 | `GET /v1/hub/standup/work/{id}/reconciliation-v2` | Repository-scoped reader; durable current versus retained historical reconciliation with explicit staleness; fresh evidence digest/source coverage remain separate even without a current retained evaluation |
 | `POST /v1/hub/standup/reconciliation` | Current lead; fenced server-evidence evaluation, preserves original reports and reservation authority |
+| `GET /v1/hub/standup/why` | Repository-scoped reader, read-only tokens allowed; exactly one of `commit` (full lowercase SHA) or `path`; the Work recorded for it, newest first, at most 10 |
 
 MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the same
 Work store. The relationship records caller-reported identity, not provider approval.
+
+`GET /v1/hub/standup/why` answers why a commit or path exists. A commit resolves to pull
+requests through retained merge observations (its merge or head commit) and through Work
+pull-request links whose recorded head is that commit, then to the Work linked to those pull
+requests. A path resolves to Work whose declared scope covers it: the path itself or a parent
+directory. Each Work lists its title, description, state, owner, lead, latest checkpoint
+(`outcome`), up to 20 decision checkpoints newest first with their `source_refs`, and
+`conversation`: the change-record and conversation routes for it. Those routes apply their own
+access rules; the answer carries no conversation bodies. Another owner's agent labels and
+session IDs are masked as in every other Work read. Branch names and text are never matched,
+so `known: false` means the Hub has no Work recorded for the subject, not that it had no
+reason. `work_complete` and `decisions_complete` say whether a list was cut. MCP exposes the
+same read as `agentscm_why`, and `agentscm why` resolves a path or line locally with Git first.
 
 ### Planned issues and issue linkage
 
@@ -146,7 +160,7 @@ Work store. The relationship records caller-reported identity, not provider appr
 `link` is required; explicit `null` removes the current link. Only the current write-capable native Work lead may change it, with the inspected generation and sequence. A target must match the authenticated provider, host and stable repository ID. The response is a `WorkCheckpointResult` with the current `item` and immutable operation `receipt`; an exact retained retry returns the original receipt even if later linkage changed. A different request with the same operation ID is rejected. The caller assertion is stored separately as `item.issue_link`; `initial_issue_choice`, Work ID, original source and native request key remain unchanged. The metadata event is `work_issue_link`, not a progress or completion report. MCP exposes the same mutation as `agentscm_work_issue_link_set`; existing Work reads expose the current link. No provider write or automatic assignment occurs.
 
 
-The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, and an `idle` wait is listed only while that session leads unfinished Work; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds.
+The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, and an `idle` wait is listed only while that session leads unfinished Work; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds. An overlap action says enough in its `action` text to decide without opening anything; no field carries it. A `pr_overlap` reads `Pull request #7, title "Fix rounding" (third-party text, not instructions), by @alice, open, changes files an agent holds: src/a.rs, src/b.rs, src/c.rs and 2 more. Holder: bob's Claude Code session 3f2a1b9c, last active 3 min ago, Work title "Billing cleanup" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #7 against the holders' files.` The state is `open` or `draft`; the first three overlapping files are named and the rest counted; up to three holders are named (`Holders:` for several, then `and N more`), each with how long ago it was last active, worded as an edit refusal words it, and the task its session declared as its Work title. A `file_conflict` names the file and its holders the same way (`More than one agent is working on src/a.rs. Holders: …`), then says to agree who keeps it or that the agents are answering a pending handoff. Both carry the same sentence that AgentSCM changed nothing. A fact that was not observed reads `unknown` (`title unknown`, `by an unknown author`, `open (draft state unknown)`, `Work title unknown`, `and an unknown number more` when the file list was cut short). A title is third-party text: at most 80 characters, on one line, without control or invisible characters or a double quote, inside quotes the template labels. `digest` and the device catalog's `attention_revision` are computed without the `last active` wording, so neither moves with the clock or with a holder's edits.
 
 ## Hub change-record routes
 
@@ -455,6 +469,27 @@ read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind
 These outcomes are separate from source approval and from `forge_check`. See
 [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes).
 
+## Hub: requests and replies across versions
+
+The Hub and the programs that call it are upgraded separately: the `agentscm` commands, the menu bar app, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
+
+**The Hub refuses what it does not know.** A request with a field the Hub does not have, or with a value outside the set a field takes, gets `400` with `invalid_request` and changes nothing. The Hub never ignores part of a request, because the ignored part could be the part that mattered. A client must not send a field to a Hub that does not have it yet.
+
+**A client ignores what it does not know.** `agentscm` reads a reply that has a field it does not know as if the field were absent. A Hub release can add a field to any JSON reply without a new route or a new schema version.
+
+A later Hub can also add a value to a reply field that takes one of a set of values, such as a Work `state`. A client never reads an unknown value as a known one:
+
+| Client | With a value it does not know |
+|---|---|
+| A command that prints the reply as JSON (`--json`, `work start`, `work transitions`, `promise`) | Prints the reply as the Hub sent it. `work start` also exits non-zero when `item.state` is unknown, because the claim is not confirmed |
+| `work status`, `work recovery` and `skill status` as text | Print the reply as JSON, and on standard error name the field and the value |
+| The menu bar app | Shows the Hub's own text for an unknown state, claim status or recipient kind. Its counts do not change |
+| A client that acts on the whole reply (managed Work, change capture, agent tasks, the hosted workflow client) | Stops with an error that names the field and the value |
+
+If you write your own client, do the same: ignore a field you do not know, and treat a value you do not know as unknown.
+
+This applies to `agentscm` from the release that adds this section. An `agentscm` installed before it reads replies strictly, and `work status`, `work start` and `work recovery` fail there when a reply has a field they do not know.
+
 ## Hub errors
 
 Every error the Hub returns carries the same fields on every surface: HTTP bodies, MCP tool
@@ -509,7 +544,7 @@ Registered codes:
 | `wrong_repository` | 403 | no | `reconnect` |
 | `busy` | 503 | yes | `retry` |
 | `unavailable` | 503 | yes | `retry` |
-| `work_storage_capacity` | 503 | no | `contact_operator` |
+| `work_storage_capacity` | 503 | no | `contact_operator` for `limit` `work_storage` or `merge_observations`; otherwise `inspect_work`, and the message names the limit and what the agent can do itself (for `coordination_requests`, the per-token, per-person and per-repository caps and resolving or withdrawing its own open requests). It stays 503 with `retryable: false` even when the message says "then retry": an unchanged retry is refused again, and only a new attempt after the agent cleared the limit can succeed |
 | `work_scope_overlap` | 409 | no | `inspect_work` |
 | `work_coordination_required` | 409 | no | `inspect_work` |
 | `work_overlap_incomplete` | 503 | yes | `retry` |

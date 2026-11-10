@@ -8,10 +8,12 @@ use agentscm::hub::promise::{
     DEFAULT_PROMISE_PAGE, MAX_PROMISE_PAGE, PromiseHistoryPageV1, PromiseInputReceiptV1,
     PromiseInputV1, PromisePageV1, PromiseViewV1,
 };
+use agentscm::hub::reply;
 use agentscm::{Error, Result};
 use clap::Subcommand;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::intent_cli::Hub;
 
@@ -69,19 +71,15 @@ pub async fn run(command: PromiseCommand) -> Result<()> {
                     query.append_pair("after", &after);
                 }
             }
-            let page: PromisePageV1 = read(
+            read::<PromisePageV1>(
                 &hub,
                 url.as_str()
                     .strip_prefix("http://hub")
                     .ok_or_else(|| invalid("invalid promise list URL"))?,
             )
-            .await?;
-            serde_json::to_value(page)?
+            .await?
         }
-        PromiseCommand::Show { id } => {
-            let view: PromiseViewV1 = read(&hub, &promise_path(&id)?).await?;
-            serde_json::to_value(view)?
-        }
+        PromiseCommand::Show { id } => read::<PromiseViewV1>(&hub, &promise_path(&id)?).await?,
         PromiseCommand::History {
             id,
             limit,
@@ -99,14 +97,13 @@ pub async fn run(command: PromiseCommand) -> Result<()> {
                     query.append_pair("before_version", &before.to_string());
                 }
             }
-            let page: PromiseHistoryPageV1 = read(
+            read::<PromiseHistoryPageV1>(
                 &hub,
                 url.as_str()
                     .strip_prefix("http://hub")
                     .ok_or_else(|| invalid("invalid promise history URL"))?,
             )
-            .await?;
-            serde_json::to_value(page)?
+            .await?
         }
         PromiseCommand::Propose { request } | PromiseCommand::Report { request } => {
             let input: PromiseInputV1 = read_request(&request)?;
@@ -117,15 +114,15 @@ pub async fn run(command: PromiseCommand) -> Result<()> {
                 .as_str()
                 .ok_or_else(|| invalid("hub did not identify the token repository"))?;
             validate_input(&input, proposal, repository)?;
-            let receipt: PromiseInputReceiptV1 = serde_json::from_value(
-                hub.call(
+            let receipt = hub
+                .call(
                     Method::POST,
                     &format!("{PATH}/inputs"),
                     Some(serde_json::to_value(input)?),
                 )
-                .await?,
-            )?;
-            serde_json::to_value(receipt)?
+                .await?;
+            reply::check::<PromiseInputReceiptV1>(&receipt)?;
+            receipt
         }
     };
     println!("{reply}");
@@ -147,8 +144,11 @@ fn validate_input(input: &PromiseInputV1, proposal: bool, repository: &str) -> R
     Ok(())
 }
 
-async fn read<T: DeserializeOwned>(hub: &Hub, path: &str) -> Result<T> {
-    serde_json::from_value(hub.call(Method::GET, path, None).await?).map_err(Error::from)
+/// The Hub's answer as it sent it, once it has the shape of `T`.
+async fn read<T: DeserializeOwned>(hub: &Hub, path: &str) -> Result<Value> {
+    let answer = hub.call(Method::GET, path, None).await?;
+    reply::check::<T>(&answer)?;
+    Ok(answer)
 }
 
 fn promise_path(id: &str) -> Result<String> {

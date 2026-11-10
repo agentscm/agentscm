@@ -54,6 +54,8 @@ mod cli;
 #[cfg(unix)]
 mod client_completion;
 #[cfg(unix)]
+mod client_replies;
+#[cfg(unix)]
 mod client_status;
 #[cfg(unix)]
 mod collisions_http;
@@ -104,6 +106,8 @@ mod guided_cli;
 #[cfg(unix)]
 mod guided_service;
 #[cfg(unix)]
+mod harness_coverage;
+#[cfg(unix)]
 mod history;
 mod hook_cli;
 mod hook_end_to_end;
@@ -130,6 +134,8 @@ mod hub_change_record_migration;
 mod hub_coordination;
 #[cfg(unix)]
 mod hub_devices;
+#[cfg(unix)]
+mod hub_digest;
 #[cfg(unix)]
 mod hub_external_runs;
 #[cfg(unix)]

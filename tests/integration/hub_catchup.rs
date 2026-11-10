@@ -16,13 +16,15 @@ use agentscm::hub::publish::{Create, NewPublication, Update, derive_id};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
 };
+use agentscm::hub::why::{self, WhyRelation, WhySubject};
 use agentscm::hub::work::{
-    BriefingQuery, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverviewQuery,
+    BriefingQuery, CheckpointKind, SourceRef, WorkCheckpoint, WorkItem, WorkOverviewQuery,
     WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
 use agentscm::hub::work_lifecycle::{
     MergeStatus, OperationalOverviewV1, OutcomeValue, ReservationStatus,
 };
+use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
 use agentscm::hub::work_preflight::{
     WorkPreflightReason, WorkPreflightRequest, WorkPreflightStatus,
 };
@@ -707,38 +709,36 @@ fn compaction_delivery_guard(fixture: &Fixture) {
         repository: REPOSITORY.into(),
         repository_id: Some(144),
     };
-    assert!(
-        fixture
-            .store
-            .work_compact(&work_scope, now - 86_400, false, now)
-            .unwrap_err()
-            .to_string()
-            .contains("work compaction is blocked by an unacknowledged catch-up delivery")
-    );
-    while !page.complete {
-        page = fixture
-            .store
-            .work_catchup(&token, &continuation(&page, 1), now)
-            .unwrap();
-    }
-    fixture
-        .store
-        .work_catchup_ack(
-            &token,
-            &CatchupAck {
-                delivery: page.delivery,
-                expected_event_from: page.event_from,
-                expected_merge_from: page.merge_from,
-            },
-            now + 1,
-        )
-        .unwrap();
+    // A live, half-read delivery no longer blocks compaction: a busy repository still compacts.
     let compacted = fixture
         .store
         .work_compact(&work_scope, now - 86_400, true, now + 1)
         .unwrap();
     assert_eq!(compacted.deleted_merge_observations, 1);
     assert_eq!(compacted.merge_retention_floor, 1);
+    // Its window started below the raised floor, so it is ended instead of skipping records.
+    let ended = fixture
+        .store
+        .work_catchup(&token, &continuation(&page, 1), now + 1);
+    assert!(
+        ended
+            .unwrap_err()
+            .to_string()
+            .contains("unknown catch-up delivery")
+    );
+    page = fixture
+        .store
+        .work_catchup(
+            &token,
+            &CatchupQuery {
+                delivery_client: "live-client".into(),
+                limit: 1,
+                ..CatchupQuery::default()
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert!(page.retention.merge_gap);
     assert!(
         !fixture
             .store
@@ -2197,6 +2197,512 @@ fn postgres_catchup_contracts() {
         return;
     };
     contracts(&fixture);
+}
+
+/// What `why` needs survives compaction: the Work, its decision checkpoints and the pull request
+/// a merge commit belongs to, after the merge observation and superseded versions are gone.
+fn why_resolves_after_compaction(fixture: &Fixture) {
+    let now = unix_now();
+    let old = now - 200_000;
+    let owner = fixture.owner(46);
+    // An older client's label names its host; another owner sees it masked.
+    let token = fixture.token(&owner, "client-laptop.example-a1b2c3", 146, false);
+    let (old_merge, _) = merge(146, old);
+    fixture
+        .store
+        .record_catchup_merge(&scope(146), &old_merge, old)
+        .unwrap();
+    let started = fixture
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("why-compaction".into()),
+                title: "Keep why answers".into(),
+                description: Some("Explains the change.".into()),
+                session: "why-session".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/why/**".into()],
+                branch: Some("feature-146".into()),
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            old,
+        )
+        .unwrap();
+    let mut seq = started.item.updated_seq;
+    for (at, kind, summary) in [
+        (
+            old + 1,
+            CheckpointKind::Decision,
+            "Chose a derived pull table",
+        ),
+        (old + 2, CheckpointKind::Progress, "Wrote the table"),
+    ] {
+        seq = fixture
+            .store
+            .work_checkpoint(
+                &token,
+                &WorkCheckpoint {
+                    work_id: started.item.id.clone(),
+                    operation_id: format!("why-{at}"),
+                    generation: 1,
+                    session: "why-session".into(),
+                    expected_updated_seq: Some(seq),
+                    kind,
+                    summary: summary.into(),
+                    next_action: None,
+                    scope: None,
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: vec![SourceRef::CapturedEvent {
+                        session_id: "why-session".into(),
+                        event_id: "evt-1".into(),
+                    }],
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                },
+                at,
+            )
+            .unwrap()
+            .item
+            .updated_seq;
+    }
+    fixture
+        .store
+        .work_pr_link_set(
+            &token,
+            &WorkPrLinkUpdate {
+                work_id: started.item.id.clone(),
+                operation_id: "why-link".into(),
+                generation: 1,
+                session: "why-session".into(),
+                expected_updated_seq: seq,
+                link: Some(WorkPrLinkTarget {
+                    repository_id: 146,
+                    number: 146,
+                    head_sha: old_merge.head_commit.clone(),
+                }),
+            },
+            old + 3,
+        )
+        .unwrap();
+    let work_scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: Some(146),
+    };
+    let compacted = fixture
+        .store
+        .work_compact(&work_scope, now - 86_400, true, now)
+        .unwrap();
+    assert_eq!(compacted.deleted_merge_observations, 1);
+    assert!(compacted.deleted_versions >= 1, "{compacted:?}");
+
+    let why = |subject: WhySubject| fixture.store.work_why(&token, &subject, now).unwrap();
+    for commit in [&old_merge.merge_commit, &old_merge.head_commit] {
+        let answer = why(WhySubject::Commit(commit.clone()));
+        assert!(answer.known && answer.work_complete, "{answer:?}");
+        assert_eq!(answer.pull_requests[0].number, 146);
+        assert_eq!(
+            answer.pull_requests[0].merge_commit.as_deref(),
+            Some(old_merge.merge_commit.as_str())
+        );
+        let work = &answer.work[0];
+        assert_eq!(work.id, started.item.id);
+        assert_eq!(work.relation, WhyRelation::PullRequest);
+        assert_eq!(work.description.as_deref(), Some("Explains the change."));
+        assert_eq!(work.outcome.as_ref().unwrap().summary, "Wrote the table");
+        assert_eq!(work.decisions.len(), 1);
+        assert_eq!(work.decisions[0].summary, "Chose a derived pull table");
+        assert!(work.conversation.conversation.ends_with("/conversation"));
+    }
+    let by_path = why(WhySubject::Path("src/why/answer.rs".into()));
+    assert_eq!(by_path.work[0].id, started.item.id);
+    assert_eq!(by_path.work[0].relation, WhyRelation::Scope);
+    assert_eq!(by_path.work[0].decisions.len(), 1);
+    for unknown in [
+        WhySubject::Commit("f".repeat(40)),
+        WhySubject::Path("src/whys.rs".into()),
+    ] {
+        let answer = why(unknown);
+        assert!(!answer.known && answer.work.is_empty(), "{answer:?}");
+    }
+    let found = fixture
+        .store
+        .work_search(&token, Some("derived pull"), None, 10, now)
+        .unwrap();
+    assert_eq!(found.items[0].id, started.item.id);
+
+    // Another owner's read-only token sees the answer with this owner's sessions digested.
+    let reader = fixture.token(&fixture.owner(47), "why-reader", 146, true);
+    let theirs = fixture
+        .store
+        .work_why(&reader, &WhySubject::Path("src/why/answer.rs".into()), now)
+        .unwrap();
+    let (mine, other) = (&by_path.work[0], &theirs.work[0]);
+    assert_eq!(mine.decisions[0].session, "why-session");
+    assert_ne!(other.decisions[0].session, "why-session");
+    assert_eq!(mine.lead_agent, "client-laptop.example-a1b2c3");
+    assert_eq!(other.lead_agent, "client-host-a1b2c3");
+    assert_eq!(other.decisions[0].agent, "client-host-a1b2c3");
+    let captured = |work: &agentscm::hub::why::WhyWork| match &work.decisions[0].source_refs[0] {
+        SourceRef::CapturedEvent { session_id, .. } => session_id.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(captured(mine), "why-session");
+    assert_ne!(captured(other), "why-session");
+    assert_eq!(
+        theirs.work[0].decisions[0].summary,
+        "Chose a derived pull table"
+    );
+    // A token of another repository finds nothing of this one.
+    let elsewhere = fixture.token_for_repository(&owner, "why-elsewhere", "acme/other", 147, false);
+    let other = fixture
+        .store
+        .work_why(
+            &elsewhere,
+            &WhySubject::Commit(old_merge.merge_commit.clone()),
+            now,
+        )
+        .unwrap();
+    assert!(!other.known && other.pull_requests.is_empty(), "{other:?}");
+}
+
+/// More Work than one answer lists, and more decisions than one Work lists, are marked cut.
+fn why_marks_cut_lists(fixture: &Fixture) {
+    let now = unix_now();
+    let owner = fixture.owner(48);
+    let token = fixture.token(&owner, "why-many", 148, false);
+    let last = why::WHY_WORK;
+    for n in 0..=last {
+        let session = format!("why-many-{n}");
+        let started = fixture
+            .store
+            .work_start(
+                &token,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: Some(session.clone()),
+                    title: format!("Many {n}"),
+                    description: None,
+                    session: session.clone(),
+                    role: WorkRole::Lead,
+                    scope: vec!["src/many/**".into()],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                now + n as i64,
+            )
+            .unwrap();
+        let mut seq = started.item.updated_seq;
+        // The newest Work records more decisions than an answer lists; each Work then finishes,
+        // which frees the scope for the next start.
+        let decisions = if n == last { why::WHY_DECISIONS + 1 } else { 0 };
+        for d in 0..=decisions {
+            let kind = if d == decisions {
+                CheckpointKind::Finish
+            } else {
+                CheckpointKind::Decision
+            };
+            seq = fixture
+                .store
+                .work_checkpoint(
+                    &token,
+                    &WorkCheckpoint {
+                        work_id: started.item.id.clone(),
+                        operation_id: format!("{session}-{d}"),
+                        generation: 1,
+                        session: session.clone(),
+                        expected_updated_seq: Some(seq),
+                        kind,
+                        summary: format!("decision {d}"),
+                        next_action: None,
+                        scope: None,
+                        branch: None,
+                        worktree: None,
+                        resolve_blocker: false,
+                        source_refs: Vec::new(),
+                        depends_on: Vec::new(),
+                        related_work: Vec::new(),
+                    },
+                    now + n as i64,
+                )
+                .unwrap()
+                .item
+                .updated_seq;
+        }
+    }
+    let answer = fixture
+        .store
+        .work_why(&token, &WhySubject::Path("src/many/x.rs".into()), now + 20)
+        .unwrap();
+    assert!(answer.known && !answer.work_complete, "{answer:?}");
+    assert_eq!(answer.work.len(), why::WHY_WORK);
+    let newest = &answer.work[0];
+    assert_eq!(newest.title, format!("Many {last}"));
+    assert!(!newest.decisions_complete);
+    assert_eq!(newest.decisions.len(), why::WHY_DECISIONS);
+    assert_eq!(
+        newest.decisions[0].summary,
+        format!("decision {}", why::WHY_DECISIONS)
+    );
+    assert!(answer.work[1].decisions_complete && answer.work[1].decisions.is_empty());
+}
+
+#[test]
+fn sqlite_why_marks_cut_lists() {
+    why_marks_cut_lists(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_why_marks_cut_lists() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    why_marks_cut_lists(&fixture);
+}
+
+/// Compaction keeps the newest 100,000 pull-commit rows of a repository and drops the lowest pull
+/// request numbers, outside any merge transaction.
+fn compaction_bounds_pull_commits(fixture: &Fixture) {
+    let now = unix_now();
+    let (merge, _) = merge(149, now - 200_000);
+    fixture
+        .store
+        .record_catchup_merge(&scope(149), &merge, now - 200_000)
+        .unwrap();
+    // 100,001 more rows for pull requests 1000..=101000, next to the recorded one (149).
+    let (bulk, count, lowest) = (
+        "INSERT INTO hub_catchup_pull_commits
+         SELECT p.provider, p.host, p.repository, p.repository_key, n, NUMBER_HEX, NUMBER_HEX
+         FROM (SELECT * FROM hub_catchup_pull_commits WHERE pull_number = 149) p, SERIES",
+        "SELECT COUNT(*) FROM hub_catchup_pull_commits WHERE repository_key = 149",
+        "SELECT MIN(pull_number) FROM hub_catchup_pull_commits WHERE repository_key = 149",
+    );
+    let read = |sql: &str| -> i64 {
+        if let Some(database) = &fixture.database {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            if sql.starts_with("INSERT") {
+                let sql = sql
+                    .replace("NUMBER_HEX", "printf('%040x', n)")
+                    .replace("SERIES", "(WITH RECURSIVE s(n) AS (SELECT 1000 UNION ALL SELECT n + 1 FROM s WHERE n < 101000) SELECT n FROM s)");
+                connection.execute(&sql, []).unwrap();
+                return 0;
+            }
+            return connection.query_row(sql, [], |row| row.get(0)).unwrap();
+        }
+        let mut client = Client::connect(&fixture._pg.as_ref().unwrap().url, NoTls).unwrap();
+        if sql.starts_with("INSERT") {
+            let sql = sql
+                .replace("NUMBER_HEX", "lpad(to_hex(n), 40, '0')")
+                .replace("SERIES", "generate_series(1000, 101000) AS n");
+            client.batch_execute(&sql).unwrap();
+            return 0;
+        }
+        client.query_one(sql, &[]).unwrap().get(0)
+    };
+    read(bulk);
+    assert_eq!(read(count), 100_002);
+    let work_scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: Some(149),
+    };
+    fixture
+        .store
+        .work_compact(&work_scope, now - 86_400, true, now)
+        .unwrap();
+    assert_eq!(read(count), 100_000);
+    assert_eq!(read(lowest), 1001);
+}
+
+/// The two why migrations backfill an existing database: a Work's newest 100 decisions (no more,
+/// so old Work does not keep extra until its next decision) and the PR-link number and head.
+fn why_migrations_backfill_existing_rows(fixture: &Fixture) {
+    let now = unix_now();
+    let owner = fixture.owner(50);
+    let token = fixture.token(&owner, "why-migrate", 150, false);
+    let started = fixture
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("why-migrate".into()),
+                title: "Migrate why".into(),
+                description: None,
+                session: "migrate".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/migrate.rs".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            now,
+        )
+        .unwrap();
+    let mut seq = started.item.updated_seq;
+    let mut decisions = Vec::new();
+    for n in 0..101 {
+        seq = fixture
+            .store
+            .work_checkpoint(
+                &token,
+                &WorkCheckpoint {
+                    work_id: started.item.id.clone(),
+                    operation_id: format!("migrate-{n}"),
+                    generation: 1,
+                    session: "migrate".into(),
+                    expected_updated_seq: Some(seq),
+                    kind: CheckpointKind::Decision,
+                    summary: format!("decision {n}"),
+                    next_action: None,
+                    scope: None,
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: Vec::new(),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                },
+                now,
+            )
+            .unwrap()
+            .item
+            .updated_seq;
+        decisions.push(seq);
+    }
+    let head = "c".repeat(40);
+    fixture
+        .store
+        .work_pr_link_set(
+            &token,
+            &WorkPrLinkUpdate {
+                work_id: started.item.id.clone(),
+                operation_id: "migrate-link".into(),
+                generation: 1,
+                session: "migrate".into(),
+                expected_updated_seq: seq,
+                link: Some(WorkPrLinkTarget {
+                    repository_id: 150,
+                    number: 77,
+                    head_sha: head.clone(),
+                }),
+            },
+            now,
+        )
+        .unwrap();
+    // Undo both migrations, then let the store apply them again over the existing rows.
+    const UNDO: [&str; 7] = [
+        "DROP TABLE hub_work_decisions",
+        "DROP INDEX hub_work_pr_links_number",
+        "DROP INDEX hub_work_pr_links_head",
+        "ALTER TABLE hub_work_pr_links DROP COLUMN number",
+        "ALTER TABLE hub_work_pr_links DROP COLUMN head_sha",
+        "DELETE FROM hub_named_migrations WHERE name='work_decisions'",
+        "DELETE FROM hub_named_migrations WHERE name='pr_link_columns'",
+    ];
+    let work = &started.item.id;
+    let read = format!(
+        "SELECT (SELECT COUNT(*) FROM hub_work_decisions WHERE work='{work}'),
+                (SELECT MIN(event_seq) FROM hub_work_decisions WHERE work='{work}'),
+                (SELECT number FROM hub_work_pr_links WHERE work='{work}'),
+                (SELECT head_sha FROM hub_work_pr_links WHERE work='{work}')"
+    );
+    let (store, row): (Arc<dyn Store>, (i64, i64, i64, String)) =
+        if let Some(database) = &fixture.database {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            UNDO.iter().for_each(|sql| {
+                connection.execute(sql, []).unwrap();
+            });
+            drop(connection);
+            let store = store::open(&format!("sqlite://{}", database.display())).unwrap();
+            let row = rusqlite::Connection::open(database)
+                .unwrap()
+                .query_row(&read, [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap();
+            (store, row)
+        } else {
+            let url = &fixture._pg.as_ref().unwrap().url;
+            let mut client = Client::connect(url, NoTls).unwrap();
+            UNDO.iter().for_each(|sql| {
+                client.execute(*sql, &[]).unwrap();
+            });
+            let store = store::open(url).unwrap();
+            let row = client.query_one(&read, &[]).unwrap();
+            (store, (row.get(0), row.get(1), row.get(2), row.get(3)))
+        };
+    assert_eq!(row, (100, decisions[1], 77, head.clone()));
+    let answer = store
+        .work_why(&token, &WhySubject::Commit(head), now)
+        .unwrap();
+    assert_eq!(answer.work[0].id, *work);
+    assert_eq!(answer.work[0].decisions[0].summary, "decision 100");
+}
+
+#[test]
+fn sqlite_why_migrations_backfill_existing_rows() {
+    why_migrations_backfill_existing_rows(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_why_migrations_backfill_existing_rows() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    why_migrations_backfill_existing_rows(&fixture);
+}
+
+#[test]
+fn sqlite_compaction_bounds_pull_commits() {
+    compaction_bounds_pull_commits(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_compaction_bounds_pull_commits() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    compaction_bounds_pull_commits(&fixture);
+}
+
+#[test]
+fn sqlite_why_resolves_after_compaction() {
+    why_resolves_after_compaction(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_why_resolves_after_compaction() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    why_resolves_after_compaction(&fixture);
 }
 
 #[test]
