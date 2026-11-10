@@ -969,8 +969,9 @@ pub trait Store: Send + Sync {
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
     /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, owner login,
-    /// id or scope contains it, whose source issue number it names, or whose lead agent label
-    /// contains it, except another owner's generated `client-…` label, which is masked.
+    /// id, scope or decision checkpoint summary contains it, whose source issue number it names,
+    /// or whose lead agent label contains it, except another owner's generated `client-…` label,
+    /// which is masked.
     /// An unknown cursor is `Invalid`.
     fn work_search(
         &self,
@@ -980,6 +981,14 @@ pub trait Store: Send + Sync {
         limit: usize,
         now: i64,
     ) -> Result<WorkSearchPage>;
+    /// The Work of the token's repository recorded for a commit or a path, with its decisions
+    /// (see [`super::why`]). A commit or path with no recorded Work answers `known: false`.
+    fn work_why(
+        &self,
+        token: &str,
+        subject: &super::why::WhySubject,
+        now: i64,
+    ) -> Result<super::why::WhyAnswer>;
     fn change_ingest(
         &self,
         token: &str,
