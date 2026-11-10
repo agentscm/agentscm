@@ -521,10 +521,17 @@ fn a_stalled_git_cannot_hold_a_client_hook_past_its_deadline() {
     }
 }
 
+/// What the stub Hub's poll replies, given the hook's own input hash.
+#[cfg(unix)]
+type Poll = fn(&Value) -> Value;
+/// Extra environment for one hook run.
+#[cfg(unix)]
+type Env<'a> = &'a [(&'a str, &'a str)];
+
 /// A stub Hub for one permission prompt: it records the wait, registers the request with
 /// `register`'s status, and answers each poll with what `poll` makes of the hook's own hash.
 #[cfg(unix)]
-fn permission_hub(register: u16, poll: fn(&Value) -> Value) -> (String, Receiver<Seen>) {
+fn permission_hub(register: u16, poll: Poll) -> (String, Receiver<Seen>) {
     serve(move |seen| {
         let body: Value = serde_json::from_slice(&seen.body).unwrap_or(Value::Null);
         let hash = &body["input_hash"];
@@ -544,7 +551,7 @@ fn permission_hub(register: u16, poll: fn(&Value) -> Value) -> (String, Receiver
 #[cfg(unix)]
 fn permission_prompt(
     (hub, seen): (String, Receiver<Seen>),
-    env: &[(&str, &str)],
+    env: Env,
     edit: fn(&mut Value),
 ) -> (Run, Vec<Seen>) {
     let dir = home();
@@ -584,7 +591,7 @@ fn answered(hash: &Value, decision: &str) -> Value {
 fn a_permission_prompt_takes_only_an_exact_answer_to_its_own_request() {
     const ALLOW: &str = "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"},\"hookEventName\":\"PermissionRequest\"}}\n";
     const DENY: &str = "{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"deny\",\"message\":\"Denied from the AgentSCM Hub by its person.\"},\"hookEventName\":\"PermissionRequest\"}}\n";
-    let cases: [(fn(&Value) -> Value, &str); 6] = [
+    let cases: [(Poll, &str); 6] = [
         (|hash| answered(hash, "allow"), ALLOW),
         (|hash| answered(hash, "deny"), DENY),
         // Another prompt's hash, input the hook never takes, a decision it does not know, and a
@@ -654,7 +661,7 @@ fn a_permission_prompt_is_left_to_the_session_when_it_cannot_be_answered_from_th
     assert!(run.elapsed < Duration::from_secs(10), "{:?}", run.elapsed);
     // Never offered, even to a Hub that would allow it.
     let allowing = || permission_hub(200, |hash| answered(hash, "allow"));
-    let cases: [(&[(&str, &str)], fn(&mut Value)); 3] = [
+    let cases: [(Env, fn(&mut Value)); 3] = [
         (&[("AGENTSCM_REMOTE_ANSWERS", "0")], |_| {}),
         (&[], |payload| payload["agent_id"] = json!("sub-1")),
         (&[], |payload| {

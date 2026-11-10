@@ -780,8 +780,14 @@ async fn list(
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
     let user = human.web_user()?.clone();
     validate_repository(&query.repository)?;
-    let repo =
-        super::login::devices::mint_check(&state, &user, &query.repository, "permissions").await?;
+    // A page polls this, and it shows only the caller's own requests, so it needs the
+    // repository's id alone. The answer makes the forge's role check.
+    let (store, host) = (state.store.clone(), user.identity.host.clone());
+    let repo = blocking(&state, move || {
+        store.repository_named(&host, &query.repository)
+    })
+    .await?
+    .ok_or_else(ApiError::not_found)?;
     let requests = state.onboarding.permissions().list(
         state.onboarding.waiting(),
         &user.id,
