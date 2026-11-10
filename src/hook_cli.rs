@@ -15,6 +15,8 @@ use crate::hub_cli::config_dir;
 use crate::intent_cli::{HubFile, parse_hub_file, repo_root, token_for, valid_repo};
 use crate::{client_config, client_config::Connection};
 
+mod permission;
+
 const LIMIT: Duration = Duration::from_secs(3);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
 const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
@@ -150,6 +152,7 @@ async fn hook(
     };
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
     let session_start = is_session_start(agent, &payload);
+    let host_session = host_session(agent, &payload);
     let wants_capture = client_connection
         && agent == "claude"
         && crate::change_capture_cli::captures_claude_event(&payload);
@@ -195,15 +198,52 @@ async fn hook(
         )
         .await
     };
-    let Some(capture) = early.or_else(|| (wants_capture && session_start).then(spawn_capture))
-    else {
-        return reply;
+    let capture = early.or_else(|| (wants_capture && session_start).then(spawn_capture));
+    let reply = match capture {
+        Some(capture) => {
+            let remaining = budget.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, capture).await {
+                Ok(Ok(Some(context))) => {
+                    within_context_limit(with_note(reply, agent, &payload, &context))
+                }
+                _ => reply,
+            }
+        }
+        None => reply,
     };
-    let remaining = budget.saturating_duration_since(Instant::now());
-    match tokio::time::timeout(remaining, capture).await {
-        Ok(Ok(Some(context))) => within_context_limit(with_note(reply, agent, &payload, &context)),
-        _ => reply,
+    // The record is written beside the Hub call; the process must not exit before it is.
+    if let Some(recording) = host_session {
+        let remaining = budget.saturating_duration_since(Instant::now());
+        let _ = tokio::time::timeout(remaining, recording).await;
     }
+    // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
+    // decision there. Any failure returns `reply`, which carries no decision.
+    if permission::applies(agent, client_connection, &payload) {
+        return permission::await_answer(&payload, started, reply).await;
+    }
+    reply
+}
+
+/// Keeps the record that the checkout's MCP server reads to name its calls with this
+/// conversation's session ([`crate::client_session`]): written when the session starts, dropped
+/// when it ends. Only an ID the Hub would accept as a session is recorded.
+fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<()>> {
+    let session = session_of(payload)
+        .filter(|id| id.len() <= 128 && !id.chars().any(char::is_control))?
+        .to_owned();
+    let config = config_dir().ok()?;
+    if is_session_start(agent, payload) {
+        return Some(tokio::task::spawn_blocking(move || {
+            crate::client_session::record(&config, &session);
+        }));
+    }
+    if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) {
+        crate::client_session::forget(&config, &session);
+    }
+    None
 }
 
 /// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
@@ -427,9 +467,39 @@ async fn call_hub(
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
             }
-            if note.is_none() && session_start {
-                note = crate::client_cli::attention(&routed.connection.root)
-                    .map(|message| format!("AgentSCM: {message}."));
+            let conflicted = unmerged(&routed.checkout, &routed.edits, deadline);
+            if !conflicted.is_empty() {
+                routed.edits.retain(|edit| !conflicted.contains(&edit.path));
+                routed.payload = sanitized_client(&agent, &payload, &routed.edits)?;
+                note = Some(conflict_note(&conflicted));
+            }
+            if session_start {
+                // Every connected session says where it coordinates, unless something stops it.
+                let coordinating = format!(
+                    "AgentSCM: coordinating on {} at {}.",
+                    routed.connection.repo, routed.connection.hub
+                );
+                note = Some(
+                    match (
+                        note.is_some(),
+                        crate::client_cli::attention(&routed.connection.root),
+                    ) {
+                        (true, _) => format!("{coordinating} This checkout was just connected."),
+                        (false, Some(message)) => format!("AgentSCM: {message}."),
+                        (false, None) => coordinating,
+                    },
+                );
+            }
+            if session_start
+                && let Some(also) = client_config::load().ok().and_then(|all| {
+                    let now = agentscm::hub::store::unix_now();
+                    also_connected(&routed.connection, &all, now)
+                })
+            {
+                note = Some(match note {
+                    Some(note) => format!("{note} {also}"),
+                    None => format!("AgentSCM: {also}"),
+                });
             }
             (
                 routed.connection.hub.clone(),
@@ -608,9 +678,7 @@ fn branch_advisory_at(
         if !branch_marker(config, &key, "start", deadline) {
             return None;
         }
-        let git = crate::quickstart::detect::which("git")
-            .and_then(|path| path.canonicalize().ok())
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        let git = git_exe();
         let snapshot = match agentscm::git_collisions::advisory_snapshot(&git, checkout, deadline) {
             Ok(snapshot) => snapshot,
             Err(_) => return Some("AgentSCM branch advisory: local branch coverage unknown; session-start scan unavailable. Edits remain allowed.".into()),
@@ -690,6 +758,48 @@ fn branch_advisory_at(
         snapshot.observed_at, snapshot.head, snapshot.base_name, snapshot.base_commit,
         if snapshot.incomplete { ", incomplete" } else { "" }, lines.join("; "),
     ))
+}
+
+/// The Git executable for the bounded local queries, which take an absolute path.
+#[cfg(unix)]
+fn git_exe() -> PathBuf {
+    crate::quickstart::detect::which("git")
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+}
+
+/// The edit paths Git reports as unmerged in `checkout`: a merge, rebase, cherry-pick, revert or
+/// stash apply stopped on them. Resolving such a conflict is not parallel authoring: both sides
+/// are already committed, and it has to be resolved in this checkout whoever holds the file. So
+/// these paths are not sent to the Hub; the edit is checked against no hold and takes none. The
+/// normal check returns when Git no longer lists the path. Empty when Git cannot say.
+#[cfg(unix)]
+fn unmerged(checkout: &Path, edits: &[EditPath], deadline: Instant) -> Vec<String> {
+    if edits.is_empty() {
+        return Vec::new();
+    }
+    let paths: Vec<&str> = edits.iter().map(|edit| edit.path.as_str()).collect();
+    let deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+    // shortcut: one Git call for every edit (10 to 20 ms), look for Git's in-progress markers first if hook time matters
+    agentscm::git_collisions::unmerged_paths(&git_exe(), checkout, &paths, deadline)
+        .unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn unmerged(_: &Path, _: &[EditPath], _: Instant) -> Vec<String> {
+    Vec::new()
+}
+
+/// Said beside an edit of unmerged paths, so that it does not read as a silent pass.
+fn conflict_note(paths: &[String]) -> String {
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| agentscm::hub::advice::sanitize(path, 160))
+        .collect();
+    format!(
+        "AgentSCM: unresolved Git conflict in {} in this checkout, so this edit was not checked against other agents' holds and holds nothing. Change only what resolves the conflict; the normal check returns once Git no longer reports the path as unmerged.",
+        paths.join(", ")
+    )
 }
 
 #[cfg(unix)]
@@ -1123,6 +1233,8 @@ struct RoutedClient {
     checkout: PathBuf,
     endpoint_agent: String,
     payload: Value,
+    /// The call's edit paths, relative to `checkout`.
+    edits: Vec<EditPath>,
 }
 
 fn patch_text(input: &Value) -> Option<&str> {
@@ -1368,7 +1480,39 @@ fn route_client_with(
         connection,
         checkout,
         endpoint_agent: endpoint_agent.to_owned(),
+        edits: normalized,
     })
+}
+
+/// One sentence for the start context that names the other repositories this computer can
+/// reach now, so an agent that edits one of them knows its AgentSCM calls go there too. Names
+/// only, at most six; a connection whose managed token has expired is left out.
+fn also_connected(current: &Connection, connections: &[Connection], now: i64) -> Option<String> {
+    const LISTED: usize = 6;
+    let mut others: Vec<&str> = connections
+        .iter()
+        .filter(|other| other.hub != current.hub || !other.repo.eq_ignore_ascii_case(&current.repo))
+        .filter(|other| {
+            other
+                .owned_token_expires_at
+                .is_none_or(|expiry| expiry > now)
+        })
+        .map(|other| other.repo.as_str())
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    let more = others.len().saturating_sub(LISTED);
+    others.truncate(LISTED);
+    if others.is_empty() {
+        return None;
+    }
+    let mut names = others.join(", ");
+    if more > 0 {
+        names.push_str(&format!(" and {more} more"));
+    }
+    Some(format!(
+        "Also connected on this computer: {names}. An AgentSCM call with absolute paths in one of them, or with `root` set to its checkout, goes to that repository."
+    ))
 }
 
 /// A start-of-session event, when an agent begins a conversation.
@@ -3461,6 +3605,30 @@ mod tests {
         let root = parent.join(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_start_context_names_the_other_repositories_this_computer_can_reach() {
+        let here = std::env::temp_dir();
+        let current = connection(&here, "acme/widgets");
+        assert_eq!(
+            also_connected(&current, std::slice::from_ref(&current), 100),
+            None
+        );
+        let mut expired = connection(&here, "acme/expired");
+        expired.owned_token_expires_at = Some(100);
+        let mut all = vec![current.clone(), expired, connection(&here, "acme/gadgets")];
+        // A second checkout of a repository does not list it twice.
+        all.push(connection(&here, "acme/gadgets"));
+        let sentence = also_connected(&current, &all, 100).unwrap();
+        assert!(
+            sentence.starts_with("Also connected on this computer: acme/gadgets. "),
+            "{sentence}"
+        );
+        assert!(sentence.contains("`root`"), "{sentence}");
+        all.extend((0..7).map(|n| connection(&here, &format!("acme/more-{n}"))));
+        let sentence = also_connected(&current, &all, 100).unwrap();
+        assert!(sentence.contains("acme/more-4 and 2 more."), "{sentence}");
     }
 
     #[test]

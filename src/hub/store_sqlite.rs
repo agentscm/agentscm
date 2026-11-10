@@ -46,7 +46,7 @@ use super::coordination::{
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_hub_via,
+    status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -100,6 +100,7 @@ use super::store::{
     plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
     validate_display_name, validate_login,
 };
+use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
@@ -108,8 +109,8 @@ use super::work::{
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
-    claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
-    work_overlap_pairs, work_payload_row_bytes,
+    claim_status, delivery_cuts, fit_json_budget, normalized_scope, scope_overlap_reasons,
+    uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_lifecycle::{
     CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
@@ -1234,6 +1235,20 @@ fn sqlite_record_catchup_merge(
             repository_key,
             seq + 1,
             observed_at
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_catchup_pull_commits
+            (provider,host,repository,repository_key,pull_number,head_commit,merge_commit)
+         VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING",
+        params![
+            scope.provider,
+            scope.host,
+            repository,
+            repository_key,
+            merge.pull_number,
+            merge.head_commit,
+            merge.merge_commit
         ],
     )?;
     let merged_at = merge.occurred_at.unwrap_or(observed_at);
@@ -2586,6 +2601,26 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     }
     event.at = item.updated_at;
     Ok(event)
+}
+
+/// Keeps `item`'s current decision checkpoint for `why` and search, and at most the newest
+/// [`why::MAX_WORK_DECISIONS`] of its Work.
+fn record_decision(tx: &Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+    let Some(decision) = &item.current else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO hub_work_decisions (work, event_seq, summary, checkpoint)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![item.id, seq, decision.summary, json_string(decision)?],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_work_decisions WHERE work = ?1 AND event_seq <= (
+             SELECT event_seq FROM hub_work_decisions WHERE work = ?1
+             ORDER BY event_seq DESC LIMIT 1 OFFSET ?2)",
+        params![item.id, why::MAX_WORK_DECISIONS],
+    )?;
+    Ok(())
 }
 
 /// Returns the stored snapshot so callers can size it without serializing the item again.
@@ -4506,6 +4541,7 @@ fn start_in(
                 if !named {
                     return Err(HubError::lease_lapsed(lapsed_unheld_text(
                         &item.id,
+                        item.generation,
                         renewed,
                         expired,
                         Unheld::UnnamedStart,
@@ -5948,6 +5984,7 @@ fn guard_managed_touch(
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
         return Err(HubError::lease_lapsed(lapsed_unheld_text(
             &eligible[0].id,
+            eligible[0].generation,
             renewed,
             expired,
             Unheld::Edit,
@@ -7345,6 +7382,9 @@ fn work_checkpoint_in(
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
     let snapshot = save_work_version(tx, &item, seq)?;
+    if checkpoint.kind == super::work::CheckpointKind::Decision {
+        record_decision(tx, &item, seq)?;
+    }
     match checkpoint.kind {
         super::work::CheckpointKind::Finish => {
             set_work_reservation(tx, &item.id, Some("completed"), None, now)?;
@@ -7734,6 +7774,7 @@ impl Store for SqliteStore {
         name: &str,
         digest: &TokenDigest,
         replaces: Option<&str>,
+        app: Option<&str>,
         now: i64,
     ) -> Result<String> {
         validate_device_name(name)?;
@@ -7741,9 +7782,9 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inserted = tx.execute(
-            "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at)
-             SELECT ?1, id, ?3, ?4, ?5, ?5 FROM hub_users WHERE id = ?2 AND disabled = 0",
-            params![id, owner, name, digest.as_str(), now],
+            "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at, app_id)
+             SELECT ?1, id, ?3, ?4, ?5, ?5, ?6 FROM hub_users WHERE id = ?2 AND disabled = 0",
+            params![id, owner, name, digest.as_str(), now, app],
         )?;
         if inserted == 0 {
             return Err(HubError::Invalid("unknown or disabled owner".into()));
@@ -7751,7 +7792,20 @@ impl Store for SqliteStore {
         if let Some(old) = replaces {
             revoke_device_in(&tx, old, Some(owner), owner, now)?;
         }
-        append(&tx, &Event::device_created(&id, owner, name)?)?;
+        // One credential per person per app: reconnecting retires the earlier ones.
+        if let Some(app) = app {
+            let earlier = tx
+                .prepare(
+                    "SELECT id FROM hub_devices
+                     WHERE owner = ?1 AND app_id = ?2 AND id <> ?3 AND revoked_at IS NULL",
+                )?
+                .query_map(params![owner, app, id], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+            for old in earlier {
+                revoke_device_in(&tx, &old, Some(owner), owner, now)?;
+            }
+        }
+        append(&tx, &Event::device_created(&id, owner, name, app)?)?;
         tx.commit()?;
         Ok(id)
     }
@@ -7920,7 +7974,7 @@ impl Store for SqliteStore {
         let found = conn
             .query_row(
                 "SELECT d.id, d.name, d.created_at, d.last_used_at,
-                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, d.app_id
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE d.digest = ?1 AND d.revoked_at IS NULL
                    AND COALESCE(d.last_used_at, d.created_at) > ?2",
@@ -7942,6 +7996,7 @@ impl Store for SqliteStore {
                             name: None,
                             disabled: row.get(9)?,
                         },
+                        app_id: row.get(10)?,
                     })
                 },
             )
@@ -7964,7 +8019,7 @@ impl Store for SqliteStore {
         let mut devices = conn
             .prepare(
                 "SELECT d.id, d.name, d.created_at, d.last_used_at, d.revoked_at,
-                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, d.app_id
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE (?1 IS NULL OR d.owner = ?1)
                    AND (d.revoked_at IS NULL OR d.revoked_at > ?3)
@@ -7989,6 +8044,7 @@ impl Store for SqliteStore {
                         disabled: row.get(10)?,
                     },
                     repositories: Vec::new(),
+                    app_id: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -8009,6 +8065,23 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let revoked = revoke_device_in(&tx, device, owner, by, now)?;
+        tx.commit()?;
+        Ok(revoked)
+    }
+
+    fn revoke_unregistered_apps(&self, registered: &[String], by: &str, now: i64) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale = tx
+            .prepare("SELECT id, app_id FROM hub_devices WHERE app_id IS NOT NULL AND revoked_at IS NULL")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut revoked = 0;
+        for (id, app) in stale {
+            if !registered.contains(&app) && revoke_device_in(&tx, &id, None, by, now)? {
+                revoked += 1;
+            }
+        }
         tx.commit()?;
         Ok(revoked)
     }
@@ -10687,6 +10760,7 @@ impl Store for SqliteStore {
         {
             return Err(HubError::lease_lapsed(lapsed_unheld_text(
                 &item.id,
+                item.generation,
                 renewed,
                 expired,
                 Unheld::Retain,
@@ -11538,11 +11612,12 @@ impl Store for SqliteStore {
         let snapshot = save_work_version(&tx, &item, seq)?;
         let link = work_links::asserted_link(&who, update, seq, now);
         let new_link = link.as_ref().map(json_string).transpose()?;
-        if let Some(snapshot) = &new_link {
+        if let (Some(snapshot), Some(link)) = (&new_link, &link) {
             tx.execute(
-                "INSERT INTO hub_work_pr_links (work,snapshot) VALUES (?1,?2)
-                        ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",
-                params![item.id, snapshot],
+                "INSERT INTO hub_work_pr_links (work,snapshot,number,head_sha) VALUES (?1,?2,?3,?4)
+                        ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot,
+                        number=excluded.number,head_sha=excluded.head_sha",
+                params![item.id, snapshot, link.target.number, link.target.head_sha],
             )?;
         } else {
             tx.execute("DELETE FROM hub_work_pr_links WHERE work=?1", [&item.id])?;
@@ -11630,7 +11705,9 @@ impl Store for SqliteStore {
                AND (?7 IS NULL OR w.source_issue = ?8
                  OR lower(w.title) LIKE ?7 ESCAPE '\\' OR lower(w.branch) LIKE ?7 ESCAPE '\\'
                  OR ((lt.owner = ?10 OR w.lead_agent NOT LIKE 'client-%') AND lower(w.lead_agent) LIKE ?7 ESCAPE '\\') OR lower(u.login) LIKE ?7 ESCAPE '\\'
-                 OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\')
+                 OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\'
+                 OR EXISTS (SELECT 1 FROM hub_work_decisions d
+                   WHERE d.work = w.id AND lower(d.summary) LIKE ?7 ESCAPE '\\'))
              ORDER BY w.created_at DESC, w.id DESC LIMIT ?9",
         )?;
         let items = statement
@@ -11665,6 +11742,165 @@ impl Store for SqliteStore {
         drop(statement);
         tx.commit()?;
         Ok(WorkSearchPage::of(items, limit))
+    }
+
+    fn work_why(&self, token: &str, subject: &WhySubject, now: i64) -> Result<WhyAnswer> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let (provider, host) = (&who.owner.identity.provider, &who.owner.identity.host);
+        let mut pulls = Vec::new();
+        let more = (why::WHY_WORK + 1) as i64;
+        let mut unscanned = false;
+        // (Work id, pull request), newest Work first.
+        let matches: Vec<(String, Option<i64>)> = match subject {
+            WhySubject::Commit(commit) => {
+                let mut statement = tx.prepare(
+                    "SELECT pull_number, head_commit, merge_commit FROM hub_catchup_pull_commits
+                     WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4
+                       AND (merge_commit=?5 OR head_commit=?5)
+                     ORDER BY pull_number DESC LIMIT ?6",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        provider,
+                        host,
+                        repository_namespace(&who.repository, who.repository_id),
+                        catchup_repository_key(who.repository_id),
+                        commit,
+                        why::WHY_PULLS as i64
+                    ],
+                    |row| {
+                        Ok(WhyPullRequest {
+                            number: row.get(0)?,
+                            head_commit: Some(row.get(1)?),
+                            merge_commit: Some(row.get(2)?),
+                        })
+                    },
+                )?;
+                for pull in rows {
+                    why::add_pull(&mut pulls, pull?);
+                }
+                drop(statement);
+                let numbers = json_string(&pulls.iter().map(|p| p.number).collect::<Vec<_>>())?;
+                let mut statement = tx.prepare(
+                    "SELECT w.id, l.number, l.head_sha
+                     FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
+                     WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
+                       AND w.repository_id IS ?4
+                       AND (l.head_sha = ?5 OR l.number IN (SELECT value FROM json_each(?6)))
+                     ORDER BY w.created_at DESC, w.id DESC LIMIT ?7",
+                )?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            provider,
+                            host,
+                            who.repository,
+                            who.repository_id,
+                            commit,
+                            numbers,
+                            more
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|(id, number, head)| {
+                        if head == *commit {
+                            why::add_pull(
+                                &mut pulls,
+                                WhyPullRequest {
+                                    number,
+                                    head_commit: Some(head),
+                                    merge_commit: None,
+                                },
+                            );
+                        }
+                        (id, Some(number))
+                    })
+                    .collect()
+            }
+            WhySubject::Path(path) => {
+                let entries = json_string(&why::covering_scope_entries(path))?;
+                // Only the newest WHY_SCAN Work are scanned; older ones leave the answer cut.
+                unscanned = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM hub_work_items
+                     WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
+                     ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET ?5)",
+                    params![
+                        provider,
+                        host,
+                        who.repository,
+                        who.repository_id,
+                        why::WHY_SCAN as i64
+                    ],
+                    |row| row.get(0),
+                )?;
+                let mut statement = tx.prepare(
+                    "SELECT w.id FROM (SELECT id, scope, created_at FROM hub_work_items
+                         WHERE provider = ?1 AND host = ?2 AND repository = ?3
+                           AND repository_id IS ?4
+                         ORDER BY created_at DESC, id DESC LIMIT ?7) w
+                     WHERE EXISTS (SELECT 1 FROM json_each(?5) c WHERE instr(w.scope, c.value) > 0)
+                     ORDER BY w.created_at DESC, w.id DESC LIMIT ?6",
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            provider,
+                            host,
+                            who.repository,
+                            who.repository_id,
+                            entries,
+                            more,
+                            why::WHY_SCAN as i64
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, None)),
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+        };
+        let relation = match subject {
+            WhySubject::Commit(_) => WhyRelation::PullRequest,
+            WhySubject::Path(_) => WhyRelation::Scope,
+        };
+        let mut work = Vec::new();
+        for (id, pull_number) in matches {
+            let Some(item) = scoped_work(&tx, &who, &id, now)? else {
+                continue;
+            };
+            let decisions = tx
+                .prepare(
+                    "SELECT event_seq, checkpoint FROM hub_work_decisions WHERE work = ?1
+                     ORDER BY event_seq DESC LIMIT ?2",
+                )?
+                .query_map(params![id, (why::WHY_DECISIONS + 1) as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .map(|row| {
+                    let (seq, checkpoint) = row?;
+                    Ok((seq, json_value(&checkpoint)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            work.push(why::work(
+                why::WhyWorkFacts {
+                    item,
+                    relation,
+                    pull_number,
+                    decisions,
+                },
+                super::viewer::Viewer(&who.owner.id),
+            ));
+        }
+        tx.commit()?;
+        Ok(why::answer(subject, pulls, work, unscanned))
     }
 
     fn change_ingest(
@@ -14450,42 +14686,6 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let catchup_repository = repository_namespace(&scope.repository, scope.repository_id);
-        let active_deliveries: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM hub_work_deliveries
-             WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-               AND acknowledged = 0 AND updated_at >= ?5",
-            params![
-                scope.provider,
-                scope.host,
-                scope.repository,
-                scope.repository_id,
-                now.saturating_sub(86_400)
-            ],
-            |row| row.get(0),
-        )?;
-        if active_deliveries > 0 {
-            return Err(HubError::Invalid(
-                "work compaction is blocked by an unacknowledged briefing delivery".into(),
-            ));
-        }
-        let active_catchup_deliveries: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM hub_catchup_deliveries
-             WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
-               AND acknowledged=0 AND superseded=0 AND updated_at>=?5",
-            params![
-                scope.provider,
-                scope.host,
-                catchup_repository,
-                scope.repository_id,
-                now.saturating_sub(86_400)
-            ],
-            |row| row.get(0),
-        )?;
-        if active_catchup_deliveries > 0 {
-            return Err(HubError::Invalid(
-                "work compaction is blocked by an unacknowledged catch-up delivery".into(),
-            ));
-        }
         let (current_merge_floor, merge_highwater): (i64, i64) = tx
             .query_row(
                 "SELECT merge_floor_seq,next_merge_seq-1 FROM hub_catchup_repositories
@@ -14669,6 +14869,23 @@ impl Store for SqliteStore {
                     ],
                 )?;
             }
+            // The copy of which pull request a commit belongs to is bounded like the merge
+            // observations it comes from: the lowest pull request numbers go first.
+            tx.execute(
+                "DELETE FROM hub_catchup_pull_commits
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
+                   AND pull_number <= (SELECT pull_number FROM hub_catchup_pull_commits
+                       WHERE provider=?1 AND host=?2 AND repository=?3
+                         AND repository_key=ifnull(?4,-1)
+                       ORDER BY pull_number DESC LIMIT 1 OFFSET ?5)",
+                params![
+                    scope.provider,
+                    scope.host,
+                    catchup_repository,
+                    scope.repository_id,
+                    MAX_CATCHUP_MERGE_ROWS
+                ],
+            )?;
             tx.execute(
                 "DELETE FROM hub_work_deliveries
                  WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
@@ -14851,6 +15068,43 @@ impl Store for SqliteStore {
                     )?;
                 }
             }
+            // An open delivery pages the live tables, so one whose window starts below a raised
+            // floor would skip removed records; end it, and the agent's next read reports the gap.
+            let (event_cut, merge_cut) = delivery_cuts(
+                [
+                    current_event_floor,
+                    current_snapshot_floor,
+                    current_coordination_floor,
+                ],
+                [event_floor, retention_floor, coordination_floor],
+                current_merge_floor,
+                merge_retention_floor,
+            );
+            tx.execute(
+                "DELETE FROM hub_work_deliveries
+                 WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
+                   AND acknowledged = 0 AND from_seq < ?5",
+                params![
+                    scope.provider,
+                    scope.host,
+                    scope.repository,
+                    scope.repository_id,
+                    event_cut
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_catchup_deliveries
+                 WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
+                   AND acknowledged=0 AND (event_from<?5 OR merge_from<?6)",
+                params![
+                    scope.provider,
+                    scope.host,
+                    catchup_repository,
+                    scope.repository_id,
+                    event_cut,
+                    merge_cut
+                ],
+            )?;
             let charged = work_payload_bytes(
                 &tx,
                 &scope.provider,
@@ -14920,6 +15174,24 @@ impl Store for SqliteStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(scopes)
+    }
+
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT charged_bytes FROM hub_work_usage
+                 WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4",
+                params![
+                    scope.provider,
+                    scope.host,
+                    scope.repository,
+                    scope.repository_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
     }
 
     fn work_briefing_preview_for(
@@ -15308,11 +15580,11 @@ impl Store for SqliteStore {
             "coordination_responded",
             &request.id,
             now,
-            with_hub_via(
+            with_via(
                 json!({"response_id": response_id, "target_work_id": target.work_id,
                     "kind": response_kind_name(reply.kind), "token": who.token,
                     "session": reply.session, "generation": target.generation}),
-                reply.via_hub,
+                reply.via.tag(),
             ),
         )?;
         let seq = append(&tx, &event)?;
@@ -15336,7 +15608,7 @@ impl Store for SqliteStore {
                 reply.note,
                 now,
                 seq,
-                reply.via_hub.then_some("hub")
+                reply.via.tag()
             ],
         )?;
         tx.execute(
@@ -15595,9 +15867,9 @@ impl Store for SqliteStore {
             "coordination_withdrawn",
             &request.id,
             now,
-            with_hub_via(
+            with_via(
                 json!({"by": who.token, "session": withdraw.session, "reason": reason}),
-                withdraw.via_hub,
+                withdraw.via_hub.then_some("hub"),
             ),
         )?;
         let seq = append(&tx, &event)?;

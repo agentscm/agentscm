@@ -48,7 +48,7 @@ use super::coordination::{
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_hub_via,
+    status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -102,6 +102,7 @@ use super::store::{
     plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
     validate_display_name, validate_login,
 };
+use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
@@ -110,8 +111,8 @@ use super::work::{
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
-    claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
-    work_overlap_pairs, work_payload_row_bytes,
+    claim_status, delivery_cuts, fit_json_budget, normalized_scope, scope_overlap_reasons,
+    uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_lifecycle::{
     CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
@@ -179,6 +180,9 @@ const PUBLICATION_LOCK_CLASS: i32 = 0x6167_6570;
 const WORK_DELIVERY_LOCK_CLASS: i32 = 0x6167_6578;
 /// Serializes every payload-growing effect in a complete repository identity.
 const WORK_CAPACITY_LOCK_CLASS: i32 = 0x6167_6579;
+/// Serializes app connects per person and app, so a reconnect always sees the credential
+/// it retires.
+const APP_CONNECT_LOCK_CLASS: i32 = 0x6167_6561;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
@@ -1037,6 +1041,20 @@ fn pg_record_catchup_merge(
             &key,
             &(seq + 1),
             &observed_at,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_catchup_pull_commits
+            (provider,host,repository,repository_key,pull_number,head_commit,merge_commit)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &merge.pull_number,
+            &merge.head_commit,
+            &merge.merge_commit,
         ],
     )?;
     let merged_at = merge.occurred_at.unwrap_or(observed_at);
@@ -2567,6 +2585,26 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     }
     event.at = item.updated_at;
     Ok(event)
+}
+
+/// Keeps `item`'s current decision checkpoint for `why` and search, and at most the newest
+/// [`why::MAX_WORK_DECISIONS`] of its Work.
+fn record_decision(tx: &mut postgres::Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+    let Some(decision) = &item.current else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO hub_work_decisions (work, event_seq, summary, checkpoint)
+         VALUES ($1, $2, $3, $4)",
+        &[&item.id, &seq, &decision.summary, &json_string(decision)?],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_work_decisions WHERE work = $1 AND event_seq <= (
+             SELECT event_seq FROM hub_work_decisions WHERE work = $1
+             ORDER BY event_seq DESC LIMIT 1 OFFSET $2)",
+        &[&item.id, &why::MAX_WORK_DECISIONS],
+    )?;
+    Ok(())
 }
 
 /// Returns the stored snapshot so callers can size it without serializing the item again.
@@ -4361,6 +4399,7 @@ fn start_in(
                 if !named {
                     return Err(HubError::lease_lapsed(lapsed_unheld_text(
                         &item.id,
+                        item.generation,
                         renewed,
                         expired,
                         Unheld::UnnamedStart,
@@ -5789,6 +5828,7 @@ fn guard_managed_touch(
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
         return Err(HubError::lease_lapsed(lapsed_unheld_text(
             &eligible[0].id,
+            eligible[0].generation,
             renewed,
             expired,
             Unheld::Edit,
@@ -7169,6 +7209,9 @@ fn work_checkpoint_in(
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
     let snapshot = save_work_version(tx, &item, seq)?;
+    if checkpoint.kind == super::work::CheckpointKind::Decision {
+        record_decision(tx, &item, seq)?;
+    }
     match checkpoint.kind {
         super::work::CheckpointKind::Finish => {
             set_work_reservation(tx, &item.id, Some("completed"), None, now)?;
@@ -7553,17 +7596,26 @@ impl Store for PgStore {
         name: &str,
         digest: &TokenDigest,
         replaces: Option<&str>,
+        app: Option<&str>,
         now: i64,
     ) -> Result<String> {
         validate_device_name(name)?;
         let id = new_id("dev")?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            // Taken before any other lock: without it two racing connects each miss the
+            // other's uncommitted row below and both stay live.
+            if let Some(app) = app {
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                    &[&APP_CONNECT_LOCK_CLASS, &format!("{owner}\n{app}")],
+                )?;
+            }
             let inserted = tx.execute(
-                "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at)
-                 SELECT $1, id, $3, $4, $5, $5 FROM hub_users WHERE id = $2 AND NOT disabled
+                "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at, app_id)
+                 SELECT $1, id, $3, $4, $5, $5, $6 FROM hub_users WHERE id = $2 AND NOT disabled
                  FOR SHARE",
-                &[&id, &owner, &name, &digest.as_str(), &now],
+                &[&id, &owner, &name, &digest.as_str(), &now, &app],
             )?;
             if inserted == 0 {
                 return Err(HubError::Invalid("unknown or disabled owner".into()));
@@ -7573,7 +7625,23 @@ impl Store for PgStore {
             if let Some(old) = replaces {
                 revoke_device_in(&mut tx, old, Some(owner), owner, now)?;
             }
-            append(&mut tx, &Event::device_created(&id, owner, name)?)?;
+            // One credential per person per app: reconnecting retires the earlier ones.
+            if let Some(app) = app {
+                let earlier: Vec<String> = tx
+                    .query(
+                        "SELECT id FROM hub_devices
+                         WHERE owner = $1 AND app_id = $2 AND id <> $3 AND revoked_at IS NULL
+                         ORDER BY id",
+                        &[&owner, &app, &id],
+                    )?
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                for old in earlier {
+                    revoke_device_in(&mut tx, &old, Some(owner), owner, now)?;
+                }
+            }
+            append(&mut tx, &Event::device_created(&id, owner, name, app)?)?;
             tx.commit()?;
             Ok(id.clone())
         })
@@ -7758,7 +7826,8 @@ impl Store for PgStore {
             let found = client
                 .query_opt(
                     "SELECT d.id, d.name, d.created_at, d.last_used_at,
-                            u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                            u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled,
+                            d.app_id
                      FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                      WHERE d.digest = $1 AND d.revoked_at IS NULL
                        AND COALESCE(d.last_used_at, d.created_at) > $2",
@@ -7780,6 +7849,7 @@ impl Store for PgStore {
                         name: None,
                         disabled: row.get(9),
                     },
+                    app_id: row.get(10),
                 });
             if let Some(device) = found.as_ref()
                 && device
@@ -7804,7 +7874,8 @@ impl Store for PgStore {
                             SELECT DISTINCT t.repository FROM hub_agent_tokens t
                             WHERE t.device_id = d.id AND NOT t.revoked AND t.expires_at > $3
                               AND NOT t.read_only
-                            ORDER BY t.repository), '{}')
+                            ORDER BY t.repository), '{}'),
+                        d.app_id
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE ($1::text IS NULL OR d.owner = $1)
                    AND (d.revoked_at IS NULL OR d.revoked_at > $4)
@@ -7831,6 +7902,7 @@ impl Store for PgStore {
                         disabled: row.get(10),
                     },
                     repositories: row.get(11),
+                    app_id: row.get(12),
                 })
                 .collect())
         })
@@ -7840,6 +7912,30 @@ impl Store for PgStore {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let revoked = revoke_device_in(&mut tx, device, owner, by, now)?;
+            tx.commit()?;
+            Ok(revoked)
+        })
+    }
+
+    fn revoke_unregistered_apps(&self, registered: &[String], by: &str, now: i64) -> Result<usize> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let stale: Vec<String> = tx
+                .query(
+                    "SELECT id FROM hub_devices
+                     WHERE app_id IS NOT NULL AND revoked_at IS NULL AND NOT (app_id = ANY($1))
+                     ORDER BY id",
+                    &[&registered],
+                )?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let mut revoked = 0;
+            for id in stale {
+                if revoke_device_in(&mut tx, &id, None, by, now)? {
+                    revoked += 1;
+                }
+            }
             tx.commit()?;
             Ok(revoked)
         })
@@ -10619,7 +10715,7 @@ impl Store for PgStore {
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {
-                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
+                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id,item.generation, renewed, expired, Unheld::Retain)));
             }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
@@ -11467,11 +11563,18 @@ impl Store for PgStore {
             let snapshot = save_work_version(&mut tx, &item, seq)?;
             let link = work_links::asserted_link(&who, update, seq, now);
             let new_link = link.as_ref().map(json_string).transpose()?;
-            if let Some(snapshot) = &new_link {
+            if let (Some(snapshot), Some(link)) = (&new_link, &link) {
                 tx.execute(
-                    "INSERT INTO hub_work_pr_links (work,snapshot) VALUES ($1,$2)
-                            ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",
-                    &[&item.id, snapshot],
+                    "INSERT INTO hub_work_pr_links (work,snapshot,number,head_sha)
+                            VALUES ($1,$2,$3,$4)
+                            ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot,
+                            number=excluded.number,head_sha=excluded.head_sha",
+                    &[
+                        &item.id,
+                        snapshot,
+                        &link.target.number,
+                        &link.target.head_sha,
+                    ],
                 )?;
             } else {
                 tx.execute("DELETE FROM hub_work_pr_links WHERE work=$1", &[&item.id])?;
@@ -11561,7 +11664,9 @@ impl Store for PgStore {
                    AND ($7::text IS NULL OR w.source_issue = $8::text
                      OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
                      OR ((lt.owner = $10 OR w.lead_agent NOT LIKE 'client-%') AND w.lead_agent ILIKE $7 ESCAPE '\\') OR u.login ILIKE $7 ESCAPE '\\'
-                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
+                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\'
+                     OR EXISTS (SELECT 1 FROM hub_work_decisions d
+                       WHERE d.work = w.id AND d.summary ILIKE $7 ESCAPE '\\'))
                  ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
                 &[
                     &who.owner.identity.provider,
@@ -11592,6 +11697,148 @@ impl Store for PgStore {
                 .collect();
             tx.commit()?;
             Ok(WorkSearchPage::of(items, limit))
+        })
+    }
+
+    fn work_why(&self, token: &str, subject: &WhySubject, now: i64) -> Result<WhyAnswer> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let (provider, host) = (&who.owner.identity.provider, &who.owner.identity.host);
+            let mut pulls = Vec::new();
+            let more = (why::WHY_WORK + 1) as i64;
+            let mut unscanned = false;
+            // (Work id, pull request), newest Work first.
+            let matches: Vec<(String, Option<i64>)> = match subject {
+                WhySubject::Commit(commit) => {
+                    for row in tx.query(
+                        "SELECT pull_number, head_commit, merge_commit FROM hub_catchup_pull_commits
+                         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+                           AND (merge_commit=$5 OR head_commit=$5)
+                         ORDER BY pull_number DESC LIMIT $6",
+                        &[
+                            provider,
+                            host,
+                            &repository_namespace(&who.repository, who.repository_id),
+                            &catchup_repository_key(who.repository_id),
+                            commit,
+                            &(why::WHY_PULLS as i64),
+                        ],
+                    )? {
+                        why::add_pull(
+                            &mut pulls,
+                            WhyPullRequest {
+                                number: row.get(0),
+                                head_commit: Some(row.get(1)),
+                                merge_commit: Some(row.get(2)),
+                            },
+                        );
+                    }
+                    let numbers = pulls.iter().map(|p| p.number).collect::<Vec<i64>>();
+                    tx.query(
+                        "SELECT w.id, l.number, l.head_sha
+                         FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4
+                           AND (l.head_sha = $5 OR l.number = ANY($6))
+                         ORDER BY w.created_at DESC, w.id DESC LIMIT $7",
+                        &[
+                            provider,
+                            host,
+                            &who.repository,
+                            &who.repository_id,
+                            commit,
+                            &numbers,
+                            &more,
+                        ],
+                    )?
+                    .into_iter()
+                    .map(|row| {
+                        let (id, number, head): (String, i64, String) =
+                            (row.get(0), row.get(1), row.get(2));
+                        if head == *commit {
+                            why::add_pull(
+                                &mut pulls,
+                                WhyPullRequest {
+                                    number,
+                                    head_commit: Some(head),
+                                    merge_commit: None,
+                                },
+                            );
+                        }
+                        (id, Some(number))
+                    })
+                    .collect()
+                }
+                WhySubject::Path(path) => {
+                    // Only the newest WHY_SCAN Work are scanned; older ones leave the answer cut.
+                    unscanned = tx
+                        .query_one(
+                            "SELECT EXISTS (SELECT 1 FROM hub_work_items
+                             WHERE provider = $1 AND host = $2 AND repository = $3
+                               AND repository_id IS NOT DISTINCT FROM $4
+                             ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET $5)",
+                            &[
+                                provider,
+                                host,
+                                &who.repository,
+                                &who.repository_id,
+                                &(why::WHY_SCAN as i64),
+                            ],
+                        )?
+                        .get(0);
+                    tx.query(
+                        "SELECT w.id FROM (SELECT id, scope, created_at FROM hub_work_items
+                             WHERE provider = $1 AND host = $2 AND repository = $3
+                               AND repository_id IS NOT DISTINCT FROM $4
+                             ORDER BY created_at DESC, id DESC LIMIT $7) w
+                         WHERE EXISTS (SELECT 1 FROM unnest($5::text[]) c WHERE strpos(w.scope, c) > 0)
+                         ORDER BY w.created_at DESC, w.id DESC LIMIT $6",
+                        &[
+                            provider,
+                            host,
+                            &who.repository,
+                            &who.repository_id,
+                            &why::covering_scope_entries(path),
+                            &more,
+                            &(why::WHY_SCAN as i64),
+                        ],
+                    )?
+                    .into_iter()
+                    .map(|row| (row.get(0), None))
+                    .collect()
+                }
+            };
+            let relation = match subject {
+                WhySubject::Commit(_) => WhyRelation::PullRequest,
+                WhySubject::Path(_) => WhyRelation::Scope,
+            };
+            let mut work = Vec::new();
+            for (id, pull_number) in matches {
+                let Some(item) = scoped_work(&mut tx, &who, &id, now, false)? else {
+                    continue;
+                };
+                let decisions = tx
+                    .query(
+                        "SELECT event_seq, checkpoint FROM hub_work_decisions WHERE work = $1
+                         ORDER BY event_seq DESC LIMIT $2",
+                        &[&id, &((why::WHY_DECISIONS + 1) as i64)],
+                    )?
+                    .into_iter()
+                    .map(|row| Ok((row.get(0), json_value(row.get::<_, &str>(1))?)))
+                    .collect::<Result<Vec<_>>>()?;
+                work.push(why::work(
+                    why::WhyWorkFacts {
+                        item,
+                        relation,
+                        pull_number,
+                        decisions,
+                    },
+                    super::viewer::Viewer(&who.owner.id),
+                ));
+            }
+            tx.commit()?;
+            Ok(why::answer(subject, pulls, work, unscanned))
         })
     }
 
@@ -13171,40 +13418,6 @@ impl Store for PgStore {
                 scope.repository_id,
             )?;
             let catchup_repository=repository_namespace(&scope.repository,scope.repository_id);
-            let active_deliveries: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM hub_work_deliveries
-                     WHERE provider = $1 AND host = $2 AND repository = $3
-                       AND repository_id IS NOT DISTINCT FROM $4
-                       AND NOT acknowledged AND updated_at >= $5",
-                    &[
-                        &scope.provider,
-                        &scope.host,
-                        &scope.repository,
-                        &scope.repository_id,
-                        &now.saturating_sub(86_400),
-                    ],
-                )?
-                .get(0);
-            if active_deliveries > 0 {
-                return Err(HubError::Invalid(
-                    "work compaction is blocked by an unacknowledged briefing delivery".into(),
-                ));
-            }
-            let active_catchup_deliveries: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM hub_catchup_deliveries
-                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
-                       AND NOT acknowledged AND NOT superseded AND updated_at>=$5",
-                    &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,
-                        &now.saturating_sub(86_400)],
-                )?
-                .get(0);
-            if active_catchup_deliveries > 0 {
-                return Err(HubError::Invalid(
-                    "work compaction is blocked by an unacknowledged catch-up delivery".into(),
-                ));
-            }
             let(current_merge_floor,merge_highwater)=tx.query_opt(
                 "SELECT merge_floor_seq,next_merge_seq-1 FROM hub_catchup_repositories
                  WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)",
@@ -13352,6 +13565,24 @@ impl Store for PgStore {
                         AND repository=$3 AND repository_key=COALESCE($4::bigint,-1) AND seq<=$5",
                         &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,&merge_retention_floor])?;
                 }
+                // The copy of which pull request a commit belongs to is bounded like the merge
+                // observations it comes from: the lowest pull request numbers go first.
+                tx.execute(
+                    "DELETE FROM hub_catchup_pull_commits
+                     WHERE provider=$1 AND host=$2 AND repository=$3
+                       AND repository_key=COALESCE($4::bigint,-1)
+                       AND pull_number <= (SELECT pull_number FROM hub_catchup_pull_commits
+                           WHERE provider=$1 AND host=$2 AND repository=$3
+                             AND repository_key=COALESCE($4::bigint,-1)
+                           ORDER BY pull_number DESC LIMIT 1 OFFSET $5)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &catchup_repository,
+                        &scope.repository_id,
+                        &MAX_CATCHUP_MERGE_ROWS,
+                    ],
+                )?;
                 tx.execute(
                     "DELETE FROM hub_work_deliveries
                      WHERE provider = $1 AND host = $2 AND repository = $3
@@ -13530,6 +13761,44 @@ impl Store for PgStore {
                         )?;
                     }
                 }
+                // An open delivery pages the live tables, so one whose window starts below a raised
+                // floor would skip removed records; end it, and the agent's next read reports the gap.
+                let (event_cut, merge_cut) = delivery_cuts(
+                    [
+                        current_event_floor,
+                        current_snapshot_floor,
+                        current_coordination_floor,
+                    ],
+                    [event_floor, retention_floor, coordination_floor],
+                    current_merge_floor,
+                    merge_retention_floor,
+                );
+                tx.execute(
+                    "DELETE FROM hub_work_deliveries
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4
+                       AND NOT acknowledged AND from_seq < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &event_cut,
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM hub_catchup_deliveries
+                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
+                       AND NOT acknowledged AND (event_from<$5 OR merge_from<$6)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &catchup_repository,
+                        &scope.repository_id,
+                        &event_cut,
+                        &merge_cut,
+                    ],
+                )?;
                 let charged = work_payload_bytes(
                     &mut tx,
                     &scope.provider,
@@ -13600,6 +13869,24 @@ impl Store for PgStore {
                     repository_id: row.get(3),
                 })
                 .collect())
+        })
+    }
+
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64> {
+        self.run(true, |client| {
+            Ok(client
+                .query_opt(
+                    "SELECT charged_bytes FROM hub_work_usage
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0)))
         })
     }
 
@@ -14010,11 +14297,11 @@ impl Store for PgStore {
                 "coordination_responded",
                 &request.id,
                 now,
-                with_hub_via(
+                with_via(
                     json!({"response_id": response_id, "target_work_id": target.work_id,
                         "kind": response_kind_name(reply.kind), "token": who.token,
                         "session": reply.session, "generation": target.generation}),
-                    reply.via_hub,
+                    reply.via.tag(),
                 ),
             )?;
             let seq = append(&mut tx, &event)?;
@@ -14038,7 +14325,7 @@ impl Store for PgStore {
                     &reply.note,
                     &now,
                     &seq,
-                    &reply.via_hub.then_some("hub"),
+                    &reply.via.tag(),
                 ],
             )?;
             tx.execute(
@@ -14306,9 +14593,9 @@ impl Store for PgStore {
                 "coordination_withdrawn",
                 &request.id,
                 now,
-                with_hub_via(
+                with_via(
                     json!({"by": who.token, "session": withdraw.session, "reason": reason}),
-                    withdraw.via_hub,
+                    withdraw.via_hub.then_some("hub"),
                 ),
             )?;
             let seq = append(&mut tx, &event)?;

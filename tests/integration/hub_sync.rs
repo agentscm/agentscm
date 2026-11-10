@@ -4063,6 +4063,27 @@ async fn pr_context_http_and_mcp_share_retained_scope_and_head_contract() {
         .get(&format!("{path}&expected_head={head}"), Some(&agent))
         .await;
     assert_eq!(changed["head_relation"], "changed");
+    // A merged PR loses its open-state context but keeps the provider merge fact.
+    env.pull(5, |pull| {
+        pull.state = "closed".into();
+        pull.merged = true;
+        pull.merge_commit_sha = Some("e".repeat(40));
+    });
+    env.poll().await;
+    let (status, merged) = env.get(path, Some(&agent)).await;
+    assert_eq!(status, 200, "{merged}");
+    assert_eq!(merged["availability"], "merged", "{merged}");
+    assert_eq!(merged["merges"][0]["merge_commit"], "e".repeat(40));
+    assert_eq!(merged["merges"][0]["paths"], json!(["src/a.rs"]));
+    assert_eq!(merged["merges_complete"], true);
+    assert!(
+        merged["not_retained"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("provider_evidence"))
+    );
+    assert!(merged["pull_request"].is_null());
+    assert_eq!(merged["coverage"]["last_sync_partial"], false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

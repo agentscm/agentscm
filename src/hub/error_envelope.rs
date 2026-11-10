@@ -139,6 +139,11 @@ error_codes! {
     UserDisabled => ("user_disabled", 403, false, AskOwner, "Your account is turned off on this Hub; ask a Hub admin to turn it back on"),
     TooManyLogins => ("too_many_logins", 429, true, Wait, "Too many sign-in requests were made; wait before trying again."),
     DeviceRevoked => ("device_revoked", 403, false, SignIn, "This computer is no longer signed in; sign in again."),
+    AppNotAllowed => ("app_not_allowed", 403, false, None, "A connected app only reads, mints read-only tokens and answers requests for its person."),
+    AppReadOnly => ("app_read_only", 403, false, ProvideField, "A connected app mints read-only tokens only; send read_only: true."),
+    // The OAuth token endpoint's own codes (RFC 6749 section 5.2).
+    InvalidClient => ("invalid_client", 400, false, ContactOperator, "The app's client ID or secret was not accepted; check what the Hub operator registered for it."),
+    InvalidGrant => ("invalid_grant", 400, false, SignIn, "The authorization code is invalid, expired or already used; connect the app again."),
     PromiseConflict => ("promise_conflict", 409, false, InspectWork, "The promise changed; read its current version before sending a new request."),
     TooManyPublications => ("too_many_publications", 429, false, ContactOperator, "The publication limit was reached; ask the Hub operator to inspect retained publications."),
     AlreadyConnected => ("already_connected", 409, false, None, "This repository is already connected; use the existing connection."),
@@ -516,6 +521,12 @@ pub fn from_hub_error(error: &HubError) -> ErrorEnvelope {
             envelope
                 .details
                 .insert("limit".into(), json!(capacity.limit.as_str()));
+            // Only full storage needs the operator; every other limit is the agent's to clear.
+            if let Some(remedy) = capacity.limit.agent_remedy() {
+                let what = capacity.limit.what();
+                envelope.message = format!("{}{}: {remedy}.", what[..1].to_uppercase(), &what[1..]);
+                envelope.recovery = RecoveryAction::InspectWork.recovery();
+            }
         }
         HubError::WorkOverlap(overlaps) => {
             envelope.details.insert("overlaps".into(), json!(overlaps));

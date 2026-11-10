@@ -29,6 +29,7 @@ use super::store::{
 use super::{HubError, HubState, Result};
 use crate::team::auth::{generate_secret, token_digest};
 
+pub(super) mod apps;
 pub(super) mod devices;
 
 const SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.session.v1\0";
@@ -99,6 +100,8 @@ pub struct LoginConfig {
     admins: Vec<Entry>,
     /// Who may sign in besides the admins; empty means admins only.
     allowed: Vec<Entry>,
+    /// Connected apps from `AGENTSCM_HUB_APPS_FILE`; empty when it is not set.
+    apps: Vec<apps::App>,
 }
 
 #[derive(Debug)]
@@ -183,11 +186,19 @@ impl LoginConfig {
                 list.split(',').map(|text| entry(var, text)).collect()
             })
         };
+        let apps = apps::load(&lookup)?;
+        if !apps.is_empty() && providers.is_empty() {
+            return Err(HubError::Invalid(format!(
+                "{} needs GitHub or GitLab sign-in: people approve a connected app after signing in",
+                apps::APPS_FILE_ENV
+            )));
+        }
         Ok(Self {
             public_url,
             providers,
             admins: list("AGENTSCM_ADMINS")?,
             allowed: list("AGENTSCM_ALLOWED_USERS")?,
+            apps,
         })
     }
 }
@@ -349,6 +360,16 @@ impl<T> Table<T> {
         self.0.retain(|key, _| !key.starts_with(prefix));
     }
 
+    /// Like `take`, but an entry `owns` refuses stays put, so a stranger cannot spend it.
+    pub(super) fn take_if(&mut self, key: &str, now: i64, owns: impl Fn(&T) -> bool) -> Option<T> {
+        match self.0.get(key) {
+            Some((expires_at, value)) if *expires_at > now && owns(value) => {
+                self.0.remove(key).map(|(_, value)| value)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn take(&mut self, key: &str, now: i64) -> Option<T> {
         self.0
             .remove(key)
@@ -390,8 +411,12 @@ struct BrowserLogin {
 
 /// The page a web sign-in may return to (`?return_to=`): a same-origin path of plain segments
 /// ending in `/`, such as `/ui/` or `/next/`, and never an API route. Anything else is refused,
-/// so the sign-in cannot be used to redirect to another site.
+/// so the sign-in cannot be used to redirect to another site. A connected app's approval page is
+/// the one API route it may return to (see [`apps::return_path`]).
 fn web_return_path(path: &str) -> Option<&str> {
+    if apps::return_path(path) {
+        return Some(path);
+    }
     let plain = (2..=128).contains(&path.len())
         && path.starts_with('/')
         && path.ends_with('/')
@@ -487,6 +512,8 @@ struct Pending {
     role_checks: Table<bool>,
     /// Providers whose forge app refused device sign-in when last asked.
     no_device: std::collections::BTreeSet<String>,
+    /// Connected-app authorization codes, by code: single use, 60 seconds.
+    app_codes: Table<apps::Code>,
 }
 
 pub struct Login {
@@ -517,6 +544,7 @@ impl Login {
                 providers: Vec::new(),
                 admins: Vec::new(),
                 allowed: Vec::new(),
+                apps: Vec::new(),
             },
             forge: None,
             pending: Mutex::new(Pending::default()),
@@ -531,6 +559,16 @@ impl Login {
     /// Never held across an await.
     fn pending(&self) -> MutexGuard<'_, Pending> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A registered connected app by its client id.
+    fn app(&self, id: &str) -> Option<&apps::App> {
+        self.config.apps.iter().find(|app| app.id == id)
+    }
+
+    /// The client ids of every registered connected app.
+    pub(super) fn app_ids(&self) -> Vec<String> {
+        self.config.apps.iter().map(|app| app.id.clone()).collect()
     }
 
     fn provider(&self, name: &str) -> Option<(&Provider, &Forge)> {
@@ -717,6 +755,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/users/{id}/disable", post(disable))
         .route("/v1/hub/users/{id}/enable", post(enable))
         .merge(devices::routes())
+        .merge(apps::routes())
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -914,11 +953,13 @@ fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> 
             .query_pairs_mut()
             .append_pair("status", "refused")
             .append_pair("reason", error.code());
-        let location = format!(
-            "{}#/signed-in?{}",
-            pending.return_to,
-            query.query().unwrap_or_default()
-        );
+        // A connected app's approval page cannot word the reason; the Hub's own page can.
+        let page = if apps::return_path(&pending.return_to) {
+            "/ui/"
+        } else {
+            &pending.return_to
+        };
+        let location = format!("{page}#/signed-in?{}", query.query().unwrap_or_default());
         return found(&location, cookie_attributes("", 0));
     }
     // The CLI's loopback hears why, stops waiting, and sends the browser to the Hub page.
@@ -1000,10 +1041,12 @@ async fn callback_inner(
             store.insert_browser_session(&owner, &digest, now + SESSION_SECONDS, now)
         })
         .await?;
-        let mut response = found(
-            &format!("{}#home", pending.return_to),
-            cookie_attributes("", 0),
-        )?;
+        let location = if apps::return_path(&pending.return_to) {
+            pending.return_to.clone()
+        } else {
+            format!("{}#home", pending.return_to)
+        };
+        let mut response = found(&location, cookie_attributes("", 0))?;
         response.headers_mut().append(
             header::SET_COOKIE,
             HeaderValue::from_str(&browser_cookie_attributes(
@@ -1370,7 +1413,7 @@ async fn signed_reply(
 ) -> ApiResult<Value> {
     let mut out = signed.json();
     if let Some(device) = device {
-        let issued = devices::issue(state, &signed.user, device).await?;
+        let issued = devices::issue(state, &signed.user, device, None).await?;
         let key = session_digest(&signed.secret)?;
         if let Some((_, human)) = state.login.pending().sessions.0.get_mut(&key) {
             human.device = issued["id"].as_str().map(str::to_owned);

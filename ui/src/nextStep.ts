@@ -117,7 +117,7 @@ export function contestedStep(c: Pick<Contested, 'path'>, wanter: Person, holder
   return {
     human: `Agree who keeps it · ask ${holder.login} or ${wanter.login}`,
     decides: logins(holder.login, wanter.login),
-    prompts: [asPrompt(wanter, `${clean(whoOf(holder))} holds the file ${clean(c.path)}. Ask for it with agentscm_ask (that path) and a one-line reason, or work on something else first. ${DATA_NOTE}`)],
+    prompts: [asPrompt(wanter, `${clean(whoOf(holder))} holds the file ${clean(c.path)}. If their task text shows your change leaves their lines alone, edit it with patches to your own lines, not a whole-file rewrite; otherwise work on something else first, or ask for it with agentscm_ask (that path) and a one-line reason. ${DATA_NOTE}`)],
   }
 }
 

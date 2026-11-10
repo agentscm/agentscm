@@ -35,7 +35,7 @@ use super::session::{
 use super::session_waiting::WaitReason;
 use super::store::{Principal, Store, agent_token_digest, unix_now};
 use super::work::{Briefing, WorkItem, WorkOverview, WorkOverviewQuery, WorkState};
-use super::work_lifecycle::{CallPhase, EDIT_UNLINKED};
+use super::work_lifecycle::{CallPhase, EDIT_UNLINKED, WORK_UNDECLARED};
 use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
@@ -125,8 +125,8 @@ enum Kind {
     /// Any other tool call: renews the lead session's lease, writes nothing else, says nothing.
     /// A shell call's start and end keep the lease live while it runs.
     Activity(CallPhase),
-    /// The session stopped to wait for its person; its next call ends the wait. Writes nothing
-    /// to the store and says nothing.
+    /// The session stopped to wait for its person, or on its own background work; its next call
+    /// ends the wait. Writes nothing to the store and says nothing.
     Waiting(WaitReason),
     Done,
     Fail(&'static str),
@@ -174,6 +174,12 @@ struct Call {
     asker: Option<String>,
     /// What a wait asks of its person, as the hook client excerpted it. Kept only on a wait.
     asks: Option<String>,
+    /// This client's hook can carry added context at a prompt or checked tool call (Claude
+    /// Code, Codex, Cursor, Copilot's PascalCase hooks); Copilot CLI's and generic hooks cannot.
+    context_hook: bool,
+    /// The host's own notice that it shows a permission prompt to a person, which confirms a
+    /// request to answer that prompt from the Hub (`permission_answer`).
+    prompt_shown: bool,
 }
 
 struct Outcome {
@@ -372,6 +378,36 @@ async fn hook(
                         outcome.text.push_str("\nCoordination inbox is partial in this hook. Page agentscm_coordination_inbox before relying on coverage.");
                     }
                 }
+                // What the person sent this session from the Hub page, where this reply reaches
+                // the model: a prompt or a checked tool call that is not refused. The start
+                // context is cut to fit, so a message there waits for the next call instead.
+                let context = matches!(call.kind, Kind::Prompt | Kind::Check)
+                    && matches!(call.shape, Shape::Hook(_) | Shape::Snake | Shape::Camel)
+                    && outcome.deny.is_none()
+                    && !call.child;
+                super::agent_messages::note_hook(
+                    &principal.token_id,
+                    &session,
+                    &call.via,
+                    !call.child,
+                    call.context_hook,
+                    unix_now(),
+                );
+                // An unknown reply loses its text after the session's first, so it takes nothing.
+                // A take that finishes past the deadline is offered again later (REOFFER_SECS).
+                if context && outcome.status != "unknown" {
+                    let (store, via) = (state.store.clone(), call.via.clone());
+                    let taken = blocking(&state, move || {
+                        super::agent_messages::take(&*store, &principal, &session, &via, unix_now())
+                    });
+                    if let Ok(Ok(Some(text))) = timeout_at(deadline, taken).await {
+                        outcome.text.push('\n');
+                        outcome.text.push_str(&text);
+                        if outcome.status == "clean" {
+                            outcome.status = "fyi";
+                        }
+                    }
+                }
             }
             failed if outcome.status != "unknown" => {
                 let error = match failed {
@@ -485,6 +521,8 @@ impl Call {
             child: false,
             asker: None,
             asks: None,
+            context_hook: false,
+            prompt_shown: false,
         }
     }
 
@@ -574,13 +612,17 @@ impl Call {
             _ => return Self::failed(agent, "hook payload not understood"),
         };
         let scope = scope(&v, root);
-        match agent {
-            Agent::Claude | Agent::Codex => pascal(agent, &v, &scope),
-            Agent::Copilot if v.get("hook_event_name").is_some() => pascal(agent, &v, &scope),
-            Agent::Copilot => copilot(&v, &scope),
-            Agent::Cursor => cursor(&v, &scope),
-            Agent::Generic => generic(&v, &scope),
-        }
+        let (mut call, context_hook) = match agent {
+            Agent::Claude | Agent::Codex => (pascal(agent, &v, &scope), true),
+            Agent::Copilot if v.get("hook_event_name").is_some() => {
+                (pascal(agent, &v, &scope), true)
+            }
+            Agent::Copilot => (copilot(&v, &scope), false),
+            Agent::Cursor => (cursor(&v, &scope), true),
+            Agent::Generic => (generic(&v, &scope), false),
+        };
+        call.context_hook = context_hook;
+        call
     }
 
     /// Whether the reply can carry text to the agent, so a handoff can be delivered with it.
@@ -666,6 +708,9 @@ impl Call {
                     });
                     if let Err(error) = recorded {
                         eprintln!("hub: waiting hook not recorded: {error}");
+                    } else if self.prompt_shown {
+                        let requests = state.onboarding.permissions();
+                        requests.confirm(&principal.token_id, &native, unix_now());
                     }
                 }
                 Ok(Outcome::clean())
@@ -737,6 +782,55 @@ impl Call {
                 };
                 let mut outcome = Outcome::advice(advice.text, advice.stop);
                 outcome.deny = advice.deny;
+                // A session that declared no Work is invisible to its person and the team, and
+                // its waits never reach them. Its first edit of a file that can be held is refused
+                // once with the start call, or noted beside the edit where the host cannot refuse;
+                // a repeat passes, so nothing is locked. A subagent works under its parent.
+                let holdable: Vec<String> = self
+                    .paths
+                    .iter()
+                    .filter(|path| !super::session::never_hold(path))
+                    .cloned()
+                    .collect();
+                if coverage.item.is_none()
+                    && !self.child
+                    && !holdable.is_empty()
+                    && let Some(native) = self.session.as_deref()
+                    && state.onboarding.start_nudges().first(
+                        &principal.repository,
+                        &principal.token_id,
+                        native,
+                        unix_now(),
+                    )
+                {
+                    super::session::count_undeclared();
+                    let why = self.undeclared_text(&principal.repository, &holdable);
+                    outcome = if self.deny {
+                        // One refusal: any note on a file another session holds rides along, and
+                        // that note's own warn-once is spent, so the repeat passes both.
+                        let mut text = format!(
+                            "AgentSCM: {WORK_UNDECLARED}: this edit was not applied because {why} Then make the edit again. If it is not part of a task, repeat it unchanged: this refusal happens once per session. {NO_BYPASS}"
+                        );
+                        // A holder's refusal is in `deny`; a plain note is in `text`.
+                        let prior = outcome.deny.as_deref().unwrap_or(&outcome.text);
+                        if !prior.is_empty() {
+                            text = format!("{text}\n{prior}");
+                        }
+                        Outcome {
+                            deny: Some(text.clone()),
+                            text,
+                            status: "stop",
+                        }
+                    } else {
+                        let note = format!("AgentSCM: {WORK_UNDECLARED}: {why}");
+                        let text = if outcome.text.is_empty() {
+                            note
+                        } else {
+                            format!("{}\n{note}", outcome.text)
+                        };
+                        Outcome { text, ..outcome }
+                    };
+                }
                 if self.agent != Agent::Generic || self.via == "hook:gemini" {
                     state.onboarding.native(
                         &principal,
@@ -883,6 +977,17 @@ impl Call {
                 Ok(Outcome::clean())
             }
         }
+    }
+
+    /// Why a session that declared no Work in `repository` is told to, with the calls that
+    /// declare it through MCP or, when its tools are bound to another repository, the CLI.
+    fn undeclared_text(&self, repository: &str, paths: &[String]) -> String {
+        let session = self.session.as_deref().unwrap_or_default();
+        let named = serde_json::to_string(session).unwrap_or_default();
+        let paths = serde_json::to_string(paths).unwrap_or_default();
+        format!(
+            "this session has declared no Work in {repository}, so your person and other agents cannot see what it is doing, and when it stops to wait on your person they are not told. Declare it: call agentscm_start with session {named}, a short task title and paths {paths}. If your AgentSCM tools are bound to another repository, that call records the Work there instead: run `agentscm work start` inside this file's checkout with {{\"title\":\"<short task title>\",\"session\":{named},\"scope\":{paths}}} on standard input. When the task is done, call agentscm_done with outcome complete."
+        )
     }
 
     /// The refusal of an edit the Hub cannot link to a current assignment of this session, with
@@ -1271,14 +1376,23 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         // Fires only where a person types, so it reaches the session they are talking to. The
         // prompt itself is never read; the client does not forward it.
         Some("UserPromptSubmit") => call(Kind::Prompt, Shape::Hook("UserPromptSubmit")),
-        // Only the facts of the wait are read: never the message, tool input or question.
-        Some("PreToolUse") if tool == ASK_USER_QUESTION => waiting(WaitReason::Question),
+        // Only the facts of the wait are read: never the message, tool input or question. A
+        // question raises its own permission request, which must not turn its wait into a
+        // permission wait. Answering a permission prompt from the Hub is in `permission_answer`.
+        Some("PreToolUse" | "PermissionRequest") if tool == ASK_USER_QUESTION => {
+            waiting(WaitReason::Question)
+        }
         Some("PermissionRequest") => waiting(WaitReason::Permission),
         Some("Notification") => match notified(str_at(v, "notification_type")) {
-            Some(reason) => waiting(reason),
+            Some(reason) => {
+                let mut call = waiting(reason);
+                call.prompt_shown = reason == WaitReason::Permission;
+                call
+            }
             None => call(Kind::Ignore, Shape::Silent),
         },
-        // Paused on its own background work, which will resume it, not on the person.
+        // Paused on its own background work, which will resume it, not on the person: nobody
+        // is asked, but the Work it leads is not quiet.
         // The client sends the count; a legacy hook sends Claude Code's own list.
         Some("Stop")
             if v["background_tasks"].as_u64().is_some_and(|n| n > 0)
@@ -1286,7 +1400,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                     .as_array()
                     .is_some_and(|tasks| !tasks.is_empty()) =>
         {
-            call(Kind::Ignore, Shape::Silent)
+            call(Kind::Waiting(WaitReason::Background), Shape::Silent)
         }
         Some("Stop") => waiting(WaitReason::Idle),
         Some("PreToolUse") if is_edit(tool) => {
@@ -1311,6 +1425,7 @@ fn copilot(v: &Value, scope: &Scope) -> Call {
     let call = |kind, shape| {
         Call::new(Agent::Copilot, kind, shape)
             .session(str_at(v, "sessionId"))
+            .child(v.get("agentId").is_some())
             .asker(str_at(v, "agentId"))
     };
     if v.get("toolName").is_none() {
@@ -1688,6 +1803,26 @@ mod tests {
     }
 
     #[test]
+    fn hub_messages_ride_the_hooks_that_can_carry_context() {
+        let pascal: &[u8] = br#"{"hook_event_name":"SessionStart","session_id":"s"}"#;
+        let copilot_cli: &[u8] = br#"{"sessionId":"s","source":"new"}"#;
+        let cursor: &[u8] = br#"{"hook_event_name":"sessionStart","session_id":"s"}"#;
+        let generic: &[u8] = br#"{"event":"start","agent":"gemini","session":"s"}"#;
+        for (agent, body, carries) in [
+            (Agent::Claude, pascal, true),
+            (Agent::Codex, pascal, true),
+            (Agent::Copilot, pascal, true),
+            (Agent::Copilot, copilot_cli, false),
+            (Agent::Cursor, cursor, true),
+            (Agent::Generic, generic, false),
+        ] {
+            let call = Call::parse(agent, body, None);
+            assert_ne!(call.kind, Kind::Ignore, "{agent:?}");
+            assert_eq!(call.context_hook, carries, "{agent:?}");
+        }
+    }
+
+    #[test]
     fn context_is_cut_at_a_line_within_the_limit() {
         let units = |text: &str| text.chars().map(char::len_utf16).sum::<usize>();
         assert_eq!(fit_context("short\ntext", 100), "short\ntext");
@@ -2034,7 +2169,7 @@ mod tests {
 
     #[test]
     fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
-        use WaitReason::{Idle, Permission, Question};
+        use WaitReason::{Background, Idle, Permission, Question};
         let wait = |agent, v: Value| {
             let call = parse(agent, &v);
             assert_eq!(
@@ -2070,6 +2205,11 @@ mod tests {
             ),
             (
                 Agent::Claude,
+                json!({"hook_event_name":"PermissionRequest","session_id":"s","tool_name":"AskUserQuestion"}),
+                Some(Question),
+            ),
+            (
+                Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}),
                 Some(Idle),
             ),
@@ -2077,12 +2217,12 @@ mod tests {
             (
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","background_tasks":2}),
-                None,
+                Some(Background),
             ),
             (
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","background_tasks":[{"id":"b"}]}),
-                None,
+                Some(Background),
             ),
             (
                 Agent::Claude,
@@ -2163,6 +2303,10 @@ mod tests {
             &json!({"hook_event_name":"PermissionRequest","session_id":"s","agent_id":"sub-1"}),
         );
         assert_eq!((sub.child, sub.asker.as_deref()), (true, Some("sub-1")));
+        // Only the host's own notice says a prompt is on screen; the request for it does not.
+        assert!(!sub.prompt_shown);
+        assert!(parse(Agent::Claude, &note("permission_prompt")).prompt_shown);
+        assert!(!parse(Agent::Claude, &note("idle_prompt")).prompt_shown);
         let camel = parse(
             Agent::Copilot,
             &json!({"sessionId":"s","notification_type":"permission_prompt","agentId":"sub-2"}),

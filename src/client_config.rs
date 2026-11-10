@@ -634,8 +634,11 @@ pub(crate) fn connection_for_path<'a>(
 }
 
 /// The connection for the Git checkout containing `path`, and that checkout's root. A linked
-/// worktree of a registered checkout shares its Git directory and routes to it, so a session an
-/// editor starts in a new worktree needs no setup. A nested or separate clone never matches.
+/// worktree without its own connection routes to its main checkout's, so a session an editor
+/// starts in a new worktree needs no setup. It never borrows another linked worktree's: that
+/// token is that worktree's to remove, and a main checkout left without a connection must
+/// auto-connect rather than pick one up. A connection whose managed token has expired still
+/// routes, so session start can renew it. A nested or separate clone never matches.
 pub(crate) fn connection_for_checkout<'a>(
     connections: &'a [Connection],
     path: &Path,
@@ -648,12 +651,17 @@ pub(crate) fn connection_for_checkout<'a>(
     if let Some(connection) = connections.iter().find(|c| c.root == checkout) {
         return Some((connection, checkout));
     }
+    let main = main_checkout(&checkout);
+    if main == checkout {
+        return None;
+    }
     let common = common_dir(&checkout)?;
     connections
         .iter()
-        .filter(|connection| common_dir(&connection.root).as_deref() == Some(common.as_path()))
-        // Several checkouts of one repository may be registered; prefer the main worktree.
-        .min_by_key(|connection| connection.root.join(".git") != common)
+        .find(|connection| {
+            connection.root == main
+                && common_dir(&connection.root).as_deref() == Some(common.as_path())
+        })
         .map(|connection| (connection, checkout))
 }
 
@@ -1189,5 +1197,18 @@ mod tests {
             connection_for_checkout(&both, &third).map(|(connection, _)| &connection.root),
             Some(&main)
         );
+
+        // Without the main checkout's connection nothing is borrowed: not by the main checkout
+        // (it auto-connects) and not by a sibling worktree (that token is the sibling's).
+        let sibling_only = [connection(beside.canonicalize().unwrap(), "acme/widgets")];
+        assert_eq!(connection_for_checkout(&sibling_only, &main), None);
+        assert_eq!(connection_for_checkout(&sibling_only, &third), None);
+        assert!(connection_for_checkout(&sibling_only, &beside).is_some());
+
+        // An expired managed token still routes, so session start can renew it.
+        let mut stale = connection(main.clone(), "acme/widgets");
+        stale.owned_token_expires_at = Some(1);
+        assert!(connection_for_checkout(std::slice::from_ref(&stale), &main).is_some());
+        assert!(connection_for_checkout(&[stale], &third).is_some());
     }
 }

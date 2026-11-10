@@ -20,7 +20,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      statuses: read
+      statuses: write # the gate is also reported as a commit status on each PR head
       checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

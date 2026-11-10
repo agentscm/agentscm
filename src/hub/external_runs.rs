@@ -1,15 +1,66 @@
 //! Optional external CI and deployment outcomes seen for a landed revision.
 //! Observations only: nothing here feeds checks, admission or publication updates.
+use axum::Router;
+use axum::extract::{Json, Path, State};
+use axum::routing::get;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::HubState;
 use super::connection::{ConnectedRepository, Connection, is_lower_hex};
 use super::github::{Gh, GhError, parse_rfc3339};
-use super::http::blocking;
+use super::http::{ApiError, Reader, blocking};
+use super::intent::scope;
 use super::publish::{Update, merged_commit, publication_on_forge};
 use super::store::{Event, unix_now};
+use super::sync::find_repository;
 use super::{HubError, Result};
+
+pub fn routes() -> Router<HubState> {
+    Router::new().route("/v1/hub/repos/{repo}/after-merge", get(after_merge))
+}
+
+const OPT_IN: &str = "AGENTSCM_GITHUB_EXTERNAL_RUNS";
+
+/// Whether the Hub reads CI runs and deployments for this repository after a merge, decided as
+/// the watcher decides it: the connected repository's connection must be GitHub, and the
+/// repository's current name must be listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A repository the
+/// Hub has no connection for is not watched, however it is listed.
+async fn after_merge(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(repo): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    scope(&principal, &repo)?;
+    let (store, who) = (state.store.clone(), principal.clone());
+    let found = blocking(&state, move || {
+        let Some(repository) = find_repository(
+            &*store,
+            &who.owner.identity.host,
+            &who.repository,
+            who.repository_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(store
+            .connection(&repository.connection)?
+            .map(|connection| (connection, repository)))
+    })
+    .await?;
+    Ok(Json(match found {
+        None => json!({"repository": principal.repository,
+            "provider": principal.owner.identity.provider, "connected": false,
+            "supported": false, "watched": false, "opt_in": OPT_IN}),
+        Some((connection, repository)) => {
+            let supported = connection.provider == "github";
+            json!({"repository": principal.repository, "provider": connection.provider,
+                "connected": true, "supported": supported,
+                "watched": supported && state.sync.external_runs_enabled(&repository.full_name),
+                "opt_in": OPT_IN})
+        }
+    }))
+}
 
 const MAX_TEXT_CHARS: usize = 200;
 const MAX_URL_BYTES: usize = 2048;
@@ -841,5 +892,215 @@ mod tests {
         let mut value = wire_deployment();
         value["description"] = Value::Null;
         assert_eq!(deploy(&value, None).unwrap().name, "");
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    //! `GET /v1/hub/repos/{repo}/after-merge`: whether the Hub watches a repository's CI and
+    //! deployments after a merge, read with a read-only token.
+    use std::sync::Arc;
+
+    use crate::backend::LocalBackend;
+    use crate::hub::connection::NewConnection;
+    use crate::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token};
+    use crate::hub::sync::{self, Sync, SyncConfig};
+    use crate::hub::{HubState, router};
+    use reqwest::Method;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    struct Hub {
+        base: String,
+        store: Arc<dyn Store>,
+        client: reqwest::Client,
+        _dir: TempDir,
+    }
+
+    impl Hub {
+        /// `listed` is the operator's `AGENTSCM_GITHUB_EXTERNAL_RUNS`, if any.
+        async fn start(listed: Option<&'static str>) -> Self {
+            let dir = TempDir::new().unwrap();
+            let store = store::open(&format!(
+                "sqlite://{}",
+                dir.path().join("hub.sqlite").display()
+            ))
+            .unwrap();
+            let secrets = dir.path().join("secrets");
+            sync::prepare_secrets_dir(&secrets, true).unwrap();
+            let config = SyncConfig::from_lookup("http://127.0.0.1:1", secrets, 14, |name| {
+                (name == "AGENTSCM_GITHUB_EXTERNAL_RUNS")
+                    .then(|| listed.map(str::to_owned))
+                    .flatten()
+            })
+            .unwrap();
+            let objects = LocalBackend::open(dir.path().join("objects")).unwrap();
+            let state = HubState::new(store.clone(), Arc::new(objects))
+                .with_sync(Sync::new(config).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = router(state);
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self {
+                base,
+                store,
+                client: reqwest::Client::new(),
+                _dir: dir,
+            }
+        }
+
+        /// The Hub's connection to `host` (made once) and its repository row.
+        fn connect(&self, provider: &str, host: &str, repository: &str, repository_id: i64) {
+            let id = format!(
+                "con_{}",
+                if provider == "github" { "1" } else { "2" }.repeat(32)
+            );
+            let connection = match self.store.connection(&id).unwrap() {
+                Some(connection) => connection,
+                None => self
+                    .store
+                    .insert_connection(
+                        &NewConnection {
+                            id,
+                            provider: provider.into(),
+                            host: host.into(),
+                            kind: "pat".into(),
+                            app_id: None,
+                            app_slug: None,
+                            acts_as: Some("synthetic".into()),
+                        },
+                        "test",
+                    )
+                    .unwrap(),
+            };
+            self.store
+                .upsert_repository(&connection.id, host, repository_id, repository, None, None)
+                .unwrap();
+        }
+
+        fn token(
+            &self,
+            provider: &str,
+            host: &str,
+            repository: &str,
+            repository_id: i64,
+        ) -> String {
+            let owner = self
+                .store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: provider.into(),
+                        host: host.into(),
+                        user_id: repository_id,
+                    },
+                    &format!("contributor{repository_id}"),
+                )
+                .unwrap();
+            let (_, secret, _) = mint_bound_agent_token(
+                &*self.store,
+                &owner.id,
+                "test-agent",
+                repository,
+                repository_id,
+                3600,
+                true,
+            )
+            .unwrap();
+            secret.expose().to_owned()
+        }
+
+        async fn get(&self, path: &str, secret: Option<&str>) -> (u16, Value) {
+            let mut request = self
+                .client
+                .request(Method::GET, format!("{}{path}", self.base));
+            if let Some(secret) = secret {
+                request = request.bearer_auth(secret);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap();
+            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+    }
+
+    const ROUTE: &str = "/v1/hub/repos/acme%2Fwidgets/after-merge";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_merge_follows_the_watcher_for_connected_repositories() {
+        let hub = Hub::start(Some(" Acme/Widgets ")).await;
+        hub.connect("github", "github.com", "acme/widgets", 100);
+        hub.connect("github", "github.com", "acme/private", 200);
+        hub.connect("gitlab", "gitlab.example.test", "acme/widgets", 300);
+        let listed = hub.token("github", "github.com", "acme/widgets", 100);
+        let unlisted = hub.token("github", "github.com", "acme/private", 200);
+        let gitlab = hub.token("gitlab", "gitlab.example.test", "acme/widgets", 300);
+
+        assert_eq!(hub.get(ROUTE, None).await.0, 401);
+        assert_eq!(hub.get(ROUTE, Some("nope")).await.0, 401);
+        // Another repository's token is told nothing about this one.
+        let (status, body) = hub.get(ROUTE, Some(&unlisted)).await;
+        assert_eq!((status, body["error"].as_str()), (404, Some("not_found")));
+
+        let (status, watched) = hub.get(ROUTE, Some(&listed)).await;
+        assert_eq!(status, 200, "{watched}");
+        assert_eq!(watched["repository"], "acme/widgets");
+        assert_eq!(watched["provider"], "github");
+        assert_eq!(watched["connected"], true);
+        assert_eq!(watched["supported"], true);
+        assert_eq!(watched["watched"], true);
+        assert_eq!(watched["opt_in"], "AGENTSCM_GITHUB_EXTERNAL_RUNS");
+
+        // Connected but not listed: supported, not watched.
+        let (_, other) = hub
+            .get("/v1/hub/repos/acme%2Fprivate/after-merge", Some(&unlisted))
+            .await;
+        assert_eq!(other["connected"], true);
+        assert_eq!(other["supported"], true);
+        assert_eq!(other["watched"], false);
+
+        // Only GitHub runs are read, even for a name the operator listed.
+        let (_, gitlab_view) = hub.get(ROUTE, Some(&gitlab)).await;
+        assert_eq!(gitlab_view["provider"], "gitlab");
+        assert_eq!(gitlab_view["connected"], true);
+        assert_eq!(gitlab_view["supported"], false);
+        assert_eq!(gitlab_view["watched"], false);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_merge_does_not_watch_a_listed_repository_the_hub_is_not_connected_to() {
+        let hub = Hub::start(Some("acme/widgets")).await;
+        // The name is listed, but the Hub holds no repository row for this id.
+        let unconnected = hub.token("github", "github.com", "acme/widgets", 999);
+        let (status, view) = hub.get(ROUTE, Some(&unconnected)).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["connected"], false);
+        assert_eq!(view["supported"], false);
+        assert_eq!(view["watched"], false);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_merge_uses_the_connected_name_after_a_rename() {
+        let hub = Hub::start(Some("acme/widgets")).await;
+        hub.connect("github", "github.com", "acme/widgets", 100);
+        // A token minted before the rename still carries the old name and the same id.
+        let stale = hub.token("github", "github.com", "acme/widgets-old", 100);
+        let (status, view) = hub
+            .get("/v1/hub/repos/acme%2Fwidgets-old/after-merge", Some(&stale))
+            .await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["connected"], true);
+        assert_eq!(view["watched"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_merge_is_off_without_the_operator_opt_in() {
+        let hub = Hub::start(None).await;
+        hub.connect("github", "github.com", "acme/widgets", 100);
+        let reader = hub.token("github", "github.com", "acme/widgets", 100);
+        let (status, off) = hub.get(ROUTE, Some(&reader)).await;
+        assert_eq!(status, 200, "{off}");
+        assert_eq!(off["connected"], true);
+        assert_eq!(off["supported"], true);
+        assert_eq!(off["watched"], false);
     }
 }

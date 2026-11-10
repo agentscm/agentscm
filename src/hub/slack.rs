@@ -3,7 +3,8 @@
 //! refused it, a handoff was declined, or new work reads like work already under way.
 //! Each binding links one Slack user to their forge identity in one repository through a
 //! dedicated, revocable read-only token. A file's holder can answer a handoff for their own
-//! agent with a button; nothing else is written from Slack.
+//! agent with a button, and the weekly digest (`digest.rs`) lets a person release or complete
+//! their own stale Work and stop their own digest; nothing else is written from Slack.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
@@ -26,6 +27,7 @@ use tokio::sync::Semaphore;
 use super::advice::{agent_name, sanitize, session_kind};
 use super::handoff::{Answered, Via};
 use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
+use super::overlap_detail::{NOTHING_CHANGED, holder_named};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::session_key;
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
@@ -54,6 +56,7 @@ const YES: &str = "agentscm_handoff_yes";
 const NO: &str = "agentscm_handoff_no";
 const OPEN: &str = "agentscm_open_hub";
 
+mod digest;
 pub mod setup;
 mod status;
 pub use status::ReminderPolicy;
@@ -170,7 +173,8 @@ pub fn slack_id(value: &str, prefix: char) -> bool {
 }
 
 /// Config and credentials are trusted operator inputs, never selected by Slack payloads.
-fn private_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+/// Connected apps read their config file the same way.
+pub(super) fn private_file(path: &Path, max: u64) -> Result<Vec<u8>> {
     if !path.is_absolute() || fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(invalid());
     }
@@ -211,7 +215,7 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn secret(path: &Path) -> Result<String> {
+pub(super) fn secret(path: &Path) -> Result<String> {
     let bytes = private_file(path, 4096)?;
     let value = std::str::from_utf8(&bytes).map_err(|_| invalid())?.trim();
     if value.is_empty() || value.chars().any(char::is_whitespace) {
@@ -452,6 +456,53 @@ fn kept(block: &Value, hub_url: &str) -> Option<Value> {
 }
 
 impl Slack {
+    /// What the Hub's Slack direct messages do for `who` in their token's repository, for a
+    /// read-only reader: the event kinds it sends, whether `who` has a binding, and that
+    /// binding's reminder policy. Slack IDs, files and tokens never appear.
+    ///
+    /// It answers as a send would: `configured` is false once the app is uninstalled or its
+    /// tokens revoked, and a binding counts only while its own token still authenticates for the
+    /// same person, repository and read-only kind. Reads the store, so call it off the runtime.
+    pub fn reader_view(&self, state: &HubState, who: &Principal) -> Value {
+        if self.active().is_err() {
+            return json!({"repository": who.repository, "configured": false});
+        }
+        let identity = &who.owner.identity;
+        let binding = self
+            .bindings
+            .iter()
+            .filter(|b| {
+                let c = &b.config;
+                c.provider == identity.provider
+                    && c.host == identity.host
+                    && c.forge_user_id == identity.user_id
+                    && c.repository == who.repository
+                    && Some(c.repository_id) == who.repository_id
+            })
+            .find(|b| {
+                self.principal(state, b).is_ok_and(|live| {
+                    live.owner.id == who.owner.id
+                        && live.repository == who.repository
+                        && live.repository_id == who.repository_id
+                })
+            })
+            .map(|b| &b.config);
+        json!({
+            "repository": who.repository,
+            "configured": true,
+            "events": KINDS,
+            "bound": binding.is_some(),
+            "reminders": binding.map(|c| json!({
+                "enabled": c.reminders.enabled,
+                "interval_seconds": c.reminders.interval_seconds,
+                "max_reminders": c.reminders.max_reminders,
+                "send_resolution": c.reminders.send_resolution,
+                "escalation": c.reminders.escalation_user.as_ref()
+                    .map(|_| json!({"after_seconds": c.reminders.escalation_after_seconds})),
+            })),
+        })
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let config: SlackConfig =
             serde_json::from_slice(&private_file(path, 64 * 1024)?).map_err(|_| invalid())?;
@@ -851,10 +902,12 @@ impl Slack {
     ) -> Result<Vec<(String, String, Value)>> {
         let paths = strings(&data["paths"]);
         let link = self.link("box-contested");
-        // What the Hub did first, as `CONTESTED_FILE` in `ui/src/copy.ts` says it.
+        let now = unix_now();
+        // What the Hub did first, as `CONTESTED_FILE` in `ui/src/copy.ts` says it, then the
+        // sentence every overlap alert carries.
         let warned = |whom: &str| {
             format!(
-                "The Hub warned {whom} once; a repeat edit goes ahead by design. Files are never locked."
+                "The Hub warned {whom} once; a repeat edit goes ahead by design. Files are never locked. {NOTHING_CHANGED}"
             )
         };
         let mut out = Vec::new();
@@ -869,6 +922,7 @@ impl Slack {
             // Opens the header, which is not a name to keep lower case.
             let opening = named.unwrap_or_else(|| "Another agent".into());
             let mut holders = Vec::new();
+            let mut holder_lines = Vec::new();
             // Under the repeater's token only its other hook sessions are other agents, as in
             // `same_agent`; an event without a session id skips the whole token.
             let own = data["session"].as_str();
@@ -960,11 +1014,13 @@ impl Slack {
                             ),
                         ),
                     };
+                    let line = holder_named(&format!("Your {mine}"), intent, now);
                     let fields = [
                         files(&held),
                         ("Repository", sanitize(&repository, TEXT_CHARS)),
                         ("Your agent", mine),
                         ("Their agent", who.clone()),
+                        ("Holder", line),
                     ];
                     let handoff = match held.as_slice() {
                         [path] => Some((
@@ -983,6 +1039,7 @@ impl Slack {
                 // One agent's hook and MCP sessions read alike: one holder, not two. Two tokens
                 // with one display name stay two.
                 if listed_holders.insert((intent.token.as_str(), holder.clone())) {
+                    holder_lines.push(holder_named(&holder, intent, now));
                     holders.push(holder);
                 }
             }
@@ -1009,6 +1066,14 @@ impl Slack {
                             "Their agents"
                         },
                         listed(&holders),
+                    ),
+                    (
+                        if holders.len() == 1 {
+                            "Holder"
+                        } else {
+                            "Holders"
+                        },
+                        listed(&holder_lines),
                     ),
                 ];
                 out.push((
@@ -1468,6 +1533,8 @@ enum Refusal {
     /// The binding's token, or the whole installation, no longer works.
     Ended,
     NotYours,
+    /// A digest button that carries Work the clicking person does not own.
+    NotYourWork,
     Busy,
     Rejected,
     Unavailable,
@@ -1481,6 +1548,9 @@ impl Refusal {
             }
             Self::NotYours => {
                 "The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in the Hub."
+            }
+            Self::NotYourWork => {
+                "The Hub did not accept this: that work is not yours. Nothing changed. Open the Hub to see whose it is."
             }
             Self::Busy => {
                 "The Hub is busy right now. Nothing changed; press the button again in a moment."
@@ -1679,6 +1749,9 @@ fn prepare(
     else {
         return Err(invalid());
     };
+    if action["action_id"].as_str().is_some_and(digest::is_button) {
+        return digest::prepare_click(state, slack, &payload, user, action);
+    }
     let accept = match action.get("action_id").and_then(Value::as_str) {
         Some(OPEN) => return Ok(Prepared::Response(json!({}))),
         Some(YES) => true,

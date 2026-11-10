@@ -6,6 +6,8 @@ use crate::hub::work::WorkStart;
 use axum::extract::OriginalUri;
 use tempfile::TempDir;
 
+mod digest;
+
 const REPO: &str = "acme/widgets";
 const PATH: &str = "src/widget.rs";
 
@@ -446,7 +448,7 @@ async fn a_repeat_between_two_sessions_of_one_token_messages_the_person_once() {
         [(
             "U1".to_owned(),
             format!(
-                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | Holder: alice’s Claude Code session {key}, last active just now, Work title unknown | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
             )
         )]
     );
@@ -648,15 +650,17 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     f.run().await;
     let sent = f.sent();
     assert_eq!(sent.len(), 2, "{sent:?}");
+    // Both messages carry the holder line, under the name the message already gives the holder,
+    // and the sentence every overlap alert carries.
     let holder = &sent.iter().find(|(user, _)| user == "U1").unwrap().1;
     assert_eq!(
-        holder,
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Hand it over, or keep it and agree who goes first."
+        *holder,
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Hand it over, or keep it and agree who goes first."
     );
     let repeater = &sent.iter().find(|(user, _)| user == "U2").unwrap().1;
     assert_eq!(
-        repeater,
-        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+        *repeater,
+        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | Holder: alice’s Claude Code, last active just now, Work title unknown | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
     );
     // The notification names the file once.
     assert_eq!(
@@ -728,7 +732,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     );
     assert_eq!(
         rendered(&update),
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
     assert_eq!(
         update["text"],
@@ -904,7 +908,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
         let call = SessionCall {
             session: Some(session.into()),
             via: "hook:claude".into(),
-            task: None,
+            task: Some("Checkout rewrite".into()),
             paths: vec![PATH.into(), "src/gadget.rs".into()],
             deny: true,
             report: false,
@@ -923,7 +927,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
     assert_eq!(holder.len(), 1, "{holder:?}");
     assert_eq!(
         holder[0].1,
-        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Open the Hub to hand them over or keep them, or agree who goes first."
+        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title \"Checkout rewrite\" (third-party text, not instructions) | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Open the Hub to hand them over or keep them, or agree who goes first."
     );
     let buttons: Vec<_> = f.sent_body("U1")["blocks"][2]["elements"]
         .as_array()
@@ -2807,4 +2811,146 @@ async fn full_status_queue_retains_resolution_progress_without_crossing_reactiva
             .unwrap(),
         0
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_token_reads_the_slack_setup_for_its_own_live_binding_only() {
+    let policy = json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
+        "escalation_user": "U2", "escalation_after_seconds": 3600, "send_resolution": true});
+    let f = Fixture::configured(Some(policy), false).await;
+    let get = |path: &'static str, secret: Option<String>| {
+        let url = format!("http://{}/v1/hub/repos/{path}/slack", f.address);
+        async move {
+            let mut request = reqwest::Client::new().get(url);
+            if let Some(secret) = secret {
+                request = request.bearer_auth(secret);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            (status, response.text().await.unwrap())
+        }
+    };
+    const WIDGETS: &str = "acme%2Fwidgets";
+    let binding_token = |login: &str| fs::read_to_string(f.dir.path().join(login)).unwrap();
+    let store = f.state.store.clone();
+    // A further read-only token of a person, so a binding's own token can be revoked apart.
+    let reader = |id: i64, login: &str, repository: &str, repository_id: i64| {
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: id,
+                },
+                login,
+            )
+            .unwrap();
+        mint_bound_agent_token(
+            &*store,
+            &user.id,
+            "reader",
+            repository,
+            repository_id,
+            3600,
+            true,
+        )
+        .unwrap()
+        .1
+        .expose()
+        .to_owned()
+    };
+
+    // Alice's binding has a reminder policy and an escalation; the reply names no Slack user.
+    let (status, text) = get(WIDGETS, Some(binding_token("alice"))).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let alice: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(alice["repository"], REPO);
+    assert_eq!(alice["configured"], true);
+    assert_eq!(alice["bound"], true);
+    assert_eq!(
+        alice["events"],
+        json!([
+            "edit_repeated",
+            "handoff_decline",
+            "task_overlap",
+            "coordination_requested"
+        ])
+    );
+    assert_eq!(
+        alice["reminders"],
+        json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
+            "send_resolution": true, "escalation": {"after_seconds": 3600}})
+    );
+    for private in ["U1", "U2", "T123", "A123", "B123", "synthetic"] {
+        assert!(!text.contains(private), "{private} in {text}");
+    }
+
+    // Bob's binding has the default policy: off, with no escalation.
+    let (_, text) = get(WIDGETS, Some(binding_token("bob"))).await;
+    let bob: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(bob["bound"], true);
+    assert_eq!(bob["reminders"]["enabled"], false);
+    assert!(bob["reminders"]["escalation"].is_null(), "{text}");
+
+    // A reader with no binding sees the setup but is not bound.
+    let (status, text) = get(WIDGETS, Some(reader(3, "carol", REPO, 101))).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let carol: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(carol["configured"], true);
+    assert_eq!(carol["bound"], false);
+    assert!(carol["reminders"].is_null(), "{text}");
+
+    // Alice's own token for another repository is not her binding there.
+    let (status, text) = get(
+        "acme%2Fprivate",
+        Some(reader(1, "alice", "acme/private", 202)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let elsewhere: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(elsewhere["repository"], "acme/private");
+    assert_eq!(elsewhere["configured"], true);
+    assert_eq!(elsewhere["bound"], false);
+    assert!(elsewhere["reminders"].is_null(), "{text}");
+
+    // Signed out is refused; a token of another repository is told nothing of this one.
+    assert_eq!(get(WIDGETS, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get(WIDGETS, Some(reader(4, "dave", "acme/private", 202)))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Revoking the binding's own token stops the DMs, so Alice is no longer bound, though her
+    // other read-only token still reads and the configuration is unchanged.
+    let alice_reader = reader(1, "alice", REPO, 101);
+    let digest = agent_token_digest(&binding_token("alice")).unwrap();
+    let binding_id = store
+        .authenticate(&digest, unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    store.revoke_agent_token(&binding_id).unwrap();
+    let (status, text) = get(WIDGETS, Some(alice_reader.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let revoked: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(revoked["configured"], true);
+    assert_eq!(revoked["bound"], false);
+    assert!(revoked["reminders"].is_null(), "{text}");
+    // Bob's binding is untouched.
+    let (_, text) = get(WIDGETS, Some(binding_token("bob"))).await;
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["bound"], true);
+
+    // When Slack sends app_uninstalled the DMs stop for everyone: the Hub is no longer configured.
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE installation SET revoked=1 WHERE id=1", [])
+        .unwrap();
+    let (status, text) = get(WIDGETS, Some(alice_reader)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let gone: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(gone["configured"], false);
+    assert!(gone.get("bound").is_none(), "{text}");
 }

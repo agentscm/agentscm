@@ -126,14 +126,18 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     };
     // UserPromptSubmit fires only in the session the person types in, so requests reach it
     // there rather than a subagent. It runs on every prompt, hence the short timeout. Every tool
-    // call keeps the session's hold live; the Hub checks only the edits. Notification and Stop
-    // tell the Hub the session waits for its person; they never answer a prompt.
+    // call keeps the session's hold live; the Hub checks only the edits. Notification, Stop and
+    // PermissionRequest tell the Hub the session waits for its person. PermissionRequest also
+    // offers its prompt to the Hub and waits, up to 12 hours since the person may be away, for
+    // them to allow or deny it there; the prompt stays usable in the session meanwhile, and every
+    // failure leaves it to the session.
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook(5)]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[{"hooks":[hook(5)]}],
         "PostToolUse":[{"hooks":[hook(3)]}],
         "Notification":[{"hooks":[hook(3)]}],
+        "PermissionRequest":[{"hooks":[hook(43_200)]}],
         "Stop":[{"hooks":[hook(3)]}],
         "SessionEnd":[{"hooks":[hook(3)]}],
         // Only change capture uses these, for checkouts whose Hub shares agent conversations.
@@ -1405,6 +1409,51 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(output.join("versions")).unwrap().count(),
             4
+        );
+    }
+
+    /// The hook events behind the coverage table in docs/agents.md, for the two agents whose
+    /// hooks come from a plugin.
+    #[test]
+    fn plugins_are_wired_for_the_events_their_coverage_names() {
+        let events = |files: Vec<(&'static str, Vec<u8>)>| -> Vec<String> {
+            let (_, hooks) = files
+                .into_iter()
+                .find(|(path, _)| *path == "agentscm/hooks/hooks.json")
+                .unwrap();
+            let hooks: Value = serde_json::from_slice(&hooks).unwrap();
+            let mut events: Vec<String> = hooks["hooks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            events.sort();
+            events
+        };
+        let claude = events(claude_files_with_version("/opt/agentscm", "1"));
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "PermissionRequest",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert!(claude.iter().any(|wired| wired == event), "{event}");
+        }
+        assert_eq!(
+            events(codex_package_files("/opt/agentscm")),
+            [
+                "PermissionRequest",
+                "PostToolUse",
+                "PreToolUse",
+                "SessionEnd",
+                "SessionStart",
+                "Stop"
+            ]
         );
     }
 }

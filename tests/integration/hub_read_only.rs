@@ -53,7 +53,10 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/intents"), "".into(), Allowed);
     row(&get, format!("{REPO}/work"), "".into(), Allowed);
     row(&get, format!("{REPO}/pr-context?number=1"), "".into(), Allowed);
+    row(&get, format!("{REPO}/retention"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity"), "".into(), Allowed);
+    row(&get, format!("{REPO}/forge-coordination"), "".into(), Allowed);
+    row(&get, format!("{REPO}/slack"), "".into(), Allowed);
     row(&get, format!("{REPO}/change-records/wrk_missing"), "".into(), Status(404));
     row(&get, "/v1/hub/skill-workflows".into(), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows/missing".into(), "".into(), Allowed);
@@ -62,19 +65,31 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
+    // A preflight reads: the exact-subject check names overlaps, changes no Work and records no event.
+    row(&post, "/v1/hub/standup/preflight".into(), r#"{"request_key":"k","title":"Synthetic","session":"s","scope":["a.rs"]}"#.into(), Allowed);
+    row(&get, "/v1/hub/standup/digest".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/digest/settings".into(), "".into(), Allowed);
+    row(&put, "/v1/hub/standup/digest/settings".into(), r#"{"enabled":true}"#.into(), AgentOnly);
+    row(&put, "/v1/hub/standup/digest/settings/me".into(), r#"{"opted_out":true}"#.into(), AgentOnly);
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/operational".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/reconciliation".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work?q=x".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/why?path=src/x.rs".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/why?path=../x".into(), "".into(), Status(400));
     row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
+    row(&get, format!("{REPO}/after-merge"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity?before=5"), "".into(), Allowed);
     for tool in ["agentscm_work_search", "agentscm_publications_list", "agentscm_workflow_runs_list"] {
         row(&post, "/mcp".into(), format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"q":"x"}}}}}}"#), Allowed);
     }
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_why","arguments":{"commit":"0000000000000000000000000000000000000000"}}}"#.into(), Allowed);
     for path in ["start", "checkpoint", "ack", "work-transition"] {
         row(&post, format!("/v1/hub/standup/{path}"), "{}".into(), AgentOnly);
     }
     row(&post, "/v1/hub/standup/usage".into(), "{}".into(), AgentOnly);
+    row(&post, "/v1/hub/permission/register".into(), "{}".into(), AgentOnly);
+    row(&post, "/v1/hub/permission/poll".into(), "{}".into(), AgentOnly);
     row(&post, "/v1/hub/standup/pr-link".into(), "{}".into(), AgentOnly);
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/pr-link".into(), "".into(), Status(404));
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
@@ -156,6 +171,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/session/dismissals?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
     row(&put, "/v1/hub/session/dismissals".into(), r#"{"repository":"acme/widgets","key":"k","fingerprint":"f"}"#.into(), HumanOnly);
     row(&delete, "/v1/hub/session/dismissals?repository=acme%2Fwidgets&key=k".into(), "".into(), HumanOnly);
+    row(&get, "/v1/hub/session/permissions?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
+    row(&post, "/v1/hub/session/permissions/answer".into(), r#"{"repository":"acme/widgets","request_id":"00ff","decision":"deny"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/session/conversation-sharing?repository=acme%2Fwidgets".into(), "".into(), HumanOnly);
     row(&put, "/v1/hub/session/conversation-sharing".into(), r#"{"repository":"acme/widgets","enabled":true}"#.into(), HumanOnly);
     row(&put, "/v1/hub/session/conversation-sharing/me".into(), r#"{"repository":"acme/widgets","opted_out":true}"#.into(), HumanOnly);

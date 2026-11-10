@@ -27,7 +27,7 @@ pub const SESSION_REQUIRED: &str = "session is required: this agent token has mo
 const MAX_SESSION_BYTES: usize = 128;
 /// Session rows untouched this long are pruned; their intents expired long before.
 pub(super) const STALE_SESSION_SECONDS: i64 = 7 * 86_400;
-const DEFAULT_TASK: &str = "task unknown";
+pub(super) const DEFAULT_TASK: &str = "task unknown";
 /// Files one session holds; a call's own paths always stay.
 pub const MAX_SESSION_PATHS: usize = 50;
 /// An intent never outlives this since it was created, however often its session is touched.
@@ -813,6 +813,7 @@ static DENIED: AtomicU64 = AtomicU64::new(0);
 static REPEATED: AtomicU64 = AtomicU64::new(0);
 static RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 static FAIL_OPEN: AtomicU64 = AtomicU64::new(0);
+static UNDECLARED: AtomicU64 = AtomicU64::new(0);
 const LATENCIES: usize = 1024;
 /// Milliseconds of the last `LATENCIES` hook requests.
 static HOOK_MS: Mutex<VecDeque<u32>> = Mutex::new(VecDeque::new());
@@ -834,6 +835,11 @@ fn count(counter: &AtomicU64, when: bool) {
 /// A hook answered "coordination unknown" (and so let the edit through).
 pub(super) fn count_fail_open() {
     count(&FAIL_OPEN, true);
+}
+
+/// A session was told once to declare its Work (`WORK_UNDECLARED`), refused or noted.
+pub(super) fn count_undeclared() {
+    count(&UNDECLARED, true);
 }
 
 pub(super) fn record_hook_ms(ms: u32) {
@@ -859,6 +865,7 @@ pub(super) fn coordination() -> Value {
     let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     json!({"denied": load(&DENIED), "repeated": load(&REPEATED),
         "rate_limited": load(&RATE_LIMITED), "fail_open": load(&FAIL_OPEN),
+        "undeclared": load(&UNDECLARED),
         "hook_p95_ms": p95.map_or(0, |index| times[index])})
 }
 
