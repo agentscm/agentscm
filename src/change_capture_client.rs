@@ -11,7 +11,7 @@ use std::time::Duration;
 use agentscm::change_capture::claude_code::{ActionRuleV1, NativeResultSourceV1};
 use agentscm::change_capture::{
     CaptureError, ConfiguredRecipeV1, LocalSpool, NamespaceBindOutcome, SpoolClassificationV1,
-    SpoolIdentityV1, SpoolLimits, SpoolNamespaceV1, inspect_spool,
+    SpoolIdentityV1, SpoolLimits, SpoolNamespaceV1, SpoolUsage, inspect_spool,
 };
 use agentscm::change_record::{
     ActionKindV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CaptureTargetV1,
@@ -1367,7 +1367,9 @@ pub(crate) fn binding_for_payload(
     Ok(Some((binding, spool, connection)))
 }
 
-pub fn capture_status(root: &Path) -> Result<Value> {
+/// `change-capture status`: the binding and its spool, and, from the Hub, whether the repository
+/// shares and the mode a session starting now captures in, so a local cap is visible.
+pub async fn capture_status(root: &Path) -> Result<Value> {
     let root = client_config::canonical_root(root)?;
     let binding = load()?
         .into_iter()
@@ -1391,11 +1393,47 @@ pub fn capture_status(root: &Path) -> Result<Value> {
         Ok(inspection) => (Some(inspection), None),
         Err(error) => (None, Some(error.to_string())),
     };
+    let full = inspection.as_ref().is_some_and(|inspection| {
+        SpoolUsage {
+            records: inspection.physical_records,
+            bytes: inspection.physical_bytes,
+            limits: binding.spool_limits,
+        }
+        .is_full()
+    });
+    let hub = checkout_hub(&root).ok();
+    let answer = match &hub {
+        Some(hub) => hub_sharing(hub).await,
+        None => None,
+    };
+    let routed = hub.as_ref().is_some_and(|hub| {
+        hub.connection.repo == binding.repository && hub.connection.hub == binding.hub
+    });
+    // What a session starting now says, and the mode it captures in: off when no hook captures
+    // for this binding, unknown (null) when the Hub did not answer.
+    let (effective_mode, session_start) = if binding.enabled && routed {
+        let mode = mode_under_hub(&binding, answer);
+        (
+            answer.map_or(Value::Null, |_| json!(mode)),
+            Some(sharing_state(mode, &binding, answer)),
+        )
+    } else {
+        let reason = hub
+            .as_ref()
+            .filter(|_| answer.is_some_and(|answer| answer.sharing))
+            .and_then(|hub| idle_binding_reason(&root, &hub.connection));
+        (json!("off"), reason)
+    };
     Ok(json!({
         "version": 1,
         "state": state,
         "enabled": binding.enabled,
         "capture_mode": binding.capture_mode,
+        "repository_shares": answer.map(|answer| answer.enabled),
+        "effective_mode": effective_mode,
+        "session_start": session_start,
+        "store_full": full,
+        "store_full_fix": full.then(|| store_full(&binding)),
         "current_connection": current_connection,
         "root": binding.root,
         "spool": binding.spool,
@@ -1621,6 +1659,12 @@ pub struct HubSharing {
     pub sharing: bool,
     /// This person's agent has already shown the one-time notice.
     pub notified: bool,
+    /// The repository's own effective setting, whatever this person chose.
+    #[serde(default)]
+    pub enabled: bool,
+    /// This person keeps their own sessions out.
+    #[serde(default)]
+    pub opted_out: bool,
 }
 
 /// The Hub's conversation sharing answer, or `None` when the Hub did not give one (an older Hub
@@ -1675,12 +1719,83 @@ pub(crate) async fn mark_sharing_notified(hub: &CaptureHub) -> Result<()> {
 /// `change-capture opt-out|opt-in`: this person's sessions in the checkout's repository, on every
 /// computer, stop (or resume) uploading conversation bodies while the repository shares them.
 pub async fn set_sharing_opt_out(root: &Path, opted_out: bool) -> Result<Value> {
-    let root = client_config::canonical_root(root)?;
-    let connections = client_config::load()?;
-    let (connection, _) = client_config::connection_for_checkout(&connections, &root)
-        .ok_or_else(|| invalid("no client connection for this checkout"))?;
-    let hub = CaptureHub::new(connection.clone())?;
+    let hub = checkout_hub(&client_config::canonical_root(root)?)?;
     put_sharing_choice(&hub, json!({"opted_out": opted_out})).await
+}
+
+/// The Hub client for `root`, a connected checkout or a linked worktree of one.
+fn checkout_hub(root: &Path) -> Result<CaptureHub> {
+    let connections = client_config::load()?;
+    let (connection, _) = client_config::connection_for_checkout(&connections, root)
+        .ok_or_else(|| invalid("no client connection for this checkout"))?;
+    CaptureHub::new(connection.clone())
+}
+
+/// Said at every session start, beside where the session coordinates: whether this session shares
+/// its conversation in `mode` and, when it does not, why and the one command that changes it.
+/// `hub` is the Hub's answer, `None` when it did not come in time.
+pub(crate) fn sharing_state(
+    mode: CaptureModeV1,
+    binding: &CaptureBinding,
+    hub: Option<HubSharing>,
+) -> String {
+    if mode == CaptureModeV1::SharedConversation {
+        return "AgentSCM: conversation sharing is on for this session.".into();
+    }
+    let off = "AgentSCM: conversation sharing is off for this session; only sanitized activity facts are recorded";
+    let repo = &binding.repository;
+    let root = shell_quote(&binding.root.to_string_lossy());
+    let set = match binding.capture_mode {
+        CaptureModeV1::LocalConversation => "keep conversations on this computer",
+        _ => "record metadata only",
+    };
+    // set-mode needs the checkout's own connection, so a followed binding (often a linked
+    // worktree) is started again instead; the next session follows the repository.
+    let fix = if binding.follows_hub {
+        format!(
+            "run `agentscm change-capture unconfigure --root {root}`, then `agentscm change-capture forget --root {root}`; the next session follows the repository's setting"
+        )
+    } else {
+        format!(
+            "run `agentscm change-capture set-mode --root {root} --mode shared-conversation`; the next session shares"
+        )
+    };
+    match hub {
+        None => format!(
+            "{off}: this checkout is set to {set}. Whether {repo} shares agent conversations is unknown, because the Hub did not answer in time."
+        ),
+        Some(answer) if answer.enabled && answer.opted_out => format!(
+            "{off}: you keep your own sessions out of sharing in {repo}. To share them again, run `agentscm change-capture opt-in` in this checkout."
+        ),
+        Some(answer)
+            if answer.sharing && binding.capture_mode != CaptureModeV1::SharedConversation =>
+        {
+            format!(
+                "{off}: {repo} shares agent conversations, but this checkout's local setting is to {set}. To share, {fix}."
+            )
+        }
+        Some(answer) if answer.sharing => format!(
+            "{off}: this session started before sharing was on here, and a session keeps the mode it started under. The next session shares."
+        ),
+        Some(_) => format!(
+            "{off}: {repo} does not share agent conversations. A repository admin or a Hub admin turns it on in the Hub's Settings."
+        ),
+    }
+}
+
+/// Said when a capture store is still full after upkeep: capture records only gaps until it has
+/// room, so the person needs the command that gives it room.
+pub(crate) fn store_full(binding: &CaptureBinding) -> String {
+    let root = shell_quote(&binding.root.to_string_lossy());
+    let spool = shell_quote(&binding.spool.to_string_lossy());
+    let next = if binding.follows_hub {
+        "the next session starts a new store"
+    } else {
+        "then set capture up again"
+    };
+    format!(
+        "AgentSCM: this checkout's local capture store is full even after removing what the Hub has accepted, so this session records only gaps. To see what it holds, run `agentscm change-capture inspect --spool {spool}`. To start a new store, run `agentscm change-capture unconfigure --root {root}`, then `agentscm change-capture forget --root {root}` ({next}); the old store stays on disk."
+    )
 }
 
 /// The mode a session captures in now. The Hub's answer can only lower the binding's mode: a
@@ -1757,6 +1872,48 @@ pub(crate) fn followed_binding(
     let binding = find(load()?).ok_or_else(|| invalid("capture binding was not saved"))?;
     let spool = ensure_spool_namespace(&binding)?;
     Ok(Some((binding, spool)))
+}
+
+/// Why a checkout whose repository shares records nothing through the plugin hook, when its
+/// binding is the reason: one saved for another repository or Hub, or one turned off. `None` for
+/// no binding, a usable one, or one with hooks of its own (that hook says its own reason).
+pub(crate) fn idle_binding_reason(
+    checkout: &Path,
+    connection: &client_config::Connection,
+) -> Option<String> {
+    let root = client_config::canonical_root(checkout).ok()?;
+    let binding = load()
+        .ok()?
+        .into_iter()
+        .find(|binding| binding.root == root)?;
+    let lead = format!(
+        "AgentSCM: conversation sharing is off for this session: {} shares agent conversations, but",
+        connection.repo
+    );
+    let root = shell_quote(&root.to_string_lossy());
+    if binding.repository != connection.repo || binding.hub != connection.hub {
+        let stop = if binding.enabled {
+            format!("`agentscm change-capture unconfigure --root {root}`, then ")
+        } else {
+            String::new()
+        };
+        return Some(format!(
+            "{lead} capture in this checkout was set up for {} on {}. To follow this repository's setting, run {stop}`agentscm change-capture forget --root {root}`; the next session shares.",
+            binding.repository, binding.hub
+        ));
+    }
+    (!binding.enabled).then(|| format!(
+        "{lead} capture is turned off in this checkout. To follow the repository's setting, run `agentscm change-capture forget --root {root}`; the next session shares."
+    ))
+}
+
+/// Said at session start when `checkout` has no binding and the Hub did not answer in time: no
+/// binding is made without the Hub's yes, so nothing is recorded, and that is not "off".
+pub(crate) fn unknown_sharing(checkout: &Path) -> Option<String> {
+    let root = client_config::canonical_root(checkout).ok()?;
+    (!load().ok()?.iter().any(|binding| binding.root == root)).then(|| {
+        "AgentSCM: whether conversation sharing is on for this session is unknown, because the Hub did not answer in time, so nothing is recorded in this session. The next session asks again.".into()
+    })
 }
 
 pub async fn fetch_change_record(root: &Path, work_id: &str) -> Result<ChangeRecordResponseV1> {
@@ -2295,10 +2452,11 @@ mod tests {
     use super::{
         CaptureBinding, CaptureSetting, ExpectedTarget, ForgetArgs, HOOK_MARKER, HubSharing,
         UnconfigureArgs, acquire_lock, capture_setting, deliver_pending, disable_binding,
-        enable_capture, followed_binding, forget, install_hooks, is_digest, is_identifier, load,
-        load_recipe_file, load_recipe_from_file, lock_checkout, managed_recipe_invocations,
-        mode_under_hub, parse_rule, plan_enable, release_excludes, remove_owned_hooks, save,
-        session_start_context, set_capture_mode, setting_in, unconfigure, validate_binding,
+        enable_capture, followed_binding, forget, idle_binding_reason, install_hooks, is_digest,
+        is_identifier, load, load_recipe_file, load_recipe_from_file, lock_checkout,
+        managed_recipe_invocations, mode_under_hub, parse_rule, plan_enable, release_excludes,
+        remove_owned_hooks, save, session_start_context, set_capture_mode, setting_in,
+        sharing_state, store_full, unconfigure, unknown_sharing, validate_binding,
         validate_binding_update,
     };
     use crate::client_config;
@@ -2828,10 +2986,14 @@ mod tests {
         let off = Some(HubSharing {
             sharing: false,
             notified: false,
+            enabled: false,
+            opted_out: false,
         });
         let on = Some(HubSharing {
             sharing: true,
             notified: true,
+            enabled: true,
+            opted_out: false,
         });
         let mut binding = recipe_binding(vec![]);
         binding.capture_mode = CaptureModeV1::SharedConversation;
@@ -2855,6 +3017,105 @@ mod tests {
             mode_under_hub(&binding, on),
             CaptureModeV1::LocalConversation
         );
+    }
+
+    #[test]
+    fn a_session_that_does_not_share_says_why_and_the_one_command_that_changes_it() {
+        let answer = |enabled: bool, opted_out: bool| {
+            Some(HubSharing {
+                sharing: enabled && !opted_out,
+                notified: true,
+                enabled,
+                opted_out,
+            })
+        };
+        let mut binding = recipe_binding(vec![]);
+        binding.root = "/work/it's here".into();
+        let say = |binding: &CaptureBinding, hub| {
+            sharing_state(mode_under_hub(binding, hub), binding, hub)
+        };
+        // A checkout left at metadata-only caps a repository that shares, and says so.
+        let capped = say(&binding, answer(true, false));
+        assert!(
+            capped.contains("counterbranch/agentscm shares agent conversations, but this checkout's local setting is to record metadata only"),
+            "{capped}"
+        );
+        assert!(
+            capped.contains("set-mode --root '/work/it'\\''s here' --mode shared-conversation"),
+            "{capped}"
+        );
+        binding.follows_hub = true;
+        let followed = say(&binding, answer(true, false));
+        assert!(
+            followed.contains(
+                "unconfigure --root '/work/it'\\''s here'`, then `agentscm change-capture forget"
+            ),
+            "{followed}"
+        );
+        // No answer in time is unknown, never "does not share".
+        let unknown = say(&binding, None);
+        assert!(
+            unknown.contains("is unknown, because the Hub did not answer in time"),
+            "{unknown}"
+        );
+        assert!(!unknown.contains("does not share"), "{unknown}");
+        binding.follows_hub = false;
+        binding.capture_mode = CaptureModeV1::SharedConversation;
+        assert!(say(&binding, answer(true, false)).ends_with("on for this session."));
+        assert!(say(&binding, answer(true, true)).contains("change-capture opt-in"));
+        assert!(say(&binding, answer(false, false)).contains("does not share agent conversations"));
+        assert!(
+            sharing_state(CaptureModeV1::MetadataOnly, &binding, answer(true, false))
+                .contains("started before sharing was on")
+        );
+        let full = store_full(&binding);
+        assert!(full.contains("records only gaps"), "{full}");
+        assert!(
+            full.contains("inspect --spool '/tmp/agentscm-recipe-spool'"),
+            "{full}"
+        );
+        assert!(
+            full.contains("forget --root '/work/it'\\''s here'"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn a_binding_that_keeps_a_sharing_repository_out_says_why() {
+        client_config::in_isolated_config_home(|config| {
+            let (root, _) = connected_checkout(config);
+            let connection = widgets_at("http://127.0.0.1:9", &root);
+            assert_eq!(idle_binding_reason(&root, &connection), None, "no binding");
+            let unknown = unknown_sharing(&root).expect("no binding and no answer is unknown");
+            assert!(unknown.contains("is unknown"), "{unknown}");
+            assert!(!unknown.contains("is off"), "{unknown}");
+            followed_binding(&root, &connection, true).unwrap().unwrap();
+            assert_eq!(idle_binding_reason(&root, &connection), None, "usable");
+            assert_eq!(
+                unknown_sharing(&root),
+                None,
+                "the binding's hook says its own state"
+            );
+            let mut bindings = load().unwrap();
+            disable_binding(&mut bindings, &root);
+            save(&bindings).unwrap();
+            let off = idle_binding_reason(&root, &connection).unwrap();
+            assert!(
+                off.contains("capture is turned off in this checkout"),
+                "{off}"
+            );
+            assert!(off.contains("change-capture forget --root"), "{off}");
+            let elsewhere = widgets_at("https://hub.example", &root);
+            let other = idle_binding_reason(&root, &elsewhere).unwrap();
+            assert!(
+                other.contains("was set up for acme/widgets on http://127.0.0.1:9"),
+                "{other}"
+            );
+            assert!(
+                !other.contains("unconfigure"),
+                "a disabled binding needs only forget: {other}"
+            );
+        });
     }
 
     #[test]

@@ -5424,3 +5424,128 @@ fn a_prompt_deferred_before_the_claim_is_captured_with_its_text_once_the_session
         b"OPENING_PROMPT_917"
     ));
 }
+
+#[test]
+fn pruning_keeps_only_recent_unassociated_deferred_facts_and_frees_the_spool() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let now = 1_782_284_400;
+    let hook = |n: u64, observed_at: i64| DeferredHookV1 {
+        occurrence_id: format!("evt:{n}"),
+        reserved_sequence: Some(n),
+        session_id: "session_fixture".into(),
+        hook_event_name: "SessionStart".into(),
+        observed_at,
+        reason: DeferredReasonV1::NoCurrentAuthorizedWork,
+        input_digest: format!("{n:064x}"),
+        event_kind: Some(CapturedEventKindV1::SessionStarted),
+        tool_kind: None,
+        source: None,
+        recipe_digest: None,
+        action_kind: None,
+    };
+    // 40 a day and more old, then 270 recent: more than the 256 kept.
+    for n in 1..=310 {
+        let at = if n <= 40 {
+            now - agentscm::change_capture::DEFERRED_KEEP_SECONDS - 60
+        } else {
+            now - 60
+        };
+        spool.retain_deferred(&hook(n, at)).unwrap();
+    }
+    let before = spool.usage().unwrap();
+    assert_eq!(spool.prune_deferred(now).unwrap(), 310 - 256);
+    let kept = spool.deferred(100).unwrap();
+    assert!(
+        kept.iter().all(|hook| hook.observed_at == now - 60),
+        "only recent ones stay"
+    );
+    assert_eq!(spool.usage().unwrap().records, before.records - (310 - 256));
+    assert_eq!(
+        spool.prune_deferred(now).unwrap(),
+        0,
+        "a second pass removes nothing"
+    );
+    assert!(!spool.usage().unwrap().is_full());
+}
+
+fn small_spool(temp: &TempDir) -> LocalSpool {
+    LocalSpool::open_with_limits(
+        temp.path().join("spool"),
+        SpoolLimits {
+            max_records: 64,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_artifact_bytes: 1024 * 1024,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn upkeep_compacts_what_the_hub_accepted_and_keeps_everything_else() {
+    let temp = TempDir::new().unwrap();
+    let spool = small_spool(&temp);
+    for index in 0..5 {
+        spool
+            .append(&sample_batch(
+                &format!("unaccepted:{index}"),
+                &format!("unaccepted-event:{index}"),
+            ))
+            .unwrap();
+    }
+    let unaccepted = spool.pending(100).unwrap();
+    let mut filled = false;
+    for index in 0..100 {
+        let envelope = sample_batch(&format!("accepted:{index}"), &format!("event:{index}"));
+        if spool.append(&envelope).is_err() {
+            filled = true;
+            break;
+        }
+        spool.acknowledge(&envelope).unwrap();
+    }
+    assert!(filled, "the spool reached its limit");
+    let before = spool.usage().unwrap();
+    assert!(before.is_full(), "{before:?}");
+
+    assert!(!spool.upkeep(1_782_284_400).unwrap(), "upkeep made room");
+    let after = spool.usage().unwrap();
+    assert!(after.records < before.records, "{before:?} -> {after:?}");
+    assert!(!after.needs_upkeep(), "{after:?}");
+    assert_eq!(
+        spool.pending(100).unwrap(),
+        unaccepted,
+        "nothing unaccepted is removed"
+    );
+    spool
+        .append(&sample_batch("after-upkeep", "after-upkeep-event"))
+        .unwrap();
+}
+
+#[test]
+fn upkeep_never_removes_what_the_hub_has_not_accepted_and_reports_the_store_full() {
+    let temp = TempDir::new().unwrap();
+    let spool = small_spool(&temp);
+    let mut filled = false;
+    for index in 0..100 {
+        if spool
+            .append(&sample_batch(
+                &format!("unaccepted:{index}"),
+                &format!("event:{index}"),
+            ))
+            .is_err()
+        {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "the spool reached its limit");
+    let pending = spool.pending(100).unwrap();
+    let before = spool.usage().unwrap();
+
+    assert!(
+        spool.upkeep(1_782_284_400).unwrap(),
+        "still full: the hook says so"
+    );
+    assert_eq!(spool.usage().unwrap(), before);
+    assert_eq!(spool.pending(100).unwrap(), pending);
+}

@@ -281,7 +281,7 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
         ChangeCaptureCommand::Status(args) => {
             println!(
                 "{}",
-                serde_json::to_string(&change_capture_client::capture_status(&args.root)?)?
+                serde_json::to_string(&change_capture_client::capture_status(&args.root).await?)?
             );
             Ok(0)
         }
@@ -396,19 +396,30 @@ pub(crate) async fn plugin_capture(
     let session_start =
         payload.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart");
     // Only a session start creates a binding, so a session keeps the mode it started under.
-    let create = session_start
-        && tokio::time::timeout_at(deadline, change_capture_client::hub_sharing(&hub))
+    let answer = if session_start {
+        tokio::time::timeout_at(deadline, change_capture_client::hub_sharing(&hub))
             .await
             .ok()
             .flatten()
-            .is_some_and(|answer| answer.sharing);
-    let found = tokio::task::spawn_blocking(move || {
-        change_capture_client::followed_binding(&checkout, &connection, create)
+    } else {
+        None
+    };
+    let create = answer.is_some_and(|answer| answer.sharing);
+    let found = tokio::task::spawn_blocking({
+        let (checkout, connection) = (checkout.clone(), connection.clone());
+        move || change_capture_client::followed_binding(&checkout, &connection, create)
     })
     .await
     .ok()?;
     let (binding, spool) = match found {
         Ok(Some(found)) => found,
+        // The repository shares, yet this checkout's binding keeps it out: say so, with the fix.
+        Ok(None) if create => {
+            return change_capture_client::idle_binding_reason(&checkout, &connection);
+        }
+        Ok(None) if session_start && answer.is_none() => {
+            return change_capture_client::unknown_sharing(&checkout);
+        }
         Ok(None) => return None,
         Err(_) => {
             eprintln!(
@@ -504,6 +515,17 @@ async fn capture_claude(
     if session_start {
         sweep_session_files();
     }
+    // Upkeep at each session start and turn end, so the spool never fills unnoticed.
+    let full = matches!(event, Some("SessionStart" | "Stop")) && maintain(spool);
+    // Said at session start: whether this session shares, why not when it does not, and a full
+    // spool, which records only gaps until it has room.
+    let start_lines = |mode: CaptureModeV1| {
+        let mut lines = vec![change_capture_client::sharing_state(mode, binding, sharing)];
+        if full {
+            lines.push(change_capture_client::store_full(binding));
+        }
+        lines
+    };
     let replies = session_file(binding, &format!("replies\0{session_id}"));
     let target = match target {
         Ok(Some(target)) => target,
@@ -534,8 +556,7 @@ async fn capture_claude(
                     "AgentSCM local capture warning: native session has no current authorized work; a sanitized fact remains unassociated"
                 );
             }
-            return session_start
-                .then(|| sharing_state(live_mode == CaptureModeV1::SharedConversation));
+            return session_start.then(|| start_lines(live_mode).join("\n\n"));
         }
         Err(_) => {
             let retained = claude_code::deferred_native_hook(
@@ -554,8 +575,7 @@ async fn capture_claude(
                     "AgentSCM local capture warning: current authorized work could not be resolved; a sanitized fact remains unassociated"
                 );
             }
-            return session_start
-                .then(|| sharing_state(live_mode == CaptureModeV1::SharedConversation));
+            return session_start.then(|| start_lines(live_mode).join("\n\n"));
         }
     };
     let live_parent = payload
@@ -668,9 +688,7 @@ async fn capture_claude(
     if payload.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
         return None;
     }
-    let mut context = vec![sharing_state(
-        capture_mode == CaptureModeV1::SharedConversation,
-    )];
+    let mut context = start_lines(capture_mode);
     if capture_mode == CaptureModeV1::SharedConversation
         && let (Some(answer), Some(hub)) = (sharing, hub)
         && answer.sharing
@@ -986,13 +1004,16 @@ fn missed_replies(
     found
 }
 
-/// Said at every session start, beside where the session coordinates.
-fn sharing_state(shared: bool) -> String {
-    if shared {
-        "AgentSCM: conversation sharing is on for this session.".into()
-    } else {
-        "AgentSCM: conversation sharing is off for this session; only sanitized activity facts are recorded.".into()
-    }
+/// Upkeep (`LocalSpool::upkeep`) that fails open. Answers whether the spool is still full, where
+/// capture records only gaps.
+fn maintain(spool: &LocalSpool) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    spool.upkeep(now).unwrap_or_else(|_| {
+        eprintln!("AgentSCM local capture warning: the capture store could not be tidied");
+        spool.usage().is_ok_and(|usage| usage.is_full())
+    })
 }
 
 /// Told once per person and repository, in the agent's session context.
