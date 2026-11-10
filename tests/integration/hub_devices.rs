@@ -1408,6 +1408,57 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert_eq!(machine.renew()["result"], "refused");
 }
 
+/// Signing in again replaces this computer's credential, which revokes the agent tokens it
+/// issued; the sign-in renews each connected checkout, and names one it could not renew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signing_in_again_keeps_connected_checkouts_working() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let login = [
+        "hub",
+        "login",
+        "--hub",
+        hub.as_str(),
+        "--provider",
+        "github",
+    ];
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+    machine.session_start("s1");
+    let first = machine.token();
+    assert_eq!(env.whoami(&first).await, 200);
+
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("was not renewed"), "{stderr}");
+    let second = machine.token();
+    assert_ne!(first, second);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&second).await, 200);
+
+    // A checkout that cannot be renewed is named with its fix; the sign-in, allowed by a role
+    // on another connected repository, still succeeds.
+    env.connect_repo("acme/gadgets", 4343, ALICE);
+    env.drop_role(ALICE);
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let root = machine.root();
+    assert!(
+        stderr.contains(&format!(
+            "The connection of {} was not renewed (",
+            root.display()
+        )) && stderr.contains(&format!(
+            "agentscm client connect --root {}",
+            root.display()
+        )),
+        "{stderr}"
+    );
+}
+
 /// A session that starts in one repository and edits another declares its Work in the other:
 /// the MCP server sends the call to the repository of the file it names, under that
 /// repository's token and the session the start hook recorded for this agent host.

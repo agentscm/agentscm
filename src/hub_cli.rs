@@ -630,7 +630,7 @@ pub(crate) async fn sign_in_with(
     )?;
     // The Hub replaces only the same person's computer. A sign-in as someone else (another
     // forge on this Hub) would leave the old credential live with its secret forgotten.
-    if let Some(previous) = previous
+    if let Some(previous) = previous.as_ref()
         && matches!(
             call(
                 &client,
@@ -643,10 +643,19 @@ pub(crate) async fn sign_in_with(
             Ok((200, _))
         )
     {
-        sign_computer_out(&client, hub, &previous).await;
+        sign_computer_out(&client, hub, previous).await;
         eprintln!(
             "This computer was signed in to {hub} as someone else; that sign-in ended, and checkouts connected through it need connecting again. A computer holds one sign-in per Hub."
         );
+    } else if previous.is_some() {
+        // The Hub replaced this computer's credential and revoked the agent tokens it issued.
+        for (root, why) in crate::client_cli::renew_after_sign_in(hub).await {
+            eprintln!(
+                "The connection of {} was not renewed ({why}); reconnect it with `agentscm client connect --root {}`.",
+                root.display(),
+                root.display()
+            );
+        }
     }
     let user = &signed["user"];
     Ok(format!(

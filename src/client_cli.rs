@@ -22,7 +22,7 @@ mod computer;
 use crate::intent_cli::valid_repo;
 use crate::prompt::Ui;
 pub(crate) use computer::{
-    RENEW_BEFORE_SECONDS, attention, auto_connect_command, due, renew_command,
+    RENEW_BEFORE_SECONDS, attention, auto_connect_command, due, renew_after_sign_in, renew_command,
 };
 // The local Hub page, quickstart and the macOS tray enroll from outside the client.
 #[cfg(unix)]
