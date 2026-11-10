@@ -26,6 +26,7 @@ mod scope;
 mod selection;
 mod snapshots;
 
+pub(crate) use glob::PathGlob;
 use scope::Scope;
 pub use selection::Rule;
 use selection::{Classified, Selection, Selector, Settings, Tracked};

@@ -4,7 +4,7 @@ title: "Operator-local repository pipeline rules"
 
 # Operator-local repository pipeline rules
 
-This experimental Unix CLI installs repository merge rules and feeds the existing
+This experimental Unix CLI installs repository merge and pull request rules and feeds the existing
 skill-workflow journal. Git and GitHub/GitLab retain source, review and merge
 authority. It does not install native landing requirements, publish artifacts,
 create PRs/MRs or merge anything. The shared Hub does not yet manage these rules.
@@ -124,7 +124,8 @@ Observation re-reads both the repository identity and numbered PR/MR through the
 configured forge. Every proposal response must independently identify the target
 repository: GitHub base-repository ID/name or GitLab target-project ID. Missing or
 changed target identity blocks acceptance, including a name reused mid-scan. Caller-provided hints are never accepted as confirmed facts.
-An open or unmerged proposal starts nothing. GitHub requires its confirmed
+An open or unmerged proposal starts no merge rule; a [pull request rule](#pull-request-heads)
+can start on an open head. GitHub requires its confirmed
 `merge_commit_sha`. GitLab uses the merge or squash commit; a fast-forward without
 either is verifiable only while the live target tip still equals the confirmed
 MR head. A later target tip leaves that observation blocked.
@@ -172,6 +173,102 @@ are `accepted_commit`, `proposal_number`, `target`, `labels` (a JSON string arra
 `repository`, `provider`, `host` and `observed_at`. Productive declarations can
 reference one with `{"kind":"event","field":"accepted_commit"}`. They are
 immutable data, not conditions, commands or permissions.
+
+## Pull request heads
+
+A rule with `"event": "pull_request"` fires on an open, non-draft GitHub pull
+request into `target` whose head is in this repository, once per head commit. A
+fork's head never starts a rule. GitLab rules cannot use this event. Optional
+predicates narrow it, and every one must hold:
+
+```json
+"trigger": {
+  "target": "main",
+  "event": "pull_request",
+  "labels_all": ["security"],
+  "paths_any": ["Cargo.lock", "**/Cargo.toml", "src/auth/**"],
+  "min_changed_files": 1,
+  "min_changed_lines": 10,
+  "run_when_unknown": false
+}
+```
+
+- `paths_any`: at least one changed path, a rename's old path included, matches
+  one of up to 32 globs. A glob matches the whole repository path: `*` and `?`
+  stay within one directory and `**` spans directories, so `*.md` matches only
+  root-level Markdown and `**/*.md` matches every Markdown file. Write `dir/**`
+  for a directory; a glob that starts or ends with `/` is refused.
+- `min_changed_files` and `min_changed_lines` (additions plus deletions) are
+  minimums from the forge's pull request counts.
+- `labels_all` works as for merges, at observation time.
+
+These predicates are refused on a merge rule.
+
+Unknown stays unknown. The paths are unknown when:
+
+- the pull request has more than 300 changed files (the client reads three pages
+  of 100);
+- GitHub's file reply is too large;
+- one path is longer than 4096 bytes;
+- or the list does not fit one 64 KiB journal event.
+
+A missing count, and matching that exceeds its work limit, are unknown in the
+same way. Preview then reports `could not evaluate ...`, lists the predicate
+under `unknown`, and the rule does not run. With `run_when_unknown: true` the
+rule runs anyway when every predicate it could evaluate holds, and preview still
+lists what it could not evaluate. `poll` shows each rule's preview for every head
+it reads, counts heads that were not evaluated in `not_evaluated`, and `status`
+lists recent ones under `unevaluated`.
+
+`observe --proposal N` confirms an open head as well as a merge. `poll` lists
+open pull requests when any rule that is not policy-owned uses this event:
+
+- Drafts and fork heads in the listing are not read.
+- Each other head is read, its file list is read, and then the head is read again.
+  If the head moved in between, nothing is accepted and the next poll reads it
+  again.
+- A head is skipped when every pull request rule has already evaluated that
+  head, base branch and label set at the rule's current generation.
+
+So retargeting, relabelling, editing a rule or re-enabling it evaluates a head
+again, but one rule runs a head at most once. Older heads of the same pull
+request, and heads of pull requests no longer open, are pruned when they started
+no run. A head event is keyed apart from a merge of the same commit.
+
+A write that would take the journal past its 128 MiB budget or a table's
+100,000-row cap is refused and rolled back, with nothing accepted. When the
+journal opens, an event, observation or dispatch row it cannot accept (oversized,
+unparseable or invalid) is moved, with the rows that depend on it, to
+`pipeline-rules/quarantine.jsonl`. `status` reports how many under
+`quarantined`, so one bad row never stops the journal from opening. Problems with
+the journal as a whole (identity, schema, integrity, binding or rules) still stop
+it.
+
+Preview takes the same synthetic JSON with `"kind": "pull_request"` and an
+optional `changes` object (`files`, `lines`, `paths`; a missing value is
+unknown). For a head, `accepted_commit` is the head commit, and the workflow also
+gets the input field `event` set to `pull_request`. The dispatch keeps the
+event, so status shows which rule and which head started each run.
+
+Delivery uses the same executor, profile and limits as a merge rule. The head's
+selected skill resource bytes must still equal the pinned ones, so a pull
+request cannot rewrite its own rule's instructions. The runner never fetches:
+the head commit must already be in the operator's checkout (for example after
+`git fetch origin`), or delivery is blocked. Rules owned by an operating policy
+receive merge events only.
+
+**Who runs code on your machine.** A pull request rule runs the profile's local
+commands and the skill agent on an unreviewed head. It runs them with the
+operator account's privileges and credentials. Any account that can push a
+branch to the repository can start that run, including bots and apps such as
+Dependabot. The head's files can also try to steer the agent (prompt injection).
+Before enabling one:
+
+- Run it under a dedicated operator account that holds no credentials beyond the
+  forge read token, on a machine or container you can discard.
+- Keep the profile's commands to read-only analysis.
+- Restrict who can push branches to the repository. A label is no gate: anyone
+  who can push can also label.
 
 ## Inspect and recover
 

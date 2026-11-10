@@ -141,6 +141,7 @@ fn fixture_provider(provider: &str) -> Fixture {
         trigger: MergeTrigger {
             target: "main".into(),
             labels_all: BTreeSet::from(["ship".into()]),
+            ..MergeTrigger::default()
         },
         recipe_digest: recipe.digest().unwrap(),
         recipe,
@@ -184,6 +185,8 @@ fn event(f: &Fixture) -> ConfirmedMerge {
         labels: BTreeSet::from(["ship".into()]),
         observed_at: 123,
         delivery_id: Some("hint".into()),
+        kind: TriggerEvent::Merge,
+        changes: None,
     }
 }
 fn journal(f: &Fixture) -> RuleJournal {
@@ -1215,6 +1218,7 @@ fn live_https_observe_execute_runs_once_through_the_production_cli() {
     f.rule.trigger = MergeTrigger {
         target: confirmed.target.clone(),
         labels_all: BTreeSet::new(),
+        ..MergeTrigger::default()
     };
     f.rule.recipe=serde_json::from_value(json!({"version":1,"name":"release-briefing","skill":{"entrypoint":"examples/productive-workflows/release-notes/v1/SKILL.md","resources":["examples/productive-workflows/release-notes/v1/explain.json","examples/productive-workflows/release-notes/v1/explain.md"]},"steps":[{"id":"explain","needs":[],"required":true,"action":{"kind":"agent_action","resource":"explain.json"}}]})).unwrap();
     f.rule.recipe_digest = f.rule.recipe.digest().unwrap();
