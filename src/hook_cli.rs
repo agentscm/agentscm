@@ -2187,7 +2187,7 @@ fn cwd_of(payload: &Value) -> PathBuf {
 
 /// Added to a failure note: it is given once per session and failure, so it has to cover the edits
 /// after it, which get the empty reply.
-const LATER_EDITS: &str = " Until AgentSCM answers again, later edits in this session are unchecked too and get no further note.";
+const LATER_EDITS: &str = " Later edits in this session that fail the same way are unchecked too and get no further note.";
 
 /// The refusal for an edit `--hub-url` routing cannot place in the checkout: an empty reply would
 /// read as "no one else is on this file".
@@ -2337,7 +2337,9 @@ fn unknown_failure(agent: &str, payload: &Value, failure: &HookFailure) -> Value
     if reason == NO_EDIT_CONNECTION {
         return fail_open(agent, payload, None);
     }
+    // An unplaced edit is about that one edit, so every one says so.
     let note = is_session_start(agent, payload)
+        || reason == UNPLACED_EDIT
         || match (session_of(payload), config_dir()) {
             (Some(session), Ok(dir)) => first_note(&dir, agent, &failure.note_key(session)),
             _ => true,
@@ -2450,7 +2452,11 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
                 format!(
                     "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
                 )
-            } + LATER_EDITS),
+            } + if reason == UNPLACED_EDIT {
+                ""
+            } else {
+                LATER_EDITS
+            }),
         ),
         None => context_reply_with(agent, payload, None),
     }
