@@ -1,6 +1,7 @@
 //! Bounded, repository-scoped conflict facts for the shared status projection.
 use super::{RecipientKind, StatusAction, StatusRecipient};
 use crate::hub::intent::{Intent, key_of, overlaps};
+use crate::hub::overlap_detail;
 use crate::hub::session::{HOLD_CAP_SECONDS, same_agent};
 use crate::hub::store::{Principal, Store};
 use crate::hub::work::WorkItem;
@@ -31,6 +32,53 @@ fn paths(data: &Value) -> Vec<&str> {
         .take(8)
         .collect()
 }
+/// The agents on one contested file: whom the row names, and their intents by id.
+#[derive(Default)]
+struct Contested<'a> {
+    owners: BTreeMap<String, StatusRecipient>,
+    holders: BTreeMap<&'a str, &'a Intent>,
+}
+impl<'a> Contested<'a> {
+    fn add(&mut self, intent: &'a Intent) {
+        self.owners
+            .insert(intent.owner.id.clone(), recipient(intent));
+        self.holders.insert(&intent.id, intent);
+    }
+}
+
+/// Whether a holder's `specs` overlap any of a pull request's `files`, and whether the scan was
+/// cut short. Every overlapping file found goes into `overlapping`. Finding the first one
+/// spends `comparisons`; listing the rest spends `listing`, so a spent listing budget never
+/// stops a later holder from being found.
+fn held_files<'a>(
+    files: impl Iterator<Item = &'a str>,
+    specs: &[String],
+    comparisons: &mut usize,
+    listing: &mut usize,
+    overlapping: &mut BTreeSet<&'a str>,
+) -> (bool, bool) {
+    let mut hit = false;
+    for file in files {
+        for spec in specs {
+            let spent = if hit {
+                &mut *listing
+            } else {
+                &mut *comparisons
+            };
+            *spent += 1;
+            if *spent > COMPARISONS {
+                return (hit, true);
+            }
+            if overlaps(key_of(file), key_of(spec)) {
+                hit = true;
+                overlapping.insert(file);
+                break;
+            }
+        }
+    }
+    (hit, false)
+}
+
 fn action(
     id: String,
     kind: &str,
@@ -154,7 +202,7 @@ pub(super) fn read(
     {
         limits.insert("conflict_event_paths_truncated".into());
     }
-    let mut found = BTreeMap::<String, BTreeMap<String, StatusRecipient>>::new();
+    let mut found = BTreeMap::<String, Contested<'_>>::new();
     let mut comparisons = 0;
     'pairs: for (n, a) in intents.iter().enumerate() {
         for b in &intents[n + 1..] {
@@ -178,9 +226,9 @@ pub(super) fn read(
                             limits.insert("file_conflicts_truncated".into());
                             continue;
                         }
-                        let owners = found.entry(path.clone()).or_default();
-                        owners.insert(a.owner.id.clone(), recipient(a));
-                        owners.insert(b.owner.id.clone(), recipient(b));
+                        let contested = found.entry(path.clone()).or_default();
+                        contested.add(a);
+                        contested.add(b);
                     }
                 }
             }
@@ -248,7 +296,7 @@ pub(super) fn read(
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
-            let mut current = BTreeMap::new();
+            let mut current = Vec::new();
             for i in &intents {
                 if !holders.contains(i.id.as_str()) {
                     continue;
@@ -260,7 +308,7 @@ pub(super) fn read(
                         break 'event_paths;
                     }
                     if overlaps(key_of(spec), key_of(path)) {
-                        current.insert(i.owner.id.clone(), recipient(i));
+                        current.push(i);
                         break;
                     }
                 }
@@ -273,15 +321,17 @@ pub(super) fn read(
                 continue;
             }
             live_repeated.insert(path.to_owned());
-            let owners = found.entry(path.into()).or_default();
-            owners.extend(current);
+            let contested = found.entry(path.into()).or_default();
+            for i in current {
+                contested.add(i);
+            }
             if let Some(i) = intents.iter().find(|i| i.token == event.token) {
-                owners.insert(i.owner.id.clone(), recipient(i));
+                contested.add(i);
             } else if own_tokens
                 .iter()
                 .any(|t| t.id == event.token && !t.revoked && t.expires_at > now)
             {
-                owners.insert(
+                contested.owners.insert(
                     who.owner.id.clone(),
                     StatusRecipient {
                         kind: RecipientKind::Person,
@@ -296,7 +346,7 @@ pub(super) fn read(
         }
     }
     let mut actions = Vec::new();
-    for (path, owners) in found {
+    for (path, contested) in found {
         let handoff = parsed.iter().find(|(e, d)| {
             e.event.kind == "handoff_request"
                 && paths(d).iter().any(|p| overlaps(key_of(p), key_of(&path)))
@@ -311,11 +361,13 @@ pub(super) fn read(
                 })
         });
         let repeated = live_repeated.contains(&path);
+        let answering = pending && !repeated;
+        let holders: Vec<&Intent> = contested.holders.into_values().collect();
         let mut row = action(
             format!("file:{path}"),
             "file_conflict",
-            owners.into_values().collect(),
-            format!("Agree who keeps the overlapping file {path}."),
+            contested.owners.into_values().collect(),
+            overlap_detail::file_conflict(&path, &holders, answering, now),
             parsed
                 .iter()
                 .filter(|(_, d)| paths(d).iter().any(|p| overlaps(key_of(p), key_of(&path))))
@@ -328,9 +380,8 @@ pub(super) fn read(
             row.limits.push("conflict_recipient_unknown".into());
             limits.insert("conflict_recipient_unknown".into());
         }
-        if pending && !repeated {
+        if answering {
             row.needs_you = false;
-            row.action = format!("The agents are answering the pending handoff for {path}.");
         }
         actions.push(row);
     }
@@ -360,6 +411,7 @@ pub(super) fn read(
             limits.insert("pr_observations_truncated".into());
         }
         let mut targets = BTreeMap::new();
+        let mut listing = 0;
         for observed in pulls.iter().take(LIMIT) {
             if comparisons >= COMPARISONS {
                 limits.insert("conflict_comparison_limit".into());
@@ -386,6 +438,13 @@ pub(super) fn read(
                 continue;
             };
             let mut recipients = BTreeMap::new();
+            let mut holders = Vec::new();
+            let mut overlapping = BTreeSet::new();
+            // Finding a holder stops at its first overlapping file, as before. Listing its other
+            // overlapping files for the text has a budget of its own, so the detail never costs
+            // a later holder or pull request its check. A budget that ran out, or a file list
+            // the forge cut short, leaves the count of the rest unknown.
+            let mut rest_unknown = pull["files_truncated"] != false;
             for intent in &intents {
                 // The agent that opened the pull request holding its own files is no overlap.
                 if opened_by(
@@ -400,37 +459,42 @@ pub(super) fn read(
                 )? {
                     continue;
                 }
-                let mut hit = false;
-                for file in files
+                let files = files
                     .iter()
                     .filter_map(Value::as_str)
-                    .filter(|p| !p.chars().any(char::is_control))
-                {
-                    for spec in &intent.paths {
-                        comparisons += 1;
-                        if comparisons > COMPARISONS {
-                            limits.insert("conflict_comparison_limit".into());
-                            break;
-                        }
-                        if overlaps(key_of(file), key_of(spec)) {
-                            hit = true;
-                            break;
-                        }
-                    }
-                    if hit || comparisons > COMPARISONS {
-                        break;
-                    }
+                    .filter(|p| !p.chars().any(char::is_control));
+                let (hit, cut) = held_files(
+                    files,
+                    &intent.paths,
+                    &mut comparisons,
+                    &mut listing,
+                    &mut overlapping,
+                );
+                rest_unknown |= cut;
+                if comparisons > COMPARISONS {
+                    limits.insert("conflict_comparison_limit".into());
                 }
                 if hit {
                     recipients.insert(intent.owner.id.clone(), recipient(intent));
+                    holders.push(intent);
                 }
             }
             if !recipients.is_empty() {
+                // By intent id, as a contested file lists its holders.
+                holders.sort_by(|a, b| a.id.cmp(&b.id));
+                let overlapping: Vec<&str> = overlapping.into_iter().collect();
                 let mut row = action(
                     format!("pr:{}:{number}", repo.id),
                     "pr_overlap",
                     recipients.into_values().collect(),
-                    format!("Review pull request #{number} against the named holders' files."),
+                    overlap_detail::pull_overlap(
+                        number,
+                        &pull,
+                        &overlapping,
+                        rest_unknown,
+                        &holders,
+                        now,
+                    ),
                     0, // Forge reads do not carry a monotone Work event sequence.
                     &who.owner.id,
                 );
@@ -465,6 +529,51 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spent_listing_budget_still_finds_the_next_holder() {
+        let specs = ["src/a.rs".to_owned()];
+        let files = ["src/a.rs", "src/b.rs", "src/c.rs"];
+        let (mut comparisons, mut listing) = (0, COMPARISONS);
+        let mut overlapping = BTreeSet::new();
+        // The holder is found with the check budget; listing its other files is cut short.
+        assert_eq!(
+            held_files(
+                files.into_iter(),
+                &specs,
+                &mut comparisons,
+                &mut listing,
+                &mut overlapping
+            ),
+            (true, true)
+        );
+        assert_eq!(comparisons, 1);
+        // The next holder is still found, though the listing budget is spent.
+        let next = ["src/c.rs".to_owned()];
+        assert_eq!(
+            held_files(
+                files.into_iter(),
+                &next,
+                &mut comparisons,
+                &mut listing,
+                &mut overlapping
+            ),
+            (true, false)
+        );
+        assert_eq!(overlapping, BTreeSet::from(["src/a.rs", "src/c.rs"]));
+        // A spent check budget finds nobody and says the scan was cut.
+        comparisons = COMPARISONS;
+        assert_eq!(
+            held_files(
+                files.into_iter(),
+                &next,
+                &mut comparisons,
+                &mut listing,
+                &mut overlapping
+            ),
+            (false, true)
+        );
+    }
 
     #[test]
     fn equal_length_evidence_changes_beyond_sixteen_mib_change_the_digest() {

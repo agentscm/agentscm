@@ -327,8 +327,11 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   are omitted; failed access checks are counted in `unchecked` without naming the repository.
   At most 20 Work rows and 40 live rows are returned per repository; `work_complete` or
   `live_complete` is false when that list was cut short. `attention_revision` is an opaque marker
-  for changes to actionable items and is null without attention. This route does not return
-  conversation bodies, source paths or agent tokens.
+  for changes to actionable items and is null without attention; how long ago the holder in an
+  overlap row was last active is left out of it, so it does not move with the clock. This route
+  does not return conversation bodies or agent tokens. An overlap row's text names the contested
+  files, and for a pull request its number, title, author and state, as the
+  [shared status](api.md) words them.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 
@@ -416,6 +419,93 @@ status shown; clients show `message` as is.
 - `GET /v1/hub/login` also lists `browser_only`: providers whose forge app refused device
   sign-in when last asked (a GitHub App without **Enable Device Flow**, which a manifest cannot
   set; the setup page links to the checkbox), so clients go straight to the browser.
+
+## Connected apps
+
+An operator can register an external app, such as a chat integration, that people connect to
+their own Hub account. A person signs in to the Hub's web pages and approves the app; the Hub then
+gives the app a revocable credential bound to that person. With it the app can read the person's
+repositories and work the way their own computer can, mint short read-only tokens for the
+repositories they can read now (the forge role is checked at every mint), and answer coordination
+and file handoff requests for the person's own agents, recorded with the app's `via`. It can
+never mint a writable agent token, enroll a computer, transition or recover Work, create
+hand-off pickups or call an administrator route.
+
+**Configuration.** `AGENTSCM_HUB_APPS_FILE` is an absolute path to a JSON file under the same
+rules as the Slack config: a regular file, not a symlink, owned by the Hub's user and not
+readable by group or others (`chmod 600`), at most 64 KiB. Unset means no apps, and every app
+route answers 404. The Hub refuses to start when the file is set but invalid, or when no GitHub or
+GitLab sign-in is configured.
+
+```json
+{"apps": [{"id": "example-app", "name": "Example App",
+  "redirect_uri": "https://app.example.com/callback",
+  "secret_file": "/etc/agentscm/example-app.secret", "via": "slack"}]}
+```
+
+- `id` (the OAuth `client_id`): 3 to 64 of `a-z`, `0-9` and `-`, unique. At most 16 apps.
+- `name`: 1 to 64 printable characters, shown on the approval page and as the credential's name
+  in the person's computers list.
+- `redirect_uri`: one exact `https` URL (`http` only on a loopback IP, for local testing),
+  without a query or fragment, written as a URL parser writes it back (a host in lower case, a
+  path of at least `/`). Requests must name it byte for byte.
+- `secret_file`: an absolute path to a private file (same rules) holding the client secret, at
+  least 32 bytes, without whitespace. The Hub keeps only its SHA-256 and compares in constant
+  time.
+- `via`: how answers through the app are recorded. Only `"slack"` exists today.
+
+**Connecting.** The standard OAuth 2.0 authorization code flow with PKCE (`S256` only):
+
+1. The app sends the person to `GET /v1/hub/apps/authorize?client_id&redirect_uri&state&code_challenge&code_challenge_method=S256`
+   (`state` 1 to 512 visible ASCII characters, `code_challenge` 43 base64url characters). An
+   unknown app, a different redirect or a bad parameter gets an error page and is never
+   redirected. Without a web sign-in the page offers the Hub's sign-in, which returns to the same
+   URL; because the sign-in cookie is `SameSite=Strict`, a browser arriving from another site
+   first reloads the page from the Hub once. Signed in, the page names the app, what it can and
+   can't do, and that it can be revoked under Computers, with Allow and Deny.
+2. Allow and Deny post the form to `POST /v1/hub/apps/authorize`, with the web sign-in's CSRF
+   token as a hidden field. Allow redirects (303) to `redirect_uri?code=…&state=…`: a one-time
+   code of 64 hex characters, held in this Hub process's memory for 60 seconds, bound to the app,
+   the redirect, the challenge and the person; a person may have 8 waiting. Deny redirects to
+   `redirect_uri?error=access_denied&state=…`. A missing or wrong CSRF field or sign-in gets a 403
+   error page.
+3. The app exchanges the code at `POST /v1/hub/apps/token` (form or JSON body:
+   `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `client_secret`,
+   `code_verifier`). The client secret is checked first, and a code issued to another app is left
+   untouched, so only its own app can spend it; the code then goes on any use by that app, even a
+   failed one. Each person has one credential per app: connecting again revokes the earlier one. Reply (200, `Cache-Control: no-store`):
+   `{"credential": "<64 hex>", "device": {"id": "dev_…", "name"}, "owner": {"provider", "host",
+   "user_id", "login"}}`. Errors are 400 `{"error": "invalid_request"}` (a bad body or grant
+   type), `invalid_client` (unknown app or wrong secret) or `invalid_grant` (a code that is
+   unknown, used, expired, for another app or redirect, or whose verifier does not match).
+
+Pages are server-rendered with everything escaped, no script, `Cache-Control: no-store`,
+`Referrer-Policy: no-referrer` and the policy `default-src 'none'; style-src 'unsafe-inline';
+base-uri 'none'; frame-ancestors 'none'; form-action 'self'`, plus the app's own origin on the
+approval page (browsers check a form's redirect against `form-action`).
+
+**The credential.** It is a computer credential (named migration `connected_apps` adds
+`app_id` to the computers table), sent as `Authorization: Bearer <credential>`, with the same
+digest storage, 90-day idle expiry and revocation. It works on:
+
+- `GET /v1/hub/device` and `DELETE /v1/hub/device` (the app disconnects itself);
+- `GET /v1/hub/device/repositories`;
+- `POST /v1/hub/device/tokens` with `"read_only": true` only (30 minutes); a writable mint is 403
+  `app_read_only`;
+- `POST /v1/hub/session/coordination/reply` and `POST /v1/hub/session/handoff/answer`, with the
+  same bodies, checks and replies as for the web sign-in: the named agent token must be one of
+  the person's own active writable tokens (403 `not_your_agent`), the store's lead, session,
+  `expected_updated_seq` and `operation_id` replay rules all hold, and the person must still be
+  on `AGENTSCM_ALLOWED_USERS` when it is set (403 `not_allowed`). A coordination response is
+  recorded with `"via": "slack"` (on the response and its `coordination_responded` event), and a
+  handoff answer as `answered_via_slack` with `"via": "slack"` on its event.
+
+Every other computer route refuses it with 403 `app_not_allowed`, and every other person,
+agent or administrator route with 401. `GET /v1/hub/devices` lists it among the person's
+computers with `"app": {"id", "name"}` (`null` for a computer); the person revokes it there with
+`DELETE /v1/hub/devices/{id}`, which also revokes the read-only tokens it minted. An app removed from
+the file has its credentials revoked, with the read-only tokens they minted, at the Hub's next
+start; until then they stop working (401 `sign_in_required`).
 
 ## Routes
 

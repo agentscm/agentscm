@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::handoff::Via;
 use super::intent::text;
 use super::work::{ForgeWorkRef, WorkPathOverlap, validate_id};
 use super::{HubError, Result};
@@ -86,7 +87,8 @@ pub struct CoordinationResponse {
     pub kind: CoordinationResponseKind,
     pub note: Option<String>,
     /// `hub` when the person who owns the responding agent answered for it from the Hub's web
-    /// pages; absent when the agent answered itself. `responder` is still the agent, so a reader
+    /// pages, `slack` when they answered through a connected app with that `via`; absent when
+    /// the agent answered itself. `responder` is still the agent, so a reader
     /// that ignores this field sees the same shape as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
@@ -200,10 +202,11 @@ pub struct CoordinationReply {
     pub expected_updated_seq: i64,
     pub kind: CoordinationResponseKind,
     pub note: Option<String>,
-    /// Set only by the Hub's browser-session route, never read from a request body: the person
-    /// who owns the lead agent answered for it. Recorded as `via: "hub"` on the response.
+    /// Set only by the person routes, never read from a request body: the person who owns the
+    /// lead agent answered for it from the Hub's web pages (`via: "hub"` on the response) or
+    /// through a connected app (`via: "slack"`). `Agent` when the agent answered itself.
     #[serde(skip)]
-    pub via_hub: bool,
+    pub via: Via,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -370,10 +373,11 @@ pub(super) fn invalid(message: &str) -> HubError {
     HubError::Invalid(message.to_owned())
 }
 
-/// The event data of a response, marked `via: "hub"` when a person answered for the agent.
-pub(super) fn with_hub_via(mut data: serde_json::Value, hub: bool) -> serde_json::Value {
-    if hub {
-        data["via"] = serde_json::json!("hub");
+/// The event data of a response, marked `via` (`hub` or `slack`) when a person answered for the
+/// agent.
+pub(super) fn with_via(mut data: serde_json::Value, via: Option<&str>) -> serde_json::Value {
+    if let Some(via) = via {
+        data["via"] = serde_json::json!(via);
     }
     data
 }
