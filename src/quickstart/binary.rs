@@ -3,9 +3,10 @@
 //! in the layout the installer uses: `agentscm-<version>` plus an `agentscm` symlink.
 use std::path::{Path, PathBuf};
 
-/// The version in the installed file's name: the release version, `<version>+<commit>` for any
-/// other release-profile build, or `<version>+dev` for a debug build without a commit (set by
-/// build.rs).
+/// The version in the installed file's name: the release version on the release tag,
+/// `<version>+<commit>` when the build knows its commit (a release-profile build from a checkout,
+/// or `AGENTSCM_BUILD_COMMIT` set), `<version>+dev` for a debug build without one, else the plain
+/// version (set by build.rs).
 pub(crate) const VERSION: &str = env!("AGENTSCM_INSTALL_VERSION");
 
 // Where symlinks need privileges (Windows) this is a copy of the versioned file instead.
@@ -249,6 +250,10 @@ mod tests {
         install(&dir, &exe, "10.0.0+abc").unwrap();
         assert_eq!(std::fs::read(&link).unwrap(), b"three");
         assert_eq!(std::fs::read(dir.join("agentscm-10.0.0")).unwrap(), b"two");
+        install(&dir, &exe, "10.0.0+dev").unwrap();
+        std::fs::write(&exe, b"four").unwrap();
+        install(&dir, &exe, "10.0.0+dev").unwrap();
+        assert_eq!(std::fs::read(&link).unwrap(), b"four");
         // A regular file named agentscm is never replaced.
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, b"mine").unwrap();
