@@ -449,9 +449,9 @@ pub(crate) async fn renew_command(root: &Path) -> Result<()> {
 }
 
 /// After a sign-in replaced this computer's credential, which revoked every agent token issued
-/// through it: renews each checkout connected to `hub` with a managed token. Returns the ones
-/// not renewed, with why.
-pub(crate) async fn renew_after_sign_in(hub: &str) -> Vec<(PathBuf, String)> {
+/// through it: renews each checkout connected to `hub` with a managed token. Each one not
+/// renewed is recorded for its next agent (the menu bar app shows no output) and returned.
+pub(crate) async fn renew_after_sign_in(hub: &str) -> Vec<String> {
     let roots: Vec<PathBuf> = load()
         .unwrap_or_default()
         .into_iter()
@@ -466,14 +466,16 @@ pub(crate) async fn renew_after_sign_in(hub: &str) -> Vec<(PathBuf, String)> {
                 record_attention(&root, None);
                 continue;
             }
-            Ok(Renewal::Refused(message)) => {
-                record_attention(&root, Some(&message));
-                message
-            }
+            Ok(Renewal::Refused(message)) => message,
             Ok(Renewal::Unavailable) => "the Hub did not answer".to_owned(),
             Err(error) => error.to_string(),
         };
-        failed.push((root, why));
+        let message = format!(
+            "The connection of {} was not renewed ({why}); reconnect it with `agentscm client connect` in that folder.",
+            root.display()
+        );
+        record_attention(&root, Some(&message));
+        failed.push(message);
     }
     failed
 }

@@ -1451,12 +1451,12 @@ async fn signing_in_again_keeps_connected_checkouts_working() {
         stderr.contains(&format!(
             "The connection of {} was not renewed (",
             root.display()
-        )) && stderr.contains(&format!(
-            "agentscm client connect --root {}",
-            root.display()
-        )),
+        )) && stderr.contains("reconnect it with `agentscm client connect` in that folder"),
         "{stderr}"
     );
+    // The next agent in the checkout is told too, since the menu bar app shows no output.
+    let reply = machine.session_start("s2");
+    assert!(context(&reply).contains("was not renewed"), "{reply}");
 }
 
 /// A session that starts in one repository and edits another declares its Work in the other:
