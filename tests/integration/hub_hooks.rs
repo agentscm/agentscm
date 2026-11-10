@@ -925,8 +925,9 @@ async fn a_second_agent_on_the_same_file_is_refused_once() {
     // Codex: a patch of two files is refused whole; the reason names the contested one.
     let codex = hub.hook_raw("codex", &x1, &fixture("codex-PreToolUse"));
     let reason = reason_of(&codex, "/hookSpecificOutput/permissionDecisionReason", &key);
-    // Protects: only the contested file is named, not the patch's uncontested one.
-    assert!(!reason.contains("src/gadget.rs"), "{reason}");
+    // Protects: the holder's refusal names only the contested file, not the patch's uncontested
+    // one (the one-time WORK_UNDECLARED line ahead of it lists every path, for the start call).
+    assert!(!warn_once_part(&reason).contains("src/gadget.rs"), "{reason}");
     assert_eq!(codex["hookSpecificOutput"]["permissionDecision"], "deny");
     assert_eq!(codex["hookSpecificOutput"]["hookEventName"], "PreToolUse");
     assert!(
