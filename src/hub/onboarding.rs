@@ -263,15 +263,16 @@ impl Row {
 }
 
 type Key = (String, String, Agent, String);
-/// Setup rows, their invalidation epoch, the sessions waiting for their person, and the sessions
-/// already told to declare their Work (kept here because every shared-status read already holds
-/// these short-lived observations).
+/// Setup rows, their invalidation epoch, the sessions waiting for their person, the sessions
+/// already told to declare their Work, and the permission requests waiting hooks hold open (kept
+/// here because every shared-status read already holds these short-lived observations).
 #[derive(Default)]
 pub struct Observations(
     Mutex<BTreeMap<Key, Row>>,
     AtomicU64,
     super::session_waiting::Waiting,
     StartNudges,
+    super::permission_answer::Requests,
 );
 
 /// Native sessions already told once to declare their Work, by repository, agent token and
@@ -339,6 +340,9 @@ impl Observations {
     }
     pub(super) fn start_nudges(&self) -> &StartNudges {
         &self.3
+    }
+    pub(super) fn permissions(&self) -> &super::permission_answer::Requests {
+        &self.4
     }
     pub(super) fn epoch(&self) -> u64 {
         self.1.load(Ordering::SeqCst)

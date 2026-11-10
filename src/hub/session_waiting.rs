@@ -8,8 +8,9 @@
 //! restart, after which a waiting session reads as not known rather than not waiting. The only
 //! text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
 //! agent's last message, its question, or what a permission prompt is for, with secrets redacted),
-//! shown to that session's own person alone. No prompt, tool input or transcript is kept, and
-//! nothing here can answer the prompt: the person answers in the session.
+//! shown to that session's own person alone. No prompt, tool input or transcript is kept here,
+//! and this table cannot answer a prompt. A permission wait may have a pending request in
+//! `permission_answer`, which lets that person allow or deny it once from the Hub.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -105,6 +106,15 @@ impl Row {
     }
 }
 
+/// The item key of a wait: stable per agent token and native session, and neither a secret nor
+/// the session ID itself.
+pub(super) fn wait_key(token: &str, native: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(token, native)).unwrap_or_default())
+    )
+}
+
 /// Keyed by agent token id and the session ID the hook reported.
 #[derive(Default)]
 pub struct Waiting(Mutex<BTreeMap<(String, String), Row>>);
@@ -191,6 +201,21 @@ impl Waiting {
         }
     }
 
+    /// The start and asking subagent of the current permission wait of `native`, or `None` when
+    /// it is gone, replaced by another kind of wait, or too old. A pending answer is valid only
+    /// while this still returns what it was made for.
+    pub(super) fn permission_wait(
+        &self,
+        token: &str,
+        native: &str,
+        now: i64,
+    ) -> Option<(i64, Option<String>)> {
+        let rows = self.0.lock().ok()?;
+        let row = rows.get(&(token.to_owned(), native.to_owned()))?;
+        (row.current(now) && row.reason == WaitReason::Permission)
+            .then(|| (row.since, row.asker.clone()))
+    }
+
     /// The waits of `viewer`'s own sessions in the repository `viewer` reads that have lasted at
     /// least [`GRACE_SECONDS`], oldest first.
     pub(super) fn owned(&self, viewer: &Principal, now: i64) -> Result<Vec<WaitingSession>> {
@@ -204,10 +229,7 @@ impl Waiting {
                     && same_repository(&row.principal, viewer)
             })
             .map(|((token, native), row)| WaitingSession {
-                key: format!(
-                    "{:x}",
-                    Sha256::digest(serde_json::to_vec(&(token, native)).unwrap_or_default())
-                ),
+                key: wait_key(token, native),
                 reason: row.reason,
                 since: row.since,
                 name: row.principal.name.clone(),

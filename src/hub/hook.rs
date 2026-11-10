@@ -174,6 +174,9 @@ struct Call {
     asker: Option<String>,
     /// What a wait asks of its person, as the hook client excerpted it. Kept only on a wait.
     asks: Option<String>,
+    /// The host's own notice that it shows a permission prompt to a person, which confirms a
+    /// request to answer that prompt from the Hub (`permission_answer`).
+    prompt_shown: bool,
 }
 
 struct Outcome {
@@ -514,6 +517,7 @@ impl Call {
             child: false,
             asker: None,
             asks: None,
+            prompt_shown: false,
         }
     }
 
@@ -695,6 +699,9 @@ impl Call {
                     });
                     if let Err(error) = recorded {
                         eprintln!("hub: waiting hook not recorded: {error}");
+                    } else if self.prompt_shown {
+                        let requests = state.onboarding.permissions();
+                        requests.confirm(&principal.token_id, &native, unix_now());
                     }
                 }
                 Ok(Outcome::clean())
@@ -1360,11 +1367,19 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         // Fires only where a person types, so it reaches the session they are talking to. The
         // prompt itself is never read; the client does not forward it.
         Some("UserPromptSubmit") => call(Kind::Prompt, Shape::Hook("UserPromptSubmit")),
-        // Only the facts of the wait are read: never the message, tool input or question.
-        Some("PreToolUse") if tool == ASK_USER_QUESTION => waiting(WaitReason::Question),
+        // Only the facts of the wait are read: never the message, tool input or question. A
+        // question raises its own permission request, which must not turn its wait into a
+        // permission wait. Answering a permission prompt from the Hub is in `permission_answer`.
+        Some("PreToolUse" | "PermissionRequest") if tool == ASK_USER_QUESTION => {
+            waiting(WaitReason::Question)
+        }
         Some("PermissionRequest") => waiting(WaitReason::Permission),
         Some("Notification") => match notified(str_at(v, "notification_type")) {
-            Some(reason) => waiting(reason),
+            Some(reason) => {
+                let mut call = waiting(reason);
+                call.prompt_shown = reason == WaitReason::Permission;
+                call
+            }
             None => call(Kind::Ignore, Shape::Silent),
         },
         // Paused on its own background work, which will resume it, not on the person.
@@ -2160,6 +2175,11 @@ mod tests {
             ),
             (
                 Agent::Claude,
+                json!({"hook_event_name":"PermissionRequest","session_id":"s","tool_name":"AskUserQuestion"}),
+                Some(Question),
+            ),
+            (
+                Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}),
                 Some(Idle),
             ),
@@ -2253,6 +2273,10 @@ mod tests {
             &json!({"hook_event_name":"PermissionRequest","session_id":"s","agent_id":"sub-1"}),
         );
         assert_eq!((sub.child, sub.asker.as_deref()), (true, Some("sub-1")));
+        // Only the host's own notice says a prompt is on screen; the request for it does not.
+        assert!(!sub.prompt_shown);
+        assert!(parse(Agent::Claude, &note("permission_prompt")).prompt_shown);
+        assert!(!parse(Agent::Claude, &note("idle_prompt")).prompt_shown);
         let camel = parse(
             Agent::Copilot,
             &json!({"sessionId":"s","notification_type":"permission_prompt","agentId":"sub-2"}),
