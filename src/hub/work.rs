@@ -311,9 +311,9 @@ pub struct WorkCompaction {
 
 /// The floors below which a compaction ends open deliveries: one that still has unread events
 /// below the first returned seq, or unread merges below the second. A delivery that already read
-/// past a floor keeps paging, so a reader whose cursor started below the floor is told of the gap
-/// once, when its delivery starts, and not ended again by later passes. Each floor is compared
-/// with its own old value and the highest raised one cuts; a pass that raised none returns 0.
+/// past a floor keeps paging and is not ended again by later passes; each of its pages reports the
+/// gap while its window starts below the floor. Each floor is compared with its own old value and
+/// the highest raised one cuts; a pass that raised none returns 0.
 pub fn delivery_cuts(
     old_event_floors: [i64; 3],
     new_event_floors: [i64; 3],

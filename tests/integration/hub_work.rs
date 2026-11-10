@@ -1888,15 +1888,12 @@ fn a_reader_past_the_floor_is_not_ended_by_later_compactions(db: &Db) {
     };
     progress("first", old + 10);
     progress("second", old + 100);
-    progress("third", now - 10);
+    progress("third", old + 200);
+    progress("fourth", now - 10);
     // The first pass raises the floor; then a reader whose cursor is still at 0, below it, reads
-    // its whole delivery and is told of the gap once.
-    assert!(
-        store
-            .work_compact(&scope, old + 50, true, now)
-            .unwrap()
-            .applied
-    );
+    // its whole delivery and is told of the gap.
+    let first = store.work_compact(&scope, old + 50, true, now).unwrap();
+    assert!(first.applied);
     let read = store
         .work_briefing(&lead.token, &BriefingQuery::default(), now)
         .unwrap();
@@ -1905,11 +1902,15 @@ fn a_reader_past_the_floor_is_not_ended_by_later_compactions(db: &Db) {
         read.retention_gap,
         "the reader learns its cursor is below the floor"
     );
-    // A later pass raises the floor again. Its window still starts at 0, but it read past the
+    // Two later passes raise the floor again. Its window still starts at 0, but it read past each
     // floor, so it is not ended and can be acknowledged.
-    let second = store.work_compact(&scope, old + 150, true, now).unwrap();
-    assert!(second.applied);
-    assert!(second.retention_floor > 0);
+    let mut floor = first.retention_floor;
+    for before in [old + 150, old + 250] {
+        let pass = store.work_compact(&scope, before, true, now).unwrap();
+        assert!(pass.applied);
+        assert!(pass.retention_floor > floor, "each pass raises the floor");
+        floor = pass.retention_floor;
+    }
     store
         .work_ack(
             &lead.token,

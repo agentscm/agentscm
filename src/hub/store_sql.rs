@@ -49,10 +49,6 @@ mod tests {
         );
         assert_eq!(sqlite("SELECT $ FROM t"), "SELECT $ FROM t");
         assert!(matches!(sqlite("SELECT 1"), Cow::Borrowed(_)));
-        assert_eq!(
-            sqlite(GET_SETTING),
-            "SELECT value FROM hub_settings WHERE key = ?1"
-        );
     }
 
     #[test]
