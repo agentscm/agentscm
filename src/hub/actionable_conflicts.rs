@@ -15,9 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 const LIMIT: usize = 100;
 const COMPARISONS: usize = 20_000;
 
+/// The agent that holds the file. An overlap is its to settle, not its person's.
 fn recipient(intent: &Intent) -> StatusRecipient {
     StatusRecipient {
-        kind: RecipientKind::Person,
+        kind: RecipientKind::LeadAgent,
         owner: Some(intent.owner.id.clone()),
         login: Some(intent.owner.login.clone()),
         agent: Some(intent.agent.clone()),
@@ -79,21 +80,20 @@ fn held_files<'a>(
     (hit, false)
 }
 
+/// An overlap for the agents it names. It asks no person: an open pull request or another agent
+/// on a held file is ordinary parallel work, which the holders settle between themselves.
 fn action(
     id: String,
     kind: &str,
     recipients: Vec<StatusRecipient>,
     text: String,
     seq: i64,
-    viewer: &str,
 ) -> StatusAction {
     StatusAction {
         id,
         kind: kind.into(),
         work_ids: vec![],
-        needs_you: recipients
-            .iter()
-            .any(|r| r.owner.as_deref() == Some(viewer)),
+        needs_you: false,
         recipients,
         action: text,
         updated_seq: seq,
@@ -334,7 +334,7 @@ pub(super) fn read(
                 contested.owners.insert(
                     who.owner.id.clone(),
                     StatusRecipient {
-                        kind: RecipientKind::Person,
+                        kind: RecipientKind::LeadAgent,
                         owner: Some(who.owner.id.clone()),
                         login: Some(who.owner.login.clone()),
                         agent: Some(event.agent.clone()),
@@ -374,14 +374,10 @@ pub(super) fn read(
                 .map(|(e, _)| e.event.seq)
                 .max()
                 .unwrap_or(0),
-            &who.owner.id,
         );
         if row.recipients.is_empty() || unknown_recipients.contains(&path) {
             row.limits.push("conflict_recipient_unknown".into());
             limits.insert("conflict_recipient_unknown".into());
-        }
-        if answering {
-            row.needs_you = false;
         }
         actions.push(row);
     }
@@ -496,7 +492,6 @@ pub(super) fn read(
                         now,
                     ),
                     0, // Forge reads do not carry a monotone Work event sequence.
-                    &who.owner.id,
                 );
                 let canonical_files: BTreeSet<&str> =
                     files.iter().filter_map(Value::as_str).collect();

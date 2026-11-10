@@ -2891,6 +2891,279 @@ async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
     );
 }
 
+/// An agent reads current Work across the repositories its person can read now: the same role
+/// check as the All repositories page, another owner's sessions digested, lists bounded, and a
+/// repository the forge could not answer for counted, never named.
+#[tokio::test]
+async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    env.connect_repo("acme/docs", 4343, ALICE);
+    // Connected, but alice cannot read it: bob's only.
+    env.connect_repo("acme/secret", 4444, BOB);
+    // Alice could read this one, and lost access before she asked.
+    env.connect_repo("acme/gone", 4545, ALICE);
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.remove(&("acme/gone".into(), ALICE));
+        fake.levels.remove(&(4545, ALICE));
+    }
+    let (_, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let alice = minted["token"].as_str().unwrap().to_owned();
+    let path = "/v1/hub/standup/repositories";
+    let host = env.base.trim_start_matches("http://").to_owned();
+    let user = |user_id: i64, login: &str| {
+        env.store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: host.clone(),
+                    user_id,
+                },
+                login,
+            )
+            .unwrap()
+            .id
+    };
+    let (_, who) = env.get("/v1/hub/whoami", &alice).await;
+    let alice_id = user(ALICE, who["owner"]["login"].as_str().unwrap());
+    let bob_id = user(BOB, "bob");
+    // Each fresh read needs its own token: one token gets its last answer back for 30 seconds.
+    let fresh = |name: &str, read_only: bool| {
+        mint_bound_agent_token(&*env.store, &alice_id, name, REPO, REPO_ID, 600, read_only)
+            .unwrap()
+            .1
+    };
+
+    // A forge that cannot answer is counted, never named, and the answer is not complete.
+    env.fake.lock().unwrap().hub_reads_roles = false;
+    let (status, body) = env.get(path, fresh("probe", false).expose()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["repositories"], json!([]));
+    assert_eq!(
+        (&body["unchecked"], &body["complete"]),
+        (&json!(4), &json!(false))
+    );
+    env.fake.lock().unwrap().hub_reads_roles = true;
+
+    let start = |owner: &str, name: &str, repository: (&str, i64), n: usize, session: &str| {
+        let (bound, _, _) = mint_bound_agent_token(
+            &*env.store,
+            owner,
+            name,
+            repository.0,
+            repository.1,
+            600,
+            false,
+        )
+        .unwrap();
+        env.store
+            .work_start(
+                &bound,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: Some(format!("cross-{n}")),
+                    title: format!("Task {n}"),
+                    description: None,
+                    session: session.into(),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("src/{n}.rs")],
+                    branch: None,
+                    worktree: None,
+                    next_action: Some(format!("step {n}")),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+        bound
+    };
+    // More of alice's Work in acme/widgets than one repository lists.
+    for n in 0..11 {
+        start(
+            &alice_id,
+            &format!("agent-{n}"),
+            (REPO, REPO_ID),
+            n,
+            &format!("alice-{n}"),
+        );
+    }
+    // Bob's Work in acme/docs, which alice can read, led by an older client whose label names
+    // its host.
+    let bob_token = start(
+        &bob_id,
+        "client-bobs-laptop-a1b2c3",
+        ("acme/docs", 4343),
+        99,
+        "bob-session",
+    );
+    let digest = agentscm::hub::store::lower_hex_of(
+        format!("agentscm.hub.session-view.v1\0{bob_token}\0bob-session").as_bytes(),
+    )[..16]
+        .to_owned();
+
+    let reader = fresh("alice-reader", true);
+    let mut first = Value::Null;
+    for token in [alice.as_str(), reader.expose()] {
+        let (status, body) = env.get(path, token).await;
+        assert_eq!(status, 200, "{body}");
+        let names: Vec<_> = body["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["repository"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["acme/docs", REPO], "{body}");
+        assert_eq!(
+            (
+                &body["unchecked"],
+                &body["complete"],
+                &body["work_complete"]
+            ),
+            (&json!(0), &json!(true), &json!(true))
+        );
+        let docs = &body["repositories"][0];
+        assert_eq!(docs["work_complete"], true);
+        let theirs = &docs["work"][0];
+        assert_eq!(theirs["title"], "Task 99");
+        assert_eq!(theirs["owner_login"], "bob");
+        assert_eq!(theirs["next_action"], "step 99");
+        assert_eq!(theirs["scope"], json!(["src/99.rs"]));
+        assert_eq!(
+            (&theirs["blocked"], &theirs["waiting"]),
+            (&json!(false), &json!(false))
+        );
+        assert_eq!(
+            theirs["lead_session"], digest,
+            "another owner's session is digested"
+        );
+        assert_eq!(
+            theirs["lead_agent"], "client-host-a1b2c3",
+            "its host name is masked"
+        );
+        let widgets = &body["repositories"][1];
+        assert_eq!(widgets["work"].as_array().unwrap().len(), 10);
+        assert_eq!(widgets["work_complete"], false);
+        assert!(
+            widgets["work"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["lead_session"].as_str().unwrap().starts_with("alice-")),
+            "alice's own sessions stay as stored"
+        );
+        if first.is_null() {
+            first = body;
+        }
+    }
+
+    // Losing access shows on the next fresh read: the role is asked, not cached.
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.remove(&("acme/docs".into(), ALICE));
+        fake.levels.remove(&(4343, ALICE));
+    }
+    let (_, body) = env.get(path, fresh("after-revoke", false).expose()).await;
+    let names: Vec<_> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["repository"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [REPO], "{body}");
+    // The token that asked within the last 30 seconds gets its earlier answer back.
+    let (_, again) = env.get(path, &alice).await;
+    assert_eq!(again, first);
+
+    // The MCP tool is the same read.
+    let (status, reply) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/mcp",
+            Some(&alice),
+            Some(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"agentscm_work_repositories","arguments":{}}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    let (_, body) = env.get(path, &alice).await;
+    assert_eq!(
+        reply["result"]["structuredContent"]["repositories"], body["repositories"],
+        "{reply}"
+    );
+}
+
+/// More Work across repositories than one agent read lists in all: the top-level `work_complete`
+/// says the overall cap cut a list, and the repositories past it list less.
+#[tokio::test]
+async fn the_agent_read_flags_the_overall_work_cap() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    let host = env.base.trim_start_matches("http://").to_owned();
+    let (_, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let alice = minted["token"].as_str().unwrap().to_owned();
+    let (_, who) = env.get("/v1/hub/whoami", &alice).await;
+    let alice_id = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host,
+                user_id: ALICE,
+            },
+            who["owner"]["login"].as_str().unwrap(),
+        )
+        .unwrap()
+        .id;
+    // Eleven repositories of ten Work each: 110, past the 100 one read lists.
+    for r in 0..11_i64 {
+        let (name, id) = (format!("acme/cap-{r:02}"), 5000 + r);
+        env.connect_repo(&name, id, ALICE);
+        let (bound, _, _) =
+            mint_bound_agent_token(&*env.store, &alice_id, "cap-agent", &name, id, 600, false)
+                .unwrap();
+        for n in 0..10 {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": format!("cap-{r}-{n}"), "title": format!("Cap {r} {n}"),
+                "session": format!("cap-{r}-{n}"), "scope": [format!("src/{n}.rs")]
+            }))
+            .unwrap();
+            assert_eq!(request.role, WorkRole::Lead);
+            env.store.work_start(&bound, &request, unix_now()).unwrap();
+        }
+    }
+    let (status, body) = env.get("/v1/hub/standup/repositories", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["work_complete"], false, "the overall cap cut a list");
+    let listed: Vec<usize> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["repository"].as_str().unwrap().starts_with("acme/cap-"))
+        .map(|row| row["work"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(listed.iter().sum::<usize>(), 100);
+    assert_eq!(listed.len(), 11);
+    assert_eq!((listed[0], listed[10]), (10, 0));
+    let last = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["repository"] == "acme/cap-10")
+        .unwrap();
+    assert_eq!(last["work_complete"], false);
+}
+
 #[tokio::test]
 async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only() {
     let env = Env::start("github").await;

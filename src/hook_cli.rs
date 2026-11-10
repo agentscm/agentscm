@@ -153,9 +153,13 @@ async fn hook(
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
     let session_start = is_session_start(agent, &payload);
     let host_session = host_session(agent, &payload);
+    #[cfg(unix)]
     let wants_capture = client_connection
         && agent == "claude"
         && crate::change_capture_cli::captures_claude_event(&payload);
+    // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
+    #[cfg(not(unix))]
+    let wants_capture = false;
     // Capture stops in time for the reply to be printed before the host's hook timeout.
     let budget = started
         + if session_start {
@@ -163,20 +167,17 @@ async fn hook(
         } else {
             CAPTURE_BUDGET
         };
+    #[cfg(unix)]
     let spawn_capture = || {
-        let (body, payload) = (body.clone(), std::sync::Arc::clone(&payload));
-        tokio::spawn(async move {
-            let routed = route_client("claude", &payload).ok()?;
-            crate::change_capture_cli::plugin_capture(
-                &body,
-                &payload,
-                routed.checkout,
-                routed.connection,
-                budget.into(),
-            )
-            .await
-        })
+        tokio::spawn(capture(
+            body.clone(),
+            std::sync::Arc::clone(&payload),
+            budget,
+        ))
     };
+    // Never called: nothing wants capture where it is not built.
+    #[cfg(not(unix))]
+    let spawn_capture = || tokio::spawn(std::future::ready(None::<String>));
     // At session start coordination may connect the checkout first, so capture follows it there
     // and runs beside it otherwise.
     let early = (wants_capture && !session_start).then(spawn_capture);
@@ -222,6 +223,21 @@ async fn hook(
         return permission::await_answer(&payload, started, reply).await;
     }
     reply
+}
+
+/// Change capture for one call of the plugin's hook, run beside coordination: context for the
+/// session, when capture has some.
+#[cfg(unix)]
+async fn capture(body: Vec<u8>, payload: std::sync::Arc<Value>, budget: Instant) -> Option<String> {
+    let routed = route_client("claude", &payload).ok()?;
+    crate::change_capture_cli::plugin_capture(
+        &body,
+        &payload,
+        routed.checkout,
+        routed.connection,
+        budget.into(),
+    )
+    .await
 }
 
 /// Keeps the record that the checkout's MCP server reads to name its calls with this
@@ -1886,7 +1902,7 @@ fn wait_asks(payload: &Value) -> Option<String> {
         _ => return None,
     };
     let mut text = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
-    agentscm::change_capture::redact::redact_json(&mut text);
+    agentscm::redact::redact_json(&mut text);
     let text = text.as_str()?.chars().collect::<Vec<_>>();
     let tail: String = text[text.len().saturating_sub(ASKS_CHARS)..]
         .iter()

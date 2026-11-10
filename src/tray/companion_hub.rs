@@ -704,18 +704,13 @@ mod tests {
             serde_json::from_str(include_str!("../hub/fixtures/needs-you-surfaces.json")).unwrap();
         let result = summarize(std::path::Path::new("/synthetic"), "acme/widgets", &value);
         assert!(result.available);
-        assert_eq!(result.count, 4);
-        assert_eq!(
-            result.keys,
-            [
-                "file:src/shared.rs",
-                "pr:rep_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:7",
-                "request:crq_cccccccccccccccccccccccccccccccc:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "work:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ]
-        );
-        assert_eq!(result.work.iter().filter(|w| w.needs_you).count(), 4);
-        assert_eq!(result.text, "acme/widgets · 4 actions need you (partial)");
+        // Only the blocked Work asks its person. The quiet Work, the request to it, the shared
+        // file and the pull request over a held file are listed for agents and do not count.
+        assert_eq!(result.count, 1);
+        assert_eq!(result.keys, ["work:wrk_ffffffffffffffffffffffffffffffff"]);
+        assert_eq!(result.work.iter().filter(|w| w.needs_you).count(), 1);
+        assert_eq!(result.work.len(), 9);
+        assert_eq!(result.text, "acme/widgets · 1 actions need you (partial)");
     }
     #[test]
     fn a_newer_hubs_fields_and_values_still_read() {

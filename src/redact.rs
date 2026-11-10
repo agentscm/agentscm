@@ -1,4 +1,5 @@
-//! Best-effort secret redaction for conversation bodies that may leave the machine.
+//! Best-effort secret redaction for text that may leave the machine: conversation bodies, and
+//! what a hook says of a wait or a permission request.
 //!
 //! This scrubber recognizes well-known credential shapes (cloud and forge tokens, JWTs, bearer
 //! credentials, PEM private keys), values of secret-named JSON fields and `NAME=value` style

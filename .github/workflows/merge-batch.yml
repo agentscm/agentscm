@@ -15,10 +15,76 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  full-suite:
-    name: Merge batch gate
+  # Formatting and Clippy gate every merge here; the signed local check is optional evidence.
+  lint:
+    name: Merge batch lint
     runs-on: ubuntu-latest
-    timeout-minutes: 45 # Clippy adds a second compile
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.merge_group.head_sha }}
+          persist-credentials: false
+      - name: Confirm exact batch source
+        env:
+          EXPECTED_SHA: ${{ github.event.merge_group.head_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: main # restore only the cache CI's warm-cache job saves on main
+          save-if: false
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Build the tests once; three shards run them from the archive. Doctests run once, here.
+  test-build:
+    name: Merge batch test build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.merge_group.head_sha }}
+          persist-credentials: false
+      - name: Confirm exact batch source
+        env:
+          EXPECTED_SHA: ${{ github.event.merge_group.head_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: nextest@0.9.148
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: main # restore only the cache CI's warm-cache job saves on main
+          save-if: false
+      - name: Build test archive
+        run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          compression-level: 0 # already zstd
+          if-no-files-found: error
+      - name: Run doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --doc
+
+  # PostgreSQL and S3 services in every shard. The first failure stops its shard (nextest profile
+  # `gate`) and cancels the other shards (matrix fail-fast).
+  test-shard:
+    name: Merge batch test shard ${{ matrix.shard }}/3
+    needs: test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        shard: [1, 2, 3]
     services:
       postgres: # hub store conformance runs against this
         image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
@@ -33,6 +99,7 @@ jobs:
       # S3 backend conformance runs against the versitygw container below.
       AGENTSCM_TEST_S3_ENDPOINT: http://127.0.0.1:7070
       AGENTSCM_TEST_S3_BUCKET: agentscm-ci
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -43,15 +110,13 @@ jobs:
           EXPECTED_SHA: ${{ github.event.merge_group.head_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - run: rustup toolchain install # reads rust-toolchain.toml
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: nextest@0.9.148
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Formatting and Clippy gate every merge here; the signed local check is optional evidence.
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
       - name: Generate throwaway S3 credentials
         run: |
           access=$(openssl rand -hex 10)
@@ -74,8 +139,22 @@ jobs:
           done
           docker logs s3
           exit 1
+      # Extracting into the checkout puts target/ where the build had it, so env!("CARGO_BIN_EXE_agentscm") resolves.
       - name: Run tests
-        run: cargo nextest run --locked
-      - name: Run doctests
-        if: ${{ !cancelled() }}
-        run: cargo test --locked --doc
+        run: cargo nextest run --profile gate --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --extract-to "$GITHUB_WORKSPACE" --partition "count:$SHARD/3"
+
+  # The required check. Merge admission reports the pull request side under the same name as a
+  # commit status; this job is the merge-group side and fails unless lint, the build and every shard passed.
+  full-suite:
+    name: Merge batch gate
+    if: ${{ always() }}
+    needs: [lint, test-build, test-shard]
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - env:
+          LINT: ${{ needs.lint.result }}
+          BUILD: ${{ needs.test-build.result }}
+          SHARDS: ${{ needs.test-shard.result }}
+        run: test "$LINT" = success && test "$BUILD" = success && test "$SHARDS" = success
