@@ -15,9 +15,9 @@ use tokio::time::Instant;
 
 use super::github::valid_ref_name;
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
-use super::session::same_agent;
+use super::session::{SESSION_TTL_SECONDS, same_agent};
 use super::store::{
-    Event, HubEvent, Principal, Store, User, new_id, unix_now, validate_repository,
+    Event, HubEvent, Principal, SessionView, Store, User, new_id, unix_now, validate_repository,
 };
 use super::sync::overlapping_pulls;
 use super::viewer::masked_label;
@@ -508,10 +508,11 @@ pub(super) fn announced(own: &str, keys: &[String], intents: Vec<Intent>) -> Res
 }
 
 impl Intent {
-    /// `{key, kind, started_at}` naming the holding session, never its id; null for REST.
+    /// `{key, name, kind, started_at}` naming the holding session, never its id; null for REST.
     fn session_json(&self) -> Value {
         self.session.as_deref().map_or(Value::Null, |session| {
             json!({"key": super::store::session_key(&self.token, session),
+                "name": super::store::owner_session(&self.owner.id, session),
                 "kind": super::advice::session_kind(&self.via), "started_at": self.started_at})
         })
     }
@@ -709,9 +710,25 @@ async fn activity(
             masked_label(agent)
         }
     };
-    let store = state.store.clone();
+    let (store, setup) = (state.store.clone(), state.onboarding.clone());
+    let now = unix_now();
     let (sessions, mut events) = blocking(&state, move || {
-        let sessions = store.live_sessions(&principal, unix_now(), MAX_ACTIVITY_SESSIONS)?;
+        // The reader's own sessions that started another, or that wait for the reader, stay
+        // listed after their last call, so a wait can be shown under the session that started it.
+        // shortcut: the waiting ones first, then the newest starts, up to the page's limit; a
+        // person with more starting sessions than that loses the row of an old one. Read only
+        // the starters of listed sessions if that is ever reached.
+        let waiting = setup.waiting().owned(&principal, now)?;
+        let starts = store.session_starts(&principal.owner.id)?;
+        let mut listed = BTreeSet::new();
+        let also: Vec<String> = waiting
+            .into_iter()
+            .map(|wait| wait.session)
+            .chain(starts.into_iter().map(|(_, started_by)| started_by))
+            .filter(|session| listed.insert(session.clone()))
+            .take(MAX_ACTIVITY_SESSIONS)
+            .collect();
+        let sessions = store.sessions_with(&principal, now, MAX_ACTIVITY_SESSIONS, &also)?;
         // One extra row says whether older events exist.
         Ok((
             sessions,
@@ -727,16 +744,35 @@ async fn activity(
         serde_json::from_str::<Value>(json)
             .map_err(|error| HubError::Unavailable(error.to_string()))
     };
-    let sessions = sessions
+    let roster = state.onboarding.subagents();
+    let row = |s: &SessionView| {
+        // Null when not known; a subagent's type and what it does are its own person's. Hooks
+        // report under the host's session ID, so a session stored under another name (one that
+        // adopted `default`, or a client's own) cannot be matched and is not known either.
+        let known = s.name.as_ref();
+        let subagents = known.and_then(|_| roster.of(&s.token, &s.session, &my_id, now));
+        let subagents = subagents.map(|all| {
+            all.iter()
+                .map(|sub| {
+                    json!({"state": sub.state.code(), "started_at": sub.started_at,
+                        "seen_at": sub.seen_at, "type": sub.kind, "does": sub.does})
+                })
+                .collect::<Vec<Value>>()
+        });
+        Ok(
+            json!({"key": s.key, "name": s.name, "started_by": s.started_by,
+            "subagents": subagents,
+            "agent": {"token": s.token, "name": label(&s.agent, &s.owner)},
+            "owner": {"login": s.owner}, "intent": s.intent, "task": s.task,
+            "via": parse(&s.via)?, "created_at": s.created_at, "updated_at": s.updated_at}),
+        )
+    };
+    // `sessions` stays the live ones; the rest of what was read is listed apart.
+    let (live, quiet): (Vec<_>, Vec<_>) = sessions
         .iter()
-        .map(|s| {
-            Ok(
-                json!({"key": s.key, "agent": {"token": s.token, "name": label(&s.agent, &s.owner)},
-                "owner": {"login": s.owner}, "intent": s.intent, "task": s.task,
-                "via": parse(&s.via)?, "created_at": s.created_at, "updated_at": s.updated_at}),
-            )
-        })
-        .collect::<Result<Vec<Value>>>()?;
+        .partition(|s| s.updated_at >= now - SESSION_TTL_SECONDS);
+    let sessions = live.into_iter().map(row).collect::<Result<Vec<Value>>>()?;
+    let quiet_sessions = quiet.into_iter().map(row).collect::<Result<Vec<Value>>>()?;
     let events = events
         .iter()
         .map(|e| {
@@ -768,8 +804,10 @@ async fn activity(
             )
         })
         .collect::<Result<Vec<Value>>>()?;
-    Ok(Json(json!({"sessions": sessions, "events": events,
-        "next_before": next_before.flatten()})))
+    Ok(Json(
+        json!({"sessions": sessions, "quiet_sessions": quiet_sessions, "events": events,
+        "next_before": next_before.flatten()}),
+    ))
 }
 
 async fn renew(

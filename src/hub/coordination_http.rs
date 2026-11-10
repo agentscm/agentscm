@@ -674,12 +674,15 @@ struct HandoffQuery {
 const PERSON_HANDOFFS: usize = 50;
 
 /// One side of a handoff. The token and session, which the page needs to answer, are given only
-/// for the person's own agent; every reader gets the session's key and kind, never its id.
+/// for the person's own agent; every reader gets the session's key, its owner-wide name and its
+/// kind, never its id.
 fn party_json(party: &HandoffParty, me: &str) -> Value {
     let mut agent = party.agent.clone();
     Viewer(me).label(Some(&party.owner), &mut agent);
     let mut out = json!({"agent": agent, "login": party.login, "mine": party.owner == me,
-        "session_key": party.key, "session_kind": party.kind});
+        "session_key": party.key,
+        "session_name": super::store::owner_session(&party.owner, &party.session),
+        "session_kind": party.kind});
     if party.owner == me {
         out["token"] = json!(party.token);
         out["session"] = json!(party.session);

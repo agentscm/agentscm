@@ -690,16 +690,24 @@ body or query string is a 400 with a fixed body.
   once; otherwise the hub looks again every second, so a notice written by
   another hub process on the same database arrives within about a second.
 - `GET /v1/hub/repos/{repo}/activity?limit=<n>&before=<seq>` is read-only and returns
-  `{"sessions": [S], "events": [E], "next_before": seq|null}` for the token's repository.
+  `{"sessions": [S], "quiet_sessions": [S], "events": [E], "next_before": seq|null}` for the
+  token's repository.
   `before` returns only events with a lower `seq`; `next_before` is the last returned event's
   `seq` when older events exist, otherwise null. `sessions` does not page. `S` is a live
   session, one updated in the last 20 minutes, newest first, at most 200:
-  `{key, agent: {token, name}, owner: {login}, intent, task, via, created_at,
-  updated_at}` (`intent` and `task` may be null). A session's id is not
+  `{key, name, started_by, subagents, agent: {token, name}, owner: {login}, intent, task, via,
+  created_at, updated_at}` (`intent` and `task` may be null). A session's id is not
   returned; `key` stands in for it, the first 16 hex characters of the SHA-256
   of `agentscm.hub.session-view.v1`, the token id and the session id, joined
   by NUL bytes (so it is stable between polls, tells two sessions of
-  one token apart, and does not give the id back). Only sessions of active
+  one token apart, and does not give the id back). `name` is the same session's name in
+  every repository of its person, or null for a session ID that is not in UUID form;
+  `started_by` is the name of the session that started it, or null; `subagents` is null when
+  not known, else `[{state, started_at, seen_at, type, does}]`, where `type` and `does` are
+  null for anyone but the session's own person
+  (see [sessions and subagents](agents.md#sessions-and-subagents-under-the-session-that-started-them)).
+  `quiet_sessions` are the caller's own sessions that are no longer live but started another
+  session or wait for the caller, in the same shape. Only sessions of active
   tokens count: a revoked or expired token, or a disabled owner, hides them.
   Sessions and events cover the tokens of the caller's repository as the forge
   knows it: the same name and forge repository id, owned by users of the same
@@ -713,8 +721,8 @@ body or query string is a 400 with a fixed body.
   It is what the [status page](#status-page) reads.
 - `I` is `{id, repository, task, branch, base, machine, paths, expires_at,
   created_at, agent: {token, name}, owner: {id, provider, host, user_id, login},
-  via, session}`. `session` is `{key, kind, started_at}` for the session holding the intent
-  (`key` as in `S`, `kind` the brand of its first `hook:` connection or null,
+  via, session}`. `session` is `{key, name, kind, started_at}` for the session holding the intent
+  (`key` and `name` as in `S`, `kind` the brand of its first `hook:` connection or null,
   `started_at` the hub's first sight of the session), and null for an intent announced
   through this route; the session id is never returned. `via` lists how the intent's session connects (`mcp`, `hook:claude`,
   ...; see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)); it is
@@ -913,8 +921,8 @@ one, it says `AgentSCM asked bob's Claude Code session 3f2a1b9c to hand it over`
 is named in the other's lines the same way (`bob's Claude Code session 3f2a1b9c asks to take
 over src/a.rs`; `agent session 3f2a1b9c` when the kind is unknown, for example after the
 requester's session ended). A request or answer made by a person from the Hub's pages or
-Slack keeps its wording. The status page's handoff list carries `session_key` and
-`session_kind` for both sides, for any reader; the raw `session` stays for the person's own
+Slack keeps its wording. The status page's handoff list carries `session_key`, `session_name`
+(as `name` in `S`) and `session_kind` for both sides, for any reader; the raw `session` stays for the person's own
 agent only.
 
 Limits: this is correct delivery among cooperating sessions, not an authorization boundary,

@@ -164,11 +164,17 @@ pub struct HubEvent {
     pub data: String,
 }
 
-/// A live session as the status page shows it; never its id or notice cursor.
+/// A live session as the status page shows it; never its notice cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionView {
     /// Stable per session and not its id; see [`session_key`].
     pub key: String,
+    /// The Hub's name for the session, to look up what the Hub holds for it. Never sent.
+    pub session: String,
+    /// The session's owner-wide name; see [`owner_session`].
+    pub name: Option<String>,
+    /// The owner-wide name of the session that started this one, when one declared it.
+    pub started_by: Option<String>,
     pub token: String,
     pub agent: String,
     pub owner: String,
@@ -540,7 +546,37 @@ pub trait Store: Send + Sync {
     fn notices_after(&self, token: &str, after: i64, limit: usize) -> Result<Vec<HubEvent>>;
     /// Sessions of the active tokens in `who`'s scope (same repository name and forge id, same
     /// owner host and provider) updated within `SESSION_TTL_SECONDS` of `now`, newest first, at most `limit`.
-    fn live_sessions(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<SessionView>>;
+    fn live_sessions(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<SessionView>> {
+        self.sessions_with(who, now, limit, &[])
+    }
+    /// [`Store::live_sessions`], and also those of `also` that are sessions of `who`'s own agent
+    /// tokens in the same scope, however long ago they last called.
+    fn sessions_with(
+        &self,
+        who: &Principal,
+        now: i64,
+        limit: usize,
+        also: &[String],
+    ) -> Result<Vec<SessionView>>;
+    /// Records that the session `started_by` started `session`, both of `owner`, in whichever
+    /// repositories they work. Refused unless `started_by` has an owner-wide name
+    /// ([`owner_session`]) and is a session of one of `owner`'s agent tokens that the Hub has
+    /// seen or that leads Work, and when the link would close a loop. A later call replaces it.
+    /// Records older than `SESSION_START_RETAIN_SECONDS`, and the oldest beyond
+    /// `SESSION_STARTS_MAX`, are dropped.
+    fn session_started_by(
+        &self,
+        owner: &str,
+        session: &str,
+        started_by: &str,
+        now: i64,
+    ) -> Result<()>;
+    /// Each of `owner`'s sessions that another session started, with that session, the newest
+    /// record first.
+    fn session_starts(&self, owner: &str) -> Result<Vec<(String, String)>>;
+    /// The sessions that lead `owner`'s unfinished Work (active, blocked or paused), in any
+    /// repository.
+    fn owner_lead_sessions(&self, owner: &str) -> Result<Vec<String>>;
     /// The status page's event kinds for the tokens and intents in `who`'s scope (as for
     /// `live_sessions`, revoked tokens included), newest first, with `seq` below `before` when
     /// given, at most `limit`.
@@ -1627,6 +1663,62 @@ fn mint(
 pub(super) fn session_key(token: &str, session: &str) -> String {
     let input = format!("agentscm.hub.session-view.v1\0{token}\0{session}");
     lower_hex_of(input.as_bytes())[..16].to_owned()
+}
+
+/// 16 hex characters naming one native session of an owner, the same in every repository on
+/// this Hub, without exposing its id. `None` unless the id has the form of a UUID, as the session
+/// IDs that native hooks report have: a name a client chose for itself (`default`, `main`) can
+/// be two unrelated sessions in two repositories.
+pub(super) fn owner_session(owner: &str, session: &str) -> Option<String> {
+    let bytes = session.as_bytes();
+    let uuid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(at, byte)| match at {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    let input = format!("agentscm.hub.session-name.v1\0{owner}\0{session}");
+    uuid.then(|| lower_hex_of(input.as_bytes())[..16].to_owned())
+}
+
+/// How long a record of which session started a session is kept.
+pub(super) const SESSION_START_RETAIN_SECONDS: i64 = 30 * 86_400;
+/// The most such records kept for one owner; the oldest give way. Every read of them loads them
+/// all, and a caller may name any session ID as its own.
+pub(super) const SESSION_STARTS_MAX: i64 = 4096;
+
+/// The sessions that started `session`, nearest first, from an owner's start records
+/// (`Store::session_starts`). Stops at a session it has already passed.
+pub(super) fn session_ancestors<'a>(starts: &'a [(String, String)], session: &str) -> Vec<&'a str> {
+    let mut found: Vec<&str> = Vec::new();
+    let mut at = session;
+    while let Some((_, parent)) = starts.iter().find(|(child, _)| child == at) {
+        if parent == session || found.contains(&parent.as_str()) {
+            break;
+        }
+        found.push(parent);
+        at = parent;
+    }
+    found
+}
+
+/// Checks a new start record for `owner` against the records it already has.
+pub(super) fn check_session_start(
+    owner: &str,
+    starts: &[(String, String)],
+    session: &str,
+    started_by: &str,
+) -> Result<()> {
+    if owner_session(owner, session).is_none() || owner_session(owner, started_by).is_none() {
+        return Err(invalid(
+            "started_by needs the native session IDs of both sessions",
+        ));
+    }
+    if session == started_by || session_ancestors(starts, started_by).contains(&session) {
+        return Err(invalid(
+            "started_by names a session that this session started",
+        ));
+    }
+    Ok(())
 }
 
 /// Lowercase hex SHA-256 of `bytes`.

@@ -1339,7 +1339,7 @@ mod tests {
         assert_eq!(
             json["session"],
             json!({"key": crate::hub::store::session_key("tok_1", "raw-id-1"),
-                "kind": "Claude Code", "started_at": 100})
+                "name": null, "kind": "Claude Code", "started_at": 100})
         );
         assert!(!json.to_string().contains("raw-id-1"));
         assert_eq!(held_by(None, &[]).to_json()["session"], Value::Null);

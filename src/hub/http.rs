@@ -148,8 +148,9 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .with_skill_workflows(workflows)
         .with_shared_conversation_retention_days(config.shared_conversation_retention_days)?;
     // The waits sessions reported to the previous process are gone: a session that has not
-    // called since reads as not known to wait, never as quiet.
+    // called since reads as not known to wait, never as quiet. So are their subagents.
     state.onboarding.waiting().lost_before(unix_now());
+    state.onboarding.subagents().started(unix_now());
     // An app dropped from the apps file loses its credentials for good, not only while absent.
     let revoker = state.clone();
     let revoked = tokio::task::spawn_blocking(move || revoker.revoke_dropped_apps())

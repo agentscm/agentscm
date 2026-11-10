@@ -156,6 +156,9 @@ mod tests {
     fn session(intent: Option<&str>) -> SessionView {
         SessionView {
             key: "key".into(),
+            session: "session".into(),
+            name: None,
+            started_by: None,
             token: "tok".into(),
             agent: "agent".into(),
             owner: "example-user".into(),

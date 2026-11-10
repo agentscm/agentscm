@@ -176,6 +176,7 @@ mod hub_refusal_outcomes;
 mod hub_reply_budget;
 mod hub_session_end;
 mod hub_session_privacy;
+mod hub_session_tree;
 mod hub_sessions;
 #[cfg(unix)]
 mod hub_skill_workflow;

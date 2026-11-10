@@ -157,6 +157,7 @@ fn action(
         // Forge reads and skill evidence carry no monotone Work event sequence.
         updated_seq: 0,
         semantic_version: Some(semantic_version),
+        session: None,
         limits,
     }
 }

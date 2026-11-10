@@ -98,6 +98,7 @@ fn action(
         action: text,
         updated_seq: seq,
         semantic_version: None,
+        session: None,
         limits: vec![],
     }
 }

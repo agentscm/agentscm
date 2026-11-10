@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::hub::coordination::{CoordinationInbox, CoordinationListQuery, CoordinationStatus};
 use crate::hub::onboarding::Observations;
 use crate::hub::session_waiting::{LeadWait, WaitReason};
-use crate::hub::store::{Principal, Store, session_key};
+use crate::hub::store::{Principal, Store, owner_session, session_ancestors, session_key};
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
 use crate::hub::work_lifecycle::{ReservationStatus, WorkOperationalV1};
@@ -127,7 +127,21 @@ pub struct StatusAction {
     /// Semantic version for actions without a Work event sequence (for example forge reads).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_version: Option<String>,
+    /// The session a `session_waiting` action is about, when it has an owner-wide name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<StatusSession>,
     pub limits: Vec<String>,
+}
+
+/// A waiting session by its owner-wide name (`store::owner_session`), never its id.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatusSession {
+    pub name: String,
+    /// When another session started it: the name of the first session of that chain, so a
+    /// surface can show the wait on the session whose task it holds up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -681,6 +695,7 @@ fn read_scoped(
             recipients,
             action: "Resolve the overlapping declared scopes between the named leads.".into(),
             semantic_version: None,
+            session: None,
             updated_seq: pair.iter().map(|i| i.updated_seq).max().unwrap_or(0),
             limits: vec![],
         });
@@ -706,7 +721,7 @@ fn read_scoped(
     actions.extend(checks);
     limits.extend(check_limits);
     actions.extend(setup_actions(store, setup, principal, &items, now)?);
-    actions.extend(waiting_actions(setup, principal, &items, now)?);
+    actions.extend(waiting_actions(store, setup, principal, &items, now)?);
     work.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     actions.sort_by(|a, b| a.id.cmp(&b.id));
     let complete_action_digest =
@@ -883,6 +898,7 @@ fn setup_actions(
                     ),
                     updated_seq: 0,
                     semantic_version: None,
+                    session: None,
                     limits: vec![],
                 }
             })
@@ -891,39 +907,77 @@ fn setup_actions(
 }
 
 /// The viewer's own sessions that stopped for them: a permission prompt or a question always
-/// needs them; the end of a turn only while that session leads unfinished Work, since a finished
-/// chat left open is not waiting on anyone. Paused Work counts: a host that stops an idle session
-/// ends it, which pauses its Work, and the resumed session still waits on its person. Its id is `waiting:<reason>:<key>` and its semantic
+/// needs them; the end of a turn only while that session leads unfinished Work, or a session that
+/// started it does, in any repository and through any number of sessions, since a finished chat
+/// left open is not waiting on anyone. A session started for part of a task often has no Work
+/// of its own, or has finished it, and its question still holds that task up. Paused Work
+/// counts: a host that stops an idle session ends it, which pauses its Work, and the resumed
+/// session still waits on its person. Its id is `waiting:<reason>:<key>` and its semantic
 /// version the time the wait began. A permission wait whose hook offers its prompt to the Hub
 /// (`permission_answer`) says so; every other wait is answered in the session.
 fn waiting_actions(
+    store: &dyn Store,
     setup: &Observations,
     principal: &Principal,
     items: &BTreeMap<String, WorkItem>,
     now: i64,
 ) -> Result<Vec<StatusAction>> {
+    let owner = principal.owner.id.as_str();
     let viewer = StatusRecipient {
         kind: RecipientKind::Person,
-        owner: Some(principal.owner.id.clone()),
+        owner: Some(owner.to_owned()),
         login: Some(principal.owner.login.clone()),
         agent: None,
     };
+    let waits = setup.waiting().owned(principal, now)?;
+    // Which of this person's sessions another started, and which lead unfinished Work in any
+    // repository. Read only while one of them waits.
+    let (starts, leads) = if waits.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            store.session_starts(owner)?,
+            store.owner_lead_sessions(owner)?,
+        )
+    };
+    let unfinished = |i: &WorkItem| {
+        matches!(
+            i.state,
+            WorkState::Active | WorkState::Blocked | WorkState::Paused
+        )
+    };
     let mut actions = Vec::new();
-    for wait in setup.waiting().owned(principal, now)? {
+    for wait in waits {
         let led = items
             .values()
             .filter(|i| {
-                i.lead_token == wait.token
-                    && i.lead_session == wait.session
-                    && matches!(
-                        i.state,
-                        WorkState::Active | WorkState::Blocked | WorkState::Paused
-                    )
+                i.lead_token == wait.token && i.lead_session == wait.session && unfinished(i)
             })
             .collect::<Vec<_>>();
-        if wait.reason == WaitReason::Idle && led.is_empty() {
+        // The sessions that started this one, nearest first.
+        let above = session_ancestors(&starts, &wait.session);
+        let holds_up = above
+            .iter()
+            .any(|session| leads.iter().any(|l| l == session));
+        if wait.reason == WaitReason::Idle && led.is_empty() && !holds_up {
             continue;
         }
+        // The task of the nearest of them that leads one here; one in another repository is not
+        // named, since this read is one repository's.
+        let started = above.first().map_or(String::new(), |_| {
+            let task = above.iter().find_map(|session| {
+                items
+                    .values()
+                    .find(|i| i.owner == owner && i.lead_session == *session && unfinished(i))
+            });
+            match task {
+                Some(i) => format!(
+                    " It was started under your session on “{}”.",
+                    crate::hub::advice::sanitize(&i.title, 80)
+                ),
+                None => " Another of your sessions started it.".to_owned(),
+            }
+        });
         // By brand ("your Claude Code"); a generated `client-<hex>` label is never shown.
         let who = match wait.agent.as_str() {
             "" | "generic" => crate::hub::advice::agent_name(&wait.name),
@@ -968,12 +1022,16 @@ fn waiting_actions(
             recipients: vec![viewer.clone()],
             needs_you: true,
             action: format!(
-                "Your {} {}{on}.{asks}{asker} {answer}",
+                "Your {} {}{on}.{started}{asks}{asker} {answer}",
                 crate::hub::advice::sanitize(&who, 64),
                 wait.reason.what(),
             ),
             updated_seq: 0,
             semantic_version: Some(wait.since.to_string()),
+            session: owner_session(owner, &wait.session).map(|name| StatusSession {
+                name,
+                started_by: above.last().and_then(|top| owner_session(owner, top)),
+            }),
             limits: vec![],
         });
     }
@@ -1127,6 +1185,7 @@ fn request_actions(
                 action: "Answer the outstanding directed coordination request.".into(),
                 updated_seq: request.updated_seq,
                 semantic_version: None,
+                session: None,
                 limits: if target.reasons_complete {
                     vec![]
                 } else {
@@ -2595,6 +2654,168 @@ mod tests {
                 .iter()
                 .all(|a| !a.action.contains("force-push"))
         );
+    }
+
+    /// The end of a turn in a session that leads nothing reaches its person while a session that
+    /// started it, through any number of sessions and in any repository, leads unfinished Work.
+    /// Every wait names its session, and the first session of the chain that started it.
+    fn started_wait_contract(store: &dyn Store) {
+        use crate::hub::onboarding::Observations;
+        use crate::hub::session::SessionCall;
+        use crate::hub::session_waiting::{GRACE_SECONDS, WaitReason};
+        use crate::hub::store::owner_session;
+        const TOP: &str = "11111111-1111-4111-8111-111111111111";
+        const MID: &str = "22222222-2222-4222-8222-222222222222";
+        const KID: &str = "33333333-3333-4333-8333-333333333333";
+        const IDLE: &str = "44444444-4444-4444-8444-444444444444";
+        const ITS_KID: &str = "55555555-5555-4555-8555-555555555555";
+        let now = crate::hub::store::unix_now();
+        let identity = |user_id| ForgeIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            user_id,
+        };
+        let me = store.upsert_user(&identity(611), "viewer").unwrap();
+        let them = store.upsert_user(&identity(612), "other").unwrap();
+        let token = |user: &crate::hub::store::User, repository: &str, id: i64| {
+            let (_, secret, _) =
+                mint_bound_agent_token(store, &user.id, "laptop", repository, id, 3600, false)
+                    .unwrap();
+            store
+                .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+                .unwrap()
+                .unwrap()
+        };
+        let viewer = token(&me, "acme/widgets", 101);
+        let elsewhere = token(&me, "acme/other", 102);
+        let other = token(&them, "acme/widgets", 101);
+        let start = |who: &Principal, key: &str, title: &str, session: &str| {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": key, "title": title, "session": session,
+                "scope": [format!("src/{key}.rs")]
+            }))
+            .unwrap();
+            store.work_start(&who.token_id, &request, now).unwrap();
+        };
+        let observations = Observations::default();
+        let earlier = now - GRACE_SECONDS;
+        let wait = |session: &str, reason, asks: Option<&str>| {
+            observations
+                .waiting()
+                .record(
+                    &viewer, session, session, "claude", reason, None, asks, earlier,
+                )
+                .unwrap();
+        };
+        let waits = |who: &Principal| {
+            super::read(store, &observations, who, now)
+                .unwrap()
+                .actions
+                .into_iter()
+                .filter(|a| a.kind == "session_waiting")
+                .collect::<Vec<_>>()
+        };
+        let name = |session: &str| owner_session(&me.id, session);
+        // TOP leads Work in another repository and started MID, which started KID. IDLE leads
+        // nothing and started ITS_KID.
+        start(&elsewhere, "orchestrate", "Orchestrate the release", TOP);
+        let seen = SessionCall {
+            session: Some(MID.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: vec![],
+            deny: false,
+            report: false,
+        };
+        store.touch_session(&viewer.token_id, &seen, now).unwrap();
+        let idle = SessionCall {
+            session: Some(IDLE.into()),
+            ..seen.clone()
+        };
+        store.touch_session(&viewer.token_id, &idle, now).unwrap();
+        for (session, by) in [(MID, TOP), (KID, MID), (ITS_KID, IDLE)] {
+            store.session_started_by(&me.id, session, by, now).unwrap();
+        }
+        wait(KID, WaitReason::Idle, Some("Shall I merge it?"));
+        wait(ITS_KID, WaitReason::Idle, None);
+        // KID leads nothing, and neither does MID: the Work that waits on it is TOP's, which
+        // this repository's read cannot name. ITS_KID holds nothing up.
+        let mine = waits(&viewer);
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert!(mine[0].work_ids.is_empty() && mine[0].needs_you);
+        assert!(
+            mine[0].action.contains(
+                "for your reply. Another of your sessions started it. Its last message ends: \
+                 “Shall I merge it?”. Answer it"
+            ),
+            "{}",
+            mine[0].action
+        );
+        assert_eq!(
+            mine[0].session,
+            Some(StatusSession {
+                name: name(KID).unwrap(),
+                started_by: name(TOP),
+            })
+        );
+        // With Work of MID's own here, the wait names that task: the nearest one it holds up.
+        start(&viewer, "fix-login", "Fix login", MID);
+        let mine = waits(&viewer);
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert!(
+            mine[0]
+                .action
+                .contains("for your reply. It was started under your session on “Fix login”."),
+            "{}",
+            mine[0].action
+        );
+        assert_eq!(
+            mine[0].session.as_ref().and_then(|s| s.started_by.clone()),
+            name(TOP)
+        );
+        // A prompt always needs its person. One in a session nobody started names only itself,
+        // and one in a started session names who started it, whether or not that leads Work.
+        wait(TOP, WaitReason::Permission, None);
+        wait(ITS_KID, WaitReason::Permission, None);
+        let mine = waits(&viewer);
+        let of = |session: &str| {
+            mine.iter()
+                .find(|a| a.session.as_ref().map(|s| &s.name) == name(session).as_ref())
+                .unwrap_or_else(|| panic!("{session}: {mine:?}"))
+        };
+        assert_eq!(mine.len(), 3, "{mine:?}");
+        assert_eq!(of(TOP).session.as_ref().unwrap().started_by, None);
+        assert!(!of(TOP).action.contains("started"), "{}", of(TOP).action);
+        assert_eq!(of(ITS_KID).session.as_ref().unwrap().started_by, name(IDLE));
+        assert!(
+            of(ITS_KID)
+                .action
+                .contains("Another of your sessions started it."),
+            "{}",
+            of(ITS_KID).action
+        );
+        // No reply carries a session ID, and another person sees none of it.
+        let text = serde_json::to_string(&mine).unwrap();
+        for id in [TOP, MID, KID, IDLE, ITS_KID] {
+            assert!(!text.contains(id), "{text}");
+        }
+        assert!(waits(&other).is_empty());
+    }
+
+    #[test]
+    fn sqlite_a_started_sessions_wait_reaches_its_person_while_its_starter_leads_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        started_wait_contract(&*store);
+    }
+
+    #[test]
+    fn a_started_sessions_wait_reaches_its_person_while_its_starter_leads_work_on_postgres() {
+        on_postgres(started_wait_contract);
     }
 
     #[test]
