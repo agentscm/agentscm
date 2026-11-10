@@ -5,7 +5,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use agentscm::hub::reply::{self, Seen};
+use agentscm::hub::work::ClaimStatus;
+use agentscm::hub::work_http::actionable_status::{
+    RecipientKind, StatusRecipient, StatusState, recipient_label,
+};
 use reqwest::Method;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::client_status::ConnectionStatus;
@@ -493,6 +499,64 @@ async fn read_one(
     summarize(&connection.root, &connection.repository, &status)
 }
 
+/// What the menu bar reads from the shared status. It names only what it shows or counts, and
+/// keeps the Hub's own text for a state it does not know, so a newer Hub's reply still reads.
+#[derive(Deserialize)]
+struct Attention {
+    repository: String,
+    work: Vec<AttentionWork>,
+    actions: Vec<AttentionAction>,
+    counts: AttentionCounts,
+    complete: bool,
+}
+
+#[derive(Deserialize)]
+struct AttentionWork {
+    work_id: String,
+    title: String,
+    state: Seen<StatusState>,
+    recipient: AttentionRecipient,
+    needs_you: bool,
+    action: String,
+    freshness: Seen<ClaimStatus>,
+}
+
+#[derive(Deserialize)]
+struct AttentionAction {
+    id: String,
+    recipients: Vec<AttentionRecipient>,
+    needs_you: bool,
+    action: String,
+}
+
+#[derive(Deserialize)]
+struct AttentionCounts {
+    needs_you: usize,
+}
+
+#[derive(Deserialize)]
+struct AttentionRecipient {
+    kind: Seen<RecipientKind>,
+    owner: Option<String>,
+    login: Option<String>,
+    agent: Option<String>,
+}
+
+impl AttentionRecipient {
+    /// The shared label, or the Hub's own text for a kind of recipient this build does not know.
+    fn label(&self) -> String {
+        match &self.kind {
+            Seen::Known(kind) => recipient_label(&StatusRecipient {
+                kind: *kind,
+                owner: self.owner.clone(),
+                login: self.login.clone(),
+                agent: self.agent.clone(),
+            }),
+            Seen::Unknown(kind) => shown_value(kind.clone()),
+        }
+    }
+}
+
 fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal {
     let unavailable = || Signal {
         root: root.to_path_buf(),
@@ -504,9 +568,7 @@ fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal 
         count: 0,
         work: vec![],
     };
-    let Ok(status) = serde_json::from_value::<
-        agentscm::hub::work_http::actionable_status::ActionableStatus,
-    >(value.clone()) else {
+    let Ok(status) = reply::decode::<Attention>(value) else {
         return unavailable();
     };
     if status.repository != repository || status.work.len() > 100 || status.actions.len() > 1000 {
@@ -535,24 +597,21 @@ fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal 
         .work
         .iter()
         .map(|row| Work {
-            agent: agentscm::hub::work_http::actionable_status::recipient_label(&row.recipient),
+            agent: row.recipient.label(),
             title: row
                 .title
                 .chars()
                 .filter(|c| !c.is_control())
                 .take(160)
                 .collect(),
-            state: serde_json::to_value(row.state)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "unknown".into()),
+            state: shown_value(row.state.to_string()),
             next_action: row
                 .action
                 .chars()
                 .filter(|c| !c.is_control())
                 .take(160)
                 .collect(),
-            claim_status: format!("{:?}", row.freshness).to_ascii_lowercase(),
+            claim_status: shown_value(row.freshness.to_string()),
             needs_you: row.needs_you,
         })
         .chain(status.actions.iter().map(|action| {
@@ -560,7 +619,7 @@ fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal 
                 agent: action
                     .recipients
                     .iter()
-                    .map(agentscm::hub::work_http::actionable_status::recipient_label)
+                    .map(AttentionRecipient::label)
                     .collect::<Vec<_>>()
                     .join(", "),
                 title: action
@@ -603,6 +662,12 @@ fn summarize(root: &std::path::Path, repository: &str, value: &Value) -> Signal 
         count,
         work,
     }
+}
+
+/// An enum value of the status as the panel shows it; a value this build does not know arrives
+/// as the Hub's own text.
+fn shown_value(text: String) -> String {
+    bounded_text(&Value::String(text), 160, "unknown")
 }
 
 fn bounded_text(value: &Value, max_chars: usize, fallback: &str) -> String {
@@ -651,6 +716,35 @@ mod tests {
         );
         assert_eq!(result.work.iter().filter(|w| w.needs_you).count(), 4);
         assert_eq!(result.text, "acme/widgets · 4 actions need you (partial)");
+    }
+    #[test]
+    fn a_newer_hubs_fields_and_values_still_read() {
+        let mut value: Value =
+            serde_json::from_str(include_str!("../hub/fixtures/actionable-status.json")).unwrap();
+        let known = summarize(std::path::Path::new("/synthetic"), "acme/widgets", &value);
+        value["added_later"] = serde_json::json!({"work": []});
+        value["counts"]["added_later"] = serde_json::json!(1);
+        for row in value["work"].as_array_mut().unwrap() {
+            row["added_later"] = serde_json::json!([1]);
+            row["operational"]["outcome"]["value"] = serde_json::json!("outcome_added_later");
+            row["recipient"]["added_later"] = serde_json::json!(true);
+        }
+        for action in value["actions"].as_array_mut().unwrap() {
+            action["added_later"] = serde_json::json!(null);
+        }
+        let newer = summarize(std::path::Path::new("/synthetic"), "acme/widgets", &value);
+        assert_eq!(newer, known);
+        // A state, claim status or recipient kind added later is shown as the Hub sent it.
+        value["work"][0]["state"] = serde_json::json!("snoozed");
+        value["work"][0]["freshness"] = serde_json::json!("fading");
+        value["work"][0]["recipient"]["kind"] = serde_json::json!("team");
+        let newer = summarize(std::path::Path::new("/synthetic"), "acme/widgets", &value);
+        assert!(newer.available);
+        assert_eq!((newer.count, &newer.keys), (known.count, &known.keys));
+        assert_eq!(newer.work[0].state, "snoozed");
+        assert_eq!(newer.work[0].claim_status, "fading");
+        assert_eq!(newer.work[0].agent, "team");
+        assert_eq!(newer.work[1..], known.work[1..]);
     }
     #[test]
     fn older_hub_response_stays_unavailable() {
