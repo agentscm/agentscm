@@ -1070,7 +1070,7 @@ async fn two_agents_round_trip_to_a_stop() {
         .await;
     assert!(!error);
     assert!(
-        text.contains("no other agents are working in acme/widgets"),
+        text.contains("no other agent sessions are live in acme/widgets"),
         "{text}"
     );
     assert!(!text.contains("already working"));
@@ -1141,7 +1141,10 @@ async fn two_agents_round_trip_to_a_stop() {
     let (done, _) = hub.tool(&bob, "/mcp", "agentscm_done", json!({})).await;
     assert_eq!(done, "AgentSCM: nothing to release.");
     let (status, _) = hub.tool(&alice, "/mcp", "agentscm_status", json!({})).await;
-    assert!(status.contains("no other agents"), "{status}");
+    assert!(
+        status.contains("no other agent sessions are live"),
+        "{status}"
+    );
 }
 
 /// `text` with each 8-hex session key as `KEY`, so a test can pin the rest exactly.

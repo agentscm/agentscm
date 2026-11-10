@@ -545,7 +545,7 @@ pub fn others(intents: &[Intent], own: Option<&str>, repository: &str, now: i64)
         .collect();
     let repository = sanitize(repository, PATH_CHARS);
     if others.is_empty() {
-        return format!("AgentSCM: no other agents are working in {repository}.");
+        return format!("AgentSCM: no other agent sessions are live in {repository}.");
     }
     let s = if others.len() == 1 { "" } else { "s" };
     let mut out = format!(
@@ -811,7 +811,7 @@ mod tests {
                 "acme/widgets",
                 0
             ),
-            "AgentSCM: no other agents are working in acme/widgets."
+            "AgentSCM: no other agent sessions are live in acme/widgets."
         );
         assert_eq!(
             others(&[mine, theirs], Some("int_me"), "acme/widgets", 90),

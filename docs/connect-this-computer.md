@@ -52,7 +52,10 @@ the forge did not accept the code. What signing in gives you:
   `agentscm hub auto-connect on|off [--hub URL]`. With it on, when a coding agent starts a session
   in a checkout that has no connection, its hook connects the checkout to the first such Hub (the
   default Hub first, at most four) that has the repository and where you have the role, and the
-  agent's context starts with `AgentSCM: coordinating on owner/name.` It writes only AgentSCM's
+  agent's context starts with `AgentSCM: coordinating on owner/name at <Hub>. This checkout was just
+  connected.` Every later session in a connected checkout starts with the same line, without the
+  last sentence, followed by whether conversation sharing is on for the session. When something
+stops coordination (the token was refused, or access ended), that reason replaces the line. It writes only AgentSCM's
   own files under your config directory, never a file in the checkout, and runs the same checks as
   `client connect`. It waits at most 2.5 seconds; a slower attempt says nothing and finishes for
   the next session. In a repository no such Hub has, the check stays silent, and that Hub is not
