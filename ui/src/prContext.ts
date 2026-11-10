@@ -5,7 +5,7 @@ import { withTimeout } from './timeout.ts'
 
 export interface PrContext {
   version: 1
-  availability: 'available' | 'not_connected' | 'not_observed'
+  availability: 'available' | 'not_connected' | 'not_observed' | 'merged'
   repository?: string
   repository_id?: number
   pull_request?: { number: number; title: string; author: string; head_ref: string; head_sha: string | null; base_ref: string; base_sha: string | null; draft: boolean; url: string | null; observed_at_ms: number; basis: 'provider_observed' }
@@ -46,7 +46,8 @@ export function decodePrContext(value: unknown, repo: string, pr: number): PrCon
   if (o.version !== 1) throw new Error('Unsupported PR context version')
   const repositoryId = o.repository_id === undefined ? {} : { repository_id: positive(o.repository_id) }
   if (o.availability === 'not_connected') return { version: 1, availability: o.availability, ...repositoryId }
-  if (o.availability === 'not_observed') return { version: 1, availability: o.availability, ...repositoryId, coverage: decodeCoverage(o.coverage) }
+  // A merged PR's open-state context is no longer kept; its merge facts are not rendered here.
+  if (o.availability === 'not_observed' || o.availability === 'merged') return { version: 1, availability: o.availability, ...repositoryId, coverage: decodeCoverage(o.coverage) }
   if (o.availability !== 'available' || o.repository !== repo) throw new Error('PR context repository mismatch')
   const p = object(o.pull_request)
   if (p.number !== pr || p.basis !== 'provider_observed') throw new Error('PR context identity mismatch')
