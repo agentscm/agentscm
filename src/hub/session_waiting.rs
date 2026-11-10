@@ -5,9 +5,11 @@
 //! it never outlives the wait it describes.
 //!
 //! Short-lived like the setup observations beside it: in memory, bounded, and lost on a Hub
-//! restart, after which a waiting session reads as not known rather than not waiting. No prompt
-//! text, tool input or transcript is kept, and nothing here can answer the prompt: the person
-//! answers in the session.
+//! restart, after which a waiting session reads as not known rather than not waiting. The only
+//! text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
+//! agent's last message, its question, or what a permission prompt is for, with secrets redacted),
+//! shown to that session's own person alone. No prompt, tool input or transcript is kept, and
+//! nothing here can answer the prompt: the person answers in the session.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -23,6 +25,8 @@ pub const GRACE_SECONDS: i64 = 60;
 const MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 const MAX_ROWS: usize = 1024;
 const MAX_TOKEN_ROWS: usize = 32;
+/// The longest excerpt of what a wait asks that is kept, in characters.
+const MAX_ASKS_CHARS: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitReason {
@@ -80,6 +84,8 @@ pub struct WaitingSession {
     pub session: String,
     /// A subagent asked; its whole session waits on the answer.
     pub subagent: bool,
+    /// What the wait asks, as the hook client excerpted it; third-party text for its person only.
+    pub asks: Option<String>,
 }
 
 struct Row {
@@ -90,6 +96,7 @@ struct Row {
     since: i64,
     /// The subagent that asked, when the host names it.
     asker: Option<String>,
+    asks: Option<String>,
 }
 
 impl Row {
@@ -104,7 +111,8 @@ pub struct Waiting(Mutex<BTreeMap<(String, String), Row>>);
 
 impl Waiting {
     /// Records that `native` (whose Hub session name is `session`) waits for its person, asked by
-    /// the subagent `asker` when the host names one. A repeat of the same wait keeps its start.
+    /// the subagent `asker` when the host names one, with `asks` saying what for when the hook
+    /// sent it. A repeat of the same wait keeps its start and takes the newer `asks`.
     #[allow(clippy::too_many_arguments)] // The fields of one hook report.
     pub(super) fn record(
         &self,
@@ -114,6 +122,7 @@ impl Waiting {
         agent: &str,
         reason: WaitReason,
         asker: Option<&str>,
+        asks: Option<&str>,
         now: i64,
     ) -> Result<()> {
         if principal.read_only || now >= principal.expires_at {
@@ -150,6 +159,9 @@ impl Waiting {
                 reason,
                 since,
                 asker: asker.map(str::to_owned),
+                asks: asks
+                    .map(|text| super::advice::sanitize(text.trim(), MAX_ASKS_CHARS))
+                    .filter(|text| !text.is_empty()),
             },
         );
         Ok(())
@@ -203,6 +215,7 @@ impl Waiting {
                 token: token.clone(),
                 session: row.session.clone(),
                 subagent: row.asker.is_some(),
+                asks: row.asks.clone(),
             })
             .collect::<Vec<_>>();
         out.sort_by(|a, b| (a.since, &a.key).cmp(&(b.since, &b.key)));
@@ -245,7 +258,7 @@ mod tests {
         let elsewhere = principal("tok_c", "usr_me", "acme/other");
         let wait = |who: &Principal, native: &str, reason, now| {
             waiting
-                .record(who, native, native, "claude", reason, None, now)
+                .record(who, native, native, "claude", reason, None, None, now)
                 .unwrap();
         };
         wait(&mine, "s1", WaitReason::Permission, 1_000);
@@ -296,6 +309,7 @@ mod tests {
                     "claude",
                     WaitReason::Permission,
                     Some("sub-a"),
+                    None,
                     1_000,
                 )
                 .unwrap();
@@ -319,7 +333,16 @@ mod tests {
         let mut mine = principal("tok_a", "usr_me", "acme/widgets");
         mine.expires_at = i64::MAX;
         waiting
-            .record(&mine, "old", "old", "codex", WaitReason::Idle, None, 0)
+            .record(
+                &mine,
+                "old",
+                "old",
+                "codex",
+                WaitReason::Idle,
+                None,
+                None,
+                0,
+            )
             .unwrap();
         assert_eq!(waiting.owned(&mine, MAX_AGE_SECONDS - 1).unwrap().len(), 1);
         assert!(waiting.owned(&mine, MAX_AGE_SECONDS).unwrap().is_empty());
@@ -334,6 +357,7 @@ mod tests {
                 "codex",
                 WaitReason::Idle,
                 None,
+                None,
                 1_000,
             )
             .unwrap();
@@ -341,7 +365,16 @@ mod tests {
         let mut reader = mine.clone();
         reader.read_only = true;
         assert!(matches!(
-            waiting.record(&reader, "r", "r", "codex", WaitReason::Idle, None, 1_000),
+            waiting.record(
+                &reader,
+                "r",
+                "r",
+                "codex",
+                WaitReason::Idle,
+                None,
+                None,
+                1_000
+            ),
             Err(HubError::Unauthorized)
         ));
         // One token cannot hold more than its share; its oldest wait gives way.
@@ -356,6 +389,7 @@ mod tests {
                     "cursor",
                     WaitReason::Question,
                     Some("x"),
+                    None,
                     at,
                 )
                 .unwrap();

@@ -1603,6 +1603,90 @@ async fn done_leaves_blocked_work_blocked_and_says_so() {
     );
 }
 
+/// A finished agent completes the Work it leads in the call it already makes, with no work_id or
+/// fences, even after its session ended once and paused that Work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_with_outcome_complete_finishes_the_led_work_without_fences() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let started = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "billing", "session": "s1", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let (paused, _) = hub
+        .tool(&alice, "/mcp", "agentscm_done", json!({"session": "s1"}))
+        .await;
+    assert!(paused.contains("paused"), "{paused}");
+
+    // A multi-line summary past the reason's 500 bytes still completes: it becomes one line.
+    let summary = format!("Merged the billing fix.\n\n{}", "Details. ".repeat(80));
+    let (done, error) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_done",
+            json!({"session": "s1", "outcome": "complete", "summary": summary}),
+        )
+        .await;
+    assert!(!error, "{done}");
+    assert!(done.starts_with("AgentSCM: completed “billing”;"), "{done}");
+    assert!(
+        done.ends_with("Before editing again, start new Work with agentscm_start."),
+        "{done}"
+    );
+    let after = hub
+        .tool_result(&alice, "agentscm_work_overview", json!({"detail": "full"}))
+        .await;
+    assert!(
+        after["structuredContent"]["operational"]["work"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{after}"
+    );
+    // Its scope is free for another agent.
+    let taken = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({"task": "rival", "session": "s2", "paths": ["src/billing.rs"]}),
+        )
+        .await;
+    assert_eq!(
+        taken["structuredContent"]["work"]["created"], true,
+        "{taken}"
+    );
+
+    // A session that leads nothing says so instead of claiming a completion.
+    let (none, error) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_done",
+            json!({"session": "s1", "outcome": "complete"}),
+        )
+        .await;
+    assert!(!error, "{none}");
+    assert!(
+        none.starts_with("AgentSCM: nothing to complete: this session leads no unfinished Work;"),
+        "{none}"
+    );
+    let (bad, error) = hub
+        .tool(
+            &alice,
+            "/mcp",
+            "agentscm_done",
+            json!({"session": "s1", "outcome": "finished"}),
+        )
+        .await;
+    assert!(error, "{bad}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() {
     let hub = Hub::start().await;
