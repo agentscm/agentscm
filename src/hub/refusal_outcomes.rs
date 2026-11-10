@@ -6,12 +6,17 @@
 //! granted the file (`handed_off`). An unsettled row is read against its hold: while the hold
 //! keeps the file it is `pending`; once the hold no longer keeps it the session `went_elsewhere`;
 //! when the hold's record is gone the outcome is `unknown`. Only what the Hub saw is counted.
+//! A notice drawn by a hook-reported edit is settled `pushed_through` when it is written: the
+//! edit already went ahead. `went_elsewhere` is inferred from what the Hub did not see (a session
+//! that ended, or whose later hooks failed open, looks the same), so it is reported on its own
+//! and never counted as resolved.
 use serde::{Deserialize, Serialize};
 
 /// Rows older than this are deleted when a new row is written.
 pub const RETAIN_SECONDS: i64 = 30 * 86_400;
-/// Rows kept per repository; the oldest go first.
-pub const MAX_ROWS: i64 = 20_000;
+/// Rows kept per token; the oldest go first. Session IDs come from the client, so a cap per
+/// repository would let one token's fresh sessions push out every other token's rows.
+pub const MAX_ROWS_PER_TOKEN: i64 = 1_000;
 /// At most this many rows are read for one metrics window; past it the counts are partial.
 pub const MAX_READ: usize = 20_000;
 
@@ -108,7 +113,8 @@ pub fn observed(
 }
 
 /// Whether a window's rows are all there: no more than `MAX_READ` matched, none of the window
-/// is older than the retention, and the repository is not at its row cap (which prunes by count).
+/// is older than the retention, and no token of the repository is at its row cap (which prunes
+/// by count).
 pub fn complete(matched: usize, since: i64, now: i64, at_cap: bool) -> bool {
     matched <= MAX_READ && since >= now - RETAIN_SECONDS && !at_cap
 }
@@ -171,12 +177,15 @@ impl ContestedMetrics {
         }
     }
 
-    /// Settled away from the file: asked for or got it, or left it while the hold stood.
+    /// Settled by asking for the file or being given it.
     pub fn resolved(&self) -> usize {
-        [&self.refusals, &self.notices]
-            .iter()
-            .map(|c| c.handed_off + c.went_elsewhere)
-            .sum()
+        self.refusals.handed_off + self.notices.handed_off
+    }
+
+    /// The hold ended with no further edit or request seen: inferred, so kept apart from
+    /// resolved and unresolved.
+    pub fn went_elsewhere(&self) -> usize {
+        self.refusals.went_elsewhere + self.notices.went_elsewhere
     }
 
     /// Edited the file again while the hold that caused the row still kept it.
@@ -245,7 +254,9 @@ mod tests {
         assert_eq!(metrics.refusals.observed, 3);
         assert_eq!(metrics.notices.observed, 2);
         assert_eq!(metrics.dismissed(), 1);
-        assert_eq!(metrics.resolved(), 2);
+        // Went elsewhere is inferred, so it is neither resolved nor unresolved.
+        assert_eq!(metrics.resolved(), 1);
+        assert_eq!(metrics.went_elsewhere(), 1);
         assert_eq!(metrics.unresolved(), 2);
     }
 }

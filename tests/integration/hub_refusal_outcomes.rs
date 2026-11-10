@@ -4,7 +4,7 @@ use crate::hub_pg;
 
 use std::sync::Arc;
 
-use agentscm::hub::hook_overhead::{ClientReport, RETAIN_SECONDS, Sample};
+use agentscm::hub::hook_overhead::{ClientReport, MAX_ROWS_PER_TOKEN, RETAIN_SECONDS, Sample};
 use agentscm::hub::session::{SESSION_TTL_SECONDS, SessionCall};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token};
 use agentscm::hub::value_metrics::{ValueMetrics, ValueMetricsQuery};
@@ -121,9 +121,15 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     store
         .answer_handoff(&alice, None, "c.rs", true, None, T0 + 4)
         .unwrap();
-    // Carol's MCP touch is told about the overlap, not refused: a notice.
+    // Carol's MCP touch is told about the overlap, not refused: a notice, still pending.
     let carol = agent(&*store, 3, "c");
     hold(&*store, &carol, &["d.rs"], T0 + 5);
+    // George's hook reports an edit it could not be refused before (as Cursor's does): the
+    // notice it draws is settled at once, because the edit already went ahead.
+    let george = agent(&*store, 7, "g");
+    store
+        .touch_session(&george, &call("hook:cursor", Some("g"), &["d.rs"], false), T0 + 6)
+        .unwrap();
 
     let now = T0 + 10;
     let live = metrics(&*store, &alice, now);
@@ -138,8 +144,11 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
         (1, 2, 1)
     );
     let notices = &live.issues.contested_edits.notices;
-    assert_eq!((notices.observed, notices.pending), (1, 1));
-    assert_eq!(live.issues.dismissed, Some(1));
+    assert_eq!(
+        (notices.observed, notices.pending, notices.pushed_through),
+        (2, 1, 1)
+    );
+    assert_eq!(live.issues.dismissed, Some(2));
     assert_eq!(live.issues.resolved, 2);
     assert_eq!(live.issues.unresolved, 2);
 
@@ -149,7 +158,10 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     assert_eq!(contested.refusals.went_elsewhere, 1);
     assert_eq!(contested.refusals.pushed_through, 1);
     assert_eq!(contested.notices.went_elsewhere, 1);
+    assert_eq!(contested.notices.pushed_through, 1);
+    // Went elsewhere is inferred, so it is neither resolved nor unresolved.
     assert_eq!(later.issues.unresolved, 0);
+    assert_eq!(later.issues.resolved, 2);
 }
 
 fn hook_overhead_adds_calls_per_session_and_prunes_old_rows(db: &Db) {
@@ -165,6 +177,7 @@ fn hook_overhead_adds_calls_per_session_and_prunes_old_rows(db: &Db) {
     let sample = |session: &str, client: Option<ClientReport>| Sample {
         session: session.into(),
         agent: "claude".into(),
+        hub_calls: 1,
         injected_start: 9000,
         injected_refusal: 0,
         injected_other: 40,
@@ -220,10 +233,8 @@ async fn a_hook_call_and_its_client_report_reach_value_metrics() {
     ))
     .unwrap();
     let objects = agentscm::backend::LocalBackend::open(dir.path().join("objects")).unwrap();
-    let app = agentscm::hub::router(agentscm::hub::HubState::new(
-        store.clone(),
-        Arc::new(objects),
-    ));
+    let state = agentscm::hub::HubState::new(store.clone(), Arc::new(objects));
+    let app = agentscm::hub::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
@@ -251,13 +262,14 @@ async fn a_hook_call_and_its_client_report_reach_value_metrics() {
         .await
         .unwrap();
     assert_eq!(reply.status(), 200);
-    // The row is written after the reply, so wait for it.
+    // Totals are written in the background, at most every 30 seconds: write them now.
     let query = ValueMetricsQuery {
         since: Some(unix_now() - 3600),
         ..Default::default()
     };
     let mut overhead = None;
     for _ in 0..50 {
+        agentscm::hub::hook_overhead::flush(&state).await;
         let read = store.value_metrics(&token, &query, unix_now()).unwrap();
         if read.overhead.hub_calls > 0 {
             overhead = Some(read.overhead);
@@ -279,6 +291,36 @@ async fn a_hook_call_and_its_client_report_reach_value_metrics() {
     assert_eq!(overhead.sessions_without_client_report, 0);
 }
 
+fn one_tokens_sessions_cannot_push_out_another_tokens_rows(db: &Db) {
+    let store = db.open();
+    let (busy, quiet) = (agent(&*store, 1, "a"), agent(&*store, 2, "b"));
+    let sample = |session: String| Sample {
+        session,
+        agent: "claude".into(),
+        hub_calls: 1,
+        ..Default::default()
+    };
+    store
+        .hook_overhead(&quiet, REPO, &sample("quiet".into()), T0)
+        .unwrap();
+    for n in 0..=MAX_ROWS_PER_TOKEN {
+        store
+            .hook_overhead(&busy, REPO, &sample(format!("s{n}")), T0 + 1 + n)
+            .unwrap();
+    }
+    let query = ValueMetricsQuery {
+        since: Some(0),
+        ..Default::default()
+    };
+    let overhead = store
+        .value_metrics(&quiet, &query, T0 + 2 + MAX_ROWS_PER_TOKEN)
+        .unwrap()
+        .overhead;
+    // The busy token keeps its newest rows; the quiet token's row is still there.
+    assert_eq!(overhead.sessions as i64, MAX_ROWS_PER_TOKEN + 1);
+    assert!(overhead.partial, "a token at its cap makes the counts partial");
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -295,4 +337,5 @@ macro_rules! conformance {
 conformance!(
     refusal_outcomes_follow_what_the_session_did_next,
     hook_overhead_adds_calls_per_session_and_prunes_old_rows,
+    one_tokens_sessions_cannot_push_out_another_tokens_rows,
 );

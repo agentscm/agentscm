@@ -403,21 +403,17 @@ async fn hook(
         }
     }
     record_hook_ms(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
+    let rendered = call.render(&outcome);
     let sample = super::hook_overhead::sample(
         call.session.as_deref(),
         call.agent.name(),
         call.kind == Kind::Start,
-        &outcome.text,
-        outcome.deny.as_deref(),
+        outcome.deny.is_some(),
+        &rendered,
         &parts.headers,
     );
-    tokio::spawn(super::hook_overhead::record(
-        state.clone(),
-        measured.0,
-        measured.1,
-        sample,
-    ));
-    let mut response = Json(call.render(&outcome)).into_response();
+    super::hook_overhead::record(&state, measured.0.as_deref(), measured.1, sample);
+    let mut response = Json(rendered).into_response();
     if let Some(reference) = failure.and_then(|error| error.correlation_id) {
         response.headers_mut().insert(
             "x-agentscm-correlation-id",
@@ -465,7 +461,7 @@ fn read_inbox(
     }
 }
 
-pub(super) async fn authenticate(
+async fn authenticate(
     state: &HubState,
     token: Option<String>,
     repo: Option<String>,

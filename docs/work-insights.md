@@ -46,26 +46,31 @@ hold (intent) that caused it. Later Hub calls settle it:
 
 | Outcome | What the Hub observed |
 |---|---|
-| `pushed_through` | The same session's hook reported an edit of the file while that hold still kept it. |
+| `pushed_through` | The same session's hook reported an edit of the file while that hold still kept it. A notice drawn by a hook-reported edit is settled this way when it is written, because the edit already went ahead. |
 | `handed_off` | The session asked for the file itself (`agentscm_ask`), or the holder granted a request for it. The Hub's own request after a refusal counts only once granted. |
 | `went_elsewhere` | Neither happened, and the hold no longer keeps the file. |
 | `pending` | Neither happened, and the hold still keeps the file. |
 | `unknown` | Neither happened, and the hold's record is gone. |
 
 `issues.contested_edits` reports `refusals` and `notices` by outcome. They also feed the issue
-totals: `pushed_through` is counted in `dismissed`, `handed_off` and `went_elsewhere` in
-`resolved`, and `pending` and `unknown` in `unresolved`. An outcome is what the Hub saw, not why
-the agent did it: an agent that went elsewhere may have finished, been stopped, or edited the file
-through a tool the hooks do not see.
+totals: `pushed_through` is counted in `dismissed`, `handed_off` in `resolved`, and `pending` and
+`unknown` in `unresolved`. `went_elsewhere` is counted in neither `resolved` nor `unresolved`:
+it is inferred from what the Hub did not see, so a session that ended, or whose later hooks failed
+open, looks the same as one that moved on, and `coverage.gaps` says so. An outcome is what the Hub
+saw, not why the agent did it.
 
 `overhead` reports, for the sessions active in the window and in total: the hook calls that
-reached the Hub (`hub_calls`); the characters the Hub returned into the agent's context, split
-into session-start context, refusal text and other text (notices, advice, requests), counted in
-UTF-16 units as Claude Code limits them; and what the hook client measured itself (`client`):
+reached the Hub (`hub_calls`); the characters of text in the reply as sent, split into
+session-start context (including the session ID line and required rules), refusal text and other
+text (notices, advice, requests), each distinct text counted once and in UTF-16 units as Claude
+Code limits them; and what the hook client measured itself (`client`):
 calls, total and longest latency in milliseconds, calls that timed out and calls that failed open.
-A call that timed out never reached the Hub, so the client keeps its counts in a small file per
+A call that timed out never reached the Hub, so the client keeps its counts in small files per
 agent session and sends them with the next call that does (`x-agentscm-hook-report`); no extra
-request is made. `per_session` lists up to 50 sessions by agent and counts, without session or
+request is made. A call takes the waiting files by renaming them first, so two hooks of one
+session running at once never send the same counts. Recording never adds a store call to a hook:
+the Hub adds each call to an in-memory total and writes the totals at most every 30 seconds, in
+one background store call; a Hub restart loses the totals not yet written. `per_session` lists up to 50 sessions by agent and counts, without session or
 token identities. A session counts as a whole when it was
 active in the window, including its calls outside it.
 
@@ -74,9 +79,12 @@ Coverage stays explicit. Both are recorded per session, so a single-Work query r
 client sent no measurement (an older client, a client whose calls all failed before a token was
 found, or one that never got a call through after a measured one); their latency, timeouts and
 fail-open answers are unknown, and `coverage.gaps` says so. Rows are kept 30 days and at most
-20,000 per repository of each kind; `partial` is true, with a gap, when the window reaches past
-that or more rows matched than were read. Concurrent hooks of one session can overwrite each
-other's waiting client counts. Nothing is converted into time, money or a percentage.
+1,000 per token of each kind, because session IDs come from the client and a cap per repository
+would let one token push out everyone else's rows; `partial` is true, with a gap, when the window
+reaches past the 30 days, a token is at its cap, or more rows matched than were read. A reply of
+"coordination unknown" from the Hub itself arrives as an answer, so the client does not count it
+as failed open; `/v1/hub/health` counts those per process. Nothing is converted into time, money
+or a percentage.
 
 Reads default to seven days, accept a maximum 90-day window, and return bounded evidence.
 MCP lists a default of 20 evidence rows and permits at most 50; repeat `since`, `until`, `work_id` when used, and

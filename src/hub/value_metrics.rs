@@ -1006,6 +1006,9 @@ pub fn project(
         if !overhead_complete {
             gaps.insert("Hook overhead records for this window were pruned by age or count, or exceeded the read limit; their counts are partial".into());
         }
+        if contested.went_elsewhere() > 0 {
+            gaps.insert("Went elsewhere means the hold ended with no further edit or request seen; it includes sessions that ended or whose later hooks failed open, so it is counted neither resolved nor unresolved".into());
+        }
         if overhead.sessions > 0 {
             gaps.insert("Hook overhead counts whole sessions active in the window, including their calls outside it".into());
         }
@@ -1324,7 +1327,9 @@ mod tests {
         assert_eq!(p.issues.contested_edits.refusals.observed, 2);
         assert_eq!(p.issues.contested_edits.refusals.went_elsewhere, 1);
         assert_eq!(p.issues.dismissed, Some(1));
-        assert_eq!((p.issues.resolved, p.issues.unresolved), (1, 1));
+        // Went elsewhere is inferred, so it is neither resolved nor unresolved.
+        assert_eq!((p.issues.resolved, p.issues.unresolved), (0, 1));
+        assert!(p.coverage.gaps.iter().any(|g| g.starts_with("Went elsewhere")));
         assert!(p.issues.contested_edits.partial);
         assert_eq!(p.overhead.client.timed_out, 48);
         assert_eq!(p.overhead.hub_calls, 13);
