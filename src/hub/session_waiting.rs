@@ -153,7 +153,8 @@ pub struct Waiting(Mutex<BTreeMap<(String, String), Row>>, AtomicI64);
 impl Waiting {
     /// Records that `native` (whose Hub session name is `session`) waits for its person, asked by
     /// the subagent `asker` when the host names one, with `asks` saying what for when the hook
-    /// sent it. A repeat of the same wait keeps its start and takes the newer `asks`.
+    /// sent it. A repeat of the same wait keeps its start and takes the newer `asks`; a repeat by
+    /// the same asker that says nothing (the host's notice after its own prompt) keeps the older.
     #[allow(clippy::too_many_arguments)] // The fields of one hook report.
     pub(super) fn record(
         &self,
@@ -191,9 +192,12 @@ impl Waiting {
                 return Err(HubError::Busy);
             }
         }
-        let since = match rows.get(&key) {
-            Some(row) if row.reason == reason => row.since,
-            _ => now,
+        let (since, said) = match rows.get(&key) {
+            Some(row) if row.reason == reason => (
+                row.since,
+                row.asks.clone().filter(|_| row.asker.as_deref() == asker),
+            ),
+            _ => (now, None),
         };
         rows.insert(
             key,
@@ -206,7 +210,8 @@ impl Waiting {
                 asker: asker.map(str::to_owned),
                 asks: asks
                     .map(|text| super::advice::sanitize(text.trim(), MAX_ASKS_CHARS))
-                    .filter(|text| !text.is_empty()),
+                    .filter(|text| !text.is_empty())
+                    .or(said),
             },
         );
         Ok(())
@@ -381,6 +386,37 @@ mod tests {
         waiting.clear("tok_a", "s1", Some("any-subagent"), false);
         assert!(!waiting.has_session("s1"));
         assert!(waiting.owned(&mine, 1_210).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_repeat_that_says_nothing_keeps_what_the_wait_asked() {
+        let waiting = Waiting::default();
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        let record = |asker, asks, now| {
+            waiting
+                .record(
+                    &mine,
+                    "s",
+                    "s",
+                    "claude",
+                    WaitReason::Permission,
+                    asker,
+                    asks,
+                    now,
+                )
+                .unwrap();
+            waiting.owned(&mine, 2_000).unwrap()[0].asks.clone()
+        };
+        let asked = record(None, Some("Publish the crate"), 1_000);
+        assert_eq!(asked.as_deref(), Some("Publish the crate"));
+        // The host's notice after its own prompt carries no text.
+        assert_eq!(record(None, None, 1_006), asked);
+        assert_eq!(
+            record(None, Some("Tag it"), 1_010).as_deref(),
+            Some("Tag it")
+        );
+        // Another asker's prompt is another question.
+        assert_eq!(record(Some("sub"), None, 1_020), None);
     }
 
     #[test]

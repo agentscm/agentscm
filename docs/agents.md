@@ -239,18 +239,25 @@ The session's next tool call, edit check, prompt, start or end ends the wait. A 
 
 For a Claude Code permission prompt, the plugin's `PermissionRequest` hook also offers the prompt to the Hub. The person who owns that session's agent token can then allow it once or deny it on the Hub's web page, away from the computer the session runs on. The prompt stays usable in the session the whole time, and the first answer wins. There is nothing to turn on.
 
-Beyond the wait itself, the hook sends the tool's name, what the request is for, and a salted hash of the tool input. What the request is for is one of these, at most 4,000 characters:
+Beyond the wait itself, the hook sends the tool's name, what the request is for, and a salted hash of the tool input. What the request is for is one of these, at most 20,000 characters:
 
 - a shell command, in full
 - an edit's file path, never its content
-- a fetch's address, without its query or sign-in part
-- a subagent's type and description
-- any other tool's input, as JSON
+- a fetch's address, without its query, fragment or sign-in part
+- any other tool's whole input, as indented JSON: a subagent's start and an MCP server's tools included
+
+So that the page can say what is asked and by which session, the hook also sends one line that says what the call does (for example "use start session (ccd_session): Fix the login") and the name of the checkout folder the session runs in. The line is a label beside the request, never a replacement for it.
 
 Recognizable secrets are redacted on the machine first, with the same best-effort redaction as the excerpt above. The Hub keeps these in memory only, for at most 12 hours. It never stores, logs or notifies them, and it shows them only to the token's owner, signed in on the web page, once the wait has lasted the same 60 seconds.
 
 - **Only a prompt a person can see is offered.** A request is offered after the host's own `permission_prompt` notification confirms the prompt is on screen. A run with nobody at a dialog sends none, so it is never offered: its hook gives up after 20 seconds and the host decides as before.
-- **Allow needs the whole request.** A request that was cut, had anything redacted, or carries a setting that is not shown (for a shell command, anything other than the command, its description, its timeout and its background flag) can only be denied from the Hub.
+- **The person may allow a request that is not shown in full.** The request is their own agent's, so the Hub accepts their allow whatever it shows, as the dialog in the session would. The list says exactly what is missing, in `missing`, so the page can say it beside Allow:
+  - `cut_from`: how many characters the request had before it was cut to 20,000;
+  - `redacted`: how many secrets were replaced on the machine;
+  - `dropped`: how many characters that do not show the Hub removed (control, zero-width, direction or tag characters; a tag character can spell words the tool receives and nobody sees);
+  - `unshown`: the parts of the request that are not shown, by name: at most 16 names of at most 64 characters, with secrets redacted, the last one "and N more" when there are more. For a shell command these are its settings other than the command, its description, its timeout and its background flag (for example `dangerouslyDisableSandbox`). For a file read, a search or a fetch they are its settings other than the path, pattern, query or address shown (for a fetch, its `prompt`), and the parts of the address that were left out. When nothing of a request can be shown, the one name is "the request's input".
+
+  An allow of such a request approves what is not shown too. A person who wants to read all of it answers in the session.
 - **The Hub cannot change the request.** The hook prints one of two fixed decisions, and only for a reply that names its own request and input hash. The Hub cannot change the command, add input or put text in front of the model. After a deny the model reads only "Denied from the AgentSCM Hub by its person."
 - **Failures leave the prompt to the session.** An older Hub, a Hub restart, a network error or a timeout produce no decision.
 - **The request ends when the session moves on**: the prompt is answered in the session, or the session makes its next tool call, takes a prompt, or ends.
@@ -263,10 +270,10 @@ The hook uses two routes with its agent token, and the web page two with the per
 
 | Route | Body and reply |
 | --- | --- |
-| `POST /v1/hub/permission/register?repo=owner/name` | `{"session", "agent_id"?, "tool", "display", "complete", "content_hidden"?, "input_hash"}`. Replies `{"request_id", "input_hash", "state"}` with `state` `unconfirmed` or `pending`. 409 `request_conflict` with `reason` `not_waiting` when that session has no permission wait. 429 `rate_limited` past 8 open requests for a token or 256 for the Hub. |
+| `POST /v1/hub/permission/register?repo=owner/name` | `{"session", "agent_id"?, "tool", "summary"?, "folder"?, "display", "missing"?, "content_hidden"?, "input_hash"}`, where `missing` is `{"cut_from"?, "redacted"?, "unshown"?}` with at most 16 names. An older hook sends `complete` in its place; unless that is true, the list names one unshown part that says the hook did not state what is missing. Replies `{"request_id", "input_hash", "state"}` with `state` `unconfirmed` or `pending`. 409 `request_conflict` with `reason` `not_waiting` when that session has no permission wait. 429 `rate_limited` past 8 open requests for a token or 256 for the Hub. |
 | `POST /v1/hub/permission/poll?repo=owner/name` | `{"request_id", "input_hash", "wait_seconds"}`, held for up to `wait_seconds` (0 to 25) until the state changes. Replies `{"request_id", "input_hash", "state", "decision"}`: `state` is `unconfirmed`, `pending`, `answered` or `ended`, and `decision` is `allow`, `deny` or null. An unknown id, another token's request and a wrong hash are all 404. |
-| `GET /v1/hub/session/permissions?repository=owner/name` | `{"requests": [{"item_id", "request_id", "tool", "display", "complete", "content_hidden", "subagent", "since", "state", "decision"}]}`: the person's own confirmed requests there, oldest first. `item_id` is the id of the wait's `session_waiting` action. |
-| `POST /v1/hub/session/permissions/answer` | `{"repository", "request_id", "decision"}` with `allow` or `deny`, and the page's CSRF token. Replies `{"state": "answered", "decision"}`; the same decision again is accepted. 400 when Allow is not offered, 403 `not_your_agent`, 409 `request_conflict` with `reason` `already_answered`, `answered_in_session` or `ended`. |
+| `GET /v1/hub/session/permissions?repository=owner/name` | `{"requests": [{"item_id", "request_id", "tool", "summary", "folder", "display", "allowable", "missing", "complete", "content_hidden", "subagent", "since", "state", "decision"}]}`: the person's own confirmed requests there, oldest first. `item_id` is the id of the wait's `session_waiting` action, which lists the Work that session leads. `allowable` is true: this Hub accepts an allow for every request it lists (a Hub without the field refuses one unless `complete`). `missing` is `{"cut_from", "redacted", "dropped", "unshown"}` as described above; `cut_from` is null when nothing was cut. `complete` is true when nothing is missing and the `display` is at most 4,000 characters, for a page that shows no more than that and offers Allow only then. `summary` and `folder` are null when the hook sent none. |
+| `POST /v1/hub/session/permissions/answer` | `{"repository", "request_id", "decision"}` with `allow` or `deny`, and the page's CSRF token. Replies `{"state": "answered", "decision"}`; the same decision again is accepted. 403 `not_your_agent`, 409 `request_conflict` with `reason` `already_answered`, `answered_in_session` or `ended`. |
 
 ### Hooks fail open
 
