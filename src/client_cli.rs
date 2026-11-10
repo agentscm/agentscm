@@ -100,6 +100,9 @@ pub(crate) struct ConnectArgs {
     /// Replace a different connection already bound to this checkout.
     #[arg(long)]
     pub(crate) replace: bool,
+    /// Give this linked worktree its own connection instead of using its main checkout's.
+    #[arg(long)]
+    pub(crate) own_connection: bool,
     /// Refuse instead of starting a browser or device sign-in (quickstart with `--yes` or no terminal).
     #[arg(skip)]
     pub(crate) no_sign_in: bool,
@@ -420,17 +423,22 @@ fn validate_setup_installation(setup: &SetupInstallation<'_>, _root: &Path) -> R
 }
 
 #[cfg(unix)]
-fn install_setup(setup: &SetupInstallation<'_>, root: &Path) -> Result<()> {
+fn install_setup(setup: &SetupInstallation<'_>, root: &Path, connection_root: &Path) -> Result<()> {
     // Recorded first, so `client remove` also takes out a plugin a failed install left behind.
+    // The agent is recorded on the connection in use, which a worktree may share with its main clone.
     for (agent, scope) in setup.agents {
-        record_agent(root, *agent)?;
+        record_agent(connection_root, *agent)?;
         crate::client_setup::install(*agent, root, setup.program, *scope)?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn install_setup(setup: &SetupInstallation<'_>, _root: &Path) -> Result<()> {
+fn install_setup(
+    setup: &SetupInstallation<'_>,
+    _root: &Path,
+    _connection_root: &Path,
+) -> Result<()> {
     let _ = setup;
     Ok(())
 }
@@ -1399,12 +1407,19 @@ async fn connect_inner(
     let hub = match args.hub.as_deref() {
         Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
         // A checkout that is already connected keeps its Hub, however many are signed in.
-        None => crate::hub_cli::default_hub_or(
-            load()?
-                .into_iter()
-                .find(|connection| connection.root == root)
-                .map(|connection| connection.hub),
-        )?,
+        None => crate::hub_cli::default_hub_or({
+            let saved = load()?;
+            if args.own_connection {
+                saved
+                    .into_iter()
+                    .find(|connection| connection.root == root)
+                    .map(|connection| connection.hub)
+            } else {
+                // A linked worktree without a connection of its own keeps its main clone's Hub.
+                crate::client_config::connection_for_checkout(&saved, &root)
+                    .map(|(connection, _)| connection.hub.clone())
+            }
+        })?,
     };
     let supplied_token = match args.token_file {
         Some(path) => {
@@ -1437,6 +1452,61 @@ async fn connect_inner(
             "a different client connection already exists for this checkout; review `agentscm client list`, then pass --replace",
         ));
     }
+    if !args.own_connection
+        && existing.is_none()
+        && let Some((shared, _)) =
+            crate::client_config::connection_for_checkout(&connections, &root)
+        && shared.root != root
+        && shared.hub == hub
+        && shared.repo.eq_ignore_ascii_case(&repo)
+        && shared.origin_host.eq_ignore_ascii_case(&origin_host)
+    {
+        let shared = shared.clone();
+        if supplied_token
+            .as_ref()
+            .is_some_and(|path| path != &shared.token_file)
+        {
+            return Err(invalid(
+                "this worktree uses the connection of its main checkout, which holds a different token; pass --own-connection to connect it separately",
+            ));
+        }
+        drop(initial_lifecycle);
+        let refused = || {
+            invalid(
+                "the main checkout's connection is not valid; run `agentscm client connect` there, or pass --own-connection to connect this worktree separately",
+            )
+        };
+        let token = read_token(&shared.token_file).map_err(|_| refused())?;
+        let verified = verify_token(&shared, &token).await.map_err(|_| refused())?;
+        let _lifecycle = lifecycle_lock()?;
+        if load()?
+            .into_iter()
+            .find(|saved| saved.root == shared.root)
+            .as_ref()
+            != Some(&shared)
+        {
+            return Err(invalid("the client connection changed during setup; retry"));
+        }
+        if !quiet {
+            eprintln!(
+                "This worktree uses the connection of {}.",
+                shared.root.display()
+            );
+        }
+        if let Some(setup) = setup.as_ref() {
+            install_setup(setup, &root, &shared.root)?;
+        }
+        if !quiet {
+            println!(
+                "Connection is already valid for {} at {} {} and permits coordination.{}",
+                shared.repo,
+                shared.hub,
+                verified.as_who(),
+                renewal_note(&shared)
+            );
+        }
+        return Ok(());
+    }
     drop(initial_lifecycle);
     if supplied_token.is_none()
         && !changed
@@ -1458,7 +1528,7 @@ async fn connect_inner(
         )?;
         if saved.repo == verified.repository {
             if let Some(setup) = setup.as_ref() {
-                install_setup(setup, &root)?;
+                install_setup(setup, &root, &root)?;
             }
             if !quiet {
                 println!(
@@ -1478,7 +1548,7 @@ async fn connect_inner(
             corrected.repo = verified.repository.clone();
             update(&root, Some(saved), Some(corrected.clone()))?;
             if let Some(setup) = setup.as_ref() {
-                install_setup(setup, &root)?;
+                install_setup(setup, &root, &root)?;
             }
             if !quiet {
                 println!(
@@ -1621,7 +1691,7 @@ async fn connect_inner(
     }
     let install_result = setup
         .as_ref()
-        .map_or(Ok(()), |setup| install_setup(setup, &root));
+        .map_or(Ok(()), |setup| install_setup(setup, &root, &root));
     let retired = existing.as_ref().filter(|saved| {
         saved.token_file != connection.token_file && saved.owned_token_id.is_some()
     });

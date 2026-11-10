@@ -76,6 +76,15 @@ Claude Code and Codex plugins, and the other agents' user-scope hooks and MCP se
 coordinate in new worktrees at once. A `--checkout-only` entry is not copied into a new worktree,
 so those MCP tools are available there only where such an entry exists.
 
+`client setup` and `client connect` run in such a worktree also use the main checkout's
+connection, when it has the same Hub, repository and origin host: they mint no token, print
+`This worktree uses the connection of <main clone>.` and verify that connection. `client setup`
+still writes the agents' checkout files in the worktree and records the agents on the main
+checkout's connection. Pass `--own-connection` to give the worktree a connection of its own
+instead; that connection has its own agent token, so an agent in the worktree may then appear
+as a second agent. A `--token-file` that differs from the main checkout's token is refused
+unless `--own-connection` is also passed.
+
 On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
 there is no separate app install. Start at Login is off until the member enables it in the menu.
 If the user-scope plugin runs in a checkout that was never connected, the tray lists that checkout
@@ -191,8 +200,8 @@ What the prompt relies on, checked against the help output of `agentscm client s
 - In a linked worktree that has no connection of its own, `client check`, `client doctor`,
   `client status --root` and `client reporting` use the main clone's connection, as the hooks
   and the MCP server there do, and say `This worktree uses the connection of <main clone>.`
-  `client setup` run in a worktree connects that worktree separately, so step 1 passes the main
-  clone as `--root`.
+  `client setup` run in a worktree does the same unless `--own-connection` is passed, so step 1
+  needs no `--root` for a worktree of a connected clone.
 - `client setup` without `--hub` in a clone that is already connected uses that clone's Hub,
   even when this computer is signed in to several.
 - The edit in step 6 must use the agent's own file-edit tool: a shell write runs no edit hook.
