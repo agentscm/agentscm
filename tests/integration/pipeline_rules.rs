@@ -144,6 +144,7 @@ fn fixture_provider(provider: &str) -> Fixture {
         trigger: MergeTrigger {
             target: "main".into(),
             labels_all: BTreeSet::from(["ship".into()]),
+            ..MergeTrigger::default()
         },
         recipe_digest: recipe.digest().unwrap(),
         recipe,
@@ -187,6 +188,8 @@ fn event(f: &Fixture) -> ConfirmedMerge {
         labels: BTreeSet::from(["ship".into()]),
         observed_at: 123,
         delivery_id: Some("hint".into()),
+        kind: TriggerEvent::Merge,
+        changes: None,
     }
 }
 fn journal(f: &Fixture) -> RuleJournal {
@@ -872,6 +875,9 @@ struct PollFakeState {
     bad_query: bool,
     listing_entries: Option<Vec<Value>>,
     target_tip: Option<String>,
+    /// Open pull requests listed for `state=open`, and each one's changed files.
+    open: Vec<i64>,
+    files: BTreeMap<i64, Vec<String>>,
 }
 fn raw_poll_pull(provider: &str, number: i64, sha: &str, merged: bool) -> Value {
     if provider == "github" {
@@ -906,7 +912,11 @@ async fn poll_fake(
             |State(state): State<Arc<std::sync::Mutex<PollFakeState>>>, uri: Uri| async move {
                 let mut s = state.lock().unwrap();
                 let path = uri.path();
-                let kind = if path.ends_with("/pulls") || path.ends_with("/merge_requests") {
+                let kind = if path.ends_with("/files") {
+                    "files"
+                } else if path.ends_with("/pulls") && uri.query().is_some_and(|q| q.contains("state=open")) {
+                    "open"
+                } else if path.ends_with("/pulls") || path.ends_with("/merge_requests") {
                     "list"
                 } else if path.contains("/pulls/") || path.contains("/merge_requests/") {
                     "pull"
@@ -951,6 +961,20 @@ async fn poll_fake(
                     } else {
                         json!({"id":42,"path_with_namespace":"acme/widgets"})
                     })
+                    .into_response();
+                }
+                if kind == "open" {
+                    return Json(s.open.iter().map(|n| s.pulls[n].clone()).collect::<Vec<_>>())
+                        .into_response();
+                }
+                if kind == "files" {
+                    let number = path.rsplit('/').nth(1).unwrap().parse::<i64>().unwrap();
+                    return Json(
+                        s.files[&number]
+                            .iter()
+                            .map(|f| json!({"filename": f, "status": "modified"}))
+                            .collect::<Vec<_>>(),
+                    )
                     .into_response();
                 }
                 if kind == "list" {
@@ -1498,4 +1522,183 @@ async fn unverifiable_items_do_not_starve_later_valid_merges_or_advance_checkpoi
         assert_eq!(j.pending(8).unwrap().len(), 1);
         task.abort();
     }
+}
+
+fn pull_rule(f: &Fixture) -> PipelineRule {
+    let mut rule = f.rule.clone();
+    rule.rule_id = "scan".into();
+    rule.trigger = MergeTrigger {
+        target: "main".into(),
+        event: TriggerEvent::PullRequest,
+        paths_any: vec!["src/**".into(), "**/*.lock".into()],
+        ..MergeTrigger::default()
+    };
+    rule
+}
+fn head_event(f: &Fixture, paths: Option<&[&str]>) -> ConfirmedMerge {
+    ConfirmedMerge {
+        kind: TriggerEvent::PullRequest,
+        changes: Some(ObservedChanges {
+            files: Some(2),
+            lines: Some(11),
+            paths: paths.map(|p| p.iter().map(|v| v.to_string()).collect()),
+        }),
+        ..event(f)
+    }
+}
+fn open_pull(number: i64, head: &str, draft: bool, head_repository: i64) -> Value {
+    json!({"number":number,"state":"open","draft":draft,"merged":false,"merge_commit_sha":null,
+        "head":{"sha":head,"repo":{"id":head_repository}},
+        "base":{"ref":"main","repo":{"id":42,"full_name":"acme/widgets"}},
+        "labels":[],"changed_files":2,"additions":10,"deletions":1,"updated_at":"2026-01-01T00:00:00Z"})
+}
+
+#[test]
+fn pull_request_preview_matches_paths_and_thresholds_and_reports_unknown() {
+    let f = fixture();
+    let mut r = pull_rule(&f);
+    let p = preview(
+        &r,
+        &head_event(&f, Some(&["README.md", "tools/Cargo.lock"])),
+    );
+    assert!(p.matches && p.unknown.is_empty(), "{p:?}");
+    let p = preview(&r, &head_event(&f, Some(&["README.md", "docs/a.md"])));
+    assert_eq!(p.reasons, vec!["no changed path matches paths_any"]);
+    // An incomplete file list is never read as "no match".
+    let p = preview(&r, &head_event(&f, None));
+    assert!(!p.matches);
+    assert_eq!(p.unknown.len(), 1);
+    assert!(p.reasons[0].starts_with("could not evaluate paths_any"));
+    r.run_when_unknown = true;
+    let p = preview(&r, &head_event(&f, None));
+    assert!(p.matches && p.unknown.len() == 1, "{p:?}");
+    r.run_when_unknown = false;
+    r.min_changed_lines = Some(12);
+    r.min_changed_files = Some(2);
+    let p = preview(&r, &head_event(&f, Some(&["src/a.rs"])));
+    assert_eq!(p.reasons, vec!["11 changed lines, fewer than 12"]);
+    // Each rule fires on its own event kind only.
+    assert_eq!(
+        preview(&pull_rule(&f), &event(&f)).reasons,
+        vec!["rule fires on pull request heads; this is a merge"]
+    );
+    assert_eq!(
+        preview(&f.rule, &head_event(&f, Some(&["src/a.rs"]))).reasons,
+        vec!["rule fires on merges; this is a pull request head"]
+    );
+    let mut j = journal(&f);
+    let mut merge_with_paths = f.rule.clone();
+    merge_with_paths.trigger.paths_any = vec!["src/**".into()];
+    assert!(j.install(&merge_with_paths, None).is_err());
+    for bad in ["src/", "/src/**", " src/**", ""] {
+        let mut rule = pull_rule(&f);
+        rule.trigger.paths_any = vec![bad.into()];
+        assert!(j.install(&rule, None).is_err(), "{bad:?}");
+    }
+    let mut gitlab = pull_rule(&f);
+    gitlab.provider = "gitlab".into();
+    assert!(
+        j.install(&gitlab, None)
+            .unwrap_err()
+            .to_string()
+            .contains("GitHub only")
+    );
+    // A merge event cannot carry a change, and a head is keyed apart from a merge of it.
+    let mut merge = event(&f);
+    merge.changes = Some(ObservedChanges::default());
+    assert!(j.accept(&merge).is_err());
+    j.install(&f.rule, None).unwrap();
+    j.install(&pull_rule(&f), None).unwrap();
+    let head = head_event(&f, Some(&["src/a.rs"]));
+    assert_eq!(j.accept(&head).unwrap().len(), 1);
+    assert_eq!(j.accept(&event(&f)).unwrap().len(), 1);
+    assert!(j.accept(&head).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&pull_rule(&f), None).unwrap();
+    let (url, state, task) = poll_fake("github", &f.commit).await;
+    {
+        let mut s = state.lock().unwrap();
+        s.pulls.insert(9, open_pull(9, &f.commit, false, 42));
+        s.pulls.insert(10, open_pull(10, &"c".repeat(40), true, 42));
+        s.pulls
+            .insert(11, open_pull(11, &"d".repeat(40), false, 99));
+        s.open = vec![9, 10, 11];
+        s.files
+            .insert(9, vec!["src/lib.rs".into(), "README.md".into()]);
+    }
+    let gh = agentscm::hub::github::Api::new(&url, &url).unwrap();
+    let api = ForgeApi::Github(&gh);
+    let first = poll_merges(api, "synthetic", &connected(), &mut j, observation_now())
+        .await
+        .unwrap();
+    assert!(
+        first.blocked.is_none() && first.checkpoint_advanced,
+        "{first:?}"
+    );
+    // No merge rule is installed, so closed proposals are not listed; drafts and forks
+    // are re-read but their files are not.
+    assert_eq!(
+        state.lock().unwrap().requests,
+        vec!["repo", "open", "pull", "files", "pull", "pull"]
+    );
+    let pending = j.pending(8).unwrap();
+    assert_eq!(pending.len(), 1);
+    let event = &pending[0].event;
+    assert_eq!(
+        (
+            event.kind,
+            event.proposal_number,
+            event.accepted_commit.as_str()
+        ),
+        (TriggerEvent::PullRequest, 9, f.commit.as_str())
+    );
+    assert_eq!(pending[0].rule.rule_id, "scan");
+    assert_eq!(
+        event.changes.as_ref().unwrap().paths.as_deref(),
+        Some(&["README.md".to_string(), "src/lib.rs".to_string()][..])
+    );
+    state.lock().unwrap().requests.clear();
+    let second = poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.skipped_confirmed, 1);
+    assert_eq!(
+        state.lock().unwrap().requests,
+        vec!["repo", "open", "pull", "pull"]
+    );
+    assert_eq!(j.pending(8).unwrap().len(), 1);
+    // The same executor runs the head's exact source.
+    let claim = j.claim(&pending[0].dispatch_id).unwrap();
+    let run = tokio::task::block_in_place(|| deliver(&f.data, &mut j, &claim, &f.work)).unwrap();
+    assert_eq!(run.state, RunState::Succeeded);
+    // A new head commit is a new event.
+    state
+        .lock()
+        .unwrap()
+        .pulls
+        .insert(9, open_pull(9, &"e".repeat(40), false, 42));
+    poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 2,
+    )
+    .await
+    .unwrap();
+    let pending = j.pending(8).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event.accepted_commit, "e".repeat(40));
+    task.abort();
 }

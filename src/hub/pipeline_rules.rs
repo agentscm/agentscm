@@ -15,12 +15,43 @@ use crate::skill_workflow::{
 };
 use crate::{Error, Result};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// The forge event a rule fires on. Omitted means `merge`, so earlier rules keep their bytes.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerEvent {
+    /// A provider-confirmed merge into `target`.
+    #[default]
+    Merge,
+    /// An open, non-draft pull request into `target` whose head is in this repository,
+    /// once per head commit. GitHub only.
+    PullRequest,
+}
+impl TriggerEvent {
+    fn is_merge(&self) -> bool {
+        *self == Self::Merge
+    }
+}
+
+/// Every predicate must hold. The path and size predicates apply to pull request heads only.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MergeTrigger {
     pub target: String,
     #[serde(default)]
     pub labels_all: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "TriggerEvent::is_merge")]
+    pub event: TriggerEvent,
+    /// Whole-path globs (`src/**`, `**/*.lock`); at least one changed path must match one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths_any: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_changed_files: Option<u64>,
+    /// Additions plus deletions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_changed_lines: Option<u64>,
+    /// Run when a predicate cannot be evaluated; otherwise that is reported and the rule does not run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub run_when_unknown: bool,
 }
 
 /// Strict graph template. The observer supplies exact source; no native target is changed.
@@ -94,12 +125,40 @@ pub struct ConfirmedMerge {
     pub labels: BTreeSet<String>,
     pub observed_at: i64,
     pub delivery_id: Option<String>,
+    /// For a pull request head, `accepted_commit` is the head commit, not a merge.
+    #[serde(default, skip_serializing_if = "TriggerEvent::is_merge")]
+    pub kind: TriggerEvent,
+    /// Pull request heads only: the change as the forge reported it when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<ObservedChanges>,
 }
+
+/// `None` is unknown, never zero or empty.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedChanges {
+    pub files: Option<u64>,
+    /// Additions plus deletions.
+    pub lines: Option<u64>,
+    /// Every changed path, a rename's old path included; `None` when the forge's list was
+    /// incomplete or larger than the retained bound.
+    pub paths: Option<Vec<String>>,
+}
+
+const MAX_PATH_GLOBS: usize = 32;
+const MAX_PATH_GLOB_BYTES: usize = 256;
+const MAX_CHANGED_PATHS: usize = 3000;
+const MAX_CHANGED_PATH_BYTES: usize = 256 * 1024;
+/// Matching work per preview, in the glob matcher's units; past it the paths are unknown.
+const MAX_PATH_MATCH_WORK: u64 = 50_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MatchPreview {
     pub matches: bool,
     pub reasons: Vec<String>,
+    /// Predicates that could not be evaluated. With `run_when_unknown` the rule still matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,9 +200,46 @@ pub async fn confirm_merge(
     verify_repository(api, token, repository)
         .await
         .map_err(observation_error)?;
-    confirm_in_repository(api, token, repository, number, observed_at, delivery_id)
+    confirm_in_repository(
+        api,
+        token,
+        repository,
+        number,
+        observed_at,
+        delivery_id,
+        false,
+    )
+    .await
+    .map_err(observation_error)
+}
+
+/// Like [`confirm_merge`], but an open, non-draft GitHub pull request whose head is in this
+/// repository is confirmed as a pull request head event, with its change read live.
+pub async fn confirm_proposal(
+    api: ForgeApi<'_>,
+    token: &str,
+    repository: &ConnectedRepository,
+    number: i64,
+    observed_at: i64,
+    delivery_id: Option<String>,
+) -> Result<Option<ConfirmedMerge>> {
+    if number < 1 {
+        return Err(Error::Invalid("proposal number must be positive".into()));
+    }
+    verify_repository(api, token, repository)
         .await
-        .map_err(observation_error)
+        .map_err(observation_error)?;
+    confirm_in_repository(
+        api,
+        token,
+        repository,
+        number,
+        observed_at,
+        delivery_id,
+        true,
+    )
+    .await
+    .map_err(observation_error)
 }
 
 enum ObservationError {
@@ -196,6 +292,7 @@ async fn confirm_in_repository(
     number: i64,
     observed_at: i64,
     delivery_id: Option<String>,
+    heads: bool,
 ) -> std::result::Result<Option<ConfirmedMerge>, ObservationError> {
     if number < 1 {
         return Err(Error::Invalid("proposal number must be positive".into()).into());
@@ -227,15 +324,21 @@ async fn confirm_in_repository(
         .into());
     }
     if !merged {
-        return Ok(None);
+        if !heads || provider != "github" {
+            return Ok(None);
+        }
+        return open_head(
+            api,
+            token,
+            repository,
+            &pull,
+            number,
+            observed_at,
+            delivery_id,
+        )
+        .await;
     }
-    let target = pull
-        .pointer("/base/ref")
-        .or_else(|| pull.get("target_branch"))
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| Error::Invalid("merged proposal has no target".into()))?
-        .to_owned();
+    let target = target_of(&pull)?;
     let mut accepted = pull
         .get("merge_commit_sha")
         .and_then(|v| v.as_str())
@@ -260,17 +363,6 @@ async fn confirm_in_repository(
     }
     let accepted_commit = accepted.filter(|v| is_oid(v)).ok_or_else(|| Error::Conflict(
         "merged proposal has no verifiable accepted commit (fast-forward target may have advanced)".into()))?;
-    let labels = pull
-        .get("labels")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|v| {
-            v.as_str()
-                .or_else(|| v.get("name").and_then(|n| n.as_str()))
-        })
-        .map(str::to_owned)
-        .collect();
     let event = ConfirmedMerge {
         provider: provider.into(),
         host: repository.host.clone(),
@@ -279,9 +371,87 @@ async fn confirm_in_repository(
         proposal_number: number as u64,
         accepted_commit,
         target,
-        labels,
+        labels: labels_of(&pull),
         observed_at,
         delivery_id,
+        kind: TriggerEvent::Merge,
+        changes: None,
+    };
+    validate_event(&event)?;
+    Ok(Some(event))
+}
+
+fn target_of(pull: &serde_json::Value) -> std::result::Result<String, ObservationError> {
+    Ok(pull
+        .pointer("/base/ref")
+        .or_else(|| pull.get("target_branch"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::Invalid("proposal has no target".into()))?
+        .to_owned())
+}
+
+fn labels_of(pull: &serde_json::Value) -> BTreeSet<String> {
+    pull.get("labels")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            v.as_str()
+                .or_else(|| v.get("name").and_then(|n| n.as_str()))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A GitHub pull request that is open, not a draft, and whose head is in this repository (a
+/// fork's head is never run). The file list is read after the head, so a push in between can
+/// pair this head with the next head's files; that next head is observed on its own.
+async fn open_head(
+    api: ForgeApi<'_>,
+    token: &str,
+    repository: &ConnectedRepository,
+    pull: &serde_json::Value,
+    number: i64,
+    observed_at: i64,
+    delivery_id: Option<String>,
+) -> std::result::Result<Option<ConfirmedMerge>, ObservationError> {
+    if pull.get("state").and_then(|v| v.as_str()) != Some("open")
+        || pull.get("draft").and_then(|v| v.as_bool()) != Some(false)
+        || pull.pointer("/head/repo/id").and_then(|v| v.as_i64()) != Some(repository.repository_id)
+    {
+        return Ok(None);
+    }
+    let head = pull
+        .pointer("/head/sha")
+        .and_then(|v| v.as_str())
+        .filter(|v| is_oid(v))
+        .ok_or_else(|| Error::Invalid("open pull request has no verifiable head commit".into()))?
+        .to_owned();
+    let count = |key: &str| pull.get(key).and_then(|v| v.as_u64());
+    let (paths, truncated) = api.pull_files(token, repository, number).await?;
+    let complete = !truncated
+        && paths.len() <= MAX_CHANGED_PATHS
+        && paths.iter().map(String::len).sum::<usize>() <= MAX_CHANGED_PATH_BYTES;
+    let event = ConfirmedMerge {
+        provider: "github".into(),
+        host: repository.host.clone(),
+        repository: repository.full_name.clone(),
+        provider_repository_id: repository.repository_id,
+        proposal_number: number as u64,
+        accepted_commit: head,
+        target: target_of(pull)?,
+        labels: labels_of(pull),
+        observed_at,
+        delivery_id,
+        kind: TriggerEvent::PullRequest,
+        changes: Some(ObservedChanges {
+            files: count("changed_files"),
+            lines: count("additions")
+                .zip(count("deletions"))
+                .map(|(a, d)| a.saturating_add(d)),
+            paths: complete.then_some(paths),
+        }),
     };
     validate_event(&event)?;
     Ok(Some(event))
@@ -341,6 +511,10 @@ impl PollReport {
     }
 }
 
+/// Why a re-read proposal produced no event.
+pub const NOT_OBSERVED: &str =
+    "proposal is neither confirmed merged nor an open, non-draft head from this repository";
+
 /// Listings are discovery hints only. A hint may suppress a read only when its exact
 /// semantic event was already confirmed. Unconfirmed proposals are always re-read;
 /// local observation timestamps never exclude changed/reopened proposals.
@@ -365,22 +539,40 @@ pub async fn poll_merges(
         blocked: None,
         coverage: "newest 100 updated proposals; known confirmed events are skipped, unconfirmed candidates are re-read; labels are observation-time",
     };
-    if !journal.has_legacy_rules(&repository.full_name)? {
+    let (merges, pulls) = journal.legacy_events(&repository.full_name)?;
+    if !merges && !pulls {
         report.coverage = "no legacy-eligible rules; use operating-policy observe for owned rules";
         return Ok(report);
+    }
+    if pulls {
+        report.coverage = if merges {
+            "newest 100 updated proposals and the open pull requests the forge lists; known confirmed events and observed heads are skipped, others are re-read; labels are observation-time"
+        } else {
+            "the open pull requests the forge lists; observed heads are skipped, others are re-read with their file lists; labels are observation-time"
+        };
     }
     if let Err(error) = verify_repository(api, token, repository).await {
         report.block(error);
         return Ok(report);
     }
-    let listing = match api.recent_closed_pulls(token, repository).await {
-        Ok(value) => value,
-        Err(error) => {
-            report.block(error.into());
-            return Ok(report);
+    let listing = if merges {
+        match api.recent_closed_pulls(token, repository).await {
+            Ok(value) => value,
+            Err(error) => {
+                report.block(error.into());
+                return Ok(report);
+            }
+        }
+    } else {
+        super::github::Paged {
+            items: vec![],
+            etag: None,
+            pages: 0,
+            unread: 0,
         }
     };
     report.unread_pages = Some(listing.unread);
+    let mut unread = listing.unread;
     for (listing_index, candidate) in listing.items.iter().take(100).enumerate() {
         let Some(number) = candidate
             .get("number")
@@ -417,12 +609,12 @@ pub async fn poll_merges(
                 }
             });
         if let Some(commit) = commit
-            && journal.confirmed_hint(provider, repository, number, commit)?
+            && journal.confirmed_hint(provider, repository, number, commit, TriggerEvent::Merge)?
         {
             report.skipped_confirmed += 1;
             continue;
         }
-        match confirm_in_repository(api,token,repository,number,observed_at,None).await {
+        match confirm_in_repository(api,token,repository,number,observed_at,None,false).await {
             Ok(Some(event))=>{
                 let accepted=journal.accept(&event)?.into_iter().map(|d|serde_json::json!({"dispatch_id":d.dispatch_id,"run_id":d.run_id})).collect::<Vec<_>>();
                 report.observations.push(serde_json::json!({"proposal":number,"event":event,"accepted":accepted}));
@@ -435,6 +627,77 @@ pub async fn poll_merges(
             Err(error)=>{report.block(error);return Ok(report);}
         }
     }
+    if pulls && provider == "github" {
+        let listing = match api.open_pulls(token, repository, None).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                report.block(ObservationError::Forge(super::github::GhError::Failed(
+                    "unexpected 304 from pulls".into(),
+                )));
+                return Ok(report);
+            }
+            Err(error) => {
+                report.block(error.into());
+                return Ok(report);
+            }
+        };
+        unread += listing.unread;
+        report.unread_pages = Some(unread);
+        for candidate in &listing.items {
+            let Some(number) = candidate
+                .get("number")
+                .and_then(|v| v.as_i64())
+                .filter(|v| *v > 0)
+            else {
+                let error = Error::Invalid("forge list has no proposal number".into());
+                report
+                    .observations
+                    .push(serde_json::json!({"accepted":[],"blocked":error.to_string()}));
+                report.block(error.into());
+                continue;
+            };
+            if let Some(head) = candidate
+                .pointer("/head/sha")
+                .and_then(|v| v.as_str())
+                .filter(|v| is_oid(v))
+                && journal.confirmed_hint(
+                    provider,
+                    repository,
+                    number,
+                    head,
+                    TriggerEvent::PullRequest,
+                )?
+            {
+                report.skipped_confirmed += 1;
+                continue;
+            }
+            match confirm_in_repository(api, token, repository, number, observed_at, None, true)
+                .await
+            {
+                Ok(Some(event)) => {
+                    let accepted = journal
+                        .accept(&event)?
+                        .into_iter()
+                        .map(|d| serde_json::json!({"dispatch_id":d.dispatch_id,"run_id":d.run_id}))
+                        .collect::<Vec<_>>();
+                    report.observations.push(
+                        serde_json::json!({"proposal":number,"event":event,"accepted":accepted}),
+                    );
+                }
+                Ok(None) => report.observations.push(
+                    serde_json::json!({"proposal":number,"accepted":[],"reason":NOT_OBSERVED}),
+                ),
+                Err(ObservationError::Invalid(error)) => {
+                    report.observations.push(serde_json::json!({"proposal":number,"accepted":[],"blocked":error.to_string()}));
+                    report.block(error.into());
+                }
+                Err(error) => {
+                    report.block(error);
+                    return Ok(report);
+                }
+            }
+        }
+    }
     if report.blocked.is_none() {
         journal.record_poll(
             &format!(
@@ -442,7 +705,7 @@ pub async fn poll_merges(
                 repository.host, repository.full_name, repository.repository_id
             ),
             observed_at,
-            listing.unread,
+            unread,
         )?;
         report.checkpoint_advanced = true;
     }
@@ -476,10 +739,73 @@ pub fn preview(rule: &PipelineRule, event: &ConfirmedMerge) -> MatchPreview {
             missing.join(", ")
         ));
     }
+    let mut unknown = Vec::new();
+    match (rule.trigger.event, event.kind) {
+        (TriggerEvent::Merge, TriggerEvent::PullRequest) => {
+            reasons.push("rule fires on merges; this is a pull request head".into())
+        }
+        (TriggerEvent::PullRequest, TriggerEvent::Merge) => {
+            reasons.push("rule fires on pull request heads; this is a merge".into())
+        }
+        (TriggerEvent::Merge, TriggerEvent::Merge) => {}
+        (TriggerEvent::PullRequest, TriggerEvent::PullRequest) => {
+            change_predicates(&rule.trigger, event, &mut reasons, &mut unknown);
+            if !unknown.is_empty() && !rule.trigger.run_when_unknown {
+                reasons.push(format!("could not evaluate {}", unknown.join(", ")));
+            }
+        }
+    }
     MatchPreview {
         matches: reasons.is_empty(),
         reasons,
+        unknown,
     }
+}
+
+fn change_predicates(
+    trigger: &MergeTrigger,
+    event: &ConfirmedMerge,
+    reasons: &mut Vec<String>,
+    unknown: &mut Vec<String>,
+) {
+    let changes = event.changes.clone().unwrap_or_default();
+    for (minimum, observed, what) in [
+        (trigger.min_changed_files, changes.files, "changed files"),
+        (trigger.min_changed_lines, changes.lines, "changed lines"),
+    ] {
+        match (minimum, observed) {
+            (None, _) => {}
+            (Some(_), None) => unknown.push(format!("the number of {what}")),
+            (Some(minimum), Some(observed)) if observed < minimum => {
+                reasons.push(format!("{observed} {what}, fewer than {minimum}"))
+            }
+            (Some(_), Some(_)) => {}
+        }
+    }
+    if trigger.paths_any.is_empty() {
+        return;
+    }
+    let Some(paths) = &changes.paths else {
+        unknown.push("paths_any: the changed file list is incomplete or too large".into());
+        return;
+    };
+    // Validated rules parse; an unparseable glob matches nothing.
+    let globs: Vec<_> = trigger
+        .paths_any
+        .iter()
+        .filter_map(|glob| crate::workspace::PathGlob::parse(glob))
+        .collect();
+    let work = std::cell::Cell::new(0);
+    for path in paths {
+        if globs.iter().any(|glob| glob.matches(path, &work)) {
+            return;
+        }
+        if work.get() > MAX_PATH_MATCH_WORK {
+            unknown.push("paths_any: matching exceeded its work limit".into());
+            return;
+        }
+    }
+    reasons.push("no changed path matches paths_any".into());
 }
 
 /// SQLite outbox. Claims are generation-fenced and intentionally have no automatic lease
@@ -661,24 +987,37 @@ impl RuleJournal {
         repository: &ConnectedRepository,
         number: i64,
         commit: &str,
+        kind: TriggerEvent,
     ) -> Result<bool> {
         self.assert_repository(provider, &repository.host, repository.repository_id)?;
-        let key = [
+        let key = proposal_key(
             provider,
-            repository.host.as_str(),
-            &repository.repository_id.to_string(),
-            &number.to_string(),
+            &repository.host,
+            repository.repository_id,
+            number as u64,
             commit,
-        ]
-        .join("\0");
+            kind,
+        );
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pipeline_observations o WHERE o.event_key=?1 AND NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=o.rule_id))",
             [key],
             |r| r.get(0),
         )?)
     }
-    pub fn has_legacy_rules(&self, repository: &str) -> Result<bool> {
-        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM pipeline_rules r WHERE repository=?1 AND NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=r.rule_id))",[repository],|r|r.get(0))?)
+    /// Whether rules that are not policy-owned fire on merges and on pull request heads.
+    fn legacy_events(&self, repository: &str) -> Result<(bool, bool)> {
+        let mut stmt = self.db.prepare("SELECT body FROM pipeline_rules r WHERE repository=?1 AND NOT EXISTS(SELECT 1 FROM operating_state s WHERE s.rule_id=r.rule_id)")?;
+        let bodies = stmt
+            .query_map([repository], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (mut merges, mut pulls) = (false, false);
+        for body in bodies {
+            match serde_json::from_str::<PipelineRule>(&body)?.trigger.event {
+                TriggerEvent::Merge => merges = true,
+                TriggerEvent::PullRequest => pulls = true,
+            }
+        }
+        Ok((merges, pulls))
     }
     pub fn polls(&self) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.db.prepare(
@@ -965,14 +1304,36 @@ impl RuleJournal {
 }
 
 fn event_key(event: &ConfirmedMerge) -> String {
-    [
-        event.provider.as_str(),
-        event.host.as_str(),
-        &event.provider_repository_id.to_string(),
-        &event.proposal_number.to_string(),
-        event.accepted_commit.as_str(),
+    proposal_key(
+        &event.provider,
+        &event.host,
+        event.provider_repository_id,
+        event.proposal_number,
+        &event.accepted_commit,
+        event.kind,
+    )
+}
+/// A pull request head is keyed apart from a merge of the same commit; merge keys are unchanged.
+fn proposal_key(
+    provider: &str,
+    host: &str,
+    repository_id: i64,
+    number: u64,
+    commit: &str,
+    kind: TriggerEvent,
+) -> String {
+    let mut key = [
+        provider,
+        host,
+        &repository_id.to_string(),
+        &number.to_string(),
+        commit,
     ]
-    .join("\0")
+    .join("\0");
+    if kind == TriggerEvent::PullRequest {
+        key.push_str("\0pull_request");
+    }
+    key
 }
 fn semantic_key(event: &ConfirmedMerge, rule_id: &str) -> String {
     format!("{}\0{rule_id}", event_key(event))
@@ -1035,7 +1396,32 @@ fn validate_rule(r: &PipelineRule) -> Result<()> {
             "invalid local pipeline rule or unsupported authority ceiling".into(),
         ));
     }
-    Ok(())
+    validate_trigger(&r.trigger, &r.provider)
+}
+fn validate_trigger(t: &MergeTrigger, provider: &str) -> Result<()> {
+    let change_predicates = !t.paths_any.is_empty()
+        || t.min_changed_files.is_some()
+        || t.min_changed_lines.is_some()
+        || t.run_when_unknown;
+    match t.event {
+        TriggerEvent::Merge if change_predicates => Err(Error::Invalid(
+            "paths_any, min_changed_files, min_changed_lines and run_when_unknown need event pull_request".into(),
+        )),
+        TriggerEvent::PullRequest if provider != "github" => Err(Error::Invalid(
+            "the pull_request trigger is GitHub only".into(),
+        )),
+        _ if t.paths_any.len() > MAX_PATH_GLOBS
+            || t.paths_any.iter().any(|glob| {
+                glob.len() > MAX_PATH_GLOB_BYTES
+                    || crate::workspace::PathGlob::parse(glob).is_none()
+            }) =>
+        {
+            Err(Error::Invalid(format!(
+                "paths_any takes at most {MAX_PATH_GLOBS} globs of at most {MAX_PATH_GLOB_BYTES} bytes, each a whole-path glob that does not start or end with / (use dir/** for a directory)"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 fn validate_event(e: &ConfirmedMerge) -> Result<()> {
     if !matches!(e.provider.as_str(), "github" | "gitlab")
@@ -1048,6 +1434,15 @@ fn validate_event(e: &ConfirmedMerge) -> Result<()> {
         || e.labels.len() > 256
         || e.labels.iter().any(|v| v.len() > 256)
         || e.delivery_id.as_ref().is_some_and(|v| v.len() > 512)
+        || (e.kind == TriggerEvent::Merge && e.changes.is_some())
+        || e.changes
+            .as_ref()
+            .and_then(|c| c.paths.as_ref())
+            .is_some_and(|paths| {
+                paths.len() > MAX_CHANGED_PATHS
+                    || paths.iter().map(String::len).sum::<usize>() > MAX_CHANGED_PATH_BYTES
+                    || paths.iter().any(|p| p.is_empty() || p.contains('\0'))
+            })
     {
         return Err(Error::Invalid("invalid confirmed merge".into()));
     }

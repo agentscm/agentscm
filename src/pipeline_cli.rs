@@ -313,10 +313,10 @@ async fn observe_one(
     delivery: Option<String>,
 ) -> Result<Value> {
     let event =
-        pipeline_rules::confirm_merge(api, token, &config.repository(), number, now(), delivery)
+        pipeline_rules::confirm_proposal(api, token, &config.repository(), number, now(), delivery)
             .await?;
     let Some(event) = event else {
-        return Ok(json!({"accepted":[],"reason":"proposal not confirmed merged"}));
+        return Ok(json!({"accepted":[],"reason":pipeline_rules::NOT_OBSERVED}));
     };
     let previews: Vec<_> = journal
         .rules()?

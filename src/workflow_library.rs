@@ -1768,6 +1768,7 @@ impl Library {
             Some(Trigger::ConfirmedMerge { target, labels_all }) => Some(MergeTrigger {
                 target: target.clone(),
                 labels_all: labels_all.clone(),
+                ..MergeTrigger::default()
             }),
             None => {
                 unmet.push("confirmed_merge trigger is required for pipeline installation".into());

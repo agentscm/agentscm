@@ -4,7 +4,7 @@ title: "Operator-local repository pipeline rules"
 
 # Operator-local repository pipeline rules
 
-This experimental Unix CLI installs repository merge rules and feeds the existing
+This experimental Unix CLI installs repository merge and pull request rules and feeds the existing
 skill-workflow journal. Git and GitHub/GitLab retain source, review and merge
 authority. It does not install native landing requirements, publish artifacts,
 create PRs/MRs or merge anything. The shared Hub does not yet manage these rules.
@@ -124,7 +124,8 @@ Observation re-reads both the repository identity and numbered PR/MR through the
 configured forge. Every proposal response must independently identify the target
 repository: GitHub base-repository ID/name or GitLab target-project ID. Missing or
 changed target identity blocks acceptance, including a name reused mid-scan. Caller-provided hints are never accepted as confirmed facts.
-An open or unmerged proposal starts nothing. GitHub requires its confirmed
+An open or unmerged proposal starts no merge rule; a [pull request rule](#pull-request-heads)
+can start on an open head. GitHub requires its confirmed
 `merge_commit_sha`. GitLab uses the merge or squash commit; a fast-forward without
 either is verifiable only while the live target tip still equals the confirmed
 MR head. A later target tip leaves that observation blocked.
@@ -172,6 +173,62 @@ are `accepted_commit`, `proposal_number`, `target`, `labels` (a JSON string arra
 `repository`, `provider`, `host` and `observed_at`. Productive declarations can
 reference one with `{"kind":"event","field":"accepted_commit"}`. They are
 immutable data, not conditions, commands or permissions.
+
+## Pull request heads
+
+A rule with `"event": "pull_request"` fires on an open, non-draft GitHub pull
+request into `target` whose head is in this repository, once per head commit. A
+fork's head never starts a rule. GitLab rules cannot use this event. Optional
+predicates narrow it, and every one must hold:
+
+```json
+"trigger": {
+  "target": "main",
+  "event": "pull_request",
+  "labels_all": ["security"],
+  "paths_any": ["Cargo.lock", "**/Cargo.toml", "src/auth/**"],
+  "min_changed_files": 1,
+  "min_changed_lines": 10,
+  "run_when_unknown": false
+}
+```
+
+- `paths_any`: at least one changed path, a rename's old path included, matches
+  one of up to 32 globs. A glob matches the whole repository path: `*` and `?`
+  stay within one directory and `**` spans directories, so `*.md` matches only
+  root-level Markdown and `**/*.md` matches every Markdown file. Write `dir/**`
+  for a directory; a glob that starts or ends with `/` is refused.
+- `min_changed_files` and `min_changed_lines` (additions plus deletions) are
+  minimums from the forge's pull request counts.
+- `labels_all` works as for merges, at observation time.
+
+These predicates are refused on a merge rule.
+
+Unknown stays unknown. When GitHub's file list is incomplete (more pages than
+the client reads), its paths exceed 3000 entries or 256 KiB, a count is missing,
+or matching exceeds its work limit, preview reports `could not evaluate ...`,
+lists the predicate under `unknown` and the rule does not run. With
+`run_when_unknown: true` the rule runs anyway when every predicate it could
+evaluate holds, and preview still lists what it could not evaluate.
+
+`observe --proposal N` confirms an open head as well as a merge, and `poll`
+lists open pull requests when any rule that is not policy-owned uses this event.
+Each head is re-read with its file list; a head already observed is skipped from
+the listing. The file list is read just after the head, so a push in between
+can pair a head with the next head's files; the next head is observed on its
+own. A head event is keyed apart from a merge of the same commit.
+
+Preview takes the same synthetic JSON with `"kind": "pull_request"` and an
+optional `changes` object (`files`, `lines`, `paths`; a missing value is
+unknown). For a head, `accepted_commit` is the head commit. The dispatch keeps
+the event, so status shows which rule and which head started each run.
+
+Delivery uses the same executor, profile and limits as a merge rule, and the
+head's selected skill resource bytes must still equal the pinned ones, so a
+pull request cannot rewrite its own rule's instructions. The runner never
+fetches: the head commit must already be in the operator's checkout (for
+example after `git fetch origin`), or delivery is blocked. Rules owned by an
+operating policy receive merge events only.
 
 ## Inspect and recover
 

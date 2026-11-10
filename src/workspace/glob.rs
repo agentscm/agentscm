@@ -154,6 +154,35 @@ impl Rule {
     }
 }
 
+/// A glob over whole repository paths, for pipeline rule path predicates: `*` and `?` stay
+/// within one component and `**` spans components, as in gitignore, but a pattern always
+/// matches the full path (`*.md` is root-level files only; `**/*.md` is every Markdown file).
+#[derive(Debug)]
+pub(crate) struct PathGlob(Rule);
+
+impl PathGlob {
+    /// `None` for a pattern that is empty, padded with spaces, starts or ends with `/`, or that
+    /// this matcher refuses or can never match.
+    pub(crate) fn parse(pattern: &str) -> Option<Self> {
+        if pattern.is_empty()
+            || pattern.trim() != pattern
+            || pattern.starts_with('/')
+            || pattern.ends_with('/')
+        {
+            return None;
+        }
+        // The leading `/` anchors the pattern to the full path; `!` and `#` stay literal after it.
+        let rule = parse_line(&format!("/{pattern}"), false).ok()??;
+        Some(Self(rule))
+    }
+
+    /// Whether `path` matches, charging `work` as [`Rule::matches_counted`] does.
+    pub(crate) fn matches(&self, path: &str, work: &Cell<u64>) -> bool {
+        let path = path.as_bytes();
+        self.0.matches_counted(path, basename(path), false, work)
+    }
+}
+
 /// The last `/`-separated component of `path`.
 pub(super) fn basename(path: &[u8]) -> &[u8] {
     path.rsplit(|&byte| byte == b'/').next().unwrap_or(path)
@@ -508,6 +537,25 @@ mod tests {
         assert!(parse_line("foo\\", false).unwrap().is_none());
         assert_eq!(rule("a  ").original, "a");
         assert_eq!(rule("a\\ ").original, "a\\ ");
+    }
+
+    #[test]
+    fn path_globs_match_the_whole_path() {
+        let work = Cell::new(0);
+        let glob = |p: &str| PathGlob::parse(p).unwrap();
+        assert!(glob("*.md").matches("README.md", &work));
+        assert!(!glob("*.md").matches("docs/a.md", &work));
+        assert!(glob("**/*.md").matches("docs/a.md", &work));
+        assert!(glob("**/*.md").matches("a.md", &work));
+        assert!(glob("src/**").matches("src/hub/a.rs", &work));
+        assert!(!glob("src/**").matches("srcs/a.rs", &work));
+        assert!(glob("Cargo.lock").matches("Cargo.lock", &work));
+        assert!(!glob("Cargo.lock").matches("tools/Cargo.lock", &work));
+        assert!(glob("!x").matches("!x", &work));
+        for refused in ["", " a", "a ", "/a", "a/", "a\0b"] {
+            assert!(PathGlob::parse(refused).is_none(), "{refused:?}");
+        }
+        assert!(work.get() > 0);
     }
 
     #[test]
