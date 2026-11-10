@@ -136,6 +136,8 @@ impl SpoolUsage {
     }
 
     /// Inside the metadata headroom, where new facts are refused and capture records only gaps.
+    /// shortcut: a lower bound, since appends also reserve room for each open action start; count
+    /// those too if a spool with many open actions is seen refusing facts while not "full".
     pub fn is_full(&self) -> bool {
         let records = BASE_METADATA_RESERVE_RECORDS.min(self.limits.max_records / 4);
         let bytes = BASE_METADATA_RESERVE_BYTES.min(self.limits.max_total_bytes / 4);
@@ -2353,7 +2355,8 @@ impl LocalSpool {
     }
 
     /// Lists sanitized unassociated hooks for local diagnosis only. There is deliberately no
-    /// acknowledgement or reassociation API in schema v1.
+    /// acknowledgement or reassociation API in schema v1; `upkeep` expires them after
+    /// `DEFERRED_KEEP_SECONDS` (unbound) or `DEFERRED_GAP_SECONDS` (bound to a target).
     pub fn deferred(&self, limit: usize) -> Result<Vec<DeferredHookV1>> {
         if limit == 0 || limit > MAX_PENDING_PAGE {
             return Err(CaptureError::Invalid(format!(
@@ -2413,20 +2416,23 @@ impl LocalSpool {
     }
 
     /// Run at session start and turn end: past 80% of a limit, deletes deferred hooks nothing will
-    /// read (`prune_deferred`) and compacts up to 500 envelopes the Hub has accepted
+    /// read (`prune_deferred`) and compacts one page of envelopes the Hub has accepted
     /// (`compact_acknowledged`, which never touches anything unaccepted). Answers whether the spool
-    /// is still full afterwards.
+    /// is still full afterwards. A failed prune does not stop compaction; its error is returned
+    /// after compaction has run.
     pub fn upkeep(&self, now: i64) -> Result<bool> {
         if !self.usage()?.needs_upkeep() {
             return Ok(false);
         }
-        self.prune_deferred(now)?;
-        // At most 500 envelopes a pass, so a hook stays inside its time; the next pass takes more.
-        for _ in 0..5 {
-            if self.compact_acknowledged(MAX_COMPACTION_PAGE)?.envelopes < MAX_COMPACTION_PAGE {
-                break;
-            }
+        let pruned = self.prune_deferred(now);
+        // One page a pass, so a hook stays inside its time; the next hook takes more. Nothing
+        // accepted means nothing to compact, so the full scan is skipped.
+        let accepted = fs::read_dir(self.root.join("acknowledged"))
+            .is_ok_and(|mut entries| entries.next().is_some());
+        if accepted {
+            self.compact_acknowledged(MAX_COMPACTION_PAGE)?;
         }
+        pruned?;
         Ok(self.usage()?.is_full())
     }
 
@@ -3180,7 +3186,8 @@ impl LocalSpool {
         Ok(AppendOutcome::Stored)
     }
 
-    /// Explicitly compacts acknowledged envelopes. Ordinary event batches retain an exact
+    /// Compacts acknowledged envelopes, when asked and from `upkeep` at session start and turn end
+    /// once the spool passes 80% of a limit. Ordinary event batches retain an exact
     /// idempotency digest; replayable events and completed action pairs retain their full receipts
     /// so following state transitions and action continuity remain checkable. Pending envelopes,
     /// incomplete action starts, artifacts and deferred diagnostics are never removed.

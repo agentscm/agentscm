@@ -82,16 +82,21 @@ facts, which are never uploaded. The Hub copies of shared bodies expire on their
 [retention and deletion](#retention-and-deletion)).
 
 **Upkeep.** A spool holds 4,096 records and 64 MiB by default. At each session start and turn end,
-a hook whose spool is past 80% of its record or byte limit (or already full) tidies it before
-capturing. It deletes sanitized deferred facts that nothing will read again: one bound to a target
-is kept for 7 days, until its session has emitted the gap it stands for, and of the others (facts
-from before a session had Work) only the newest 256 from the last day are kept for local
-diagnosis. It then compacts up to 500 acknowledged envelopes, exactly as `change-capture compact`
-does. If the spool is still full afterwards (inside the headroom kept for gaps, where new facts are
-refused), the session-start context says so, because capture then records only gaps, and names the
-commands that help: `change-capture inspect --spool <spool>` to see what it holds, and
-`unconfigure` then `forget` to start a new store (the old one stays on disk). `change-capture
-status` reports the same as `store_full` and `store_full_fix`.
+a hook whose spool is past 80% of its record or byte limit (or already full) tidies it after
+delivering, so what the Hub accepted in that same hook is tidied too. It deletes sanitized deferred
+facts that nothing will read again: one bound to a target is kept for 7 days, until its session has
+emitted the gap it stands for, and of the others (facts from before a session had Work) only the
+newest 256 from the last day are kept for local diagnosis. It then compacts one page of up to 500
+acknowledged envelopes, exactly as `change-capture compact` does, and skips that scan when nothing
+is acknowledged. Upkeep runs within the hook's delivery time; a pass cut short continues at the
+next hook. If the spool is still full afterwards (inside the headroom kept for gaps, where new
+facts are refused), the session-start context says so, because capture then records only gaps, and
+names the commands that help: `change-capture inspect --spool <spool>` to see what it holds, and
+`unconfigure` then `forget` to start a new store. The old store stays on disk, but records still
+waiting in it are no longer delivered. `change-capture status` reports the same as `store_full`
+and `store_full_fix`. Each session's own sequence and association records are not expired yet, so
+a checkout that runs many thousands of sessions can still fill its store; that is when the
+commands above are needed.
 
 The compaction index is the durable commit point. Crash recovery completes its exact envelope,
 acknowledgement, native-observation, active-order, and delivery-cursor cleanup. A cursor naming
@@ -144,13 +149,16 @@ default that applies to every repository without its own setting. The routes are
   - capture is turned off in this checkout, or was set up for another repository or Hub, while the
     repository shares: `change-capture forget --root <checkout>` (after `unconfigure` if it is still
     on), and the next session follows the repository;
-  - the person keeps their own sessions out: `change-capture opt-in`;
-  - the session started before sharing was on: the next session shares;
+  - the person keeps their own sessions out: `change-capture opt-in`, and also the `set-mode` fix
+    above when this checkout's own setting caps it;
+  - the session keeps a lower mode it started under (it started before sharing was on, or its
+    saved mode could not be read): the next session shares;
   - the repository does not share: a repository admin or a Hub admin turns it on in the Hub's
     Settings;
-  - the Hub's answer did not arrive in time: whether the repository shares is unknown, and the
-    context says so instead of "off". A checkout without a binding records nothing in that session
-    and asks again at the next one.
+  - the Hub did not answer (out of time, unreachable or refused): whether the repository shares
+    is unknown, and the context says so instead of "off". A checkout without a binding records
+    nothing in that session and asks again at the next one;
+  - an older Hub without the sharing setting: the context says only that sharing is off.
 - **Off means off.** The client asks the Hub again on every hook call, and the Hub itself
   refuses uploads (403 `sharing_off`) and lists nothing as missing while the setting is off or the
   person opted out, so bodies not yet uploaded stay declared `local`; they are not uploaded later
@@ -192,11 +200,11 @@ agentscm change-capture set-mode --root /absolute/repository --mode metadata-onl
 `set-mode` changes only the stored mode. It requires an enabled capture binding for the checkout
 (run `configure` first), leaves hooks and the spool untouched, and never deletes local or Hub data.
 `change-capture status` reports the stored `capture_mode` beside what the Hub says:
-`repository_shares` (null when the Hub did not answer), `effective_mode` (the mode a session
-starting now captures in; `off` when no hook captures for this binding, null when the Hub did not
-answer) and `session_start`, the sentence that session would say. When `repository_shares` is true
-and `capture_mode` is not `shared-conversation`, this checkout's local setting is what keeps
-sharing off. The macOS menu-bar companion and the
+`repository_shares` (null when the Hub did not answer or has no sharing setting),
+`effective_mode` (the mode a session starting now captures in; `off` when no hook captures for
+this binding, null when the Hub did not answer) and `session_start`, the sentence that session
+would say. When `repository_shares` is true, you have not opted out, and `capture_mode` is not
+`shared-conversation`, this checkout's local setting is what keeps sharing off. The macOS menu-bar companion and the
 Hub page opened from this computer (**Settings → Conversation sharing**) have the same switch per
 checkout, **Share agent conversations with Hub**; it is unchecked by default and does not need
 `configure` first (see below). Turning it off only switches the mode. The capture config is written as version 6 only while
