@@ -2064,6 +2064,7 @@ fn value_aged_finished_followups_keep_actionable_and_period_cohorts_separate(db:
             default_branch: Some("main".into()),
             observed_at: old,
             reported_by: None,
+            local_skills: None,
         })
         .unwrap();
     let policy = value_metrics::identity(&["null"]);

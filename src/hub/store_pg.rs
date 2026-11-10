@@ -12272,7 +12272,8 @@ impl Store for PgStore {
         self.run(true, |client| {
             Ok(client
                 .query_opt(
-                    "SELECT repository, source, lock_json, default_branch, observed_at, reported_by
+                    "SELECT repository, source, lock_json, default_branch, observed_at, reported_by,
+                            local_skills
                      FROM hub_skill_adoptions WHERE repository = $1",
                     &[&repo],
                 )?
@@ -12283,6 +12284,7 @@ impl Store for PgStore {
                     default_branch: row.get(3),
                     observed_at: row.get(4),
                     reported_by: row.get(5),
+                    local_skills: row.get(6),
                 }))
         })
     }
@@ -12291,11 +12293,13 @@ impl Store for PgStore {
         self.run(false, |client| {
             client.execute(
                 "INSERT INTO hub_skill_adoptions
-                     (repository, source, lock_json, default_branch, observed_at, reported_by)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                     (repository, source, lock_json, default_branch, observed_at, reported_by,
+                      local_skills)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (repository) DO UPDATE SET source = excluded.source,
                      lock_json = excluded.lock_json, default_branch = excluded.default_branch,
-                     observed_at = excluded.observed_at, reported_by = excluded.reported_by
+                     observed_at = excluded.observed_at, reported_by = excluded.reported_by,
+                     local_skills = excluded.local_skills
                  WHERE excluded.source = 'default_branch'
                     OR hub_skill_adoptions.source <> 'default_branch'",
                 &[
@@ -12305,6 +12309,7 @@ impl Store for PgStore {
                     &a.default_branch,
                     &a.observed_at,
                     &a.reported_by,
+                    &a.local_skills,
                 ],
             )?;
             Ok(())
