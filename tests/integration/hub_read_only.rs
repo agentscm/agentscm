@@ -62,6 +62,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/operational".into(), "".into(), Allowed);
+    // A preflight reads: the exact-subject check names overlaps, changes no Work and records no event.
+    row(&post, "/v1/hub/standup/preflight".into(), r#"{"request_key":"k","title":"Synthetic","session":"s","scope":["a.rs"]}"#.into(), Allowed);
     row(&get, "/v1/hub/standup/digest".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/digest/settings".into(), "".into(), Allowed);
     row(&put, "/v1/hub/standup/digest/settings".into(), r#"{"enabled":true}"#.into(), AgentOnly);
