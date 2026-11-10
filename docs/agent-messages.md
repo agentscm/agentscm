@@ -45,7 +45,7 @@ From these facts the Hub derives the tier it can use:
 | --- | --- | --- |
 | `wake` | Claude Code with the AgentSCM plugin, while its background hook waits (seen within the last 90 seconds). | Within seconds, idle or busy: the hook wakes the session with the notice. |
 | `hook` | Claude Code and Codex (the reply to `UserPromptSubmit` and to a checked `PreToolUse`, as `hookSpecificOutput.additionalContext`). Cursor (a checked edit's `additional_context`). Copilot's PascalCase hooks. | At the next prompt or checked tool call that is not a subagent's. No tool call is needed. |
-| `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). Every client with MCP and no hooks: Codex without its hooks, Antigravity, Devin, Amp, opencode. | At the session's next AgentSCM tool call, as an extra text block in the result. Never sooner: no host but Claude Code puts a server's push in front of the model (see [Other clients](#other-clients)). |
+| `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). Every client with MCP and no hooks: Codex without its hooks, Antigravity, Devin, Amp, opencode. | At the session's next AgentSCM tool call, as an extra text block in the result. |
 | `unknown` | Nothing from the session itself since the Hub started, only its subagents' hook calls. | Nothing is offered until the session calls; use copy and paste from the Hub page meanwhile. |
 
 The tier follows the client, not the first call: a Claude Code session takes its messages in its hook replies even before its first prompt, never in an MCP result.
@@ -94,22 +94,10 @@ What this does not cover:
 
 ### Other clients
 
-MCP has server-to-client messages, but a host decides what reaches the model. Read in each host's own documentation or source on 2026-11-10, only Claude Code channels put a server's push in front of the model and can start a turn:
-
-| Host | What reaches the model | Wakes an idle session | What only the person sees |
-| --- | --- | --- | --- |
-| Claude Code | [Channels](https://code.claude.com/docs/en/channels-reference) (`notifications/claude/channel`): a research preview, opted in per session with `--channels` or `--dangerously-load-development-channels`, stdio servers only, off by default on Team and Enterprise | Yes, as documented; events sent while busy join the next turn | Elicitation dialogs; `list_changed` refreshes lists |
-| Codex CLI | Nothing: [its MCP client](https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/logging_client_handler.rs) logs `notifications/message` and `resources/updated` | No | Elicitation |
-| Codex `app-server` | Not MCP: a client that runs the thread can `turn/start` or `thread/inject_items` ([app-server](https://learn.chatgpt.com/docs/app-server)) | Only for that client, not a terminal session already running | Its own notifications |
-| Cursor | Nothing documented ([MCP](https://cursor.com/docs/context/mcp)) | No | Elicitation |
-| VS Code with Copilot | Nothing documented ([MCP](https://code.visualstudio.com/api/extension-guides/ai/mcp)) | No | Elicitation, sampling prompts, the output channel |
-| Copilot CLI | Nothing documented; `copilot --acp` is for sessions the ACP client creates ([ACP](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)) | No | Sampling and elicitation prompts |
-| Gemini CLI | Nothing: [its MCP client](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/tools/mcp-client.ts) only re-reads lists on `list_changed` | No | Progress |
-| Zed | Nothing ([MCP](https://zed.dev/docs/ai/mcp)) | No | None |
-
-The Claude Code background hook already wakes a Claude Code session (tier `wake`), so the Hub sends no MCP push: every other client gets a message at its next AgentSCM tool call, and nothing here or on the Hub page says it is instant. The 2026-07-28 MCP revision also moves sampling and elicitation inside a tool call, so neither can start one.
-
-A push would need the local proxy (`agentscm client mcp`) to hold a stream from the Hub for the whole host session: the `GET` event stream with its `Mcp-Session-Id` under the 2025-11-25 transport, or a `subscriptions/listen` response stream under 2026-07-28. It would write each notification to the host on standard output. The Hub's MCP endpoint is stateless today and serves neither stream.
+- **Claude Code channels** (`notifications/claude/channel`) are a research preview behind `--dangerously-load-development-channels` for servers off the allowlist, and are not used.
+- **Codex** documents `codex app-server` (`turn/steer`, `thread/inject_items`) for a session that the app server itself runs. It does not document attaching to a terminal session that is already running.
+- **Cursor** documents steering only for its cloud agents.
+- **Copilot CLI** documents `copilot --acp` for sessions that the ACP client creates.
 
 ### Manual path
 
