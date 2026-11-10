@@ -611,12 +611,33 @@ fn render(view: &RunView) -> String {
             GateState::Current => "current",
             GateState::NotReached => "not reached",
         };
-        let label = if g.assurance == Some(Assurance::SelfReported) {
-            " [self-reported]"
-        } else {
-            ""
+        let label = match g.assurance {
+            Some(Assurance::SelfReported) => " [self-reported]",
+            Some(Assurance::Observed) => " [observed]",
+            _ => "",
         };
         let _ = writeln!(out, "  {:<12} {state}{label}", g.id);
+    }
+    if let Some(check) = &view.merge_check {
+        let mut past = check.skipped.clone();
+        past.extend(
+            check
+                .unobserved
+                .iter()
+                .map(|g| format!("{g} (not observed)")),
+        );
+        if check.merged_head != check.run_head {
+            past.push("evidence for another head".into());
+        }
+        let _ = writeln!(
+            out,
+            "Merged past: {}",
+            if past.is_empty() {
+                "nothing".into()
+            } else {
+                past.join(", ")
+            }
+        );
     }
     let _ = writeln!(out, "Next: {}", view.next_action);
     let _ = write!(

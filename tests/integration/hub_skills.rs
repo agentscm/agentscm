@@ -321,7 +321,8 @@ async fn evidence_runs_through_the_gates_to_ci_and_every_assurance_is_labelled()
         .await;
     assert_eq!(
         lib["counts"]["pr-gate"],
-        json!({"open": 1, "at_stop_gate": 0, "completed": 0})
+        json!({"open": 1, "at_stop_gate": 0, "completed": 0, "merged_observed": 0,
+            "merged_with_skips": 0, "merged_unobserved": 0})
     );
 
     let (status, _) = hub

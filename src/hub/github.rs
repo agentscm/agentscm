@@ -745,6 +745,65 @@ impl Api {
             .await
     }
 
+    /// The combined status of the requested commit: the latest status per context, at most 100.
+    /// `total_count` above the listed entries means some contexts were not returned.
+    pub async fn combined_status(&self, token: &str, repository: &str, sha: &str) -> Gh<Value> {
+        context_sha(sha)?;
+        self.repo_get(
+            token,
+            repository,
+            &format!("commits/{sha}/status?per_page=100"),
+        )
+        .await
+    }
+
+    /// The latest check run per name on `sha`, one page of up to 100; compare `total_count`
+    /// with the listed runs to know whether that is all of them.
+    pub async fn latest_check_runs(&self, token: &str, repository: &str, sha: &str) -> Gh<Value> {
+        context_sha(sha)?;
+        self.repo_get(
+            token,
+            repository,
+            &format!("commits/{sha}/check-runs?filter=latest&per_page=100"),
+        )
+        .await
+    }
+
+    /// Every review of pull request `number`, at most 300; more is an error, never a partial list.
+    pub async fn all_reviews(&self, token: &str, repository: &str, number: u64) -> Gh<Vec<Value>> {
+        let mut all = Vec::new();
+        for page in 1..=3 {
+            let body = self
+                .repo_get(
+                    token,
+                    repository,
+                    &format!("pulls/{number}/reviews?per_page=100&page={page}"),
+                )
+                .await?;
+            let rows = body
+                .as_array()
+                .ok_or_else(|| GhError::Failed("unreadable reviews reply".into()))?;
+            all.extend(rows.iter().cloned());
+            if rows.len() < 100 {
+                return Ok(all);
+            }
+        }
+        Err(GhError::Failed("more than 300 reviews".into()))
+    }
+
+    /// One JSON read under `repos/{repository}/`; a 403 is an authorization refusal.
+    async fn repo_get(&self, token: &str, repository: &str, suffix: &str) -> Gh<Value> {
+        validate_repository(repository)?;
+        let url = format!("{}/repos/{repository}/{suffix}", self.base);
+        let reply = self
+            .send(token, Method::GET, &url, None, None, false)
+            .await?;
+        if reply.status == 403 {
+            return Err(GhError::Auth("403 from repos".into()));
+        }
+        reply.ok("repos")
+    }
+
     async fn context_page(
         &self,
         token: &str,
