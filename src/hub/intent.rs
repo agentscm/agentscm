@@ -759,8 +759,16 @@ async fn activity(
                 })
                 .collect::<Vec<Value>>()
         });
+        // As Work replies name this session to this reader (`Viewer`): its ID for the reader's
+        // own, the key for anyone else's. Without it no reader could tell which session leads
+        // their own task. Whose it is goes by the person's id, never the login two can share.
+        let session = if s.owner_id == my_id {
+            &s.session
+        } else {
+            &s.key
+        };
         Ok(
-            json!({"key": s.key, "name": s.name, "started_by": s.started_by,
+            json!({"key": s.key, "session": session, "name": s.name, "started_by": s.started_by,
             "subagents": subagents,
             "agent": {"token": s.token, "name": label(&s.agent, &s.owner)},
             "owner": {"login": s.owner}, "intent": s.intent, "task": s.task,

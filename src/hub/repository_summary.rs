@@ -162,6 +162,7 @@ mod tests {
             token: "tok".into(),
             agent: "agent".into(),
             owner: "example-user".into(),
+            owner_id: "usr_example".into(),
             intent: intent.map(Into::into),
             task: None,
             via: "[]".into(),

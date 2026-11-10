@@ -5,8 +5,9 @@
 //! it never outlives the wait it describes.
 //!
 //! Short-lived like the setup observations beside it: in memory, bounded, and lost on a Hub
-//! restart, after which a waiting session reads as not known rather than not waiting. The only
-//! text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
+//! restart, after which a waiting session reads as not known rather than not waiting. The wait
+//! of a session its host named belongs to its person, not to the agent token that reported it
+//! (see [`holder`]). The only text kept is the short excerpt of what the wait asks that the hook client sends (the end of the
 //! agent's last message, its question, or what a permission prompt is for, with secrets redacted),
 //! shown to that session's own person alone. No prompt, tool input or transcript is kept here,
 //! and this table cannot answer a prompt. A wait at a permission prompt or a question may have a
@@ -211,7 +212,7 @@ pub enum LeadWait {
 /// One of the viewer's own sessions that has waited for at least [`GRACE_SECONDS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaitingSession {
-    /// Stable per agent token and native session; neither a secret nor the session ID itself.
+    /// Stable per [`holder`] and native session; neither a secret nor the session ID itself.
     pub key: String,
     pub reason: WaitReason,
     pub since: i64,
@@ -219,8 +220,11 @@ pub struct WaitingSession {
     pub name: String,
     /// The hook's agent (`claude`, `gemini`, ...), for display.
     pub agent: String,
-    /// The agent token id, to link the Work the session leads. Never shown.
+    /// The agent token that reported the wait, to link the Work the session leads. Never shown.
     pub token: String,
+    /// The wait is its person's, not that token's: Work that a session of this name leads for the
+    /// same person is this session's, whichever of their tokens leads it.
+    pub person: bool,
     /// The Hub's name for the session, which Work records as its lead session.
     pub session: String,
     /// A subagent asked; its whole session waits on the answer.
@@ -238,37 +242,75 @@ struct Row {
     /// The subagent that asked, when the host names it.
     asker: Option<String>,
     asks: Option<String>,
+    /// Kept under its person ([`holder`]), so it does not end with the token that reported it.
+    person: bool,
 }
 
 impl Row {
     fn current(&self, now: i64) -> bool {
         self.since <= now
             && now - self.since < self.reason.keep_seconds()
-            && self.principal.expires_at > now
+            && (self.person || self.principal.expires_at > now)
     }
 }
 
-/// The item key of a wait: stable per agent token and native session, and neither a secret nor
+/// Whose wait a session's is. A session its host named (an ID in UUID form, as the native hooks
+/// report) is one session of its person on every call, so its wait is the person's: an agent
+/// token is renewed twice a day, and the wait must be found and ended whichever of that
+/// person's tokens the next call presents. A name a client chose for itself (`default`, `main`)
+/// can be two unrelated sessions of one person, so such a wait stays with the agent token that
+/// reported it, and ends with it.
+pub(super) fn holder<'a>(principal: &'a Principal, native: &str) -> &'a str {
+    if super::store::owner_session(&principal.owner.id, native).is_some() {
+        &principal.owner.id
+    } else {
+        &principal.token_id
+    }
+}
+
+/// The item key of a wait: stable per [`holder`] and native session, and neither a secret nor
 /// the session ID itself.
-pub(super) fn wait_key(token: &str, native: &str) -> String {
+pub(super) fn wait_key(holder: &str, native: &str) -> String {
     format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&(token, native)).unwrap_or_default())
+        Sha256::digest(serde_json::to_vec(&(holder, native)).unwrap_or_default())
     )
 }
 
-/// Keyed by agent token id and the session ID the hook reported.
+/// Keyed by the wait's [`holder`] and the session ID the hook reported.
 /// The second field is the time before which a session's last call leaves its wait unknown: the
 /// Hub's start, or just after the start of the newest wait it dropped for room.
 #[derive(Default)]
 pub struct Waiting(Mutex<BTreeMap<(String, String), Row>>, AtomicI64);
 
 impl Waiting {
+    /// The host's notice that a dialog is on screen for `native`. It names no asker and says
+    /// nothing, also when the dialog is a question or a subagent's, so a wait at a dialog stays as
+    /// it is: its kind, its asker, its start and what it asks. With no such wait on record (the
+    /// prompt's own hook did not report it), the notice is the wait.
+    pub(super) fn notice(
+        &self,
+        principal: &Principal,
+        native: &str,
+        session: &str,
+        agent: &str,
+        now: i64,
+    ) -> Result<()> {
+        if self
+            .dialog_wait(holder(principal, native), native, now)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let reason = WaitReason::Permission;
+        self.record(principal, native, session, agent, reason, None, None, now)
+    }
+
     /// Records that `native` (whose Hub session name is `session`) waits for its person, asked by
     /// the subagent `asker` when the host names one, with `asks` saying what for when the hook
     /// sent it. A repeat of the same wait keeps its start and takes the newer `asks`; a repeat by
-    /// the same asker that says nothing (the host's notice after its own prompt) keeps the older,
-    /// and leaves a question a question.
+    /// the same asker that says nothing keeps the older. The host's own notice goes through
+    /// [`Self::notice`].
     #[allow(clippy::too_many_arguments)] // The fields of one hook report.
     pub(super) fn record(
         &self,
@@ -286,20 +328,9 @@ impl Waiting {
         }
         let mut rows = self.0.lock().map_err(|_| HubError::Busy)?;
         rows.retain(|_, row| row.current(now));
-        let key = (principal.token_id.clone(), native.to_owned());
-        // The host's notice that a dialog is on screen arrives as a permission prompt that says
-        // nothing, also when the dialog is a question. That is the wait already on record.
-        // shortcut: any permission report that says nothing is taken for the notice. A real
-        // prompt follows a tool call, which ends the question first; pass the notice down from
-        // the hook route if a prompt ever follows a question with no call between.
-        if reason == WaitReason::Permission
-            && asks.is_none()
-            && rows.get(&key).is_some_and(|row| {
-                row.reason == WaitReason::Question && row.asker.as_deref() == asker
-            })
-        {
-            return Ok(());
-        }
+        let kept_by = holder(principal, native);
+        let person = kept_by == principal.owner.id;
+        let key = (kept_by.to_owned(), native.to_owned());
         if !rows.contains_key(&key) {
             let mine = |row: &Row| row.principal.owner.id == principal.owner.id;
             if rows.values().filter(|row| mine(row)).count() >= MAX_OWNER_ROWS {
@@ -360,6 +391,7 @@ impl Waiting {
                     .map(|text| super::advice::sanitize(text.trim(), MAX_ASKS_CHARS))
                     .filter(|text| !text.is_empty())
                     .or(said),
+                person,
             },
         );
         Ok(())
@@ -371,7 +403,7 @@ impl Waiting {
         self.1.fetch_max(at, Ordering::Relaxed);
     }
 
-    /// Whether any token's session `native` waits: lets a hook skip authenticating a clear.
+    /// Whether anyone's session `native` waits: lets a hook skip authenticating a clear.
     pub(super) fn has_session(&self, native: &str) -> bool {
         self.0
             .lock()
@@ -381,12 +413,14 @@ impl Waiting {
     /// Ends the wait of `native` after a call from it: `all` for a prompt, start or end of the
     /// session; otherwise a tool call by `by` (a subagent, or `None` for the lead), which ends
     /// only a wait that subagent asked, or one whose asker the host did not name. Another
-    /// subagent working on in parallel does not end it.
-    pub(super) fn clear(&self, token: &str, native: &str, by: Option<&str>, all: bool) {
+    /// subagent working on in parallel does not end it. `holder` is [`holder`] of the token that
+    /// made the call: any of a person's tokens ends the wait of a session its host named, and
+    /// another person's never does.
+    pub(super) fn clear(&self, holder: &str, native: &str, by: Option<&str>, all: bool) {
         let Ok(mut rows) = self.0.lock() else {
             return;
         };
-        let key = (token.to_owned(), native.to_owned());
+        let key = (holder.to_owned(), native.to_owned());
         if rows
             .get(&key)
             .is_some_and(|row| all || row.asker.is_none() || row.asker.as_deref() == by)
@@ -401,12 +435,12 @@ impl Waiting {
     /// made for.
     pub(super) fn dialog_wait(
         &self,
-        token: &str,
+        holder: &str,
         native: &str,
         now: i64,
     ) -> Option<(i64, Option<String>, WaitReason)> {
         let rows = self.0.lock().ok()?;
-        let row = rows.get(&(token.to_owned(), native.to_owned()))?;
+        let row = rows.get(&(holder.to_owned(), native.to_owned()))?;
         let dialog = matches!(row.reason, WaitReason::Permission | WaitReason::Question);
         (row.current(now) && dialog).then(|| (row.since, row.asker.clone(), row.reason))
     }
@@ -424,13 +458,14 @@ impl Waiting {
                     && row.principal.owner.id == viewer.owner.id
                     && same_repository(&row.principal, viewer)
             })
-            .map(|((token, native), row)| WaitingSession {
-                key: wait_key(token, native),
+            .map(|((holder, native), row)| WaitingSession {
+                key: wait_key(holder, native),
                 reason: row.reason,
                 since: row.since,
                 name: row.principal.name.clone(),
                 agent: row.agent.clone(),
-                token: token.clone(),
+                token: row.principal.token_id.clone(),
+                person: row.person,
                 session: row.session.clone(),
                 subagent: row.asker.is_some(),
                 asks: row.asks.clone(),
@@ -440,18 +475,32 @@ impl Waiting {
         Ok(out)
     }
 
-    /// Whether the session `session` of agent token `token` waits, for the Work it leads, which
-    /// last called at `last_call`. Unlike `owned` it has no grace: the Work waits from the moment
+    /// Whether the session `session` waits, for the Work it leads for `owner` under agent token
+    /// `token`, which last called at `last_call`. A wait kept under its person is that session's
+    /// whichever of the person's tokens leads the Work: the Work takes a renewed token only at
+    /// the session's next Work call, and the wait at its next report. Unlike `owned` it has no grace: the Work waits from the moment
     /// its session stops, and only the notice to its person is held back. With no wait on record
     /// the answer is unknown while one may be missing; after 24 hours no wait would still be
     /// believed, so then the session is not waiting.
-    pub(super) fn lead(&self, token: &str, session: &str, last_call: i64, now: i64) -> LeadWait {
+    pub(super) fn lead(
+        &self,
+        owner: &str,
+        token: &str,
+        session: &str,
+        last_call: i64,
+        now: i64,
+    ) -> LeadWait {
         let Ok(rows) = self.0.lock() else {
             return LeadWait::Unknown;
         };
-        let wait = rows
-            .iter()
-            .find(|((owner, _), row)| owner == token && row.session == session && row.current(now));
+        let wait = rows.iter().find(|(_, row)| {
+            let leads = if row.person {
+                row.principal.owner.id == owner
+            } else {
+                row.principal.token_id == token
+            };
+            leads && row.session == session && row.current(now)
+        });
         match wait {
             Some((_, row)) => LeadWait::Waiting(row.reason),
             None if last_call < self.1.load(Ordering::Relaxed)
@@ -583,19 +632,41 @@ mod tests {
             record(WaitReason::Question, Some("Which color?"), 1_000),
             question
         );
-        // The notice names a permission prompt and says nothing: same wait, same start.
-        assert_eq!(record(WaitReason::Permission, None, 1_006), question);
+        let notice = |now| {
+            waiting.notice(&mine, "s", "s", "claude", now).unwrap();
+            waiting.dialog_wait("tok_a", "s", now)
+        };
+        // The notice says a dialog is on screen, not which: same wait, same start.
+        assert_eq!(notice(1_006), question);
         assert_eq!(
             waiting.owned(&mine, 2_000).unwrap()[0].asks.as_deref(),
             Some("Which color?")
         );
-        // A permission prompt that says what it is for is a new wait, and the end of a turn is
-        // no dialog at all.
+        // A permission prompt is a new wait, also one that says nothing, and the end of a turn
+        // is no dialog at all.
         assert_eq!(
-            record(WaitReason::Permission, Some("Push the branch"), 1_010),
+            record(WaitReason::Permission, None, 1_010),
             Some((1_010, None, WaitReason::Permission))
         );
         assert_eq!(record(WaitReason::Idle, None, 1_020), None);
+        // With no dialog's wait on record, the notice is the wait.
+        assert_eq!(notice(1_025), Some((1_025, None, WaitReason::Permission)));
+        // A subagent's prompt keeps its asker through the notice, which names none. The lead's
+        // own prompt, which says nothing either, replaces it.
+        let report = |asker, now| {
+            let reason = WaitReason::Permission;
+            waiting
+                .record(&mine, "s", "s", "claude", reason, asker, None, now)
+                .unwrap();
+            waiting.dialog_wait("tok_a", "s", now)
+        };
+        let asked = Some((1_025, Some("sub".to_owned()), WaitReason::Permission));
+        assert_eq!(report(Some("sub"), 1_030), asked);
+        assert_eq!(notice(1_036), asked);
+        assert_eq!(
+            report(None, 1_040),
+            Some((1_025, None, WaitReason::Permission))
+        );
     }
 
     #[test]
@@ -699,16 +770,16 @@ mod tests {
         assert!(shown.iter().all(|w| w.session != "idle0" && w.subagent));
         // The dropped wait is lost, not ended: its session reads as unknown, the kept ones wait.
         assert_eq!(
-            waiting.lead("tok_a", "idle0", 1_000, 5_000),
+            waiting.lead("usr_me", "tok_a", "idle0", 1_000, 5_000),
             LeadWait::Unknown
         );
         assert_eq!(
-            waiting.lead("tok_a", "s2", 1_002, 5_000),
+            waiting.lead("usr_me", "tok_a", "s2", 1_002, 5_000),
             LeadWait::Waiting(WaitReason::Question)
         );
         record(&mine, "new1", WaitReason::Permission, 2_001).unwrap();
         assert_eq!(
-            waiting.lead("tok_b", "idle1", 1_001, 5_000),
+            waiting.lead("usr_me", "tok_b", "idle1", 1_001, 5_000),
             LeadWait::Unknown
         );
         // With only questions and prompts left, a new wait is refused and none is dropped.
@@ -717,9 +788,57 @@ mod tests {
             Err(HubError::Busy)
         ));
         assert_eq!(
-            waiting.lead("tok_a", "s2", 1_002, 5_000),
+            waiting.lead("usr_me", "tok_a", "s2", 1_002, 5_000),
             LeadWait::Waiting(WaitReason::Question)
         );
+    }
+
+    #[test]
+    fn the_wait_of_a_session_its_host_named_follows_its_person_to_a_renewed_token() {
+        const NATIVE: &str = "0a1b2c3d-0000-4000-8000-000000000001";
+        let waiting = Waiting::default();
+        let mut old = principal("tok_old", "usr_me", "acme/widgets");
+        old.expires_at = 2_000;
+        let new = principal("tok_new", "usr_me", "acme/widgets");
+        let theirs = principal("tok_x", "usr_them", "acme/widgets");
+        let record = |native: &str| {
+            let reason = WaitReason::Permission;
+            waiting
+                .record(&old, native, native, "claude", reason, None, None, 1_000)
+                .unwrap();
+        };
+        record(NATIVE);
+        // The token that reported the wait has ended. The session still waits, under one key,
+        // and the Work it leads reads as waiting under the old token and the renewed one.
+        let shown = waiting.owned(&new, 3_000).unwrap();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].key, wait_key("usr_me", NATIVE));
+        assert!(shown[0].person);
+        for token in ["tok_old", "tok_new"] {
+            assert_eq!(
+                waiting.lead("usr_me", token, NATIVE, 990, 3_000),
+                LeadWait::Waiting(WaitReason::Permission)
+            );
+        }
+        assert_eq!(
+            waiting.lead("usr_them", "tok_x", NATIVE, 990, 3_000),
+            LeadWait::NotWaiting
+        );
+        // Another person's call does not end it. The session's next call does, under whichever
+        // token its person's computer holds by then.
+        waiting.clear(holder(&theirs, NATIVE), NATIVE, None, true);
+        assert!(waiting.has_session(NATIVE));
+        waiting.clear(holder(&new, NATIVE), NATIVE, None, false);
+        assert!(!waiting.has_session(NATIVE));
+        // A name a client chose for itself can be two sessions of one person: its wait stays
+        // with the token that reported it, and ends with it.
+        record("default");
+        assert_eq!(holder(&old, "default"), "tok_old");
+        waiting.clear(holder(&new, "default"), "default", None, true);
+        assert!(waiting.has_session("default"));
+        assert_eq!(waiting.owned(&new, 1_900).unwrap().len(), 1);
+        assert!(!waiting.owned(&new, 1_900).unwrap()[0].person);
+        assert!(waiting.owned(&new, 2_000).unwrap().is_empty());
     }
 
     #[test]
@@ -731,7 +850,7 @@ mod tests {
                 .record(&mine, "native", "s1", "claude", reason, None, None, at)
                 .unwrap();
         };
-        let lead = |session, now| waiting.lead("tok_a", session, 990, now);
+        let lead = |session, now| waiting.lead("usr_me", "tok_a", session, 990, now);
         wait(WaitReason::Idle, 1_000);
         // The Work waits from the moment its session stops; only the notice has a grace.
         assert_eq!(lead("s1", 1_000), LeadWait::Waiting(WaitReason::Idle));
@@ -739,7 +858,7 @@ mod tests {
         // Another session, and another token's session of the same name, do not.
         assert_eq!(lead("s2", 1_100), LeadWait::NotWaiting);
         assert_eq!(
-            waiting.lead("tok_b", "s1", 990, 1_100),
+            waiting.lead("usr_me", "tok_b", "s1", 990, 1_100),
             LeadWait::NotWaiting
         );
         // Its next call ends the wait.
@@ -846,15 +965,18 @@ mod tests {
         let waiting = Waiting::default();
         // A Hub that started at 5 000 never saw what a session reported before then.
         waiting.lost_before(5_000);
-        assert_eq!(waiting.lead("tok_a", "s1", 4_999, 6_000), LeadWait::Unknown);
+        assert_eq!(
+            waiting.lead("usr_me", "tok_a", "s1", 4_999, 6_000),
+            LeadWait::Unknown
+        );
         // A session that called since would have reported its wait to this Hub.
         assert_eq!(
-            waiting.lead("tok_a", "s1", 5_000, 6_000),
+            waiting.lead("usr_me", "tok_a", "s1", 5_000, 6_000),
             LeadWait::NotWaiting
         );
         // No wait is believed for longer than a day, so by then its absence means quiet.
         assert_eq!(
-            waiting.lead("tok_a", "s1", 4_999, 4_999 + MAX_AGE_SECONDS),
+            waiting.lead("usr_me", "tok_a", "s1", 4_999, 4_999 + MAX_AGE_SECONDS),
             LeadWait::NotWaiting
         );
         // A wait reported to this Hub is known, whatever came before.
@@ -872,7 +994,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            waiting.lead("tok_a", "s1", 4_999, 6_000),
+            waiting.lead("usr_me", "tok_a", "s1", 4_999, 6_000),
             LeadWait::Waiting(WaitReason::Question)
         );
     }

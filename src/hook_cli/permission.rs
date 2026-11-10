@@ -67,16 +67,41 @@ const MAX_OFFER_CHARS: usize = 500;
 const MAX_TYPED_CHARS: usize = 2000;
 const HASH_DOMAIN: &[u8] = b"agentscm.permission.v1\0";
 
+/// How the host says it was started, to every hook it runs.
+const ENTRYPOINT: &str = "CLAUDE_CODE_ENTRYPOINT";
+
 /// Whether this hook call should offer its prompt to the Hub.
 pub(super) fn applies(agent: &str, client_connection: bool, payload: &Value) -> bool {
+    let env = |name: &str| std::env::var(name).ok();
     applies_with(
         agent,
         client_connection,
         payload,
-        std::env::var(OFF_SWITCH).ok().as_deref(),
-    )
+        env(OFF_SWITCH).as_deref(),
+    ) && asker_fits(payload, env(ENTRYPOINT).as_deref())
 }
 
+/// Whether the prompt's asker can be offered: the lead always; a subagent only with an id the
+/// Hub takes, and only where its dialog is on screen while this hook waits.
+fn asker_fits(payload: &Value, entrypoint: Option<&str>) -> bool {
+    match payload["agent_id"].as_str() {
+        None | Some("") => true,
+        Some(_) => agent_id_of(payload).is_some() && asks_its_app(entrypoint),
+    }
+}
+
+/// Whether the host asks an app for permission while this hook still waits, so a subagent's
+/// dialog is on screen meanwhile. Measured: started by an app or an SDK (`claude-desktop`,
+/// `sdk-cli`) the host sends the app its request as the hook starts. In a terminal (`cli`) it
+/// shows a subagent's dialog only after the hook returns, so waiting there would hide the prompt
+/// from the person at the keyboard; that prompt is left to the session. A host this does not
+/// know is taken to ask its app: if it does not, the request is never confirmed and the hook
+/// gives up after [`UNCONFIRMED_GIVE_UP`].
+fn asks_its_app(entrypoint: Option<&str>) -> bool {
+    entrypoint.is_some_and(|entry| !matches!(entry.trim(), "" | "cli"))
+}
+
+/// Everything but the asker: see [`applies`] for a subagent's prompt.
 fn applies_with(
     agent: &str,
     client_connection: bool,
@@ -87,9 +112,6 @@ fn applies_with(
         && client_connection
         && switch.is_none_or(|value| value.trim() != "0")
         && payload["hook_event_name"] == "PermissionRequest"
-        // The host holds a subagent's dialog until this hook returns, so waiting here would only
-        // delay the person at the keyboard; those prompts are answered in the session.
-        && payload["agent_id"].as_str().is_none_or(str::is_empty)
         && tool_of(payload).is_some()
         && session_of(payload).is_some()
 }
@@ -667,6 +689,8 @@ enum Step {
     Decide(Answer),
     /// A busy or unreachable Hub: try again shortly, for as long as the hook waits.
     Retry,
+    /// The Hub no longer knows this hook's agent token, which this computer may have renewed.
+    Renew,
     Stop,
 }
 
@@ -732,6 +756,7 @@ fn classify(reply: Option<(u16, Value)>, id: &str, hash: &str) -> Step {
         200 => {}
         // 502 and 504 are a proxy in front of a Hub that is being replaced.
         429 | 502 | 503 | 504 => return Step::Retry,
+        401 => return Step::Renew,
         _ => return Step::Stop,
     }
     const KEYS: [&str; 7] = [
@@ -845,7 +870,7 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     if let Some(folder) = routed.checkout.file_name().and_then(|name| name.to_str()) {
         body["folder"] = json!(folder);
     }
-    let hub = Hub {
+    let mut hub = Hub {
         client: forge_http::client().ok()?,
         base: routed.connection.hub.trim_end_matches('/').to_owned(),
         repo: routed.connection.repo.clone(),
@@ -905,9 +930,20 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
                 failures = failures.saturating_add(1);
                 pause(failures).await;
             }
+            // The agent token ended while the prompt was up. The Hub keeps the request for the
+            // same person's next token, so the hook goes on with the one this computer holds
+            // now, and stops when that is the token the Hub just refused.
+            Step::Renew => hub.token = renewed(payload, &hub.token)?,
             Step::Stop => return None,
         }
     }
+}
+
+/// The agent token this checkout holds now, when it is not `old`.
+fn renewed(payload: &Value, old: &str) -> Option<String> {
+    let routed = super::route_client("claude", payload).ok()?;
+    let token = crate::client_cli::read_token(&routed.connection.token_file).ok()?;
+    (!token.is_empty() && token != old).then_some(token)
 }
 
 #[cfg(test)]
@@ -928,11 +964,26 @@ mod tests {
         assert!(!applies_with("claude", true, &prompt, Some("0")));
         assert!(!applies_with("claude", false, &prompt, None));
         assert!(!applies_with("codex", true, &prompt, None));
+        // A subagent's prompt is offered only where the host asks its app while the hook waits.
         let mut subagent = prompt.clone();
         subagent["agent_id"] = json!("sub-1");
-        assert!(!applies_with("claude", true, &subagent, None));
+        for (entrypoint, offered) in [
+            (Some("claude-desktop"), true),
+            (Some("sdk-cli"), true),
+            (Some("cli"), false),
+            (Some(" cli "), false),
+            (Some(" "), false),
+            (None, false),
+        ] {
+            assert_eq!(asker_fits(&subagent, entrypoint), offered, "{entrypoint:?}");
+            // The lead's prompt is offered wherever the host runs.
+            assert!(asker_fits(&prompt, entrypoint), "{entrypoint:?}");
+        }
+        // An empty id is the lead; an id the Hub would not take is nobody's prompt to offer.
         subagent["agent_id"] = json!("");
-        assert!(applies_with("claude", true, &subagent, None));
+        assert!(asker_fits(&subagent, Some("cli")));
+        subagent["agent_id"] = json!("sub\n1");
+        assert!(!asker_fits(&subagent, Some("claude-desktop")));
         let mut question = prompt.clone();
         question["tool_name"] = json!("AskUserQuestion");
         assert!(applies_with("claude", true, &question, None));
@@ -1434,7 +1485,6 @@ mod tests {
             reply(200, "pending", json!("allow")),
             reply(200, "answered", json!(true)),
             reply(404, "answered", json!("allow")),
-            reply(401, "answered", json!("allow")),
             reply(409, "answered", json!("allow")),
             reply(500, "answered", json!("allow")),
             Some((200, json!("allow"))),
@@ -1456,6 +1506,11 @@ mod tests {
         ] {
             assert_eq!(classify(stop.clone(), id, &hash), Step::Stop, "{stop:?}");
         }
+        // An ended agent token is no decision either: the hook looks for its renewal.
+        assert_eq!(
+            classify(reply(401, "answered", json!("allow")), id, &hash),
+            Step::Renew
+        );
         // Transient trouble is retried.
         assert_eq!(classify(None, id, &hash), Step::Retry);
         assert_eq!(
