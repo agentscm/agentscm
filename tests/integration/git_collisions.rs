@@ -20,14 +20,7 @@ fn git_path() -> PathBuf {
 /// Every git call the fixtures make carries this: a commit can start background
 /// maintenance or auto gc, which outlives the call and writes `.git/objects`
 /// (for example `maintenance.lock`) while a test compares repository states.
-const NO_MAINTENANCE: [&str; 6] = [
-    "-c",
-    "gc.auto=0",
-    "-c",
-    "maintenance.auto=false",
-    "-c",
-    "gc.autoDetach=false",
-];
+const NO_MAINTENANCE: [&str; 4] = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"];
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new(git_path())
