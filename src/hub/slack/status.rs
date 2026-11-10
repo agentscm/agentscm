@@ -1,5 +1,5 @@
-//! Private deterministic status queries, opt-in action reminders and the weekly digest's jobs
-//! (built in `digest.rs`). No Slack message text is retained. Jobs bind an exact configured
+//! Private deterministic status queries, opt-in action reminders, the one message per wait of
+//! a person's own agent session, and the weekly digest's jobs (built in `digest.rs`). No Slack message text is retained. Jobs bind an exact configured
 //! identity and re-read their facts before every send.
 use super::*;
 use crate::hub::work::{WorkItem, WorkState};
@@ -549,6 +549,77 @@ impl Slack {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// One direct message per wait of a bound person's own session that outlasted the Hub's
+    /// grace. It needs no `reminders.enabled`: a waiting agent is what a person away from the
+    /// desk most needs to hear about. The message id hashes the wait's id and start, so a
+    /// later pass finds the row and sends nothing, and a new wait of the same session is new.
+    /// The row is kept a day, longer than the Hub believes a wait.
+    pub(super) fn collect_waits(&self, state: &HubState, now: i64) -> Result<()> {
+        for binding in &self.bindings {
+            let key = binding_key(binding);
+            let scan = format!("{key}:waits");
+            let due: Option<i64> = self
+                .database()?
+                .query_row(
+                    "SELECT next_due FROM status_scans WHERE binding=?1",
+                    [&scan],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if due.is_some_and(|d| d > now) {
+                continue;
+            }
+            self.database()?.execute("INSERT INTO status_scans(binding,next_due) VALUES(?1,?2) ON CONFLICT(binding) DO UPDATE SET next_due=excluded.next_due", params![scan, now + SCAN_SECONDS])?;
+            let status = {
+                let _slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
+                let principal = match self.principal(state, binding) {
+                    Ok(p) => p,
+                    Err(HubError::Unauthorized) => continue,
+                    Err(e) => return Err(e),
+                };
+                actionable_status::read(&*state.store, &state.onboarding, &principal, now)?
+            };
+            let link = self.link("box-needs");
+            let mut db = self.database()?;
+            let tx = db.transaction()?;
+            let mut queued: i64 = tx.query_row(
+                "SELECT count(*) FROM messages WHERE state IN ('queued','sending')",
+                [],
+                |r| r.get(0),
+            )?;
+            for action in &status.actions {
+                let Some(since) = &action.semantic_version else {
+                    continue;
+                };
+                if action.kind != "session_waiting" || !action.needs_you || queued >= CAPACITY {
+                    continue;
+                }
+                let id = hash(format!("wait\n{key}\n{}\n{since}", action.id).as_bytes());
+                let body = message(
+                    "Your agent is waiting for you",
+                    &[("Waiting", sanitize(&action.action, 900))],
+                    "It stays stopped until you answer. The Hub lists it under Needs you.",
+                    None,
+                    &link,
+                );
+                let user = &binding.config.slack_user;
+                let new = tx.execute(
+                    "INSERT OR IGNORE INTO messages(id,user,body,state,created,due) VALUES(?1,?2,?3,'queued',?4,?4)",
+                    params![id, user, body.to_string(), now],
+                )?;
+                if new > 0 {
+                    queued += 1;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO message_bindings(message,binding) VALUES(?1,?2)",
+                        params![id, key],
+                    )?;
+                }
+            }
+            tx.commit()?;
+        }
         Ok(())
     }
 

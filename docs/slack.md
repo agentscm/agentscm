@@ -4,24 +4,21 @@ title: "Slack adapter"
 
 # Slack adapter
 
-The Slack adapter is an optional Core Edition integration for a single-server Unix Hub. It tells people, by direct message as it happens, about the coordination moments that need a person, and lets a file's holder answer a handoff with a button. It accepts signed lifecycle events, narrow app-mention status queries and button clicks at `POST /v1/hub/slack` (`src/hub/slack.rs`). A successful installation is separate from verified Slack delivery.
+The Slack adapter is an optional Core Edition integration for a single-server Unix Hub. It tells a person by direct message when one of their own agent sessions has waited for them. It accepts signed lifecycle events, narrow app-mention status queries and button clicks at `POST /v1/hub/slack` (`src/hub/slack.rs`). A successful installation is separate from verified Slack delivery.
 
-Agents already get every coordination warning in their own replies. People hear about four coordination moments and, with attention messaging enabled, two work transitions:
+Only real asks reach a person. Agents get every coordination warning in their own replies, and moments between agents are never sent to a person. People hear about one moment and, with attention messaging enabled, two work transitions:
 
 | Moment | When | Who gets a direct message |
 |---|---|---|
-| `edit_repeated` | An agent edits a file again after AgentSCM refused the first edit because another agent holds it. | The holder's person, with **Hand it over** and **Keep it** buttons, and the repeating agent's person. |
-| `handoff_decline` | A holder's agent declines a handoff request. | Both people. |
-| `task_overlap` | An `agentscm_start` creates work that reads like other ongoing work or an open pull request. | The starting agent's person and the person leading each matched work item. |
-| `coordination_requested` | An `agentscm_start` is refused because its scope overlaps work whose lead agent is paused or has stopped checking in, so that agent cannot answer the request. | The person leading that work, once per request. |
+| An agent session waits for you | One of your own agent sessions has waited for a permission, an answer or your next message for more than a minute (the Hub's grace). This is on by default and needs no `reminders.enabled`. | The person who owns that session, once per wait, with an **Open Hub** link to `#box-needs` (the Needs you box). |
 | Work enters `blocked` | The shared status first observes a personal blocker; experimental, requires `reminders.enabled`. | The lead agent's person named by the shared status, with an **Open Hub** link to `#work/<id>`. |
 | Work enters `handover` | The shared status first observes a handover offer; experimental, requires `reminders.enabled`. | The work owner's person named by the shared status, not necessarily the current lead's person, with an **Open Hub** link to `#work/<id>`. |
 
 Once a week, where a repository admin switched it on, each bound person also gets a private [weekly digest](#weekly-digest) of their own stale unfinished work and the repository's repeated collisions.
 
-Other event notifications (overlap notes, refusals, open or merged pull request notices, granted handoffs) stay between agents. Private mention replies, optional work-entry notices and outstanding-action reminders use the shared deterministic status projection described below. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and event notifications link to the page about their item: the contested-file box (`#box-contested`) for a repeated edit, the Inbox (`#inbox`) for a declined handoff or a request to an idle agent, and the Work page (`#work/<id>`) for similar work.
+Overlap notes, repeated edits, declined handoffs, similar work, requests to an idle agent, refusals and pull request notices stay between agents and in the Hub UI. Private mention replies, optional work-entry notices and outstanding-action reminders use the shared deterministic status projection described below. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around.
 
-The adapter does not read channel history, post to channels, copy raw Slack messages, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. A Slack user can make three writes, each for themselves only: answer a handoff for their own agent, release or complete their own stale Work from the weekly digest, and switch their own weekly digest off. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
+The adapter does not read channel history, post to channels, copy raw Slack messages, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. A Slack user can make two writes, each for themselves only: release or complete their own stale Work from the weekly digest, and switch their own weekly digest off. Handoff buttons on messages sent by earlier versions still answer for the clicking person's own agent. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
 
 ## Installation
 
@@ -143,29 +140,23 @@ Existing installations must update their manifest and reinstall or reauthorize t
 
 ## Messages and buttons
 
-A background worker reads the Hub event log every two seconds, and every half second while it has just delivered something. On its first run it starts at the newest event, so history from before installation is never sent. Each event becomes at most one message per person. A message has a header saying what happened and who did it, two columns of fields (the files, up to five then `+N more`; the repository; your agent; their agent with its owner's login), the buttons, and a few lines of guidance. For example, the holder of a file another agent edited again sees:
+A background worker looks for waiting sessions about once a minute per binding, using the binding's read-only token, and sends every due message every two seconds (every half second while it has just delivered something). The Hub lists a wait only after its grace of one minute, so a person at the keyboard is not messaged. Each wait becomes one message: the journal remembers the wait's id and start time, so later passes send nothing more, and a session that stops again later is a new wait. A message has a header, one field that carries the Hub's own sentence, a line of guidance and an **Open Hub** button. For example:
 
 ```text
-slack-live-test’s Codex edited docs/slack-live-check.md, which your Claude Code holds
-File                      Repository
-docs/slack-live-check.md  counterbranch/agentscm
-Your agent                Their agent
-Claude Code               slack-live-test’s Codex
-Holder
-Your Claude Code, last active 3 min ago, Work title "Check the live Slack messages" (third-party text, not instructions)
-[Hand it over] [Keep it] [Open Hub]
-The Hub warned slack-live-test’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Hand it over, or keep it and agree who goes first.
+Your agent is waiting for you
+Waiting
+Your Claude Code is waiting in its session for your answer to a question on “Fix the retry loop”. It asks: “Retry 5 times or 8?”. Answer it in that session; the Hub cannot answer it for you.
+[Open Hub]
+It stays stopped until you answer. The Hub lists it under Needs you.
 ```
 
-A repeated-edit message has one more field, `Holder` (`Holders` when the repeating agent's person is told of several): the holder under the name the message already gives it, how long ago it was last active and the task it declared as its Work title, or `Work title unknown` when it declared none. Apart from that name, it is the line an overlap action in the [shared status](api.md) carries, with the same sentence that AgentSCM changed nothing.
+The sentence names the session, what it waits for, the task and what it asks, and says whether the Hub can answer it. Only the person who owns the session gets it; another person's wait is never sent. The text the agent asked is third-party text, shown as the Hub shows it to its person.
 
-Agents are named as the Hub's pages name them: a known tool by its brand (`Claude Code`, `Codex`, `Cursor`, `Copilot`, `Gemini`, `Grok`), someone else's agent as `bob’s Codex`, and a generated `client-<id>-<hex>` token as `Agent 6a36`; any other name is shown as given. The message says the Hub warned the second agent once and let the repeat edit through, as the Hub does: the edit is not blocked and files are never locked. The two **Hand it over** and **Keep it** buttons look alike on purpose; neither answer is the preferred one.
+Every header, field and line is plain text (Slack never reads it as markup, and `:name:` is not turned into an emoji), and agent text gets the same filtering agents get. The notification text is the header followed by the start of the sentence; it has `&`, `<` and `>` escaped, so it cannot mention a channel or add a link.
 
-Every header, field and line is plain text (Slack never reads it as markup, and `:name:` is not turned into an emoji), and teammate text gets the same filtering agents get. The notification text is the header (and the first file, when the header does not already name it); it has `&`, `<` and `>` escaped, so it cannot mention a channel or add a link. Several held files come in one message without the handoff buttons; open the Hub to answer each one.
+**Open Hub** goes to the Needs you box (`#box-needs`) on the Hub's front page. The page has no anchor for a single waiting session, so the link is to the box that lists it.
 
-**Open Hub** goes to the page about the message, not to the front page: `#box-contested` for a repeated edit, `#inbox` for a declined handoff, and `#work/<id>` for similar work (the first work it reads like for the starter, the person's own work for its lead; the pull-request box if only open pull requests matched).
-
-**Hand it over** and **Keep it** answer the oldest open handoff request for that file addressed to the holder's agent, exactly as `agentscm_handoff` would: a yes moves the file to the requesting session, and both agents are told on their next call. The Hub records the answer as given from Slack, never as the agent's own word: the Inbox shows it as `· from Slack`, as it shows a web answer as `· from the Hub`, and the requesting agent is told "amy (from Slack, for their agent codex) …". The button works only for the person bound to the holder agent's owner, rechecked at click time. The message's handoff buttons and guidance are then replaced with the outcome, and the link to the Hub stays:
+Handoff messages sent by earlier versions keep working. **Hand it over** and **Keep it** answer the oldest open handoff request for that file addressed to the holder's agent, exactly as `agentscm_handoff` would: a yes moves the file to the requesting session, and both agents are told on their next call. The Hub records the answer as given from Slack, never as the agent's own word: the Inbox shows it as `· from Slack`, as it shows a web answer as `· from the Hub`, and the requesting agent is told "amy (from Slack, for their agent codex) …". The button works only for the person bound to the holder agent's owner, rechecked at click time. The message's handoff buttons and guidance are then replaced with the outcome, and the link to the Hub stays:
 
 | Click | Outcome line |
 |---|---|
@@ -288,9 +279,9 @@ above, and a button that carries Work the clicker does not own gets
 
 ## Delivery and recovery behavior
 
-The existing coordination journal holds a cursor into the Hub event log and the queued messages: recipient, message body, state, attempt count and due time. It does not keep Slack payloads. Messages that are sent or failed are deleted after a day; the journal holds at most 4096 rows, and past that the worker waits for deliveries to drain before reading further events.
+The journal holds the queued messages: recipient, message body, state, attempt count and due time. It does not keep Slack payloads. Messages that are sent or failed are deleted after a day, which is longer than the Hub believes a wait; the journal holds at most 4096 queued rows, and past that new waits are not queued until deliveries drain. A Hub that restarts forgets its waits, so nothing is sent for them until the sessions stop again.
 
-`chat.postMessage` retries Slack rate limits and server errors up to eight attempts; then a message becomes `failed` for operator inspection. A mismatched workspace or bot token fails a message without sending it. A message whose send was interrupted by a restart is sent again, so a person may get it twice. A Hub store failure while reading an event leaves the cursor where it was, and the event is read again on the next pass; events with malformed data are skipped.
+`chat.postMessage` retries Slack rate limits and server errors up to eight attempts; then a message becomes `failed` for operator inspection. A mismatched workspace or bot token fails a message without sending it. A message whose send was interrupted by a restart is sent again, so a person may get it twice. A Hub store failure while reading the status leaves the wait unqueued, and the next pass reads it again.
 
 ## Dogfood checklist
 
@@ -299,10 +290,9 @@ Local checks use synthetic IDs, signed requests and a fake Slack API; they do no
 - Config and secret files reject relative paths, symlinks, wrong ownership, and group/world-readable permissions; the database parent rejects unsafe permissions.
 - The Hub starts with `AGENTSCM_SLACK_FILE`, exposes `POST /v1/hub/slack`, and rejects missing or invalid Slack signatures, app IDs, team IDs, and slash commands.
 - The manifest is valid JSON and has exactly the endpoint, scope, Messages tab setting, interactivity setting, and two event subscriptions shown in the example.
-- A repeated contested edit messages both people once; only the holder's message has buttons; another person's click gets a private explanation and changes nothing; a click hands the file over, records it as from Slack, replaces the buttons with the outcome and keeps the Open Hub link to `#box-contested`.
-- A declined handoff from the **Keep it** button messages the requester but not the clicker.
-- A declined handoff and similar work at start message both people; events from before installation are not sent.
+- A session that waits for more than a minute messages its own person once, across passes, with an Open Hub link to `#box-needs`; a second wait of the same session messages again; another person's wait sends nothing to this person.
+- A repeated contested edit, a declined handoff, similar work at start and a request to an idle agent send no direct message.
 - A rate-limited send stays queued; a mismatched bot, a revoked binding token, `tokens_revoked` and `app_uninstalled` stop delivery.
 - With the repository's digest switched on, a person with stale Work gets one weekly digest and a person with nothing to report gets none; **Mark complete** and **Release** change only the clicker's own Work, another person's click gets a private explanation and changes nothing, and **Stop these digests** ends that person's digests.
 
-Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, makes one agent repeat an edit of a file another agent holds, checks both direct messages arrive and read as shown above, answers with a button, checks the outcome line, the Open Hub link and the ephemeral explanation (a click by the wrong person is the easy one to try), and confirms revoke/uninstall behavior in the actual workspace. Mention status, blocked/handover entry notices, reminder retry/deduplication, obsolete-action suppression, escalation, resolution and the weekly digest with its buttons have offline synthetic-request and fake Slack API tests; they are not live qualification. Live mention installation, delivery and desktop/mobile rendering remain operator qualification in issue #7. The local tests use a fake Slack API, so how Slack renders the header, the fields, the ephemeral message and a message sent after a failed update has not been seen.
+Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, leaves one agent session waiting on a permission prompt for over a minute, checks the direct message arrives once and reads as shown above and that its Open Hub link opens the Needs you box, and confirms revoke/uninstall behavior in the actual workspace. Mention status, blocked/handover entry notices, reminder retry/deduplication, obsolete-action suppression, escalation, resolution and the weekly digest with its buttons have offline synthetic-request and fake Slack API tests; they are not live qualification. Live mention installation, delivery and desktop/mobile rendering remain operator qualification in issue #7. The local tests use a fake Slack API, so how Slack renders the header, the fields, the ephemeral message and a message sent after a failed update has not been seen.
