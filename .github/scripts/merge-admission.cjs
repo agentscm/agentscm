@@ -33,24 +33,31 @@ async function admit({github, context, validateTitle}) {
   const pendingStatus = async head => report(github, repo, head,
     (await github.rest.repos.listCommitStatusesForRef({...repo, ref: head, per_page: 100})).data,
     'pending', 'PR admission pending');
+  // Only a prerequisite's completion can change an outcome; its start leaves every gate as it is.
+  if (context.payload.workflow_run && context.payload.action !== 'completed') return;
   const pending = [];
   const errors = [];
-  // Invalidate each observed page before fetching another. No prerequisite read can
-  // abort the sweep while another known head still carries an older acceptance.
+  const started = {title: 'PR admission pending', summary: 'Checking current local validation, title and CI checks; this does not qualify a merge batch.'};
+  const create = async head => (await github.rest.checks.create({...repo, name: NAME, head_sha: head, status: 'in_progress', output: started})).data;
+  // The pull request's own event starts a fresh pending gate check run. A sweep runs for every open
+  // pull request on every prerequisite completion, so it reuses the newest one this workflow made
+  // and leaves it as it is until it writes the new outcome.
+  async function gate(head) {
+    if (ownEvent) return create(head);
+    const {data} = await github.rest.checks.listForRef({...repo, ref: head, check_name: NAME, filter: 'all', per_page: 100});
+    const existing = data.check_runs.filter(c => c.name === NAME && c.app?.id === ACTIONS_APP).sort((a, b) => b.id - a.id)[0];
+    return existing ?? create(head);
+  }
   async function invalidate(candidates) {
     for (const candidate of candidates) {
       try {
-        const create = head => github.rest.checks.create({
-          ...repo, name: NAME, head_sha: head, status: 'in_progress',
-          output: {title: 'PR admission pending', summary: 'Checking current local validation, title and CI checks; this does not qualify a merge batch.'},
-        });
-        let {data: check} = await create(candidate.head.sha);
+        let check = await gate(candidate.head.sha);
         // A status failure is reported but never stops the check-run path below.
         if (ownEvent) await pendingStatus(candidate.head.sha).catch(e => errors.push(e));
         const {data: pull} = await github.rest.pulls.get({...repo, pull_number: candidate.number});
         if (pull.state !== 'open' || pull.base.ref !== context.payload.repository.default_branch) continue;
         if (pull.head.sha !== candidate.head.sha) {
-          ({data: check} = await create(pull.head.sha));
+          check = await gate(pull.head.sha);
           if (ownEvent) await pendingStatus(pull.head.sha).catch(e => errors.push(e));
         }
         pending.push({pull, check});
@@ -60,15 +67,12 @@ async function admit({github, context, validateTitle}) {
   if (context.payload.pull_request) {
     await invalidate([context.payload.pull_request]);
   } else {
-    // Overflow or a later page error leaves all already-observed pages pending.
+    // Overflow or a later page error fails the run; outcomes already written stand.
     await pages(args => github.rest.pulls.list({...repo, state: 'open', base: context.payload.repository.default_branch, ...args}), undefined, invalidate);
   }
   for (const {pull, check} of pending) {
     const head = pull.head.sha;
     try {
-    // Prerequisite workflows invalidate prior acceptance as soon as they start. Their
-    // completion event will recompute; an out-of-order start can only leave pending.
-    if (context.payload.workflow_run && context.payload.action !== 'completed') continue;
     const statuses = await pages(args => github.rest.repos.listCommitStatusesForRef({...repo, ref: head, ...args}));
     const checks = await pages(args => github.rest.checks.listForRef({...repo, ref: head, filter: 'latest', ...args}), 'check_runs');
     // GitHub returns newest statuses first. A newer pending/failing status must defeat old success.

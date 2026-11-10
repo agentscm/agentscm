@@ -32,8 +32,13 @@ function fixture() {
         },
       },
       checks: {
-        listForRef: async () => ({data: {check_runs: checks}}),
-        create: async value => {writes.push(value); return {data: {id: 90}};},
+        listForRef: async ({ref}) => ({data: {check_runs: checks.filter(c => !c.head_sha || c.head_sha === ref)}}),
+        create: async value => {
+          writes.push(value);
+          const run = {id: 90 + writes.length, name: value.name, head_sha: value.head_sha, status: value.status, app: {id: 15368}};
+          checks.push(run);
+          return {data: run};
+        },
         update: async value => {writes.push(value);},
       },
     }},
@@ -209,17 +214,54 @@ test('pagination reads all pages and refuses incomplete coverage', async () => {
   await assert.rejects(pages(async () => ({data: Array(100).fill('a')})), /500/);
 });
 
-test('prerequisite start invalidates prior green without reading old success', async () => {
+test('a prerequisite start leaves every gate as it is', async () => {
   for (const action of ['requested', 'in_progress']) {
     const f = fixture(); delete f.args.context.payload.pull_request;
     f.args.context.payload.workflow_run = {id: 3};
     f.args.context.payload.action = action;
-    f.apiError = true;
     await admit(f.args);
-    assert.equal(f.writes.length, 1);
-    assert.equal(f.writes[0].status, 'in_progress');
+    assert.equal(f.writes.length, 0);
     assert.equal(f.statusWrites.length, 0);
   }
+});
+
+test('one gate check run per head: later passes update it instead of adding another', async () => {
+  const f = fixture();
+  await admit(f.args);
+  delete f.args.context.payload.pull_request;
+  await admit(f.args);
+  assert.equal(f.writes.filter(w => !w.check_run_id).length, 1);
+  assert.ok(f.writes.filter(w => w.check_run_id).every(w => w.check_run_id === 91));
+});
+
+test('a sweep leaves an existing gate untouched until it writes the new outcome', async () => {
+  const f = fixture();
+  await admit(f.args);
+  const before = f.writes.length;
+  delete f.args.context.payload.pull_request;
+  f.checks[0].conclusion = 'failure';
+  await admit(f.args);
+  const sweep = f.writes.slice(before);
+  assert.equal(sweep.length, 1);
+  assert.equal(sweep[0].check_run_id, 91);
+  assert.equal(sweep[0].conclusion, 'failure');
+});
+
+test("the pull request's own event starts a fresh pending gate", async () => {
+  const f = fixture();
+  await admit(f.args);
+  const before = f.writes.length;
+  await admit(f.args);
+  const own = f.writes.slice(before);
+  assert.deepEqual(own.map(w => [w.check_run_id, w.status]), [[undefined, 'in_progress'], [93, 'completed']]);
+});
+
+test('a sweep never reuses a gate check run from another app', async () => {
+  const f = fixture(); delete f.args.context.payload.pull_request;
+  f.checks.push({id: 50, name: 'Merge batch gate', head_sha: f.pull.head.sha, status: 'completed', conclusion: 'success', app: {id: 1}});
+  await admit(f.args);
+  assert.equal(f.writes[0].head_sha, f.pull.head.sha);
+  assert.equal(f.writes[0].check_run_id, undefined);
 });
 
 
@@ -239,10 +281,9 @@ test('one PR API failure cannot preserve another PR old acceptance', async () =>
   assert.equal(f.writes[2].conclusion, 'success');
 });
 
-test('observed pages are invalidated before pagination overflow', async () => {
+test('pagination overflow fails the sweep after reusing one gate per head', async () => {
   const f = fixture(); delete f.args.context.payload.pull_request;
   f.args.github.rest.pulls.list = async () => ({data: Array(100).fill(f.pull)});
   await assert.rejects(admit(f.args), /500/);
-  assert.equal(f.writes.length, 500);
-  assert.ok(f.writes.every(w => w.status === 'in_progress'));
+  assert.equal(f.writes.length, 1);
 });
