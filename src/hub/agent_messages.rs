@@ -502,10 +502,9 @@ pub fn take(
     if principal.read_only || !elsewhere_due(&principal.token_id, session, now) {
         return Ok(None);
     }
-    // Best effort, as in the wait: the request still reaches its lead's person after the bound.
-    Ok(request_wake_elsewhere(store, principal, session, now)
-        .ok()
-        .flatten())
+    // Both callers drop a take that fails: the request still reaches its lead's person after
+    // the bound.
+    request_wake_elsewhere(store, principal, session, now)
 }
 
 /// Whether this call reads the person's other tokens: the session's hook is not waiting (a
@@ -577,6 +576,11 @@ fn request_wake_elsewhere(
     session: &str,
     now: i64,
 ) -> Result<Option<String>> {
+    // `default` names no one conversation: Work that an unnamed start leads with another token
+    // is not this session's.
+    if session == super::session::DEFAULT_SESSION {
+        return Ok(None);
+    }
     let tokens = store.list_agent_tokens(&principal.owner.id)?;
     let live = tokens.into_iter().filter(|token| {
         token.id != principal.token_id
@@ -600,10 +604,10 @@ fn request_wake_elsewhere(
             .and_then(|name| request_wake(store, &other, &name, true, now));
         match found {
             Ok(Some(text)) => return Ok(Some(text)),
-            Err(HubError::Busy) => return Err(HubError::Busy),
-            // Nothing there, or a token the store refuses (its repository is no longer
-            // connected): the others are still read.
-            Ok(None) | Err(_) => {}
+            // Nothing there, or the store no longer lets that token act (its repository was
+            // renamed since this list was read): the others are still read.
+            Ok(None) | Err(HubError::Unauthorized) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(None)
