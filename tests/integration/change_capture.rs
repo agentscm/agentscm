@@ -5549,3 +5549,149 @@ fn upkeep_never_removes_what_the_hub_has_not_accepted_and_reports_the_store_full
     assert_eq!(spool.usage().unwrap(), before);
     assert_eq!(spool.pending(100).unwrap(), pending);
 }
+
+#[test]
+fn an_event_refused_for_lack_of_room_leaves_a_gap_that_says_the_store_was_full() {
+    let temp = TempDir::new().unwrap();
+    let spool = small_spool(&temp);
+    let mut index = 0;
+    while spool
+        .append(&sample_batch(
+            &format!("unaccepted:{index}"),
+            &format!("event:{index}"),
+        ))
+        .is_ok()
+    {
+        index += 1;
+        assert!(index < 100, "the spool reached its limit");
+    }
+    let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt_id":"p1","prompt":"hello"}"#;
+    capture_hook(
+        prompt,
+        &capture_request(CaptureModeV1::MetadataOnly),
+        &spool,
+    )
+    .unwrap();
+    let captured = captured_events(&spool);
+    assert!(
+        captured
+            .iter()
+            .all(|(_, event)| event.kind != CapturedEventKindV1::UserPrompt)
+    );
+    assert!(
+        captured.iter().any(|(_, event)| event
+            .gap
+            .as_ref()
+            .is_some_and(|gap| gap.reason == GapReasonV1::LocalRetentionExpired)),
+        "{captured:?}"
+    );
+}
+
+#[test]
+fn compaction_frees_accepted_shared_bodies_and_keeps_pending_and_local_ones() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let (token, password) = synthetic_secrets();
+    let hooks = shared_prompt_and_tool_hooks(&token, &password);
+    let bodies = |spool: &LocalSpool| -> Vec<_> {
+        captured_events(spool)
+            .into_iter()
+            .filter_map(|(_, event)| event.artifact)
+            .collect()
+    };
+    let shared = capture_request(CaptureModeV1::SharedConversation);
+    for hook in &hooks[..2] {
+        capture_hook(hook.as_bytes(), &shared, &spool).unwrap();
+    }
+    let local = CaptureRequest {
+        observed_session_id: "session_local".into(),
+        canonical_session_id: "session_local".into(),
+        ..capture_request(CaptureModeV1::LocalConversation)
+    };
+    capture_hook(
+        hooks[0]
+            .replace("session_fixture", "session_local")
+            .as_bytes(),
+        &local,
+        &spool,
+    )
+    .unwrap();
+    let accepted = bodies(&spool);
+    assert_eq!(accepted.len(), 3);
+    for envelope in spool.pending(100).unwrap() {
+        spool.acknowledge(&envelope).unwrap();
+    }
+    capture_hook(hooks[2].as_bytes(), &shared, &spool).unwrap();
+    let pending = bodies(&spool);
+    assert_eq!(pending.len(), 1);
+
+    assert!(spool.compact_acknowledged(100).unwrap().envelopes > 0);
+    let kept = |digest: &str| spool.root().join("artifacts").join(digest).exists();
+    for body in &accepted {
+        // The Hub holds an accepted shared body; a body kept on this computer only stays.
+        assert_eq!(
+            kept(&body.digest),
+            body.retention == RetentionClassV1::WorkLocal,
+            "{body:?}"
+        );
+    }
+    assert!(
+        accepted
+            .iter()
+            .any(|body| body.retention == RetentionClassV1::WorkLocal)
+    );
+    assert!(
+        kept(&pending[0].digest),
+        "a body still waiting for the Hub stays"
+    );
+    assert!(!spool.read_artifact(&pending[0]).unwrap().is_empty());
+}
+
+#[test]
+fn a_tool_claim_ends_when_no_start_can_follow_and_expires_when_its_other_phase_never_comes() {
+    let repo = git_fixture();
+    let spool_dir = TempDir::new().unwrap();
+    let spool = LocalSpool::open(spool_dir.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: vec![ActionRuleV1 {
+            native_tool: "Bash".into(),
+            kind: ActionKindV1::Execution,
+            coverage: CoverageV1::Partial,
+            result_source: NativeResultSourceV1::ProcessExitCode,
+            recipe_digest: None,
+        }],
+    };
+    let claims = || {
+        inspect_spool(spool.root())
+            .unwrap()
+            .live_claim_count
+            .present
+    };
+
+    // A Post whose Pre never reached the spool has no start to finish, so its claim ends with it.
+    let post = br#"{"hook_event_name":"PostToolUse","session_id":"session_fixture","tool_name":"Bash","tool_use_id":"no_start","tool_input":{"command":"true"},"tool_response":{"stdout":""}}"#;
+    let report = capture_native_hook(post, &request, &actions, &spool).unwrap();
+    assert_eq!(report.action, NativeActionOutcome::MissingStart);
+    assert_eq!(claims(), 0);
+
+    // A Pre whose Post never comes keeps its claim for a day; then it expires.
+    let pre = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Bash","tool_use_id":"no_post","tool_input":{"command":"true"}}"#;
+    capture_native_hook(pre, &request, &actions, &spool).unwrap();
+    assert_eq!(claims(), 1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(spool.expire_claims(now).unwrap(), 0);
+    assert_eq!(
+        spool
+            .expire_claims(now + agentscm::change_capture::CLAIM_KEEP_SECONDS + 60)
+            .unwrap(),
+        1
+    );
+    assert_eq!(claims(), 0);
+}
