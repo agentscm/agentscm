@@ -149,6 +149,8 @@ const MAX_PATH_GLOBS: usize = 32;
 const MAX_PATH_GLOB_BYTES: usize = 256;
 const MAX_CHANGED_PATHS: usize = 3000;
 const MAX_CHANGED_PATH_BYTES: usize = 256 * 1024;
+/// Git's own path limit on most systems; it also bounds one glob match's work.
+const MAX_CHANGED_PATH_LEN: usize = 4096;
 /// Matching work per preview, in the glob matcher's units; past it the paths are unknown.
 const MAX_PATH_MATCH_WORK: u64 = 50_000_000;
 
@@ -432,7 +434,8 @@ async fn open_head(
     let (paths, truncated) = api.pull_files(token, repository, number).await?;
     let complete = !truncated
         && paths.len() <= MAX_CHANGED_PATHS
-        && paths.iter().map(String::len).sum::<usize>() <= MAX_CHANGED_PATH_BYTES;
+        && paths.iter().map(String::len).sum::<usize>() <= MAX_CHANGED_PATH_BYTES
+        && paths.iter().all(|p| p.len() <= MAX_CHANGED_PATH_LEN);
     let event = ConfirmedMerge {
         provider: "github".into(),
         host: repository.host.clone(),
@@ -797,12 +800,14 @@ fn change_predicates(
         .collect();
     let work = std::cell::Cell::new(0);
     for path in paths {
-        if globs.iter().any(|glob| glob.matches(path, &work)) {
-            return;
-        }
-        if work.get() > MAX_PATH_MATCH_WORK {
-            unknown.push("paths_any: matching exceeded its work limit".into());
-            return;
+        for glob in &globs {
+            if glob.matches(path, &work) {
+                return;
+            }
+            if work.get() > MAX_PATH_MATCH_WORK {
+                unknown.push("paths_any: matching exceeded its work limit".into());
+                return;
+            }
         }
     }
     reasons.push("no changed path matches paths_any".into());
@@ -1441,7 +1446,9 @@ fn validate_event(e: &ConfirmedMerge) -> Result<()> {
             .is_some_and(|paths| {
                 paths.len() > MAX_CHANGED_PATHS
                     || paths.iter().map(String::len).sum::<usize>() > MAX_CHANGED_PATH_BYTES
-                    || paths.iter().any(|p| p.is_empty() || p.contains('\0'))
+                    || paths
+                        .iter()
+                        .any(|p| p.is_empty() || p.len() > MAX_CHANGED_PATH_LEN || p.contains('\0'))
             })
     {
         return Err(Error::Invalid("invalid confirmed merge".into()));

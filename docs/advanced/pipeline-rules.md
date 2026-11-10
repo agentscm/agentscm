@@ -205,7 +205,7 @@ predicates narrow it, and every one must hold:
 These predicates are refused on a merge rule.
 
 Unknown stays unknown. When GitHub's file list is incomplete (more pages than
-the client reads), its paths exceed 3000 entries or 256 KiB, a count is missing,
+the client reads), its paths exceed 3000 entries, 256 KiB in all or 4096 bytes for one path, a count is missing,
 or matching exceeds its work limit, preview reports `could not evaluate ...`,
 lists the predicate under `unknown` and the rule does not run. With
 `run_when_unknown: true` the rule runs anyway when every predicate it could

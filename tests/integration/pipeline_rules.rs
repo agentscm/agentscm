@@ -1700,5 +1700,26 @@ async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks()
     let pending = j.pending(8).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].event.accepted_commit, "e".repeat(40));
+    // A file list past the retained bound is unknown, never "no match": the rule does not run.
+    {
+        let mut s = state.lock().unwrap();
+        s.pulls
+            .insert(12, open_pull(12, &"f".repeat(40), false, 42));
+        s.open = vec![12];
+        s.files
+            .insert(12, (0..3001).map(|i| format!("docs/{i}.md")).collect());
+    }
+    let report = poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 3,
+    )
+    .await
+    .unwrap();
+    let observed = &report.observations[0]["event"];
+    assert_eq!(observed["changes"]["paths"], Value::Null, "{observed}");
+    assert_eq!(j.pending(8).unwrap().len(), 1);
     task.abort();
 }
