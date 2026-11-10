@@ -1329,7 +1329,12 @@ mod tests {
         assert_eq!(p.issues.dismissed, Some(1));
         // Went elsewhere is inferred, so it is neither resolved nor unresolved.
         assert_eq!((p.issues.resolved, p.issues.unresolved), (0, 1));
-        assert!(p.coverage.gaps.iter().any(|g| g.starts_with("Went elsewhere")));
+        assert!(
+            p.coverage
+                .gaps
+                .iter()
+                .any(|g| g.starts_with("Went elsewhere"))
+        );
         assert!(p.issues.contested_edits.partial);
         assert_eq!(p.overhead.client.timed_out, 48);
         assert_eq!(p.overhead.hub_calls, 13);

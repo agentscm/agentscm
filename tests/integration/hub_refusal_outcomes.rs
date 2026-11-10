@@ -128,7 +128,11 @@ fn refusal_outcomes_follow_what_the_session_did_next(db: &Db) {
     // notice it draws is settled at once, because the edit already went ahead.
     let george = agent(&*store, 7, "g");
     store
-        .touch_session(&george, &call("hook:cursor", Some("g"), &["d.rs"], false), T0 + 6)
+        .touch_session(
+            &george,
+            &call("hook:cursor", Some("g"), &["d.rs"], false),
+            T0 + 6,
+        )
         .unwrap();
 
     let now = T0 + 10;
@@ -318,7 +322,10 @@ fn one_tokens_sessions_cannot_push_out_another_tokens_rows(db: &Db) {
         .overhead;
     // The busy token keeps its newest rows; the quiet token's row is still there.
     assert_eq!(overhead.sessions as i64, MAX_ROWS_PER_TOKEN + 1);
-    assert!(overhead.partial, "a token at its cap makes the counts partial");
+    assert!(
+        overhead.partial,
+        "a token at its cap makes the counts partial"
+    );
 }
 
 macro_rules! conformance {

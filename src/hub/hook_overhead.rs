@@ -177,12 +177,7 @@ fn store_key(state: &super::HubState) -> usize {
 /// Adds the call to its session's in-memory total; no store call. When the last write is
 /// [`FLUSH_EVERY`] old, starts one background write of every total for this Hub's store. A call
 /// without a usable token is not counted.
-pub fn record(
-    state: &super::HubState,
-    token: Option<&str>,
-    repo: Option<String>,
-    sample: Sample,
-) {
+pub fn record(state: &super::HubState, token: Option<&str>, repo: Option<String>, sample: Sample) {
     let Some(digest) = token.and_then(|token| super::store::agent_token_digest(token).ok()) else {
         return;
     };
@@ -257,9 +252,10 @@ pub async fn flush(state: &super::HubState) {
     if written.is_err() {
         let mut pending = PENDING.lock().unwrap_or_else(|p| p.into_inner());
         for (key, sample) in taken {
+            let held = pending.totals.len();
             match pending.totals.get_mut(&key) {
                 Some(total) => total.add(&sample),
-                None if pending.totals.len() < MAX_PENDING => {
+                None if held < MAX_PENDING => {
                     pending.totals.insert(key, sample);
                 }
                 None => {}
@@ -364,7 +360,8 @@ impl OverheadMetrics {
                 let client = &mut self.client;
                 client.reporting_sessions += 1;
                 client.calls = client.calls.saturating_add(row.client_calls);
-                client.latency_ms_total = client.latency_ms_total.saturating_add(row.client_ms_total);
+                client.latency_ms_total =
+                    client.latency_ms_total.saturating_add(row.client_ms_total);
                 client.latency_ms_max = client.latency_ms_max.max(row.client_ms_max);
                 client.timed_out = client.timed_out.saturating_add(row.client_timeouts);
                 client.failed_open = client.failed_open.saturating_add(row.client_failed_open);
