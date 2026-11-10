@@ -3380,7 +3380,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
 
     // Catalog counts, recipient and next action are exactly the shared person/token projection.
     let mut work = started["item"].clone();
-    let mut previous_marker = Value::Null;
+    let mut previous_marker = None;
     for (operation, summary) in [
         ("catalog-handover-1", "Synthetic handover"),
         ("catalog-handover-2", "Synthetic updated handover"),
@@ -3420,13 +3420,16 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         assert_eq!(row["work"][0]["state"], "awaiting_party");
         assert_eq!(row["work"][0]["recipient"], status["work"][0]["recipient"]);
         assert_eq!(row["work"][0]["next_action"], status["work"][0]["action"]);
-        assert_eq!(row["work"][0]["needs_you"], true);
-        assert!(row["attention_revision"].as_str().is_some());
-        assert_ne!(
-            row["attention_revision"], previous_marker,
-            "same count with changed action evidence changes attention identity"
-        );
-        previous_marker = row["attention_revision"].clone();
+        assert_eq!(row["work"][0]["needs_you"], false);
+        assert_eq!(row["status_counts"]["needs_you"], 0);
+        assert_eq!(row["attention_revision"], Value::Null);
+        if let Some(previous) = &previous_marker {
+            assert_eq!(
+                &row["attention_revision"], previous,
+                "routine handover updates do not create a personal obligation"
+            );
+        }
+        previous_marker = Some(row["attention_revision"].clone());
         let (_, again) = env
             .call(
                 &env.hub,
@@ -3443,7 +3446,8 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .find(|r| r["repository"] == REPO)
             .unwrap();
         assert_eq!(
-            again["attention_revision"], previous_marker,
+            Some(again["attention_revision"].clone()),
+            previous_marker,
             "poll time does not create new attention"
         );
     }
@@ -4333,6 +4337,7 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
     let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
     let register = |hash: &str, complete: bool| {
         json!({"session": session, "tool": "Bash", "display": "cargo publish",
+            "summary": "run a shell command: Publish the crate", "folder": "widgets",
             "complete": complete, "input_hash": hash.repeat(64)})
     };
     let answer = |id: &Value, decision: &str| {
@@ -4402,18 +4407,29 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
         (409, Some("already_answered"))
     );
 
-    // The tool ran. The next prompt's request was cut, so it can be denied but not allowed; once
-    // the session has moved on, an answer says so.
+    // The tool ran. The next prompt's request says what of it is not shown, and can be allowed
+    // all the same.
     agent("/v1/hub/hook/claude", ran.clone()).await;
     agent("/v1/hub/hook/claude", prompt.clone()).await;
-    let (_, made) = agent("/v1/hub/permission/register", register("b", false)).await;
+    let mut partial = register("b", true);
+    partial.as_object_mut().unwrap().remove("complete");
+    partial["missing"] = json!({"cut_from": 31_400, "redacted": 2, "unshown": ["sandbox"]});
+    let (_, made) = agent("/v1/hub/permission/register", partial).await;
     let cut = made["request_id"].clone();
     agent("/v1/hub/hook/claude", shown.clone()).await;
     let allowed = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "allow")).await;
-    assert_eq!(allowed.0, 400, "{}", allowed.1);
+    assert_eq!(allowed.0, 200, "{}", allowed.1);
+
+    // An older hook says only that its request is incomplete. Once the session has moved on, an
+    // answer says so.
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("d", false)).await;
+    let late = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
     agent("/v1/hub/hook/claude", ran).await;
     let (status, refused) =
-        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "deny")).await;
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&late, "deny")).await;
     assert_eq!(
         (status, refused["reason"].as_str()),
         (409, Some("answered_in_session"))

@@ -2702,12 +2702,16 @@ fn skill_adoption_and_evidence(db: &Db) {
         default_branch: (source == "default_branch").then(|| "main".to_owned()),
         observed_at: 10,
         reported_by: None,
+        // Only the forge's default-branch read stores repository skills.
+        local_skills: (source == "default_branch").then(|| "[{\"local\":1}]".to_owned()),
     };
     assert_eq!(store.skill_adoption(REPO).unwrap(), None);
     let checkout = store
         .skill_adoption_put(&adoption("reported_by_checkout", "{\"a\":1}"))
         .unwrap();
     assert_eq!(checkout.lock_json, "{\"a\":1}");
+    // A checkout report stores no repository skills.
+    assert_eq!(checkout.local_skills, None);
     // The forge replaces a checkout report; a checkout report never replaces the forge.
     let forge = store
         .skill_adoption_put(&adoption("default_branch", "{\"b\":2}"))
@@ -2716,6 +2720,8 @@ fn skill_adoption_and_evidence(db: &Db) {
         (forge.source.as_str(), forge.default_branch.as_deref()),
         ("default_branch", Some("main"))
     );
+    // Repository skills are stored and returned with the forge row.
+    assert_eq!(forge.local_skills.as_deref(), Some("[{\"local\":1}]"));
     let kept = store
         .skill_adoption_put(&adoption("reported_by_checkout", "{\"c\":3}"))
         .unwrap();

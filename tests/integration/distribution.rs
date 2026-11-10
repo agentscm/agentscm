@@ -165,7 +165,8 @@ fn native_bundle_is_self_contained_and_matches_its_inventory() {
         .output()
         .unwrap();
     assert!(installed.status.success());
-    // A build from a branch also names its commit: `0.1.0+<commit>`.
+    // A build that is not a release has a suffix: `0.1.0+<commit>` when it knows its commit,
+    // `0.1.0+dev` for a debug build that does not.
     let printed = String::from_utf8(installed.stdout).unwrap();
     assert!(
         printed

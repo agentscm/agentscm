@@ -96,8 +96,8 @@ the bodies, replies and rules. Requests live in the memory of one Hub process.
 |---|---|---|
 | `POST /v1/hub/permission/register?repo=…` | Agent token | Offers the prompt its session waits at; replies its `request_id` and `state` |
 | `POST /v1/hub/permission/poll?repo=…` | Agent token | Waits up to 25 seconds for the request's `state` to change; replies the `decision` once answered |
-| `GET /v1/hub/session/permissions?repository=…` | Web sign-in | `{"requests": [...]}`: the person's own requests there that a prompt on screen confirmed |
-| `POST /v1/hub/session/permissions/answer` | Web sign-in, `x-csrf-token` | Body `{"repository", "request_id", "decision"}`; `allow` only when the whole request was shown |
+| `GET /v1/hub/session/permissions?repository=…` | Web sign-in | `{"requests": [...]}`: the person's own requests there that a prompt on screen confirmed, each with what of it is not shown |
+| `POST /v1/hub/session/permissions/answer` | Web sign-in, `x-csrf-token` | Body `{"repository", "request_id", "decision"}`; `allow` or `deny`, for any pending request the list shows |
 
 ## Hub: connected apps
 
@@ -174,7 +174,7 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | `GET /v1/hub/standup/work/{id}/reconciliation-v2` | Repository-scoped reader; durable current versus retained historical reconciliation with explicit staleness; fresh evidence digest/source coverage remain separate even without a current retained evaluation |
 | `POST /v1/hub/standup/reconciliation` | Current lead; fenced server-evidence evaluation, preserves original reports and reservation authority |
 | `GET /v1/hub/standup/why` | Repository-scoped reader, read-only tokens allowed; exactly one of `commit` (full lowercase SHA) or `path`; the Work recorded for it, newest first, at most 10 |
-| `GET /v1/hub/standup/repositories` | Agent token, read-only allowed; current unfinished Work in every repository on this Hub that the token's person can read now, at most 10 per repository and 100 in all |
+| `GET /v1/hub/standup/repositories` | Agent token, read-only allowed; current unfinished Work in every connected repository on the person's forge host that the person can read now, at most 10 per repository and 100 in all |
 
 MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the same
 Work store. The relationship records caller-reported identity, not provider approval.
