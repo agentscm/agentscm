@@ -232,9 +232,17 @@ open pull requests when any rule that is not policy-owned uses this event:
 
 So retargeting, relabelling, editing a rule or re-enabling it evaluates a head
 again, but one rule runs a head at most once. Older heads of the same pull
-request that started no run are pruned. A head event is keyed apart from a merge
-of the same commit. A write that would take the journal past its 128 MiB budget
-is refused, so the journal always opens.
+request, and heads of pull requests no longer open, are pruned when they started
+no run. A head event is keyed apart from a merge of the same commit.
+
+A write that would take the journal past its 128 MiB budget or a table's
+100,000-row cap is refused and rolled back, with nothing accepted. When the
+journal opens, an event, observation or dispatch row it cannot accept (oversized,
+unparseable or invalid) is moved, with the rows that depend on it, to
+`pipeline-rules/quarantine.jsonl`. `status` reports how many under
+`quarantined`, so one bad row never stops the journal from opening. Problems with
+the journal as a whole (identity, schema, integrity, binding or rules) still stop
+it.
 
 Preview takes the same synthetic JSON with `"kind": "pull_request"` and an
 optional `changes` object (`files`, `lines`, `paths`; a missing value is

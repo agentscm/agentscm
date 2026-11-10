@@ -1704,6 +1704,21 @@ async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks()
     .unwrap();
     assert_eq!(second.skipped_confirmed, 1);
     assert_eq!(state.lock().unwrap().requests, vec!["repo", "open"]);
+    // Editing the rule does not re-read a head that already ran for it.
+    let mut edited = j.rule("acme/widgets", "scan").unwrap();
+    edited.generation = 2;
+    j.install(&edited, Some(1)).unwrap();
+    state.lock().unwrap().requests.clear();
+    poll_merges(
+        api,
+        "synthetic",
+        &connected(),
+        &mut j,
+        observation_now() + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.lock().unwrap().requests, vec!["repo", "open"]);
     assert_eq!(j.pending(8).unwrap().len(), 1);
     // The same executor runs the head's exact source.
     let claim = j.claim(&pending[0].dispatch_id).unwrap();
@@ -1805,8 +1820,23 @@ async fn polled_pull_request_heads_run_once_per_head_and_never_drafts_or_forks()
     )
     .await
     .unwrap();
-    assert!(report.blocked.is_some() && !report.checkpoint_advanced);
+    // One moving pull request does not hold the checkpoint for the others.
+    assert!(
+        report.blocked.is_none() && report.checkpoint_advanced,
+        "{report:?}"
+    );
+    assert!(report.observations[0]["retry"].is_string());
     assert_eq!(j.pending(8).unwrap().len(), 1);
+    // Heads of pull requests no longer listed as open, that started no run, were pruned.
+    let left: i64 = rusqlite::Connection::open(f.data.join("pipeline-rules/state.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM pipeline_events WHERE body LIKE '%\"proposal_number\":12,%' OR body LIKE '%\"proposal_number\":13,%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0);
     poll_merges(
         api,
         "synthetic",
@@ -1888,4 +1918,75 @@ fn head_observations_follow_base_labels_and_rule_generation_and_are_pruned() {
     assert!(j.accept(&head_event(&f, Some(&paths))).is_err());
     drop(j);
     journal(&f);
+}
+
+fn raw_journal(f: &Fixture) -> rusqlite::Connection {
+    rusqlite::Connection::open(f.data.join("pipeline-rules/state.sqlite")).unwrap()
+}
+
+#[test]
+fn open_quarantines_an_oversized_or_malformed_row_instead_of_refusing_the_journal() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&f.rule, None).unwrap();
+    assert_eq!(j.accept(&event(&f)).unwrap().len(), 1);
+    drop(j);
+    // An event the earlier branch could write (256 KiB of paths) and one that does not parse.
+    let paths: Vec<String> = (0..1000).map(|i| format!("src/{i:0>250}.rs")).collect();
+    let old = serde_json::to_string(&ConfirmedMerge {
+        proposal_number: 8,
+        ..head_event(
+            &f,
+            Some(&paths.iter().map(String::as_str).collect::<Vec<_>>()),
+        )
+    })
+    .unwrap();
+    assert!(old.len() > 200 * 1024);
+    let db = raw_journal(&f);
+    db.execute(
+        "INSERT INTO pipeline_events(semantic_key,body) VALUES('old',?1),('bad','{')",
+        [&old],
+    )
+    .unwrap();
+    drop(db);
+    let j = journal(&f);
+    let quarantined = j.quarantined().unwrap();
+    assert_eq!(quarantined["count"], 2, "{quarantined}");
+    assert!(quarantined["newest"][0].get("body").is_none());
+    // The good rows stay, and the journal keeps working.
+    assert_eq!(j.pending(8).unwrap().len(), 1);
+    let rows: i64 = raw_journal(&f)
+        .query_row("SELECT count(*) FROM pipeline_events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    drop(j);
+    assert_eq!(journal(&f).quarantined().unwrap()["count"], 2);
+}
+
+#[test]
+fn writes_stop_at_the_row_caps_that_open_enforces() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&f.rule, None).unwrap();
+    drop(j);
+    // Fill the events table to the cap that open allows.
+    raw_journal(&f)
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000)
+             INSERT INTO pipeline_events(semantic_key,body)
+             SELECT 'github'||char(0)||'forge.invalid'||char(0)||'42'||char(0)||(i+1000)||char(0)||printf('%040x',i),
+                    json_object('provider','github','host','forge.invalid','repository','acme/widgets','provider_repository_id',42,'proposal_number',i+1000,'accepted_commit',printf('%040x',i),'target','main','labels',json('[]'),'observed_at',1,'delivery_id',NULL)
+             FROM n;",
+        )
+        .unwrap();
+    let mut j = journal(&f);
+    let error = j.accept(&event(&f)).unwrap_err();
+    assert!(
+        error.to_string().contains("row or payload budget"),
+        "{error}"
+    );
+    drop(j);
+    let j = journal(&f);
+    assert!(j.pending(8).unwrap().is_empty());
+    assert_eq!(j.quarantined().unwrap()["count"], 0);
 }

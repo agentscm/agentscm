@@ -251,6 +251,8 @@ pub async fn confirm_proposal(
 enum ObservationError {
     Forge(super::github::GhError),
     Invalid(Error),
+    /// This proposal only: read it again next poll; others are unaffected.
+    Retry(String),
 }
 impl From<super::github::GhError> for ObservationError {
     fn from(e: super::github::GhError) -> Self {
@@ -265,6 +267,7 @@ impl From<Error> for ObservationError {
 fn observation_error(error: ObservationError) -> Error {
     match error {
         ObservationError::Invalid(e) => e,
+        ObservationError::Retry(reason) => Error::Conflict(reason),
         ObservationError::Forge(error) => Error::Conflict(match error {
             super::github::GhError::Auth(_) => {
                 "forge authentication failed; no event accepted".into()
@@ -442,10 +445,9 @@ async fn open_head(
         .and_then(|p| p.pointer("/head/sha")?.as_str())
         != Some(head.as_str())
     {
-        return Err(Error::Invalid(
+        return Err(ObservationError::Retry(
             "pull request head moved while its files were read; it is read again next poll".into(),
-        )
-        .into());
+        ));
     }
     let complete = !truncated && paths.iter().all(|p| p.len() <= MAX_CHANGED_PATH_LEN);
     let mut event = ConfirmedMerge {
@@ -523,6 +525,11 @@ impl PollReport {
             ObservationError::Forge(GhError::Failed(_) | GhError::TooLarge(_)) => PollBlocked {
                 kind: "unavailable".into(),
                 reason: "forge read failed; successful checkpoint unchanged".into(),
+                retry_at: None,
+            },
+            ObservationError::Retry(reason) => PollBlocked {
+                kind: "unverifiable".into(),
+                reason,
                 retry_at: None,
             },
             ObservationError::Invalid(error) => PollBlocked {
@@ -702,7 +709,7 @@ pub async fn poll_merges(
                     head,
                 );
                 let key = head_key(&proposal, &target, &labels_of(candidate));
-                if journal.head_settled(&key, &repository.full_name)? {
+                if journal.head_settled(&proposal, &key, &repository.full_name)? {
                     report.skipped_confirmed += 1;
                     continue;
                 }
@@ -742,6 +749,9 @@ pub async fn poll_merges(
                 Ok(None) => report.observations.push(
                     serde_json::json!({"proposal":number,"accepted":[],"reason":NOT_OBSERVED}),
                 ),
+                Err(ObservationError::Retry(reason)) => report
+                    .observations
+                    .push(serde_json::json!({"proposal":number,"accepted":[],"retry":reason})),
                 Err(ObservationError::Invalid(error)) => {
                     report.observations.push(serde_json::json!({"proposal":number,"accepted":[],"blocked":error.to_string()}));
                     report.block(error.into());
@@ -751,6 +761,15 @@ pub async fn poll_merges(
                     return Ok(report);
                 }
             }
+        }
+        // Only a complete listing proves which pull requests are no longer open.
+        if listing.unread == 0 {
+            let open: BTreeSet<u64> = listing
+                .items
+                .iter()
+                .filter_map(|c| c.get("number").and_then(|v| v.as_u64()))
+                .collect();
+            journal.prune_closed_heads(provider, repository, &open)?;
         }
     }
     if report.blocked.is_none() {
@@ -879,6 +898,7 @@ const SCHEMA_VERSION: i64 = 2;
 pub struct RuleJournal {
     pub(crate) db: Connection,
     native_repository: String,
+    quarantine: PathBuf,
     _access: crate::local_recovery::AccessGuard,
 }
 impl RuleJournal {
@@ -918,12 +938,15 @@ impl RuleJournal {
         }
         if app == APPLICATION_ID && version == 1 {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            quarantine_rows(&tx, &native_repository, &directory.join(QUARANTINE_FILE))?;
             validate_recovery(&tx, &native_repository)?;
             tx.execute_batch(crate::operating_policy::SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
-        let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let quarantine = directory.join(QUARANTINE_FILE);
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        quarantine_rows(&tx, &native_repository, &quarantine)?;
         validate_recovery(&tx, &native_repository)?;
         tx.commit()?;
         db.execute_batch(
@@ -932,6 +955,7 @@ impl RuleJournal {
         Ok(Self {
             db,
             native_repository,
+            quarantine,
             _access: access,
         })
     }
@@ -1061,8 +1085,11 @@ impl RuleJournal {
     }
     /// Whether every pull request rule that is not policy-owned has evaluated this head, base
     /// and label set at its current generation; an edited or re-enabled rule evaluates again.
-    fn head_settled(&self, key: &str, repository: &str) -> Result<bool> {
+    fn head_settled(&self, proposal: &str, key: &str, repository: &str) -> Result<bool> {
         for (rule_id, generation) in self.legacy_head_rules(repository)? {
+            if head_ran(&self.db, &head_prefix(proposal), &rule_id)? {
+                continue;
+            }
             let observed: Option<i64> = self
                 .db
                 .query_row(
@@ -1090,6 +1117,67 @@ impl RuleJournal {
             }
         }
         Ok(rules)
+    }
+    /// Drop head events, with their observations, of pull requests that are no longer open and
+    /// started no run. `open` must come from a complete listing.
+    fn prune_closed_heads(
+        &mut self,
+        provider: &str,
+        repository: &ConnectedRepository,
+        open: &BTreeSet<u64>,
+    ) -> Result<()> {
+        let prefix = format!(
+            "{provider}\0{}\0{}\0",
+            repository.host, repository.repository_id
+        );
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stmt = tx.prepare("SELECT semantic_key FROM pipeline_events WHERE substr(CAST(semantic_key AS BLOB),1,length(CAST(?1 AS BLOB)))=CAST(?1 AS BLOB) AND NOT EXISTS(SELECT 1 FROM pipeline_dispatches d WHERE d.event_key=pipeline_events.semantic_key)")?;
+        let keys = stmt
+            .query_map([&prefix], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for key in keys {
+            let number = key[prefix.len()..]
+                .split('\0')
+                .next()
+                .and_then(|v| v.parse::<u64>().ok());
+            if key.contains("\0pull_request\0") && number.is_some_and(|n| !open.contains(&n)) {
+                tx.execute(
+                    "DELETE FROM pipeline_observations WHERE event_key=?1",
+                    [&key],
+                )?;
+                tx.execute("DELETE FROM pipeline_events WHERE semantic_key=?1", [&key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Rows moved out of the journal on open: how many, and the newest few without their bodies.
+    pub fn quarantined(&self) -> Result<serde_json::Value> {
+        use std::io::BufRead;
+        let file = match std::fs::File::open(&self.quarantine) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(serde_json::json!({"count":0,"newest":[]}));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut count = 0u64;
+        let mut newest = std::collections::VecDeque::new();
+        for line in std::io::BufReader::new(file).lines() {
+            let mut entry: serde_json::Value = serde_json::from_str(&line?)?;
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove("body");
+            }
+            count += 1;
+            newest.push_back(entry);
+            if newest.len() > 8 {
+                newest.pop_front();
+            }
+        }
+        Ok(serde_json::json!({"count":count,"newest":newest,"file":QUARANTINE_FILE}))
     }
     /// Pull request heads a rule could not evaluate, newest first.
     pub fn unevaluated(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -1228,6 +1316,10 @@ impl RuleJournal {
         }
         let mut accepted = Vec::new();
         for mut rule in selected {
+            // A rule never fires on the other event kind; recording that would only grow the journal.
+            if rule.trigger.event != event.kind {
+                continue;
+            }
             let mut matched = preview(&rule, event);
             // A different repository is rejected before any observation is retained.
             if rule.provider != event.provider
@@ -1244,7 +1336,14 @@ impl RuleJournal {
                     "DELETE FROM pipeline_observations WHERE semantic_key=?1 AND rule_generation<>?2 AND NOT EXISTS(SELECT 1 FROM pipeline_dispatches d WHERE d.semantic_key=?1)",
                     params![semantic, rule.generation],
                 )?;
-                if matched.matches && head_ran(&tx, event, &rule.rule_id)? {
+                let prefix = head_prefix(&proposal_key(
+                    &event.provider,
+                    &event.host,
+                    event.provider_repository_id,
+                    event.proposal_number,
+                    &event.accepted_commit,
+                ));
+                if matched.matches && head_ran(&tx, &prefix, &rule.rule_id)? {
                     matched.matches = false;
                     matched.reasons = vec!["this head already ran for this rule".into()];
                 }
@@ -1304,9 +1403,9 @@ impl RuleJournal {
             }
         }
         // Refuse here, rolling back, what opening the journal would later refuse.
-        if payload_bytes(&tx)? > MAX_JOURNAL_PAYLOAD {
+        if payload_bytes(&tx)? > MAX_JOURNAL_PAYLOAD || over_row_caps(&tx)? {
             return Err(Error::Limit(
-                "pipeline journal payload budget reached; no event accepted".into(),
+                "pipeline journal row or payload budget reached; no event accepted".into(),
             ));
         }
         tx.commit()?;
@@ -1463,19 +1562,161 @@ fn prune_superseded_heads(db: &Connection, event: &ConfirmedMerge) -> Result<()>
     Ok(())
 }
 /// Whether this rule already dispatched this head under any base or label set.
-fn head_ran(db: &Connection, event: &ConfirmedMerge, rule_id: &str) -> Result<bool> {
-    let prefix = head_prefix(&proposal_key(
-        &event.provider,
-        &event.host,
-        event.provider_repository_id,
-        event.proposal_number,
-        &event.accepted_commit,
-    ));
+fn head_ran(db: &Connection, prefix: &str, rule_id: &str) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM pipeline_dispatches WHERE rule_id=?1 AND substr(CAST(event_key AS BLOB),1,length(CAST(?2 AS BLOB)))=CAST(?2 AS BLOB))",
         params![rule_id, prefix],
         |r| r.get(0),
     )?)
+}
+const QUARANTINE_FILE: &str = "quarantine.jsonl";
+/// Event, observation and dispatch rows that `validate_recovery` would refuse one at a time
+/// (oversized, unparseable, invalid or unbound) are appended to `quarantine.jsonl` and removed
+/// with the rows that depend on them, so one bad row never stops the journal from opening.
+/// Whole-journal problems (identity, schema, integrity, binding, rules) still refuse.
+fn quarantine_rows(db: &Connection, native: &str, file: &Path) -> Result<usize> {
+    let tables: i64 = db.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('pipeline_rules','pipeline_events','pipeline_observations','pipeline_dispatches')",
+        [],
+        |r| r.get(0),
+    )?;
+    if tables != 4 {
+        return Ok(0);
+    }
+    let mut rules = std::collections::BTreeMap::new();
+    let mut stmt = db.prepare("SELECT rule_id,body FROM pipeline_rules")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, body) = row?;
+        // A bad rule is the operator's to fix; the strict check reports it.
+        let Ok(rule) = serde_json::from_str::<PipelineRule>(&body) else {
+            return Ok(0);
+        };
+        rules.insert(id, rule.generation);
+    }
+    drop(stmt);
+    let rows = |sql: &str| -> Result<Vec<(String, String, Vec<u8>)>> {
+        let mut stmt = db.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    };
+    let mut moved: Vec<(&str, String, &str, Vec<u8>)> = Vec::new();
+    let mut bad_events = BTreeSet::new();
+    for (key, _, body) in rows("SELECT semantic_key,'',CAST(body AS BLOB) FROM pipeline_events")? {
+        let reason = if body.len() > MAX_EVENT_BODY {
+            "oversized"
+        } else {
+            match serde_json::from_slice::<ConfirmedMerge>(&body) {
+                Err(_) => "malformed",
+                Ok(e)
+                    if validate_event(&e).is_err()
+                        || event_key(&e) != key
+                        || ensure_binding(
+                            db,
+                            native,
+                            &e.provider,
+                            &e.host,
+                            e.provider_repository_id,
+                        )
+                        .is_err() =>
+                {
+                    "invalid"
+                }
+                Ok(_) => continue,
+            }
+        };
+        bad_events.insert(key.clone());
+        moved.push(("pipeline_events", key, reason, body));
+    }
+    let mut bad_observations = BTreeSet::new();
+    for (key, event, reasons) in
+        rows("SELECT semantic_key,event_key,CAST(reasons AS BLOB) FROM pipeline_observations")?
+    {
+        let rule = key
+            .strip_prefix(&format!("{event}\0"))
+            .and_then(|id| rules.get(id));
+        let generation: i64 = db.query_row(
+            "SELECT rule_generation FROM pipeline_observations WHERE semantic_key=?1",
+            [&key],
+            |r| r.get(0),
+        )?;
+        let parsed = serde_json::from_slice::<Vec<String>>(&reasons);
+        let reason = if bad_events.contains(&event) {
+            "event quarantined"
+        } else if reasons.len() > 32768 {
+            "oversized"
+        } else if parsed
+            .as_ref()
+            .map_or(true, |r| r.len() > MAX_OBSERVATION_REASONS)
+        {
+            "malformed"
+        } else if rule.is_none_or(|current| generation < 1 || generation > *current) {
+            "invalid"
+        } else {
+            continue;
+        };
+        bad_observations.insert(key.clone());
+        moved.push(("pipeline_observations", key, reason, reasons));
+    }
+    for (key, event, body) in
+        rows("SELECT semantic_key,event_key,CAST(body AS BLOB) FROM pipeline_dispatches")?
+    {
+        let reason = if bad_events.contains(&event) || bad_observations.contains(&key) {
+            "observation quarantined"
+        } else if body.len() > 524288 {
+            "oversized"
+        } else if serde_json::from_slice::<PendingDispatch>(&body).is_err() {
+            "malformed"
+        } else {
+            continue;
+        };
+        moved.push(("pipeline_dispatches", key, reason, body));
+    }
+    if moved.is_empty() {
+        return Ok(0);
+    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(file)?;
+    for (table, key, reason, body) in &moved {
+        let line = serde_json::json!({"table":table,"key":key.replace('\0', "/"),"reason":reason,"bytes":body.len(),"body":String::from_utf8_lossy(body)});
+        writeln!(out, "{line}")?;
+    }
+    out.sync_all()?;
+    // Dependents first, so no reference is left dangling.
+    for table in [
+        "pipeline_dispatches",
+        "pipeline_observations",
+        "pipeline_events",
+    ] {
+        for (_, key, _, _) in moved.iter().filter(|m| m.0 == table) {
+            db.execute(&format!("DELETE FROM {table} WHERE semantic_key=?1"), [key])?;
+        }
+    }
+    Ok(moved.len())
+}
+/// Row caps `validate_recovery` enforces; `accept` checks them before it commits.
+const ROW_CAPS: [(&str, i64); 5] = [
+    ("pipeline_rules", 256),
+    ("pipeline_events", 100_000),
+    ("pipeline_observations", 100_000),
+    ("pipeline_dispatches", 100_000),
+    ("pipeline_polls", 256),
+];
+fn over_row_caps(db: &Connection) -> Result<bool> {
+    for (table, limit) in ROW_CAPS {
+        let count: i64 =
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        if count > limit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 const PAYLOAD_COLUMNS: [(&str, &str, i64); 4] = [
     ("pipeline_rules", "body", 262144),
@@ -2200,13 +2441,7 @@ pub(crate) fn validate_recovery(db: &Connection, native: &str) -> Result<()> {
     }
     let bound:Option<(String,String,String,i64)>=db.query_row("SELECT native_repository,provider,host,provider_repository_id FROM pipeline_binding WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let mut bytes = 0i64;
-    for (table, limit) in [
-        ("pipeline_rules", 256),
-        ("pipeline_events", 100_000),
-        ("pipeline_observations", 100_000),
-        ("pipeline_dispatches", 100_000),
-        ("pipeline_polls", 256),
-    ] {
+    for (table, limit) in ROW_CAPS {
         let count: i64 =
             db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
         if count > limit || (bound.is_none() && count != 0) {

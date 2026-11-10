@@ -439,7 +439,7 @@ pub async fn run(data: &Path, command: PipelineCommand) -> Result<Value> {
                 None
             };
             Ok(
-                json!({"rules":journal.rules()?,"dispatches":dispatches,"next_before":next_before,"polls":journal.polls()?,"unevaluated":journal.unevaluated(64)?}),
+                json!({"rules":journal.rules()?,"dispatches":dispatches,"next_before":next_before,"polls":journal.polls()?,"unevaluated":journal.unevaluated(64)?,"quarantined":journal.quarantined()?}),
             )
         }
         PipelineCommand::Preview {
