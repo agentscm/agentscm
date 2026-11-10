@@ -195,11 +195,11 @@ impl Client {
 type Clients = BTreeMap<(String, String), Client>;
 /// Per agent token and Hub session name.
 static SESSIONS: Mutex<Clients> = Mutex::new(BTreeMap::new());
-/// Per agent token and the proxy's installation id: the last `initialize` `clientInfo` and when
-/// it came, which names no session (the endpoint is stateless) until a tool call from the same
-/// proxy does.
-static INITIALIZED: Mutex<BTreeMap<(String, String), (String, String, i64)>> =
-    Mutex::new(BTreeMap::new());
+/// Client name, version and when its `initialize` came.
+type Initialized = BTreeMap<(String, String), (String, String, i64)>;
+/// Per agent token and the proxy's installation id: the last `initialize` `clientInfo`, which
+/// names no session (the endpoint is stateless) until a tool call from the same proxy does.
+static INITIALIZED: Mutex<Initialized> = Mutex::new(BTreeMap::new());
 
 /// Past the cap, drops the entry seen longest ago.
 fn bounded<K: Ord + Clone, V>(map: &mut BTreeMap<K, V>, seen: impl Fn(&V) -> i64) {
@@ -340,6 +340,18 @@ impl Answered {
     }
 }
 
+/// Queued, or delivered and still unanswered after a while: the reply that carried it may have
+/// been lost.
+fn due(message: &Message, now: i64) -> bool {
+    match message.state {
+        MessageState::Queued => true,
+        MessageState::Delivered => message
+            .delivered_at
+            .is_none_or(|at| now - at >= REOFFER_SECS),
+        _ => false,
+    }
+}
+
 /// The queued messages for this session, marked delivered via `via`; `None` when there are
 /// none or the person's mode is `ignore`. Only a writing token's own session receives them.
 pub fn take(
@@ -357,16 +369,9 @@ pub fn take(
     }
     let owner = &principal.owner.id;
     let key = messages_key(owner, repository_id);
-    // A read without the lock first: most calls have nothing to deliver. Delivered but still
-    // unanswered counts again after a while: the reply that carried it may have been lost.
-    let waiting = |m: &Message| {
-        let due = match m.state {
-            MessageState::Queued => true,
-            MessageState::Delivered => m.delivered_at.is_none_or(|at| now - at >= REOFFER_SECS),
-            _ => false,
-        };
-        due && m.token == principal.token_id && m.session == session
-    };
+    // A read without the lock first: most calls have nothing to deliver.
+    let waiting =
+        |m: &Message| due(m, now) && m.token == principal.token_id && m.session == session;
     if !load(store, &key)?.iter().any(waiting) {
         return Ok(None);
     }
@@ -666,7 +671,7 @@ async fn send(
     let (user, repository_id, tokens) = scoped(&state, &human, &body.repository).await?;
     if !tokens.iter().any(|(id, _)| *id == body.token) {
         return Err(
-            ApiError::new(StatusCode::FORBIDDEN, "not_your_session").with_message(
+            ApiError::new(StatusCode::FORBIDDEN, "not_your_agent").with_message(
                 "Messages go only to sessions your own agent tokens for this repository lead",
             ),
         );
@@ -804,6 +809,25 @@ mod tests {
             done.contains("is now done") && !done.contains("verified"),
             "{done}"
         );
+    }
+
+    #[test]
+    fn an_unanswered_delivery_is_offered_again_and_an_answered_one_never() {
+        let mut m = message("msg_1", 0);
+        assert!(due(&m, 0));
+        m.state = MessageState::Delivered;
+        m.delivered_at = Some(100);
+        assert!(!due(&m, 100 + REOFFER_SECS - 1));
+        assert!(due(&m, 100 + REOFFER_SECS));
+        for answered in [
+            MessageState::Accepted,
+            MessageState::Declined,
+            MessageState::Done,
+            MessageState::Withdrawn,
+        ] {
+            m.state = answered;
+            assert!(!due(&m, 100 + REOFFER_SECS));
+        }
     }
 
     #[test]

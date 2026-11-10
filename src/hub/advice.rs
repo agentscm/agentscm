@@ -38,12 +38,16 @@ pub(super) fn invisible(c: char) -> bool {
 /// Third-party text on one line, without control or invisible characters or `"` (-> `'`), at most `max` chars.
 /// It never carries the words that open a Hub message (`agent_messages::FRAME`).
 pub fn sanitize(text: &str, max: usize) -> String {
-    let text = unframed(
-        text.chars()
-            .filter(|c| !c.is_control() && !invisible(*c))
-            .map(|c| if c == '"' { '\'' } else { c })
-            .collect(),
-    );
+    unframed(clean(text, max).chars().collect())
+}
+
+/// [`sanitize`] without the Hub message rewrite, for checks on text stored before it existed.
+pub(super) fn clean(text: &str, max: usize) -> String {
+    let text: String = text
+        .chars()
+        .filter(|c| !c.is_control() && !invisible(*c))
+        .map(|c| if c == '"' { '\'' } else { c })
+        .collect();
     if text.chars().count() <= max {
         return text;
     }
