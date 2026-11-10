@@ -1853,8 +1853,10 @@ mod tests {
             Some("quiet-session"),
             observations.epoch(),
         );
+        // Observations stamp the wall clock, and a read leaves out rows stamped after its time.
+        let read_at = crate::hub::store::unix_now();
         // Right after MCP verifies, an unseen edit hook is not yet a problem.
-        let early = super::read(store, &observations, &viewer, now).unwrap();
+        let early = super::read(store, &observations, &viewer, read_at).unwrap();
         assert!(
             !early
                 .actions
@@ -1865,7 +1867,7 @@ mod tests {
             store,
             &observations,
             &viewer,
-            now + crate::hub::setup_attention::EDIT_HOOK_GRACE_SECONDS,
+            read_at + crate::hub::setup_attention::EDIT_HOOK_GRACE_SECONDS,
         )
         .unwrap();
         assert!(

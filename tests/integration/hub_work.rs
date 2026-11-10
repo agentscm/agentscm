@@ -1899,19 +1899,8 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
         .work_briefing(&lead.token, &BriefingQuery::default(), now)
         .unwrap();
     assert!(open.complete);
-    assert_invalid(
-        store.work_compact(&scope, now - 86_400, false, now),
-        "work compaction is blocked by an unacknowledged briefing delivery",
-    );
-    store
-        .work_ack(
-            &lead.token,
-            &BriefingAck {
-                delivery: open.delivery.unwrap(),
-            },
-            now,
-        )
-        .unwrap();
+    // An open delivery no longer blocks compaction; the delivery it cuts is ended below.
+    let open_delivery = open.delivery.unwrap();
 
     let preview = store
         .work_compact(&scope, now - 86_400, false, now)
@@ -1933,6 +1922,17 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
     assert_eq!(compacted.deleted_operations, 1);
     assert_eq!(compacted.deleted_versions, 1);
     assert_eq!(compacted.retention_floor, baseline.receipt.event_seq);
+    // Its window started below the raised floor, so acknowledging it now fails.
+    assert_invalid(
+        store.work_ack(
+            &lead.token,
+            &BriefingAck {
+                delivery: open_delivery,
+            },
+            now,
+        ),
+        "delivery is unknown or incomplete",
+    );
     let (used, aggregate) = db.work_usage_and_aggregate();
     assert_eq!(used, aggregate);
 

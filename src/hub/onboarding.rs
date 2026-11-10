@@ -263,14 +263,50 @@ impl Row {
 }
 
 type Key = (String, String, Agent, String);
-/// Setup rows, their invalidation epoch, and the sessions waiting for their person (kept here
-/// because every shared-status read already holds these short-lived observations).
+/// Setup rows, their invalidation epoch, the sessions waiting for their person, and the sessions
+/// already told to declare their Work (kept here because every shared-status read already holds
+/// these short-lived observations).
 #[derive(Default)]
 pub struct Observations(
     Mutex<BTreeMap<Key, Row>>,
     AtomicU64,
     super::session_waiting::Waiting,
+    StartNudges,
 );
+
+/// Native sessions already told once to declare their Work, by repository, agent token and
+/// session ID, so a repeat of the edit passes. In memory and bounded like the waits: after a Hub
+/// restart, or a day, a session is told once more. A full table drops its oldest row.
+#[derive(Default)]
+pub struct StartNudges(Mutex<BTreeMap<(String, String, String), i64>>);
+
+impl StartNudges {
+    const MAX_ROWS: usize = 4096;
+    const KEEP_SECONDS: i64 = 24 * 60 * 60;
+
+    /// Records that this session is told now. False when it already was within the day, so the
+    /// caller tells it nothing.
+    pub(super) fn first(&self, repository: &str, token: &str, session: &str, now: i64) -> bool {
+        let Ok(mut seen) = self.0.lock() else {
+            return false;
+        };
+        seen.retain(|_, at| now - *at < Self::KEEP_SECONDS);
+        let key = (repository.to_owned(), token.to_owned(), session.to_owned());
+        if seen.contains_key(&key) {
+            return false;
+        }
+        if seen.len() >= Self::MAX_ROWS
+            && let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+        {
+            seen.remove(&oldest);
+        }
+        seen.insert(key, now);
+        true
+    }
+}
 
 /// Capture before authentication/body waits. A Hub-wide conservative fence rejects
 /// in-flight proof if any lifecycle/blocker invalidation occurred while it waited.
@@ -300,6 +336,9 @@ pub fn client(headers: &HeaderMap) -> Option<&str> {
 impl Observations {
     pub(super) fn waiting(&self) -> &super::session_waiting::Waiting {
         &self.2
+    }
+    pub(super) fn start_nudges(&self) -> &StartNudges {
+        &self.3
     }
     pub(super) fn epoch(&self) -> u64 {
         self.1.load(Ordering::SeqCst)
@@ -714,6 +753,44 @@ impl Observations {
 mod tests {
     use super::*;
     use crate::hub::store::{ForgeIdentity, User};
+
+    #[test]
+    fn a_session_is_told_to_declare_its_work_once_a_day() {
+        let nudges = StartNudges::default();
+        assert!(nudges.first("o/r", "tok_a", "s1", 1_000));
+        assert!(
+            !nudges.first("o/r", "tok_a", "s1", 1_001),
+            "the repeat passes"
+        );
+        assert!(
+            nudges.first("o/r", "tok_a", "s2", 1_002),
+            "another session is told"
+        );
+        assert!(
+            nudges.first("o/r", "tok_b", "s1", 1_003),
+            "another token is told"
+        );
+        assert!(
+            nudges.first("o/other", "tok_a", "s1", 1_004),
+            "another repository is told"
+        );
+        let day = StartNudges::KEEP_SECONDS;
+        assert!(
+            nudges.first("o/r", "tok_a", "s1", 1_000 + day),
+            "told again a day later"
+        );
+        // A full table drops its oldest row rather than telling nobody.
+        let full = StartNudges::default();
+        for n in 0..StartNudges::MAX_ROWS {
+            assert!(full.first("o/r", "tok", &format!("s{n}"), 2_000 + n as i64));
+        }
+        assert!(full.first("o/r", "tok", "late", 9_000));
+        assert!(
+            full.first("o/r", "tok", "s0", 9_001),
+            "the oldest was dropped"
+        );
+        assert!(!full.first("o/r", "tok", "late", 9_002));
+    }
 
     fn principal(token: &str) -> Principal {
         Principal {

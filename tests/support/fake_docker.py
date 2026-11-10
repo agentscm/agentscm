@@ -26,7 +26,10 @@ def load():
     return json.loads(state_path.read_text()) if state_path.exists() else None
 
 def save(value):
-    state_path.write_text(json.dumps(value, separators=(",", ":")))
+    # Replace, never rewrite in place: a CLI killed mid-save must not tear the daemon's state.
+    temporary = state_path.with_name(f"state.json.{os.getpid()}")
+    temporary.write_text(json.dumps(value, separators=(",", ":")))
+    os.replace(temporary, state_path)
 
 if args[:1] == ["info"]:
     if scenario == "hanging_probe":

@@ -48,6 +48,7 @@ mod client_config;
 mod client_mcp;
 #[cfg(unix)]
 mod client_plugin;
+mod client_session;
 #[cfg(unix)]
 mod client_setup;
 mod client_status;

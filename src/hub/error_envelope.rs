@@ -516,6 +516,12 @@ pub fn from_hub_error(error: &HubError) -> ErrorEnvelope {
             envelope
                 .details
                 .insert("limit".into(), json!(capacity.limit.as_str()));
+            // Only full storage needs the operator; every other limit is the agent's to clear.
+            if let Some(remedy) = capacity.limit.agent_remedy() {
+                let what = capacity.limit.what();
+                envelope.message = format!("{}{}: {remedy}.", what[..1].to_uppercase(), &what[1..]);
+                envelope.recovery = RecoveryAction::InspectWork.recovery();
+            }
         }
         HubError::WorkOverlap(overlaps) => {
             envelope.details.insert("overlaps".into(), json!(overlaps));

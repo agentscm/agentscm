@@ -110,8 +110,8 @@ use super::work::{
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
-    claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
-    work_overlap_pairs, work_payload_row_bytes,
+    claim_status, delivery_cuts, fit_json_budget, normalized_scope, scope_overlap_reasons,
+    uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_lifecycle::{
     CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
@@ -4361,6 +4361,7 @@ fn start_in(
                 if !named {
                     return Err(HubError::lease_lapsed(lapsed_unheld_text(
                         &item.id,
+                        item.generation,
                         renewed,
                         expired,
                         Unheld::UnnamedStart,
@@ -5789,6 +5790,7 @@ fn guard_managed_touch(
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
         return Err(HubError::lease_lapsed(lapsed_unheld_text(
             &eligible[0].id,
+            eligible[0].generation,
             renewed,
             expired,
             Unheld::Edit,
@@ -10619,7 +10621,7 @@ impl Store for PgStore {
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {
-                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
+                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id,item.generation, renewed, expired, Unheld::Retain)));
             }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
@@ -13166,40 +13168,6 @@ impl Store for PgStore {
                 scope.repository_id,
             )?;
             let catchup_repository=repository_namespace(&scope.repository,scope.repository_id);
-            let active_deliveries: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM hub_work_deliveries
-                     WHERE provider = $1 AND host = $2 AND repository = $3
-                       AND repository_id IS NOT DISTINCT FROM $4
-                       AND NOT acknowledged AND updated_at >= $5",
-                    &[
-                        &scope.provider,
-                        &scope.host,
-                        &scope.repository,
-                        &scope.repository_id,
-                        &now.saturating_sub(86_400),
-                    ],
-                )?
-                .get(0);
-            if active_deliveries > 0 {
-                return Err(HubError::Invalid(
-                    "work compaction is blocked by an unacknowledged briefing delivery".into(),
-                ));
-            }
-            let active_catchup_deliveries: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM hub_catchup_deliveries
-                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
-                       AND NOT acknowledged AND NOT superseded AND updated_at>=$5",
-                    &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,
-                        &now.saturating_sub(86_400)],
-                )?
-                .get(0);
-            if active_catchup_deliveries > 0 {
-                return Err(HubError::Invalid(
-                    "work compaction is blocked by an unacknowledged catch-up delivery".into(),
-                ));
-            }
             let(current_merge_floor,merge_highwater)=tx.query_opt(
                 "SELECT merge_floor_seq,next_merge_seq-1 FROM hub_catchup_repositories
                  WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)",
@@ -13525,6 +13493,44 @@ impl Store for PgStore {
                         )?;
                     }
                 }
+                // An open delivery pages the live tables, so one whose window starts below a raised
+                // floor would skip removed records; end it, and the agent's next read reports the gap.
+                let (event_cut, merge_cut) = delivery_cuts(
+                    [
+                        current_event_floor,
+                        current_snapshot_floor,
+                        current_coordination_floor,
+                    ],
+                    [event_floor, retention_floor, coordination_floor],
+                    current_merge_floor,
+                    merge_retention_floor,
+                );
+                tx.execute(
+                    "DELETE FROM hub_work_deliveries
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4
+                       AND NOT acknowledged AND from_seq < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &event_cut,
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM hub_catchup_deliveries
+                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
+                       AND NOT acknowledged AND (event_from<$5 OR merge_from<$6)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &catchup_repository,
+                        &scope.repository_id,
+                        &event_cut,
+                        &merge_cut,
+                    ],
+                )?;
                 let charged = work_payload_bytes(
                     &mut tx,
                     &scope.provider,

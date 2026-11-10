@@ -530,7 +530,7 @@ Registered codes:
 | `wrong_repository` | 403 | no | `reconnect` |
 | `busy` | 503 | yes | `retry` |
 | `unavailable` | 503 | yes | `retry` |
-| `work_storage_capacity` | 503 | no | `contact_operator` |
+| `work_storage_capacity` | 503 | no | `contact_operator` for `limit` `work_storage` or `merge_observations`; otherwise `inspect_work`, and the message names the limit and what the agent can do itself (for `coordination_requests`, the per-token, per-person and per-repository caps and resolving or withdrawing its own open requests). It stays 503 with `retryable: false` even when the message says "then retry": an unchanged retry is refused again, and only a new attempt after the agent cleared the limit can succeed |
 | `work_scope_overlap` | 409 | no | `inspect_work` |
 | `work_coordination_required` | 409 | no | `inspect_work` |
 | `work_overlap_incomplete` | 503 | yes | `retry` |
