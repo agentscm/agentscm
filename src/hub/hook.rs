@@ -125,8 +125,8 @@ enum Kind {
     /// Any other tool call: renews the lead session's lease, writes nothing else, says nothing.
     /// A shell call's start and end keep the lease live while it runs.
     Activity(CallPhase),
-    /// The session stopped to wait for its person; its next call ends the wait. Writes nothing
-    /// to the store and says nothing.
+    /// The session stopped to wait for its person, or on its own background work; its next call
+    /// ends the wait. Writes nothing to the store and says nothing.
     Waiting(WaitReason),
     Done,
     Fail(&'static str),
@@ -174,6 +174,12 @@ struct Call {
     asker: Option<String>,
     /// What a wait asks of its person, as the hook client excerpted it. Kept only on a wait.
     asks: Option<String>,
+    /// This client's hook can carry added context at a prompt or checked tool call (Claude
+    /// Code, Codex, Cursor, Copilot's PascalCase hooks); Copilot CLI's and generic hooks cannot.
+    context_hook: bool,
+    /// The host's own notice that it shows a permission prompt to a person, which confirms a
+    /// request to answer that prompt from the Hub (`permission_answer`).
+    prompt_shown: bool,
 }
 
 struct Outcome {
@@ -384,7 +390,8 @@ async fn hook(
                     &principal.token_id,
                     &session,
                     &call.via,
-                    context,
+                    !call.child,
+                    call.context_hook,
                     unix_now(),
                 );
                 // An unknown reply loses its text after the session's first, so it takes nothing.
@@ -525,6 +532,8 @@ impl Call {
             child: false,
             asker: None,
             asks: None,
+            context_hook: false,
+            prompt_shown: false,
         }
     }
 
@@ -614,13 +623,17 @@ impl Call {
             _ => return Self::failed(agent, "hook payload not understood"),
         };
         let scope = scope(&v, root);
-        match agent {
-            Agent::Claude | Agent::Codex => pascal(agent, &v, &scope),
-            Agent::Copilot if v.get("hook_event_name").is_some() => pascal(agent, &v, &scope),
-            Agent::Copilot => copilot(&v, &scope),
-            Agent::Cursor => cursor(&v, &scope),
-            Agent::Generic => generic(&v, &scope),
-        }
+        let (mut call, context_hook) = match agent {
+            Agent::Claude | Agent::Codex => (pascal(agent, &v, &scope), true),
+            Agent::Copilot if v.get("hook_event_name").is_some() => {
+                (pascal(agent, &v, &scope), true)
+            }
+            Agent::Copilot => (copilot(&v, &scope), false),
+            Agent::Cursor => (cursor(&v, &scope), true),
+            Agent::Generic => (generic(&v, &scope), false),
+        };
+        call.context_hook = context_hook;
+        call
     }
 
     /// Whether the reply can carry text to the agent, so a handoff can be delivered with it.
@@ -706,6 +719,9 @@ impl Call {
                     });
                     if let Err(error) = recorded {
                         eprintln!("hub: waiting hook not recorded: {error}");
+                    } else if self.prompt_shown {
+                        let requests = state.onboarding.permissions();
+                        requests.confirm(&principal.token_id, &native, unix_now());
                     }
                 }
                 Ok(Outcome::clean())
@@ -1371,14 +1387,23 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         // Fires only where a person types, so it reaches the session they are talking to. The
         // prompt itself is never read; the client does not forward it.
         Some("UserPromptSubmit") => call(Kind::Prompt, Shape::Hook("UserPromptSubmit")),
-        // Only the facts of the wait are read: never the message, tool input or question.
-        Some("PreToolUse") if tool == ASK_USER_QUESTION => waiting(WaitReason::Question),
+        // Only the facts of the wait are read: never the message, tool input or question. A
+        // question raises its own permission request, which must not turn its wait into a
+        // permission wait. Answering a permission prompt from the Hub is in `permission_answer`.
+        Some("PreToolUse" | "PermissionRequest") if tool == ASK_USER_QUESTION => {
+            waiting(WaitReason::Question)
+        }
         Some("PermissionRequest") => waiting(WaitReason::Permission),
         Some("Notification") => match notified(str_at(v, "notification_type")) {
-            Some(reason) => waiting(reason),
+            Some(reason) => {
+                let mut call = waiting(reason);
+                call.prompt_shown = reason == WaitReason::Permission;
+                call
+            }
             None => call(Kind::Ignore, Shape::Silent),
         },
-        // Paused on its own background work, which will resume it, not on the person.
+        // Paused on its own background work, which will resume it, not on the person: nobody
+        // is asked, but the Work it leads is not quiet.
         // The client sends the count; a legacy hook sends Claude Code's own list.
         Some("Stop")
             if v["background_tasks"].as_u64().is_some_and(|n| n > 0)
@@ -1386,7 +1411,7 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
                     .as_array()
                     .is_some_and(|tasks| !tasks.is_empty()) =>
         {
-            call(Kind::Ignore, Shape::Silent)
+            call(Kind::Waiting(WaitReason::Background), Shape::Silent)
         }
         Some("Stop") => waiting(WaitReason::Idle),
         Some("PreToolUse") if is_edit(tool) => {
@@ -1789,6 +1814,26 @@ mod tests {
     }
 
     #[test]
+    fn hub_messages_ride_the_hooks_that_can_carry_context() {
+        let pascal: &[u8] = br#"{"hook_event_name":"SessionStart","session_id":"s"}"#;
+        let copilot_cli: &[u8] = br#"{"sessionId":"s","source":"new"}"#;
+        let cursor: &[u8] = br#"{"hook_event_name":"sessionStart","session_id":"s"}"#;
+        let generic: &[u8] = br#"{"event":"start","agent":"gemini","session":"s"}"#;
+        for (agent, body, carries) in [
+            (Agent::Claude, pascal, true),
+            (Agent::Codex, pascal, true),
+            (Agent::Copilot, pascal, true),
+            (Agent::Copilot, copilot_cli, false),
+            (Agent::Cursor, cursor, true),
+            (Agent::Generic, generic, false),
+        ] {
+            let call = Call::parse(agent, body, None);
+            assert_ne!(call.kind, Kind::Ignore, "{agent:?}");
+            assert_eq!(call.context_hook, carries, "{agent:?}");
+        }
+    }
+
+    #[test]
     fn context_is_cut_at_a_line_within_the_limit() {
         let units = |text: &str| text.chars().map(char::len_utf16).sum::<usize>();
         assert_eq!(fit_context("short\ntext", 100), "short\ntext");
@@ -2135,7 +2180,7 @@ mod tests {
 
     #[test]
     fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
-        use WaitReason::{Idle, Permission, Question};
+        use WaitReason::{Background, Idle, Permission, Question};
         let wait = |agent, v: Value| {
             let call = parse(agent, &v);
             assert_eq!(
@@ -2171,6 +2216,11 @@ mod tests {
             ),
             (
                 Agent::Claude,
+                json!({"hook_event_name":"PermissionRequest","session_id":"s","tool_name":"AskUserQuestion"}),
+                Some(Question),
+            ),
+            (
+                Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}),
                 Some(Idle),
             ),
@@ -2178,12 +2228,12 @@ mod tests {
             (
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","background_tasks":2}),
-                None,
+                Some(Background),
             ),
             (
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","background_tasks":[{"id":"b"}]}),
-                None,
+                Some(Background),
             ),
             (
                 Agent::Claude,
@@ -2264,6 +2314,10 @@ mod tests {
             &json!({"hook_event_name":"PermissionRequest","session_id":"s","agent_id":"sub-1"}),
         );
         assert_eq!((sub.child, sub.asker.as_deref()), (true, Some("sub-1")));
+        // Only the host's own notice says a prompt is on screen; the request for it does not.
+        assert!(!sub.prompt_shown);
+        assert!(parse(Agent::Claude, &note("permission_prompt")).prompt_shown);
+        assert!(!parse(Agent::Claude, &note("idle_prompt")).prompt_shown);
         let camel = parse(
             Agent::Copilot,
             &json!({"sessionId":"s","notification_type":"permission_prompt","agentId":"sub-2"}),

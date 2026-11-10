@@ -839,6 +839,12 @@ hold lapses. A failure never refuses. The holder's task is cut to 80 printable A
 characters without quotes, backticks, angle brackets or markup, so it cannot
 leave its quotes; names are filtered the same way.
 
+A file that Git reports as unmerged in the editing agent's checkout is not checked while its
+conflict lasts. The connected hook client leaves that path out of its call, so this refusal,
+`EDIT_UNLINKED` and `LEASE_LAPSED` do not apply to the edit that resolves the conflict, and the
+edit holds nothing. The [agents guide](agents.md) gives the reason and the limits, under "An edit
+that resolves a Git conflict is not checked".
+
 Notes (the advice for an MCP check, Cursor, the Copilot CLI after an edit, or a
 rate-limited edit) use the same factual wording:
 

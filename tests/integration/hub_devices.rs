@@ -4036,6 +4036,130 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
     );
 }
 
+const PERMISSIONS: &str = "/v1/hub/session/permissions";
+const PERMISSION_ANSWER: &str = "/v1/hub/session/permissions/answer";
+
+/// A person allows or denies a permission prompt their own agent's session waits at: only with
+/// the web sign-in and its CSRF token, only for their own active agent, once, and only while the
+/// session still waits at that prompt.
+#[tokio::test]
+async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (token, secret) = agent_for(&env, &alice.id, "claude-code", false);
+    let session = "11111111-2222-3333-4444-555555555555";
+    // What the session's hooks send: the prompt, the host's notice that it is on screen, the
+    // registration, and the tool call that follows an answer in the session.
+    let agent = |path: &'static str, body: Value| {
+        env.call(&env.hub, Method::POST, path, Some(&secret), Some(body))
+    };
+    let prompt =
+        json!({"hook_event_name": "PermissionRequest", "session_id": session, "tool_name": "Bash"});
+    let shown = json!({"hook_event_name": "Notification", "session_id": session,
+        "notification_type": "permission_prompt"});
+    let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
+    let register = |hash: &str, complete: bool| {
+        json!({"session": session, "tool": "Bash", "display": "cargo publish",
+            "complete": complete, "input_hash": hash.repeat(64)})
+    };
+    let answer = |id: &Value, decision: &str| {
+        json!({"repository": REPO,
+            "request_id": id, "decision": decision})
+    };
+
+    assert_eq!(agent("/v1/hub/hook/claude", prompt.clone()).await.0, 200);
+    let (status, made) = agent("/v1/hub/permission/register", register("a", true)).await;
+    assert_eq!(
+        (status, &made["state"]),
+        (200, &json!("unconfirmed")),
+        "{made}"
+    );
+    let id = made["request_id"].clone();
+    // Until the host says a person can see the prompt, there is nothing to answer.
+    let early = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "deny")).await;
+    assert_eq!(early.0, 404, "{}", early.1);
+    assert_eq!(agent("/v1/hub/hook/claude", shown.clone()).await.0, 200);
+
+    // Signed out, a cookie without its CSRF token, another person and an unknown decision.
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            PERMISSION_ANSWER,
+            None,
+            Some(answer(&id, "allow")),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, refused) =
+        page_post(&env, &alice, false, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (status, refused) =
+        page_post(&env, &bob, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    let always = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "always")).await;
+    assert_eq!(always.0, 400);
+    // The list is the person's own, and shows a request only after the wait's first minute.
+    let list = format!("{PERMISSIONS}?repository={REPO}");
+    let listed = with_cookie(&env.hub, Method::GET, &list, &alice.cookie, None).await;
+    assert_eq!(listed, (200, json!({"requests": []})));
+
+    // Alice allows it once: the hook's poll hears exactly that, and the answer cannot be changed.
+    let (status, done) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(
+        (status, &done),
+        (200, &json!({"state": "answered", "decision": "allow"}))
+    );
+    let poll = json!({"request_id": id, "input_hash": "a".repeat(64), "wait_seconds": 0});
+    let (_, polled) = agent("/v1/hub/permission/poll", poll).await;
+    assert_eq!(
+        (&polled["state"], &polled["decision"]),
+        (&json!("answered"), &json!("allow"))
+    );
+    let again = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(again.0, 200);
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "deny")).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("already_answered"))
+    );
+
+    // The tool ran. The next prompt's request was cut, so it can be denied but not allowed; once
+    // the session has moved on, an answer says so.
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("b", false)).await;
+    let cut = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let allowed = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "allow")).await;
+    assert_eq!(allowed.0, 400, "{}", allowed.1);
+    agent("/v1/hub/hook/claude", ran).await;
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "deny")).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("answered_in_session"))
+    );
+
+    // A person no longer answers for an agent whose token was revoked.
+    agent("/v1/hub/hook/claude", prompt).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("c", true)).await;
+    let last = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown).await;
+    assert!(env.store.revoke_agent_token(&token).unwrap());
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&last, "deny")).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+}
+
 const AGENT_MESSAGES: &str = "/v1/hub/session/agent-messages";
 
 async fn mcp_call(env: &Env, token: &str, method: &str, params: Value) -> Value {
@@ -4077,7 +4201,8 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(page0["mode"], "manual", "{page0}");
     assert_eq!(page0["sessions"], json!([]));
 
-    // An MCP-only client: its initialize names it, its first call names its session.
+    // Gemini CLI: its initialize names it, its first call names its session. MCP alone does not
+    // show that a person leads the session rather than a subagent, so its tier is unknown.
     mcp_call(
         &env,
         &alice_secret,
@@ -4090,7 +4215,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await;
     let seen = read().await;
     let session = seen["sessions"][0].clone();
-    assert_eq!(session["tier"], "mcp", "{seen}");
+    assert_eq!(session["tier"], "unknown", "{seen}");
     assert_eq!(session["name"], "gemini-cli");
     assert_eq!(session["token_name"], "laptop");
     let s1 = session["session"].as_str().unwrap().to_owned();
@@ -4127,10 +4252,25 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(message["state"], "queued");
     let id = message["id"].as_str().unwrap().to_owned();
 
-    // A call that names no session never takes it.
+    // A call that names no session never takes it, and nor does a session shown only by MCP.
     let no_session = json!({"name":"agentscm_status","arguments":{}});
     let unnamed = texts(&mcp_call(&env, &alice_secret, "tools/call", no_session).await);
     assert!(!unnamed.contains(&id), "{unnamed}");
+    let held = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(!held.contains(&id), "{held}");
+
+    // Its hook's start carries no subagent marker, and that hook cannot carry context.
+    let response = browser()
+        .post(format!("{}/v1/hub/hook/generic", env.hub))
+        .bearer_auth(&alice_secret)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"event":"start","agent":"gemini","session":"s1"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let seen = read().await;
+    assert_eq!(seen["sessions"][0]["tier"], "mcp", "{seen}");
 
     // Delivered once, in the next tool result, as a notice that names no mode.
     let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
@@ -4161,6 +4301,14 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(forged["isError"], true, "{forged}");
+    // Without its session the Hub does not guess one: it asks for the field.
+    let unnamed = json!({"name":"agentscm_hub_message",
+        "arguments":{"id": id, "status": "accepted"}});
+    let unnamed = mcp_call(&env, &alice_secret, "tools/call", unnamed).await;
+    assert_eq!(unnamed["isError"], true, "{unnamed}");
+    let error = &unnamed["structuredContent"]["error"];
+    assert_eq!(error["recovery"]["action"], "provide_field", "{unnamed}");
+    assert_eq!(error["fields"][0]["name"], "session", "{unnamed}");
     let ok = mcp_call(&env, &alice_secret, "tools/call", answer("accepted")).await;
     assert_eq!(ok["isError"], false, "{ok}");
     let verified = texts(&ok);
@@ -4174,9 +4322,13 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(read().await["messages"][0]["state"], "done");
 
     // A hook client gets it in the next prompt's added context, with no tool call.
-    let hook = |session: &str| {
+    let hook = |session: &str, subagent: bool| {
         let (hub, secret) = (env.hub.clone(), alice_secret.clone());
-        let body = json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        let mut body =
+            json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        if subagent {
+            body["agent_id"] = json!("sub-1");
+        }
         async move {
             let response = browser()
                 .post(format!("{hub}/v1/hub/hook/claude"))
@@ -4189,7 +4341,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
             serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
         }
     };
-    hook("h1").await;
+    hook("h1", false).await;
     let h1 = read().await["sessions"]
         .as_array()
         .unwrap()
@@ -4208,12 +4360,36 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(status, 201);
-    let reply = hook("h1").await;
+    let reply = hook("h1", false).await;
     let context = reply["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_default();
     assert!(context.contains("Auto please"), "{reply}");
     assert_eq!(read().await["messages"][0]["via"], "hook:claude");
+
+    // A session seen only through a subagent's hook calls is offered nothing.
+    hook("sub1", true).await;
+    let sub = read().await["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["hook"] == "hook:claude" && s["session"] != h1.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(sub["tier"], "unknown", "{sub}");
+    let sub = sub["session"].as_str().unwrap().to_owned();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &sub, "Not for a subagent"),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let reply = hook("sub1", true).await;
+    assert!(!reply.to_string().contains("Not for a subagent"), "{reply}");
+    assert_eq!(read().await["messages"][0]["state"], "queued");
 
     // Ignore holds everything: sending is refused.
     let mode = |mode: Value| json!({"repository": REPO, "this_repository": true, "mode": mode});

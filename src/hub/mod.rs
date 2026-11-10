@@ -38,6 +38,7 @@ pub mod mcp;
 pub mod narrative;
 pub mod onboarding;
 mod overlap_detail;
+mod permission_answer;
 pub mod pickup;
 #[cfg(unix)]
 pub mod pipeline_rules;

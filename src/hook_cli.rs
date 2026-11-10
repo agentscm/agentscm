@@ -15,6 +15,8 @@ use crate::hub_cli::config_dir;
 use crate::intent_cli::{HubFile, parse_hub_file, repo_root, token_for, valid_repo};
 use crate::{client_config, client_config::Connection};
 
+mod permission;
+
 const LIMIT: Duration = Duration::from_secs(3);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
 const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
@@ -213,6 +215,11 @@ async fn hook(
     if let Some(recording) = host_session {
         let remaining = budget.saturating_duration_since(Instant::now());
         let _ = tokio::time::timeout(remaining, recording).await;
+    }
+    // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
+    // decision there. Any failure returns `reply`, which carries no decision.
+    if permission::applies(agent, client_connection, &payload) {
+        return permission::await_answer(&payload, started, reply).await;
     }
     reply
 }
@@ -480,6 +487,12 @@ async fn call_hub(
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
             }
+            let conflicted = unmerged(&routed.checkout, &routed.edits, deadline);
+            if !conflicted.is_empty() {
+                routed.edits.retain(|edit| !conflicted.contains(&edit.path));
+                routed.payload = sanitized_client(&agent, &payload, &routed.edits)?;
+                note = Some(conflict_note(&conflicted));
+            }
             if session_start {
                 // Every connected session says where it coordinates, unless something stops it.
                 let coordinating = format!(
@@ -686,9 +699,7 @@ fn branch_advisory_at(
         if !branch_marker(config, &key, "start", deadline) {
             return None;
         }
-        let git = crate::quickstart::detect::which("git")
-            .and_then(|path| path.canonicalize().ok())
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        let git = git_exe();
         let snapshot = match agentscm::git_collisions::advisory_snapshot(&git, checkout, deadline) {
             Ok(snapshot) => snapshot,
             Err(_) => return Some("AgentSCM branch advisory: local branch coverage unknown; session-start scan unavailable. Edits remain allowed.".into()),
@@ -768,6 +779,48 @@ fn branch_advisory_at(
         snapshot.observed_at, snapshot.head, snapshot.base_name, snapshot.base_commit,
         if snapshot.incomplete { ", incomplete" } else { "" }, lines.join("; "),
     ))
+}
+
+/// The Git executable for the bounded local queries, which take an absolute path.
+#[cfg(unix)]
+fn git_exe() -> PathBuf {
+    crate::quickstart::detect::which("git")
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+}
+
+/// The edit paths Git reports as unmerged in `checkout`: a merge, rebase, cherry-pick, revert or
+/// stash apply stopped on them. Resolving such a conflict is not parallel authoring: both sides
+/// are already committed, and it has to be resolved in this checkout whoever holds the file. So
+/// these paths are not sent to the Hub; the edit is checked against no hold and takes none. The
+/// normal check returns when Git no longer lists the path. Empty when Git cannot say.
+#[cfg(unix)]
+fn unmerged(checkout: &Path, edits: &[EditPath], deadline: Instant) -> Vec<String> {
+    if edits.is_empty() {
+        return Vec::new();
+    }
+    let paths: Vec<&str> = edits.iter().map(|edit| edit.path.as_str()).collect();
+    let deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+    // shortcut: one Git call for every edit (10 to 20 ms), look for Git's in-progress markers first if hook time matters
+    agentscm::git_collisions::unmerged_paths(&git_exe(), checkout, &paths, deadline)
+        .unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn unmerged(_: &Path, _: &[EditPath], _: Instant) -> Vec<String> {
+    Vec::new()
+}
+
+/// Said beside an edit of unmerged paths, so that it does not read as a silent pass.
+fn conflict_note(paths: &[String]) -> String {
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| agentscm::hub::advice::sanitize(path, 160))
+        .collect();
+    format!(
+        "AgentSCM: unresolved Git conflict in {} in this checkout, so this edit was not checked against other agents' holds and holds nothing. Change only what resolves the conflict; the normal check returns once Git no longer reports the path as unmerged.",
+        paths.join(", ")
+    )
 }
 
 #[cfg(unix)]
@@ -1201,6 +1254,8 @@ struct RoutedClient {
     checkout: PathBuf,
     endpoint_agent: String,
     payload: Value,
+    /// The call's edit paths, relative to `checkout`.
+    edits: Vec<EditPath>,
 }
 
 fn patch_text(input: &Value) -> Option<&str> {
@@ -1446,6 +1501,7 @@ fn route_client_with(
         connection,
         checkout,
         endpoint_agent: endpoint_agent.to_owned(),
+        edits: normalized,
     })
 }
 
