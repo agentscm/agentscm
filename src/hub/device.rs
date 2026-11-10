@@ -45,6 +45,8 @@ pub struct Device {
     pub revoked_at: Option<i64>,
     /// Repositories with a live agent token minted through this computer, sorted.
     pub repositories: Vec<String>,
+    /// The connected app this credential was issued to; None for a computer.
+    pub app_id: Option<String>,
 }
 
 /// An authenticated computer credential.
@@ -55,6 +57,8 @@ pub struct DevicePrincipal {
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub owner: User,
+    /// The connected app this credential was issued to; None for a computer.
+    pub app_id: Option<String>,
 }
 
 /// Why a sign-in or a computer mint was refused, for administrators.
@@ -82,11 +86,16 @@ pub struct RepositoryUsage {
 }
 
 impl Event {
-    pub(super) fn device_created(device: &str, owner: &str, name: &str) -> Result<Self> {
+    pub(super) fn device_created(
+        device: &str,
+        owner: &str,
+        name: &str,
+        app_id: Option<&str>,
+    ) -> Result<Self> {
         Self::new(
             "device_created",
             device,
-            json!({"owner": owner, "name": name}),
+            json!({"owner": owner, "name": name, "app_id": app_id}),
         )
     }
 

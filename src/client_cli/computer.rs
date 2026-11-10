@@ -1,7 +1,7 @@
 //! This computer's Hub credential on the client: mint agent tokens without a session, renew
 //! them before they end, and connect a checkout automatically. Renewal and auto-connect run as
 //! their own short processes, so a hook never waits on them past its budget.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::Method;
@@ -354,16 +354,16 @@ fn superseded(saved: &Connection, latest: &Connection, now: i64) -> bool {
         && !due(latest, now)
 }
 
-/// Renews the checkout's managed token when it is due: mint a new one, save it, then revoke
-/// the old one, so a failure part way leaves a working token.
-async fn renew(root: &Path) -> Result<Renewal> {
+/// Renews the checkout's managed token when it is due, or always with `force`: mint a new one,
+/// save it, then revoke the old one, so a failure part way leaves a working token.
+async fn renew(root: &Path, force: bool) -> Result<Renewal> {
     let Some(saved) = load()?
         .into_iter()
         .find(|connection| connection.root == root)
     else {
         return Ok(Renewal::NotDue);
     };
-    if !due(&saved, unix_now()) {
+    if !force && !due(&saved, unix_now()) {
         return Ok(Renewal::NotDue);
     }
     enroll(&saved.hub).await;
@@ -432,7 +432,7 @@ async fn renew(root: &Path) -> Result<Renewal> {
 /// `agentscm client renew`: prints one JSON line, `{"result": "renewed" | "not_due" |
 /// "unavailable" | "refused", "message"?}`.
 pub(crate) async fn renew_command(root: &Path) -> Result<()> {
-    let renewal = renew(root).await?;
+    let renewal = renew(root, false).await?;
     match &renewal {
         Renewal::Renewed => record_attention(root, None),
         Renewal::Refused(message) => record_attention(root, Some(message)),
@@ -446,6 +446,38 @@ pub(crate) async fn renew_command(root: &Path) -> Result<()> {
     };
     println!("{line}");
     Ok(())
+}
+
+/// After a sign-in replaced this computer's credential, which revoked every agent token issued
+/// through it: renews each checkout connected to `hub` with a managed token. Each one not
+/// renewed is recorded for its next agent (the menu bar app shows no output) and returned.
+pub(crate) async fn renew_after_sign_in(hub: &str) -> Vec<String> {
+    let roots: Vec<PathBuf> = load()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|connection| connection.hub == hub && connection.owned_token_id.is_some())
+        .map(|connection| connection.root)
+        .collect();
+    let mut failed = Vec::new();
+    for root in roots {
+        let why = match renew(&root, true).await {
+            // NotDue: the connection was removed meanwhile.
+            Ok(Renewal::Renewed | Renewal::NotDue) => {
+                record_attention(&root, None);
+                continue;
+            }
+            Ok(Renewal::Refused(message)) => message,
+            Ok(Renewal::Unavailable) => "the Hub did not answer".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        let message = format!(
+            "The connection of {} was not renewed ({why}); reconnect it with `agentscm client connect` in that folder.",
+            root.display()
+        );
+        record_attention(&root, Some(&message));
+        failed.push(message);
+    }
+    failed
 }
 
 #[derive(Debug, PartialEq, Eq)]

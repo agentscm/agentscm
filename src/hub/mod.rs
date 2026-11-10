@@ -36,6 +36,8 @@ pub mod login;
 pub mod mcp;
 pub mod narrative;
 pub mod onboarding;
+mod overlap_detail;
+mod permission_answer;
 pub mod pickup;
 #[cfg(unix)]
 pub mod pipeline_rules;
@@ -46,7 +48,9 @@ mod promise_http;
 pub mod provider_context;
 pub mod publish;
 pub mod reply;
+mod repo_setup;
 mod repository_summary;
+mod retention;
 pub mod session;
 pub mod session_waiting;
 pub mod setup_attention;
@@ -340,6 +344,13 @@ impl HubState {
         self
     }
 
+    /// Revokes every connected-app credential whose app the apps file no longer registers, with
+    /// the tokens each minted. Run at start, after the login configuration is loaded.
+    pub fn revoke_dropped_apps(&self) -> Result<usize> {
+        self.store
+            .revoke_unregistered_apps(&self.login.app_ids(), "hub", store::unix_now())
+    }
+
     pub fn with_slack(mut self, slack: slack::Slack) -> Self {
         self.slack = Some(Arc::new(slack));
         self
@@ -490,14 +501,17 @@ pub fn router(state: HubState) -> Router {
     let router = Router::new()
         .merge(http::routes())
         .merge(onboarding::routes())
+        .merge(repo_setup::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
         .merge(digest_http::routes())
         .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
+        .merge(retention::routes())
         .merge(continuity::routes())
         .merge(promise_http::routes())
         .merge(skills::routes())
+        .merge(external_runs::routes())
         .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())

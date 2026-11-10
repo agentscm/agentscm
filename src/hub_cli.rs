@@ -441,13 +441,18 @@ pub(crate) async fn call(
 
 /// The Hub for a command run without `--hub`.
 pub(crate) fn default_hub() -> Result<String> {
+    default_hub_or(None)
+}
+
+/// [`default_hub`] for a checkout: after `AGENTSCM_HUB`, the Hub it is already `bound` to.
+pub(crate) fn default_hub_or(bound: Option<String>) -> Result<String> {
     let sessions = if session_files_present()? {
         load_sessions()?.sessions
     } else {
         Vec::new()
     };
     let saved: Vec<&str> = sessions.iter().map(|saved| saved.hub.as_str()).collect();
-    pick_default_hub(env_hub(), &saved)
+    pick_default_hub(env_hub().or(bound), &saved)
 }
 
 /// `AGENTSCM_HUB`, when set: the Hub for commands run without `--hub`.
@@ -625,23 +630,25 @@ pub(crate) async fn sign_in_with(
     )?;
     // The Hub replaces only the same person's computer. A sign-in as someone else (another
     // forge on this Hub) would leave the old credential live with its secret forgotten.
-    if let Some(previous) = previous
-        && matches!(
-            call(
-                &client,
-                Method::GET,
-                &format!("{hub}/v1/hub/device"),
-                Some(&previous.secret),
-                None
-            )
-            .await,
-            Ok((200, _))
-        )
-    {
-        sign_computer_out(&client, hub, &previous).await;
-        eprintln!(
-            "This computer was signed in to {hub} as someone else; that sign-in ended, and checkouts connected through it need connecting again. A computer holds one sign-in per Hub."
-        );
+    if let Some(previous) = previous.as_ref() {
+        let url = format!("{hub}/v1/hub/device");
+        match call(&client, Method::GET, &url, Some(&previous.secret), None).await {
+            Ok((200, _)) => {
+                sign_computer_out(&client, hub, previous).await;
+                eprintln!(
+                    "This computer was signed in to {hub} as someone else; that sign-in ended, and checkouts connected through it need connecting again. A computer holds one sign-in per Hub."
+                );
+            }
+            // Replaced: the Hub revoked the agent tokens the old credential issued.
+            Ok((401, _)) => {
+                for failure in crate::client_cli::renew_after_sign_in(hub).await {
+                    eprintln!("{failure}");
+                }
+            }
+            _ => eprintln!(
+                "Could not check this computer's previous sign-in to {hub}; if a connected checkout stops working, reconnect it with `agentscm client connect` in that folder."
+            ),
+        }
     }
     let user = &signed["user"];
     Ok(format!(

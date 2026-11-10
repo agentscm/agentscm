@@ -1067,14 +1067,14 @@ fn program_plan(home: &Path) -> Option<(binary::Program, PathBuf)> {
     Some((binary::plan(home, &exe, on_path.as_deref(), &temp), exe))
 }
 
-/// This checkout's `client setup` connection, if it has one.
+/// This checkout's `client setup` connection, if it has one: a linked worktree's may be its main
+/// clone's.
 fn checkout_connection(found: &Detected) -> Option<crate::client_config::Connection> {
     let root = found.repo_root.as_ref()?;
     let root = crate::client_config::canonical_root(root).ok()?;
-    crate::client_config::load()
-        .ok()?
-        .into_iter()
-        .find(|connection| connection.root == root)
+    let connections = crate::client_config::load().ok()?;
+    crate::client_config::connection_for_checkout(&connections, &root)
+        .map(|(connection, _)| connection.clone())
 }
 
 /// The program the agents' hooks and MCP entries run. They must keep working after quickstart

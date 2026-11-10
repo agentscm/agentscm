@@ -233,6 +233,8 @@ struct Env {
     fake: Shared,
     store: Arc<dyn Store>,
     workspace: Option<Arc<Workspace>>,
+    /// `AGENTSCM_HUB_APPS_FILE` for the next `serve`.
+    apps: Option<String>,
     http: reqwest::Client,
     dir: TempDir,
 }
@@ -252,6 +254,7 @@ impl Env {
             ))
             .unwrap(),
             workspace: None,
+            apps: None,
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
             dir,
         };
@@ -294,6 +297,9 @@ impl Env {
         if !allowed.is_empty() {
             vars.insert("AGENTSCM_ALLOWED_USERS".into(), allowed.into());
         }
+        if let Some(apps) = &self.apps {
+            vars.insert("AGENTSCM_HUB_APPS_FILE".into(), apps.clone());
+        }
         if self.provider == "gitlab" {
             vars.insert("AGENTSCM_GITLAB_TOKEN".into(), HUB_TOKEN.into());
         } else {
@@ -316,6 +322,7 @@ impl Env {
             None => state,
         };
         sync::start(&state).await.unwrap();
+        state.revoke_dropped_apps().unwrap();
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, app).await });
         url
@@ -1098,6 +1105,20 @@ impl Machine {
 
     /// One SessionStart hook in the checkout; returns the hook's JSON reply.
     fn session_start(&self, session: &str) -> Value {
+        self.session_start_in(&self.root(), session)
+    }
+
+    /// One SessionStart hook whose working directory is `cwd`.
+    fn session_start_in(&self, cwd: &std::path::Path, session: &str) -> Value {
+        self.hook_in(
+            cwd,
+            session,
+            json!({"hook_event_name": "SessionStart", "source": "startup"}),
+        )
+    }
+
+    /// One hook event, `event` plus the session and `cwd`; returns the hook's JSON reply.
+    fn hook_in(&self, cwd: &std::path::Path, session: &str, event: Value) -> Value {
         use std::io::Write;
         let mut child = self
             .command(&["--no-telemetry", "hook", "claude", "--client-connection"])
@@ -1105,8 +1126,9 @@ impl Machine {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let payload = json!({"hook_event_name": "SessionStart", "session_id": session,
-            "cwd": self.root(), "source": "startup"});
+        let mut payload = event;
+        payload["session_id"] = json!(session);
+        payload["cwd"] = json!(cwd);
         child
             .stdin
             .take()
@@ -1141,7 +1163,11 @@ impl Machine {
     }
 
     fn mcp(&self) -> Mcp {
-        let root = self.root();
+        self.mcp_at(&self.root())
+    }
+
+    /// A `client mcp` server started with `--root root`.
+    fn mcp_at(&self, root: &std::path::Path) -> Mcp {
         let mut child = self
             .command(&[
                 "--no-telemetry",
@@ -1401,6 +1427,57 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert_eq!(machine.renew()["result"], "refused");
 }
 
+/// Signing in again replaces this computer's credential, which revokes the agent tokens it
+/// issued; the sign-in renews each connected checkout, and names one it could not renew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signing_in_again_keeps_connected_checkouts_working() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let login = [
+        "hub",
+        "login",
+        "--hub",
+        hub.as_str(),
+        "--provider",
+        "github",
+    ];
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+    machine.session_start("s1");
+    let first = machine.token();
+    assert_eq!(env.whoami(&first).await, 200);
+
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("was not renewed"), "{stderr}");
+    let second = machine.token();
+    assert_ne!(first, second);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&second).await, 200);
+
+    // A checkout that cannot be renewed is named with its fix; the sign-in, allowed by a role
+    // on another connected repository, still succeeds.
+    env.connect_repo("acme/gadgets", 4343, ALICE);
+    env.drop_role(ALICE);
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let root = machine.root();
+    assert!(
+        stderr.contains(&format!(
+            "The connection of {} was not renewed (",
+            root.display()
+        )) && stderr.contains("reconnect it with `agentscm client connect` in that folder"),
+        "{stderr}"
+    );
+    // The next agent in the checkout is told too, since the menu bar app shows no output.
+    let reply = machine.session_start("s2");
+    assert!(context(&reply).contains("was not renewed"), "{reply}");
+}
+
 /// A session that starts in one repository and edits another declares its Work in the other:
 /// the MCP server sends the call to the repository of the file it names, under that
 /// repository's token and the session the start hook recorded for this agent host.
@@ -1500,6 +1577,90 @@ async fn a_session_declares_work_in_the_other_connected_repository_it_edits() {
     );
     assert_eq!(work(OTHER).len(), 1);
     assert!(work(REPO).is_empty());
+}
+
+/// A Claude Code session in a linked worktree that has its own connection is one agent: the
+/// MCP server, started in the main checkout, declares Work under the worktree connection the
+/// session's hooks use, not under the main checkout's.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_agent() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let main = machine.root();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&main)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    let linked = machine.home.path().join("linked");
+    git(&["worktree", "add", "-q", linked.to_str().unwrap()]);
+    let linked = linked.canonicalize().unwrap();
+    for (root, own) in [(&main, false), (&linked, true)] {
+        let mut args = vec!["--no-telemetry", "client", "connect"];
+        if own {
+            args.push("--own-connection");
+        }
+        args.extend(["--hub", &env.hub, "--provider", "github", "--root"]);
+        args.push(root.to_str().unwrap());
+        let (ok, _, stderr) = machine.run(&args);
+        assert!(ok, "{stderr}");
+    }
+
+    machine.session_start_in(&linked, "native-1");
+    let mut mcp = machine.mcp_at(&main);
+    let started = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the worktree", "session": "native-1"}),
+    );
+    assert_ne!(started["isError"], true, "{started}");
+    // The same repository, so the reply does not claim it left the session's repository.
+    assert!(!started["content"].to_string().contains("this call went to"));
+    // A session no hook routed stays on the main checkout's connection.
+    let default = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the main checkout", "session": "native-2"}),
+    );
+    assert_ne!(default["isError"], true, "{default}");
+
+    let connections = machine.file("connections.json");
+    let token = connections["connections"][0]["owned_token_id"]
+        .as_str()
+        .unwrap();
+    let query = agentscm::hub::work::WorkOverviewQuery::default();
+    let current = env
+        .store
+        .work_overview(token, &query, unix_now())
+        .unwrap()
+        .current;
+    let lead = |task: &str| {
+        let work = current.iter().find(|work| work.title == task).unwrap();
+        work.lead_agent.clone()
+    };
+    let (worktree_agent, main_agent) = (
+        lead("Work in the worktree"),
+        lead("Work in the main checkout"),
+    );
+    assert_ne!(worktree_agent, main_agent, "{current:?}");
+    // Not asserted: the Work's lead is a Hub-side agent name, and no hook here declares Work
+    // that could be compared with it, so the two agents are told apart by name only.
+
+    // Ending the session drops its route record, and the hook does not write it back.
+    let routes = machine.config.path().join("agentscm/session-routes");
+    let recorded = || std::fs::read_dir(&routes).map_or(0, Iterator::count);
+    assert_eq!(recorded(), 1);
+    machine.hook_in(
+        &linked,
+        "native-1",
+        json!({"hook_event_name": "SessionEnd"}),
+    );
+    assert_eq!(recorded(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2884,6 +3045,279 @@ async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
     );
 }
 
+/// An agent reads current Work across the repositories its person can read now: the same role
+/// check as the All repositories page, another owner's sessions digested, lists bounded, and a
+/// repository the forge could not answer for counted, never named.
+#[tokio::test]
+async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    env.connect_repo("acme/docs", 4343, ALICE);
+    // Connected, but alice cannot read it: bob's only.
+    env.connect_repo("acme/secret", 4444, BOB);
+    // Alice could read this one, and lost access before she asked.
+    env.connect_repo("acme/gone", 4545, ALICE);
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.remove(&("acme/gone".into(), ALICE));
+        fake.levels.remove(&(4545, ALICE));
+    }
+    let (_, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let alice = minted["token"].as_str().unwrap().to_owned();
+    let path = "/v1/hub/standup/repositories";
+    let host = env.base.trim_start_matches("http://").to_owned();
+    let user = |user_id: i64, login: &str| {
+        env.store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: host.clone(),
+                    user_id,
+                },
+                login,
+            )
+            .unwrap()
+            .id
+    };
+    let (_, who) = env.get("/v1/hub/whoami", &alice).await;
+    let alice_id = user(ALICE, who["owner"]["login"].as_str().unwrap());
+    let bob_id = user(BOB, "bob");
+    // Each fresh read needs its own token: one token gets its last answer back for 30 seconds.
+    let fresh = |name: &str, read_only: bool| {
+        mint_bound_agent_token(&*env.store, &alice_id, name, REPO, REPO_ID, 600, read_only)
+            .unwrap()
+            .1
+    };
+
+    // A forge that cannot answer is counted, never named, and the answer is not complete.
+    env.fake.lock().unwrap().hub_reads_roles = false;
+    let (status, body) = env.get(path, fresh("probe", false).expose()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["repositories"], json!([]));
+    assert_eq!(
+        (&body["unchecked"], &body["complete"]),
+        (&json!(4), &json!(false))
+    );
+    env.fake.lock().unwrap().hub_reads_roles = true;
+
+    let start = |owner: &str, name: &str, repository: (&str, i64), n: usize, session: &str| {
+        let (bound, _, _) = mint_bound_agent_token(
+            &*env.store,
+            owner,
+            name,
+            repository.0,
+            repository.1,
+            600,
+            false,
+        )
+        .unwrap();
+        env.store
+            .work_start(
+                &bound,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: Some(format!("cross-{n}")),
+                    title: format!("Task {n}"),
+                    description: None,
+                    session: session.into(),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("src/{n}.rs")],
+                    branch: None,
+                    worktree: None,
+                    next_action: Some(format!("step {n}")),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+        bound
+    };
+    // More of alice's Work in acme/widgets than one repository lists.
+    for n in 0..11 {
+        start(
+            &alice_id,
+            &format!("agent-{n}"),
+            (REPO, REPO_ID),
+            n,
+            &format!("alice-{n}"),
+        );
+    }
+    // Bob's Work in acme/docs, which alice can read, led by an older client whose label names
+    // its host.
+    let bob_token = start(
+        &bob_id,
+        "client-bobs-laptop-a1b2c3",
+        ("acme/docs", 4343),
+        99,
+        "bob-session",
+    );
+    let digest = agentscm::hub::store::lower_hex_of(
+        format!("agentscm.hub.session-view.v1\0{bob_token}\0bob-session").as_bytes(),
+    )[..16]
+        .to_owned();
+
+    let reader = fresh("alice-reader", true);
+    let mut first = Value::Null;
+    for token in [alice.as_str(), reader.expose()] {
+        let (status, body) = env.get(path, token).await;
+        assert_eq!(status, 200, "{body}");
+        let names: Vec<_> = body["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["repository"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["acme/docs", REPO], "{body}");
+        assert_eq!(
+            (
+                &body["unchecked"],
+                &body["complete"],
+                &body["work_complete"]
+            ),
+            (&json!(0), &json!(true), &json!(true))
+        );
+        let docs = &body["repositories"][0];
+        assert_eq!(docs["work_complete"], true);
+        let theirs = &docs["work"][0];
+        assert_eq!(theirs["title"], "Task 99");
+        assert_eq!(theirs["owner_login"], "bob");
+        assert_eq!(theirs["next_action"], "step 99");
+        assert_eq!(theirs["scope"], json!(["src/99.rs"]));
+        assert_eq!(
+            (&theirs["blocked"], &theirs["waiting"]),
+            (&json!(false), &json!(false))
+        );
+        assert_eq!(
+            theirs["lead_session"], digest,
+            "another owner's session is digested"
+        );
+        assert_eq!(
+            theirs["lead_agent"], "client-host-a1b2c3",
+            "its host name is masked"
+        );
+        let widgets = &body["repositories"][1];
+        assert_eq!(widgets["work"].as_array().unwrap().len(), 10);
+        assert_eq!(widgets["work_complete"], false);
+        assert!(
+            widgets["work"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["lead_session"].as_str().unwrap().starts_with("alice-")),
+            "alice's own sessions stay as stored"
+        );
+        if first.is_null() {
+            first = body;
+        }
+    }
+
+    // Losing access shows on the next fresh read: the role is asked, not cached.
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.remove(&("acme/docs".into(), ALICE));
+        fake.levels.remove(&(4343, ALICE));
+    }
+    let (_, body) = env.get(path, fresh("after-revoke", false).expose()).await;
+    let names: Vec<_> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["repository"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [REPO], "{body}");
+    // The token that asked within the last 30 seconds gets its earlier answer back.
+    let (_, again) = env.get(path, &alice).await;
+    assert_eq!(again, first);
+
+    // The MCP tool is the same read.
+    let (status, reply) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/mcp",
+            Some(&alice),
+            Some(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"agentscm_work_repositories","arguments":{}}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    let (_, body) = env.get(path, &alice).await;
+    assert_eq!(
+        reply["result"]["structuredContent"]["repositories"], body["repositories"],
+        "{reply}"
+    );
+}
+
+/// More Work across repositories than one agent read lists in all: the top-level `work_complete`
+/// says the overall cap cut a list, and the repositories past it list less.
+#[tokio::test]
+async fn the_agent_read_flags_the_overall_work_cap() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    let host = env.base.trim_start_matches("http://").to_owned();
+    let (_, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let alice = minted["token"].as_str().unwrap().to_owned();
+    let (_, who) = env.get("/v1/hub/whoami", &alice).await;
+    let alice_id = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host,
+                user_id: ALICE,
+            },
+            who["owner"]["login"].as_str().unwrap(),
+        )
+        .unwrap()
+        .id;
+    // Eleven repositories of ten Work each: 110, past the 100 one read lists.
+    for r in 0..11_i64 {
+        let (name, id) = (format!("acme/cap-{r:02}"), 5000 + r);
+        env.connect_repo(&name, id, ALICE);
+        let (bound, _, _) =
+            mint_bound_agent_token(&*env.store, &alice_id, "cap-agent", &name, id, 600, false)
+                .unwrap();
+        for n in 0..10 {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": format!("cap-{r}-{n}"), "title": format!("Cap {r} {n}"),
+                "session": format!("cap-{r}-{n}"), "scope": [format!("src/{n}.rs")]
+            }))
+            .unwrap();
+            assert_eq!(request.role, WorkRole::Lead);
+            env.store.work_start(&bound, &request, unix_now()).unwrap();
+        }
+    }
+    let (status, body) = env.get("/v1/hub/standup/repositories", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["work_complete"], false, "the overall cap cut a list");
+    let listed: Vec<usize> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["repository"].as_str().unwrap().starts_with("acme/cap-"))
+        .map(|row| row["work"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(listed.iter().sum::<usize>(), 100);
+    assert_eq!(listed.len(), 11);
+    assert_eq!((listed[0], listed[10]), (10, 0));
+    let last = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["repository"] == "acme/cap-10")
+        .unwrap();
+    assert_eq!(last["work_complete"], false);
+}
+
 #[tokio::test]
 async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only() {
     let env = Env::start("github").await;
@@ -3100,7 +3534,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
 
     // Catalog counts, recipient and next action are exactly the shared person/token projection.
     let mut work = started["item"].clone();
-    let mut previous_marker = Value::Null;
+    let mut previous_marker = None;
     for (operation, summary) in [
         ("catalog-handover-1", "Synthetic handover"),
         ("catalog-handover-2", "Synthetic updated handover"),
@@ -3140,13 +3574,16 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         assert_eq!(row["work"][0]["state"], "awaiting_party");
         assert_eq!(row["work"][0]["recipient"], status["work"][0]["recipient"]);
         assert_eq!(row["work"][0]["next_action"], status["work"][0]["action"]);
-        assert_eq!(row["work"][0]["needs_you"], true);
-        assert!(row["attention_revision"].as_str().is_some());
-        assert_ne!(
-            row["attention_revision"], previous_marker,
-            "same count with changed action evidence changes attention identity"
-        );
-        previous_marker = row["attention_revision"].clone();
+        assert_eq!(row["work"][0]["needs_you"], false);
+        assert_eq!(row["status_counts"]["needs_you"], 0);
+        assert_eq!(row["attention_revision"], Value::Null);
+        if let Some(previous) = &previous_marker {
+            assert_eq!(
+                &row["attention_revision"], previous,
+                "routine handover updates do not create a personal obligation"
+            );
+        }
+        previous_marker = Some(row["attention_revision"].clone());
         let (_, again) = env
             .call(
                 &env.hub,
@@ -3163,7 +3600,8 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .find(|r| r["repository"] == REPO)
             .unwrap();
         assert_eq!(
-            again["attention_revision"], previous_marker,
+            Some(again["attention_revision"].clone()),
+            previous_marker,
             "poll time does not create new attention"
         );
     }
@@ -4029,6 +4467,142 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
     );
 }
 
+const PERMISSIONS: &str = "/v1/hub/session/permissions";
+const PERMISSION_ANSWER: &str = "/v1/hub/session/permissions/answer";
+
+/// A person allows or denies a permission prompt their own agent's session waits at: only with
+/// the web sign-in and its CSRF token, only for their own active agent, once, and only while the
+/// session still waits at that prompt.
+#[tokio::test]
+async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (token, secret) = agent_for(&env, &alice.id, "claude-code", false);
+    let session = "11111111-2222-3333-4444-555555555555";
+    // What the session's hooks send: the prompt, the host's notice that it is on screen, the
+    // registration, and the tool call that follows an answer in the session.
+    let agent = |path: &'static str, body: Value| {
+        env.call(&env.hub, Method::POST, path, Some(&secret), Some(body))
+    };
+    let prompt =
+        json!({"hook_event_name": "PermissionRequest", "session_id": session, "tool_name": "Bash"});
+    let shown = json!({"hook_event_name": "Notification", "session_id": session,
+        "notification_type": "permission_prompt"});
+    let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
+    let register = |hash: &str, complete: bool| {
+        json!({"session": session, "tool": "Bash", "display": "cargo publish",
+            "summary": "run a shell command: Publish the crate", "folder": "widgets",
+            "complete": complete, "input_hash": hash.repeat(64)})
+    };
+    let answer = |id: &Value, decision: &str| {
+        json!({"repository": REPO,
+            "request_id": id, "decision": decision})
+    };
+
+    assert_eq!(agent("/v1/hub/hook/claude", prompt.clone()).await.0, 200);
+    let (status, made) = agent("/v1/hub/permission/register", register("a", true)).await;
+    assert_eq!(
+        (status, &made["state"]),
+        (200, &json!("unconfirmed")),
+        "{made}"
+    );
+    let id = made["request_id"].clone();
+    // Until the host says a person can see the prompt, there is nothing to answer.
+    let early = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "deny")).await;
+    assert_eq!(early.0, 404, "{}", early.1);
+    assert_eq!(agent("/v1/hub/hook/claude", shown.clone()).await.0, 200);
+
+    // Signed out, a cookie without its CSRF token, another person and an unknown decision.
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            PERMISSION_ANSWER,
+            None,
+            Some(answer(&id, "allow")),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, refused) =
+        page_post(&env, &alice, false, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (status, refused) =
+        page_post(&env, &bob, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    let always = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "always")).await;
+    assert_eq!(always.0, 400);
+    // The list is the person's own, and shows a request only after the wait's first minute.
+    let list = format!("{PERMISSIONS}?repository={REPO}");
+    let listed = with_cookie(&env.hub, Method::GET, &list, &alice.cookie, None).await;
+    assert_eq!(listed, (200, json!({"requests": []})));
+
+    // Alice allows it once: the hook's poll hears exactly that, and the answer cannot be changed.
+    let (status, done) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(
+        (status, &done),
+        (200, &json!({"state": "answered", "decision": "allow"}))
+    );
+    let poll = json!({"request_id": id, "input_hash": "a".repeat(64), "wait_seconds": 0});
+    let (_, polled) = agent("/v1/hub/permission/poll", poll).await;
+    assert_eq!(
+        (&polled["state"], &polled["decision"]),
+        (&json!("answered"), &json!("allow"))
+    );
+    let again = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(again.0, 200);
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "deny")).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("already_answered"))
+    );
+
+    // The tool ran. The next prompt's request says what of it is not shown, and can be allowed
+    // all the same.
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let mut partial = register("b", true);
+    partial.as_object_mut().unwrap().remove("complete");
+    partial["missing"] = json!({"cut_from": 31_400, "redacted": 2, "unshown": ["sandbox"]});
+    let (_, made) = agent("/v1/hub/permission/register", partial).await;
+    let cut = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let allowed = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "allow")).await;
+    assert_eq!(allowed.0, 200, "{}", allowed.1);
+
+    // An older hook says only that its request is incomplete. Once the session has moved on, an
+    // answer says so.
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("d", false)).await;
+    let late = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    agent("/v1/hub/hook/claude", ran).await;
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&late, "deny")).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("answered_in_session"))
+    );
+
+    // A person no longer answers for an agent whose token was revoked.
+    agent("/v1/hub/hook/claude", prompt).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("c", true)).await;
+    let last = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown).await;
+    assert!(env.store.revoke_agent_token(&token).unwrap());
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&last, "deny")).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+}
+
 const AGENT_MESSAGES: &str = "/v1/hub/session/agent-messages";
 
 async fn mcp_call(env: &Env, token: &str, method: &str, params: Value) -> Value {
@@ -4070,7 +4644,8 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(page0["mode"], "manual", "{page0}");
     assert_eq!(page0["sessions"], json!([]));
 
-    // An MCP-only client: its initialize names it, its first call names its session.
+    // Gemini CLI: its initialize names it, its first call names its session. MCP alone does not
+    // show that a person leads the session rather than a subagent, so its tier is unknown.
     mcp_call(
         &env,
         &alice_secret,
@@ -4083,7 +4658,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await;
     let seen = read().await;
     let session = seen["sessions"][0].clone();
-    assert_eq!(session["tier"], "mcp", "{seen}");
+    assert_eq!(session["tier"], "unknown", "{seen}");
     assert_eq!(session["name"], "gemini-cli");
     assert_eq!(session["token_name"], "laptop");
     let s1 = session["session"].as_str().unwrap().to_owned();
@@ -4120,10 +4695,25 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(message["state"], "queued");
     let id = message["id"].as_str().unwrap().to_owned();
 
-    // A call that names no session never takes it.
+    // A call that names no session never takes it, and nor does a session shown only by MCP.
     let no_session = json!({"name":"agentscm_status","arguments":{}});
     let unnamed = texts(&mcp_call(&env, &alice_secret, "tools/call", no_session).await);
     assert!(!unnamed.contains(&id), "{unnamed}");
+    let held = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(!held.contains(&id), "{held}");
+
+    // Its hook's start carries no subagent marker, and that hook cannot carry context.
+    let response = browser()
+        .post(format!("{}/v1/hub/hook/generic", env.hub))
+        .bearer_auth(&alice_secret)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"event":"start","agent":"gemini","session":"s1"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let seen = read().await;
+    assert_eq!(seen["sessions"][0]["tier"], "mcp", "{seen}");
 
     // Delivered once, in the next tool result, as a notice that names no mode.
     let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
@@ -4154,6 +4744,14 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(forged["isError"], true, "{forged}");
+    // Without its session the Hub does not guess one: it asks for the field.
+    let unnamed = json!({"name":"agentscm_hub_message",
+        "arguments":{"id": id, "status": "accepted"}});
+    let unnamed = mcp_call(&env, &alice_secret, "tools/call", unnamed).await;
+    assert_eq!(unnamed["isError"], true, "{unnamed}");
+    let error = &unnamed["structuredContent"]["error"];
+    assert_eq!(error["recovery"]["action"], "provide_field", "{unnamed}");
+    assert_eq!(error["fields"][0]["name"], "session", "{unnamed}");
     let ok = mcp_call(&env, &alice_secret, "tools/call", answer("accepted")).await;
     assert_eq!(ok["isError"], false, "{ok}");
     let verified = texts(&ok);
@@ -4167,9 +4765,13 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(read().await["messages"][0]["state"], "done");
 
     // A hook client gets it in the next prompt's added context, with no tool call.
-    let hook = |session: &str| {
+    let hook = |session: &str, subagent: bool| {
         let (hub, secret) = (env.hub.clone(), alice_secret.clone());
-        let body = json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        let mut body =
+            json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        if subagent {
+            body["agent_id"] = json!("sub-1");
+        }
         async move {
             let response = browser()
                 .post(format!("{hub}/v1/hub/hook/claude"))
@@ -4182,7 +4784,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
             serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
         }
     };
-    hook("h1").await;
+    hook("h1", false).await;
     let h1 = read().await["sessions"]
         .as_array()
         .unwrap()
@@ -4201,12 +4803,36 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(status, 201);
-    let reply = hook("h1").await;
+    let reply = hook("h1", false).await;
     let context = reply["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_default();
     assert!(context.contains("Auto please"), "{reply}");
     assert_eq!(read().await["messages"][0]["via"], "hook:claude");
+
+    // A session seen only through a subagent's hook calls is offered nothing.
+    hook("sub1", true).await;
+    let sub = read().await["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["hook"] == "hook:claude" && s["session"] != h1.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(sub["tier"], "unknown", "{sub}");
+    let sub = sub["session"].as_str().unwrap().to_owned();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &sub, "Not for a subagent"),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let reply = hook("sub1", true).await;
+    assert!(!reply.to_string().contains("Not for a subagent"), "{reply}");
+    assert_eq!(read().await["messages"][0]["state"], "queued");
 
     // Ignore holds everything: sending is refused.
     let mode = |mode: Value| json!({"repository": REPO, "this_repository": true, "mode": mode});
@@ -4237,4 +4863,691 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(status, 400);
+}
+
+const APP_SECRET: &str = "example-app-client-secret-0123456789abcdef";
+const APP_REDIRECT: &str = "https://app.example.com/callback";
+const AUTHORIZE: &str = "/v1/hub/apps/authorize";
+const VERIFIER: &str = "example-verifier-0123456789-0123456789-0123456789";
+
+/// A private file, as the Hub requires for its config and secrets.
+fn private_file(env: &Env, name: &str, text: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = env.dir.path().join(name);
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path.display().to_string()
+}
+
+/// A Hub with one connected app, "Example <App>", whose name needs escaping.
+async fn apps_env() -> Env {
+    apps_env_with(&[]).await
+}
+
+/// The same, plus a second app for each id in `more`.
+async fn apps_env_with(more: &[&str]) -> Env {
+    let mut env = Env::start("github").await;
+    let secret = private_file(&env, "app-secret", &format!("{APP_SECRET}\n"));
+    let mut list = vec![json!({"id": "example-app", "name": "Example <App>",
+        "redirect_uri": APP_REDIRECT, "secret_file": secret, "via": "slack"})];
+    for id in more {
+        list.push(json!({"id": id, "name": id,
+            "redirect_uri": APP_REDIRECT, "secret_file": secret, "via": "slack"}));
+    }
+    let apps = json!({ "apps": list });
+    env.apps = Some(private_file(&env, "apps.json", &apps.to_string()));
+    env.hub = env.serve("").await;
+    env
+}
+
+fn encode(pairs: &[(&str, &str)]) -> String {
+    let mut url = reqwest::Url::parse("http://x/").unwrap();
+    url.query_pairs_mut().extend_pairs(pairs);
+    url.query().unwrap().to_owned()
+}
+
+fn challenge(verifier: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier))
+}
+
+fn authorize_query(client: &str, redirect: &str) -> String {
+    encode(&[
+        ("client_id", client),
+        ("redirect_uri", redirect),
+        ("state", "st-1"),
+        ("code_challenge", &challenge(VERIFIER)),
+        ("code_challenge_method", "S256"),
+    ])
+}
+
+async fn authorize_page(env: &Env, query: &str, cookie: Option<&str>) -> (u16, HeaderMap, String) {
+    let mut request = browser().get(format!("{}{AUTHORIZE}?{query}", env.hub));
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, format!("__Host-agentscm_session={cookie}"));
+    }
+    let response = request.send().await.unwrap();
+    let (status, headers) = (response.status().as_u16(), response.headers().clone());
+    (status, headers, response.text().await.unwrap())
+}
+
+/// The approval form's POST; `csrf` None leaves the field out.
+async fn approve(env: &Env, cookie: &str, csrf: Option<&str>, decision: &str) -> (u16, String) {
+    let ch = challenge(VERIFIER);
+    let mut pairs = vec![
+        ("client_id", "example-app"),
+        ("redirect_uri", APP_REDIRECT),
+        ("state", "st-1"),
+        ("code_challenge", ch.as_str()),
+        ("code_challenge_method", "S256"),
+        ("decision", decision),
+    ];
+    pairs.extend(csrf.map(|csrf| ("csrf", csrf)));
+    let response = browser()
+        .post(format!("{}{AUTHORIZE}", env.hub))
+        .header(header::COOKIE, format!("__Host-agentscm_session={cookie}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(encode(&pairs))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .map(|value| value.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    (status, location)
+}
+
+/// A code from Alice's approval.
+async fn app_code(env: &Env, page: &Page) -> String {
+    let (status, location) = approve(env, &page.cookie, Some(&page.csrf), "allow").await;
+    assert_eq!(status, 303);
+    let url = reqwest::Url::parse(&location).unwrap();
+    assert_eq!(&location[..APP_REDIRECT.len()], APP_REDIRECT);
+    let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(pairs["state"], "st-1");
+    pairs["code"].clone()
+}
+
+async fn exchange(env: &Env, json: bool, fields: &[(&str, &str)]) -> (u16, Value) {
+    let request = env.http.post(format!("{}/v1/hub/apps/token", env.hub));
+    let request = if json {
+        let body: serde_json::Map<String, Value> = fields
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), json!(v)))
+            .collect();
+        request
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Value::Object(body).to_string())
+    } else {
+        request
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(encode(fields))
+    };
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+fn token_fields<'a>(code: &'a str, secret: &'a str, verifier: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", APP_REDIRECT),
+        ("client_id", "example-app"),
+        ("client_secret", secret),
+        ("code_verifier", verifier),
+    ]
+}
+
+/// Alice connects the app and returns its credential.
+async fn connect_app(env: &Env, alice: &Page) -> String {
+    let code = app_code(env, alice).await;
+    let (status, issued) = exchange(env, true, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 200, "{issued}");
+    issued["credential"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn a_connected_app_is_approved_through_sign_in_consent_and_a_single_use_pkce_code() {
+    // No apps file: every app route is 404.
+    let plain = Env::start("github").await;
+    let query = authorize_query("example-app", APP_REDIRECT);
+    assert_eq!(authorize_page(&plain, &query, None).await.0, 404);
+    let fields = token_fields("x", APP_SECRET, VERIFIER);
+    assert_eq!(exchange(&plain, false, &fields).await.0, 404);
+
+    let env = apps_env().await;
+    // An unknown app, a different redirect or no PKCE gets an error page and never a redirect.
+    for bad in [
+        authorize_query("other-app", APP_REDIRECT),
+        authorize_query("example-app", "https://evil.example/callback"),
+        authorize_query("example-app", "https://app.example.com/callback/"),
+        encode(&[
+            ("client_id", "example-app"),
+            ("redirect_uri", APP_REDIRECT),
+            ("state", "s"),
+        ]),
+    ] {
+        let (status, headers, body) = authorize_page(&env, &bad, None).await;
+        assert_eq!(status, 400, "{bad}");
+        assert!(headers.get(header::LOCATION).is_none(), "{bad}");
+        assert!(!body.contains("evil.example"), "{body}");
+    }
+
+    // Signed out: the page reloads itself from the Hub once (the Strict cookie is not sent from
+    // another site), then offers the sign-in that returns here.
+    let (status, headers, body) = authorize_page(&env, &query, None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("http-equiv=\"refresh\""), "{body}");
+    assert!(body.contains("hop=1"), "{body}");
+    // A browser that ignores the refresh gets a plain link to the same page.
+    assert!(
+        body.contains(">Continue</a>") && body.contains("&amp;hop=1\">Continue"),
+        "{body}"
+    );
+    let (_, _, body) = authorize_page(&env, &format!("{query}&hop=1"), None).await;
+    assert!(
+        !body.contains("http-equiv") && !body.contains("Continue"),
+        "{body}"
+    );
+    let here = format!("{AUTHORIZE}?{query}");
+    let sign_in = encode(&[("web", "1"), ("return_to", &here)]);
+    assert!(
+        body.contains(&format!(
+            "/v1/hub/login/github?{}",
+            sign_in.replace('&', "&amp;")
+        )),
+        "{body}"
+    );
+    assert!(headers[header::CACHE_CONTROL] == "no-store");
+    let done = callback_query(&env, ALICE, &sign_in).await;
+    assert_eq!(done.status(), 302);
+    assert_eq!(done.headers()[header::LOCATION].to_str().unwrap(), here);
+    let cookie = set_cookie(&done, "__Host-agentscm_session").unwrap();
+
+    // Signed in: the consent page, escaped, without script, framed by nobody, posting only here
+    // and to the app's own origin.
+    let (status, headers, body) = authorize_page(&env, &query, Some(&cookie)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("Example &lt;App&gt;") && !body.contains("<App>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("via Slack") && body.contains("Computers"),
+        "{body}"
+    );
+    let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+    assert!(
+        csp.contains("default-src 'none'") && !csp.contains("script-src"),
+        "{csp}"
+    );
+    assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert!(
+        csp.contains("form-action 'self' https://app.example.com"),
+        "{csp}"
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let (_, me) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    let alice = Page {
+        csrf: me["csrf_token"].as_str().unwrap().to_owned(),
+        id: me["user"]["id"].as_str().unwrap().to_owned(),
+        cookie,
+    };
+    assert!(body.contains(&format!("name=\"csrf\" value=\"{}\"", alice.csrf)));
+
+    // A post without the page's CSRF field, or with another, is refused without a redirect.
+    assert_eq!(
+        approve(&env, &alice.cookie, None, "allow").await,
+        (403, String::new())
+    );
+    assert_eq!(
+        approve(&env, &alice.cookie, Some("0".repeat(64).as_str()), "allow").await,
+        (403, String::new())
+    );
+    assert_eq!(
+        approve(&env, "nope", Some(&alice.csrf), "allow").await.0,
+        403
+    );
+    // Deny goes back to the app with access_denied.
+    let (status, location) = approve(&env, &alice.cookie, Some(&alice.csrf), "deny").await;
+    assert_eq!(
+        (status, location.as_str()),
+        (
+            303,
+            "https://app.example.com/callback?error=access_denied&state=st-1"
+        )
+    );
+
+    // The token exchange: a wrong secret does not spend the code; a wrong verifier does.
+    let code = app_code(&env, &alice).await;
+    let wrong_secret = token_fields(&code, "not-the-secret", VERIFIER);
+    let (status, refused) = exchange(&env, false, &wrong_secret).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_client"))
+    );
+    let other_verifier = format!("{VERIFIER}x");
+    let (status, refused) = exchange(
+        &env,
+        false,
+        &token_fields(&code, APP_SECRET, &other_verifier),
+    )
+    .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_grant"))
+    );
+    let (status, refused) = exchange(&env, false, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_grant"))
+    );
+    let mut bad_grant = token_fields(&code, APP_SECRET, VERIFIER);
+    bad_grant[0].1 = "client_credentials";
+    let (status, refused) = exchange(&env, false, &bad_grant).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_request"))
+    );
+
+    // A good code, as a form, once.
+    let code = app_code(&env, &alice).await;
+    let (status, issued) = exchange(&env, false, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 200, "{issued}");
+    assert_eq!(issued["device"]["name"], "Example <App>");
+    assert_eq!(
+        issued["owner"],
+        json!({"provider": "github", "host": env.base.trim_start_matches("http://"),
+            "user_id": ALICE, "login": "alice"})
+    );
+    assert_eq!(issued["credential"].as_str().unwrap().len(), 64);
+    let (status, _) = exchange(&env, true, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 400);
+    // A code is bound to its redirect.
+    let code = app_code(&env, &alice).await;
+    let mut moved = token_fields(&code, APP_SECRET, VERIFIER);
+    moved[2].1 = "https://app.example.com/other";
+    assert_eq!(
+        exchange(&env, true, &moved).await.1["error"],
+        "invalid_grant"
+    );
+
+    // The person's computers list names the app.
+    let (status, list) = with_cookie(
+        &env.hub,
+        Method::GET,
+        "/v1/hub/devices",
+        &alice.cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{list}");
+    let app = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == issued["device"]["id"])
+        .unwrap();
+    assert_eq!(
+        app["app"],
+        json!({"id": "example-app", "name": "Example <App>"})
+    );
+    assert!(!alice.id.is_empty());
+
+    // One person has at most eight codes waiting.
+    for _ in 0..8 {
+        app_code(&env, &alice).await;
+    }
+    let (status, location) = approve(&env, &alice.cookie, Some(&alice.csrf), "allow").await;
+    assert_eq!((status, location.as_str()), (429, ""));
+}
+
+#[tokio::test]
+async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() {
+    let env = apps_env().await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let app = connect_app(&env, &alice).await;
+
+    // What the person's computer reads, and read-only tokens only.
+    let (status, me) = env.get("/v1/hub/device", &app).await;
+    assert_eq!(
+        (status, me["user"]["login"].as_str()),
+        (200, Some("alice")),
+        "{me}"
+    );
+    let (status, repos) = env.get("/v1/hub/device/repositories", &app).await;
+    assert_eq!(status, 200, "{repos}");
+    assert_eq!(repos["repositories"][0]["repository"], REPO);
+    let mint = |read_only: Option<bool>| {
+        let mut body = json!({"name": "example-read", "repository": REPO});
+        if let Some(read_only) = read_only {
+            body["read_only"] = json!(read_only);
+        }
+        env.mint_at(&env.hub, &app, body)
+    };
+    let (status, minted) = mint(Some(true)).await;
+    assert_eq!(
+        (status, minted["read_only"].as_bool()),
+        (201, Some(true)),
+        "{minted}"
+    );
+    let read_token = minted["token"].as_str().unwrap().to_owned();
+    for writable in [Some(false), None] {
+        let (status, refused) = mint(writable).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (403, Some("app_read_only"))
+        );
+    }
+
+    // Nothing else: computer routes, the person's other routes, agent and admin routes.
+    let refused = [
+        (
+            Method::POST,
+            "/v1/hub/device/name",
+            json!({"name": "x"}),
+            403,
+        ),
+        (Method::GET, "/v1/hub/devices", Value::Null, 403),
+        (Method::POST, "/v1/hub/devices", json!({}), 401),
+        (
+            Method::POST,
+            "/v1/hub/tokens",
+            json!({"name": "x", "repository": REPO, "ttl_seconds": 60}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/work/transition",
+            json!({}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/work/recovery",
+            json!({}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/pickups",
+            json!({"repository": REPO}),
+            401,
+        ),
+        (Method::POST, "/v1/hub/session/handoff/ask", json!({}), 401),
+        (
+            Method::POST,
+            "/v1/hub/session/coordination/withdraw",
+            json!({}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/read-token",
+            json!({"repository": REPO}),
+            401,
+        ),
+        (Method::GET, "/v1/hub/whoami", Value::Null, 401),
+        (Method::GET, "/v1/hub/admin/devices", Value::Null, 401),
+    ];
+    for (method, path, body, expected) in refused {
+        let body = (!body.is_null()).then_some(body);
+        let (status, reply) = env.call(&env.hub, method, path, Some(&app), body).await;
+        assert_eq!(status, expected, "{path}: {reply}");
+    }
+
+    // A coordination reply for Alice's own agent, recorded as from Slack.
+    let (lead, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let (asker, _) = agent_for(&env, &bob.id, "codex", false);
+    let now = unix_now();
+    env.store
+        .work_start(&lead, &work("billing", "alice-session"), now)
+        .unwrap();
+    let request = env
+        .store
+        .work_start(&asker, &work("rounding", "bob-session"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let body = |token: &str| {
+        json!({"token": token, "request_id": request.id, "operation_id": "slack-1",
+            "target_work_id": request.targets[0].work_id, "session": "alice-session",
+            "expected_updated_seq": request.updated_seq, "kind": "handover", "note": null})
+    };
+    let (status, refused) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            REPLY,
+            Some(&app),
+            Some(body(&asker)),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    let (status, answered) = env
+        .call(&env.hub, Method::POST, REPLY, Some(&app), Some(body(&lead)))
+        .await;
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(answered["responses"][0]["via"], "slack");
+    assert_eq!(answered["responses"][0]["responder"]["login"], "alice");
+    let (status, replay) = env
+        .call(&env.hub, Method::POST, REPLY, Some(&app), Some(body(&lead)))
+        .await;
+    assert_eq!(
+        (status, replay["responses"].as_array().unwrap().len()),
+        (200, 1)
+    );
+    let responded: Vec<_> = env
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "coordination_responded")
+        .collect();
+    assert!(
+        responded[0].data.contains("\"via\":\"slack\""),
+        "{}",
+        responded[0].data
+    );
+
+    // A file handoff answered through the app is recorded as answered from Slack.
+    let (holder, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let (wanter, _) = agent_for(&env, &bob.id, "codex", false);
+    let file = "src/tax.rs";
+    env.store
+        .touch_session(&holder, &hook_call("ha", &[file]), now)
+        .unwrap();
+    env.store
+        .touch_session(&wanter, &hook_call("hb", &[]), now + 1)
+        .unwrap();
+    env.store
+        .ask_handoff(&wanter, Some("hb"), file, None, now + 2)
+        .unwrap();
+    let answer = json!({"token": holder, "session": "ha", "path": file, "accept": true});
+    let (status, done) = env
+        .call(&env.hub, Method::POST, ANSWER, Some(&app), Some(answer))
+        .await;
+    assert_eq!(
+        (status, done["outcome"].as_str()),
+        (200, Some("granted")),
+        "{done}"
+    );
+    let path = format!("/v1/hub/session/handoffs?repository={REPO}");
+    let (_, mine) = with_cookie(&env.hub, Method::GET, &path, &alice.cookie, None).await;
+    let row = mine["handoffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["path"] == file)
+        .unwrap();
+    assert_eq!(
+        (
+            row["answered_via_slack"].as_bool(),
+            row["answered_via_hub"].as_bool()
+        ),
+        (Some(true), Some(false))
+    );
+
+    // The read-only token reads as the person.
+    assert_eq!(env.whoami(&read_token).await, 200);
+
+    // An app the operator stops registering loses its credential.
+    let mut env = env;
+    env.apps = None;
+    let unregistered = env.serve("").await;
+    let (status, _) = env
+        .call(
+            &unregistered,
+            Method::GET,
+            "/v1/hub/device",
+            Some(&app),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn a_revoked_connected_app_is_refused_everywhere() {
+    let env = apps_env().await;
+    let alice = page(&env, ALICE).await;
+    let app = connect_app(&env, &alice).await;
+    let (status, minted) = env
+        .mint_at(
+            &env.hub,
+            &app,
+            json!({"name": "example-read", "repository": REPO, "read_only": true}),
+        )
+        .await;
+    assert_eq!(status, 201, "{minted}");
+    let read_token = minted["token"].as_str().unwrap().to_owned();
+    assert_eq!(env.delete("/v1/hub/device", &app).await, 204);
+    for (method, path) in [
+        (Method::GET, "/v1/hub/device"),
+        (Method::GET, "/v1/hub/device/repositories"),
+        (Method::POST, "/v1/hub/device/tokens"),
+        (Method::DELETE, "/v1/hub/device"),
+        (Method::POST, REPLY),
+        (Method::POST, ANSWER),
+    ] {
+        let body = (method == Method::POST).then(|| json!({}));
+        let (status, reply) = env.call(&env.hub, method, path, Some(&app), body).await;
+        assert_eq!(status, 401, "{path}: {reply}");
+    }
+    // Its read-only tokens went with it.
+    assert_eq!(env.whoami(&read_token).await, 401);
+
+    // The person revokes a second connection from their computers list.
+    let app = connect_app(&env, &alice).await;
+    // Leaving the allow list stops the app answering for the person.
+    let allow_list = env.serve("github:bob").await;
+    let (status, refused) = env
+        .call(
+            &allow_list,
+            Method::POST,
+            REPLY,
+            Some(&app),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_allowed"))
+    );
+    let (_, me) = env.get("/v1/hub/device", &app).await;
+    let id = me["device"]["id"].as_str().unwrap();
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        &format!("/v1/hub/devices/{id}"),
+        &alice.cookie,
+        Some(&alice.csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(env.get("/v1/hub/device/repositories", &app).await.0, 401);
+}
+
+#[tokio::test]
+async fn reconnecting_leaves_one_credential_per_person_and_app() {
+    let env = apps_env().await;
+    let alice = page(&env, ALICE).await;
+    let first = connect_app(&env, &alice).await;
+    let (status, minted) = env
+        .mint_at(
+            &env.hub,
+            &first,
+            json!({"name": "example-read", "repository": REPO, "read_only": true}),
+        )
+        .await;
+    assert_eq!(status, 201, "{minted}");
+    let read_token = minted["token"].as_str().unwrap().to_owned();
+    // Auto-connect is a computer's; an app credential cannot ask for it.
+    let (status, refused) = env
+        .mint_at(
+            &env.hub,
+            &first,
+            json!({"name": "example-read", "repository": REPO, "read_only": true, "auto": true}),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("app_read_only"))
+    );
+    let second = connect_app(&env, &alice).await;
+    assert_eq!(env.get("/v1/hub/device", &first).await.0, 401);
+    assert_eq!(env.whoami(&read_token).await, 401);
+    assert_eq!(env.get("/v1/hub/device", &second).await.0, 200);
+    let created = env
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "device_created")
+        .map(|event| serde_json::from_str::<Value>(&event.data).unwrap()["app_id"].clone())
+        .collect::<Vec<_>>();
+    assert!(created.iter().all(|id| id == "example-app"), "{created:?}");
+}
+
+#[tokio::test]
+async fn another_apps_credentials_cannot_spend_a_code_and_a_dropped_app_stays_revoked() {
+    let mut env = apps_env_with(&["other-app"]).await;
+    let alice = page(&env, ALICE).await;
+    let code = app_code(&env, &alice).await;
+    let mut stranger = token_fields(&code, APP_SECRET, VERIFIER);
+    stranger[3].1 = "other-app";
+    assert_eq!(
+        exchange(&env, true, &stranger).await.1["error"],
+        "invalid_grant"
+    );
+    // The code is still good for its own app.
+    let (status, issued) = exchange(&env, true, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 200, "{issued}");
+    let credential = issued["credential"].as_str().unwrap().to_owned();
+
+    // Dropping the app and restarting revokes for good: registering it again does not revive it.
+    let apps = env.apps.clone();
+    env.apps = None;
+    env.serve("").await;
+    env.apps = apps;
+    let back = env.serve("").await;
+    let (status, _) = env
+        .call(
+            &back,
+            Method::GET,
+            "/v1/hub/device",
+            Some(&credential),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401);
 }

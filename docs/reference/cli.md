@@ -124,6 +124,22 @@ and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (w
 `retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
 items stay applied, and sending the same batch again is safe.
 
+### `why`
+
+`agentscm why <commit | path | path:line>` asks the Hub which Work produced a commit or a file,
+and prints its description, outcome and decision checkpoints as JSON. A commit is anything
+`git rev-parse` resolves to a full SHA. For `path:line`, local `git blame` names the commit that
+last changed that line; for a path, `git log` names its newest commits (`--commits`, default 5,
+at most 20). Each commit is asked about together with the merge that brought it into `HEAD`:
+the oldest merge on `HEAD`'s first-parent line that descends from it, not a merge of `main`
+into the branch, because the Hub knows pull requests by their merge and head commits. On
+squash-merge history the blamed commit is already the merge commit. The path is asked about
+too, relative to the repository root, so `.` and absolute paths work and the root itself asks
+only about commits; its answer lists Work whose declared scope covers it. An answer with
+`known: false` means the Hub has no Work recorded for that commit or path: a commit merged
+without a linked Work, or history the Hub never saw, stays unknown. A line that is not
+committed yet names no commit.
+
 ### `change-capture` (experimental, Unix)
 
 After `agentscm client connect` has saved a write-capable connection for a checkout, configure its
@@ -398,12 +414,12 @@ process from recent hook/MCP sightings, whose live task state is unknown. Existi
 attention appears with an action to use its tray menu. When a saved Hub sign-in permits it, the
 tray checks connected checkouts about once a minute with short-lived read-only tokens and
 counts what needs you from the same shared status projection as the Hub's **Needs you** badge:
-blockers and reassessments on Work your agent leads; handovers and still-held reservations on
-paused, quiet or merged Work you own; requests to your idle Work; live tasks whose declared
-scopes overlap yours; files you and another agent hold; open pull requests touching files you
-hold; required checks failing on your open pull requests; and `pr-gate` runs blocked at a gate
-after their agent stopped. Another person's
-blocker or request is listed but not counted. The Hub badge also leaves out needs hidden in that
+your own agents waiting for you; blockers and reassessments on Work your agent leads; handovers
+of Work you own; required checks failing on your open pull requests; `pr-gate` runs blocked at a
+gate after their agent stopped; and agent setup problems. What agents settle between themselves
+is listed but not counted: paused, quiet or merged Work, live tasks whose declared scopes
+overlap, files two agents hold, open pull requests touching held files and requests from one
+agent to another. Another person's blocker is listed but not counted. The Hub badge also leaves out needs hidden in that
 browser, which the tray cannot see. It refreshes the cross-repository list about every two
 minutes. A newly observed need opens a small attention notice, or marks **New attention** when
 the Now card is fully visible; a partial read may reveal an older one later. The summary marks
@@ -771,11 +787,11 @@ agentscm --data-dir ./agentscm-data git-snapshot capture --repository ./checkout
 
 ## Supported skills (experimental)
 
-`agentscm skill` browses the first-party skills embedded in the binary and adopts them per repository. Adoption is the lock file `agentscm-skills.lock.json` at the repository root; committing it is the review. Evidence an agent records is **self-reported**: the Hub stores what the session said, and every gate satisfied that way is labelled `[self-reported]` in `status` output. On a GitHub connection the Hub also records green checks, an approval and the merge it reads from the forge; a gate satisfied only by those is labelled `[observed]`. After an observed merge, `status` names any gate the merge went past.
+`agentscm skill` browses the first-party skills embedded in the binary, and any repository skills the lock pins, and adopts them per repository. Adoption is the lock file `agentscm-skills.lock.json` at the repository root; committing it is the review. Evidence an agent records is **self-reported**: the Hub stores what the session said, and every gate satisfied that way is labelled `[self-reported]` in `status` output. On a GitHub connection the Hub also records green checks, an approval and the merge it reads from the forge; a gate satisfied only by those is labelled `[observed]`. After an observed merge, `status` names any gate the merge went past.
 
 - `skill list [--json]` and `skill show NAME [--version N] [--json]` work offline: summary, when to follow it, prerequisites, what it is not for, parameters with defaults, gates (id, who, enforcement, minimum assurance), an adopted marker from the lock file and, for `show`, the agent procedure (`SKILL.md`) under "Procedure:". The `sha256` is a bundle digest of `skill.json` and `SKILL.md`.
-- `skill add NAME [--version N] [--param key=value ...]` pins the embedded manifest (sha256, source `first_party`), validates parameters against it (`key=null` resets one) and prints a before/after of the pin. `skill remove NAME` removes it. Neither commits.
-- `skill report-adoption` sends the lock file to the Hub (`PUT /v1/hub/repos/{repo}/skills/adoption`) and prints which adoption source the Hub applies. When the repository has a forge connection the Hub refuses the report (409 `forge_authoritative`): the lock file on the default branch is the only adoption, so merge it there.
+- `skill add NAME [--version N] [--param key=value ...]` pins the embedded manifest (sha256, source `first_party`), validates parameters against it (`key=null` resets one) and prints a before/after of the pin. `skill add NAME --path PATH [--param ...]` pins a skill defined in this repository instead: `PATH` is its `skill.json` (manifest and procedure regular files of at most 64 KiB each, not symlinks), the pin's source is `repo_local` and its sha256 covers the manifest and the procedure, so editing either needs a new pin. A built-in skill's name is refused. Repository skills need a forge connection (GitHub): the Hub reads them from the default branch. `skill list` and `skill show` include repository skills the lock pins; `skill show` prints the procedure only while this checkout's files match the pin. `skill remove NAME` removes it. Neither commits.
+- `skill report-adoption` sends the lock file to the Hub (`PUT /v1/hub/repos/{repo}/skills/adoption`) and prints which adoption source the Hub applies. When the repository has a forge connection the Hub refuses the report (409 `forge_authoritative`): the lock file on the default branch is the only adoption, so merge it there. A lock that pins a repository skill is refused too (400, repository skills need a forge connection), and the command exits non-zero.
 - `skill status [--branch B] [--json]` shows the branch's run: gates, state, the next action and whether finishing is blocked.
 - `skill evidence --gate G --kind K --summary S [--url U] [--pr N] [--skill NAME] [--detail-json FILE] [--branch B]` records self-reported evidence at `git rev-parse HEAD`. The Hub refuses a review recorded with the same agent token and session as an author, and evidence for a commit older than the run head. A refusal (for example `stale_head`, `not_independent`) is printed with its message and exits non-zero.
 - `skill stop --agent claude|codex` is an opt-in Stop hook: nothing blocks unless you install it (see below). It reads the hook JSON on standard input and blocks (`{"decision":"block","reason":...}`) while the branch's run needs the agent (`blocks_finish`), or when `pr-gate` is adopted, the branch is not the default branch, has commits ahead of it and has no run yet. It also blocks, at any gate before the merge, when local `git rev-parse HEAD` differs from the head the run last saw (record tests for the new commit; the review must be redone). It allows the stop with a note when the lock pins `pr-gate` but the Hub has not adopted it yet. It never blocks while waiting on CI, approval or merge, stops blocking after 8 consecutive continuations, and allows the stop with a warning on standard error when there is no lock file, no connection, the Hub is unreachable or the directory is not a Git repository.

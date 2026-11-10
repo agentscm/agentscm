@@ -296,13 +296,16 @@ pub trait Store: Send + Sync {
     /// None if unknown, revoked, expired, or the owner is disabled.
     fn authenticate(&self, digest: &TokenDigest, now: i64) -> Result<Option<Principal>>;
     /// A new computer for an enabled `owner`. `replaces` (a computer `owner` owns) is revoked
-    /// with its agent tokens in the same transaction. Returns the `dev_` id.
+    /// with its agent tokens in the same transaction. `app` marks a connected app's credential.
+    /// Returns the `dev_` id.
+    #[allow(clippy::too_many_arguments)]
     fn insert_device(
         &self,
         owner: &str,
         name: &str,
         digest: &TokenDigest,
         replaces: Option<&str>,
+        app: Option<&str>,
         now: i64,
     ) -> Result<String>;
     /// None if unknown, revoked or idle past `DEVICE_IDLE_SECONDS`. A disabled owner is returned
@@ -319,6 +322,9 @@ pub trait Store: Send + Sync {
     /// Revokes a live computer (only `owner`'s when Some) and every agent token it minted.
     /// True if it was live.
     fn revoke_device(&self, device: &str, owner: Option<&str>, by: &str, now: i64) -> Result<bool>;
+    /// Revokes every live connected-app credential whose app is not in `registered`, with the
+    /// agent tokens each minted. Returns how many were revoked.
+    fn revoke_unregistered_apps(&self, registered: &[String], by: &str, now: i64) -> Result<usize>;
     /// True if `owner`'s live computer was renamed.
     fn rename_device(&self, device: &str, owner: &str, name: &str) -> Result<bool>;
     /// Authorizes a local CI device (generation 1) for the repository row `repository`
@@ -1304,6 +1310,9 @@ pub trait Store: Send + Sync {
     ) -> Result<super::work::WorkRepositoryRenameResult>;
     /// Every repository scope that retains Work items or coordination requests.
     fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>>;
+    /// Bytes of stand-up payload the repository retains now, against `WORK_PAYLOAD_CAPACITY_BYTES`.
+    /// A repository that never wrote reports 0.
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64>;
     /// Trusted workspace calls only: authorization is held across this transaction.
     fn promise_create(
         &self,

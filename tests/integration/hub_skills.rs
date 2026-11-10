@@ -104,6 +104,7 @@ impl Hub {
                 default_branch: Some("main".into()),
                 observed_at: unix_now(),
                 reported_by: None,
+                local_skills: None,
             })
             .unwrap();
     }

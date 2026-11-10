@@ -43,7 +43,9 @@ the forge did not accept the code. What signing in gives you:
   30-day limit. A computer unused for 90 days is signed out. The credential is kept in the
   owner-only `$XDG_CONFIG_HOME/agentscm/hub-sessions.json` (default under `~/.config`), next to
   the 8-hour session, and is sent only to the Hub that issued it. Signing in again on the same
-  computer replaces its credential; the Hub never matches computers by name.
+  computer replaces its credential; the Hub never matches computers by name. Replacing it revokes
+  the agent tokens the old credential issued, so the sign-in renews the token of each checkout
+  connected to that Hub, and names any it could not renew with the command that reconnects it.
 - **Agents connect themselves**, if you say so. AgentSCM's agent plugin runs a quick check
   whenever an agent starts. The sign-in asks once at a terminal: "Turn on
   auto-connect for <hub>? [Y/n]" (`--no-auto-connect` answers no). A sign-in from the menu bar

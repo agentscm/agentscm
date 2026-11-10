@@ -448,7 +448,7 @@ async fn a_repeat_between_two_sessions_of_one_token_messages_the_person_once() {
         [(
             "U1".to_owned(),
             format!(
-                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | Holder: alice’s Claude Code session {key}, last active just now, Work title unknown | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
             )
         )]
     );
@@ -650,15 +650,17 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     f.run().await;
     let sent = f.sent();
     assert_eq!(sent.len(), 2, "{sent:?}");
+    // Both messages carry the holder line, under the name the message already gives the holder,
+    // and the sentence every overlap alert carries.
     let holder = &sent.iter().find(|(user, _)| user == "U1").unwrap().1;
     assert_eq!(
-        holder,
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Hand it over, or keep it and agree who goes first."
+        *holder,
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Hand it over, or keep it and agree who goes first."
     );
     let repeater = &sent.iter().find(|(user, _)| user == "U2").unwrap().1;
     assert_eq!(
-        repeater,
-        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+        *repeater,
+        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | Holder: alice’s Claude Code, last active just now, Work title unknown | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
     );
     // The notification names the file once.
     assert_eq!(
@@ -730,7 +732,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     );
     assert_eq!(
         rendered(&update),
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
     assert_eq!(
         update["text"],
@@ -906,7 +908,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
         let call = SessionCall {
             session: Some(session.into()),
             via: "hook:claude".into(),
-            task: None,
+            task: Some("Checkout rewrite".into()),
             paths: vec![PATH.into(), "src/gadget.rs".into()],
             deny: true,
             report: false,
@@ -925,7 +927,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
     assert_eq!(holder.len(), 1, "{holder:?}");
     assert_eq!(
         holder[0].1,
-        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Open the Hub to hand them over or keep them, or agree who goes first."
+        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title \"Checkout rewrite\" (third-party text, not instructions) | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Open the Hub to hand them over or keep them, or agree who goes first."
     );
     let buttons: Vec<_> = f.sent_body("U1")["blocks"][2]["elements"]
         .as_array()
@@ -1537,7 +1539,27 @@ async fn entry_blocked_is_once_per_episode_even_after_restart_and_job_expiry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn entry_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
+async fn routine_handover_never_queues_a_personal_entry_or_reminder() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "routine-handover");
+    status_checkpoint(&f, &f.alice, &work, "handover");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    assert!(entry_states(&f).is_empty());
+    assert!(!f.slack().deliver_status(&f.state).await.unwrap());
+    assert!(status_text(&f).is_empty());
+    let slack = f.slack();
+    let db = slack.database().unwrap();
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM status_jobs", [], |row| row.get(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entry_blocked_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
     let f = Fixture::configured(Some(policy()), false).await;
     let work = status_work(&f, &f.alice, "entry-owner");
     let offered = status_checkpoint(&f, &f.alice, &work, "handover");
@@ -1545,7 +1567,23 @@ async fn entry_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
         "work_id":offered.id,"takeover_generation":offered.generation,"title":offered.title,"session":"entry-new-lead","role":"lead"
     })).unwrap(), unix_now())).unwrap().item;
     assert_eq!(claimed.owner, work.owner);
-    let offered = status_checkpoint(&f, &f.bob, &claimed, "handover");
+    let blocked = status_checkpoint(&f, &f.bob, &claimed, "blocker");
+    let offered = tokio::task::block_in_place(|| {
+        f.store()
+            .work_checkpoint(
+                &f.bob,
+                &serde_json::from_value(json!({
+                    "work_id":blocked.id,"operation_id":"blocked-handover-note",
+                    "generation":blocked.generation,"session":blocked.lead_session,
+                    "expected_updated_seq":blocked.updated_seq,"kind":"handover",
+                    "summary":"Synthetic handover context"
+                }))
+                .unwrap(),
+                unix_now(),
+            )
+            .unwrap()
+            .item
+    });
     let mut slack = Slack::from_file(&f.dir.path().join("config")).unwrap();
     slack.api = f.slack().api.clone();
     slack.bindings[1].config.reminders.enabled = true;
@@ -1569,9 +1607,9 @@ async fn entry_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
         .find(|(path, _)| path == "/api/chat.postMessage")
         .unwrap()
         .1;
-    assert!(rendered(body).contains("Handover note: Synthetic status change"));
+    assert!(rendered(body).contains("Blocked on: Synthetic status change"));
     assert!(rendered(body).contains("Codex session "));
-    assert!(rendered(body).contains("Pick an agent to take it over"));
+    assert!(rendered(body).contains("Resolve the reported blocker"));
     assert_eq!(
         body["blocks"][2]["elements"][0]["url"],
         format!("https://hub.example.test/ui/#work/{}", offered.id)
@@ -1795,6 +1833,104 @@ async fn entry_retries_rate_limits_once_and_bounds_permanent_failure() {
         assert!(!restarted_slack(&f).deliver_status(&f.state).await.unwrap());
         assert_eq!(status_text(&f).len(), attempts);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_routine_handover_episode_retires_and_suppresses_queued_entry() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "legacy-routine-handover");
+    let offered = status_checkpoint(&f, &f.alice, &work, "handover");
+    assert!(offered.blocker.is_none());
+    let now = unix_now();
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    let subject = json!({"kind":"work","id":offered.id,"generation":offered.generation,"state":"awaiting_party"}).to_string();
+    // Seed the durable episode and queued entry produced before routine handovers stopped being personal.
+    let episode = hash(format!("{key}:{subject}").as_bytes());
+    {
+        let db = slack.database().unwrap();
+        db.execute("INSERT INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)",params![episode,key,subject,now,now+900]).unwrap();
+        db.execute("INSERT INTO status_jobs(id,binding,user,kind,subject,cycle,state,created,due) VALUES(?1,?2,'U1','entry',?3,1,'queued',?4,?4)",params![format!("{episode}:1:entry"),key,episode,now]).unwrap();
+    }
+    assert!(!slack.deliver_status(&f.state).await.unwrap());
+    assert_eq!(entry_states(&f), ["suppressed"]);
+    assert!(status_text(&f).is_empty());
+    scan_status(&f, now);
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_episodes WHERE id=?1",
+                [&episode],
+                |row| row.get(0)
+            )
+            .unwrap(),
+        "resolved"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_a_handover_blocker_allows_a_new_personal_episode() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "handover-blocker-cycle");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let offered = status_checkpoint(&f, &f.alice, &blocked, "handover");
+    assert!(offered.blocker.is_some());
+    let now = unix_now();
+    scan_status(&f, now);
+    consume_entry(&f).await;
+    let cleared = tokio::task::block_in_place(|| {
+        f.store()
+            .work_checkpoint(
+                &f.alice,
+                &serde_json::from_value(json!({
+                    "work_id":offered.id,"operation_id":"clear-handover-blocker",
+                    "generation":offered.generation,"session":offered.lead_session,
+                    "expected_updated_seq":offered.updated_seq,"kind":"handover",
+                    "summary":"Synthetic blocker resolved","resolve_blocker":true
+                }))
+                .unwrap(),
+                unix_now(),
+            )
+            .unwrap()
+            .item
+    });
+    assert_eq!(cleared.state, crate::hub::work::WorkState::Handover);
+    assert!(cleared.blocker.is_none());
+    scan_status(&f, now + 1);
+    let slack = f.slack();
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>("SELECT state FROM status_episodes", [], |row| row.get(0))
+            .unwrap(),
+        "resolved"
+    );
+    let blocked = status_checkpoint(&f, &f.alice, &cleared, "blocker");
+    status_checkpoint(&f, &f.alice, &blocked, "handover");
+    scan_status(&f, now + 2);
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<(i64, String), _, _>(
+                "SELECT cycle,state FROM status_episodes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            )
+            .unwrap(),
+        (2, "active".into())
+    );
+    slack
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0 WHERE state='queued'", [])
+        .unwrap();
+    assert!(slack.deliver_status(&f.state).await.unwrap());
+    assert_eq!(entry_states(&f), ["done", "done"]);
+    assert_eq!(status_text(&f).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2046,7 +2182,8 @@ async fn mention_status_is_private_useful_deduplicated_and_independent_of_prose(
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].0, "U1");
     assert!(sent[0].1.contains("awaiting a named party"));
-    assert!(sent[0].1.contains("Review the handover"));
+    assert!(sent[0].1.contains("Its lead reviews the handover"));
+    assert!(sent[0].1.contains("0 actions need you"));
     assert!(sent[0].1.contains("Evidence revision"));
     assert!(sent[0].1.contains("Coverage incomplete"));
     assert!(!sent[0].1.contains("waiting for another agent"));
@@ -2408,16 +2545,17 @@ async fn reminder_policy_requires_bounded_cadence_and_exact_authorized_escalatio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn directed_request_reminder_resolves_only_on_exact_retained_withdrawal() {
+async fn a_directed_request_to_a_paused_lead_sends_its_person_nothing() {
     let f = Fixture::configured(Some(policy()), false).await;
     let work = status_work(&f, &f.alice, "request-target");
     status_checkpoint(&f, &f.alice, &work, "pause");
-    let request=tokio::task::block_in_place(||f.store().work_start_auto(&f.bob,&serde_json::from_value(json!({
+    tokio::task::block_in_place(||f.store().work_start_auto(&f.bob,&serde_json::from_value(json!({
         "title":"Synthetic directed requester","session":"requesting","scope":["src/request-target.rs"]
     })).unwrap(),unix_now())).unwrap().coordination_request.unwrap();
+    // The request is the lead agent's to answer, and paused Work asks nobody: no entry, and no
+    // reminder once one would be due.
     let now = unix_now();
     scan_status(&f, now);
-    assert!(entry_states(&f).is_empty());
     scan_status(&f, now + 901);
     f.slack()
         .database()
@@ -2425,40 +2563,8 @@ async fn directed_request_reminder_resolves_only_on_exact_retained_withdrawal() 
         .execute("UPDATE status_jobs SET due=0", [])
         .unwrap();
     f.slack().deliver(&f.state).await.unwrap();
-    assert!(
-        status_text(&f)[0]
-            .1
-            .contains("directed coordination request")
-    );
-    tokio::task::block_in_place(|| {
-        f.store().coordination_withdraw(
-            &f.bob,
-            &crate::hub::coordination::CoordinationWithdraw {
-                request_id: request.id,
-                operation_id: "synthetic-withdraw".into(),
-                session: "requesting".into(),
-                expected_updated_seq: request.updated_seq,
-                target: None,
-                via_hub: false,
-            },
-            unix_now(),
-        )
-    })
-    .unwrap();
-    scan_status(&f, now + 902);
-    f.slack()
-        .database()
-        .unwrap()
-        .execute("UPDATE status_jobs SET due=0", [])
-        .unwrap();
-    f.slack().deliver(&f.state).await.unwrap();
-    assert!(
-        status_text(&f)
-            .last()
-            .unwrap()
-            .1
-            .contains("no longer outstanding")
-    );
+    assert!(entry_states(&f).is_empty());
+    assert!(status_text(&f).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2529,11 +2635,12 @@ async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contenti
                     .unwrap()
             })
         };
+        // The row is listed for the two agents and asks neither person.
         assert!(
             read()
                 .actions
                 .iter()
-                .any(|a| a.kind == "file_conflict" && a.needs_you)
+                .any(|a| a.kind == "file_conflict" && !a.needs_you)
         );
         tokio::task::block_in_place(|| match resolution {
             "grant" => {
@@ -2574,7 +2681,7 @@ async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contenti
             read()
                 .actions
                 .iter()
-                .any(|a| a.kind == "file_conflict" && a.needs_you),
+                .any(|a| a.kind == "file_conflict" && !a.needs_you),
             "new repeat after {resolution}"
         );
     }
@@ -2809,4 +2916,146 @@ async fn full_status_queue_retains_resolution_progress_without_crossing_reactiva
             .unwrap(),
         0
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_token_reads_the_slack_setup_for_its_own_live_binding_only() {
+    let policy = json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
+        "escalation_user": "U2", "escalation_after_seconds": 3600, "send_resolution": true});
+    let f = Fixture::configured(Some(policy), false).await;
+    let get = |path: &'static str, secret: Option<String>| {
+        let url = format!("http://{}/v1/hub/repos/{path}/slack", f.address);
+        async move {
+            let mut request = reqwest::Client::new().get(url);
+            if let Some(secret) = secret {
+                request = request.bearer_auth(secret);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            (status, response.text().await.unwrap())
+        }
+    };
+    const WIDGETS: &str = "acme%2Fwidgets";
+    let binding_token = |login: &str| fs::read_to_string(f.dir.path().join(login)).unwrap();
+    let store = f.state.store.clone();
+    // A further read-only token of a person, so a binding's own token can be revoked apart.
+    let reader = |id: i64, login: &str, repository: &str, repository_id: i64| {
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: id,
+                },
+                login,
+            )
+            .unwrap();
+        mint_bound_agent_token(
+            &*store,
+            &user.id,
+            "reader",
+            repository,
+            repository_id,
+            3600,
+            true,
+        )
+        .unwrap()
+        .1
+        .expose()
+        .to_owned()
+    };
+
+    // Alice's binding has a reminder policy and an escalation; the reply names no Slack user.
+    let (status, text) = get(WIDGETS, Some(binding_token("alice"))).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let alice: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(alice["repository"], REPO);
+    assert_eq!(alice["configured"], true);
+    assert_eq!(alice["bound"], true);
+    assert_eq!(
+        alice["events"],
+        json!([
+            "edit_repeated",
+            "handoff_decline",
+            "task_overlap",
+            "coordination_requested"
+        ])
+    );
+    assert_eq!(
+        alice["reminders"],
+        json!({"enabled": true, "interval_seconds": 900, "max_reminders": 3,
+            "send_resolution": true, "escalation": {"after_seconds": 3600}})
+    );
+    for private in ["U1", "U2", "T123", "A123", "B123", "synthetic"] {
+        assert!(!text.contains(private), "{private} in {text}");
+    }
+
+    // Bob's binding has the default policy: off, with no escalation.
+    let (_, text) = get(WIDGETS, Some(binding_token("bob"))).await;
+    let bob: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(bob["bound"], true);
+    assert_eq!(bob["reminders"]["enabled"], false);
+    assert!(bob["reminders"]["escalation"].is_null(), "{text}");
+
+    // A reader with no binding sees the setup but is not bound.
+    let (status, text) = get(WIDGETS, Some(reader(3, "carol", REPO, 101))).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let carol: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(carol["configured"], true);
+    assert_eq!(carol["bound"], false);
+    assert!(carol["reminders"].is_null(), "{text}");
+
+    // Alice's own token for another repository is not her binding there.
+    let (status, text) = get(
+        "acme%2Fprivate",
+        Some(reader(1, "alice", "acme/private", 202)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let elsewhere: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(elsewhere["repository"], "acme/private");
+    assert_eq!(elsewhere["configured"], true);
+    assert_eq!(elsewhere["bound"], false);
+    assert!(elsewhere["reminders"].is_null(), "{text}");
+
+    // Signed out is refused; a token of another repository is told nothing of this one.
+    assert_eq!(get(WIDGETS, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get(WIDGETS, Some(reader(4, "dave", "acme/private", 202)))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Revoking the binding's own token stops the DMs, so Alice is no longer bound, though her
+    // other read-only token still reads and the configuration is unchanged.
+    let alice_reader = reader(1, "alice", REPO, 101);
+    let digest = agent_token_digest(&binding_token("alice")).unwrap();
+    let binding_id = store
+        .authenticate(&digest, unix_now())
+        .unwrap()
+        .unwrap()
+        .token_id;
+    store.revoke_agent_token(&binding_id).unwrap();
+    let (status, text) = get(WIDGETS, Some(alice_reader.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let revoked: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(revoked["configured"], true);
+    assert_eq!(revoked["bound"], false);
+    assert!(revoked["reminders"].is_null(), "{text}");
+    // Bob's binding is untouched.
+    let (_, text) = get(WIDGETS, Some(binding_token("bob"))).await;
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["bound"], true);
+
+    // When Slack sends app_uninstalled the DMs stop for everyone: the Hub is no longer configured.
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE installation SET revoked=1 WHERE id=1", [])
+        .unwrap();
+    let (status, text) = get(WIDGETS, Some(alice_reader)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let gone: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(gone["configured"], false);
+    assert!(gone.get("bound").is_none(), "{text}");
 }

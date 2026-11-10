@@ -48,7 +48,7 @@ use super::coordination::{
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_hub_via,
+    status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -180,6 +180,9 @@ const PUBLICATION_LOCK_CLASS: i32 = 0x6167_6570;
 const WORK_DELIVERY_LOCK_CLASS: i32 = 0x6167_6578;
 /// Serializes every payload-growing effect in a complete repository identity.
 const WORK_CAPACITY_LOCK_CLASS: i32 = 0x6167_6579;
+/// Serializes app connects per person and app, so a reconnect always sees the credential
+/// it retires.
+const APP_CONNECT_LOCK_CLASS: i32 = 0x6167_6561;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
@@ -7593,17 +7596,26 @@ impl Store for PgStore {
         name: &str,
         digest: &TokenDigest,
         replaces: Option<&str>,
+        app: Option<&str>,
         now: i64,
     ) -> Result<String> {
         validate_device_name(name)?;
         let id = new_id("dev")?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            // Taken before any other lock: without it two racing connects each miss the
+            // other's uncommitted row below and both stay live.
+            if let Some(app) = app {
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                    &[&APP_CONNECT_LOCK_CLASS, &format!("{owner}\n{app}")],
+                )?;
+            }
             let inserted = tx.execute(
-                "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at)
-                 SELECT $1, id, $3, $4, $5, $5 FROM hub_users WHERE id = $2 AND NOT disabled
+                "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at, app_id)
+                 SELECT $1, id, $3, $4, $5, $5, $6 FROM hub_users WHERE id = $2 AND NOT disabled
                  FOR SHARE",
-                &[&id, &owner, &name, &digest.as_str(), &now],
+                &[&id, &owner, &name, &digest.as_str(), &now, &app],
             )?;
             if inserted == 0 {
                 return Err(HubError::Invalid("unknown or disabled owner".into()));
@@ -7613,7 +7625,23 @@ impl Store for PgStore {
             if let Some(old) = replaces {
                 revoke_device_in(&mut tx, old, Some(owner), owner, now)?;
             }
-            append(&mut tx, &Event::device_created(&id, owner, name)?)?;
+            // One credential per person per app: reconnecting retires the earlier ones.
+            if let Some(app) = app {
+                let earlier: Vec<String> = tx
+                    .query(
+                        "SELECT id FROM hub_devices
+                         WHERE owner = $1 AND app_id = $2 AND id <> $3 AND revoked_at IS NULL
+                         ORDER BY id",
+                        &[&owner, &app, &id],
+                    )?
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                for old in earlier {
+                    revoke_device_in(&mut tx, &old, Some(owner), owner, now)?;
+                }
+            }
+            append(&mut tx, &Event::device_created(&id, owner, name, app)?)?;
             tx.commit()?;
             Ok(id.clone())
         })
@@ -7798,7 +7826,8 @@ impl Store for PgStore {
             let found = client
                 .query_opt(
                     "SELECT d.id, d.name, d.created_at, d.last_used_at,
-                            u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                            u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled,
+                            d.app_id
                      FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                      WHERE d.digest = $1 AND d.revoked_at IS NULL
                        AND COALESCE(d.last_used_at, d.created_at) > $2",
@@ -7820,6 +7849,7 @@ impl Store for PgStore {
                         name: None,
                         disabled: row.get(9),
                     },
+                    app_id: row.get(10),
                 });
             if let Some(device) = found.as_ref()
                 && device
@@ -7844,7 +7874,8 @@ impl Store for PgStore {
                             SELECT DISTINCT t.repository FROM hub_agent_tokens t
                             WHERE t.device_id = d.id AND NOT t.revoked AND t.expires_at > $3
                               AND NOT t.read_only
-                            ORDER BY t.repository), '{}')
+                            ORDER BY t.repository), '{}'),
+                        d.app_id
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE ($1::text IS NULL OR d.owner = $1)
                    AND (d.revoked_at IS NULL OR d.revoked_at > $4)
@@ -7871,6 +7902,7 @@ impl Store for PgStore {
                         disabled: row.get(10),
                     },
                     repositories: row.get(11),
+                    app_id: row.get(12),
                 })
                 .collect())
         })
@@ -7880,6 +7912,30 @@ impl Store for PgStore {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let revoked = revoke_device_in(&mut tx, device, owner, by, now)?;
+            tx.commit()?;
+            Ok(revoked)
+        })
+    }
+
+    fn revoke_unregistered_apps(&self, registered: &[String], by: &str, now: i64) -> Result<usize> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let stale: Vec<String> = tx
+                .query(
+                    "SELECT id FROM hub_devices
+                     WHERE app_id IS NOT NULL AND revoked_at IS NULL AND NOT (app_id = ANY($1))
+                     ORDER BY id",
+                    &[&registered],
+                )?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let mut revoked = 0;
+            for id in stale {
+                if revoke_device_in(&mut tx, &id, None, by, now)? {
+                    revoked += 1;
+                }
+            }
             tx.commit()?;
             Ok(revoked)
         })
@@ -12216,7 +12272,8 @@ impl Store for PgStore {
         self.run(true, |client| {
             Ok(client
                 .query_opt(
-                    "SELECT repository, source, lock_json, default_branch, observed_at, reported_by
+                    "SELECT repository, source, lock_json, default_branch, observed_at, reported_by,
+                            local_skills
                      FROM hub_skill_adoptions WHERE repository = $1",
                     &[&repo],
                 )?
@@ -12227,6 +12284,7 @@ impl Store for PgStore {
                     default_branch: row.get(3),
                     observed_at: row.get(4),
                     reported_by: row.get(5),
+                    local_skills: row.get(6),
                 }))
         })
     }
@@ -12235,11 +12293,13 @@ impl Store for PgStore {
         self.run(false, |client| {
             client.execute(
                 "INSERT INTO hub_skill_adoptions
-                     (repository, source, lock_json, default_branch, observed_at, reported_by)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                     (repository, source, lock_json, default_branch, observed_at, reported_by,
+                      local_skills)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (repository) DO UPDATE SET source = excluded.source,
                      lock_json = excluded.lock_json, default_branch = excluded.default_branch,
-                     observed_at = excluded.observed_at, reported_by = excluded.reported_by
+                     observed_at = excluded.observed_at, reported_by = excluded.reported_by,
+                     local_skills = excluded.local_skills
                  WHERE excluded.source = 'default_branch'
                     OR hub_skill_adoptions.source <> 'default_branch'",
                 &[
@@ -12249,6 +12309,7 @@ impl Store for PgStore {
                     &a.default_branch,
                     &a.observed_at,
                     &a.reported_by,
+                    &a.local_skills,
                 ],
             )?;
             Ok(())
@@ -13811,6 +13872,24 @@ impl Store for PgStore {
         })
     }
 
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64> {
+        self.run(true, |client| {
+            Ok(client
+                .query_opt(
+                    "SELECT charged_bytes FROM hub_work_usage
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0)))
+        })
+    }
+
     fn work_briefing_preview_for(
         &self,
         token: &str,
@@ -14218,11 +14297,11 @@ impl Store for PgStore {
                 "coordination_responded",
                 &request.id,
                 now,
-                with_hub_via(
+                with_via(
                     json!({"response_id": response_id, "target_work_id": target.work_id,
                         "kind": response_kind_name(reply.kind), "token": who.token,
                         "session": reply.session, "generation": target.generation}),
-                    reply.via_hub,
+                    reply.via.tag(),
                 ),
             )?;
             let seq = append(&mut tx, &event)?;
@@ -14246,7 +14325,7 @@ impl Store for PgStore {
                     &reply.note,
                     &now,
                     &seq,
-                    &reply.via_hub.then_some("hub"),
+                    &reply.via.tag(),
                 ],
             )?;
             tx.execute(
@@ -14514,9 +14593,9 @@ impl Store for PgStore {
                 "coordination_withdrawn",
                 &request.id,
                 now,
-                with_hub_via(
+                with_via(
                     json!({"by": who.token, "session": withdraw.session, "reason": reason}),
-                    withdraw.via_hub,
+                    withdraw.via_hub.then_some("hub"),
                 ),
             )?;
             let seq = append(&mut tx, &event)?;

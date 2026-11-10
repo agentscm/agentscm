@@ -147,6 +147,17 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .with_sync(github)
         .with_skill_workflows(workflows)
         .with_shared_conversation_retention_days(config.shared_conversation_retention_days)?;
+    // The waits sessions reported to the previous process are gone: a session that has not
+    // called since reads as not known to wait, never as quiet.
+    state.onboarding.waiting().lost_before(unix_now());
+    // An app dropped from the apps file loses its credentials for good, not only while absent.
+    let revoker = state.clone();
+    let revoked = tokio::task::spawn_blocking(move || revoker.revoke_dropped_apps())
+        .await
+        .map_err(|_| HubError::Unavailable("startup task failed".into()))??;
+    if revoked > 0 {
+        eprintln!("revoked {revoked} credential(s) of apps no longer registered");
+    }
     if let Some(path) = std::env::var_os("AGENTSCM_WORKSPACE_FILE") {
         let config = super::workspace::WorkspaceConfig::from_file(PathBuf::from(path).as_path())?;
         #[cfg(unix)]
