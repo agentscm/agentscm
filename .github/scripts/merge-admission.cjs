@@ -87,11 +87,12 @@ async function admit({github, context, validateTitle}) {
     if (!trustedTitle || title.status !== 'completed') waiting.push('Conventional PR title');
     else if (title.conclusion !== 'success') failed.push('Conventional PR title');
     // The pull request's own CI jobs must pass on this exact head, so a red change never enters
-    // the queue. Every trusted latest run of each name must succeed; other apps never count.
+    // the queue. The newest trusted run of each name decides (a rerun on ready_for_review cancels
+    // the older suite's run); other apps never count.
     for (const name of CI_CHECKS) {
-      const runs = checks.filter(c => c.name === name && c.app?.id === ACTIONS_APP && c.head_sha === head);
-      if (runs.some(c => c.status === 'completed' && c.conclusion !== 'success')) failed.push(name);
-      else if (!runs.length || runs.some(c => c.status !== 'completed')) waiting.push(name);
+      const run = checks.filter(c => c.name === name && c.app?.id === ACTIONS_APP && c.head_sha === head).sort((a, b) => b.id - a.id)[0];
+      if (!run || run.status !== 'completed') waiting.push(name);
+      else if (run.conclusion !== 'success') failed.push(name);
     }
     const conclusion = failed.length ? 'failure' : waiting.length ? undefined : 'success';
     // Re-read after the API sweep. Never certify an obsolete head/base/title snapshot.

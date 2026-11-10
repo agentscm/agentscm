@@ -101,7 +101,18 @@ test('a same-named check from another app never counts', async () => {
   assert.equal(g.writes[1].conclusion, 'success');
 });
 
+test('the newest run of each CI check decides when a rerun left an older suite', async () => {
+  // ready_for_review reruns CI on the same head and cancels the older suite's run.
+  const f = fixture(); f.checks.push({...ci(f, 'tests'), id: 5, conclusion: 'cancelled'});
+  await admit(f.args);
+  assert.equal(f.writes[1].conclusion, 'success');
+  const g = fixture(); g.checks.push({...ci(g, 'tests'), id: 30, conclusion: 'failure'});
+  await admit(g.args);
+  assert.equal(g.statusWrites.at(-1).description, 'PR admission blocked: tests failed');
+});
+
 test('a CI check on an older head never counts', async () => {
+  // Mock-only: in production the real protection is listForRef({ref: head}).
   const f = fixture(); ci(f, 'static').head_sha = 'e'.repeat(40);
   await admit(f.args);
   assert.equal(f.writes[1].output.title, 'PR admission pending: waiting for static');
