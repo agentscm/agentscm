@@ -126,7 +126,8 @@ async fn health_reports_storage() {
             "fail_open",
             "hook_p95_ms",
             "rate_limited",
-            "repeated"
+            "repeated",
+            "undeclared"
         ]
     );
     assert!(counters.values().all(Value::is_u64), "{health}");

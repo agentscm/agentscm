@@ -569,6 +569,7 @@ async fn protocol_basics() {
             "agentscm_contribution_receipt",
             "agentscm_receipt_settings",
             "agentscm_work_search",
+            "agentscm_why",
             "agentscm_publications_list",
             "agentscm_workflow_runs_list",
             "agentscm_work_usage",
@@ -661,6 +662,14 @@ async fn protocol_basics() {
         .tool_result(reader.expose(), "agentscm_work_status", json!({}))
         .await;
     assert_eq!(status_read["isError"], false, "{status_read}");
+    // This Hub has no workspace, so promise reads say so instead of asking for a retry.
+    let promises = hub
+        .tool_result(reader.expose(), "agentscm_promises_list", json!({}))
+        .await;
+    assert_eq!(promises["isError"], true, "{promises}");
+    let error = &promises["structuredContent"]["error"];
+    assert_eq!(error["code"], "not_configured", "{promises}");
+    assert_eq!(error["retryable"], false, "{promises}");
     let read_only = hub.rpc(reader.expose(), &list).await.json();
     let read_only_names: Vec<&str> = read_only["result"]["tools"]
         .as_array()
@@ -2503,6 +2512,58 @@ fn publication(branch: &str) -> agentscm::hub::publish::NewPublication {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn why_answers_the_same_over_mcp_and_http() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "why-agent");
+    let started = hub
+        .tool_result(
+            &secret,
+            "agentscm_start",
+            json!({"task": "Why over MCP", "request_key": "why-mcp", "session": "why-mcp",
+                "paths": ["src/why_mcp.rs"]}),
+        )
+        .await;
+    assert_eq!(started["isError"], false, "{started}");
+    let mcp = hub
+        .tool_result(&secret, "agentscm_why", json!({"path": "src/why_mcp.rs"}))
+        .await;
+    assert_eq!(mcp["isError"], false, "{mcp}");
+    let body = &mcp["structuredContent"];
+    assert_eq!(body["known"], true, "{body}");
+    assert_eq!(body["path"], "src/why_mcp.rs");
+    assert_eq!(body["work"][0]["title"], "Why over MCP");
+    assert_eq!(body["work"][0]["relation"], "scope");
+    assert_eq!(body["work"][0]["decisions"], json!([]));
+    let http = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/standup/why?path=src/why_mcp.rs",
+            Some(&secret),
+            "",
+        )
+        .await;
+    assert_eq!(http.status, 200, "{}", http.text);
+    assert_eq!(http.json(), *body);
+    let unknown = hub
+        .tool_result(&secret, "agentscm_why", json!({"commit": "0".repeat(40)}))
+        .await;
+    assert_eq!(unknown["structuredContent"]["known"], false, "{unknown}");
+    for arguments in [json!({}), json!({"path": "../x"}), json!({"commit": "ABC"})] {
+        let refused = hub.tool_result(&secret, "agentscm_why", arguments).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+    }
+    let bad = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/standup/why",
+            Some(&secret),
+            "",
+        )
+        .await;
+    assert_eq!(bad.status, 400, "{}", bad.text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_tools_page_filter_and_stay_in_the_tokens_repository() {
     let hub = Hub::start().await;
     let user = |id: i64, login: &str| {
@@ -2753,7 +2814,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (49, 52, 57));
+    assert_eq!((before.len(), listed.len(), all.len()), (50, 53, 58));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
