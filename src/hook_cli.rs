@@ -1727,6 +1727,9 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
     if let Some(tasks) = payload["background_tasks"].as_array() {
         out.insert("background_tasks".into(), json!(tasks.len()));
     }
+    if let Some(asks) = wait_asks(payload) {
+        out.insert("asks".into(), json!(asks));
+    }
     if normalized.is_none() {
         if let Some(cwd) = payload["cwd"]
             .as_str()
@@ -1765,6 +1768,44 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         out.insert("tool_input".into(), json!({"path": path.path}));
     }
     Ok(Value::Object(out))
+}
+
+/// The most of a wait's text that leaves the machine, in characters.
+const ASKS_CHARS: usize = 400;
+
+/// What a wait asks of its person, so the Hub can show that person (and only them) what their
+/// agent needs: the end of the agent's last message when it stops, the questions it asks, or what
+/// a permission prompt is for. One line, secrets redacted, and cut to its last [`ASKS_CHARS`]
+/// characters, where a closing question sits. A stop that background work will resume sends none.
+fn wait_asks(payload: &Value) -> Option<String> {
+    let busy = payload["background_tasks"]
+        .as_array()
+        .is_some_and(|tasks| !tasks.is_empty())
+        || payload["background_tasks"].as_u64().is_some_and(|n| n > 0);
+    let text = match payload["hook_event_name"].as_str()? {
+        "Stop" if !busy => payload["last_assistant_message"].as_str()?.to_owned(),
+        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => {
+            payload["tool_input"]["questions"]
+                .as_array()?
+                .iter()
+                .filter_map(|q| q["question"].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        "PermissionRequest" => payload["tool_input"]["description"].as_str()?.to_owned(),
+        _ => return None,
+    };
+    let mut text = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
+    agentscm::change_capture::redact::redact_json(&mut text);
+    let text = text.as_str()?.chars().collect::<Vec<_>>();
+    let tail: String = text[text.len().saturating_sub(ASKS_CHARS)..]
+        .iter()
+        .collect();
+    match text.len() {
+        0 => None,
+        n if n > ASKS_CHARS => Some(format!("…{tail}")),
+        _ => Some(tail),
+    }
 }
 
 fn bounded_string(value: &Value, max: usize) -> Option<&str> {
@@ -2241,6 +2282,40 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_sends_one_redacted_line_of_what_it_asks() {
+        let long = format!(
+            "{}\n\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 is set.\n\nShould I force-push the rebased branch?",
+            "Context. ".repeat(80)
+        );
+        let stop = json!({"hook_event_name":"Stop","session_id":"s","last_assistant_message":long});
+        let sent = sanitized_codex(&stop, Some(&[])).unwrap();
+        let asks = sent["asks"].as_str().unwrap();
+        assert!(asks.starts_with('…'), "{asks}");
+        assert!(
+            asks.ends_with("is set. Should I force-push the rebased branch?"),
+            "{asks}"
+        );
+        assert!(!asks.contains("ghp_abc") && !asks.contains('\n'), "{asks}");
+        assert_eq!(asks.chars().count(), ASKS_CHARS + 1);
+
+        let question = json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
+            "tool_input":{"questions":[{"question":"Which cache?"},{"question":"Now?"}]}});
+        assert_eq!(wait_asks(&question).as_deref(), Some("Which cache? Now?"));
+        let prompt = json!({"hook_event_name":"PermissionRequest","tool_name":"Bash",
+            "tool_input":{"command":"git push -f","description":"Force-push the branch"}});
+        assert_eq!(wait_asks(&prompt).as_deref(), Some("Force-push the branch"));
+        // Nothing for a prompt with no description, other events, or a stop background work resumes.
+        for quiet in [
+            json!({"hook_event_name":"PermissionRequest","tool_input":{"command":"x"}}),
+            json!({"hook_event_name":"PostToolUse","last_assistant_message":"x"}),
+            json!({"hook_event_name":"Stop","last_assistant_message":"x","background_tasks":2}),
+            json!({"hook_event_name":"Stop","last_assistant_message":"  "}),
+        ] {
+            assert_eq!(wait_asks(&quiet), None, "{quiet}");
+        }
+    }
 
     #[test]
     fn a_wait_sends_only_its_facts_and_its_next_call_is_never_skipped() {
