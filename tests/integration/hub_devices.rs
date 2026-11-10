@@ -1163,11 +1163,11 @@ impl Machine {
     }
 
     fn mcp(&self) -> Mcp {
-        self.mcp_at(&self.root())
+        self.mcp_at(&self.root(), &[])
     }
 
-    /// A `client mcp` server started with `--root root`.
-    fn mcp_at(&self, root: &std::path::Path) -> Mcp {
+    /// A `client mcp` server started with `--root root` and `env` added to its environment.
+    fn mcp_at(&self, root: &std::path::Path, env: &[(&str, &str)]) -> Mcp {
         let mut child = self
             .command(&[
                 "--no-telemetry",
@@ -1176,6 +1176,7 @@ impl Machine {
                 "--root",
                 root.to_str().unwrap(),
             ])
+            .envs(env.iter().copied())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -1378,6 +1379,12 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert_eq!(machine.renew()["result"], "renewed");
     let after = mcp.tools_list();
     assert!(after.contains("\"result\""), "{after}");
+    assert!(!after.contains("agentscm_promises_list"), "{after}");
+    // AGENTSCM_MCP_TOOLS=all asks the Hub for the full list, opt-in tools included.
+    let mut full = machine.mcp_at(&machine.root(), &[("AGENTSCM_MCP_TOOLS", "all")]);
+    full.call("agentscm_work_status", json!({}));
+    let listed = full.tools_list();
+    assert!(listed.contains("agentscm_promises_list"), "{listed}");
     let second = machine.token();
     assert_ne!(first, second);
     assert_eq!(env.whoami(&first).await, 401);
@@ -1614,7 +1621,7 @@ async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_a
     }
 
     machine.session_start_in(&linked, "native-1");
-    let mut mcp = machine.mcp_at(&main);
+    let mut mcp = machine.mcp_at(&main, &[]);
     let started = mcp.call(
         "agentscm_start",
         json!({"task": "Work in the worktree", "session": "native-1"}),

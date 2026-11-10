@@ -966,13 +966,18 @@ notification is a 202. A batch or a non-object is `-32600`, bad JSON
 `-32700`, an unknown method `-32601`, an unknown tool `-32602`. The body limit
 is 64 KiB.
 
-An agent token sees a default set of tools, including the ones the shipped skill, instruction files, hook
-context, server instructions and MCP App views ask agents to call, plus `agentscm_skill_list`,
-`agentscm_skill_status` and `agentscm_skill_evidence` when the repository has adopted supported
-skills. `POST /mcp?tools=all` lists every tool, including `agentscm_change_record`,
-`agentscm_workflow_status`, `agentscm_shared_conversation`, `agentscm_publications_list` and
-`agentscm_workflow_runs_list` (and its instructions describe them); every tool stays callable
-either way. A read-only token's list is unchanged.
+An agent token sees a core set of tools: the ones the shipped skills, instruction files, hook
+context, replies, server instructions and MCP App views ask agents to call, including
+`agentscm_work_repositories`, plus `agentscm_skill_list`, `agentscm_skill_status` and
+`agentscm_skill_evidence` when the repository has adopted supported skills. `POST /mcp?tools=all`
+also lists the rarely needed tools, and its instructions describe them: `agentscm_change_record`,
+`agentscm_workflow_status`, `agentscm_shared_conversation`, `agentscm_publications_list`,
+`agentscm_workflow_runs_list`, the five promise tools, `agentscm_contribution_receipt`,
+`agentscm_receipt_settings`, `agentscm_work_declarations(_set)`, `agentscm_work_pr_link(_set)`,
+`agentscm_work_reconciliation(_apply)` and `agentscm_work_transitions`. `agentscm client mcp`
+asks for the full set when `AGENTSCM_MCP_TOOLS=all` is in its environment. Every tool stays
+callable by name either way. A read-only token's list is unchanged: it always lists every read
+tool it may call.
 
 Tools:
 

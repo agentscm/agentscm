@@ -503,7 +503,10 @@ async fn protocol_basics() {
     let default_init = hub.rpc(&key, &init("2025-11-25")).await.json();
     let instructions = default_init["result"]["instructions"].as_str().unwrap();
     assert!(instructions.contains("agentscm_start") && !instructions.contains("workflow_status"));
-    assert!(instructions.contains("agentscm_promises_list"));
+    // Rarely needed tools are not named, but the one step that lists them is.
+    assert!(
+        !instructions.contains("agentscm_promises_list") && instructions.contains("?tools=all")
+    );
 
     let ping = hub
         .rpc(&key, &json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}))
@@ -606,7 +609,6 @@ async fn protocol_basics() {
         .map(|tool| tool["name"].as_str().unwrap().to_owned())
         .collect();
     let opt_in = [
-        "agentscm_work_repositories",
         "agentscm_skill_list",
         "agentscm_skill_status",
         "agentscm_skill_evidence",
@@ -615,6 +617,20 @@ async fn protocol_basics() {
         "agentscm_publications_list",
         "agentscm_workflow_runs_list",
         "agentscm_workflow_status",
+        "agentscm_promises_list",
+        "agentscm_promise_show",
+        "agentscm_promise_history",
+        "agentscm_promise_propose",
+        "agentscm_promise_report",
+        "agentscm_contribution_receipt",
+        "agentscm_receipt_settings",
+        "agentscm_work_declarations",
+        "agentscm_work_declarations_set",
+        "agentscm_work_pr_link",
+        "agentscm_work_pr_link_set",
+        "agentscm_work_reconciliation",
+        "agentscm_work_reconciliation_apply",
+        "agentscm_work_transitions",
     ];
     assert_eq!(
         default_names,
@@ -631,7 +647,8 @@ async fn protocol_basics() {
         "agentscm_promise_propose",
         "agentscm_promise_report",
     ] {
-        assert!(default_names.iter().any(|listed| listed == name), "{name}");
+        assert!(!default_names.iter().any(|listed| listed == name), "{name}");
+        assert!(names.contains(&name), "{name}");
     }
     let reader_owner = hub
         .store
@@ -2786,8 +2803,92 @@ async fn search_tools_page_filter_and_stay_in_the_tokens_repository() {
     }
 }
 
-/// Every tool the shipped skill, instruction files, hook context, advice, views and server
-/// instructions name is in the default list, so the two cannot drift apart.
+/// What a default session pays for tool definitions: tool count, characters of every
+/// description (tool and parameter), and the serialized list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_tool_list_cost() {
+    fn descriptions(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => map
+                .iter()
+                .map(|(key, value)| match (key.as_str(), value) {
+                    ("description", Value::String(text)) => text.chars().count(),
+                    _ => descriptions(value),
+                })
+                .sum(),
+            Value::Array(items) => items.iter().map(descriptions).sum(),
+            _ => 0,
+        }
+    }
+    let hub = Hub::start().await;
+    let key = hub.secret(1, "alice");
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let tools = hub.rpc(&key, &list).await.json()["result"]["tools"].clone();
+    let (count, chars, bytes) = (
+        tools.as_array().unwrap().len(),
+        descriptions(&tools),
+        tools.to_string().len(),
+    );
+    eprintln!("default tools: {count}, description chars: {chars}, serialized bytes: {bytes}");
+    // Before the core profile: 51 tools, 23,319 description characters, 53,455 bytes.
+    // A tool joins every session's default list only by being named here.
+    const CORE: [&str; 38] = [
+        "agentscm_ask",
+        "agentscm_briefing_pending",
+        "agentscm_briefing_prepare",
+        "agentscm_briefing_read",
+        "agentscm_briefing_submit",
+        "agentscm_check",
+        "agentscm_coordination_ack",
+        "agentscm_coordination_inbox",
+        "agentscm_coordination_reply",
+        "agentscm_coordination_resolve",
+        "agentscm_coordination_withdraw",
+        "agentscm_done",
+        "agentscm_handoff",
+        "agentscm_hub_message",
+        "agentscm_pr_context",
+        "agentscm_setup_status",
+        "agentscm_start",
+        "agentscm_status",
+        "agentscm_value_metrics",
+        "agentscm_view_settings",
+        "agentscm_why",
+        "agentscm_work_ack",
+        "agentscm_work_briefing",
+        "agentscm_work_catchup",
+        "agentscm_work_catchup_ack",
+        "agentscm_work_checkpoint",
+        "agentscm_work_insight",
+        "agentscm_work_insights",
+        "agentscm_work_issue_link_set",
+        "agentscm_work_overview",
+        "agentscm_work_preflight",
+        "agentscm_work_recovery",
+        "agentscm_work_recovery_preview",
+        "agentscm_work_repositories",
+        "agentscm_work_search",
+        "agentscm_work_status",
+        "agentscm_work_transition",
+        "agentscm_work_usage",
+    ];
+    let mut names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, CORE);
+    assert!(
+        chars <= 17_500,
+        "default descriptions grew to {chars} characters"
+    );
+}
+
+/// Every tool the shipped skills, instruction files, hook context, advice, views, replies, client
+/// code, server instructions and default tool descriptions name is in the default list, so the
+/// two cannot drift apart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
     use agentscm::hub::skills::SkillAdoption;
@@ -2821,7 +2922,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (51, 54, 60));
+    assert_eq!(listed.len(), before.len() + 3);
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
@@ -2829,6 +2930,8 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         .as_str()
         .unwrap()
         .to_owned();
+    // The default tools' own descriptions are text agents are told, too.
+    let default_list = hub.rpc(&key, &list).await.json()["result"]["tools"].to_string();
     let told = [
         include_str!("../../src/client_setup.rs"),
         include_str!("../../src/init_cli/targets.rs"),
@@ -2840,8 +2943,24 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         include_str!("../../src/hub/mcp_views/work-overview.html"),
         include_str!("../../src/hub/mcp_views/coordination-inbox.html"),
         include_str!("../../src/hub/mcp_views/value-metrics.html"),
+        include_str!("../../skills/intent-review/SKILL.md"),
+        include_str!("../../skills/native-workflow/SKILL.md"),
         &instructions,
+        &default_list,
     ];
+    // Replies and the client: the shipped code only, not the test modules below it.
+    let code = [
+        include_str!("../../src/hub/work_recovery.rs"),
+        include_str!("../../src/hub/work_transition.rs"),
+        include_str!("../../src/hub/handoff.rs"),
+        include_str!("../../src/hub/pickup.rs"),
+        include_str!("../../src/hub/agent_messages.rs"),
+        include_str!("../../src/hook_cli.rs"),
+        include_str!("../../src/client_mcp.rs"),
+        include_str!("../../src/client_plugin.rs"),
+    ]
+    .map(|text| text.split("\n#[cfg(test)]\nmod tests {").next().unwrap());
+    let told = told.into_iter().chain(code);
     let mut checked = 0;
     for text in told {
         for (start, _) in text.match_indices("agentscm_") {

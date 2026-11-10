@@ -206,7 +206,7 @@ counted and never named, because a name could reveal that a private repository e
 `work_complete` (false when the 100-item cap cut a list) and `checked_at`. A token that asks
 again within 30 seconds gets its previous answer back with the same `checked_at`, so a lost
 access can be served stale to that same token for up to 30 seconds; any other token sees it at
-once. MCP exposes the same read as the opt-in tool `agentscm_work_repositories`.
+once. MCP exposes the same read as `agentscm_work_repositories`, which every agent token lists by default.
 
 ### Planned issues and issue linkage
 
