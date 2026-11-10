@@ -30,7 +30,8 @@ const UNCONFIRMED_GIVE_UP: Duration = Duration::from_secs(20);
 const POLL_SECONDS: u64 = 25;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_PAUSE: Duration = Duration::from_secs(5);
-const MAX_RETRIES: u32 = 3;
+/// The longest pause between tries while the Hub cannot be reached.
+const MAX_RETRY_PAUSE: Duration = Duration::from_secs(60);
 const MAX_SESSION_BYTES: usize = 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_TOOL_BYTES: usize = 128;
@@ -376,7 +377,7 @@ enum Step {
         unconfirmed: bool,
     },
     Decide(Answer),
-    /// A busy or unreachable Hub: try again shortly, a few times.
+    /// A busy or unreachable Hub: try again shortly, for as long as the hook waits.
     Retry,
     Stop,
 }
@@ -418,7 +419,8 @@ fn classify(reply: Option<(u16, Value)>, id: &str, hash: &str) -> Step {
     };
     match status {
         200 => {}
-        429 | 503 => return Step::Retry,
+        // 502 and 504 are a proxy in front of a Hub that is being replaced.
+        429 | 502 | 503 | 504 => return Step::Retry,
         _ => return Step::Stop,
     }
     if !only_keys(&reply, &["request_id", "input_hash", "state", "decision"])
@@ -533,10 +535,12 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
     let (id, mut unconfirmed) =
         registered(hub.post("/v1/hub/permission/register", &body).await, &hash)?;
     let until = started + bound();
-    // Never past the bound, so the hook ends on time.
-    let pause =
-        || tokio::time::sleep(RETRY_PAUSE.min(until.saturating_duration_since(Instant::now())));
-    let mut failures = 0;
+    // Longer after each failure in a row, and never past the bound, so the hook ends on time.
+    let pause = |tries: u32| {
+        let wait = (RETRY_PAUSE * tries.max(1)).min(MAX_RETRY_PAUSE);
+        tokio::time::sleep(wait.min(until.saturating_duration_since(Instant::now())))
+    };
+    let mut failures: u32 = 0;
     loop {
         let now = Instant::now();
         if now >= until || parent_gone(started_under) {
@@ -560,16 +564,16 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
                 let quick = asked.elapsed() < Duration::from_secs(1) && next == unconfirmed;
                 unconfirmed = next;
                 if quick {
-                    pause().await;
+                    pause(1).await;
                 }
             }
             Step::Decide(answer) => return Some(decision_output(answer)),
+            // The computer slept, the network dropped or the Hub is being replaced. The prompt
+            // may still be on screen, so the hook keeps trying for its whole bound; the Hub
+            // offers the request again once it hears this hook again.
             Step::Retry => {
-                failures += 1;
-                if failures > MAX_RETRIES {
-                    return None;
-                }
-                pause().await;
+                failures = failures.saturating_add(1);
+                pause(failures).await;
             }
             Step::Stop => return None,
         }
@@ -928,8 +932,12 @@ mod tests {
         ] {
             assert_eq!(classify(stop.clone(), id, &hash), Step::Stop, "{stop:?}");
         }
-        // Transient trouble is retried, a few times.
+        // Transient trouble is retried.
         assert_eq!(classify(None, id, &hash), Step::Retry);
+        assert_eq!(
+            classify(reply(502, "pending", Value::Null), id, &hash),
+            Step::Retry
+        );
         assert_eq!(
             classify(reply(429, "pending", Value::Null), id, &hash),
             Step::Retry

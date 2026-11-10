@@ -13,6 +13,10 @@
 //! the permission wait it was made for is still the session's current wait, so a prompt answered
 //! in the session, or replaced by anything else, ends it.
 //!
+//! A request whose hook has not polled for a minute (a sleeping or offline computer) is asleep:
+//! kept, but neither listed nor answerable, since nobody would hear the answer. It is offered
+//! again when that hook polls again, within the same wait and the request's 12 hours.
+//!
 //! A request starts `unconfirmed` and becomes `pending` only when the Hub also hears the host's
 //! `permission_prompt` notification for that session. A host that runs without a person at a
 //! dialog (a headless run) raises the permission request but never shows the prompt, so it never
@@ -41,15 +45,19 @@ use super::{HubError, HubState};
 
 /// A person may be away for hours; the hook's own bound is a little shorter than this.
 const TTL_SECONDS: i64 = 12 * 60 * 60;
-/// A request whose hook stopped polling is not answerable any more.
+/// A request whose hook has not polled for this long is not offered: nobody would hear the
+/// answer. It is offered again when that hook polls again (a computer back from sleep, a network
+/// that is back), for as long as its wait is still the session's wait.
 const HOOK_GONE_SECONDS: i64 = 60;
-/// A finished request stays readable so a late answer can say what happened.
+/// A finished request stays readable so a late answer can say what happened. One that is asleep
+/// is kept for as long as it can wake.
 const RETAIN_SECONDS: i64 = 120;
-/// Live requests one agent token may hold; registering another ends the oldest.
-const MAX_PER_TOKEN: usize = 8;
-const MAX_LIVE: usize = 256;
+/// Requests this Hub holds. A session has one open request, and the waits table bounds a
+/// person's waiting sessions, so there is no further bound per person or token. Past this a
+/// new request is refused; the ones already waiting stay answerable.
+const MAX_LIVE: usize = 1024;
 /// Long polls held open at once; past it a poll answers at once.
-const MAX_POLLERS: usize = 256;
+const MAX_POLLERS: usize = MAX_LIVE;
 const MAX_WAIT_SECONDS: u64 = 25;
 /// What the host's notification may lead the hook's own request by.
 const CONFIRM_SLACK_SECONDS: i64 = 5;
@@ -135,6 +143,8 @@ pub(super) enum Ended {
     /// moved on.
     SessionMovedOn,
     Superseded,
+    /// Its hook stopped polling. While its wait is still the session's wait the request is only
+    /// asleep, and wakes when the hook polls again.
     HookGone,
     Expired,
 }
@@ -167,12 +177,38 @@ struct Pending {
     last_poll: i64,
     /// When it was answered or ended.
     settled: i64,
+    /// The host said it shows this prompt.
+    shown: bool,
     state: Phase,
 }
 
 impl Pending {
     fn open(&self) -> bool {
         matches!(self.state, Phase::Unconfirmed | Phase::Pending)
+    }
+
+    /// It ended only because its hook went quiet, and the wait it was made for is still the
+    /// session's wait: the hook may come back and be heard.
+    fn asleep(&self, waiting: &Waiting, now: i64) -> bool {
+        self.state == Phase::Ended(Ended::HookGone)
+            && now - self.created < TTL_SECONDS
+            && self.attached(waiting, now).is_some()
+    }
+
+    /// Its hook is back: a request that was only asleep is offered again. True when the request
+    /// is open afterwards.
+    fn wake(&mut self, waiting: &Waiting, now: i64) -> bool {
+        if self.asleep(waiting, now) {
+            self.state = if self.shown {
+                Phase::Pending
+            } else {
+                Phase::Unconfirmed
+            };
+        }
+        if self.open() {
+            self.last_poll = now;
+        }
+        self.open()
     }
 
     fn end(&mut self, why: Ended, now: i64) {
@@ -197,7 +233,8 @@ struct Inner {
 }
 
 impl Inner {
-    /// Ends what has expired, lost its hook or lost its wait, and drops what was kept long enough.
+    /// Ends what has expired, lost its hook or lost its wait, and drops what was kept long
+    /// enough. A request that is only asleep is kept for its hook's return.
     fn settle(&mut self, waiting: &Waiting, now: i64) {
         for row in self.rows.values_mut().filter(|row| row.open()) {
             if now - row.created >= TTL_SECONDS {
@@ -208,8 +245,9 @@ impl Inner {
                 row.end(Ended::SessionMovedOn, now);
             }
         }
-        self.rows
-            .retain(|_, row| row.open() || now - row.settled < RETAIN_SECONDS);
+        self.rows.retain(|_, row| {
+            row.open() || now - row.settled < RETAIN_SECONDS || row.asleep(waiting, now)
+        });
     }
 }
 
@@ -468,33 +506,23 @@ impl Requests {
         let same = |row: &Pending| {
             row.token == principal.token_id && row.native == session && row.asker == agent_id
         };
-        if let Some((id, row)) = inner
-            .rows
-            .iter_mut()
-            .find(|(_, row)| row.open() && same(row) && row.input_hash == input_hash)
-        {
-            row.last_poll = now;
-            return Ok((id.clone(), row.state));
+        for (id, row) in &mut inner.rows {
+            if same(row) && row.input_hash == input_hash && row.wake(waiting, now) {
+                return Ok((id.clone(), row.state));
+            }
         }
+        // A session shows one prompt at a time: its other requests are over, also one that is
+        // asleep, which must not wake beside this one.
         for row in inner
             .rows
             .values_mut()
-            .filter(|row| row.open() && row.token == principal.token_id && row.native == session)
+            .filter(|row| row.token == principal.token_id && row.native == session)
         {
-            row.end(Ended::Superseded, now);
+            if row.open() || row.asleep(waiting, now) {
+                row.end(Ended::Superseded, now);
+            }
         }
-        let open: Vec<(i64, String)> = inner
-            .rows
-            .iter()
-            .filter(|(_, row)| row.open() && row.token == principal.token_id)
-            .map(|(id, row)| (row.created, id.clone()))
-            .collect();
-        if open.len() >= MAX_PER_TOKEN
-            && let Some((_, oldest)) = open.into_iter().min()
-            && let Some(row) = inner.rows.get_mut(&oldest)
-        {
-            row.end(Ended::Superseded, now);
-        }
+        // A request that already waits is never ended to make room for a new one.
         if inner.rows.len() >= MAX_LIVE {
             // Finished rows only wait to answer a late click; they never crowd out a live one.
             inner.rows.retain(|_, row| row.open());
@@ -531,6 +559,7 @@ impl Requests {
                 created: now,
                 last_poll: now,
                 settled: now,
+                shown: confirmed,
                 state,
             },
         );
@@ -557,9 +586,16 @@ impl Requests {
         }
         let mut changed = false;
         for row in inner.rows.values_mut() {
-            if row.state == Phase::Unconfirmed && row.token == token && row.native == native {
+            if row.token != token || row.native != native {
+                continue;
+            }
+            if row.state == Phase::Unconfirmed {
                 row.state = Phase::Pending;
                 changed = true;
+            }
+            // Also for a request that is asleep, so it wakes as shown.
+            if row.open() || row.state == Phase::Ended(Ended::HookGone) {
+                row.shown = true;
             }
         }
         drop(inner);
@@ -569,7 +605,8 @@ impl Requests {
     }
 
     /// The state of a request for the hook that made it; `None` for an unknown id, another
-    /// token's request or a different hash, which look alike.
+    /// token's request or a different hash, which look alike. The call is that hook being heard:
+    /// it keeps an open request live and wakes one that was asleep.
     pub(super) fn check(
         &self,
         waiting: &Waiting,
@@ -584,9 +621,7 @@ impl Requests {
         if row.token != token || row.input_hash != hash {
             return None;
         }
-        if row.open() {
-            row.last_poll = now;
-        }
+        row.wake(waiting, now);
         Some(row.state)
     }
 
@@ -1117,11 +1152,12 @@ mod tests {
     }
 
     #[test]
-    fn a_token_and_the_whole_hub_hold_a_bounded_number_of_live_requests() {
+    fn the_hub_holds_a_bounded_number_of_requests_and_ends_none_for_room() {
         let (requests, waiting) = (Requests::default(), Waiting::default());
+        // Many sessions of one person on one token all keep their requests.
         let mine = principal("tok_a", "usr_me", "acme/widgets");
         let mut ids = Vec::new();
-        for n in 0..=MAX_PER_TOKEN {
+        for n in 0..40 {
             let session = format!("s{n}");
             wait(
                 &waiting,
@@ -1131,28 +1167,24 @@ mod tests {
                 None,
                 1_000,
             );
-            let at = 1_001 + i64::try_from(n).unwrap();
             ids.push(
                 requests
-                    .register(&waiting, &mine, registration(&session, None, HASH), at)
+                    .register(&waiting, &mine, registration(&session, None, HASH), 1_001)
                     .unwrap()
                     .0,
             );
         }
-        // The oldest gave way to the ninth.
-        let at = 1_010;
-        assert_eq!(
-            requests.check(&waiting, "tok_a", &ids[0], HASH, at),
-            Some(Phase::Ended(Ended::Superseded))
-        );
-        assert_eq!(
-            requests.check(&waiting, "tok_a", &ids[MAX_PER_TOKEN], HASH, at),
-            Some(Phase::Unconfirmed)
-        );
+        for id in &ids {
+            assert_eq!(
+                requests.check(&waiting, "tok_a", id, HASH, 1_010),
+                Some(Phase::Unconfirmed)
+            );
+        }
+        // Past the Hub's bound a new request is refused.
         let mut refused = false;
-        'fill: for t in 0..(MAX_LIVE / MAX_PER_TOKEN + 2) {
-            let who = principal(&format!("tok_{t}"), "usr_x", "acme/widgets");
-            for n in 0..MAX_PER_TOKEN {
+        'fill: for t in 0..(MAX_LIVE / 64 + 2) {
+            let who = principal(&format!("tok_{t}"), &format!("usr_{t}"), "acme/widgets");
+            for n in 0..64 {
                 let session = format!("c{n}");
                 wait(
                     &waiting,
@@ -1163,7 +1195,7 @@ mod tests {
                     1_000,
                 );
                 let outcome =
-                    requests.register(&waiting, &who, registration(&session, None, HASH), 1_200);
+                    requests.register(&waiting, &who, registration(&session, None, HASH), 1_010);
                 if matches!(outcome, Err(Refusal::Busy)) {
                     refused = true;
                     break 'fill;
@@ -1172,10 +1204,15 @@ mod tests {
             }
         }
         assert!(refused, "the hub-wide bound refused a request");
+        // The requests that already waited are still open.
+        assert_eq!(
+            requests.check(&waiting, "tok_a", &ids[0], HASH, 1_020),
+            Some(Phase::Unconfirmed)
+        );
     }
 
     #[test]
-    fn a_request_ends_when_its_hook_goes_quiet_or_at_the_limit() {
+    fn a_request_sleeps_while_its_hook_is_quiet_and_ends_at_the_limit() {
         let (requests, waiting) = (Requests::default(), Waiting::default());
         let mine = principal("tok_a", "usr_me", "acme/widgets");
         wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_000);
@@ -1183,18 +1220,50 @@ mod tests {
             .register(&waiting, &mine, registration("s", None, HASH), 1_000)
             .unwrap()
             .0;
+        requests.confirm("tok_a", "s", 1_001);
+        let key = wait_key("tok_a", "s");
+        assert!(requests.answerable(&waiting, &key, 1_002));
+        // A hook that has not polled for a minute would not hear an answer, so none is taken.
         let quiet = 1_000 + HOOK_GONE_SECONDS;
+        assert!(!requests.answerable(&waiting, &key, quiet));
+        assert!(matches!(
+            requests.answer(&waiting, "usr_me", Some(7), &id, Decision::Allow, quiet),
+            Err(Refusal::Ended)
+        ));
+        // An hour later the computer is awake and the hook polls: the same request is offered
+        // again, shown as it was.
+        let back = quiet + 3_600;
         assert_eq!(
-            requests.check(&waiting, "tok_a", &id, HASH, quiet),
-            Some(Phase::Ended(Ended::HookGone))
+            requests.check(&waiting, "tok_a", &id, HASH, back),
+            Some(Phase::Pending)
         );
-        // Kept polling, it lives until the limit.
-        let id = requests
-            .register(&waiting, &mine, registration("s", None, OTHER_HASH), quiet)
+        assert!(requests.answerable(&waiting, &key, back));
+        // Asleep again, it is over when the session shows another prompt in the same wait.
+        let asleep = back + HOOK_GONE_SECONDS;
+        assert!(!requests.answerable(&waiting, &key, asleep));
+        let other = requests
+            .register(&waiting, &mine, registration("s", None, OTHER_HASH), asleep)
             .unwrap()
             .0;
-        let mut now = quiet;
-        while now - quiet < TTL_SECONDS - 30 {
+        assert_eq!(
+            requests.check(&waiting, "tok_a", &id, HASH, asleep),
+            Some(Phase::Ended(Ended::Superseded))
+        );
+        // A request does not wake once its session has moved on.
+        waiting.clear("tok_a", "s", None, true);
+        let gone = asleep + HOOK_GONE_SECONDS + 10;
+        assert_eq!(
+            requests.check(&waiting, "tok_a", &other, OTHER_HASH, gone),
+            Some(Phase::Ended(Ended::HookGone))
+        );
+        // Kept polling, a request lives until the limit.
+        wait(&waiting, &mine, "s", WaitReason::Permission, None, gone);
+        let id = requests
+            .register(&waiting, &mine, registration("s", None, OTHER_HASH), gone)
+            .unwrap()
+            .0;
+        let mut now = gone;
+        while now - gone < TTL_SECONDS - 30 {
             now += 30;
             wait(&waiting, &mine, "s", WaitReason::Permission, None, now);
             assert_eq!(
@@ -1203,7 +1272,7 @@ mod tests {
             );
         }
         assert_eq!(
-            requests.check(&waiting, "tok_a", &id, OTHER_HASH, quiet + TTL_SECONDS),
+            requests.check(&waiting, "tok_a", &id, OTHER_HASH, gone + TTL_SECONDS),
             Some(Phase::Ended(Ended::Expired))
         );
     }
