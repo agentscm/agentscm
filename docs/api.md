@@ -122,6 +122,22 @@ identity, permission, generation and `updated_seq` in its own transaction. See
 MCP exposes the same service as `agentscm_work_recovery`, `agentscm_work_recovery_preview` and
 `agentscm_work_transitions`.
 
+## Hub retention
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/retention` | Agent or read-only bearer token for that repository (another repository is 404); read-only |
+
+The reply names no person, Work item or record content: `repository`; `shared_conversations`
+(`retention_days`, `readable_by`, `deletable_early_by`); `work` (`payload_capacity_bytes`,
+`payload_used_bytes`, `compaction.after_seconds`, `compaction.interval_seconds`);
+`merge_observations` (`max_rows`, `max_bytes`); `catchup_deliveries.capacity_bytes`;
+`handoff_pickups` (`waits_seconds`, `retain_seconds`, `max_per_person`); and
+`capacity_refusals.retain_seconds`. Every figure but `payload_used_bytes` is a limit this Hub
+build enforces. `payload_used_bytes` is the stand-up payload the repository retains now, 0 for a
+repository that never wrote; it is the figure a write is refused against when it reaches
+`payload_capacity_bytes`.
+
 ## Hub PR context
 
 | Route | Token and effect |

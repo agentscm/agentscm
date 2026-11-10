@@ -13867,6 +13867,24 @@ impl Store for PgStore {
         })
     }
 
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64> {
+        self.run(true, |client| {
+            Ok(client
+                .query_opt(
+                    "SELECT charged_bytes FROM hub_work_usage
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0)))
+        })
+    }
+
     fn work_briefing_preview_for(
         &self,
         token: &str,
