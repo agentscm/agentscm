@@ -39,11 +39,64 @@ pub enum WaitReason {
     Permission,
     /// The agent asked the person a question: a choice, or a form an MCP server opened.
     Question,
-    /// The agent finished its turn and waits for the person's next message.
+    /// The agent finished its turn and waits for the person's next message. Its last message
+    /// asked for something, or whether it did is not known.
     Idle,
+    /// The agent finished its turn and the end of its last message asked its person nothing. It
+    /// asks nobody, so it is never shown as a wait: a finished turn is read, not answered.
+    Finished,
     /// The agent stopped on its own background work, which will resume it. It asks nobody, so it
     /// is never shown as a wait: it only keeps the Work its session leads from reading as quiet.
     Background,
+}
+
+/// Whether `text`, the end of an agent's last message or the next action it reported, asks its
+/// person for something. A wrong yes shows a session its person need not answer; a wrong no
+/// hides a request, so anything that reads like one counts.
+/// shortcut: question marks and English phrases only, so an ask in another language that ends
+/// without a question mark is missed; let the agent's host say whether the turn asked if that shows.
+pub(super) fn asks_person(text: &str) -> bool {
+    // Words to the person, and words for being stuck or needing a ruling.
+    const REQUESTS: &[&str] = &[
+        "let me know",
+        "tell me",
+        "send me",
+        "please",
+        "should i",
+        "want me to",
+        "your call",
+        "up to you",
+        "need you",
+        "needs you",
+        "need your",
+        "needs your",
+        "for you",
+        "from you",
+        "on you",
+        "once you",
+        "when you",
+        "if you",
+        "you can",
+        "you need",
+        "you must",
+        "you should",
+        "you'll",
+        "would you",
+        "can you",
+        "could you",
+        "do you",
+        "decision",
+        "decide",
+        "confirm",
+        "approv",
+        "permission",
+        "blocked",
+        "cannot proceed",
+        "can't proceed",
+        "owner",
+    ];
+    let text = text.to_lowercase();
+    text.contains(['?', '？']) || REQUESTS.iter().any(|phrase| text.contains(phrase))
 }
 
 impl WaitReason {
@@ -53,7 +106,22 @@ impl WaitReason {
             Self::Permission => "permission",
             Self::Question => "question",
             Self::Idle => "idle",
+            Self::Finished => "finished",
             Self::Background => "background",
+        }
+    }
+
+    /// A stop that asks nobody: never shown as a wait, and never counted for a person.
+    pub fn asks_nobody(self) -> bool {
+        matches!(self, Self::Finished | Self::Background)
+    }
+
+    /// The wait a turn's end is, from the end of the agent's last message as its hook excerpted
+    /// it. Without the excerpt it is not known whether the turn asked, and the session is shown.
+    pub(super) fn turn_end(last_words: Option<&str>) -> Self {
+        match last_words {
+            Some(text) if !asks_person(text) => Self::Finished,
+            _ => Self::Idle,
         }
     }
 
@@ -81,6 +149,7 @@ impl WaitReason {
             Self::Permission => "is waiting in its session for your permission to use a tool",
             Self::Question => "is waiting in its session for your answer to a question",
             Self::Idle => "finished its turn and is waiting in its session for your reply",
+            Self::Finished => "finished its turn and asked you nothing",
             Self::Background => "stopped on its own background work, which will resume it",
         }
     }
@@ -192,15 +261,15 @@ impl Waiting {
         if !rows.contains_key(&key) {
             let mine = |row: &Row| row.principal.owner.id == principal.owner.id;
             if rows.values().filter(|row| mine(row)).count() >= MAX_OWNER_ROWS {
-                // Room is made from waits that ask nobody or the least: a stop on background
-                // work first, then the end of a turn, oldest first. A prompt or a question is
+                // Room is made from waits that ask nobody or the least: a stop that asks nobody
+                // first, then the end of a turn, oldest first. A prompt or a question is
                 // never dropped for room; with only those left, the new wait is refused.
                 let spare = rows
                     .iter()
                     .filter(|(_, row)| {
-                        mine(row) && matches!(row.reason, WaitReason::Background | WaitReason::Idle)
+                        mine(row) && (row.reason.asks_nobody() || row.reason == WaitReason::Idle)
                     })
-                    .min_by_key(|(_, row)| (row.reason != WaitReason::Background, row.since))
+                    .min_by_key(|(_, row)| (!row.reason.asks_nobody(), row.since))
                     .map(|(key, _)| key.clone());
                 // shortcut: one mark for the whole Hub, so one person's overflow also makes
                 // other people's older quiet Work read unknown; keep a mark per person if that
@@ -215,6 +284,16 @@ impl Waiting {
                 self.lost_before(now + 1);
                 return Err(HubError::Busy);
             }
+        }
+        // The host's idle notice follows a turn's end and says nothing: a turn that asked nothing
+        // still asked nothing.
+        if reason == WaitReason::Idle
+            && asks.is_none()
+            && rows
+                .get(&key)
+                .is_some_and(|row| row.reason == WaitReason::Finished)
+        {
+            return Ok(());
         }
         let (since, said) = match rows.get(&key) {
             Some(row) if row.reason == reason => (
@@ -295,7 +374,7 @@ impl Waiting {
             .iter()
             .filter(|(_, row)| {
                 row.current(now)
-                    && row.reason != WaitReason::Background
+                    && !row.reason.asks_nobody()
                     && now - row.since >= GRACE_SECONDS
                     && row.principal.owner.id == viewer.owner.id
                     && same_repository(&row.principal, viewer)
@@ -633,6 +712,51 @@ mod tests {
             lead("s1", 2_000 + IN_FLIGHT_CAP_SECONDS),
             LeadWait::NotWaiting
         );
+    }
+
+    #[test]
+    fn a_turn_that_ended_asking_nothing_is_nobodys_wait() {
+        // The end of the last message decides. With no excerpt it is not known, and shown.
+        assert_eq!(WaitReason::turn_end(None), WaitReason::Idle);
+        for asks in [
+            "Which of the two should I merge?",
+            "Both are ready. Let me know which one to merge.",
+            "Nothing wakes me when it merges: send me any message then.",
+            "This is blocked until the owner picks a region.",
+            "I need a decision on the region before I continue.",
+            "The branch is pushed; you can merge it when the checks pass.",
+            "どちらにしますか？",
+        ] {
+            assert_eq!(WaitReason::turn_end(Some(asks)), WaitReason::Idle, "{asks}");
+        }
+        for done in [
+            "Both pull requests are merged and the Work is completed.",
+            "Tests pass on SQLite and PostgreSQL. Not checked: the full suite.",
+        ] {
+            assert_eq!(
+                WaitReason::turn_end(Some(done)),
+                WaitReason::Finished,
+                "{done}"
+            );
+        }
+        let waiting = Waiting::default();
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        let record = |reason, asks, at| {
+            waiting
+                .record(&mine, "native", "s1", "claude", reason, None, asks, at)
+                .unwrap();
+            waiting.owned(&mine, 5_000).unwrap().len()
+        };
+        // The Work its session leads knows the turn ended; its person is shown no wait.
+        assert_eq!(record(WaitReason::Finished, None, 1_000), 0);
+        assert_eq!(
+            waiting.lead("tok_a", "s1", 990, 5_000),
+            LeadWait::Waiting(WaitReason::Finished)
+        );
+        // The host's idle notice a minute later says nothing, so nothing changes.
+        assert_eq!(record(WaitReason::Idle, None, 1_060), 0);
+        // A turn whose end asks is a wait.
+        assert_eq!(record(WaitReason::Idle, Some("Which one?"), 1_100), 1);
     }
 
     #[test]

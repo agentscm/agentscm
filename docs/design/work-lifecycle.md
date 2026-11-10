@@ -476,6 +476,14 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
   live sessions, which the conflict and check readers already use), a stale claim reads
   `freshness: active` on the row.
 - **Waiting for its person** (a permission prompt, a question or the end of its turn): the row is `awaiting_party`, names that person and reads `freshness: active`, from the moment the session stops. It does not set `needs_you`, because the person's `session_waiting` action asks them, 60 seconds later, and one wait counts once. Active and paused Work read this way. A reported blocker, a handover and an observed merge say more and are shown instead on the Work row. The separate `session_waiting` action still asks the person for a question or permission; routing a routine handover to an agent does not remove that action.
+- **Ended its turn and asked nothing**: a finished turn is read, not answered. The Hub takes a
+  turn's end for a wait only when the end of the agent's last message asks for something (a
+  question mark, or words such as "let me know" or "send me"), or when its hook sent no excerpt
+  and so it is not known. Otherwise no `session_waiting` action is listed, and the row is
+  `reassessment_needed`, names nobody and reads `freshness: active`, because the session is
+  there. One exception keeps a request from being hidden: when the Work's last report is a pause
+  whose next action asks its person for something or names them, the row is `awaiting_party`,
+  names that person and sets `needs_you`, since no action asks for it.
 - **Stopped on its own background work**, which will resume it: the row stays `active` and asks
   nobody.
 - **How long.** A wait for a person is believed until the session's next call or its end, for at

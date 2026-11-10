@@ -1506,7 +1506,13 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         {
             call(Kind::Waiting(WaitReason::Background), Shape::Silent)
         }
-        Some("Stop") => waiting(WaitReason::Idle),
+        // A turn whose last message ends asking nothing is read, not answered: nobody is shown
+        // that wait, so what the turn ended on is not kept. Without the client's excerpt it is
+        // not known whether the turn asked, and the session is shown.
+        Some("Stop") => match WaitReason::turn_end(str_at(v, "asks")) {
+            WaitReason::Finished => call(Kind::Waiting(WaitReason::Finished), Shape::Silent),
+            reason => waiting(reason),
+        },
         Some("PreToolUse") if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Hook("PreToolUse"))
@@ -2345,7 +2351,7 @@ mod tests {
 
     #[test]
     fn every_agent_reports_the_waits_its_host_exposes_and_says_nothing_back() {
-        use WaitReason::{Background, Idle, Permission, Question};
+        use WaitReason::{Background, Finished, Idle, Permission, Question};
         let wait = |agent, v: Value| {
             let call = parse(agent, &v);
             assert_eq!(
@@ -2388,6 +2394,17 @@ mod tests {
                 Agent::Claude,
                 json!({"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}),
                 Some(Idle),
+            ),
+            // The end of its last message says whether the turn asked its person anything.
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","asks":"Shall I merge it?"}),
+                Some(Idle),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","asks":"Merged; tests pass."}),
+                Some(Finished),
             ),
             // Paused for its own background work: the client's count and a legacy hook's list.
             (
