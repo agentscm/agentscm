@@ -683,13 +683,24 @@ fn request_wake(
             } else {
                 (String::new(), String::new())
             };
+            // A request between two agents of one person is never raised to that person, so
+            // its notice does not promise it.
+            let raised = if request.requester.owner == lead.owner {
+                String::new()
+            } else {
+                format!(
+                    " If it is still not acknowledged {} minutes after it was made, your person is asked in the Hub's Needs you.",
+                    super::coordination::ACK_BOUND_SECS / 60
+                )
+            };
+            // Without `target_work_id` an acknowledgement is the requester's, and the lead's is
+            // refused: the notice names the Work to pass.
             return Ok(Some(format!(
-                "{REQUEST_FRAME} {} for your Work {}{place}: {}'s {} asks for {files}, which this Work reserves. Read it with agentscm_coordination_inbox, acknowledge it with agentscm_coordination_ack, then reply with agentscm_coordination_reply: split, join, handover or decline.{root} If it is still not acknowledged {} minutes after it was made, your person is asked in the Hub's Needs you. A subagent leaves it for the session that started it.",
+                "{REQUEST_FRAME} {} for your Work {work}{place}: {}'s {} asks for {files}, which this Work reserves. Read it with agentscm_coordination_inbox, acknowledge it with agentscm_coordination_ack, then reply with agentscm_coordination_reply: split, join, handover or decline. Pass `target_work_id` set to {work} on the acknowledgement and on the reply.{root}{raised} A subagent leaves it for the session that started it.",
                 request.id,
-                target.work_id,
                 ascii_name(&request.requester.login),
                 ascii_name(&agent_name(&request.requester.agent)),
-                super::coordination::ACK_BOUND_SECS / 60,
+                work = target.work_id,
             )));
         }
     }
@@ -1567,6 +1578,8 @@ mod tests {
             "src/client_plugin.rs",
             " in acme/gadgets:",
             "Pass `root` set to your checkout of acme/gadgets",
+            "Pass `target_work_id` set to ",
+            "your person is asked in the Hub's Needs you",
         ] {
             assert!(text.contains(named), "{named}: {text}");
         }
@@ -1582,6 +1595,22 @@ mod tests {
         assert!(
             own.contains(&second) && !own.contains("acme/gadgets"),
             "{own}"
+        );
+        // A request from another agent of the lead's own person is never raised to that
+        // person, so its notice does not say it will be.
+        let mine = minted(store, now, 701, "releaser2", "acme/gadgets");
+        let third = started(store, now, &mine, "own")
+            .coordination_request
+            .unwrap()
+            .id;
+        let quiet = request_wake(store, &at.there, LEAD_SESSION, false, now)
+            .unwrap()
+            .unwrap();
+        assert!(
+            quiet.contains(&third)
+                && quiet.contains(&format!("Pass `target_work_id` set to {}", at.work))
+                && !quiet.contains("Needs you"),
+            "{quiet}"
         );
     }
 
