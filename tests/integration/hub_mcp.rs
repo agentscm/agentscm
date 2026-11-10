@@ -2818,7 +2818,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (50, 53, 58));
+    assert_eq!((before.len(), listed.len(), all.len()), (51, 54, 59));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
