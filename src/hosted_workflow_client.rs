@@ -560,8 +560,8 @@ impl Remote {
         let bytes = self
             .exchange(method, url, body, maximum, "application/json")
             .await?;
-        serde_json::from_slice(&bytes)
-            .map_err(|_| Error::Invalid("hosted workflow returned invalid JSON".into()))
+        agentscm::hub::reply::decode_slice(&bytes)
+            .map_err(|error| Error::Invalid(format!("hosted workflow: {error}")))
     }
 
     async fn bytes<B: Serialize + ?Sized>(
@@ -593,8 +593,8 @@ impl Remote {
                 .body(body);
         }
         let bytes = response_bytes(request, maximum, "application/json").await?;
-        serde_json::from_slice(&bytes)
-            .map_err(|_| Error::Invalid("hosted workflow returned invalid JSON".into()))
+        agentscm::hub::reply::decode_slice(&bytes)
+            .map_err(|error| Error::Invalid(format!("hosted workflow: {error}")))
     }
 
     async fn exchange<B: Serialize + ?Sized>(

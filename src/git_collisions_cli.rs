@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use agentscm::Result;
-use agentscm::git_collisions::{self, Request};
+use agentscm::git_collisions::{self, HistoryRequest, Request};
 use agentscm::hub::advice::sanitize;
 use clap::Args;
 use serde_json::{Value, json};
@@ -40,6 +40,17 @@ pub struct CollisionsArgs {
     /// fewest new heads.
     #[arg(long)]
     merge_order: bool,
+    /// Instead of checking open branches, count past overlaps: files that different authors
+    /// changed within 72 hours of each other, in commits that reached the base in this many
+    /// days. Prints counts by top directory. A lower bound, read from this repository's history
+    /// only.
+    #[arg(
+        long,
+        value_name = "DAYS",
+        value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with_all = ["refs", "worktrees", "include_merged", "merge_order"]
+    )]
+    history: Option<u32>,
     /// Print the full JSON report. This is the default when stdout is not a terminal.
     #[arg(long, conflicts_with = "text")]
     json: bool,
@@ -50,18 +61,27 @@ pub struct CollisionsArgs {
 
 pub fn run(args: CollisionsArgs) -> Result<()> {
     let text = !args.json && (args.text || std::io::stdout().is_terminal());
-    let report = git_collisions::collisions(&Request {
-        git: args.git.unwrap_or_else(default_git),
-        repository: args.git_dir,
-        base: args.base,
-        refs: args.refs,
-        worktrees: args.worktrees,
-        active_days: (args.active_days > 0).then_some(args.active_days),
-        include_merged: args.include_merged,
-        deadline: None,
-        max_bytes: None,
-        merge_order: args.merge_order,
-    });
+    let git = args.git.unwrap_or_else(default_git);
+    let report = match args.history {
+        Some(days) => git_collisions::history(&HistoryRequest {
+            git,
+            repository: args.git_dir,
+            base: args.base,
+            days,
+        }),
+        None => git_collisions::collisions(&Request {
+            git,
+            repository: args.git_dir,
+            base: args.base,
+            refs: args.refs,
+            worktrees: args.worktrees,
+            active_days: (args.active_days > 0).then_some(args.active_days),
+            include_merged: args.include_merged,
+            deadline: None,
+            max_bytes: None,
+            merge_order: args.merge_order,
+        }),
+    };
     let report = match report {
         Ok(report) => report,
         // Same exit code as the JSON error path in main.
@@ -71,12 +91,64 @@ pub fn run(args: CollisionsArgs) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    if text {
-        print!("{}", render(&report, args.worktrees));
-    } else {
-        println!("{}", json!({"ok": true, "collisions": report}));
+    match (text, args.history.is_some()) {
+        (true, true) => print!("{}", render_history(&report)),
+        (true, false) => print!("{}", render(&report, args.worktrees)),
+        (false, true) => println!("{}", json!({"ok": true, "history": report})),
+        (false, false) => println!("{}", json!({"ok": true, "collisions": report})),
     }
     Ok(())
+}
+
+fn render_history(report: &Value) -> String {
+    let number = |key: &str| report[key].as_u64().unwrap_or(0) as usize;
+    let base = name(&report["base"]["name"]);
+    let days = count(number("days"), "day", "days");
+    if number("commits") == 0 {
+        return format!("No commits reached {base} in the last {days}; nothing to count.\n");
+    }
+    let mut out = format!(
+        "Read {} by {} on {base} from the last {days}",
+        count(number("commits"), "commit", "commits"),
+        count(number("authors"), "author", "authors"),
+    );
+    let overlaps = |entry: &Value| {
+        format!(
+            "{} in {}",
+            count(
+                entry["overlaps"].as_u64().unwrap_or(0) as usize,
+                "overlap",
+                "overlaps"
+            ),
+            count(
+                entry["files"].as_u64().unwrap_or(0) as usize,
+                "file",
+                "files"
+            )
+        )
+    };
+    let directories = report["directories"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if directories.is_empty() {
+        out.push_str(" · No overlaps found\n");
+    } else {
+        let _ = writeln!(out, " · at least {}\n\nBy top directory:", overlaps(report));
+        for entry in directories.iter().take(MAX_PAIRS) {
+            let _ = writeln!(out, "  {}   {}", name(&entry["directory"]), overlaps(entry));
+        }
+        if directories.len() > MAX_PAIRS {
+            let _ = writeln!(out, "  ... and {} more", directories.len() - MAX_PAIRS);
+        }
+    }
+    let notes: Vec<String> = report["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(name)
+        .collect();
+    let _ = write!(out, "\n{}\n", notes.join(" "));
+    out
 }
 
 /// The first `git` on PATH as an absolute path, else /usr/bin/git.
