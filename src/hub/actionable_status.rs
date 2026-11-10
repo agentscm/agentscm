@@ -229,10 +229,26 @@ fn waiting_text(reason: WaitReason) -> &'static str {
         }
         WaitReason::Question => "Its lead session waits for its person's answer to a question.",
         WaitReason::Idle => "Its lead session ended its turn and waits for its person's reply.",
+        WaitReason::Finished => {
+            "Its lead session ended its turn and asked nothing; it goes on when its person next writes to it. Nobody is asked."
+        }
         WaitReason::Background => {
             "Its lead session stopped on its own background work, which will resume it; nobody is asked."
         }
     }
+}
+
+/// Paused Work whose reported next action speaks to its lead's person, or names them or the
+/// owner. Work that was resumed since is not paused, so an answered pause does not ask again.
+fn pause_asks_person(item: &WorkItem) -> bool {
+    let person = lead_person(item).login.unwrap_or_default().to_lowercase();
+    item.state == WorkState::Paused
+        && item.next_action.as_deref().is_some_and(|next| {
+            let named = next.to_lowercase();
+            crate::hub::session_waiting::addresses_person(next)
+                || named.contains("owner")
+                || (!person.is_empty() && named.contains(&person))
+        })
 }
 
 /// A report is routed to its named lead/owner, never to every reader of the repository. `wait`
@@ -365,16 +381,27 @@ pub fn project_work(
             "Review the reported blocker and identify its next action.",
         )
     } else if let LeadWait::Waiting(reason) = wait {
-        if reason == WaitReason::Background {
-            (StatusState::Active, lead(item), waiting_text(reason))
-        } else {
-            // Its `session_waiting` action asks the person, so one wait counts once.
-            not_the_persons = true;
-            (
+        match reason {
+            // A turn that ended asking nothing is shown as no wait, so when its pause report
+            // says it waits on its person, this row is what asks them.
+            WaitReason::Finished if pause_asks_person(item) => (
                 StatusState::AwaitingParty,
                 lead_person(item),
-                waiting_text(reason),
-            )
+                "Its lead session ended its turn, and its pause report says what it needs from its person.",
+            ),
+            // Neither asks anybody, and neither is stuck: the text says which it is.
+            WaitReason::Finished | WaitReason::Background => {
+                (StatusState::Active, lead(item), waiting_text(reason))
+            }
+            WaitReason::Permission | WaitReason::Question | WaitReason::Idle => {
+                // Its `session_waiting` action asks the person, so one wait counts once.
+                not_the_persons = true;
+                (
+                    StatusState::AwaitingParty,
+                    lead_person(item),
+                    waiting_text(reason),
+                )
+            }
         }
     } else if quiet {
         if wait == LeadWait::Unknown {
@@ -1009,8 +1036,10 @@ fn waiting_actions(
                 let label = match wait.reason {
                     WaitReason::Permission => "The prompt is for",
                     WaitReason::Question => "It asks",
-                    // A stop on background work asks nobody and is never listed here.
-                    WaitReason::Idle | WaitReason::Background => "Its last message ends",
+                    // A stop that asks nobody is never listed here.
+                    WaitReason::Idle | WaitReason::Finished | WaitReason::Background => {
+                        "Its last message ends"
+                    }
                 };
                 format!(" {label}: “{text}”.")
             })
@@ -1722,6 +1751,33 @@ mod tests {
         assert_eq!(busy.recipient.kind, RecipientKind::LeadAgent);
         assert_eq!(busy.freshness, ClaimStatus::Active);
         assert!(!busy.needs_you);
+        // A turn that ended asking nothing is nobody's to answer, and its session is there.
+        let finished = |item: &WorkItem| {
+            let wait = LeadWait::Waiting(WaitReason::Finished);
+            row(item, true, wait, "usr_lead")
+        };
+        // Neither is it stuck: it reads like a stop on background work.
+        let read = finished(&item);
+        assert_eq!(read.state, StatusState::Active);
+        assert_eq!(read.recipient.kind, RecipientKind::LeadAgent);
+        assert_eq!(read.freshness, ClaimStatus::Active);
+        assert!(!read.needs_you);
+        // No wait is shown for it, so paused Work whose next action waits on its person asks
+        // through the row: one that speaks to them, or one that names them.
+        for (next, asks) in [
+            ("Needs your decision on the deployment region", true),
+            ("Wait for lead to choose the deployment region", true),
+            ("Waiting on the merge queue for pull request 12", false),
+        ] {
+            item.next_action = Some(next.into());
+            let row = finished(&item);
+            assert_eq!(row.needs_you, asks, "{next}");
+            assert_eq!(row.state == StatusState::AwaitingParty, asks, "{next}");
+        }
+        // Work resumed since that pause is not paused: an answered pause does not ask again.
+        item.state = WorkState::Active;
+        item.next_action = Some("Needs your decision on the deployment region".into());
+        assert!(!finished(&item).needs_you);
         // A reported blocker says more than the wait.
         item.state = WorkState::Blocked;
         let blocked = row(&item, true, LeadWait::Waiting(WaitReason::Idle), "usr_lead");

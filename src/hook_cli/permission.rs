@@ -37,6 +37,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_PAUSE: Duration = Duration::from_secs(5);
 /// The longest pause between tries while the Hub cannot be reached.
 const MAX_RETRY_PAUSE: Duration = Duration::from_secs(60);
+/// The least time between two offers of the same prompt to a Hub that forgot its request, so a
+/// Hub that keeps forgetting ends the hook.
+const AGAIN_PAUSE: Duration = Duration::from_secs(60);
 const MAX_SESSION_BYTES: usize = 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_TOOL_BYTES: usize = 128;
@@ -691,6 +694,8 @@ enum Step {
     Retry,
     /// The Hub no longer knows this hook's agent token, which this computer may have renewed.
     Renew,
+    /// The Hub does not know the request: it restarted since it was registered.
+    Again,
     Stop,
 }
 
@@ -757,6 +762,7 @@ fn classify(reply: Option<(u16, Value)>, id: &str, hash: &str) -> Step {
         // 502 and 504 are a proxy in front of a Hub that is being replaced.
         429 | 502 | 503 | 504 => return Step::Retry,
         401 => return Step::Renew,
+        404 => return Step::Again,
         _ => return Step::Stop,
     }
     const KEYS: [&str; 7] = [
@@ -888,7 +894,8 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
         offer = Offer::default();
         reply = hub.post("/v1/hub/permission/register", &body).await;
     }
-    let (id, mut unconfirmed) = registered(reply, &hash)?;
+    let (mut id, mut unconfirmed) = registered(reply, &hash)?;
+    let mut offered_again: Option<Instant> = None;
     let until = started + bound();
     // Longer after each failure in a row, and never past the bound, so the hook ends on time.
     let pause = |tries: u32| {
@@ -934,6 +941,18 @@ async fn run(payload: &Value, started: Instant) -> Option<Value> {
             // same person's next token, so the hook goes on with the one this computer holds
             // now, and stops when that is the token the Hub just refused.
             Step::Renew => hub.token = renewed(payload, &hub.token)?,
+            // A Hub that restarted keeps the session's wait and not the request. The same
+            // prompt offered again, with the id this hook holds, is the same request while the
+            // session still waits at it. Only a prompt the host confirmed is offered again.
+            Step::Again => {
+                if unconfirmed || offered_again.is_some_and(|at| at.elapsed() < AGAIN_PAUSE) {
+                    return None;
+                }
+                body["again"] = json!(id);
+                let reply = hub.post("/v1/hub/permission/register", &body).await;
+                (id, unconfirmed) = registered(reply, &hash)?;
+                offered_again = Some(Instant::now());
+            }
             Step::Stop => return None,
         }
     }
@@ -1484,7 +1503,6 @@ mod tests {
             reply(200, "answered", Value::Null),
             reply(200, "pending", json!("allow")),
             reply(200, "answered", json!(true)),
-            reply(404, "answered", json!("allow")),
             reply(409, "answered", json!("allow")),
             reply(500, "answered", json!("allow")),
             Some((200, json!("allow"))),
@@ -1506,10 +1524,15 @@ mod tests {
         ] {
             assert_eq!(classify(stop.clone(), id, &hash), Step::Stop, "{stop:?}");
         }
-        // An ended agent token is no decision either: the hook looks for its renewal.
+        // An ended agent token is no decision either: the hook looks for its renewal. Nor is a
+        // Hub that does not know the request: the hook offers the prompt again.
         assert_eq!(
             classify(reply(401, "answered", json!("allow")), id, &hash),
             Step::Renew
+        );
+        assert_eq!(
+            classify(reply(404, "answered", json!("allow")), id, &hash),
+            Step::Again
         );
         // Transient trouble is retried.
         assert_eq!(classify(None, id, &hash), Step::Retry);

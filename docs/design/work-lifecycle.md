@@ -475,7 +475,19 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
 - **Still calling.** While the lead session called the Hub within the last 20 minutes (the store's
   live sessions, which the conflict and check readers already use), a stale claim reads
   `freshness: active` on the row.
-- **Waiting for its person** (a permission prompt, a question or the end of its turn): the row is `awaiting_party`, names that person and reads `freshness: active`, from the moment the session stops. It does not set `needs_you`, because the person's `session_waiting` action asks them, 60 seconds later, and one wait counts once. Active and paused Work read this way. A reported blocker, a handover and an observed merge say more and are shown instead on the Work row. The separate `session_waiting` action still asks the person for a question or permission; routing a routine handover to an agent does not remove that action.
+- **Waiting for its person** (a permission prompt, a question, or the end of a turn that may have asked for something): the row is `awaiting_party`, names that person and reads `freshness: active`, from the moment the session stops. It does not set `needs_you`, because the person's `session_waiting` action asks them, 60 seconds later, and one wait counts once. Active and paused Work read this way. A reported blocker, a handover and an observed merge say more and are shown instead on the Work row. The separate `session_waiting` action still asks the person for a question or permission; routing a routine handover to an agent does not remove that action.
+- **Ended its turn and asked nothing**: a finished turn is read, not answered. The session's
+  hook judges its whole last message where it is and sends only the answer. The message asked
+  nothing when it is English prose with no question mark, no word to the person and no word
+  for waiting, needing or being stuck; a wrong "asked" only shows a session, a wrong "asked
+  nothing" hides a request, so anything else counts as an ask. A hook that sends no answer
+  leaves the Hub its excerpt, which decides only when it is the whole message and not its cut
+  end. Where the turn asked nothing, no `session_waiting` action is listed, and the row stays
+  `active`, names its lead agent and asks nobody, like a stop on background work: the session
+  is there and the task is not stuck. One exception keeps a request from being hidden: when the
+  Work is paused and its reported next action speaks to its person or names them or the owner,
+  the row is `awaiting_party`, names that person and sets `needs_you`, since no action asks for
+  it.
 - **Stopped on its own background work**, which will resume it: the row stays `active` and asks
   nobody.
 - **How long.** A wait for a person is believed until the session's next call or its end, for at
@@ -483,10 +495,14 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
   background work is believed for 60 minutes (`IN_FLIGHT_CAP_SECONDS`), as long as a running shell
   call, because nothing shows that the background work still runs. After that the row reads from
   the claim again.
-- **Unknown, never stale.** After a Hub restart, or when the Hub dropped a wait for room, a quiet
+- **Unknown, never stale.** After a Hub restart that left no list of waits (the Hub died, or was
+  down for 10 minutes or more), or when the Hub dropped a wait for room, a quiet
   Work whose lead session has not called since reads `freshness: unknown` with the limit
   `lead_wait_unknown`. It names nobody and needs nobody until that session calls again, or until
-  24 hours after its last check-in, when no wait could still be believed.
+  24 hours after its last check-in, when no wait could still be believed. A Hub that was stopped
+  leaves its waits for the process that starts next, which then knows them as before. What
+  sessions reported while no Hub ran is still missing, so Work whose lead session called in the
+  hour before the stop, has no wait in that list and has not called since reads unknown too.
 - **Who is asked.** A row asks a person for Work its agent reported blocked, including a handover carrying an unresolved `item.blocker`, and for reassessment of such a blocker. The handover shows the specific reported blocker. A routine handover names the lead agent and sets `needs_you: false`, regardless of merge observation. The agent decides whether to complete the Work or resume it; shared status neither infers a blocker from `next_action` prose nor completes or releases the Work. A quiet or paused row asks nobody, held or not, because a hold its lead no longer renews lapses by itself. The projection's `actionable` field still names the owner for a held pause or handover; shared status does not turn that into something the owner must do.
 - **Not changed.** The store's `claim_status`, the operational projection's `freshness`, takeover
   rules and which scope overlaps are listed still follow the lead's reports. Leases are untouched:

@@ -4664,6 +4664,29 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
         (status, refused["error"].as_str()),
         (403, Some("not_your_agent"))
     );
+    // Unless that was this computer renewing its token, which leaves the person another one for
+    // the repository: the answer is taken, and the hook hears it under the new token.
+    let (_, renewed) = agent_for(&env, &alice.id, "claude-code-renewed", false);
+    let poll = json!({"request_id": last.clone(), "input_hash": "c".repeat(64), "wait_seconds": 0});
+    let (status, _) = agent("/v1/hub/permission/poll", poll.clone()).await;
+    assert_eq!(status, 401);
+    let (status, taken) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&last, "deny")).await;
+    assert_eq!(status, 200, "{taken}");
+    let (status, heard) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/permission/poll",
+            Some(&renewed),
+            Some(poll),
+        )
+        .await;
+    assert_eq!(
+        (status, &heard["decision"]),
+        (200, &json!("deny")),
+        "{heard}"
+    );
 }
 
 const AGENT_MESSAGES: &str = "/v1/hub/session/agent-messages";
