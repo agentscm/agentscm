@@ -177,14 +177,16 @@ impl Waiting {
         rows.retain(|_, row| row.current(now));
         let key = (principal.token_id.clone(), native.to_owned());
         // The host's notice that a dialog is on screen arrives as a permission prompt that says
-        // nothing, also when the dialog is a question. That is the wait already on record.
-        // shortcut: any permission report that says nothing is taken for the notice. A real
-        // prompt follows a tool call, which ends the question first; pass the notice down from
-        // the hook route if a prompt ever follows a question with no call between.
+        // nothing and names no asker, also when the dialog is a question or a subagent's. That
+        // is the wait already on record: its kind, its asker and what it asks all stay.
+        // shortcut: any such report over a dialog's wait is taken for the notice. A real prompt
+        // follows a tool call, which ends the wait first; pass the notice down from the hook
+        // route if a prompt ever follows a dialog with no call between.
         if reason == WaitReason::Permission
             && asks.is_none()
+            && asker.is_none()
             && rows.get(&key).is_some_and(|row| {
-                row.reason == WaitReason::Question && row.asker.as_deref() == asker
+                matches!(row.reason, WaitReason::Permission | WaitReason::Question)
             })
         {
             return Ok(());
@@ -472,6 +474,25 @@ mod tests {
             Some((1_010, None, WaitReason::Permission))
         );
         assert_eq!(record(WaitReason::Idle, None, 1_020), None);
+        // A subagent's prompt keeps its asker through the notice, which names none.
+        let report = |asker, asks, now| {
+            waiting
+                .record(
+                    &mine,
+                    "s",
+                    "s",
+                    "claude",
+                    WaitReason::Permission,
+                    asker,
+                    asks,
+                    now,
+                )
+                .unwrap();
+            waiting.dialog_wait("tok_a", "s", now)
+        };
+        let asked = Some((1_030, Some("sub".to_owned()), WaitReason::Permission));
+        assert_eq!(report(Some("sub"), Some("Run it"), 1_030), asked);
+        assert_eq!(report(None, None, 1_036), asked);
     }
 
     #[test]
