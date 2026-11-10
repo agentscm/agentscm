@@ -262,6 +262,18 @@ fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<
     None
 }
 
+/// Remembers which connection this session's hooks route to, so the checkout's MCP server names
+/// the same agent. Best effort and unchanged records are not rewritten: a failure leaves the
+/// MCP server on its default connection and never touches the hook's reply.
+fn record_session_route(payload: &Value, root: &Path) {
+    if let (Some(session), Ok(config)) = (
+        session_of(payload).filter(|id| id.len() <= 128 && !id.chars().any(char::is_control)),
+        config_dir(),
+    ) {
+        let _ = crate::client_session::record_route(&config, session, root);
+    }
+}
+
 /// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
 /// (5 at session start), and the reply still has to be printed.
 const CAPTURE_BUDGET: Duration = Duration::from_millis(2500);
@@ -483,6 +495,7 @@ async fn call_hub(
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
             }
+            record_session_route(&payload, &routed.connection.root);
             let conflicted = unmerged(&routed.checkout, &routed.edits, deadline);
             if !conflicted.is_empty() {
                 routed.edits.retain(|edit| !conflicted.contains(&edit.path));
