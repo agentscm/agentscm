@@ -27,8 +27,63 @@ jobs:
         with:
           persist-credentials: false
       - name: Build on native hardware
-        run: docker build --platform "${{ matrix.platform }}" -t "agentscm:ci-${{ matrix.arch }}" .
+        env:
+          COMMIT: ${{ github.sha }} # the build context has no .git; build.rs reads AGENTSCM_BUILD_COMMIT
+        run: docker build --platform "${{ matrix.platform }}" --build-arg "AGENTSCM_BUILD_COMMIT=$COMMIT" -t "agentscm:ci-${{ matrix.arch }}" .
       - name: Confirm the loaded image architecture
         run: test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' 'agentscm:ci-${{ matrix.arch }}')" = "${{ matrix.arch }}/linux"
       - name: Smoke test
-        run: .github/docker-smoke.sh "agentscm:ci-${{ matrix.arch }}" # build and smoke test only; nothing is pushed
+        run: .github/docker-smoke.sh "agentscm:ci-${{ matrix.arch }}" # nothing is pushed to any registry
+      # Unsigned convenience copy of the exact tested arm64 image for maintainers' test environments;
+      # released images come only from release.yml, with provenance.
+      - name: Save the tested arm64 image
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'arm64' }}
+        run: docker save agentscm:ci-arm64 | gzip > agentscm-linux-arm64.tar.gz
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'arm64' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agentscm-image-linux-arm64-${{ github.sha }}
+          path: agentscm-linux-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0 # already gzipped
+
+  client-macos:
+    # Unsigned convenience build for maintainers' test computers, built as release.yml builds its
+    # aarch64-apple-darwin binary; released binaries come only from release.yml, with provenance.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Build the status page embedded by --features ui
+        run: npm ci --ignore-scripts && npm run build
+        working-directory: ui
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - run: rustup target add "$TARGET"
+      - run: cargo build --locked --release --features ui --target "$TARGET"
+      - name: Smoke test
+        run: '"target/$TARGET/release/agentscm" --version'
+      - name: Smoke test the reconciliation command surface
+        run: |
+          help=$("target/$TARGET/release/agentscm" local-validation reconcile --help)
+          grep -F -- '--github-authenticated-fetch' <<<"$help"
+      - name: Stage the binary and its SHA-256
+        run: |
+          mkdir dist
+          cp "target/$TARGET/release/agentscm" "dist/agentscm-$TARGET"
+          (cd dist && shasum -a 256 "agentscm-$TARGET" > "agentscm-$TARGET.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agentscm-aarch64-apple-darwin-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
