@@ -2410,16 +2410,17 @@ async fn reminder_policy_requires_bounded_cadence_and_exact_authorized_escalatio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn directed_request_reminder_resolves_only_on_exact_retained_withdrawal() {
+async fn a_directed_request_to_a_paused_lead_sends_its_person_nothing() {
     let f = Fixture::configured(Some(policy()), false).await;
     let work = status_work(&f, &f.alice, "request-target");
     status_checkpoint(&f, &f.alice, &work, "pause");
-    let request=tokio::task::block_in_place(||f.store().work_start_auto(&f.bob,&serde_json::from_value(json!({
+    tokio::task::block_in_place(||f.store().work_start_auto(&f.bob,&serde_json::from_value(json!({
         "title":"Synthetic directed requester","session":"requesting","scope":["src/request-target.rs"]
     })).unwrap(),unix_now())).unwrap().coordination_request.unwrap();
+    // The request is the lead agent's to answer, and paused Work asks nobody: no entry, and no
+    // reminder once one would be due.
     let now = unix_now();
     scan_status(&f, now);
-    assert!(entry_states(&f).is_empty());
     scan_status(&f, now + 901);
     f.slack()
         .database()
@@ -2427,40 +2428,8 @@ async fn directed_request_reminder_resolves_only_on_exact_retained_withdrawal() 
         .execute("UPDATE status_jobs SET due=0", [])
         .unwrap();
     f.slack().deliver(&f.state).await.unwrap();
-    assert!(
-        status_text(&f)[0]
-            .1
-            .contains("directed coordination request")
-    );
-    tokio::task::block_in_place(|| {
-        f.store().coordination_withdraw(
-            &f.bob,
-            &crate::hub::coordination::CoordinationWithdraw {
-                request_id: request.id,
-                operation_id: "synthetic-withdraw".into(),
-                session: "requesting".into(),
-                expected_updated_seq: request.updated_seq,
-                target: None,
-                via_hub: false,
-            },
-            unix_now(),
-        )
-    })
-    .unwrap();
-    scan_status(&f, now + 902);
-    f.slack()
-        .database()
-        .unwrap()
-        .execute("UPDATE status_jobs SET due=0", [])
-        .unwrap();
-    f.slack().deliver(&f.state).await.unwrap();
-    assert!(
-        status_text(&f)
-            .last()
-            .unwrap()
-            .1
-            .contains("no longer outstanding")
-    );
+    assert!(entry_states(&f).is_empty());
+    assert!(status_text(&f).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2531,11 +2500,12 @@ async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contenti
                     .unwrap()
             })
         };
+        // The row is listed for the two agents and asks neither person.
         assert!(
             read()
                 .actions
                 .iter()
-                .any(|a| a.kind == "file_conflict" && a.needs_you)
+                .any(|a| a.kind == "file_conflict" && !a.needs_you)
         );
         tokio::task::block_in_place(|| match resolution {
             "grant" => {
@@ -2576,7 +2546,7 @@ async fn shared_status_drops_resolved_repeated_edits_and_keeps_new_live_contenti
             read()
                 .actions
                 .iter()
-                .any(|a| a.kind == "file_conflict" && a.needs_you),
+                .any(|a| a.kind == "file_conflict" && !a.needs_you),
             "new repeat after {resolution}"
         );
     }
