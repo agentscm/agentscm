@@ -498,8 +498,9 @@ on no others:
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff, and
-  the shared-conversation reads under it (only the author's tokens and Hub admins get a body, and a listing shows
-  a caller their own entries; see [shared conversations](#shared-conversation-reads))
+  the shared-conversation reads under it (while the repository shares agent conversations any reader of the
+  repository gets a body and a listing shows every author's entries, otherwise only the author's tokens
+  and Hub admins do and a listing shows a caller their own entries; see [shared conversations](#shared-conversation-reads))
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
 - `GET /v1/hub/repos/{repo}/pr-context?number=…` ([retained PR context](advanced/pr-context.md), no provider refresh)

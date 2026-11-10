@@ -1,18 +1,22 @@
 name: Status page
 
 on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ui-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ui:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 10
     defaults:
       run:
