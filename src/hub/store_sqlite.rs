@@ -7209,11 +7209,35 @@ impl SqliteStore {
         let catchup_repository = repository_namespace(&who.repository, who.repository_id);
         let catchup_key = catchup_repository_key(who.repository_id);
         let settled = settled_work_sql("w", "w.state", "w.branch", "w.snapshot", [1, 2, 6, 7, 8]);
+        // A cursor the repository does not have is refused, never read as the end of the list.
+        let after_created = match &query.after {
+            Some(id) => Some(
+                tx.query_row(
+                    "SELECT created_at FROM hub_work_items
+                     WHERE id = ?1 AND provider = ?2 AND host = ?3 AND repository = ?4
+                       AND repository_id IS ?5",
+                    params![
+                        id,
+                        who.owner.identity.provider,
+                        who.owner.identity.host,
+                        who.repository,
+                        who.repository_id
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| HubError::Invalid("overview_after_not_found".into()))?,
+            ),
+            None => None,
+        };
+        // Newest first: when the list is cut, what is left out is the oldest unfinished Work.
         let current_rows = {
             let mut statement = tx.prepare(&format!(
                 "SELECT w.snapshot, w.reservation_basis IS NOT NULL FROM hub_work_items w
                  WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
-                   AND w.state <> 'finished' AND (w.reservation_basis IS NOT NULL OR NOT {settled}) ORDER BY w.id LIMIT ?5"
+                   AND w.state <> 'finished' AND (w.reservation_basis IS NOT NULL OR NOT {settled})
+                   AND (?9 IS NULL OR w.created_at < ?9 OR (w.created_at = ?9 AND w.id < ?10))
+                 ORDER BY w.created_at DESC, w.id DESC LIMIT ?5"
             ))?;
             statement
                 .query_map(
@@ -7225,7 +7249,9 @@ impl SqliteStore {
                         fetch_limit,
                         catchup_repository,
                         catchup_key,
-                        AUTO_PAUSE_SUMMARY
+                        AUTO_PAUSE_SUMMARY,
+                        after_created,
+                        query.after
                     ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
                 )?
@@ -7339,7 +7365,9 @@ impl SqliteStore {
             .cloned()
             .collect::<Vec<_>>();
         let mut overlaps = work_overlap_pairs(&reserved, query.limit + 1);
-        let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
+        // A continuation page sees only its own items, so its overlaps are never the whole set.
+        let mut overlaps_complete =
+            query.after.is_none() && current_complete && overlaps.len() <= query.limit;
         overlaps.truncate(query.limit);
         if fit_json_budget(&mut overlaps, overview_part_budget)? {
             overlaps_complete = false;

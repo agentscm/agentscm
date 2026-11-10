@@ -705,6 +705,63 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
     assert_eq!(work_event_count(&*store, "work_started"), 3);
 }
 
+fn the_overview_lists_newest_work_first_and_pages(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    // Two started in one second, then two later. Ids are random, so only time orders them.
+    let ids = [now, now, now + 1, now + 2]
+        .into_iter()
+        .enumerate()
+        .map(|(n, at)| {
+            let mut start = native_start(&format!("page-{n}"), "Paged", &format!("page-{n}"));
+            start.scope = vec![format!("page-{n}/**")];
+            store.work_start(&alice.token, &start, at).unwrap().item.id
+        })
+        .collect::<Vec<_>>();
+    let page = |after: Option<&String>| {
+        let query = WorkOverviewQuery {
+            limit: 2,
+            after: after.cloned(),
+            ..Default::default()
+        };
+        let overview = store.work_overview(&alice.token, &query, now + 3).unwrap();
+        let listed = overview
+            .current
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        (
+            listed,
+            overview.current_complete,
+            overview.overlaps_complete,
+        )
+    };
+    let (first, complete, _) = page(None);
+    assert_eq!(first, [ids[3].clone(), ids[2].clone()]);
+    assert!(
+        !complete,
+        "two older tasks are left out, and the page says so"
+    );
+    // The two of one second follow, the greater id first.
+    let mut tied = vec![ids[0].clone(), ids[1].clone()];
+    tied.sort_by(|a, b| b.cmp(a));
+    let (second, complete, overlaps_complete) = page(Some(&ids[2]));
+    assert_eq!(second, tied);
+    assert!(complete && !overlaps_complete);
+    assert_eq!(page(Some(&tied[0])).0, [tied[1].clone()]);
+    assert!(page(Some(&tied[1])).0.is_empty());
+    // A cursor this repository does not have is refused, not read as the end of the list.
+    let unknown = WorkOverviewQuery {
+        after: Some(format!("wrk_{}", "0".repeat(32))),
+        ..Default::default()
+    };
+    assert!(matches!(
+        store.work_overview(&alice.token, &unknown, now + 3),
+        Err(HubError::Invalid(_))
+    ));
+}
+
 fn a_description_is_kept_from_creation_and_read_back(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -2476,6 +2533,7 @@ conformance!(
     concurrent_pr_link_updates_fence_and_replay,
     concurrent_forge_start_has_one_work_and_one_lead,
     native_and_automatic_starts_have_explicit_retry_rules,
+    the_overview_lists_newest_work_first_and_pages,
     a_description_is_kept_from_creation_and_read_back,
     authorization_and_claim_projection_keep_old_claims_visible,
     repository_namespaces_fence_work_and_relations,

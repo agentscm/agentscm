@@ -501,6 +501,7 @@ fn read_scoped(
     let query = WorkOverviewQuery {
         recent_since: None,
         limit: MAX_STATUS_WORK,
+        after: None,
     };
     let overview = match reader {
         WorkLifecycleReader::Token(token) => store.work_overview(token, &query, now)?,

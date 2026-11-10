@@ -297,6 +297,7 @@ async fn prepare_snapshot(
             &WorkOverviewQuery {
                 recent_since: None,
                 limit: 20,
+                after: None,
             },
             now,
         )?;

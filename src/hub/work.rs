@@ -406,6 +406,10 @@ pub struct WorkOverviewQuery {
     pub recent_since: Option<i64>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Continue `current`, which lists the newest Work first, after this Work id: the last id
+    /// of the previous page.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 impl Default for WorkOverviewQuery {
@@ -413,6 +417,7 @@ impl Default for WorkOverviewQuery {
         Self {
             recent_since: None,
             limit: default_limit(),
+            after: None,
         }
     }
 }
@@ -963,6 +968,9 @@ impl WorkOverviewQuery {
     pub(super) fn validate(&self, now: i64) -> Result<i64> {
         if !(1..=MAX_WORK_PAGE).contains(&self.limit) {
             return Err(invalid("overview limit must be 1 to 100"));
+        }
+        if let Some(id) = &self.after {
+            validate_id("overview after", id, "wrk")?;
         }
         let since = self
             .recent_since

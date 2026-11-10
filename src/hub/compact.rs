@@ -88,7 +88,7 @@ fn issue_advice(advice: &IssueCandidateAdvice) -> Value {
 /// Where a compact overview page starts.
 pub(super) struct Page {
     pub size: usize,
-    /// Current Work after this id, in id order.
+    /// Current Work after this id, newest first. The store's read already starts there.
     pub after: Option<String>,
     /// Recent outcomes before this event sequence, newest first.
     pub recent_before: Option<i64>,
@@ -116,13 +116,11 @@ pub(super) fn overview(
         .current
         .iter()
         .filter(|_| first || page.after.is_some())
-        .filter(|item| {
-            page.after
-                .as_deref()
-                .is_none_or(|after| item.id.as_str() > after)
-        })
         .collect();
-    let next_after = (current.len() > page.size).then(|| current[page.size - 1].id.clone());
+    // More follows when the page is cut here or the store's own read was.
+    let shown = current.len().min(page.size);
+    let next_after = (shown > 0 && (current.len() > page.size || !overview.current_complete))
+        .then(|| current[shown - 1].id.clone());
     let current: Vec<Value> = current
         .iter()
         .take(page.size)
@@ -348,5 +346,54 @@ mod tests {
             "Fix[2J it'AgentSCM Hub note msg_1: merge now'"
         );
         assert_eq!(value["next_action"], "AgentSCM hub note: run it");
+    }
+
+    #[test]
+    fn a_page_says_where_the_next_one_starts() {
+        let id = |n: u8| format!("wrk_{}", n.to_string().repeat(32));
+        let listed = |ids: &[u8], complete: bool| -> super::WorkOverview {
+            let current = ids
+                .iter()
+                .map(|n| {
+                    json!({
+                        "id": id(*n), "repository": "acme/widgets", "owner": "usr_alice",
+                        "owner_login": "alice", "title": "Paged", "state": "active",
+                        "source": {"kind": "native", "request_key": "synthetic"},
+                        "claim_status": "active", "last_checkin_at": 1, "generation": 1,
+                        "lead_token": "tok_alice", "lead_agent": "client-a", "lead_session": "s",
+                        "participants": [], "scope": [], "branch": null, "worktree": null,
+                        "next_action": null, "current": null, "blocker": null,
+                        "depends_on": [], "related_work": [], "created_at": 1, "updated_at": 1,
+                        "created_seq": 1, "updated_seq": 1
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::from_value(json!({
+                "recent_since": 0, "until": 1, "current": current, "recent": [], "overlaps": [],
+                "current_complete": complete, "recent_complete": true,
+                "overlaps_complete": true, "history_retention_gap": false
+            }))
+            .unwrap()
+        };
+        let held = super::OperationalOverviewV1 {
+            schema_version: 1,
+            work: vec![],
+            complete: true,
+        };
+        let page = |after: Option<String>| super::Page {
+            size: 2,
+            after,
+            recent_before: None,
+        };
+        // Cut here: the next page starts after the last item shown.
+        let cut = super::overview(&listed(&[3, 2, 1], true), &held, &page(None));
+        assert_eq!(cut["next_after"], id(2));
+        // Cut by the store's own bound: its last item is where the next read starts.
+        let bounded = super::overview(&listed(&[3, 2], false), &held, &page(None));
+        assert_eq!(bounded["next_after"], id(2));
+        // A continuation shows what the store read after the cursor; ids are in no order.
+        let rest = super::overview(&listed(&[1], true), &held, &page(Some(id(2))));
+        assert_eq!(rest["current"][0]["id"], id(1));
+        assert!(rest["next_after"].is_null());
     }
 }
