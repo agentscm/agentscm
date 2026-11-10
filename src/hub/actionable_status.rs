@@ -1852,7 +1852,9 @@ mod tests {
             Some("quiet-session"),
             observations.epoch(),
         );
-        let status = super::read(store, &observations, &viewer, now).unwrap();
+        // Observations stamp the wall clock, and a read leaves out rows stamped after its time.
+        let read_at = crate::hub::store::unix_now();
+        let status = super::read(store, &observations, &viewer, read_at).unwrap();
         let mut setup_rows = status
             .actions
             .iter()
