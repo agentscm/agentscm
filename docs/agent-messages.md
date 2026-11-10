@@ -76,9 +76,9 @@ The Claude Code plugin that `agentscm client setup` installs adds a background h
 - When a message is sent, the Hub answers the waiting request at once with the same notice a hook reply carries and marks the message delivered via `wake:claude`, exactly as a hook reply would, so it is not delivered twice. The hook prints the notice and exits 2. The woken turn's `Stop` starts the next waiter.
 - The notice still proves nothing alone: the agent answers `accepted` with `agentscm_hub_message` and acts only on that reply.
 - One waiter runs per session. A later start for the same session finds the first one's lock file held and exits; on the Hub a newer wait for the same token and session replaces an older one, which ends empty and never takes a message.
-- A waiter ends silently (exit 0) when its 7 days are up, when the process that started it is gone, when the checkout is not connected, when the person's mode is Ignore, when the token cannot receive messages, when the Hub does not serve the route, or when the Hub has been unreachable for 15 minutes. An error never wakes the session. The next turn's `Stop` starts a new waiter.
+- A waiter ends silently (exit 0) when its 7 days are up, when the process that started it is gone, when its session ended (the plugin's `SessionEnd` hook runs `agentscm hook-wait claude --end`, which leaves an end marker the waiter sees before its next request, so `/clear` ends the old session's waiter too), when the checkout is not connected, when the person's mode is Ignore, when the token cannot receive messages, when the Hub does not serve the route, or when the Hub has been unreachable for 15 minutes. An error never wakes the session. The next turn's `Stop` starts a new waiter.
 - The hook never waits for a subagent: `SessionStart` and `Stop` fire only in the session a person leads, and the hook exits at once for input that carries a subagent's `agent_id`. A waiting hook is top-level evidence for its session.
-- The Hub holds at most 1024 waits at once and 64 per person; past either it answers `429` and the hook asks again later.
+- Each Hub process holds at most 4096 waits at once and 64 per person; past either it answers `429` and the hook asks again later. A Hub that runs several processes counts each one on its own.
 
 What this does not cover:
 

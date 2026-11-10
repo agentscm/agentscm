@@ -6,13 +6,14 @@
 //! It holds one request at a time open at the Hub (`/v1/hub/agent-messages/wait`) for this
 //! session; when a message comes it prints the Hub's notice and exits 2. Only one waits per
 //! session: a later start finds the lock held and exits at once. It ends quietly when its time is
-//! up, when the session that started it is gone, when the checkout is not connected, when the
+//! up, when the process that started it is gone or the session's `SessionEnd` hook
+//! (`hook-wait claude --end`) left its end marker, when the checkout is not connected, when the
 //! person's mode is `ignore`, or when the Hub refuses, lacks the route or stays unreachable.
 //! Every failure exits 0, so the session is never woken by an error. On Windows it exits at once:
 //! it cannot tell there when its session has ended.
 use std::fs::{DirBuilder, File, TryLockError};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agentscm::hub::agent_messages::{FRAME, WAIT_SECS};
@@ -33,10 +34,22 @@ const STDIN_BYTES: u64 = 1 << 20;
 pub struct HookWaitArgs {
     /// The agent whose hook this is; only `claude` has a background hook that wakes its session.
     pub agent: String,
+    /// SessionEnd: tell this session's waiter to leave, then exit at once.
+    #[arg(long)]
+    pub end: bool,
 }
 
 /// Never returns: exits 2 with the Hub's notice on stderr when a message came, else 0.
 pub async fn run(args: HookWaitArgs) -> ! {
+    if args.end {
+        // The session ended while its process may live on (/clear), so its waiter cannot see it.
+        if let (Some(payload), Some(dir)) = (input(), wait_dir())
+            && let Some(session) = session_of(&payload)
+        {
+            let _ = File::create(marker(&dir, &session));
+        }
+        std::process::exit(0)
+    }
     let found = if args.agent == "claude" && cfg!(unix) {
         waited().await
     } else {
@@ -69,14 +82,38 @@ fn session_of(payload: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn waited() -> Option<String> {
+/// The host's hook input, not a Hub reply.
+fn input() -> Option<Value> {
     let mut input = String::new();
     std::io::stdin()
         .take(STDIN_BYTES)
         .read_to_string(&mut input)
         .ok()?;
-    // The host's hook input, not a Hub reply.
-    let payload: Value = input.parse().ok()?;
+    input.parse().ok()
+}
+
+fn wait_dir() -> Option<PathBuf> {
+    Some(
+        crate::hub_cli::config_dir()
+            .ok()?
+            .join("agentscm")
+            .join("hook-wait"),
+    )
+}
+
+/// This session's file name in the wait directory; the session id itself is not a safe name.
+fn file_name(session: &str) -> String {
+    let name = format!("{:x}", Sha256::digest(session.as_bytes()));
+    name[..32].to_owned()
+}
+
+/// Present once the session ended; its waiter leaves before its next request.
+fn marker(dir: &Path, session: &str) -> PathBuf {
+    dir.join(format!("{}.ended", file_name(session)))
+}
+
+async fn waited() -> Option<String> {
+    let payload = input()?;
     let session = session_of(&payload)?;
     let cwd = Path::new(payload["cwd"].as_str()?);
     let connections = client_config::load().ok()?;
@@ -84,10 +121,10 @@ async fn waited() -> Option<String> {
     if !client_config::is_current_in(connection, &checkout) {
         return None;
     }
-    let dir = crate::hub_cli::config_dir()
-        .ok()?
-        .join("agentscm")
-        .join("hook-wait");
+    let dir = wait_dir()?;
+    // A resumed session keeps its id, so an old end marker must not stop its new waiter.
+    let ended = marker(&dir, &session);
+    let _ = std::fs::remove_file(&ended);
     // Held until this process exits; a second waiter for the session leaves at once.
     let _lock = lock(&dir, &session)?;
     let client = reqwest::Client::builder()
@@ -104,7 +141,11 @@ async fn waited() -> Option<String> {
         token_file: &connection.token_file,
     };
     request
-        .until(MAX_LIFE, || parent() == started, Duration::from_secs(5))
+        .until(
+            MAX_LIFE,
+            || parent() == started && !ended.exists(),
+            Duration::from_secs(5),
+        )
         .await
 }
 
@@ -196,8 +237,20 @@ fn lock(dir: &Path, session: &str) -> Option<File> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir).ok()?;
-    let name = format!("{:x}", Sha256::digest(session.as_bytes()));
-    let file = File::create(dir.join(&name[..32])).ok()?;
+    // Files of sessions long gone. Each start rewrites its lock file, so a live waiter's file
+    // is younger than its life.
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > MAX_LIFE + Duration::from_secs(24 * 3600));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let file = File::create(dir.join(file_name(session))).ok()?;
     match file.try_lock() {
         Ok(()) => Some(file),
         Err(TryLockError::WouldBlock | TryLockError::Error(_)) => None,
@@ -253,7 +306,12 @@ mod tests {
     }
 
     /// A Hub that answers each request with the next of `replies` (status, body).
-    async fn hub(replies: Vec<(u16, &'static str)>) -> (String, tokio::task::JoinHandle<usize>) {
+    /// With `end`, the session's end marker is written before the last reply goes out.
+    async fn hub(
+        replies: Vec<(u16, &'static str)>,
+        end: Option<PathBuf>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        let last = replies.len();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let served = tokio::spawn(async move {
@@ -299,15 +357,20 @@ mod tests {
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                stream.write_all(reply.as_bytes()).await.unwrap();
                 count += 1;
+                if count == last
+                    && let Some(end) = &end
+                {
+                    File::create(end).unwrap();
+                }
+                stream.write_all(reply.as_bytes()).await.unwrap();
             }
             count
         });
         (url, served)
     }
 
-    async fn ask(url: &str, life: Duration) -> Option<String> {
+    async fn ask(url: &str, life: Duration, alive: impl Fn() -> bool) -> Option<String> {
         let dir = tempfile::tempdir().unwrap();
         let token_file = dir.path().join("token");
         let mut options = std::fs::OpenOptions::new();
@@ -326,14 +389,24 @@ mod tests {
             body: r#"{"session":"s1"}"#.into(),
             token_file: &token_file,
         };
-        wait.until(life, || true, Duration::ZERO).await
+        wait.until(life, alive, Duration::ZERO).await
+    }
+
+    #[tokio::test]
+    async fn a_session_end_marker_ends_the_wait_without_another_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let ended = marker(dir.path(), "s1");
+        assert!(ended.starts_with(dir.path()));
+        let (url, served) = hub(vec![(204, "")], Some(ended.clone())).await;
+        assert_eq!(ask(&url, MAX_LIFE, || !ended.exists()).await, None);
+        assert_eq!(served.await.unwrap(), 1);
     }
 
     #[tokio::test]
     async fn a_message_after_empty_waits_is_the_notice_and_wakes_with_exit_2() {
         let notice = r#"{"text":"AgentSCM Hub message msg_1 for this session, from octo"}"#;
-        let (url, served) = hub(vec![(204, ""), (204, ""), (200, notice)]).await;
-        let text = ask(&url, MAX_LIFE).await.expect("the notice");
+        let (url, served) = hub(vec![(204, ""), (204, ""), (200, notice)], None).await;
+        let text = ask(&url, MAX_LIFE, || true).await.expect("the notice");
         assert_eq!(served.await.unwrap(), 3);
         let mut err = Vec::new();
         assert_eq!(finish(Some(text), &mut err), 2);
@@ -343,15 +416,15 @@ mod tests {
     #[tokio::test]
     async fn time_up_or_a_hub_with_nothing_to_wait_for_exits_0() {
         // The life is up after the first empty wait.
-        let (url, served) = hub(vec![(204, "")]).await;
-        let found = ask(&url, Duration::ZERO).await;
+        let (url, served) = hub(vec![(204, "")], None).await;
+        let found = ask(&url, Duration::ZERO, || true).await;
         assert_eq!(found, None);
         assert_eq!(served.await.unwrap(), 1);
         assert_eq!(finish(found, &mut Vec::new()), 0);
         // Ignore (410) and an older Hub without the route (404) end it at once.
         for status in [410, 404] {
-            let (url, served) = hub(vec![(status, "")]).await;
-            assert_eq!(ask(&url, MAX_LIFE).await, None);
+            let (url, served) = hub(vec![(status, "")], None).await;
+            assert_eq!(ask(&url, MAX_LIFE, || true).await, None);
             assert_eq!(served.await.unwrap(), 1);
         }
     }

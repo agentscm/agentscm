@@ -64,7 +64,8 @@ const WAKE_FRESH_SECS: i64 = 90;
 const WAKE_VIA: &str = "wake:claude";
 /// Waits held open at once, in all and per person; past either a wait answers 429 and the hook
 /// asks again later. One per running Claude Code session, so forty sessions are well inside.
-const MAX_WAITS: usize = 1024;
+/// Counted per Hub process; the total is large so the per-person cap is the one that binds.
+const MAX_WAITS: usize = 4096;
 const MAX_WAITS_PER_PERSON: usize = 64;
 /// Wakes waiting hooks in this process when a message is sent.
 static SENT: Notify = Notify::const_new();
@@ -707,7 +708,6 @@ async fn wait(
     )
     .await?;
     drop(slot);
-    note_wait(&principal.token_id, &session, unix_now());
     Ok(match text {
         Some(text) => Json(serde_json::json!({ "text": text })).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),

@@ -139,6 +139,11 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
         "args":["--no-telemetry", "hook-wait", "claude"],
         "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "asyncRewake":true
     });
+    // SessionEnd tells this session's waiter to leave, as /clear keeps the same process.
+    let wait_end = json!({
+        "type":"command", "command":program,
+        "args":["--no-telemetry", "hook-wait", "claude", "--end"], "timeout":5
+    });
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook(5), wait.clone()]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
@@ -147,7 +152,7 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
         "Notification":[{"hooks":[hook(3)]}],
         "PermissionRequest":[{"hooks":[hook(43_200)]}],
         "Stop":[{"hooks":[hook(3), wait]}],
-        "SessionEnd":[{"hooks":[hook(3)]}],
+        "SessionEnd":[{"hooks":[hook(3), wait_end]}],
         // Only change capture uses these, for checkouts whose Hub shares agent conversations.
         "PostToolUseFailure":[{"hooks":[hook(3)]}],
         "MessageDisplay":[{"hooks":[hook(3)]}],
@@ -1229,8 +1234,16 @@ mod tests {
             assert_eq!(wait["asyncRewake"], true);
             assert!(wait["timeout"].as_u64().unwrap() > crate::message_wait::MAX_LIFE.as_secs());
         }
+        // SessionEnd ends the waiter, briefly and in the foreground.
+        let end = &hooks["hooks"]["SessionEnd"][0]["hooks"][1];
+        assert_eq!(
+            end["args"],
+            json!(["--no-telemetry", "hook-wait", "claude", "--end"])
+        );
+        assert!(end.get("asyncRewake").is_none());
+        assert_eq!(end["timeout"], 5);
         let waits = hooks.to_string().matches("hook-wait").count();
-        assert_eq!(waits, 2, "no other event starts a waiter");
+        assert_eq!(waits, 3, "no other event starts or ends a waiter");
         // The MCP server is user scope too, and names no checkout of its own.
         assert_eq!(
             read(&old, "agentscm/.mcp.json"),
