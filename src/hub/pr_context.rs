@@ -142,6 +142,7 @@ pub async fn read(
 
 /// Provider-confirmed merge facts for a PR whose open-state context the Hub no longer keeps.
 fn merged(coverage: Value, merges: &[CatchupMergeObservation]) -> Value {
+    // `Store::catchup_merges_for_pull` returns at most 17 rows; a 17th means more may exist.
     let merges_complete = merges.len() < 17;
     let merges: Vec<_> = merges
         .iter()
