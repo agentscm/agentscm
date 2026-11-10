@@ -644,6 +644,15 @@ async fn db<T: Send + 'static>(
     blocking(state, move || work(&*store)).await
 }
 
+/// No one has signed in through a forge yet. People made on this computer with `agentscm hub
+/// local-token` do not count, so they leave the Hub's first-run setup available.
+fn no_forge_people(store: &dyn Store) -> Result<bool> {
+    Ok(store
+        .list_users()?
+        .iter()
+        .all(|user| user.identity.host == super::store::LOCAL_HOST))
+}
+
 fn gh_to_hub(error: GhError) -> HubError {
     forge_to_hub("GitHub", error)
 }
@@ -2477,7 +2486,7 @@ pub async fn bootstrap(
         return skip("a GitHub PAT is configured");
     }
     let first_run = db(state, |store| {
-        Ok(store.list_users()?.is_empty() && store.connections()?.is_empty())
+        Ok(no_forge_people(store)? && store.connections()?.is_empty())
     })
     .await;
     match first_run {
@@ -2733,8 +2742,7 @@ async fn setup_callback(
         // A first-run link only creates the first connection, even if someone signed in meanwhile.
         // shortcut: check-then-insert, not one transaction; two hub processes finishing first-run
         // setups at the same moment could both pass. Make it transactional if hubs run replicated.
-        if actor == BOOTSTRAP_ACTOR
-            && !(store.list_users()?.is_empty() && store.connections()?.is_empty())
+        if actor == BOOTSTRAP_ACTOR && !(no_forge_people(store)? && store.connections()?.is_empty())
         {
             return Err(HubError::Invalid(
                 "first-run setup is no longer valid".into(),
@@ -2985,6 +2993,26 @@ async fn work(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn people_made_on_this_computer_leave_first_run_setup_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let person = |host: &str| super::super::store::ForgeIdentity {
+            provider: "github".into(),
+            host: host.into(),
+            user_id: 7,
+        };
+        assert!(no_forge_people(&*store).unwrap());
+        store.upsert_user(&person("localhost"), "maya").unwrap();
+        assert!(no_forge_people(&*store).unwrap());
+        store.upsert_user(&person("github.com"), "maya").unwrap();
+        assert!(!no_forge_people(&*store).unwrap());
+    }
 
     #[test]
     fn a_pull_request_comment_masks_a_stored_host_label() {

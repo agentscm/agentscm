@@ -1433,6 +1433,18 @@ fn windows_drive_path(_path: &str) -> Option<&str> {
 }
 
 pub fn open(url: &str) -> Result<Arc<dyn Store>> {
+    open_with(url, false)
+}
+
+/// Opens a Hub database that `hub serve` already created and migrated, for an operator command
+/// working beside a running Hub. It creates nothing and migrates nothing: a missing database, or
+/// one this binary would migrate, is refused, so a newer CLI never upgrades a running Hub's schema
+/// and a mistyped URL never yields a new, empty database.
+pub fn open_existing(url: &str) -> Result<Arc<dyn Store>> {
+    open_with(url, true)
+}
+
+fn open_with(url: &str, existing: bool) -> Result<Arc<dyn Store>> {
     // Errors never echo the input: it may hold a password.
     if let Some(path) = url.strip_prefix("sqlite://") {
         let path = windows_drive_path(path).unwrap_or(path);
@@ -1445,15 +1457,40 @@ pub fn open(url: &str) -> Result<Arc<dyn Store>> {
                 "sqlite database path must be absolute, without ?, # or %, and not end in /",
             ));
         }
-        Ok(Arc::new(SqliteStore::open(Path::new(path))?))
+        Ok(if existing {
+            Arc::new(SqliteStore::open_existing(Path::new(path))?)
+        } else {
+            Arc::new(SqliteStore::open(Path::new(path))?)
+        })
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Ok(Arc::new(PgStore::open(url)?))
+        Ok(if existing {
+            Arc::new(PgStore::open_existing(url)?)
+        } else {
+            Arc::new(PgStore::open(url)?)
+        })
     } else {
         Err(invalid(
             "AGENTSCM_DATABASE_URL must start with sqlite:// or postgres://",
         ))
     }
 }
+
+/// Refuses a database that this binary would migrate, given its applied migrations.
+pub(super) fn ensure_current(versions: &[i64], names: &[String]) -> Result<()> {
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    if pending(versions)?.is_empty() && plan_named(NAMED_MIGRATIONS, &names)?.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(NOT_CURRENT))
+    }
+}
+
+/// Said when an existing database is missing or would need migrating.
+pub(super) const NOT_CURRENT: &str = "no Hub database of this version there: start the Hub with `agentscm hub serve` from the same release first";
+
+/// The identity host of a person made on this computer with `agentscm hub local-token`. No forge
+/// sign-in uses it, so such a person never matches a forge account or a forge admin entry.
+pub const LOCAL_HOST: &str = "localhost";
 
 pub fn agent_token_digest(raw: &str) -> Result<TokenDigest> {
     token_digest(AGENT_TOKEN_DIGEST_DOMAIN, raw)
