@@ -1034,11 +1034,18 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     }
     assert_eq!(walked, all_seqs);
     let url = format!("{ACTIVITY}?limit=1");
-    let (status, body) = hub.call(get, &url, Some(&alice), None).await;
+    let (status, body) = hub.call(get.clone(), &url, Some(&alice), None).await;
     assert_eq!(status, 200);
     let sessions = body["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     let session = &sessions[0];
+    // A reader gets the ID of their own session once, as their Work replies name it. Anyone else
+    // gets its key there, and the ID nowhere.
+    assert_eq!(session["session"], "secret-session-name");
+    assert_eq!(body.to_string().matches("secret-session-name").count(), 1);
+    let (_, theirs) = hub.call(get, &url, Some(&hub.secret(2, "b")), None).await;
+    assert_eq!(theirs["sessions"][0]["session"], session["key"]);
+    assert!(!theirs.to_string().contains("secret-session-name"));
     assert_eq!(
         session["agent"],
         json!({"token": token.token_id, "name": "a"})
@@ -1047,7 +1054,6 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     assert_eq!(session["via"], json!(["mcp"]));
     assert_eq!(session["task"], "refactor");
     assert!(session["intent"].as_str().unwrap().starts_with("int_"));
-    assert!(!body.to_string().contains("secret-session-name"));
     let events = body["events"].as_array().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["agent"], session["agent"]);
@@ -1099,10 +1105,14 @@ async fn activity_hand_off_events_carry_session_keys_and_no_session_ids() {
         .await;
     assert_eq!(status, 200);
     let text = body.to_string();
+    // No event carries a session ID, and nobody else's appears anywhere. The reader's own is on
+    // its session's row alone.
+    assert!(!text.contains("raw-requester-id"), "{text}");
     assert!(
-        !text.contains("raw-holder-id") && !text.contains("raw-requester-id"),
+        !body["events"].to_string().contains("raw-holder-id"),
         "{text}"
     );
+    assert_eq!(text.matches("raw-holder-id").count(), 1, "{text}");
     let events = body["events"].as_array().unwrap();
     let find = |kind: &str| events.iter().find(|e| e["kind"] == kind).unwrap();
     let key = |token: &str, session: &str| {

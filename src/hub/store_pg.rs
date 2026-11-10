@@ -135,7 +135,7 @@ use super::work_transition::{
     self, MAX_TOKEN_WORK_SCOPES, OperationalOverviewV1, OperationalSelect, WorkLifecycleReader,
     WorkTransitionActor, WorkTransitionRequest, WorkTransitionResult,
 };
-use super::{HubError, Result};
+use super::{HubError, Result, store_sql};
 use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
@@ -9215,6 +9215,7 @@ impl Store for PgStore {
                         token: row.get(0),
                         agent: row.get(1),
                         owner: row.get(2),
+                        owner_id: owner,
                         intent: row.get(3),
                         task: row.get(4),
                         via: row.get(5),
@@ -9441,7 +9442,7 @@ impl Store for PgStore {
     fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.run(true, |client| {
             Ok(client
-                .query_opt("SELECT value FROM hub_settings WHERE key = $1", &[&key])?
+                .query_opt(store_sql::GET_SETTING, &[&key])?
                 .map(|row| row.get(0)))
         })
     }
@@ -9449,11 +9450,7 @@ impl Store for PgStore {
     fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()> {
         let now = unix_now();
         self.run(false, |client| {
-            client.execute(
-                "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = $3, updated_by = $4",
-                &[&key, &value, &now, &actor],
-            )?;
+            client.execute(store_sql::SET_SETTING, &[&key, &value, &now, &actor])?;
             Ok(())
         })
     }
@@ -9461,14 +9458,8 @@ impl Store for PgStore {
     fn get_or_create_setting(&self, key: &str, value: &str, actor: &str) -> Result<String> {
         let now = unix_now();
         self.run(false, |client| {
-            client.execute(
-                "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (key) DO NOTHING",
-                &[&key, &value, &now, &actor],
-            )?;
-            Ok(client
-                .query_one("SELECT value FROM hub_settings WHERE key = $1", &[&key])?
-                .get(0))
+            client.execute(store_sql::CREATE_SETTING, &[&key, &value, &now, &actor])?;
+            Ok(client.query_one(store_sql::GET_SETTING, &[&key])?.get(0))
         })
     }
 

@@ -696,12 +696,15 @@ body or query string is a 400 with a fixed body.
   `before` returns only events with a lower `seq`; `next_before` is the last returned event's
   `seq` when older events exist, otherwise null. `sessions` does not page. `S` is a live
   session, one updated in the last 20 minutes, newest first, at most 200:
-  `{key, name, started_by, subagents, agent: {token, name}, owner: {login}, intent, task, via,
-  created_at, updated_at}` (`intent` and `task` may be null). A session's id is not
-  returned; `key` stands in for it, the first 16 hex characters of the SHA-256
-  of `agentscm.hub.session-view.v1`, the token id and the session id, joined
+  `{key, session, name, started_by, subagents, agent: {token, name}, owner: {login}, intent,
+  task, via, created_at, updated_at}` (`intent` and `task` may be null). Another person's
+  session id is never returned; `key` stands in for it, the first 16 hex characters of the
+  SHA-256 of `agentscm.hub.session-view.v1`, the token id and the session id, joined
   by NUL bytes (so it is stable between polls, tells two sessions of
-  one token apart, and does not give the id back). `name` is the same session's name in
+  one token apart, and does not give the id back). `session` is the session as Work replies
+  name it to this caller (`lead_session`, a participant's or a checkpoint's `session`): the
+  session id for the caller's own session, and `key` for anyone else's. It is what tells a
+  caller which session leads or helps on a task. `name` is the same session's name in
   every repository of its person, or null for a session ID that is not in UUID form;
   `started_by` is the name of the session that started it, or null; `subagents` is null when
   not known, else `[{state, started_at, seen_at, type, does}]`, where `type` and `does` are

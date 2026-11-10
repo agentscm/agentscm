@@ -2357,7 +2357,7 @@ mod tests {
         let id = register(1_011).unwrap().0;
         // The host's notice names a permission prompt: it confirms the request, and the wait
         // stays the question it is.
-        wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_016);
+        waiting.notice(&mine, "s", "s", "claude", 1_016).unwrap();
         requests.confirm("tok_a", "s", 1_016);
         let at = 1_010 + GRACE_SECONDS;
         let shown = requests.list(&waiting, "usr_me", Some(7), at).unwrap();

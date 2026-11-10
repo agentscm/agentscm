@@ -776,8 +776,26 @@ fn a_permission_prompt_is_left_to_the_session_when_it_cannot_be_answered_from_th
         );
     };
     never_offered(&[("AGENTSCM_REMOTE_ANSWERS", "0")], |_| {});
-    never_offered(&[], |payload| payload["agent_id"] = json!("sub-1"));
     never_offered(&[], |payload| {
         payload["tool_name"] = json!("AskUserQuestion")
     });
+    // A subagent's prompt: in a terminal the host shows its dialog only after the hook returns,
+    // so it is left to the session. Started by an app, the host asks the app while the hook
+    // waits, so it is offered like any other.
+    let subagent: fn(&mut Value) = |payload| payload["agent_id"] = json!("sub-1");
+    never_offered(&[("CLAUDE_CODE_ENTRYPOINT", "cli")], subagent);
+    let hub = permission_hub(200, |hash| answered(hash, "deny"));
+    let app = [("CLAUDE_CODE_ENTRYPOINT", "claude-desktop")];
+    let (run, seen) = permission_prompt(hub, &app, subagent);
+    assert!(
+        run.stdout.contains("\"behavior\":\"deny\""),
+        "{}",
+        run.stdout
+    );
+    let registered = seen
+        .iter()
+        .find(|seen| seen.path.starts_with("/v1/hub/permission/register"))
+        .expect("the subagent's prompt was offered");
+    let body: Value = serde_json::from_slice(&registered.body).unwrap();
+    assert_eq!(body["agent_id"], "sub-1");
 }
