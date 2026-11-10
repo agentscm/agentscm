@@ -4689,6 +4689,36 @@ fn start_in(
         },
         _ => return Err(HubError::Invalid("invalid work resolver".into())),
     };
+    let item = insert_work_in(tx, who, start, &id, source, scope, true, now)?;
+    let reclaimed = lapse_reservations(tx, who, &lapsed, &id, now)?;
+    bind_coordination_request(tx, who, &start.session, &item, now)?;
+    Ok(WorkStartResult {
+        reclaimed,
+        item,
+        created: true,
+        joined: false,
+        took_over: false,
+        conflict: None,
+        context: None,
+        coordination_request: None,
+        preflight: None,
+    })
+}
+
+/// Inserts new Work `id` from `start`, led by `who`'s session, with its participant, relations,
+/// declarations and first version. Reserved Work holds `scope` under a fresh lease; provisional
+/// Work is not reserved and holds nothing.
+#[allow(clippy::too_many_arguments)]
+fn insert_work_in(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    id: &str,
+    source: WorkSource,
+    scope: Vec<String>,
+    reserved: bool,
+    now: i64,
+) -> Result<WorkItem> {
     let mut item = WorkItem {
         initial_issue_choice: start.issue_choice.clone().unwrap_or_default(),
         issue_link: start
@@ -4696,7 +4726,7 @@ fn start_in(
             .as_ref()
             .and_then(|choice| choice.linked_issue())
             .cloned(),
-        id: id.clone(),
+        id: id.to_owned(),
         repository: who.repository.clone(),
         owner: who.owner.id.clone(),
         owner_login: who.owner.login.clone(),
@@ -4754,6 +4784,9 @@ fn start_in(
         };
     let scope_json = json_string(&item.scope)?;
     let snapshot = json_string(&item)?;
+    let basis = reserved.then_some("admitted");
+    let renewed = reserved.then_some(now);
+    let expires = reserved.then_some(now + LEASE_SECONDS);
     tx.execute(
         "INSERT INTO hub_work_items
             (id, provider, host, repository, repository_id, owner, lead_token, lead_agent,
@@ -4762,8 +4795,8 @@ fn start_in(
              current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq,
              reservation_basis, reservation_renewed_at, reservation_expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14,
-                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22, 'admitted',
-                 $21, $21::bigint + $23::bigint)",
+                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22, $23,
+                 $24, $25)",
         &[
             &item.id,
             &who.owner.identity.provider,
@@ -4787,7 +4820,9 @@ fn start_in(
             &snapshot,
             &now,
             &seq,
-            &LEASE_SECONDS,
+            &basis,
+            &renewed,
+            &expires,
         ],
     )?;
     tx.execute(
@@ -4822,19 +4857,7 @@ fn start_in(
             + work_payload_row_bytes(declarations_snapshot.len())?,
         now,
     )?;
-    let reclaimed = lapse_reservations(tx, who, &lapsed, &id, now)?;
-    bind_coordination_request(tx, who, &start.session, &item, now)?;
-    Ok(WorkStartResult {
-        reclaimed,
-        item,
-        created: true,
-        joined: false,
-        took_over: false,
-        conflict: None,
-        context: None,
-        coordination_request: None,
-        preflight: None,
-    })
+    Ok(item)
 }
 
 #[allow(clippy::too_many_arguments)]
