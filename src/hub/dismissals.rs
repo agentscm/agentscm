@@ -1,7 +1,9 @@
-//! A person's own dismissed and snoozed attention items, per repository. The Hub stores the
-//! page's opaque item key with a fingerprint of the item's state; the page hides an item while
-//! its stored fingerprint still matches, so a dismissed item returns when it changes. A snooze
-//! also carries `until`, after which the entry is pruned. Nobody else reads these entries.
+//! A person's own dismissed and snoozed attention items, per repository. The Hub stores an item
+//! key with a fingerprint of the item's state; the item is hidden while its stored fingerprint
+//! still matches, so a dismissed item returns when it changes. A snooze also carries `until`,
+//! after which the entry is pruned. The shared status reads its viewer's entries and stops
+//! counting the items they name (see `actionable_status`); any other key stays the page's own.
+//! Nobody else's entries are read.
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Query, State};
@@ -38,8 +40,18 @@ pub fn routes() -> Router<HubState> {
 }
 
 /// Keyed by the repository's forge id, so a rename keeps the entries.
-fn setting_key(user_id: &str, repository_id: i64) -> String {
+pub(super) fn setting_key(user_id: &str, repository_id: i64) -> String {
     format!("dismissals:{user_id}:{repository_id}")
+}
+
+/// A person's live entries for a repository.
+pub(super) fn current(
+    store: &dyn Store,
+    user_id: &str,
+    repository_id: i64,
+    now: i64,
+) -> Result<Vec<Dismissal>> {
+    load(store, &setting_key(user_id, repository_id), now)
 }
 
 /// A missing or corrupt value is no entries; expired snoozes are dropped.

@@ -709,6 +709,35 @@ fn read_scoped(
             limits.insert("recipients_truncated".into());
         }
     }
+    // What the viewer dismissed or snoozed is set aside for them on every surface that counts
+    // this status, while the item is unchanged. A Work row is named `work:<work_id>` with the
+    // fingerprint `<state>:<updated_seq>`; an action by its `id` with its `semantic_version`, or
+    // its `updated_seq` when it has none.
+    if let Some(repository_id) = principal.repository_id
+        && (work.iter().any(|w| w.needs_you) || actions.iter().any(|a| a.needs_you))
+    {
+        let aside =
+            crate::hub::dismissals::current(store, &principal.owner.id, repository_id, now)?;
+        let asked = |key: &str, fingerprint: &str| {
+            !aside
+                .iter()
+                .any(|d| d.key == key && d.fingerprint == fingerprint)
+        };
+        for row in work.iter_mut().filter(|w| w.needs_you) {
+            let state = serde_json::to_string(&row.state).expect("state serializes");
+            row.needs_you = asked(
+                &format!("work:{}", row.work_id),
+                &format!("{}:{}", state.trim_matches('"'), row.updated_seq),
+            );
+        }
+        for action in actions.iter_mut().filter(|a| a.needs_you) {
+            let version = action
+                .semantic_version
+                .clone()
+                .unwrap_or_else(|| action.updated_seq.to_string());
+            action.needs_you = asked(&action.id, &version);
+        }
+    }
     let mut counts = StatusCounts::default();
     for row in &work {
         match row.state {
@@ -2584,6 +2613,32 @@ mod tests {
         // One wait is one thing to do: its action asks the person, the row does not ask again.
         assert!(!waiting.needs_you);
         assert_eq!(asked_waiting, asked + 1);
+        // Its person sets the wait aside, as for a session that died at its prompt: it is not
+        // counted for them until the session waits anew.
+        let status = super::read(store, &observations, &who, later).unwrap();
+        let wait = status
+            .actions
+            .iter()
+            .find(|a| a.kind == "session_waiting")
+            .unwrap();
+        let set_aside = |fingerprint: &str| {
+            let entry = crate::hub::dismissals::Dismissal {
+                key: wait.id.clone(),
+                fingerprint: fingerprint.into(),
+                until: None,
+                at: later,
+            };
+            store
+                .set_setting(
+                    &crate::hub::dismissals::setting_key(&who.owner.id, 101),
+                    &serde_json::to_string(&[entry]).unwrap(),
+                    &who.owner.id,
+                )
+                .unwrap();
+            read(&observations).1
+        };
+        assert_eq!(set_aside(wait.semantic_version.as_deref().unwrap()), asked);
+        assert_eq!(set_aside("an earlier wait"), asked + 1);
         // A Hub that restarted after the session's last call holds no wait for it.
         let restarted = Observations::default();
         restarted.waiting().lost_before(later);
@@ -2871,6 +2926,47 @@ mod tests {
         let lapsed = now + crate::hub::work_lifecycle::LEASE_SECONDS + 1;
         let after = read(store, &viewer, lapsed).unwrap();
         assert!(after.actions.iter().all(|a| a.kind != "directed_request"));
+        // What the viewer dismissed or snoozed is not counted for them while it is unchanged.
+        let row = status
+            .work
+            .iter()
+            .find(|w| w.work_id == blocked.id)
+            .unwrap();
+        let set_aside = |updated_seq: i64, until: Option<i64>| {
+            let entry = crate::hub::dismissals::Dismissal {
+                key: format!("work:{}", blocked.id),
+                fingerprint: format!("blocked:{updated_seq}"),
+                until,
+                at: later,
+            };
+            store
+                .set_setting(
+                    &crate::hub::dismissals::setting_key(&viewer.owner.id, 101),
+                    &serde_json::to_string(&[entry]).unwrap(),
+                    &viewer.owner.id,
+                )
+                .unwrap();
+            read(store, &viewer, later).unwrap()
+        };
+        let aside = set_aside(row.updated_seq, None);
+        assert_eq!(aside.counts.needs_you, 0);
+        assert_ne!(aside.digest, status.digest, "a reader sees the change");
+        assert_eq!(
+            set_aside(row.updated_seq, Some(later + 60))
+                .counts
+                .needs_you,
+            0
+        );
+        assert_eq!(
+            set_aside(row.updated_seq - 1, None).counts.needs_you,
+            1,
+            "a changed item returns"
+        );
+        assert_eq!(
+            set_aside(row.updated_seq, Some(later)).counts.needs_you,
+            1,
+            "an ended snooze returns"
+        );
     }
 
     #[test]
