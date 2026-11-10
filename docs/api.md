@@ -244,8 +244,9 @@ The shared status projection is also exposed as the authenticated read-only MCP 
 `status_state`, `is_gate`). The switch belongs to the forge connection, so `enabled` covers every
 repository that connection has; `status_state` is always `success` and `is_gate` is `false`.
 
-`slack` replies `{"repository", "configured"}`, and when Slack is configured `events` (the Hub
-event kinds sent as direct messages as they happen; none has a switch of its own, and the
+`slack` replies `{"repository", "configured"}`, and when Slack is configured `events` (the
+status actions sent as direct messages; today `["session_waiting"]`, sent once per wait of a
+person's own agent session. It has no switch of its own, and the
 [weekly digest](slack.md#weekly-digest) is not among them), `bound`, and for a bound person
 `reminders` (`enabled`, `interval_seconds`, `max_reminders`, `send_resolution`, and `escalation`
 with `after_seconds`, or `null`). It answers as a send would: `configured` is false once Slack

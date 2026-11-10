@@ -6,6 +6,11 @@ use crate::hub::work::{WorkItem, WorkState};
 use crate::hub::work_http::actionable_status::{self, ActionableStatus, StatusState};
 
 const SCAN_SECONDS: i64 = 60;
+/// How long a session that only finished its turn must wait before it is messaged: nearly
+/// every turn ends this way, so the Hub's one-minute grace would message after each one.
+const IDLE_QUIET_SECONDS: i64 = 300;
+/// The header of a wait message, which also marks wait rows in the journal.
+pub(super) const WAIT_HEADLINE: &str = "Your agent is waiting for you";
 const JOB_TTL: i64 = 86400;
 const EPISODE_LIMIT: i64 = 4096;
 
@@ -213,7 +218,6 @@ fn entry_message(item: &WorkItem, repository: &str, link: &str) -> Option<Value>
             ),
         ],
         guidance,
-        None,
         link,
     ))
 }
@@ -558,7 +562,7 @@ impl Slack {
     /// later pass finds the row and sends nothing, and a new wait of the same session is new.
     /// The row is kept a day, longer than the Hub believes a wait.
     pub(super) fn collect_waits(&self, state: &HubState, now: i64) -> Result<()> {
-        for binding in &self.bindings {
+        for (index, binding) in self.bindings.iter().enumerate() {
             let key = binding_key(binding);
             let scan = format!("{key}:waits");
             let due: Option<i64> = self
@@ -572,7 +576,16 @@ impl Slack {
             if due.is_some_and(|d| d > now) {
                 continue;
             }
-            self.database()?.execute("INSERT INTO status_scans(binding,next_due) VALUES(?1,?2) ON CONFLICT(binding) DO UPDATE SET next_due=excluded.next_due", params![scan, now + SCAN_SECONDS])?;
+            // Each scan is a full status read; after a restart no binding has a row, so the
+            // first scans start one second apart instead of all in the same pass.
+            let (first, at) = match due {
+                None if index > 0 => (false, now + index as i64),
+                _ => (true, now + SCAN_SECONDS),
+            };
+            self.database()?.execute("INSERT INTO status_scans(binding,next_due) VALUES(?1,?2) ON CONFLICT(binding) DO UPDATE SET next_due=excluded.next_due", params![scan, at])?;
+            if !first {
+                continue;
+            }
             let status = {
                 let _slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
                 let principal = match self.principal(state, binding) {
@@ -597,12 +610,20 @@ impl Slack {
                 if action.kind != "session_waiting" || !action.needs_you || queued >= CAPACITY {
                     continue;
                 }
+                // An agent that only finished its turn is not worth a message until it has
+                // stayed quiet a few minutes; a prompt or question keeps the Hub's grace.
+                if action.id.starts_with("waiting:idle:")
+                    && since
+                        .parse::<i64>()
+                        .map_or(true, |since| now - since < IDLE_QUIET_SECONDS)
+                {
+                    continue;
+                }
                 let id = hash(format!("wait\n{key}\n{}\n{since}", action.id).as_bytes());
                 let body = message(
-                    "Your agent is waiting for you",
+                    WAIT_HEADLINE,
                     &[("Waiting", sanitize(&action.action, 900))],
                     "It stays stopped until you answer. The Hub lists it under Needs you.",
-                    None,
                     &link,
                 );
                 let user = &binding.config.slack_user;

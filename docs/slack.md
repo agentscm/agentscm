@@ -10,7 +10,7 @@ Only real asks reach a person. Agents get every coordination warning in their ow
 
 | Moment | When | Who gets a direct message |
 |---|---|---|
-| An agent session waits for you | One of your own agent sessions has waited for a permission, an answer or your next message for more than a minute (the Hub's grace). This is on by default and needs no `reminders.enabled`. | The person who owns that session, once per wait, with an **Open Hub** link to `#box-needs` (the Needs you box). |
+| An agent session waits for you | One of your own agent sessions has waited for a permission, an answer or your next message for more than a minute (the Hub's grace), or for more than five minutes when it only finished its turn. This is on by default and needs no `reminders.enabled`. | The person who owns that session, once per wait, with an **Open Hub** link to `#box-needs` (the Needs you box). |
 | Work enters `blocked` | The shared status first observes a personal blocker; experimental, requires `reminders.enabled`. | The lead agent's person named by the shared status, with an **Open Hub** link to `#work/<id>`. |
 | Work enters `handover` | The shared status first observes a handover with an unresolved blocker; experimental, requires `reminders.enabled`. | The work owner's person named by the shared status, not necessarily the current lead's person, with an **Open Hub** link to `#work/<id>`. |
 
@@ -140,7 +140,7 @@ Existing installations must update their manifest and reinstall or reauthorize t
 
 ## Messages and buttons
 
-A background worker looks for waiting sessions about once a minute per binding, using the binding's read-only token, and sends every due message every two seconds (every half second while it has just delivered something). The Hub lists a wait only after its grace of one minute, so a person at the keyboard is not messaged. Each wait becomes one message: the journal remembers the wait's id and start time, so later passes send nothing more, and a session that stops again later is a new wait. A message has a header, one field that carries the Hub's own sentence, a line of guidance and an **Open Hub** button. For example:
+A background worker looks for waiting sessions about once a minute per binding, using the binding's read-only token, and sends every due message every two seconds (every half second while it has just delivered something). Each look is one full status read, so the cost is one status read per bound person a minute; after a restart the first looks start a second apart instead of together. The Hub lists a wait only after its grace of one minute, so a person at the keyboard is not messaged. A session that only finished its turn is held to five minutes instead, since nearly every turn ends that way; a permission prompt or a question keeps the one-minute grace. A message that Slack could not take because of an outage or a server error is tried again after 5 seconds, then 10, 20 and so on up to 5 minutes, eight tries in all (about ten minutes). Each wait becomes one message: the journal remembers the wait's id and start time, so later passes send nothing more, and a session that stops again later is a new wait. A message has a header, one field that carries the Hub's own sentence, a line of guidance and an **Open Hub** button. For example:
 
 ```text
 Your agent is waiting for you

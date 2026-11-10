@@ -150,6 +150,76 @@ async fn a_full_journal_holds_a_wait_until_queued_messages_are_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_end_of_turn_waits_five_minutes_but_a_question_keeps_the_grace() {
+    let f = Fixture::new().await;
+    let now = unix_now();
+    let a = agent(&f, 0);
+    // An idle stop counts only while its session leads unfinished Work.
+    let request: crate::hub::work::WorkStart = serde_json::from_value(json!({
+        "request_key": "idle-lead", "title": "Lead", "session": "idle", "scope": ["src/idle.rs"]
+    }))
+    .unwrap();
+    tokio::task::block_in_place(|| f.store().work_start(&a.token_id, &request, now)).unwrap();
+    let waiting = f.state.onboarding.waiting();
+    let (idle, ask) = (WaitReason::Idle, WaitReason::Question);
+    waiting
+        .record(&a, "idle", "idle", "claude", idle, None, None, now - 100)
+        .unwrap();
+    waiting
+        .record(
+            &a,
+            "ask",
+            "ask",
+            "claude",
+            ask,
+            None,
+            Some("Retry the job?"),
+            now - 100,
+        )
+        .unwrap();
+    // Both have outlasted the Hub's grace; only the question is sent.
+    pass(&f, now + 61).await;
+    pass(&f, now + 122).await;
+    let sent = f.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].1.contains("Retry the job?"), "{sent:?}");
+    // The idle stop has now waited past five minutes.
+    pass(&f, now + 240).await;
+    assert_eq!(f.sent().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_text_an_agent_asks_stays_plain_text() {
+    let f = Fixture::new().await;
+    let now = unix_now();
+    f.state
+        .onboarding
+        .waiting()
+        .record(
+            &agent(&f, 0),
+            "s1",
+            "s1",
+            "claude",
+            WaitReason::Question,
+            None,
+            Some("<!channel> @here <http://x|y> & more"),
+            now - 120,
+        )
+        .unwrap();
+    pass(&f, now + 61).await;
+    let body = f.sent_body("U1");
+    let text = body["text"].as_str().unwrap();
+    assert!(!text.contains('<') && !text.contains('>'), "{text}");
+    assert!(!text.contains("<!channel>") && !text.contains("<http://x|y>"));
+    assert!(
+        text.contains("&amp; more") || text.contains("&amp;"),
+        "{text}"
+    );
+    // Every block is plain text, so Slack renders none of it as a mention or link.
+    rendered(&body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn moments_between_agents_send_nothing() {
     let f = Fixture::new().await;
     // Bob edits a file alice's agent holds: refused once, then repeated.

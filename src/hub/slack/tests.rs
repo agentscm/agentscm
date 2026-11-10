@@ -435,18 +435,38 @@ async fn ingress_checks_signature_workspace_app_and_request_shape() {
     assert!(f.calls.lock().unwrap().is_empty());
 }
 
+/// The body of a handoff message as an earlier version sent it: the Hub link with the two
+/// answers before it, whose value names the holder token, session `a` and `PATH`.
+fn old_handoff_body(holder: &str, headline: &str, guidance: &str) -> Value {
+    let mut body = message(
+        headline,
+        &[("File", PATH.to_owned())],
+        guidance,
+        "https://hub.example.test/ui/#box-contested",
+    );
+    let value = json!({"t": holder, "s": "a", "p": PATH}).to_string();
+    let elements = body["blocks"][2]["elements"].as_array_mut().unwrap();
+    elements.insert(
+        0,
+        json!({"type":"button","action_id":NO,"text":plain_text("Keep it",30),"value":value}),
+    );
+    elements.insert(
+        0,
+        json!({"type":"button","action_id":YES,"text":plain_text("Hand it over",30),"value":value}),
+    );
+    body
+}
+
 /// A handoff message as an earlier version sent it, still in Slack with its buttons: alice's
 /// agent holds `PATH` and bob's has asked for it. Nothing sends such a message any more, so it
 /// is put in the journal directly, and `run` delivers it.
 impl Fixture {
     fn old_handoff_message(&self) {
         self.contest();
-        let body = message(
+        let body = old_handoff_body(
+            &self.alice,
             "bob’s Codex edited src/widget.rs, which your Claude Code holds",
-            &[("File", PATH.to_owned())],
             "Hand it over, or keep it and agree who goes first.",
-            Some((&self.alice, Some("a"), PATH)),
-            "https://hub.example.test/ui/#box-contested",
         );
         self.seed("old-handoff", 0, body);
     }
@@ -610,13 +630,7 @@ async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
     tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &other, unix_now())).unwrap();
     assert!(!f.edit(&f.bob, "b").denied.is_empty());
     assert!(!f.edit(&f.bob, "b").repeated.is_empty());
-    let body = message(
-        "h",
-        &[("File", PATH.to_owned())],
-        "g",
-        Some((&f.alice, Some("a"), PATH)),
-        "https://hub.example.test/ui/#box-contested",
-    );
+    let body = old_handoff_body(&f.alice, "h", "g");
     f.seed("old-handoff", 0, body);
     f.run().await;
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
@@ -699,6 +713,69 @@ async fn rate_limits_retry_and_a_wrong_bot_or_revoked_binding_sends_nothing() {
     f.slack().deliver(&f.state).await.unwrap();
     assert_eq!(f.state_of_messages(), ["failed", "failed"]);
     assert_eq!(f.calls.lock().unwrap().len(), calls);
+}
+
+#[test]
+fn transient_failures_back_off_to_about_ten_minutes_over_eight_tries() {
+    let waits: Vec<i64> = (0..7).map(|n| retry_delay(TRANSIENT, n)).collect();
+    assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300]);
+    assert!((600..=900).contains(&waits.iter().sum::<i64>()));
+    // A rate limit's own delay is kept.
+    assert_eq!(retry_delay(30, 5), 30);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slack_outage_is_waited_out_and_the_message_then_arrives() {
+    let f = Fixture::new().await;
+    f.seed("m0", 0, json!({"text": "one", "blocks": []}));
+    for _ in 0..3 {
+        f.replies.lock().unwrap().push((503, json!({"ok":false})));
+    }
+    for expected in [5, 10, 20] {
+        f.slack().deliver(&f.state).await.unwrap();
+        let (state, wait): (String, i64) = f
+            .slack()
+            .database()
+            .unwrap()
+            .query_row("SELECT state,due-?1 FROM messages", [unix_now()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(state, "queued");
+        assert!((expected - 1..=expected).contains(&wait), "{wait}");
+        f.slack()
+            .database()
+            .unwrap()
+            .execute("UPDATE messages SET due=0", [])
+            .unwrap();
+    }
+    f.slack().deliver(&f.state).await.unwrap();
+    assert_eq!(f.state_of_messages(), ["done"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_fails_old_queued_messages_but_keeps_wait_messages() {
+    let f = Fixture::new().await;
+    f.seed("old", 0, json!({"text": "x", "blocks": []}));
+    let wait = message(
+        status::WAIT_HEADLINE,
+        &[("Waiting", "x".to_owned())],
+        "g",
+        "https://hub.example.test/ui/#box-needs",
+    );
+    f.seed("wait", 0, wait);
+    let reopened = Slack::from_file(&f.dir.path().join("config")).unwrap();
+    let states: Vec<(String, String)> = reopened
+        .database()
+        .unwrap()
+        .prepare("SELECT id,state FROM messages ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let pair = |id: &str, state: &str| (id.to_owned(), state.to_owned());
+    assert_eq!(states, [pair("old", "failed"), pair("wait", "queued")]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -865,11 +942,11 @@ fn a_message_names_its_subject_once_and_keeps_text_as_typed() {
     let link = "https://hub.example.test/ui/#inbox";
     // A header that already names the file is the whole notification.
     assert_eq!(
-        message("bob’s Codex edited src/a.rs", &fields, "g", None, link)["text"],
+        message("bob’s Codex edited src/a.rs", &fields, "g", link)["text"],
         "bob’s Codex edited src/a.rs"
     );
     assert_eq!(
-        message("Your agent kept a file", &fields, "g", None, link)["text"],
+        message("Your agent kept a file", &fields, "g", link)["text"],
         "Your agent kept a file: src/a.rs"
     );
     // `:rocket:` in a path or name is not turned into an emoji.
@@ -877,7 +954,6 @@ fn a_message_names_its_subject_once_and_keeps_text_as_typed() {
         "h :rocket:",
         &[("File", ":tada:".to_owned())],
         ":smile:",
-        None,
         link,
     );
     assert_eq!(body["blocks"][0]["text"]["emoji"], false);
@@ -915,7 +991,6 @@ fn message_text_cannot_mention_or_link() {
         "<!channel> & <http://x|y>",
         &[("File", "<@U1>".into())],
         "<!here>",
-        None,
         "https://hub.example.test/ui/",
     );
     assert_eq!(
@@ -939,13 +1014,7 @@ fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
         ("Their agent", who.clone()),
     ];
     let headline = format!("Another agent edited {hostile}");
-    let body = message(
-        &headline,
-        &fields,
-        &hostile,
-        Some(("token", None, &long)),
-        "https://hub.example.test/ui/",
-    );
+    let body = message(&headline, &fields, &hostile, "https://hub.example.test/ui/");
     let blocks = body["blocks"].as_array().unwrap();
     let header = blocks[0]["text"]["text"].as_str().unwrap();
     assert!(header.chars().count() <= 150);
@@ -957,7 +1026,6 @@ fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
         assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
     }
     assert!(section[0]["text"].as_str().unwrap().ends_with("\n+7 more"));
-    // A button value past Slack's limit sends the message without the handoff buttons.
     assert_eq!(blocks[2]["elements"].as_array().unwrap().len(), 1);
     let text = body["text"].as_str().unwrap();
     assert!(!text.contains('<') && !text.contains('>'));
@@ -2188,7 +2256,6 @@ async fn unavailable_status_answers_unknown_privately_and_does_not_block_coordin
         "h",
         &[("File", PATH.to_owned())],
         "g",
-        None,
         "https://hub.example.test/ui/",
     );
     f.seed("queued", 0, queued);

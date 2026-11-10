@@ -36,7 +36,23 @@ pub const CONFIG_ENV: &str = "AGENTSCM_SLACK_FILE";
 const CAPACITY: i64 = 4096;
 /// A message is tried at most this many times.
 const MAX_ATTEMPTS: i64 = 8;
+/// The retry delay `api_data` reports for a server error or network failure; `retry_delay`
+/// grows it with each attempt, so an outage of Slack is waited out, not burned through.
+const TRANSIENT: u64 = 5;
+/// The longest wait between two tries.
+const RETRY_CAP: i64 = 300;
 const SENDS_PER_PASS: usize = 20;
+
+/// Seconds before try `attempts + 2`: a server's own request (`Retry-After`) as given, a
+/// transient failure doubling from 5 s up to [`RETRY_CAP`], so eight tries span about ten minutes.
+fn retry_delay(delay: u64, attempts: i64) -> i64 {
+    let seconds = if delay == TRANSIENT {
+        (TRANSIENT as i64) << attempts.clamp(0, 6)
+    } else {
+        delay as i64
+    };
+    seconds.min(RETRY_CAP)
+}
 /// The moments that become direct messages without an opt-in.
 const KINDS: [&str; 1] = ["session_waiting"];
 const NAME_CHARS: usize = 64;
@@ -315,29 +331,11 @@ fn open_button(url: &str) -> Value {
 }
 
 /// A direct message, all plain text (never mrkdwn): a header, two-column label/value
-/// fields, handoff buttons for `handoff` (holder token, holder session, path) beside a link
-/// to the Hub page `link` is about, and one line of guidance. The notification text is the
-/// header, followed by the first field's first line unless the header already says it.
-fn message(
-    headline: &str,
-    fields: &[(&str, String)],
-    guidance: &str,
-    handoff: Option<(&str, Option<&str>, &str)>,
-    link: &str,
-) -> Value {
-    let mut elements = Vec::new();
-    // Slack refuses a whole message whose button value passes 2000 characters; send it without buttons.
-    let value = handoff
-        .map(|(token, session, path)| json!({"t": token, "s": session, "p": path}).to_string())
-        .filter(|value| value.chars().count() <= 2000);
-    // Both answers look alike: handing a file over is not the better choice.
-    if let Some(value) = value {
-        elements.push(json!({"type":"button","action_id":YES,
-            "text":plain_text("Hand it over",30),"value":value}));
-        elements.push(json!({"type":"button","action_id":NO,
-            "text":plain_text("Keep it",30),"value":value}));
-    }
-    elements.push(open_button(link));
+/// fields, a button to the Hub page `link` is about, and one line of guidance. The
+/// notification text is the header, followed by the first field's first line unless the
+/// header already says it.
+fn message(headline: &str, fields: &[(&str, String)], guidance: &str, link: &str) -> Value {
+    let elements = vec![open_button(link)];
     let subject = fields
         .first()
         .and_then(|(_, value)| value.lines().next())
@@ -473,7 +471,6 @@ impl Slack {
         db.busy_timeout(Duration::from_millis(250))?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS installation (id INTEGER PRIMARY KEY CHECK(id=1), team TEXT NOT NULL, app TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS cursor (id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, due INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);")?;
         db.execute(
             "INSERT OR IGNORE INTO installation(id,team,app) VALUES(1,?1,?2)",
@@ -491,6 +488,11 @@ impl Slack {
         db.execute(
             "UPDATE messages SET state='queued' WHERE state='sending'",
             [],
+        )?;
+        // Earlier versions queued other direct messages; only wait messages are sent now.
+        db.execute(
+            "UPDATE messages SET state='failed' WHERE state='queued' AND body NOT LIKE ?1",
+            [format!("%\"{}\"%", status::WAIT_HEADLINE)],
         )?;
         Ok(Self {
             app: config.app_id,
@@ -559,7 +561,7 @@ impl Slack {
             .body(serde_json::to_vec(&body).map_err(|_| 0u64)?)
             .send()
             .await
-            .map_err(|_| 5u64)?;
+            .map_err(|_| TRANSIENT)?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             return Err(response
                 .headers()
@@ -571,14 +573,14 @@ impl Slack {
         }
         if !response.status().is_success() {
             return Err(if response.status().is_server_error() {
-                5
+                TRANSIENT
             } else {
                 0
             });
         }
         let mut response = response;
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| 5u64)? {
+        while let Some(chunk) = response.chunk().await.map_err(|_| TRANSIENT)? {
             if bytes.len() + chunk.len() > 512 * 1024 {
                 return Err(0);
             }
@@ -695,6 +697,9 @@ impl Slack {
             }
             Some(Err(error)) => return Err(error),
         }
+        // shortcut: a queued wait message is not re-checked against its wait, so a long Slack
+        // rate limit can deliver it after the person answered; store the wait key and skip
+        // ended waits if that shows.
         self.database()?.execute(
             "UPDATE messages SET state='sending',attempts=attempts+1 WHERE id=?1",
             [&id],
@@ -721,7 +726,9 @@ impl Slack {
         body["channel"] = json!(user);
         let (status, delay) = match self.api("chat.postMessage", body).await {
             Ok(()) => ("done", 0),
-            Err(delay) if delay > 0 && attempts + 1 < MAX_ATTEMPTS => ("queued", delay as i64),
+            Err(delay) if delay > 0 && attempts + 1 < MAX_ATTEMPTS => {
+                ("queued", retry_delay(delay, attempts))
+            }
             Err(_) => ("failed", 0),
         };
         let service = self.clone();
