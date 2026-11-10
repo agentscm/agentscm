@@ -662,6 +662,14 @@ async fn protocol_basics() {
         .tool_result(reader.expose(), "agentscm_work_status", json!({}))
         .await;
     assert_eq!(status_read["isError"], false, "{status_read}");
+    // This Hub has no workspace, so promise reads say so instead of asking for a retry.
+    let promises = hub
+        .tool_result(reader.expose(), "agentscm_promises_list", json!({}))
+        .await;
+    assert_eq!(promises["isError"], true, "{promises}");
+    let error = &promises["structuredContent"]["error"];
+    assert_eq!(error["code"], "not_configured", "{promises}");
+    assert_eq!(error["retryable"], false, "{promises}");
     let read_only = hub.rpc(reader.expose(), &list).await.json();
     let read_only_names: Vec<&str> = read_only["result"]["tools"]
         .as_array()

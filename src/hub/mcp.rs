@@ -1666,8 +1666,9 @@ async fn promise_call(
     ) {
         return None;
     }
+    // Promises live in the workspace; a Hub started without one cannot serve them, so retrying will not help.
     let Some(workspace) = state.workspace.clone() else {
-        return Some(refused("unavailable"));
+        return Some(refused("not_configured"));
     };
     let Some(token) = crate::http_listener::bearer(headers).map(str::to_owned) else {
         return Some(refused("unauthorized"));
