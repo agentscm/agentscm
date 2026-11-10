@@ -1569,12 +1569,12 @@ fn pull_request_preview_matches_paths_and_thresholds_and_reports_unknown() {
     assert!(!p.matches);
     assert_eq!(p.unknown.len(), 1);
     assert!(p.reasons[0].starts_with("could not evaluate paths_any"));
-    r.run_when_unknown = true;
+    r.trigger.run_when_unknown = true;
     let p = preview(&r, &head_event(&f, None));
     assert!(p.matches && p.unknown.len() == 1, "{p:?}");
-    r.run_when_unknown = false;
-    r.min_changed_lines = Some(12);
-    r.min_changed_files = Some(2);
+    r.trigger.run_when_unknown = false;
+    r.trigger.min_changed_lines = Some(12);
+    r.trigger.min_changed_files = Some(2);
     let p = preview(&r, &head_event(&f, Some(&["src/a.rs"])));
     assert_eq!(p.reasons, vec!["11 changed lines, fewer than 12"]);
     // Each rule fires on its own event kind only.
