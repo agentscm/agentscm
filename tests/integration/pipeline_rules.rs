@@ -2129,3 +2129,139 @@ async fn a_fired_head_shows_pending_then_its_result_on_that_exact_commit_only() 
     assert!(journal(&f).report_failures(8).unwrap().is_empty());
     task.abort();
 }
+
+/// One poll that accepts head `sha` on each pull request in `pulls`.
+async fn fire(
+    api: ForgeApi<'_>,
+    j: &mut RuleJournal,
+    state: &Arc<std::sync::Mutex<PollFakeState>>,
+    pulls: &[(i64, &str)],
+) {
+    {
+        let mut s = state.lock().unwrap();
+        s.open = pulls.iter().map(|(n, _)| *n).collect();
+        for (n, sha) in pulls {
+            s.pulls.insert(*n, open_pull(*n, sha, false, 42));
+            s.files.insert(*n, vec!["src/lib.rs".into()]);
+        }
+    }
+    let report = poll_merges(api, "synthetic", &connected(), j, observation_now())
+        .await
+        .unwrap();
+    assert!(report.blocked.is_none(), "{report:?}");
+}
+async fn post_all(api: ForgeApi<'_>, j: &mut RuleJournal) -> Vec<Value> {
+    report_results(api, "synthetic", &connected(), j)
+        .await
+        .unwrap()
+}
+fn finish_as(j: &mut RuleJournal, dispatch_id: &str, state: &str) {
+    let claim = j.claim(dispatch_id).unwrap();
+    j.finish(&claim, state, Some("synthetic")).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_of_one_rule_on_one_commit_share_a_status_and_failing_posts_do_not_starve() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&pull_rule(&f), None).unwrap();
+    let (url, state, task) = poll_fake("github", &f.commit).await;
+    let gh = agentscm::hub::github::Api::new(&url, &url).unwrap();
+    let api = ForgeApi::Github(&gh);
+    let posted = |sha: &str| -> Vec<String> {
+        state
+            .lock()
+            .unwrap()
+            .statuses
+            .iter()
+            .filter(|(at, _)| at == sha)
+            .map(|(_, body)| body["state"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // Two pull requests with the same head: one status for the commit, not one per run.
+    let shared = "1".repeat(40);
+    fire(api, &mut j, &state, &[(9, &shared), (10, &shared)]).await;
+    let runs = j.pending(8).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(post_all(api, &mut j).await.len(), 1);
+    assert_eq!(posted(&shared), vec!["pending"]);
+    // One run succeeds; the other is still running: still pending, not green.
+    finish_as(&mut j, &runs[0].dispatch_id, "complete");
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&shared), vec!["pending", "pending"]);
+    // The other fails while posts fail; the retry posts the combined state, never a stale success.
+    state.lock().unwrap().failure = Some(("status".into(), 502));
+    finish_as(&mut j, &runs[1].dispatch_id, "blocked");
+    assert_eq!(post_all(api, &mut j).await[0]["posted"], false);
+    state.lock().unwrap().failure = None;
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&shared), vec!["pending", "pending", "failure"]);
+    assert!(post_all(api, &mut j).await.is_empty());
+    // Recovering the failed run sets the commit back to pending.
+    let view = j.dispatch(&runs[1].dispatch_id).unwrap();
+    j.recover(&runs[1].dispatch_id, view.claim_generation)
+        .unwrap();
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&shared).last().unwrap(), "pending");
+    // A refusal for the whole token stops the cycle; a 422 only skips that commit.
+    let (a, b) = ("2".repeat(40), "3".repeat(40));
+    fire(api, &mut j, &state, &[(11, &a), (12, &b)]).await;
+    state.lock().unwrap().failure = Some(("status".into(), 403));
+    assert_eq!(post_all(api, &mut j).await.len(), 1);
+    state.lock().unwrap().failure = Some(("status".into(), 422));
+    assert_eq!(post_all(api, &mut j).await.len(), 2);
+    // An answer that cannot change is given up after three attempts and stays visible, and
+    // it never starves a new head.
+    post_all(api, &mut j).await;
+    post_all(api, &mut j).await;
+    let failures = j.report_failures(8).unwrap();
+    assert!(
+        failures.iter().all(|f| f["gave_up"] == true),
+        "{failures:?}"
+    );
+    assert!(post_all(api, &mut j).await.is_empty());
+    state.lock().unwrap().failure = None;
+    let fresh = "4".repeat(40);
+    fire(api, &mut j, &state, &[(13, &fresh)]).await;
+    post_all(api, &mut j).await;
+    assert_eq!(posted(&fresh), vec!["pending"]);
+    assert!(posted(&a).is_empty() && posted(&b).is_empty());
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrading_to_reports_posts_nothing_for_old_runs_and_quarantine_drops_their_reports() {
+    let f = fixture();
+    let mut j = journal(&f);
+    j.install(&pull_rule(&f), None).unwrap();
+    let (url, state, task) = poll_fake("github", &f.commit).await;
+    let gh = agentscm::hub::github::Api::new(&url, &url).unwrap();
+    let api = ForgeApi::Github(&gh);
+    fire(api, &mut j, &state, &[(9, &"5".repeat(40))]).await;
+    drop(j);
+    // A version 2 journal that already holds a pull request run.
+    let db = raw_journal(&f);
+    db.execute("DROP TABLE pipeline_reports", []).unwrap();
+    db.pragma_update(None, "user_version", 2).unwrap();
+    drop(db);
+    let mut j = journal(&f);
+    assert!(
+        report_results(api, "synthetic", &connected(), &mut j)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(state.lock().unwrap().statuses.is_empty());
+    // A run whose row is quarantined takes its report row with it, and the journal opens.
+    drop(j);
+    raw_journal(&f)
+        .execute("UPDATE pipeline_dispatches SET body='{'", [])
+        .unwrap();
+    let j = journal(&f);
+    assert_eq!(j.quarantined().unwrap()["count"], 1);
+    let reports: i64 = raw_journal(&f)
+        .query_row("SELECT count(*) FROM pipeline_reports", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reports, 0);
+    task.abort();
+}

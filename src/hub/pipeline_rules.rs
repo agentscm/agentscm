@@ -787,6 +787,9 @@ pub async fn poll_merges(
 }
 
 const MAX_REPORT_ERROR: usize = 1024;
+/// Attempts before a post that got an unchanging answer (HTTP 422, an unsupported commit) is
+/// given up; it stays listed in `status`.
+const MAX_PERMANENT_ATTEMPTS: i64 = 3;
 const REPORTS_PER_POLL: usize = 64;
 
 /// The commit status context a pull request rule posts on the head it ran.
@@ -794,23 +797,32 @@ pub fn report_context(rule_id: &str) -> String {
     format!("agentscm/pipeline/{rule_id}")
 }
 
-/// What a run's outbox state tells the pull request. Fixed text only: nothing from the pull
-/// request reaches the status.
-fn report_state(state: &str) -> (&'static str, super::github::StatusState, &'static str) {
+/// What the runs of one rule on one commit tell the pull request: failure if any failed,
+/// pending while any is unfinished, success only when every one succeeded. GitHub keeps one
+/// status per commit and context, so no single run may decide it alone.
+fn combined_state(run_states: &[String]) -> &'static str {
+    if run_states.iter().any(|s| s == "blocked") {
+        "failure"
+    } else if run_states.iter().any(|s| s != "complete") {
+        "pending"
+    } else {
+        "success"
+    }
+}
+
+/// The status for a combined state. Fixed text only: nothing from the pull request reaches it.
+fn report_state(state: &str) -> (super::github::StatusState, &'static str) {
     use super::github::StatusState;
     match state {
-        "complete" => (
-            "success",
+        "success" => (
             StatusState::Success,
             "AgentSCM rule run succeeded on this commit",
         ),
-        "blocked" => (
-            "failure",
+        "failure" => (
             StatusState::Failure,
             "AgentSCM rule run failed or was blocked; see pipeline status",
         ),
         _ => (
-            "pending",
             StatusState::Pending,
             "AgentSCM rule fired on this commit; the run has not finished",
         ),
@@ -834,15 +846,24 @@ pub async fn report_results(
     }
     journal.assert_repository("github", &repository.host, repository.repository_id)?;
     let mut reports = Vec::new();
-    for (dispatch, state) in journal.unreported(REPORTS_PER_POLL)? {
+    let mut done = BTreeSet::new();
+    for dispatch in journal.unreported(REPORTS_PER_POLL)? {
         let event = &dispatch.event;
-        if event.host != repository.host || event.provider_repository_id != repository.repository_id
+        let rule_id = &dispatch.rule.rule_id;
+        if event.host != repository.host
+            || event.provider_repository_id != repository.repository_id
+            || !done.insert((rule_id.clone(), event.accepted_commit.clone()))
         {
             continue;
         }
-        let (want, status_state, description) = report_state(&state);
-        let context = report_context(&dispatch.rule.rule_id);
+        let runs = journal.runs_on_commit(rule_id, &event.accepted_commit)?;
+        let states: Vec<String> = runs.iter().map(|(_, state)| state.clone()).collect();
+        let want = combined_state(&states);
+        let (status_state, description) = report_state(want);
+        let context = report_context(rule_id);
         let mut stop = false;
+        // An answer that cannot change on retry; it is given up after a few attempts.
+        let mut permanent = false;
         let outcome = match super::github::CommitStatus::new(
             &event.accepted_commit,
             status_state,
@@ -850,6 +871,7 @@ pub async fn report_results(
             description,
         ) {
             Err(_) => {
+                permanent = true;
                 Err("this commit cannot carry a GitHub status (40-digit commits only)".to_owned())
             }
             Ok(status) => match api
@@ -860,8 +882,9 @@ pub async fn report_results(
                 Ok(Err(code)) => {
                     // A token or repository refusal applies to every later post too.
                     stop = matches!(code, 401 | 403 | 404);
+                    permanent = code == 422;
                     Err(format!(
-                        "forge refused the status (HTTP {code}); check the token can write commit statuses"
+                        "forge refused the status (HTTP {code}); check the token can write commit statuses and the commit still exists"
                     ))
                 }
                 Err(error) => {
@@ -877,12 +900,14 @@ pub async fn report_results(
             },
         };
         let error = outcome.err();
-        journal.record_report(&dispatch.dispatch_id, want, error.as_deref())?;
+        for (dispatch_id, run_state) in &runs {
+            journal.record_report(dispatch_id, run_state, want, error.as_deref(), permanent)?;
+        }
         reports.push(serde_json::json!({
-            "dispatch_id": dispatch.dispatch_id,
             "head": event.accepted_commit,
             "context": context,
             "state": want,
+            "runs": runs.iter().map(|(id, _)| id).collect::<Vec<_>>(),
             "posted": error.is_none(),
             "error": error,
         }));
@@ -1002,7 +1027,14 @@ const SCHEMA:&str="CREATE TABLE pipeline_binding(singleton INTEGER PRIMARY KEY C
             CREATE TABLE pipeline_dispatches(dispatch_id TEXT PRIMARY KEY,run_id TEXT NOT NULL UNIQUE,semantic_key TEXT NOT NULL UNIQUE REFERENCES pipeline_observations(semantic_key),event_key TEXT NOT NULL REFERENCES pipeline_events(semantic_key),rule_id TEXT NOT NULL REFERENCES pipeline_rules(rule_id),body TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','claimed','complete','blocked')),claim_generation INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation>=0),error TEXT) STRICT;";
 /// Version 3: what each pull request run last told the forge, so a status is posted once per
 /// state and a failed post is retried and shown.
-const REPORTS_SCHEMA: &str = "CREATE TABLE pipeline_reports(dispatch_id TEXT PRIMARY KEY REFERENCES pipeline_dispatches(dispatch_id),state TEXT NOT NULL CHECK(state IN ('pending','success','failure')),posted INTEGER NOT NULL CHECK(posted IN (0,1)),attempts INTEGER NOT NULL CHECK(attempts>=0),error TEXT) STRICT;";
+/// `run_state` is the run's outbox state when last reported; `state` is what was posted for its
+/// commit and rule, combined over every run of that rule on that commit.
+const REPORTS_SCHEMA: &str = "CREATE TABLE pipeline_reports(dispatch_id TEXT PRIMARY KEY REFERENCES pipeline_dispatches(dispatch_id),run_state TEXT NOT NULL CHECK(run_state IN ('pending','claimed','complete','blocked')),state TEXT NOT NULL CHECK(state IN ('pending','success','failure')),posted INTEGER NOT NULL CHECK(posted IN (0,1)),attempts INTEGER NOT NULL CHECK(attempts>=0),gave_up INTEGER NOT NULL CHECK(gave_up IN (0,1)),error TEXT) STRICT;";
+/// Runs that already existed when the journal moved to version 3 count as reported, so an
+/// upgrade posts nothing on old (often closed) pull requests.
+const REPORTS_SEED: &str = "INSERT INTO pipeline_reports(dispatch_id,run_state,state,posted,attempts,gave_up,error)
+  SELECT dispatch_id,state,CASE state WHEN 'complete' THEN 'success' WHEN 'blocked' THEN 'failure' ELSE 'pending' END,1,0,0,NULL
+  FROM pipeline_dispatches WHERE instr(CAST(event_key AS BLOB),CAST(char(0)||'pull_request'||char(0) AS BLOB))>0;";
 const APPLICATION_ID: i64 = 0x4153_5052;
 const SCHEMA_VERSION: i64 = 3;
 pub struct RuleJournal {
@@ -1057,6 +1089,9 @@ impl RuleJournal {
             quarantine_rows(&tx, &native_repository, &directory.join(QUARANTINE_FILE))?;
             validate_recovery(&tx, &native_repository)?;
             tx.execute_batch(added)?;
+            if from == 2 {
+                tx.execute_batch(REPORTS_SEED)?;
+            }
             tx.pragma_update(None, "user_version", from + 1)?;
             tx.commit()?;
         }
@@ -1295,49 +1330,91 @@ impl RuleJournal {
         }
         Ok(serde_json::json!({"count":count,"newest":newest,"file":QUARANTINE_FILE}))
     }
-    /// Pull request runs whose current state the forge has not been told, oldest first.
-    fn unreported(&self, limit: usize) -> Result<Vec<(PendingDispatch, String)>> {
+    /// Pull request runs whose state changed since it was last reported, or whose post failed
+    /// and is not given up. Runs that never failed come first, so failing posts cannot starve
+    /// new heads.
+    fn unreported(&self, limit: usize) -> Result<Vec<PendingDispatch>> {
         let mut stmt = self.db.prepare(
-            "SELECT d.body,d.state FROM pipeline_dispatches d LEFT JOIN pipeline_reports r ON r.dispatch_id=d.dispatch_id
+            "SELECT d.body FROM pipeline_dispatches d LEFT JOIN pipeline_reports r ON r.dispatch_id=d.dispatch_id
              WHERE instr(CAST(d.event_key AS BLOB),CAST(?1 AS BLOB))>0
-               AND (r.dispatch_id IS NULL OR r.posted=0 OR r.state<>CASE d.state WHEN 'complete' THEN 'success' WHEN 'blocked' THEN 'failure' ELSE 'pending' END)
-             ORDER BY d.rowid LIMIT ?2",
+               AND (r.dispatch_id IS NULL OR r.run_state<>d.state OR (r.posted=0 AND r.gave_up=0))
+             ORDER BY coalesce(r.attempts,0)>0, d.rowid LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(params!["\0pull_request\0", limit as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                r.get::<_, String>(0)
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(body, state)| Ok((serde_json::from_str(&body)?, state)))
+            .map(|body| Ok(serde_json::from_str(&body)?))
             .collect()
     }
-    fn record_report(&mut self, dispatch_id: &str, state: &str, error: Option<&str>) -> Result<()> {
-        let error = error.map(|e| e.chars().take(MAX_REPORT_ERROR).collect::<String>());
+    /// Every run of `rule_id` on head `commit`, under any pull request, base or labels.
+    fn runs_on_commit(&self, rule_id: &str, commit: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT dispatch_id,state FROM pipeline_dispatches WHERE rule_id=?1 AND instr(CAST(event_key AS BLOB),CAST(?2 AS BLOB))>0 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![rule_id, format!("\0{commit}\0pull_request\0")],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+    fn record_report(
+        &mut self,
+        dispatch_id: &str,
+        run_state: &str,
+        state: &str,
+        error: Option<&str>,
+        permanent: bool,
+    ) -> Result<()> {
+        // Bytes, cut on a character boundary: the same measure `validate_recovery` uses.
+        let error = error.map(|e| {
+            let mut end = e.len().min(MAX_REPORT_ERROR);
+            while !e.is_char_boundary(end) {
+                end -= 1;
+            }
+            e[..end].to_owned()
+        });
+        // A new failure, or a changed run state, starts counting attempts again.
         self.db.execute(
-            "INSERT INTO pipeline_reports(dispatch_id,state,posted,attempts,error) VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(dispatch_id) DO UPDATE SET state=excluded.state,posted=excluded.posted,
-               attempts=CASE WHEN excluded.posted=1 THEN 0 ELSE pipeline_reports.attempts+1 END,error=excluded.error",
+            "INSERT INTO pipeline_reports(dispatch_id,run_state,state,posted,attempts,gave_up,error) VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(dispatch_id) DO UPDATE SET
+               attempts=CASE WHEN excluded.posted=1 THEN 0
+                 WHEN pipeline_reports.run_state<>excluded.run_state THEN 1
+                 ELSE pipeline_reports.attempts+1 END,
+               gave_up=CASE WHEN excluded.posted=1 THEN 0
+                 WHEN pipeline_reports.run_state<>excluded.run_state THEN excluded.gave_up
+                 ELSE (?8 AND pipeline_reports.attempts+1>=?9) END,
+               run_state=excluded.run_state,state=excluded.state,posted=excluded.posted,error=excluded.error",
             params![
                 dispatch_id,
+                run_state,
                 state,
                 error.is_none(),
                 i64::from(error.is_some()),
-                error
+                permanent && MAX_PERMANENT_ATTEMPTS <= 1,
+                error,
+                permanent,
+                MAX_PERMANENT_ATTEMPTS,
             ],
         )?;
         Ok(())
     }
-    /// Pull request runs whose latest state could not be posted yet, newest first.
+    /// Pull request runs whose latest state is not posted, newest first. `gave_up` marks an
+    /// answer that cannot change, no longer retried until the run's state changes.
     pub fn report_failures(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
-        let mut stmt = self.db.prepare("SELECT dispatch_id,state,attempts,error FROM pipeline_reports WHERE posted=0 ORDER BY rowid DESC LIMIT ?1")?;
+        let mut stmt = self.db.prepare("SELECT dispatch_id,state,attempts,gave_up,error FROM pipeline_reports WHERE posted=0 ORDER BY rowid DESC LIMIT ?1")?;
         let rows = stmt
             .query_map([limit.min(256) as i64], |r| {
                 Ok(serde_json::json!({
                     "dispatch_id": r.get::<_, String>(0)?,
                     "state": r.get::<_, String>(1)?,
                     "attempts": r.get::<_, i64>(2)?,
-                    "error": r.get::<_, Option<String>>(3)?,
+                    "gave_up": r.get::<_, bool>(3)?,
+                    "error": r.get::<_, Option<String>>(4)?,
                 }))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

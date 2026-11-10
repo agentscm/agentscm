@@ -368,8 +368,11 @@ async fn observe(
         )?
     };
     // Statuses go out after observation, so a run accepted now shows pending at once.
-    observed["reports"] =
-        json!(pipeline_rules::report_results(api, &token, &config.repository(), journal).await?);
+    // Observation has already committed; a reporting failure must not hide its output.
+    match pipeline_rules::report_results(api, &token, &config.repository(), journal).await {
+        Ok(reports) => observed["reports"] = json!(reports),
+        Err(error) => observed["reports_error"] = json!(error.to_string()),
+    }
     Ok(observed)
 }
 
