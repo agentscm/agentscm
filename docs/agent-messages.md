@@ -35,9 +35,9 @@ The Hub records three facts per session, in memory, from the session's own calls
 - the hook the session reports through (`hook:claude`, `hook:codex`, `hook:cursor`, `hook:copilot`, `hook:gemini`, `hook:generic`);
 - the agent token's label.
 
-After a Hub restart these facts are lost: a session's tier reads `unknown` until its next hook call.
+After a Hub restart these facts are lost: a session's tier reads `unknown` until its next hook call or AgentSCM tool call. Until a hooked session's next hook call, its next AgentSCM tool call can carry a message instead.
 
-Only the session a person leads is offered a message, never a subagent's. The evidence is a start, prompt or checked tool hook call from that session that carries no subagent marker (Claude Code's `agent_id`, Copilot's `agentId`). An MCP call is no evidence: a subagent makes its AgentSCM calls with its parent's session. So a client with only MCP and no hooks is never offered a message.
+A session is offered a message once it has shown itself in one of two ways. One is a start, prompt or checked tool hook call that carries no subagent marker (Claude Code's `agent_id`, Copilot's `agentId`). The other is an AgentSCM MCP tool call that names the session's `session`. A session whose hook carries context takes its messages only in its hook replies, where a subagent's call is told apart, never in an MCP result. An MCP call cannot say whether a subagent made it, because a subagent makes its AgentSCM calls with its parent's session. So a message delivered in an MCP result tells a subagent to leave it for the session that started it, and one left unanswered is offered again at a later call.
 
 From these facts the Hub derives the tier it can use:
 
@@ -45,8 +45,8 @@ From these facts the Hub derives the tier it can use:
 | --- | --- | --- |
 | `wake` | Claude Code with the AgentSCM plugin, while its background hook waits (seen within the last 90 seconds). | Within seconds, idle or busy: the hook wakes the session with the notice. |
 | `hook` | Claude Code and Codex (the reply to `UserPromptSubmit` and to a checked `PreToolUse`, as `hookSpecificOutput.additionalContext`). Cursor (a checked edit's `additional_context`). Copilot's PascalCase hooks. | At the next prompt or checked tool call that is not a subagent's. No tool call is needed. |
-| `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). | At the session's next AgentSCM tool call, as an extra text block in the result. |
-| `unknown` | No top-level hook call seen since the Hub started, including every MCP-only client (Antigravity, Devin, Amp, opencode). | Use copy and paste from the Hub page. |
+| `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). Every client with MCP and no hooks: Codex without its hooks, Antigravity, Devin, Amp, opencode. | At the session's next AgentSCM tool call, as an extra text block in the result. Never sooner: no host but Claude Code puts a server's push in front of the model (see [Other clients](#other-clients)). |
+| `unknown` | Nothing from the session itself since the Hub started, only its subagents' hook calls. | Nothing is offered until the session calls; use copy and paste from the Hub page meanwhile. |
 
 The tier follows the client, not the first call: a Claude Code session takes its messages in its hook replies even before its first prompt, never in an MCP result.
 
@@ -55,14 +55,14 @@ These client hooks use the `mcp` tier:
 - Copilot CLI's `preToolUse` has no context field.
 - Gemini CLI shows the hook's text to the person, not to the model.
 
-In the `mcp` tier the session is known to be a top-level one, but a single MCP call still cannot say whether a subagent made it, so the notice tells a subagent to leave the message for the session that started it.
+In the `mcp` tier a single MCP call cannot say whether a subagent made it, so the notice tells a subagent to leave the message for the session that started it.
 
 A refused edit's reply carries only the refusal, so a queued message waits for the next call. The start context is cut to fit the host's limit, so the Hub does not deliver a message there either. Each reply carries at most three messages.
 
 A message is never delivered:
 
-- to a subagent: hook calls from a subagent are skipped, and a session whose hook carries context takes its messages only there;
-- to a session without top-level evidence (tier `unknown`);
+- to a subagent's hook call: those are skipped, and a session whose hook carries context takes its messages only in its own hook replies (a subagent of a client without such a hook can receive one in an MCP result; its notice tells it to leave it);
+- to a session the Hub has heard nothing from itself since it started (tier `unknown`);
 - by an MCP call that names no `session`;
 - in a hook reply whose outcome is unknown, because that reply's text may be dropped.
 
@@ -84,7 +84,7 @@ The Claude Code plugin that `agentscm client setup` installs adds a background h
 
 What this does not cover:
 
-- **Other hosts.** Only Claude Code has the background hook. Codex, Cursor, Copilot, Gemini CLI and MCP-only clients still get a message at their next call, as in the tiers above.
+- **Other hosts.** Only Claude Code has the background hook. Codex, Cursor, Copilot, Gemini CLI and MCP-only clients still get a message at their next hook or AgentSCM tool call, as in the tiers above.
 - **Sessions started before this change.** A session reads its plugin's hooks when it starts, so a session that was already running when the client was updated has no waiter until it restarts.
 - **Windows.** The waiter exits at once on Windows, because it cannot tell there when its session has ended. A Windows session gets its messages at its next hook or tool call.
 - **Requests in another repository, the cases not covered.** A session is woken for Work it leads in another repository only when both repositories are on the same Hub and the person's token for the other one is live and can write. The Hub reads the person's eight newest such tokens. A token that was replaced after the Work started is no longer read, so that Work's request waits for the session's next call in its repository. A session the Hub knows only by the shared name `default` is not looked up under other tokens, and two clients of one person that report the same session name can get each other's notice. In each case the lead's person is asked after 10 minutes as above.
@@ -94,10 +94,22 @@ What this does not cover:
 
 ### Other clients
 
-- **Claude Code channels** (`notifications/claude/channel`) are a research preview behind `--dangerously-load-development-channels` for servers off the allowlist, and are not used.
-- **Codex** documents `codex app-server` (`turn/steer`, `thread/inject_items`) for a session that the app server itself runs. It does not document attaching to a terminal session that is already running.
-- **Cursor** documents steering only for its cloud agents.
-- **Copilot CLI** documents `copilot --acp` for sessions that the ACP client creates.
+MCP has server-to-client messages, but a host decides what reaches the model. Read in each host's own documentation or source on 2026-11-10, only Claude Code channels put a server's push in front of the model and can start a turn:
+
+| Host | What reaches the model | Wakes an idle session | What only the person sees |
+| --- | --- | --- | --- |
+| Claude Code | [Channels](https://code.claude.com/docs/en/channels-reference) (`notifications/claude/channel`): a research preview, opted in per session with `--channels` or `--dangerously-load-development-channels`, stdio servers only, off by default on Team and Enterprise | Yes, as documented; events sent while busy join the next turn | Elicitation dialogs; `list_changed` refreshes lists |
+| Codex CLI | Nothing: [its MCP client](https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/logging_client_handler.rs) logs `notifications/message` and `resources/updated` | No | Elicitation |
+| Codex `app-server` | Not MCP: a client that runs the thread can `turn/start` or `thread/inject_items` ([app-server](https://learn.chatgpt.com/docs/app-server)) | Only for that client, not a terminal session already running | Its own notifications |
+| Cursor | Nothing documented ([MCP](https://cursor.com/docs/context/mcp)) | No | Elicitation |
+| VS Code with Copilot | Nothing documented ([MCP](https://code.visualstudio.com/api/extension-guides/ai/mcp)) | No | Elicitation, sampling prompts, the output channel |
+| Copilot CLI | Nothing documented; `copilot --acp` is for sessions the ACP client creates ([ACP](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)) | No | Sampling and elicitation prompts |
+| Gemini CLI | Nothing: [its MCP client](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/tools/mcp-client.ts) only re-reads lists on `list_changed` | No | Progress |
+| Zed | Nothing ([MCP](https://zed.dev/docs/ai/mcp)) | No | None |
+
+The Claude Code background hook already wakes a Claude Code session (tier `wake`), so the Hub sends no MCP push: every other client gets a message at its next AgentSCM tool call, and nothing here or on the Hub page says it is instant. The 2026-07-28 MCP revision also moves sampling and elicitation inside a tool call, so neither can start one.
+
+A push would need the local proxy (`agentscm client mcp`) to hold a stream from the Hub for the whole host session: the `GET` event stream with its `Mcp-Session-Id` under the 2025-11-25 transport, or a `subscriptions/listen` response stream under 2026-07-28. It would write each notification to the host on standard output. The Hub's MCP endpoint is stateless today and serves neither stream.
 
 ### Manual path
 

@@ -1633,9 +1633,9 @@ async fn call(
     }
     // What the session's own person sent it from the Hub page rides on its next tool call. Only a
     // call naming its own session takes it: without one the Hub would guess the token's recent hook
-    // session. An MCP call cannot say whether a subagent made it, so it takes messages only for a
-    // session a top-level hook call has shown and whose hook cannot carry them; a hook that can
-    // takes them itself, where subagents are excluded.
+    // session. A session whose hook carries context takes them there, where subagents are
+    // excluded; any other session takes them here. An MCP call cannot say whether a subagent made
+    // it, so the notice tells a subagent to leave the message for the session that started it.
     if !principal.read_only
         && let Some(requested) = params
             .and_then(|p| p["arguments"]["session"].as_str())
