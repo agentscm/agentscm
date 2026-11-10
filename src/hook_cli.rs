@@ -15,6 +15,8 @@ use crate::hub_cli::config_dir;
 use crate::intent_cli::{HubFile, parse_hub_file, repo_root, token_for, valid_repo};
 use crate::{client_config, client_config::Connection};
 
+mod permission;
+
 const LIMIT: Duration = Duration::from_secs(3);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
 const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
@@ -213,6 +215,11 @@ async fn hook(
     if let Some(recording) = host_session {
         let remaining = budget.saturating_duration_since(Instant::now());
         let _ = tokio::time::timeout(remaining, recording).await;
+    }
+    // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
+    // decision there. Any failure returns `reply`, which carries no decision.
+    if permission::applies(agent, client_connection, &payload) {
+        return permission::await_answer(&payload, started, reply).await;
     }
     reply
 }
