@@ -4361,6 +4361,7 @@ fn start_in(
                 if !named {
                     return Err(HubError::lease_lapsed(lapsed_unheld_text(
                         &item.id,
+                        item.generation,
                         renewed,
                         expired,
                         Unheld::UnnamedStart,
@@ -5789,6 +5790,7 @@ fn guard_managed_touch(
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
         return Err(HubError::lease_lapsed(lapsed_unheld_text(
             &eligible[0].id,
+            eligible[0].generation,
             renewed,
             expired,
             Unheld::Edit,
@@ -10619,7 +10621,7 @@ impl Store for PgStore {
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {
-                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
+                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id,item.generation, renewed, expired, Unheld::Retain)));
             }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;

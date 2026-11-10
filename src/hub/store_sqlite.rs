@@ -4506,6 +4506,7 @@ fn start_in(
                 if !named {
                     return Err(HubError::lease_lapsed(lapsed_unheld_text(
                         &item.id,
+                        item.generation,
                         renewed,
                         expired,
                         Unheld::UnnamedStart,
@@ -5948,6 +5949,7 @@ fn guard_managed_touch(
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
         return Err(HubError::lease_lapsed(lapsed_unheld_text(
             &eligible[0].id,
+            eligible[0].generation,
             renewed,
             expired,
             Unheld::Edit,
@@ -10687,6 +10689,7 @@ impl Store for SqliteStore {
         {
             return Err(HubError::lease_lapsed(lapsed_unheld_text(
                 &item.id,
+                item.generation,
                 renewed,
                 expired,
                 Unheld::Retain,
