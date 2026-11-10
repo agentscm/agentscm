@@ -407,7 +407,12 @@ fn route(
 /// linked worktree's own. The record is only a hint: the connection must still be saved, in the
 /// same Hub and repository, and current for its checkout, or the default serves the call.
 fn session_connection(default: &Connection, session: &str) -> Option<(Connection, PathBuf)> {
-    let root = client_session::route_of(&crate::hub_cli::config_dir().ok()?, session)?;
+    let root = client_session::route_of(
+        &crate::hub_cli::config_dir().ok()?,
+        session,
+        &default.hub,
+        &default.repo,
+    )?;
     if root == default.root {
         return None;
     }
@@ -548,8 +553,15 @@ impl Client {
         } else {
             self.session()
         };
+        // A call that names a checkout of its own is sent there, whatever the session recorded.
+        let explicit = arguments.get(ROOT).is_some_and(|root| !root.is_null())
+            || arguments
+                .get("worktree")
+                .and_then(Value::as_str)
+                .is_some_and(|worktree| Path::new(worktree).is_absolute());
         let mut target = route(&mut arguments, &self.start, default)?;
         if target.is_none()
+            && !explicit
             && let (Some(default), Some(session)) = (default, &session)
         {
             target = session_connection(default, session);
@@ -1329,7 +1341,11 @@ mod tests {
             );
             // The hook's record sends the session's calls through the worktree's connection,
             // and only that session's.
-            client_session::record_route(config, "native-1", &linked).unwrap();
+            let record = |root: &Path, repo: &str| {
+                client_session::record_route(config, "native-1", "https://hub.example", repo, root)
+                    .unwrap()
+            };
+            record(&linked, "acme/widgets");
             let (target, forwarded) = call(json!({"task": "t", "session": "native-1"})).unwrap();
             assert_eq!(target, here);
             assert_eq!(forwarded, json!({"task": "t", "session": "native-1"}));
@@ -1344,10 +1360,31 @@ mod tests {
                     .0,
                 here
             );
+            // An explicit root or worktree is honoured: the session's record never overrides it.
+            record(&linked, "acme/widgets");
+            for key in ["root", "worktree"] {
+                let (target, forwarded) =
+                    call(json!({"task": "t", "session": "native-1", key: main.to_str().unwrap()}))
+                        .unwrap();
+                assert_eq!(target, None, "{key}");
+                assert_eq!(forwarded["session"], "native-1");
+            }
+            // A route recorded for another repository is not this repository's.
+            record(&linked, "acme/gadgets");
+            record(&main, "acme/widgets");
+            assert_eq!(
+                call(json!({"task": "t", "session": "native-1"})).unwrap().0,
+                None
+            );
+            record(&linked, "acme/widgets");
+            assert_eq!(
+                call(json!({"task": "t", "session": "native-1"})).unwrap().0,
+                here
+            );
             // A record naming the default's own root, another repository, or a connection that
             // is not saved is ignored.
             for root in [main.clone(), other.clone(), main.join("missing")] {
-                client_session::record_route(config, "native-1", &root).unwrap();
+                record(&root, "acme/widgets");
                 assert_eq!(
                     call(json!({"task": "t", "session": "native-1"})).unwrap().0,
                     None,

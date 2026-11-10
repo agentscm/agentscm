@@ -83,7 +83,9 @@ still writes the agents' checkout files in the worktree and records the agents o
 checkout's connection. Pass `--own-connection` to give the worktree a connection of its own
 instead; that connection has its own agent token, so an agent in the worktree may then appear
 as a second agent. A `--token-file` that differs from the main checkout's token is refused
-unless `--own-connection` is also passed.
+unless `--own-connection` is also passed. With `--own-connection` and no `--hub`, the worktree
+keeps its main checkout's Hub. `client remove` in such a worktree removes the agents' files it
+holds and leaves the main checkout's connection and token alone.
 
 On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
 there is no separate app install. Start at Login is off until the member enables it in the menu.

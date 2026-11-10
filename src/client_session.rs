@@ -190,27 +190,49 @@ fn routes(config: &Path) -> PathBuf {
 /// How long a route record that no hook rewrote survives a later write.
 const ROUTE_KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
 
-/// The root of the connection `session`'s hooks route to, if one is recorded. The record is
-/// data a hook wrote, so the caller checks it against the saved connections.
-pub(crate) fn route_of(config: &Path, session: &str) -> Option<PathBuf> {
+/// The file-name part for `session`'s route in one repository.
+fn route_tag(session: &str, hub: &str, repo: &str) -> String {
+    tag(&format!("{session}\0{hub}\0{repo}"))
+}
+
+/// The text of one route record, when it is readable.
+fn route_record(file: &Path) -> Option<Value> {
     use std::io::Read;
     let mut text = String::new();
-    std::fs::File::open(routes(config).join(tag(session)))
+    std::fs::File::open(file)
         .ok()?
         .take(RECORD_BYTES)
         .read_to_string(&mut text)
         .ok()?;
-    let record: Value = serde_json::from_str(&text).ok()?;
-    let root = PathBuf::from(record["root"].as_str()?);
-    (record["session"].as_str()? == session && root.is_absolute()).then_some(root)
+    serde_json::from_str(&text).ok()
 }
 
-/// Records that `session`'s hooks route to the connection at `root`, so the MCP server names
-/// the same agent. Only the root is stored, never a token path. Nothing is written when the
-/// record already says so; a write also drops the oldest records beyond the bound.
-pub(crate) fn record_route(config: &Path, session: &str, root: &Path) -> std::io::Result<()> {
+/// The root of the connection `session`'s hooks route to in `hub`'s `repo`, if one is
+/// recorded. The record is data a hook wrote, so the caller checks it against the saved
+/// connections.
+pub(crate) fn route_of(config: &Path, session: &str, hub: &str, repo: &str) -> Option<PathBuf> {
+    let record = route_record(&routes(config).join(route_tag(session, hub, repo)))?;
+    let root = PathBuf::from(record["root"].as_str()?);
+    (record["session"].as_str()? == session
+        && record["hub"].as_str()? == hub
+        && record["repo"].as_str()? == repo
+        && root.is_absolute())
+    .then_some(root)
+}
+
+/// Records that `session`'s hooks route to the connection at `root` for `hub`'s `repo`, so the
+/// MCP server names the same agent. Only the root is stored, never a token path. Nothing is
+/// written when the record already says so; a write also drops the oldest records beyond the
+/// bound.
+pub(crate) fn record_route(
+    config: &Path,
+    session: &str,
+    hub: &str,
+    repo: &str,
+    root: &Path,
+) -> std::io::Result<()> {
     use std::io::Write;
-    if route_of(config, session).as_deref() == Some(root) {
+    if route_of(config, session, hub, repo).as_deref() == Some(root) {
         return Ok(());
     }
     let directory = routes(config);
@@ -220,9 +242,9 @@ pub(crate) fn record_route(config: &Path, session: &str, root: &Path) -> std::io
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&directory)?;
     let mut file = tempfile::NamedTempFile::new_in(&directory)?;
-    let record = json!({"session": session, "root": root});
+    let record = json!({"session": session, "hub": hub, "repo": repo, "root": root});
     file.write_all(record.to_string().as_bytes())?;
-    file.persist(directory.join(tag(session)))?;
+    file.persist(directory.join(route_tag(session, hub, repo)))?;
     let mut kept: Vec<_> = std::fs::read_dir(&directory)?
         .flatten()
         .filter_map(|entry| {
@@ -241,9 +263,19 @@ pub(crate) fn record_route(config: &Path, session: &str, root: &Path) -> std::io
     Ok(())
 }
 
-/// Drops `session` from every host, when its conversation ends.
+/// Drops `session` from every host, and every repository's route, when its conversation ends.
 pub(crate) fn forget(config: &Path, session: &str) {
-    let _ = std::fs::remove_file(routes(config).join(tag(session)));
+    for entry in std::fs::read_dir(routes(config))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .take(MAX_RECORDS)
+    {
+        let file = entry.path();
+        if route_record(&file).is_some_and(|record| record["session"].as_str() == Some(session)) {
+            let _ = std::fs::remove_file(file);
+        }
+    }
     for record in records(&directory(config)) {
         if record.session == session {
             let _ = std::fs::remove_file(record.file);
@@ -337,32 +369,55 @@ mod tests {
     fn a_session_route_is_written_once_read_back_and_forgotten() {
         let config = tempfile::tempdir().unwrap();
         let (one, two) = (Path::new("/work/one"), Path::new("/work/two"));
-        assert_eq!(route_of(config.path(), "native-1"), None);
-        record_route(config.path(), "native-1", one).unwrap();
-        assert_eq!(route_of(config.path(), "native-1").as_deref(), Some(one));
-        assert_eq!(route_of(config.path(), "native-2"), None);
+        let get = |session: &str| route_of(config.path(), session, "https://hub", "o/r");
+        assert_eq!(get("native-1"), None);
+        record_route(config.path(), "native-1", "https://hub", "o/r", one).unwrap();
+        assert_eq!(get("native-1").as_deref(), Some(one));
+        assert_eq!(get("native-2"), None);
 
         // The same root is a no-op: the file is not replaced.
-        let file = routes(config.path()).join(tag("native-1"));
+        let file = routes(config.path()).join(route_tag("native-1", "https://hub", "o/r"));
         let before = std::fs::metadata(&file).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        record_route(config.path(), "native-1", one).unwrap();
+        record_route(config.path(), "native-1", "https://hub", "o/r", one).unwrap();
         assert_eq!(
             std::fs::metadata(&file).unwrap().modified().unwrap(),
             before
         );
-        record_route(config.path(), "native-1", two).unwrap();
-        assert_eq!(route_of(config.path(), "native-1").as_deref(), Some(two));
+        record_route(config.path(), "native-1", "https://hub", "o/r", two).unwrap();
+        assert_eq!(get("native-1").as_deref(), Some(two));
 
-        // A record that names another session, or a relative root, is not a route.
-        std::fs::write(&file, r#"{"session":"other","root":"/work/one"}"#).unwrap();
-        assert_eq!(route_of(config.path(), "native-1"), None);
-        std::fs::write(&file, r#"{"session":"native-1","root":"one"}"#).unwrap();
-        assert_eq!(route_of(config.path(), "native-1"), None);
+        // A record that names another session, hub or repository, or a relative root, is not
+        // a route.
+        for text in [
+            r#"{"session":"other","hub":"https://hub","repo":"o/r","root":"/work/one"}"#,
+            r#"{"session":"native-1","hub":"https://other","repo":"o/r","root":"/work/one"}"#,
+            r#"{"session":"native-1","hub":"https://hub","repo":"o/x","root":"/work/one"}"#,
+            r#"{"session":"native-1","hub":"https://hub","repo":"o/r","root":"one"}"#,
+        ] {
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(get("native-1"), None);
+        }
 
-        record_route(config.path(), "native-1", one).unwrap();
+        record_route(config.path(), "native-1", "https://hub", "o/r", one).unwrap();
         forget(config.path(), "native-1");
-        assert_eq!(route_of(config.path(), "native-1"), None);
+        assert_eq!(get("native-1"), None);
+    }
+
+    #[test]
+    fn a_session_keeps_one_route_per_repository_and_forgets_them_all() {
+        let config = tempfile::tempdir().unwrap();
+        let (one, two) = (Path::new("/work/one"), Path::new("/work/two"));
+        record_route(config.path(), "s", "https://hub", "o/a", one).unwrap();
+        record_route(config.path(), "s", "https://hub", "o/b", two).unwrap();
+        record_route(config.path(), "t", "https://hub", "o/a", two).unwrap();
+        let get = |session: &str, repo: &str| route_of(config.path(), session, "https://hub", repo);
+        assert_eq!(get("s", "o/a").as_deref(), Some(one));
+        assert_eq!(get("s", "o/b").as_deref(), Some(two));
+        forget(config.path(), "s");
+        assert_eq!(get("s", "o/a"), None);
+        assert_eq!(get("s", "o/b"), None);
+        assert_eq!(get("t", "o/a").as_deref(), Some(two));
     }
 
     #[test]
@@ -370,11 +425,26 @@ mod tests {
         let config = tempfile::tempdir().unwrap();
         let root = Path::new("/work/one");
         for index in 0..=MAX_RECORDS {
-            record_route(config.path(), &format!("s{index}"), root).unwrap();
+            record_route(
+                config.path(),
+                &format!("s{index}"),
+                "https://hub",
+                "o/r",
+                root,
+            )
+            .unwrap();
         }
         let count = std::fs::read_dir(routes(config.path())).unwrap().count();
         assert_eq!(count, MAX_RECORDS);
-        assert!(route_of(config.path(), &format!("s{MAX_RECORDS}")).is_some());
+        assert!(
+            route_of(
+                config.path(),
+                &format!("s{MAX_RECORDS}"),
+                "https://hub",
+                "o/r"
+            )
+            .is_some()
+        );
     }
 
     #[cfg(unix)]

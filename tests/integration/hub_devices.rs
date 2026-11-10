@@ -1110,6 +1110,15 @@ impl Machine {
 
     /// One SessionStart hook whose working directory is `cwd`.
     fn session_start_in(&self, cwd: &std::path::Path, session: &str) -> Value {
+        self.hook_in(
+            cwd,
+            session,
+            json!({"hook_event_name": "SessionStart", "source": "startup"}),
+        )
+    }
+
+    /// One hook event, `event` plus the session and `cwd`; returns the hook's JSON reply.
+    fn hook_in(&self, cwd: &std::path::Path, session: &str, event: Value) -> Value {
         use std::io::Write;
         let mut child = self
             .command(&["--no-telemetry", "hook", "claude", "--client-connection"])
@@ -1117,8 +1126,9 @@ impl Machine {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let payload = json!({"hook_event_name": "SessionStart", "session_id": session,
-            "cwd": cwd, "source": "startup"});
+        let mut payload = event;
+        payload["session_id"] = json!(session);
+        payload["cwd"] = json!(cwd);
         child
             .stdin
             .take()
@@ -1638,6 +1648,19 @@ async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_a
         lead("Work in the main checkout"),
     );
     assert_ne!(worktree_agent, main_agent, "{current:?}");
+    // Not asserted: the Work's lead is a Hub-side agent name, and no hook here declares Work
+    // that could be compared with it, so the two agents are told apart by name only.
+
+    // Ending the session drops its route record, and the hook does not write it back.
+    let routes = machine.config.path().join("agentscm/session-routes");
+    let recorded = || std::fs::read_dir(&routes).map_or(0, Iterator::count);
+    assert_eq!(recorded(), 1);
+    machine.hook_in(
+        &linked,
+        "native-1",
+        json!({"hook_event_name": "SessionEnd"}),
+    );
+    assert_eq!(recorded(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
