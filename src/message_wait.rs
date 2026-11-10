@@ -16,6 +16,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use agentscm::hub::agent_messages::{FRAME, WAIT_SECS};
+use agentscm::hub::reply;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -74,7 +75,8 @@ async fn waited() -> Option<String> {
         .take(STDIN_BYTES)
         .read_to_string(&mut input)
         .ok()?;
-    let payload: Value = serde_json::from_str(&input).ok()?;
+    // The host's hook input, not a Hub reply.
+    let payload: Value = input.parse().ok()?;
     let session = session_of(&payload)?;
     let cwd = Path::new(payload["cwd"].as_str()?);
     let connections = client_config::load().ok()?;
@@ -104,6 +106,12 @@ async fn waited() -> Option<String> {
     request
         .until(MAX_LIFE, || parent() == started, Duration::from_secs(5))
         .await
+}
+
+/// The Hub's answer when a message came.
+#[derive(serde::Deserialize)]
+struct Notice {
+    text: String,
 }
 
 struct Wait<'a> {
@@ -140,9 +148,9 @@ impl Wait<'_> {
                 .send()
                 .await;
             match sent.map(|reply| (reply.status().as_u16(), reply)) {
-                Ok((200, reply)) => {
-                    let reply: Value = serde_json::from_slice(&reply.bytes().await.ok()?).ok()?;
-                    return reply["text"].as_str().map(str::to_owned);
+                Ok((200, answer)) => {
+                    let bytes = answer.bytes().await.ok()?;
+                    return reply::decode_slice::<Notice>(&bytes).ok().map(|n| n.text);
                 }
                 // Nothing came in this request: ask again at once.
                 Ok((204, _)) => {
