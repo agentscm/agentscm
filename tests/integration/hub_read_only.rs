@@ -76,6 +76,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/why?path=../x".into(), "".into(), Status(400));
     row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
+    row(&get, format!("{REPO}/after-merge"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity?before=5"), "".into(), Allowed);
     for tool in ["agentscm_work_search", "agentscm_publications_list", "agentscm_workflow_runs_list"] {
         row(&post, "/mcp".into(), format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"q":"x"}}}}}}"#), Allowed);

@@ -509,6 +509,7 @@ pub fn router(state: HubState) -> Router {
         .merge(continuity::routes())
         .merge(promise_http::routes())
         .merge(skills::routes())
+        .merge(external_runs::routes())
         .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())

@@ -508,6 +508,15 @@ read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind
 These outcomes are separate from source approval and from `forge_check`. See
 [external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes).
 
+`GET /v1/hub/repos/{repo}/after-merge` (agent or read-only bearer token for that repository;
+another repository is 404) says whether the Hub watches that repository after a merge:
+`{"repository", "provider", "connected", "supported", "watched", "opt_in"}`. It decides as the
+watcher does, from the repository the Hub has connected (looked up by the token's repository id)
+and that repository's current name: `connected` says the Hub has a connection for it,
+`supported` is true only when that connection is GitHub, and `watched` only when it is also
+listed in `opt_in`, which is `AGENTSCM_GITHUB_EXTERNAL_RUNS`. A listed repository the Hub is not
+connected to is not watched, and `provider` is then the token owner's.
+
 ## Hub: requests and replies across versions
 
 The Hub and the programs that call it are upgraded separately: the `agentscm` commands, the menu bar app, and the hook and MCP clients on each computer. Either side can be the older one. Two rules keep them working together.
@@ -675,7 +684,6 @@ Registered codes:
 | `owner_disabled` | 409 | no | `ask_owner` |
 | `owner_wrong_forge` | 409 | no | `provide_field` |
 | `repository_renamed` | 409 | no | `inspect_work` |
-
 
 ## HTTP boundaries
 
