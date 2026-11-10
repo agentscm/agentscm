@@ -350,6 +350,8 @@ pub struct FakeState {
     pub users: HashMap<String, (String, i64, BTreeSet<i64>)>,
     /// The first entry whose `path_contains` matches a request is consumed and answered.
     pub fail: VecDeque<Failure>,
+    /// Repository permission by login, for `collaborators/{login}/permission`; others are 404.
+    pub collaborator_permissions: HashMap<String, String>,
     /// Answer the actions and deployments lists with 200 and an empty object, no array.
     pub arrayless_external_lists: bool,
     /// Answer every GET whose path contains this with 200 and an empty object, no array.
@@ -1461,8 +1463,19 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .get(&(id, sha.to_string()))
                         .cloned()
                         .unwrap_or_default();
+                    let total = rows.len();
                     let (page, link) = paginate(ctx, uri, &query, rows);
-                    reply(200, &link, Some(json!({"check_runs":page})))
+                    reply(
+                        200,
+                        &link,
+                        Some(json!({"total_count": total, "check_runs": page})),
+                    )
+                }
+                (&Method::GET, ["collaborators", login, "permission"]) => {
+                    match state.collaborator_permissions.get(*login) {
+                        Some(permission) => json_reply(200, json!({"permission": permission})),
+                        None => not_found(),
+                    }
                 }
                 (&Method::GET, ["commits", sha, "status"]) => {
                     let repo = &state.repos[&id];

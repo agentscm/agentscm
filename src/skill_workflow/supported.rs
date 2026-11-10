@@ -1211,6 +1211,24 @@ pub fn merge_gate_index(manifest: &SupportedManifest) -> Option<usize> {
         .position(|g| g.evidence.iter().any(|s| s.kind() == EvidenceKind::Merged))
 }
 
+/// Whether `gate` has observed evidence on `head` that its own rule accepts: green CI without
+/// a required label does not count, whatever a report says about the label.
+pub fn observed_on(
+    gate: &GateDefinition,
+    evidence: &[StoredEvidence],
+    head: &str,
+    params: &Params,
+) -> bool {
+    evidence.iter().any(|e| {
+        e.evidence.gate == gate.id
+            && e.evidence.assurance == Assurance::Observed
+            && e.evidence.head_sha == head
+            && gate.evidence.iter().any(|s| {
+                s.kind() == e.evidence.kind && s.accepts(e.evidence.detail.as_ref(), params)
+            })
+    })
+}
+
 /// Kinds the hub records from the forge itself.
 pub fn forge_observable(kind: EvidenceKind) -> bool {
     matches!(
@@ -1224,7 +1242,8 @@ fn merge_check(
     identity: &RunIdentity,
     evidence: &[StoredEvidence],
 ) -> Option<MergeCheck> {
-    let at = evidence.iter().position(|e| {
+    // The latest merge: a branch name reused after a merge is judged by its newest pull request.
+    let at = evidence.iter().rposition(|e| {
         e.evidence.kind == EvidenceKind::Merged && e.evidence.assurance == Assurance::Observed
     })?;
     let merged_head = evidence[at].evidence.head_sha.clone();
@@ -1238,12 +1257,7 @@ fn merge_check(
             skipped.push(gate.id.clone());
         }
         let observable = gate.evidence.iter().any(|s| forge_observable(s.kind()));
-        let observed = before.iter().any(|e| {
-            e.evidence.gate == gate.id
-                && e.evidence.assurance == Assurance::Observed
-                && e.evidence.head_sha == merged_head
-        });
-        if observable && !observed {
+        if observable && !observed_on(gate, before, &merged_head, &identity.params) {
             unobserved.push(gate.id.clone());
         }
     }
@@ -2083,6 +2097,37 @@ mod tests {
             (A, B)
         );
         assert!(check.skipped_any());
+    }
+
+    #[test]
+    fn the_latest_observed_merge_is_judged_and_unlabelled_ci_is_unobserved() {
+        let mut m = manifest();
+        let mut params = m.effective_params(None).unwrap();
+        params.insert("ci_label".into(), "ci-extended".into());
+        let identity = RunIdentity { params, ..ident() };
+        // A branch reused after a merge: the newer pull request's merge is the one judged.
+        let reused = evaluate(
+            &m,
+            &identity,
+            &[
+                observed("merge", EvidenceKind::Merged, A),
+                tests(B),
+                observed("merge", EvidenceKind::Merged, B),
+            ],
+        );
+        assert_eq!(reused.merge_check.as_ref().unwrap().merged_head, B);
+        // Observed green CI without the required label is not the observed fact the gate needs.
+        let v = evaluate(
+            &m,
+            &identity,
+            &[
+                observed("ci", EvidenceKind::HostedCi, A),
+                observed("merge", EvidenceKind::Merged, A),
+            ],
+        );
+        assert!(v.merge_check.unwrap().unobserved.contains(&"ci".to_owned()));
+        m.gates.truncate(1);
+        assert!(!observed_on(&m.gates[0], &[], A, &identity.params));
     }
 
     #[test]

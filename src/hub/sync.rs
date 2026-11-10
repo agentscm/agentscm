@@ -1411,7 +1411,7 @@ async fn reconcile_provider_context(
         })
         .await?;
         if let Some(current) = &current {
-            super::skills::observe_open_pull(state, conn, repo, token, current, &snapshot).await;
+            super::skills::observe_open_pull(state, conn, repo, token, current).await;
         }
         lock(&state.sync.provider_cursors).insert(repo.id.clone(), **number);
     }
