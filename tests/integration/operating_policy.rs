@@ -541,6 +541,7 @@ fn old_pipeline_journals_migrate_without_replaying_or_changing_rules() {
         "operating_rehearsals",
         "operating_state",
         "operating_versions",
+        "pipeline_reports",
     ] {
         db.execute(&format!("DROP TABLE {table}"), []).unwrap();
     }
@@ -1723,10 +1724,10 @@ fn explicit_cli_recovery_preserves_work_and_does_not_replay_failed_effect() {
 
 #[test]
 fn typed_backup_preserves_both_pipeline_versions_and_migrates_only_on_open() {
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         let f = fixture();
         let mut j = journal(&f);
-        let retained_policy = if version == 2 {
+        let retained_policy = if version >= 2 {
             Some(activated(&f, &mut j))
         } else {
             j.install(&f.rule, None).unwrap();
@@ -1744,19 +1745,22 @@ fn typed_backup_preserves_both_pipeline_versions_and_migrates_only_on_open() {
         let expected = retained_policy.map(|_| j.operating_policy(&f.rule.rule_id).unwrap());
         drop(j);
         let path = f.data.join("pipeline-rules/state.sqlite");
-        if version == 1 {
+        if version < 3 {
             let db = rusqlite::Connection::open(&path).unwrap();
-            for table in [
-                "operating_drafts",
-                "operating_reservations",
-                "operating_decisions",
-                "operating_rehearsals",
-                "operating_state",
-                "operating_versions",
-            ] {
-                db.execute(&format!("DROP TABLE {table}"), []).unwrap();
+            db.execute("DROP TABLE pipeline_reports", []).unwrap();
+            if version == 1 {
+                for table in [
+                    "operating_drafts",
+                    "operating_reservations",
+                    "operating_decisions",
+                    "operating_rehearsals",
+                    "operating_state",
+                    "operating_versions",
+                ] {
+                    db.execute(&format!("DROP TABLE {table}"), []).unwrap();
+                }
             }
-            db.pragma_update(None, "user_version", 1).unwrap();
+            db.pragma_update(None, "user_version", version).unwrap();
         }
         let backup = f._root.path().join("backup");
         let manifest = agentscm::local_recovery::backup(&f.data, &backup, &[], &[], true).unwrap();
@@ -1823,7 +1827,7 @@ fn typed_backup_rejects_future_or_mistagged_pipeline_versions_and_operating_corr
         let path = f.data.join("pipeline-rules/state.sqlite");
         let db = rusqlite::Connection::open(&path).unwrap();
         match failure {
-            "future_version" => db.pragma_update(None, "user_version", 3).unwrap(),
+            "future_version" => db.pragma_update(None, "user_version", 4).unwrap(),
             "v2_tables_tagged_v1" => db.pragma_update(None, "user_version", 1).unwrap(),
             "missing_operating_table" => {
                 db.execute("DROP TABLE operating_drafts", []).unwrap();

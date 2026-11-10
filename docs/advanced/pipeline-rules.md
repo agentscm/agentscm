@@ -257,6 +257,40 @@ the head commit must already be in the operator's checkout (for example after
 `git fetch origin`), or delivery is blocked. Rules owned by an operating policy
 receive merge events only.
 
+### What the pull request shows
+
+Each time `observe` or `poll` runs (and so each `watch` cycle), it posts a commit
+status for every pull request run whose state the forge has not been told yet:
+
+| Run state | Status on the head commit | Description |
+| --- | --- | --- |
+| accepted, waiting or running | `pending` | AgentSCM rule fired on this commit; the run has not finished |
+| complete | `success` | AgentSCM rule run succeeded on this commit |
+| blocked or failed | `failure` | AgentSCM rule run failed or was blocked; see pipeline status |
+
+- The context is `agentscm/pipeline/<rule_id>`. The status is set on the exact
+  head commit that ran, so a result for an older head never appears on a newer
+  one. A new head shows nothing from this rule until the rule fires for it.
+- `pending` goes out in the same cycle that accepts the run. `watch` posts the
+  final state on its next cycle after pickup. A rule that fired always has a
+  status, or a retried post failure.
+- Descriptions are fixed text. Nothing from the pull request (title, body, branch,
+  paths or labels) is put in a status.
+- A post that fails (refused, rate limited, unavailable) is kept as unposted and
+  retried on every later cycle. `status` lists it under `unposted_reports` with
+  the attempt count and reason, and `observe`/`poll` output lists each attempt
+  under `reports`. An authentication or rate-limit failure stops that cycle's
+  posting.
+- The forge token needs permission to write commit statuses (`statuses: write`).
+- Statuses are only written, never read back, so a posted status cannot start a
+  rule again.
+- `success` means the workflow run succeeded. Whether a finding fails the run is
+  up to the workflow's own steps.
+- Don't make the context a required check unless the rule fires on every pull
+  request. A head the rule does not match gets no status.
+
+Recovering a blocked run with `recover` sets the head back to `pending`.
+
 **Who runs code on your machine.** A pull request rule runs the profile's local
 commands and the skill agent on an unreviewed head. It runs them with the
 operator account's privileges and credentials. Any account that can push a
