@@ -102,6 +102,7 @@ use super::store::{
     plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
     validate_display_name, validate_login,
 };
+use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
@@ -1037,6 +1038,35 @@ fn pg_record_catchup_merge(
             &key,
             &(seq + 1),
             &observed_at,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_catchup_pull_commits
+            (provider,host,repository,repository_key,pull_number,head_commit,merge_commit)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &merge.pull_number,
+            &merge.head_commit,
+            &merge.merge_commit,
+        ],
+    )?;
+    // Bounded like the observations it is copied from: the oldest pull requests go first.
+    tx.execute(
+        "DELETE FROM hub_catchup_pull_commits
+         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+           AND pull_number <= (SELECT pull_number FROM hub_catchup_pull_commits
+               WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+               ORDER BY pull_number DESC LIMIT 1 OFFSET $5)",
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &MAX_CATCHUP_MERGE_ROWS,
         ],
     )?;
     let merged_at = merge.occurred_at.unwrap_or(observed_at);
@@ -2567,6 +2597,26 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     }
     event.at = item.updated_at;
     Ok(event)
+}
+
+/// Keeps `item`'s current decision checkpoint for `why` and search, and at most the newest
+/// [`why::MAX_WORK_DECISIONS`] of its Work.
+fn record_decision(tx: &mut postgres::Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+    let Some(decision) = &item.current else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO hub_work_decisions (work, event_seq, summary, checkpoint)
+         VALUES ($1, $2, $3, $4)",
+        &[&item.id, &seq, &decision.summary, &json_string(decision)?],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_work_decisions WHERE work = $1 AND event_seq <= (
+             SELECT event_seq FROM hub_work_decisions WHERE work = $1
+             ORDER BY event_seq DESC LIMIT 1 OFFSET $2)",
+        &[&item.id, &why::MAX_WORK_DECISIONS],
+    )?;
+    Ok(())
 }
 
 /// Returns the stored snapshot so callers can size it without serializing the item again.
@@ -7169,6 +7219,9 @@ fn work_checkpoint_in(
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
     let snapshot = save_work_version(tx, &item, seq)?;
+    if checkpoint.kind == super::work::CheckpointKind::Decision {
+        record_decision(tx, &item, seq)?;
+    }
     match checkpoint.kind {
         super::work::CheckpointKind::Finish => {
             set_work_reservation(tx, &item.id, Some("completed"), None, now)?;
@@ -11561,7 +11614,9 @@ impl Store for PgStore {
                    AND ($7::text IS NULL OR w.source_issue = $8::text
                      OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
                      OR ((lt.owner = $10 OR w.lead_agent NOT LIKE 'client-%') AND w.lead_agent ILIKE $7 ESCAPE '\\') OR u.login ILIKE $7 ESCAPE '\\'
-                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
+                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\'
+                     OR EXISTS (SELECT 1 FROM hub_work_decisions d
+                       WHERE d.work = w.id AND d.summary ILIKE $7 ESCAPE '\\'))
                  ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
                 &[
                     &who.owner.identity.provider,
@@ -11592,6 +11647,130 @@ impl Store for PgStore {
                 .collect();
             tx.commit()?;
             Ok(WorkSearchPage::of(items, limit))
+        })
+    }
+
+    fn work_why(&self, token: &str, subject: &WhySubject, now: i64) -> Result<WhyAnswer> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let (provider, host) = (&who.owner.identity.provider, &who.owner.identity.host);
+            let mut pulls = Vec::new();
+            let more = (why::WHY_WORK + 1) as i64;
+            // (Work id, pull request), newest Work first.
+            let matches: Vec<(String, Option<i64>)> = match subject {
+                WhySubject::Commit(commit) => {
+                    for row in tx.query(
+                        "SELECT pull_number, head_commit, merge_commit FROM hub_catchup_pull_commits
+                         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+                           AND (merge_commit=$5 OR head_commit=$5)
+                         ORDER BY pull_number DESC LIMIT $6",
+                        &[
+                            provider,
+                            host,
+                            &repository_namespace(&who.repository, who.repository_id),
+                            &catchup_repository_key(who.repository_id),
+                            commit,
+                            &(why::WHY_PULLS as i64),
+                        ],
+                    )? {
+                        why::add_pull(
+                            &mut pulls,
+                            WhyPullRequest {
+                                number: row.get(0),
+                                head_commit: Some(row.get(1)),
+                                merge_commit: Some(row.get(2)),
+                            },
+                        );
+                    }
+                    let numbers = pulls.iter().map(|p| p.number).collect::<Vec<i64>>();
+                    tx.query(
+                        "SELECT w.id, (l.snapshot::jsonb #>> '{target,number}')::bigint,
+                                l.snapshot::jsonb #>> '{target,head_sha}'
+                         FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4
+                           AND (l.snapshot::jsonb #>> '{target,head_sha}' = $5
+                             OR (l.snapshot::jsonb #>> '{target,number}')::bigint = ANY($6))
+                         ORDER BY w.created_at DESC, w.id DESC LIMIT $7",
+                        &[
+                            provider,
+                            host,
+                            &who.repository,
+                            &who.repository_id,
+                            commit,
+                            &numbers,
+                            &more,
+                        ],
+                    )?
+                    .into_iter()
+                    .map(|row| {
+                        let (id, number, head): (String, i64, String) =
+                            (row.get(0), row.get(1), row.get(2));
+                        if head == *commit {
+                            why::add_pull(
+                                &mut pulls,
+                                WhyPullRequest {
+                                    number,
+                                    head_commit: Some(head),
+                                    merge_commit: None,
+                                },
+                            );
+                        }
+                        (id, Some(number))
+                    })
+                    .collect()
+                }
+                WhySubject::Path(path) => tx
+                    .query(
+                        "SELECT w.id FROM hub_work_items w
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4
+                           AND EXISTS (SELECT 1 FROM unnest($5::text[]) c WHERE strpos(w.scope, c) > 0)
+                         ORDER BY w.created_at DESC, w.id DESC LIMIT $6",
+                        &[
+                            provider,
+                            host,
+                            &who.repository,
+                            &who.repository_id,
+                            &why::covering_scope_entries(path),
+                            &more,
+                        ],
+                    )?
+                    .into_iter()
+                    .map(|row| (row.get(0), None))
+                    .collect(),
+            };
+            let relation = match subject {
+                WhySubject::Commit(_) => WhyRelation::PullRequest,
+                WhySubject::Path(_) => WhyRelation::Scope,
+            };
+            let mut work = Vec::new();
+            for (id, pull_number) in matches {
+                let Some(item) = scoped_work(&mut tx, &who, &id, now, false)? else {
+                    continue;
+                };
+                let decisions = tx
+                    .query(
+                        "SELECT event_seq, checkpoint FROM hub_work_decisions WHERE work = $1
+                         ORDER BY event_seq DESC LIMIT $2",
+                        &[&id, &((why::WHY_DECISIONS + 1) as i64)],
+                    )?
+                    .into_iter()
+                    .map(|row| Ok((row.get(0), json_value(row.get::<_, &str>(1))?)))
+                    .collect::<Result<Vec<_>>>()?;
+                work.push(why::work(
+                    why::WhyWorkFacts {
+                        item,
+                        relation,
+                        pull_number,
+                        decisions,
+                    },
+                    super::viewer::Viewer(&who.owner.id),
+                ));
+            }
+            tx.commit()?;
+            Ok(why::answer(subject, pulls, work))
         })
     }
 

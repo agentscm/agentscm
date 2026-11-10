@@ -560,6 +560,7 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_shared_conversation"
                     | "agentscm_workflow_status"
                     | "agentscm_work_search"
+                    | "agentscm_why"
                     | "agentscm_publications_list"
                     | "agentscm_workflow_runs_list"
                     | "agentscm_coordination_inbox"
@@ -844,6 +845,13 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             "limit":{"type":"integer","minimum":1,"maximum":super::work::MAX_WORK_SEARCH,"default":super::work::DEFAULT_WORK_SEARCH},
             "cursor":{"type":"string","maxLength":255,"description":"next_cursor from the previous page."}
         }), &[])});
+    let why = json!({"name": "agentscm_why",
+        "description": "Pure read: the Work and decisions recorded for a commit (full SHA) or a repository path; known false means none is recorded.",
+        "annotations": {"readOnlyHint": true},
+        "inputSchema": schema(json!({
+            "commit":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+            "path":{"type":"string","maxLength":4096}
+        }), &[])});
     let publications = json!({"name": "agentscm_publications_list",
         "description": "Lists this repository's publications (published branches and pull requests), newest first, from stored rows only. A search examines at most the 256 newest publications below the cursor, so a page can be short while next_cursor is set (complete is false); searched_to names the oldest one examined. q matches branch, title, base, publication id, owner, agent name or a pull request number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
         "annotations": {"readOnlyHint": true},
@@ -1006,6 +1014,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             value_metrics,
             contribution_receipt,
             work_search,
+            why,
             publications,
             workflow_runs,
             skill_list,
@@ -1199,6 +1208,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         contribution_receipt,
         receipt_settings,
         work_search,
+        why,
         publications,
         workflow_runs,
         usage,
@@ -1895,6 +1905,7 @@ async fn call_inner(
             | "agentscm_work_ack"
             | "agentscm_workflow_status"
             | "agentscm_work_search"
+            | "agentscm_why"
             | "agentscm_publications_list"
             | "agentscm_workflow_runs_list"
             | "agentscm_promises_list"
@@ -2386,6 +2397,23 @@ async fn call_inner(
             .await
             {
                 Ok(value) => structured(&value),
+                Err(error) => work_failure(&error),
+            },
+        );
+    }
+    if name == "agentscm_why" {
+        let subject = match try_args::<super::why::WhyQuery>(arguments) {
+            Ok(query) => match query.subject() {
+                Ok(subject) => subject,
+                Err(error) => return Ok(invalid_args(name, &error.to_string())),
+            },
+            Err(error) => return Ok(invalid_args(name, &error)),
+        };
+        let store = state.store.clone();
+        let token = principal.token_id.clone();
+        return Ok(
+            match blocking(state, move || store.work_why(&token, &subject, unix_now())).await {
+                Ok(answer) => structured(&answer),
                 Err(error) => work_failure(&error),
             },
         );

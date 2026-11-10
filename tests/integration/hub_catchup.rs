@@ -16,6 +16,7 @@ use agentscm::hub::publish::{Create, NewPublication, Update, derive_id};
 use agentscm::hub::store::{
     self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
 };
+use agentscm::hub::why::{self, WhyRelation, WhySubject};
 use agentscm::hub::work::{
     BriefingQuery, CheckpointKind, WorkCheckpoint, WorkItem, WorkOverviewQuery,
     WorkRepositoryScope, WorkRole, WorkStart, WorkState,
@@ -23,6 +24,7 @@ use agentscm::hub::work::{
 use agentscm::hub::work_lifecycle::{
     MergeStatus, OperationalOverviewV1, OutcomeValue, ReservationStatus,
 };
+use agentscm::hub::work_links::{WorkPrLinkTarget, WorkPrLinkUpdate};
 use agentscm::hub::work_preflight::{
     WorkPreflightReason, WorkPreflightRequest, WorkPreflightStatus,
 };
@@ -2197,6 +2199,286 @@ fn postgres_catchup_contracts() {
         return;
     };
     contracts(&fixture);
+}
+
+/// What `why` needs survives compaction: the Work, its decision checkpoints and the pull request
+/// a merge commit belongs to, after the merge observation and superseded versions are gone.
+fn why_resolves_after_compaction(fixture: &Fixture) {
+    let now = unix_now();
+    let old = now - 200_000;
+    let owner = fixture.owner(46);
+    let token = fixture.token(&owner, "why-lead", 146, false);
+    let (old_merge, _) = merge(146, old);
+    fixture
+        .store
+        .record_catchup_merge(&scope(146), &old_merge, old)
+        .unwrap();
+    let started = fixture
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                issue_choice: None,
+                work_id: None,
+                source: None,
+                request_key: Some("why-compaction".into()),
+                title: "Keep why answers".into(),
+                description: Some("Explains the change.".into()),
+                session: "why-session".into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/why/**".into()],
+                branch: Some("feature-146".into()),
+                worktree: None,
+                next_action: None,
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+                preflight: None,
+            },
+            old,
+        )
+        .unwrap();
+    let mut seq = started.item.updated_seq;
+    for (at, kind, summary) in [
+        (
+            old + 1,
+            CheckpointKind::Decision,
+            "Chose a derived pull table",
+        ),
+        (old + 2, CheckpointKind::Progress, "Wrote the table"),
+    ] {
+        seq = fixture
+            .store
+            .work_checkpoint(
+                &token,
+                &WorkCheckpoint {
+                    work_id: started.item.id.clone(),
+                    operation_id: format!("why-{at}"),
+                    generation: 1,
+                    session: "why-session".into(),
+                    expected_updated_seq: Some(seq),
+                    kind,
+                    summary: summary.into(),
+                    next_action: None,
+                    scope: None,
+                    branch: None,
+                    worktree: None,
+                    resolve_blocker: false,
+                    source_refs: Vec::new(),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                },
+                at,
+            )
+            .unwrap()
+            .item
+            .updated_seq;
+    }
+    fixture
+        .store
+        .work_pr_link_set(
+            &token,
+            &WorkPrLinkUpdate {
+                work_id: started.item.id.clone(),
+                operation_id: "why-link".into(),
+                generation: 1,
+                session: "why-session".into(),
+                expected_updated_seq: seq,
+                link: Some(WorkPrLinkTarget {
+                    repository_id: 146,
+                    number: 146,
+                    head_sha: old_merge.head_commit.clone(),
+                }),
+            },
+            old + 3,
+        )
+        .unwrap();
+    let work_scope = WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPOSITORY.into(),
+        repository_id: Some(146),
+    };
+    let compacted = fixture
+        .store
+        .work_compact(&work_scope, now - 86_400, true, now)
+        .unwrap();
+    assert_eq!(compacted.deleted_merge_observations, 1);
+    assert!(compacted.deleted_versions >= 1, "{compacted:?}");
+
+    let why = |subject: WhySubject| fixture.store.work_why(&token, &subject, now).unwrap();
+    for commit in [&old_merge.merge_commit, &old_merge.head_commit] {
+        let answer = why(WhySubject::Commit(commit.clone()));
+        assert!(answer.known && answer.work_complete, "{answer:?}");
+        assert_eq!(answer.pull_requests[0].number, 146);
+        assert_eq!(
+            answer.pull_requests[0].merge_commit.as_deref(),
+            Some(old_merge.merge_commit.as_str())
+        );
+        let work = &answer.work[0];
+        assert_eq!(work.id, started.item.id);
+        assert_eq!(work.relation, WhyRelation::PullRequest);
+        assert_eq!(work.description.as_deref(), Some("Explains the change."));
+        assert_eq!(work.outcome.as_ref().unwrap().summary, "Wrote the table");
+        assert_eq!(work.decisions.len(), 1);
+        assert_eq!(work.decisions[0].summary, "Chose a derived pull table");
+        assert!(work.conversation.conversation.ends_with("/conversation"));
+    }
+    let by_path = why(WhySubject::Path("src/why/answer.rs".into()));
+    assert_eq!(by_path.work[0].id, started.item.id);
+    assert_eq!(by_path.work[0].relation, WhyRelation::Scope);
+    assert_eq!(by_path.work[0].decisions.len(), 1);
+    for unknown in [
+        WhySubject::Commit("f".repeat(40)),
+        WhySubject::Path("src/whys.rs".into()),
+    ] {
+        let answer = why(unknown);
+        assert!(!answer.known && answer.work.is_empty(), "{answer:?}");
+    }
+    let found = fixture
+        .store
+        .work_search(&token, Some("derived pull"), None, 10, now)
+        .unwrap();
+    assert_eq!(found.items[0].id, started.item.id);
+
+    // Another owner's read-only token sees the answer with this owner's sessions digested.
+    let reader = fixture.token(&fixture.owner(47), "why-reader", 146, true);
+    let theirs = fixture
+        .store
+        .work_why(&reader, &WhySubject::Path("src/why/answer.rs".into()), now)
+        .unwrap();
+    let mine = by_path.work[0].decisions[0].session.clone();
+    assert_eq!(mine, "why-session");
+    assert_ne!(theirs.work[0].decisions[0].session, mine);
+    assert_eq!(
+        theirs.work[0].decisions[0].summary,
+        "Chose a derived pull table"
+    );
+    // A token of another repository finds nothing of this one.
+    let elsewhere = fixture.token_for_repository(&owner, "why-elsewhere", "acme/other", 147, false);
+    let other = fixture
+        .store
+        .work_why(
+            &elsewhere,
+            &WhySubject::Commit(old_merge.merge_commit.clone()),
+            now,
+        )
+        .unwrap();
+    assert!(!other.known && other.pull_requests.is_empty(), "{other:?}");
+}
+
+/// More Work than one answer lists, and more decisions than one Work lists, are marked cut.
+fn why_marks_cut_lists(fixture: &Fixture) {
+    let now = unix_now();
+    let owner = fixture.owner(48);
+    let token = fixture.token(&owner, "why-many", 148, false);
+    let last = why::WHY_WORK;
+    for n in 0..=last {
+        let session = format!("why-many-{n}");
+        let started = fixture
+            .store
+            .work_start(
+                &token,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: Some(session.clone()),
+                    title: format!("Many {n}"),
+                    description: None,
+                    session: session.clone(),
+                    role: WorkRole::Lead,
+                    scope: vec!["src/many/**".into()],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                now + n as i64,
+            )
+            .unwrap();
+        let mut seq = started.item.updated_seq;
+        // The newest Work records more decisions than an answer lists; each Work then finishes,
+        // which frees the scope for the next start.
+        let decisions = if n == last { why::WHY_DECISIONS + 1 } else { 0 };
+        for d in 0..=decisions {
+            let kind = if d == decisions {
+                CheckpointKind::Finish
+            } else {
+                CheckpointKind::Decision
+            };
+            seq = fixture
+                .store
+                .work_checkpoint(
+                    &token,
+                    &WorkCheckpoint {
+                        work_id: started.item.id.clone(),
+                        operation_id: format!("{session}-{d}"),
+                        generation: 1,
+                        session: session.clone(),
+                        expected_updated_seq: Some(seq),
+                        kind,
+                        summary: format!("decision {d}"),
+                        next_action: None,
+                        scope: None,
+                        branch: None,
+                        worktree: None,
+                        resolve_blocker: false,
+                        source_refs: Vec::new(),
+                        depends_on: Vec::new(),
+                        related_work: Vec::new(),
+                    },
+                    now + n as i64,
+                )
+                .unwrap()
+                .item
+                .updated_seq;
+        }
+    }
+    let answer = fixture
+        .store
+        .work_why(&token, &WhySubject::Path("src/many/x.rs".into()), now + 20)
+        .unwrap();
+    assert!(answer.known && !answer.work_complete, "{answer:?}");
+    assert_eq!(answer.work.len(), why::WHY_WORK);
+    let newest = &answer.work[0];
+    assert_eq!(newest.title, format!("Many {last}"));
+    assert!(!newest.decisions_complete);
+    assert_eq!(newest.decisions.len(), why::WHY_DECISIONS);
+    assert_eq!(
+        newest.decisions[0].summary,
+        format!("decision {}", why::WHY_DECISIONS)
+    );
+    assert!(answer.work[1].decisions_complete && answer.work[1].decisions.is_empty());
+}
+
+#[test]
+fn sqlite_why_marks_cut_lists() {
+    why_marks_cut_lists(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_why_marks_cut_lists() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    why_marks_cut_lists(&fixture);
+}
+
+#[test]
+fn sqlite_why_resolves_after_compaction() {
+    why_resolves_after_compaction(&Fixture::sqlite());
+}
+
+#[test]
+fn postgres_why_resolves_after_compaction() {
+    let Some(fixture) = Fixture::postgres() else {
+        return;
+    };
+    why_resolves_after_compaction(&fixture);
 }
 
 #[test]

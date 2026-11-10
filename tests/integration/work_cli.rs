@@ -143,6 +143,20 @@ impl Client {
         self.request("start", request)
     }
 
+    fn why(&self, directory: &std::path::Path, target: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(["why", target])
+            .current_dir(directory)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.config.path())
+            .env("XDG_CONFIG_HOME", self.config.path())
+            .env("AGENTSCM_HUB_URL", &self.url)
+            .env("AGENTSCM_HUB_TOKEN_FILE", &self.token_file)
+            .output()
+            .unwrap()
+    }
+
     fn checkpoint(&self, request: &str) -> Output {
         self.request("checkpoint", request)
     }
@@ -635,6 +649,53 @@ fn catchup_read_does_not_acknowledge_until_the_exact_delivery_is_marked_reviewed
     assert!(retry.status.success(), "{retry:?}");
     let retry: CatchupAckResult = serde_json::from_slice(&retry.stdout).unwrap();
     assert_eq!(retry.status, CatchupAckStatus::AlreadyAcknowledged);
+}
+
+/// `agentscm why` turns a line and a path into commits with local Git, asks the Hub about each
+/// and about the path from the repository root, and refuses a target that is neither.
+#[test]
+fn why_resolves_a_line_and_a_path_through_git_then_asks_the_hub() {
+    let hub = Hub::start();
+    let client = hub.client(19, "why");
+    let started = client.start(r#"{"request_key":"why-cli","title":"Explain why.rs","session":"why-cli","scope":["src/why.rs"]}"#);
+    assert!(started.status.success(), "{started:?}");
+    let repository = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    std::fs::create_dir(repository.path().join("src")).unwrap();
+    std::fs::write(repository.path().join("src/why.rs"), "fn why() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "why"]);
+    let commit = git(&["rev-parse", "HEAD"]).trim().to_owned();
+
+    let line = client.why(&repository.path().join("src"), "why.rs:1");
+    assert!(line.status.success(), "{line:?}");
+    let line: serde_json::Value = serde_json::from_slice(&line.stdout).unwrap();
+    assert_eq!(line["commits"], serde_json::json!([commit]));
+    assert_eq!(line["path"], "src/why.rs");
+    assert_eq!(line["answers"][0]["known"], false, "{line}");
+    assert_eq!(
+        line["answers"][1]["work"][0]["title"], "Explain why.rs",
+        "{line}"
+    );
+
+    let root = client.why(repository.path(), ".");
+    assert!(root.status.success(), "{root:?}");
+    let root: serde_json::Value = serde_json::from_slice(&root.stdout).unwrap();
+    assert_eq!(root["path"], serde_json::Value::Null);
+    assert_eq!(root["commits"], serde_json::json!([commit]));
+
+    let unknown = client.why(repository.path(), "no-such-target");
+    assert!(!unknown.status.success(), "{unknown:?}");
 }
 
 #[test]
