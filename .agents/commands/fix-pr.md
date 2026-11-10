@@ -72,7 +72,7 @@ git rev-parse HEAD
 gh pr view --json headRefOid --jq .headRefOid
 ```
 
-A new head is ready to queue once its hosted checks are green (`gh pr checks <PR#>`), as in step 11 of `.agents/commands/pr.md`; report it as not ready until then. Do not run the signed attestation for each fix round: it is optional evidence, worth running only in the cases that step names. If a hosted check fails because of the branch, treat the failure as a new item to fix in this step and push again. After two hosted-check failures caused by the change on successive heads, stop and report instead of looping. A failure shown to be unrelated to the change may be rerun on the same head without a push, under the evidence rule in that step. Do not edit the PR title or body after the last push; if you must, run `gh pr update-branch <PR#>` afterwards.
+A new head is ready to queue once its hosted checks are green (`gh pr checks <PR#>`), as in step 11 of `.agents/commands/pr.md`; report it as not ready until then. Do not run the signed attestation for each fix round: it is optional evidence, worth running only in the cases that step names. If a hosted check fails because of the branch, treat the failure as a new item to fix in this step and push again. After two hosted-check failures caused by the change on successive heads, stop and report instead of looping. A failure shown to be unrelated to the change may be rerun on the same head without a push, under the evidence rule in that step. Do not edit the PR title or body after the last push; if you must, run `gh pr update-branch <PR#>` afterwards (the one allowed merge of `main`; if GitHub reports the branch is already up to date, push the next real change instead of editing).
 
 If nothing changed, do not create an empty commit.
 
