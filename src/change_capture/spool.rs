@@ -119,6 +119,39 @@ thread_local! {
     };
 }
 
+/// What a spool holds now, against its limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpoolUsage {
+    pub records: usize,
+    pub bytes: u64,
+    pub limits: SpoolLimits,
+}
+
+impl SpoolUsage {
+    /// Past 80% of the record or the byte limit, or full (small limits reach full first).
+    pub fn needs_upkeep(&self) -> bool {
+        self.records as u64 * 5 >= self.limits.max_records as u64 * 4
+            || self.bytes.saturating_mul(5) >= self.limits.max_total_bytes.saturating_mul(4)
+            || self.is_full()
+    }
+
+    /// Inside the metadata headroom, where new facts are refused and capture records only gaps.
+    /// shortcut: a lower bound, since appends also reserve room for each open action start; count
+    /// those too if a spool with many open actions is seen refusing facts while not "full".
+    pub fn is_full(&self) -> bool {
+        let records = BASE_METADATA_RESERVE_RECORDS.min(self.limits.max_records / 4);
+        let bytes = BASE_METADATA_RESERVE_BYTES.min(self.limits.max_total_bytes / 4);
+        self.records.saturating_add(records) >= self.limits.max_records
+            || self.bytes.saturating_add(bytes) >= self.limits.max_total_bytes
+    }
+}
+
+/// Sanitized deferred hooks kept without a target, and for how long; target-bound ones are kept
+/// until their session can have emitted its gap. See `LocalSpool::prune_deferred`.
+pub const DEFERRED_KEEP: usize = 256;
+pub const DEFERRED_KEEP_SECONDS: i64 = 24 * 60 * 60;
+pub const DEFERRED_GAP_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpoolLimits {
@@ -2322,7 +2355,8 @@ impl LocalSpool {
     }
 
     /// Lists sanitized unassociated hooks for local diagnosis only. There is deliberately no
-    /// acknowledgement or reassociation API in schema v1.
+    /// acknowledgement or reassociation API in schema v1; `upkeep` expires them after
+    /// `DEFERRED_KEEP_SECONDS` (unbound) or `DEFERRED_GAP_SECONDS` (bound to a target).
     pub fn deferred(&self, limit: usize) -> Result<Vec<DeferredHookV1>> {
         if limit == 0 || limit > MAX_PENDING_PAGE {
             return Err(CaptureError::Invalid(format!(
@@ -2334,6 +2368,72 @@ impl LocalSpool {
         records.sort_by_key(|record| record.receipt_order);
         records.truncate(limit);
         Ok(records.into_iter().map(|record| record.hook).collect())
+    }
+
+    /// Physical records and bytes the spool holds now, against its limits.
+    pub fn usage(&self) -> Result<SpoolUsage> {
+        let _lock = self.lock()?;
+        let (records, bytes) = usage(&self.root, self.limits.max_records)?;
+        Ok(SpoolUsage {
+            records,
+            bytes,
+            limits: self.limits,
+        })
+    }
+
+    /// Deletes sanitized deferred hooks that nothing will read again, so a checkout whose sessions
+    /// often run without Work cannot fill its spool with them. A hook bound to a target is kept
+    /// for `DEFERRED_GAP_SECONDS`, until its session has emitted the gap it stands for; the
+    /// newest `DEFERRED_KEEP` others are kept for `DEFERRED_KEEP_SECONDS` for local diagnosis.
+    /// Returns how many were deleted.
+    pub fn prune_deferred(&self, now: i64) -> Result<usize> {
+        let _lock = self.lock()?;
+        let mut records = deferred_records(&self.root, self.limits.max_records)?;
+        records.sort_by_key(|record| std::cmp::Reverse(record.receipt_order));
+        let mut unbound = 0usize;
+        let mut removed = 0usize;
+        for record in records {
+            let age = now.saturating_sub(record.hook.observed_at);
+            let keep = if record.target.is_some() {
+                age < DEFERRED_GAP_SECONDS
+            } else {
+                unbound += 1;
+                unbound <= DEFERRED_KEEP && age < DEFERRED_KEEP_SECONDS
+            };
+            if !keep {
+                let path = self.root.join("deferred").join(format!(
+                    "{}.json",
+                    sha256(record.hook.occurrence_id.as_bytes())
+                ));
+                match std::fs::remove_file(path) {
+                    Ok(()) => removed += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Run at session start and turn end: past 80% of a limit, deletes deferred hooks nothing will
+    /// read (`prune_deferred`) and compacts one page of envelopes the Hub has accepted
+    /// (`compact_acknowledged`, which never touches anything unaccepted). Answers whether the spool
+    /// is still full afterwards. A failed prune does not stop compaction; its error is returned
+    /// after compaction has run.
+    pub fn upkeep(&self, now: i64) -> Result<bool> {
+        if !self.usage()?.needs_upkeep() {
+            return Ok(false);
+        }
+        let pruned = self.prune_deferred(now);
+        // One page a pass, so a hook stays inside its time; the next hook takes more. Nothing
+        // accepted means nothing to compact, so the full scan is skipped.
+        let accepted = fs::read_dir(self.root.join("acknowledged"))
+            .is_ok_and(|mut entries| entries.next().is_some());
+        if accepted {
+            self.compact_acknowledged(MAX_COMPACTION_PAGE)?;
+        }
+        pruned?;
+        Ok(self.usage()?.is_full())
     }
 
     /// Lists bounded private crash debris for inspection. Entries remain retained until an
@@ -3086,7 +3186,8 @@ impl LocalSpool {
         Ok(AppendOutcome::Stored)
     }
 
-    /// Explicitly compacts acknowledged envelopes. Ordinary event batches retain an exact
+    /// Compacts acknowledged envelopes, when asked and from `upkeep` at session start and turn end
+    /// once the spool passes 80% of a limit. Ordinary event batches retain an exact
     /// idempotency digest; replayable events and completed action pairs retain their full receipts
     /// so following state transitions and action continuity remain checkable. Pending envelopes,
     /// incomplete action starts, artifacts and deferred diagnostics are never removed.

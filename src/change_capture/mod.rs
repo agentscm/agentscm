@@ -42,12 +42,12 @@ use crate::execution::process::{Stop, capture_with_input, capture_with_input_tee
 use spool::{RecipeAttemptReservationV1, RecipeAttemptV1};
 
 pub use spool::{
-    AppendOutcome, BoundedCountV1, CompactionReport, DeferredHookV1, DeferredReasonV1,
-    FileIdentityV1, LocalSpool, MIN_ACTION_CAPTURE_BYTES, MIN_ACTION_CAPTURE_RECORDS,
-    NamespaceBindOutcome, QuarantineEntryV1, QuarantinePruneReport, SpoolAttemptInspectionV1,
-    SpoolClassificationV1, SpoolDigestV1, SpoolEntryInspectionV1, SpoolExportManifestV1,
-    SpoolIdentityV1, SpoolInspectionV1, SpoolLimits, SpoolNamespaceV1, SpoolProbeStateV1,
-    export_spool_archive, inspect_spool,
+    AppendOutcome, BoundedCountV1, CompactionReport, DEFERRED_GAP_SECONDS, DEFERRED_KEEP,
+    DEFERRED_KEEP_SECONDS, DeferredHookV1, DeferredReasonV1, FileIdentityV1, LocalSpool,
+    MIN_ACTION_CAPTURE_BYTES, MIN_ACTION_CAPTURE_RECORDS, NamespaceBindOutcome, QuarantineEntryV1,
+    QuarantinePruneReport, SpoolAttemptInspectionV1, SpoolClassificationV1, SpoolDigestV1,
+    SpoolEntryInspectionV1, SpoolExportManifestV1, SpoolIdentityV1, SpoolInspectionV1, SpoolLimits,
+    SpoolNamespaceV1, SpoolProbeStateV1, SpoolUsage, export_spool_archive, inspect_spool,
 };
 
 #[derive(Debug)]
