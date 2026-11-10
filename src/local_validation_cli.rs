@@ -842,7 +842,7 @@ async fn submit_retained(
             "Hub submission refused (HTTP {status}); retained pending submission can be retried"
         )));
     }
-    let receipt: ValidationEvidenceReceipt = serde_json::from_value(body).map_err(|_| {
+    let receipt: ValidationEvidenceReceipt = agentscm::hub::reply::decode(&body).map_err(|_| {
         Error::Invalid("invalid Hub submission receipt; retry retained submission".into())
     })?;
     if receipt.repository != args.repository_id

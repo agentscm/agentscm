@@ -21,6 +21,7 @@ use agentscm::change_record::{
 };
 use agentscm::forge::encode_path_segment;
 use agentscm::hub::forge_http::{self, send};
+use agentscm::hub::reply;
 use agentscm::{Error, Result};
 use clap::{Args, ValueEnum};
 use reqwest::header::CONTENT_TYPE;
@@ -1599,8 +1600,8 @@ pub async fn resolve_target_with(
         .map_err(|_| invalid("capture target lookup unavailable"))?;
     match status {
         200 => {
-            let target: CaptureTargetV1 = serde_json::from_value(body)
-                .map_err(|_| invalid("capture target response is invalid"))?;
+            let target: CaptureTargetV1 = reply::decode(&body)
+                .map_err(|error| invalid(format!("capture target response: {error}")))?;
             target
                 .validate()
                 .map_err(|_| invalid("capture target response is invalid"))?;
@@ -1635,7 +1636,7 @@ pub async fn hub_sharing(hub: &CaptureHub) -> Option<HubSharing> {
         .bearer_auth(&hub.token)
         .timeout(Duration::from_secs(2));
     match send(request, REPLY_BYTES).await {
-        Ok((200, body)) => serde_json::from_value(body).ok(),
+        Ok((200, body)) => reply::decode(&body).ok(),
         _ => None,
     }
 }
@@ -1782,8 +1783,8 @@ pub async fn fetch_change_record(root: &Path, work_id: &str) -> Result<ChangeRec
             "change record lookup returned status {status}"
         )));
     }
-    let response: ChangeRecordResponseV1 =
-        serde_json::from_value(body).map_err(|_| invalid("change record response is invalid"))?;
+    let response: ChangeRecordResponseV1 = reply::decode(&body)
+        .map_err(|error| invalid(format!("change record response: {error}")))?;
     response
         .validate_encoded_size()
         .map_err(|_| invalid("change record response is too large"))?;
@@ -1845,7 +1846,7 @@ pub async fn list_conversation(
         return Err(conversation_status_error(status));
     }
     let page: ConversationPageV1 =
-        serde_json::from_value(body).map_err(|_| invalid("conversation response is invalid"))?;
+        reply::decode(&body).map_err(|error| invalid(format!("conversation response: {error}")))?;
     page.validate_encoded_size()
         .map_err(|_| invalid("conversation response is too large"))?;
     Ok(page)
@@ -2104,7 +2105,7 @@ async fn missing_digests(
         .await
         .map_err(|_| invalid("capture Hub body preflight unavailable"))?;
     match status {
-        200 => Ok(serde_json::from_value::<ConversationMissingV1>(body)
+        200 => Ok(reply::decode::<ConversationMissingV1>(&body)
             .ok()
             .map(|answer| answer.missing.into_iter().collect())),
         s if s >= 500 => Err(invalid(format!(

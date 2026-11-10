@@ -54,6 +54,8 @@ mod cli;
 #[cfg(unix)]
 mod client_completion;
 #[cfg(unix)]
+mod client_replies;
+#[cfg(unix)]
 mod client_status;
 #[cfg(unix)]
 mod collisions_http;
