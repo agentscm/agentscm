@@ -1735,7 +1735,7 @@ fn typed_backup_preserves_both_pipeline_versions_and_migrates_only_on_open() {
         };
         let mut next = event(&f);
         next.proposal_number += 1;
-        let dispatch = if version == 2 {
+        let dispatch = if version >= 2 {
             j.accept_operating_event(&f.rule.rule_id, &next, ACTOR)
                 .unwrap()
                 .remove(0)
@@ -1808,7 +1808,11 @@ fn typed_backup_preserves_both_pipeline_versions_and_migrates_only_on_open() {
                     .is_empty()
             );
         }
-        assert_eq!(read_version(&restored_path), 2);
+        assert_eq!(
+            read_version(&restored_path),
+            3,
+            "opening migrates to the current version"
+        );
     }
 }
 

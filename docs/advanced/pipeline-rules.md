@@ -279,8 +279,8 @@ status for every pull request run whose state the forge has not been told yet:
 - A post that fails (refused, rate limited, unavailable) is kept as unposted and
   retried on every later cycle. `status` lists it under `unposted_reports` with
   the attempt count and reason, and `observe`/`poll` output lists each attempt
-  under `reports`. An authentication or rate-limit failure stops that cycle's
-  posting.
+  under `reports`. An authentication or rate-limit failure, or a refusal that
+  applies to the whole token (HTTP 401, 403 or 404), stops that cycle's posting.
 - The forge token needs permission to write commit statuses (`statuses: write`).
 - Statuses are only written, never read back, so a posted status cannot start a
   rule again.

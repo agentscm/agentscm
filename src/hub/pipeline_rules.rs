@@ -857,9 +857,13 @@ pub async fn report_results(
                 .await
             {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(code)) => Err(format!(
-                    "forge refused the status (HTTP {code}); check the token can write commit statuses"
-                )),
+                Ok(Err(code)) => {
+                    // A token or repository refusal applies to every later post too.
+                    stop = matches!(code, 401 | 403 | 404);
+                    Err(format!(
+                        "forge refused the status (HTTP {code}); check the token can write commit statuses"
+                    ))
+                }
                 Err(error) => {
                     stop = matches!(error, GhError::Auth(_) | GhError::Limited(_));
                     Err(match error {
