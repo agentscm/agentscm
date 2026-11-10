@@ -1539,7 +1539,27 @@ async fn entry_blocked_is_once_per_episode_even_after_restart_and_job_expiry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn entry_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
+async fn routine_handover_never_queues_a_personal_entry_or_reminder() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "routine-handover");
+    status_checkpoint(&f, &f.alice, &work, "handover");
+    let now = unix_now();
+    scan_status(&f, now);
+    scan_status(&f, now + 901);
+    assert!(entry_states(&f).is_empty());
+    assert!(!f.slack().deliver_status(&f.state).await.unwrap());
+    assert!(status_text(&f).is_empty());
+    let slack = f.slack();
+    let db = slack.database().unwrap();
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM status_jobs", [], |row| row.get(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entry_blocked_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
     let f = Fixture::configured(Some(policy()), false).await;
     let work = status_work(&f, &f.alice, "entry-owner");
     let offered = status_checkpoint(&f, &f.alice, &work, "handover");
@@ -1547,7 +1567,23 @@ async fn entry_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
         "work_id":offered.id,"takeover_generation":offered.generation,"title":offered.title,"session":"entry-new-lead","role":"lead"
     })).unwrap(), unix_now())).unwrap().item;
     assert_eq!(claimed.owner, work.owner);
-    let offered = status_checkpoint(&f, &f.bob, &claimed, "handover");
+    let blocked = status_checkpoint(&f, &f.bob, &claimed, "blocker");
+    let offered = tokio::task::block_in_place(|| {
+        f.store()
+            .work_checkpoint(
+                &f.bob,
+                &serde_json::from_value(json!({
+                    "work_id":blocked.id,"operation_id":"blocked-handover-note",
+                    "generation":blocked.generation,"session":blocked.lead_session,
+                    "expected_updated_seq":blocked.updated_seq,"kind":"handover",
+                    "summary":"Synthetic handover context"
+                }))
+                .unwrap(),
+                unix_now(),
+            )
+            .unwrap()
+            .item
+    });
     let mut slack = Slack::from_file(&f.dir.path().join("config")).unwrap();
     slack.api = f.slack().api.clone();
     slack.bindings[1].config.reminders.enabled = true;
@@ -1571,9 +1607,9 @@ async fn entry_handover_uses_shared_owner_not_the_new_lead_or_other_readers() {
         .find(|(path, _)| path == "/api/chat.postMessage")
         .unwrap()
         .1;
-    assert!(rendered(body).contains("Handover note: Synthetic status change"));
+    assert!(rendered(body).contains("Blocked on: Synthetic status change"));
     assert!(rendered(body).contains("Codex session "));
-    assert!(rendered(body).contains("Pick an agent to take it over"));
+    assert!(rendered(body).contains("Resolve the reported blocker"));
     assert_eq!(
         body["blocks"][2]["elements"][0]["url"],
         format!("https://hub.example.test/ui/#work/{}", offered.id)
@@ -1797,6 +1833,104 @@ async fn entry_retries_rate_limits_once_and_bounds_permanent_failure() {
         assert!(!restarted_slack(&f).deliver_status(&f.state).await.unwrap());
         assert_eq!(status_text(&f).len(), attempts);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_routine_handover_episode_retires_and_suppresses_queued_entry() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "legacy-routine-handover");
+    let offered = status_checkpoint(&f, &f.alice, &work, "handover");
+    assert!(offered.blocker.is_none());
+    let now = unix_now();
+    let slack = f.slack();
+    let key = status::binding_key(&slack.bindings[0]);
+    let subject = json!({"kind":"work","id":offered.id,"generation":offered.generation,"state":"awaiting_party"}).to_string();
+    // Seed the durable episode and queued entry produced before routine handovers stopped being personal.
+    let episode = hash(format!("{key}:{subject}").as_bytes());
+    {
+        let db = slack.database().unwrap();
+        db.execute("INSERT INTO status_episodes(id,binding,subject,cycle,state,first_seen,next_due) VALUES(?1,?2,?3,1,'active',?4,?5)",params![episode,key,subject,now,now+900]).unwrap();
+        db.execute("INSERT INTO status_jobs(id,binding,user,kind,subject,cycle,state,created,due) VALUES(?1,?2,'U1','entry',?3,1,'queued',?4,?4)",params![format!("{episode}:1:entry"),key,episode,now]).unwrap();
+    }
+    assert!(!slack.deliver_status(&f.state).await.unwrap());
+    assert_eq!(entry_states(&f), ["suppressed"]);
+    assert!(status_text(&f).is_empty());
+    scan_status(&f, now);
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT state FROM status_episodes WHERE id=?1",
+                [&episode],
+                |row| row.get(0)
+            )
+            .unwrap(),
+        "resolved"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_a_handover_blocker_allows_a_new_personal_episode() {
+    let f = Fixture::configured(Some(policy()), false).await;
+    let work = status_work(&f, &f.alice, "handover-blocker-cycle");
+    let blocked = status_checkpoint(&f, &f.alice, &work, "blocker");
+    let offered = status_checkpoint(&f, &f.alice, &blocked, "handover");
+    assert!(offered.blocker.is_some());
+    let now = unix_now();
+    scan_status(&f, now);
+    consume_entry(&f).await;
+    let cleared = tokio::task::block_in_place(|| {
+        f.store()
+            .work_checkpoint(
+                &f.alice,
+                &serde_json::from_value(json!({
+                    "work_id":offered.id,"operation_id":"clear-handover-blocker",
+                    "generation":offered.generation,"session":offered.lead_session,
+                    "expected_updated_seq":offered.updated_seq,"kind":"handover",
+                    "summary":"Synthetic blocker resolved","resolve_blocker":true
+                }))
+                .unwrap(),
+                unix_now(),
+            )
+            .unwrap()
+            .item
+    });
+    assert_eq!(cleared.state, crate::hub::work::WorkState::Handover);
+    assert!(cleared.blocker.is_none());
+    scan_status(&f, now + 1);
+    let slack = f.slack();
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<String, _, _>("SELECT state FROM status_episodes", [], |row| row.get(0))
+            .unwrap(),
+        "resolved"
+    );
+    let blocked = status_checkpoint(&f, &f.alice, &cleared, "blocker");
+    status_checkpoint(&f, &f.alice, &blocked, "handover");
+    scan_status(&f, now + 2);
+    assert_eq!(
+        slack
+            .database()
+            .unwrap()
+            .query_row::<(i64, String), _, _>(
+                "SELECT cycle,state FROM status_episodes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            )
+            .unwrap(),
+        (2, "active".into())
+    );
+    slack
+        .database()
+        .unwrap()
+        .execute("UPDATE status_jobs SET due=0 WHERE state='queued'", [])
+        .unwrap();
+    assert!(slack.deliver_status(&f.state).await.unwrap());
+    assert_eq!(entry_states(&f), ["done", "done"]);
+    assert_eq!(status_text(&f).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2048,7 +2182,8 @@ async fn mention_status_is_private_useful_deduplicated_and_independent_of_prose(
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].0, "U1");
     assert!(sent[0].1.contains("awaiting a named party"));
-    assert!(sent[0].1.contains("Review the handover"));
+    assert!(sent[0].1.contains("Its lead reviews the handover"));
+    assert!(sent[0].1.contains("0 actions need you"));
     assert!(sent[0].1.contains("Evidence revision"));
     assert!(sent[0].1.contains("Coverage incomplete"));
     assert!(!sent[0].1.contains("waiting for another agent"));

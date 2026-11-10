@@ -3542,6 +3542,90 @@ fn settles_and_returns_on_a_later_check_in(fixture: &Fixture) {
     assert_eq!(again.state, WorkState::Active);
 }
 
+fn a_handover_after_merge_keeps_observation_without_settling_current_work(fixture: &Fixture) {
+    let (token, reader, t0) = settled_work(fixture);
+    let item = begin(
+        fixture,
+        &token,
+        "handover",
+        Some("feat/handover"),
+        "src/handover.rs",
+        t0,
+    );
+    merged(fixture, 71, "feat/handover", "main", true, t0 + 100);
+    let observations = fixture.merge_ids(SETTLED_RID);
+    assert_eq!(observations.len(), 1);
+    let before = operational_read(
+        fixture,
+        &reader,
+        &OperationalSelect::One(&item.id),
+        t0 + 101,
+    );
+    assert_eq!(before.work[0].merge.status, MergeStatus::Observed);
+
+    let handed = checkin(
+        fixture,
+        &token,
+        &item,
+        CheckpointKind::Handover,
+        "Continue routine follow-up",
+        t0 + 103,
+    );
+    let now = t0 + 104;
+    let after = operational_read(fixture, &reader, &OperationalSelect::One(&item.id), now);
+    let operational = &after.work[0];
+    // The temporal settlement predicate no longer applies to this newer report. That is
+    // not evidence that the earlier immutable merge observation disappeared.
+    assert_eq!(operational.merge.status, MergeStatus::Unknown);
+    assert!(!operational.merge.hidden_by_merged_pr);
+    assert_eq!(fixture.merge_ids(SETTLED_RID), observations);
+    assert_eq!(operational.state, WorkState::Handover);
+    assert_eq!(operational.outcome, before.work[0].outcome);
+    assert_eq!(operational.outcome.value, OutcomeValue::None);
+    assert_eq!(operational.reservation.status, ReservationStatus::Held);
+    assert_eq!(
+        operational.reservation.scope,
+        before.work[0].reservation.scope
+    );
+    assert_eq!(operational.generation, item.generation);
+    assert_eq!(
+        listed(fixture, &reader, 100, now),
+        (vec![item.id.clone()], 0, true)
+    );
+
+    let recovery = agentscm::hub::work_recovery::inspect(
+        &*fixture.store,
+        &agentscm::hub::work_recovery::RecoveryCaller::Agent {
+            token: &reader,
+            session: None,
+        },
+        &agentscm::hub::work_recovery::RecoveryQuery {
+            work_id: Some(item.id.clone()),
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    assert_eq!(recovery.work[0].operational.merge, operational.merge);
+    let status = agentscm::hub::work_http::actionable_status::project_work(
+        &handed,
+        operational.clone(),
+        None,
+        agentscm::hub::session_waiting::LeadWait::NotWaiting,
+        &handed.owner,
+    );
+    assert_eq!(status.operational.merge, operational.merge);
+    // Reads do not complete or release Work, or rewrite the checkpoint.
+    assert_eq!(
+        fixture
+            .store
+            .work_get(&reader, &item.id, now)
+            .unwrap()
+            .unwrap(),
+        handed
+    );
+}
+
 fn nothing_settles_without_merge_data_or_a_branch(fixture: &Fixture) {
     let (token, reader, t0) = settled_work(fixture);
     let branchless = begin(fixture, &token, "nb", None, "src/nb.rs", t0);
@@ -4243,6 +4327,7 @@ macro_rules! settled_cases {
 }
 
 settled_cases!(
+    a_handover_after_merge_keeps_observation_without_settling_current_work,
     settles_and_returns_on_a_later_check_in,
     nothing_settles_without_merge_data_or_a_branch,
     blocked_work_never_settles,
