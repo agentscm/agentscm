@@ -9,6 +9,7 @@ pub mod change_record;
 pub mod change_record_http;
 mod compact;
 pub mod connection;
+pub mod context_source;
 pub mod continuity;
 pub mod conversation_sharing;
 pub mod coordination;
@@ -314,6 +315,8 @@ pub struct HubState {
     /// Days an uploaded shared-conversation body stays readable.
     shared_conversation_retention_days: i64,
     slack: Option<Arc<slack::Slack>>,
+    /// The operator-registered context source; `None` unless `hub serve` loaded one.
+    pub context_source: Option<Arc<context_source::ContextSource>>,
     workspace: Option<Arc<workspace::Workspace>>,
     #[cfg(unix)]
     workspace_execution: Option<Arc<workspace_execution::ExecutionService>>,
@@ -335,6 +338,7 @@ impl HubState {
             demo: false,
             shared_conversation_retention_days: DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS,
             slack: None,
+            context_source: None,
             workspace: None,
             #[cfg(unix)]
             workspace_execution: None,

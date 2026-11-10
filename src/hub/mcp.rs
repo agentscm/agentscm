@@ -1631,6 +1631,31 @@ async fn call(
             }
         }
     }
+    // The operator's context source adds its lines to a start that went through and names its
+    // session. A missing answer adds nothing and changes nothing above.
+    if name == "agentscm_start"
+        && !principal.read_only
+        && value["isError"] != true
+        && let Some(source) = &state.context_source
+        && let Some(requested) = params
+            .and_then(|p| p["arguments"]["session"].as_str())
+            .map(str::to_owned)
+    {
+        let (store, token) = (state.store.clone(), principal.token_id.clone());
+        let resolved = blocking(state, move || {
+            store.session_name_for(&token, Some(requested.as_str()), unix_now())
+        })
+        .await;
+        if let Ok(session) = resolved {
+            let moment = super::context_source::Moment::WorkStart;
+            let lines = source.lines(moment, principal, &session).await;
+            if let Some(block) = super::context_source::render(&lines)
+                && let Some(content) = value["content"].as_array_mut()
+            {
+                content.push(json!({"type": "text", "text": block}));
+            }
+        }
+    }
     // What the session's own person sent it from the Hub page rides on its next tool call. Only a
     // call naming its own session takes it: without one the Hub would guess the token's recent hook
     // session. An MCP call cannot say whether a subagent made it, so it takes messages only for a

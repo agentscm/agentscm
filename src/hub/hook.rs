@@ -1029,13 +1029,30 @@ impl Call {
                             unix_now(),
                         )
                     }),
-                )
-                .await;
+                );
+                // The operator's context source is asked while the status is read, never after
+                // it, and not for a subagent's session.
+                let session_name = advice.touched.session.as_str();
+                let operator_context = async {
+                    match &state.context_source {
+                        Some(source) if !self.child => {
+                            let moment = super::context_source::Moment::SessionStart;
+                            source.lines(moment, &principal, session_name).await
+                        }
+                        _ => Vec::new(),
+                    }
+                };
+                let (current_status, operator_context) =
+                    tokio::join!(current_status, operator_context);
                 // Most useful first: a host's context limit cuts the end (see `START_CONTEXT`).
                 text.push('\n');
                 match current_status {
                     Ok(Ok(facts)) => text.push_str(&super::work_http::actionable_status::render_compact_text(&facts)),
                     _ => text.push_str("Current actionable status unavailable; retry agentscm_work_status. Missing coverage does not mean clear status."),
+                }
+                if let Some(block) = super::context_source::render(&operator_context) {
+                    text.push('\n');
+                    text.push_str(&block);
                 }
                 text.push('\n');
                 text.push_str(&match briefing {
