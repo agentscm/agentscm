@@ -35,26 +35,33 @@ The Hub records three facts per session, in memory, from the session's own calls
 - the hook the session reports through (`hook:claude`, `hook:codex`, `hook:cursor`, `hook:copilot`, `hook:gemini`, `hook:generic`);
 - the agent token's label.
 
-After a Hub restart these facts are lost: a session's tier reads `unknown` until its next call.
+After a Hub restart these facts are lost: a session's tier reads `unknown` until its next hook call.
 
-From these facts the Hub derives the best tier it can use:
+Only the session a person leads is offered a message, never a subagent's. The evidence is a start, prompt or checked tool hook call from that session that carries no subagent marker (Claude Code's `agent_id`, Copilot's `agentId`). An MCP call is no evidence: a subagent makes its AgentSCM calls with its parent's session. So a client with only MCP and no hooks is never offered a message.
+
+From these facts the Hub derives the tier it can use:
 
 | Tier | Clients | When it arrives |
 | --- | --- | --- |
-| `hook` | Claude Code and Codex (the reply to `UserPromptSubmit` and to a checked `PreToolUse`, as `hookSpecificOutput.additionalContext`). Cursor (a checked edit's `additional_context`). | At the next prompt or checked tool call. No tool call is needed. |
-| `mcp` | Any MCP client, including Gemini CLI, Copilot CLI, Antigravity, Devin, Amp and opencode. | At the session's next AgentSCM tool call, as an extra text block in the result. |
-| `unknown` | A session not seen since the Hub started. | Use copy and paste from the Hub page. |
+| `hook` | Claude Code and Codex (the reply to `UserPromptSubmit` and to a checked `PreToolUse`, as `hookSpecificOutput.additionalContext`). Cursor (a checked edit's `additional_context`). Copilot's PascalCase hooks. | At the next prompt or checked tool call that is not a subagent's. No tool call is needed. |
+| `mcp` | Clients whose hook cannot carry context: Copilot CLI and Gemini CLI (or any generic hook). | At the session's next AgentSCM tool call, as an extra text block in the result. |
+| `unknown` | No top-level hook call seen since the Hub started, including every MCP-only client (Antigravity, Devin, Amp, opencode). | Use copy and paste from the Hub page. |
 
-These client hooks fall back to the `mcp` tier:
+The tier follows the client, not the first call: a Claude Code session takes its messages in its hook replies even before its first prompt, never in an MCP result.
+
+These client hooks use the `mcp` tier:
 
 - Copilot CLI's `preToolUse` has no context field.
 - Gemini CLI shows the hook's text to the person, not to the model.
+
+In the `mcp` tier the session is known to be a top-level one, but a single MCP call still cannot say whether a subagent made it, so the notice tells a subagent to leave the message for the session that started it.
 
 A refused edit's reply carries only the refusal, so a queued message waits for the next call. The start context is cut to fit the host's limit, so the Hub does not deliver a message there either. Each reply carries at most three messages.
 
 A message is never delivered:
 
-- to a subagent: hook calls from a subagent are skipped, and a session whose hook carries context takes its messages only there, since an MCP call cannot say whether a subagent made it;
+- to a subagent: hook calls from a subagent are skipped, and a session whose hook carries context takes its messages only there;
+- to a session without top-level evidence (tier `unknown`);
 - by an MCP call that names no `session`;
 - in a hook reply whose outcome is unknown, because that reply's text may be dropped.
 
@@ -90,7 +97,7 @@ The routes are for the Hub's web page only:
 - `GET /v1/hub/session/agent-messages?repository=OWNER/NAME` returns:
   - `mode`, the mode in force;
   - `default_mode` and `repository_mode`, the person's own settings;
-  - `sessions`, with `token`, `token_name`, `session`, `tier`, `name`, `version`, `hook`, `hook_context`, `mcp` and `seen_at`;
+  - `sessions`, with `token`, `token_name`, `session`, `tier`, `name`, `version`, `hook`, `hook_context`, `top_level`, `mcp` and `seen_at`;
   - `messages`, newest first.
 - `PUT /v1/hub/session/agent-messages/mode` with `{repository, this_repository, mode}` sets a mode; `mode: null` clears it.
 - `POST /v1/hub/session/agent-messages` with `{repository, token, session, work_id?, note}` queues a message and returns it (`201`). The note is 1 to 1000 bytes, with newlines allowed.
@@ -100,4 +107,4 @@ A message's `state` is `queued`, `delivered`, `accepted`, `declined`, `done` or 
 
 ## MCP
 
-`agentscm_hub_message` takes `{id, status: accepted | declined | done, session}`. An agent can answer `accepted` or `declined` while the message is `delivered`, and `done` once it is `delivered` or `accepted`.
+`agentscm_hub_message` takes `{id, status: accepted | declined | done, session}`, all three required. A call without `session` is refused with `invalid_request`, recovery `provide_field` and the field `session`: the Hub never guesses which of the token's sessions is answering. An agent can answer `accepted` or `declined` while the message is `delivered`, and `done` once it is `delivered` or `accepted`.
