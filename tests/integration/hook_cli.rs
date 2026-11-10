@@ -857,3 +857,50 @@ fn a_permission_prompt_goes_on_under_the_renewed_agent_token() {
     assert_eq!(run.stdout, "{}\n");
     assert_eq!(polls(&seen), [OLD]);
 }
+
+/// A Hub that restarted does not know the request. The hook offers the prompt again with the id
+/// it holds, and leaves a Hub alone that forgets it again at once.
+#[cfg(unix)]
+#[test]
+fn a_permission_prompt_is_offered_again_to_a_hub_that_forgot_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // The stub answers the first `forgets` polls as a Hub does that never heard of the request.
+    let forgetting = |forgets: usize| {
+        let polls = AtomicUsize::new(0);
+        serve(move |seen| {
+            let body: Value = serde_json::from_slice(&seen.body).unwrap_or(Value::Null);
+            let hash = &body["input_hash"];
+            if seen.path.starts_with("/v1/hub/permission/register") {
+                let made = json!({"request_id": "00ff", "input_hash": hash, "state": "pending"});
+                (200, made)
+            } else if !seen.path.starts_with("/v1/hub/permission/poll") {
+                (200, json!({}))
+            } else if polls.fetch_add(1, Ordering::Relaxed) < forgets {
+                (404, json!({"error": "not_found"}))
+            } else {
+                (200, answered(hash, "allow"))
+            }
+        })
+    };
+    let offers = |seen: &[Seen]| -> Vec<Value> {
+        seen.iter()
+            .filter(|seen| seen.path.starts_with("/v1/hub/permission/register"))
+            .map(|seen| serde_json::from_slice(&seen.body).unwrap())
+            .collect()
+    };
+    let (run, seen) = permission_prompt(forgetting(1), &[], |_| {});
+    assert!(
+        run.stdout.contains("\"behavior\":\"allow\""),
+        "{}",
+        run.stdout
+    );
+    let offered = offers(&seen);
+    assert_eq!(offered.len(), 2);
+    assert_eq!(
+        (offered[0].get("again"), &offered[1]["again"]),
+        (None, &json!("00ff"))
+    );
+    let (run, seen) = permission_prompt(forgetting(2), &[], |_| {});
+    assert_eq!(run.stdout, "{}\n");
+    assert_eq!(offers(&seen).len(), 2);
+}
