@@ -6,11 +6,11 @@
 //! row is read against the holder: while any hold of the same holder token keeps the file it is
 //! `pending`; once none does, the session `went_elsewhere`; when the hold's record is gone the
 //! outcome is `unknown`. A hold renewed past its cap under a new id still counts as the holder's.
+//! The refused session's own hold never does: two sessions of one token are two agents.
 //!
 //! A `notice` row is written when the Hub reported an overlap without refusing. The call that drew
-//! it always took the file (a hook-reported edit, or an MCP claim), so it is written `proceeded`:
-//! the agent was told and went ahead. That is not a dismissal of anything, so it feeds no issue
-//! total.
+//! it always took the file: its hook edit went ahead, or it claimed the file over MCP. So it is
+//! written `proceeded`. That is not a dismissal of anything, so it feeds no issue total.
 //!
 //! Only what the Hub saw is counted, and what it cannot tell is never guessed into a favourable
 //! class: `went_elsewhere` (a session that ended, or whose later hooks failed open, looks the

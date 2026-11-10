@@ -6126,7 +6126,9 @@ fn contested_in(
                AND outcome IN ('pending', 'asked')
                AND EXISTS (SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
                    WHERE p.key = $3 AND p.expires_at > $4 AND i.token =
-                       (SELECT h.token FROM hub_intents h WHERE h.id = hub_contested_edits.hold))",
+                       (SELECT h.token FROM hub_intents h WHERE h.id = hub_contested_edits.hold)
+                     AND i.id NOT IN (SELECT s.intent FROM hub_sessions s
+                       WHERE s.token = $1 AND s.session = $2 AND s.intent IS NOT NULL))",
             &[&token, &session, key, &now],
         )?;
     }
@@ -6141,7 +6143,7 @@ fn contested_in(
         }));
     let mut wrote = false;
     for (key, hold, kind) in rows {
-        // The call that drew a notice took the file: the agent was told and went ahead.
+        // The call that drew a notice took the file: its hook edit went ahead, or it claimed it.
         let (outcome, resolved_at) = if kind == "notice" {
             ("proceeded", Some(now))
         } else {
@@ -6220,7 +6222,10 @@ fn contested_facts(
             "SELECT c.kind, c.outcome, c.observed_at,
                  EXISTS (SELECT 1 FROM hub_intent_paths p JOIN hub_intents i ON i.id = p.intent
                      WHERE p.key = c.path AND p.expires_at > $4 AND i.token =
-                         (SELECT h.token FROM hub_intents h WHERE h.id = c.hold)),
+                         (SELECT h.token FROM hub_intents h WHERE h.id = c.hold)
+                       AND i.id NOT IN (SELECT s.intent FROM hub_sessions s
+                         WHERE s.token = c.token AND s.session = c.session
+                           AND s.intent IS NOT NULL)),
                  EXISTS (SELECT 1 FROM hub_intents i WHERE i.id = c.hold)
              FROM hub_contested_edits c
              WHERE c.repository = $1 AND c.observed_at >= $2 AND c.observed_at <= $3
@@ -6299,7 +6304,8 @@ fn overhead_facts(
         )?
         .get(0);
     // Calls this process dropped, or has not written yet, are missing from the rows.
-    let complete = complete(rows.len(), since, now, pruned) && super::hook_overhead::all_written();
+    let complete = complete(rows.len(), since, now, pruned)
+        && super::hook_overhead::all_written(repository, since, until);
     Ok((rows.into_iter().take(MAX_READ).collect(), complete))
 }
 

@@ -243,6 +243,28 @@ mod tests {
     }
 
     #[test]
+    fn two_unanswered_calls_at_once_keep_both_reports_and_send_each_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = || Pending::load(Some(dir.path()), "claude", Some("s1"));
+        load().settle(Duration::from_millis(5000), Sent::TimedOut);
+        load().settle(Duration::from_millis(5000), Sent::TimedOut);
+        // The first call takes both waiting counts; the second starts with nothing.
+        let (first, second) = (load(), load());
+        let carried = counts(&first);
+        assert_eq!(carried.calls, 2);
+        assert_eq!(second.header(), None);
+        first.settle(Duration::from_millis(10), Sent::TimedOut);
+        second.settle(Duration::from_millis(20), Sent::TimedOut);
+        // The unanswered report goes again unchanged, once; then the two new counts.
+        let resent = load();
+        assert_eq!(counts(&resent), carried);
+        resent.settle(Duration::from_millis(30), Sent::Answered);
+        let next = counts(&load());
+        assert_eq!((next.calls, next.timeouts), (3, 2));
+        assert_ne!(next.id, carried.id);
+    }
+
+    #[test]
     fn stale_session_directories_are_removed_when_a_new_one_starts() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("hook-report");

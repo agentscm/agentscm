@@ -14,7 +14,6 @@
 //! id once per session, so a report the client sends again after a timeout is not added twice.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -179,22 +178,112 @@ type Key = (usize, String, Option<String>, String, String);
 /// A token as the store verified it: store, digest and the repository the call named.
 type Token = (usize, String, Option<String>);
 
+/// A session's calls not written yet, and when the first of them came (Unix seconds).
+#[derive(Clone)]
+struct Waiting {
+    sample: Sample,
+    first_at: i64,
+}
+
+/// The report ids last counted for a session, and when it last sent one.
+struct Ids {
+    ids: VecDeque<u64>,
+    at: Instant,
+}
+
 #[derive(Default)]
 struct Pending {
     /// Totals of sessions whose token the store verified.
-    totals: BTreeMap<Key, Sample>,
+    totals: BTreeMap<Key, Waiting>,
     /// Totals of sessions whose token is not verified yet; the next write checks them.
-    unverified: BTreeMap<Key, Sample>,
-    verified: BTreeMap<Token, Instant>,
-    /// Report ids already counted, per session.
-    seen: BTreeMap<Key, VecDeque<u64>>,
+    unverified: BTreeMap<Key, Waiting>,
+    /// When the store last accepted each token, and the repository the token belongs to.
+    verified: BTreeMap<Token, (Instant, String)>,
+    /// Report ids already counted, per session, apart for verified and unverified tokens so
+    /// made-up tokens cannot push out real sessions' ids.
+    seen: BTreeMap<Key, Ids>,
+    seen_unverified: BTreeMap<Key, Ids>,
+    /// When a call was last dropped for lack of room, per repository ("" when not known).
+    dropped: BTreeMap<String, i64>,
     /// Stores with a write scheduled.
     scheduled: BTreeSet<usize>,
 }
 
+impl Pending {
+    /// The repository a waiting total counts for: the token's own once verified, else the one
+    /// the call named; None when neither is known.
+    fn repository<'a>(&'a self, key: &'a Key) -> Option<&'a str> {
+        self.verified
+            .get(&(key.0, key.1.clone(), key.2.clone()))
+            .map(|(_, repository)| repository.as_str())
+            .or(key.2.as_deref())
+    }
+
+    /// Adds `sample` to the total at `key` in the verified or unverified table, or counts it as
+    /// dropped when that table is full.
+    fn add(&mut self, verified: bool, key: Key, sample: &Sample, first_at: i64) {
+        let repository = self.repository(&key).unwrap_or_default().to_owned();
+        let (table, limit) = if verified {
+            (&mut self.totals, MAX_PENDING)
+        } else {
+            (&mut self.unverified, MAX_UNVERIFIED)
+        };
+        let held = table.len();
+        match table.get_mut(&key) {
+            Some(total) => {
+                total.sample.add(sample);
+                total.first_at = total.first_at.min(first_at);
+            }
+            None if held < limit => {
+                table.insert(
+                    key,
+                    Waiting {
+                        sample: sample.clone(),
+                        first_at,
+                    },
+                );
+            }
+            None => {
+                // Repository names of unverified calls come from the client, so they are bounded.
+                let repository = if self.dropped.len() < MAX_UNVERIFIED || verified {
+                    repository
+                } else {
+                    String::new()
+                };
+                self.dropped.insert(repository, super::store::unix_now());
+            }
+        }
+    }
+}
+
+/// Whether `table` already counted report `id` for `key`; records it if not. A full table
+/// forgets the session that sent a report longest ago, never every session at once.
+fn counted_before(table: &mut BTreeMap<Key, Ids>, limit: usize, key: &Key, id: u64) -> bool {
+    if !table.contains_key(key) && table.len() >= limit {
+        let oldest = table
+            .iter()
+            .min_by_key(|(_, ids)| ids.at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            table.remove(&oldest);
+        }
+    }
+    let entry = table.entry(key.clone()).or_insert_with(|| Ids {
+        ids: VecDeque::new(),
+        at: Instant::now(),
+    });
+    entry.at = Instant::now();
+    if entry.ids.contains(&id) {
+        return true;
+    }
+    if entry.ids.len() == SEEN_PER_SESSION {
+        entry.ids.pop_front();
+    }
+    entry.ids.push_back(id);
+    false
+}
+
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
-/// Hook calls not counted in this process because the memory tables were full.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 fn pending() -> std::sync::MutexGuard<'static, Option<Pending>> {
     PENDING.lock().unwrap_or_else(|p| p.into_inner())
@@ -204,26 +293,29 @@ fn store_key(state: &super::HubState) -> usize {
     std::sync::Arc::as_ptr(&state.store).cast::<()>() as usize
 }
 
-/// Adds `sample` to the total at `key` in `table`, or drops it when the table is full.
-fn add_to(table: &mut BTreeMap<Key, Sample>, limit: usize, key: Key, sample: &Sample) {
-    let held = table.len();
-    match table.get_mut(&key) {
-        Some(total) => total.add(sample),
-        None if held < limit => {
-            table.insert(key, sample.clone());
-        }
-        None => {
-            DROPPED.fetch_add(sample.hub_calls, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Whether every hook call this process saw is in the store: none dropped, none waiting.
-pub fn all_written() -> bool {
-    DROPPED.load(Ordering::Relaxed) == 0
-        && pending()
-            .as_ref()
-            .is_none_or(|p| p.totals.is_empty() && p.unverified.is_empty())
+/// Whether the store holds every hook call this process saw for `repository` in the window from
+/// `since` to `until`: none dropped in it, and none waiting longer than a write takes. Calls of
+/// the last [`FLUSH_EVERY`] or two are on their way and do not make a read partial.
+pub fn all_written(repository: &str, since: i64, until: i64) -> bool {
+    let overdue = super::store::unix_now() - 2 * FLUSH_EVERY.as_secs() as i64;
+    let guard = pending();
+    let Some(pending) = guard.as_ref() else {
+        return true;
+    };
+    let dropped = [repository, ""]
+        .iter()
+        .filter_map(|name| pending.dropped.get(*name))
+        .any(|at| *at >= since);
+    let waiting = pending
+        .totals
+        .iter()
+        .chain(&pending.unverified)
+        .any(|(key, waiting)| {
+            pending.repository(key).is_none_or(|r| r == repository)
+                && waiting.first_at <= until
+                && waiting.first_at < overdue
+        });
+    !dropped && !waiting
 }
 
 /// Adds the call to its session's in-memory total; no store call. The first call since the last
@@ -251,57 +343,59 @@ pub fn record(
     let schedule = {
         let mut guard = pending();
         let pending = guard.get_or_insert_with(Pending::default);
-        if let Some(id) = sample.client.and_then(|client| client.id) {
-            if pending.seen.len() >= MAX_PENDING && !pending.seen.contains_key(&key) {
-                // shortcut: forgetting every session's ids can count a resent report twice once
-                // in this many sessions; a per-session expiry would fix it if that ever matters.
-                pending.seen.clear();
-            }
-            let seen = pending.seen.entry(key.clone()).or_default();
-            if seen.contains(&id) {
-                sample.client = None;
-            } else {
-                if seen.len() == SEEN_PER_SESSION {
-                    seen.pop_front();
-                }
-                seen.push_back(id);
-            }
-        }
         let verified = pending
             .verified
             .get(&token)
-            .is_some_and(|at| at.elapsed() < VERIFIED_FOR);
-        if verified {
-            add_to(&mut pending.totals, MAX_PENDING, key, &sample);
-        } else {
-            add_to(&mut pending.unverified, MAX_UNVERIFIED, key, &sample);
+            .is_some_and(|(at, _)| at.elapsed() < VERIFIED_FOR);
+        if let Some(id) = sample.client.and_then(|client| client.id) {
+            let other = if verified {
+                &pending.seen_unverified
+            } else {
+                &pending.seen
+            };
+            let before = other.get(&key).is_some_and(|ids| ids.ids.contains(&id))
+                || if verified {
+                    counted_before(&mut pending.seen, MAX_PENDING, &key, id)
+                } else {
+                    counted_before(&mut pending.seen_unverified, MAX_UNVERIFIED, &key, id)
+                };
+            if before {
+                sample.client = None;
+            }
         }
+        pending.add(verified, key, &sample, super::store::unix_now());
         pending.scheduled.insert(store)
     };
-    if schedule {
-        schedule_flush(state);
+    if schedule && !schedule_flush(state) {
+        pending()
+            .get_or_insert_with(Pending::default)
+            .scheduled
+            .remove(&store);
     }
 }
 
-/// Writes this store's totals [`FLUSH_EVERY`] from now. A plain function, so `flush` can schedule
-/// itself without checking its own future's `Send` from inside its definition.
-fn schedule_flush(state: &super::HubState) {
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        let state = state.clone();
-        runtime.spawn(async move {
-            tokio::time::sleep(FLUSH_EVERY).await;
-            flush(&state).await;
-        });
-    }
+/// Writes this store's totals [`FLUSH_EVERY`] from now; false when there is no runtime to run
+/// the write. A plain function, so `flush` can schedule itself without checking its own
+/// future's `Send` from inside its definition.
+fn schedule_flush(state: &super::HubState) -> bool {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    let state = state.clone();
+    runtime.spawn(async move {
+        tokio::time::sleep(FLUSH_EVERY).await;
+        flush(&state).await;
+    });
+    true
 }
 
 /// Writes every waiting total of this Hub's store, each session in its own store transaction,
-/// in one background store call. A token the store does not accept loses its totals. When a
-/// write fails, the totals from that one on are kept for the next write and those before it,
-/// already committed, are not.
+/// in one background store call. A token the store does not accept loses its totals. A total
+/// whose write fails is kept for the next write and the rest are still written; after two
+/// failures in a row the store is taken to be unavailable and every total not written is kept.
 pub async fn flush(state: &super::HubState) {
     let store_id = store_key(state);
-    let taken: Vec<(Key, Sample)> = {
+    let taken: Vec<(Key, Waiting)> = {
         let mut guard = pending();
         let Some(pending) = guard.as_mut() else {
             return;
@@ -321,29 +415,38 @@ pub async fn flush(state: &super::HubState) {
         return;
     }
     let store = state.store.clone();
-    let writing = taken.clone();
-    fn accepted(
-        checked: BTreeMap<(String, Option<String>), Option<super::store::Principal>>,
-    ) -> BTreeSet<(String, Option<String>)> {
+    let writing: Vec<(Key, Sample)> = taken
+        .iter()
+        .map(|(key, waiting)| (key.clone(), waiting.sample.clone()))
+        .collect();
+    type Checked = BTreeMap<(String, Option<String>), Option<super::store::Principal>>;
+    fn accepted(checked: Checked) -> BTreeMap<(String, Option<String>), String> {
         checked
             .into_iter()
-            .filter_map(|(token, principal)| principal.map(|_| token))
+            .filter_map(|(token, principal)| principal.map(|p| (token, p.repository)))
             .collect()
     }
-    // (tokens the store accepted, index of the first total not written)
+    // (tokens the store accepted with their repository, indexes of the totals not written)
     let written = super::http::blocking(state, move || {
         let now = super::store::unix_now();
         // Each token is checked once per write; None is a token the store does not accept.
-        let mut checked: BTreeMap<(String, Option<String>), Option<super::store::Principal>> =
-            BTreeMap::new();
+        let mut checked = Checked::new();
+        let mut failed = Vec::new();
+        let mut in_a_row = 0;
         for (at, ((_, digest, repo, ..), sample)) in writing.iter().enumerate() {
+            if in_a_row == 2 {
+                failed.extend(at..writing.len());
+                break;
+            }
             let token = (digest.clone(), repo.clone());
             if !checked.contains_key(&token) {
                 let Ok(parsed) = super::store::TokenDigest::from_persisted(digest) else {
                     continue;
                 };
                 let Ok(found) = store.authenticate(&parsed, now) else {
-                    return Ok((accepted(checked), Some(at)));
+                    failed.push(at);
+                    in_a_row += 1;
+                    continue;
                 };
                 let found = found
                     .filter(|principal| !principal.read_only)
@@ -357,38 +460,46 @@ pub async fn flush(state: &super::HubState) {
                 .hook_overhead(&principal.token_id, &principal.repository, sample, now)
                 .is_err()
             {
-                return Ok((accepted(checked), Some(at)));
+                failed.push(at);
+                in_a_row += 1;
+            } else {
+                in_a_row = 0;
             }
         }
-        Ok((accepted(checked), None))
+        Ok((accepted(checked), failed))
     })
     .await;
-    let (accepted, unwritten) = match written {
-        Ok((accepted, failed_at)) => (accepted, failed_at.unwrap_or(taken.len())),
+    let (accepted, failed) = match written {
+        Ok(written) => written,
         // The store call never ran (no free permit): nothing was written.
-        Err(_) => (BTreeSet::new(), 0),
+        Err(_) => (BTreeMap::new(), (0..taken.len()).collect()),
     };
-    let left = unwritten < taken.len();
+    let left = !failed.is_empty();
     let again = {
         let mut guard = pending();
         let pending = guard.get_or_insert_with(Pending::default);
         let now = Instant::now();
-        for (digest, repo) in accepted {
-            pending.verified.insert((store_id, digest, repo), now);
+        for ((digest, repo), repository) in accepted {
+            pending
+                .verified
+                .insert((store_id, digest, repo), (now, repository));
         }
-        for (key, sample) in taken.into_iter().skip(unwritten) {
-            let token = (key.0, key.1.clone(), key.2.clone());
-            if pending.verified.contains_key(&token) {
-                add_to(&mut pending.totals, MAX_PENDING, key, &sample);
-            } else {
-                add_to(&mut pending.unverified, MAX_UNVERIFIED, key, &sample);
+        let failed: BTreeSet<usize> = failed.into_iter().collect();
+        for (at, (key, waiting)) in taken.into_iter().enumerate() {
+            if failed.contains(&at) {
+                let token = (key.0, key.1.clone(), key.2.clone());
+                let verified = pending.verified.contains_key(&token);
+                pending.add(verified, key, &waiting.sample, waiting.first_at);
             }
         }
         // Totals a failed write put back are retried by the timer, not left for the next call.
         (left || !pending.unverified.is_empty()) && pending.scheduled.insert(store_id)
     };
-    if again {
-        schedule_flush(state);
+    if again && !schedule_flush(state) {
+        pending()
+            .get_or_insert_with(Pending::default)
+            .scheduled
+            .remove(&store_id);
     }
 }
 
@@ -625,8 +736,34 @@ mod tests {
             .iter()
             .chain(&pending.unverified)
             .filter(|((store, ..), _)| *store == store_key(state))
-            .map(|(_, sample)| sample.clone())
+            .map(|(_, waiting)| waiting.sample.clone())
             .collect()
+    }
+
+    /// Makes every waiting total of this store look older than a write takes.
+    fn age(state: &super::super::HubState) {
+        let mut guard = pending();
+        let pending = guard.as_mut().unwrap();
+        for (key, waiting) in pending
+            .totals
+            .iter_mut()
+            .chain(pending.unverified.iter_mut())
+        {
+            if key.0 == store_key(state) {
+                waiting.first_at -= 3600;
+            }
+        }
+    }
+
+    fn verify(state: &super::super::HubState, token: &str, repository: &str) {
+        let digest = super::super::store::agent_token_digest(token).unwrap();
+        pending()
+            .get_or_insert_with(Pending::default)
+            .verified
+            .insert(
+                (store_key(state), digest.as_str().to_owned(), None),
+                (Instant::now(), repository.into()),
+            );
     }
 
     #[test]
@@ -653,39 +790,66 @@ mod tests {
         assert_eq!((totals[0].hub_calls, totals[0].injected_other), (3, 30));
         let client = totals[0].client.unwrap();
         assert_eq!((client.calls, client.timeouts), (6, 2));
-        assert!(!all_written());
+        // Calls of the last write period are on their way; once overdue the read is partial.
+        assert!(all_written("r", 0, i64::MAX));
+        age(&state);
+        assert!(!all_written("r", 0, i64::MAX));
     }
 
     #[test]
     fn unverified_tokens_cannot_crowd_out_verified_ones_and_drops_are_reported() {
         let (_dir, state) = hub();
         let real = "6".repeat(64);
-        let digest = super::super::store::agent_token_digest(&real).unwrap();
-        pending()
-            .get_or_insert_with(Pending::default)
-            .verified
-            .insert(
-                (store_key(&state), digest.as_str().to_owned(), None),
-                Instant::now(),
-            );
+        verify(&state, &real, "r");
+        let report = Some(ClientReport {
+            id: Some(1),
+            calls: 2,
+            ms_total: 10,
+            ms_max: 5,
+            ..Default::default()
+        });
+        record(&state, Some(&real), None, one("real", report));
         // A flood of sessions under a token the store has not verified fills only its own table.
         for n in 0..MAX_UNVERIFIED + 10 {
             record(
                 &state,
                 Some(&"7".repeat(64)),
                 None,
-                one(&format!("fake{n}"), None),
+                one(
+                    &format!("fake{n}"),
+                    Some(ClientReport {
+                        id: Some(n as u64),
+                        ..Default::default()
+                    }),
+                ),
             );
         }
-        assert_eq!(DROPPED.load(Ordering::Relaxed), 10);
-        // The verified token is still counted.
-        record(&state, Some(&real), None, one("real", None));
-        assert!(
-            waiting(&state)
-                .iter()
-                .any(|sample| sample.session == "real")
-        );
-        assert!(!all_written(), "dropped calls make the read partial");
+        // The verified token is still counted, and its report ids were not pushed out: the
+        // resent report 1 is not counted again.
+        record(&state, Some(&real), None, one("real", report));
+        let real = waiting(&state)
+            .into_iter()
+            .find(|sample| sample.session == "real")
+            .unwrap();
+        assert_eq!((real.hub_calls, real.client.unwrap().calls), (2, 2));
+        // Drops of calls naming no repository make every read partial from then on, and no
+        // read of an earlier window.
+        let now = super::super::store::unix_now();
+        assert!(!all_written("r", now - 60, i64::MAX));
+        assert!(all_written("r", now + 60, i64::MAX));
+    }
+
+    #[test]
+    fn a_waiting_total_makes_only_its_own_repository_partial() {
+        let (_dir, state) = hub();
+        let token = "8".repeat(64);
+        verify(&state, &token, "a");
+        record(&state, Some(&token), None, one("s", None));
+        age(&state);
+        assert!(!all_written("a", 0, i64::MAX));
+        assert!(all_written("b", 0, i64::MAX));
+        // A window that ended before the calls came is not missing them.
+        assert!(all_written("a", 0, 0));
     }
 
     #[test]

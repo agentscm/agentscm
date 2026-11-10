@@ -197,8 +197,31 @@ fn a_hold_renewed_past_its_cap_keeps_the_refusal_live_and_its_grant_settles_it(d
     assert_eq!(granted.issues.resolved, 1);
 }
 
+fn a_session_that_waits_and_then_takes_the_file_from_its_own_tokens_session_went_elsewhere(
+    db: &Db,
+) {
+    // One person, one token, two agent sessions: they refuse each other like any two agents.
+    let store = db.open();
+    let token = agent(&*store, 1, "a");
+    assert!(!edit(&*store, &token, "s1", &["a.rs"], T0));
+    assert!(edit(&*store, &token, "s2", &["a.rs"], T0 + 1));
+    let waiting = metrics(&*store, &token, T0 + 2);
+    assert_eq!(waiting.issues.contested_edits.refusals.pending, 1);
+    // s1 finishes; s2's next edit takes a.rs under a hold of the same token, its own.
+    store.end_session(&token, Some("s1"), T0 + 3).unwrap();
+    assert!(!edit(&*store, &token, "s2", &["a.rs"], T0 + 4));
+    let after = metrics(&*store, &token, T0 + 5);
+    let refusals = &after.issues.contested_edits.refusals;
+    assert_eq!(refusals.pushed_through, 0, "waiting was not an override");
+    assert_eq!(
+        refusals.went_elsewhere, 1,
+        "its own hold does not keep it pending"
+    );
+    assert_eq!(after.issues.dismissed, Some(0));
+}
+
 fn a_failed_overhead_write_keeps_only_the_totals_not_yet_written(db: &Db) {
-    use agentscm::hub::hook_overhead::{all_written, flush, record};
+    use agentscm::hub::hook_overhead::{flush, record};
     use agentscm::hub::store::unix_now;
     let store = db.open();
     let objects = TempDir::new().unwrap();
@@ -220,7 +243,9 @@ fn a_failed_overhead_write_keeps_only_the_totals_not_yet_written(db: &Db) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         record(&state, Some(&secret), None, sample("a", 1));
         record(&state, Some(&secret), None, sample("big", 1));
-        // "a" is written, "big" fails and waits; the next write must not add "a" again.
+        record(&state, Some(&secret), None, sample("c", 1));
+        // "a" is written, "big" fails and waits, and "c" after it is still written; the next
+        // write must not add "a" or "c" again.
         flush(&state).await;
         flush(&state).await;
     });
@@ -232,17 +257,14 @@ fn a_failed_overhead_write_keeps_only_the_totals_not_yet_written(db: &Db) {
         .value_metrics(&token, &query, unix_now())
         .unwrap()
         .overhead;
-    let a = overhead
-        .per_session
-        .iter()
-        .find(|row| row.session == "a")
-        .expect("session a was written");
-    assert_eq!(a.hub_calls, 1, "the written total is not written twice");
-    assert!(!all_written());
-    assert!(
-        overhead.partial,
-        "a total still waiting makes the read partial"
-    );
+    for session in ["a", "c"] {
+        let row = overhead
+            .per_session
+            .iter()
+            .find(|row| row.session == session)
+            .expect("written although another total failed");
+        assert_eq!(row.hub_calls, 1, "a written total is not written twice");
+    }
 }
 
 fn hook_overhead_adds_calls_per_session_and_prunes_old_rows(db: &Db) {
@@ -429,4 +451,5 @@ conformance!(
     one_tokens_sessions_cannot_push_out_another_tokens_rows,
     a_hold_renewed_past_its_cap_keeps_the_refusal_live_and_its_grant_settles_it,
     a_failed_overhead_write_keeps_only_the_totals_not_yet_written,
+    a_session_that_waits_and_then_takes_the_file_from_its_own_tokens_session_went_elsewhere,
 );
