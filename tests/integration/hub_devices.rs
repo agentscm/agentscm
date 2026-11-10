@@ -2787,15 +2787,6 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
     assert_eq!(status, 201, "{minted}");
     let alice = minted["token"].as_str().unwrap().to_owned();
     let path = "/v1/hub/standup/repositories";
-
-    // A forge that cannot answer is counted, never named.
-    env.fake.lock().unwrap().hub_reads_roles = false;
-    let (status, body) = env.get(path, &alice).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["repositories"], json!([]));
-    assert_eq!(body["unchecked"], 4);
-    env.fake.lock().unwrap().hub_reads_roles = true;
-
     let host = env.base.trim_start_matches("http://").to_owned();
     let user = |user_id: i64, login: &str| {
         env.store
@@ -2813,11 +2804,29 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
     let (_, who) = env.get("/v1/hub/whoami", &alice).await;
     let alice_id = user(ALICE, who["owner"]["login"].as_str().unwrap());
     let bob_id = user(BOB, "bob");
-    let start = |owner: &str, repository: (&str, i64), n: usize, session: &str| {
+    // Each fresh read needs its own token: one token gets its last answer back for 30 seconds.
+    let fresh = |name: &str, read_only: bool| {
+        mint_bound_agent_token(&*env.store, &alice_id, name, REPO, REPO_ID, 600, read_only)
+            .unwrap()
+            .1
+    };
+
+    // A forge that cannot answer is counted, never named, and the answer is not complete.
+    env.fake.lock().unwrap().hub_reads_roles = false;
+    let (status, body) = env.get(path, fresh("probe", false).expose()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["repositories"], json!([]));
+    assert_eq!(
+        (&body["unchecked"], &body["complete"]),
+        (&json!(4), &json!(false))
+    );
+    env.fake.lock().unwrap().hub_reads_roles = true;
+
+    let start = |owner: &str, name: &str, repository: (&str, i64), n: usize, session: &str| {
         let (bound, _, _) = mint_bound_agent_token(
             &*env.store,
             owner,
-            &format!("agent-{n}"),
+            name,
             repository.0,
             repository.1,
             600,
@@ -2848,24 +2857,34 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
                 unix_now(),
             )
             .unwrap();
+        bound
     };
     // More of alice's Work in acme/widgets than one repository lists.
     for n in 0..11 {
-        start(&alice_id, (REPO, REPO_ID), n, &format!("alice-{n}"));
+        start(
+            &alice_id,
+            &format!("agent-{n}"),
+            (REPO, REPO_ID),
+            n,
+            &format!("alice-{n}"),
+        );
     }
-    // Bob's Work in acme/docs, which alice can read.
-    start(&bob_id, ("acme/docs", 4343), 99, "bob-session");
+    // Bob's Work in acme/docs, which alice can read, led by an older client whose label names
+    // its host.
+    let bob_token = start(
+        &bob_id,
+        "client-bobs-laptop-a1b2c3",
+        ("acme/docs", 4343),
+        99,
+        "bob-session",
+    );
+    let digest = agentscm::hub::store::lower_hex_of(
+        format!("agentscm.hub.session-view.v1\0{bob_token}\0bob-session").as_bytes(),
+    )[..16]
+        .to_owned();
 
-    let (_, reader, _) = mint_bound_agent_token(
-        &*env.store,
-        &alice_id,
-        "alice-reader",
-        REPO,
-        REPO_ID,
-        600,
-        true,
-    )
-    .unwrap();
+    let reader = fresh("alice-reader", true);
+    let mut first = Value::Null;
     for token in [alice.as_str(), reader.expose()] {
         let (status, body) = env.get(path, token).await;
         assert_eq!(status, 200, "{body}");
@@ -2877,8 +2896,12 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
             .collect();
         assert_eq!(names, ["acme/docs", REPO], "{body}");
         assert_eq!(
-            (&body["unchecked"], &body["complete"]),
-            (&json!(0), &json!(true))
+            (
+                &body["unchecked"],
+                &body["complete"],
+                &body["work_complete"]
+            ),
+            (&json!(0), &json!(true), &json!(true))
         );
         let docs = &body["repositories"][0];
         assert_eq!(docs["work_complete"], true);
@@ -2891,9 +2914,13 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
             (&theirs["blocked"], &theirs["waiting"]),
             (&json!(false), &json!(false))
         );
-        assert_ne!(
-            theirs["lead_session"], "bob-session",
+        assert_eq!(
+            theirs["lead_session"], digest,
             "another owner's session is digested"
+        );
+        assert_eq!(
+            theirs["lead_agent"], "client-host-a1b2c3",
+            "its host name is masked"
         );
         let widgets = &body["repositories"][1];
         assert_eq!(widgets["work"].as_array().unwrap().len(), 10);
@@ -2906,7 +2933,28 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
                 .all(|item| item["lead_session"].as_str().unwrap().starts_with("alice-")),
             "alice's own sessions stay as stored"
         );
+        if first.is_null() {
+            first = body;
+        }
     }
+
+    // Losing access shows on the next fresh read: the role is asked, not cached.
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.remove(&("acme/docs".into(), ALICE));
+        fake.levels.remove(&(4343, ALICE));
+    }
+    let (_, body) = env.get(path, fresh("after-revoke", false).expose()).await;
+    let names: Vec<_> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["repository"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [REPO], "{body}");
+    // The token that asked within the last 30 seconds gets its earlier answer back.
+    let (_, again) = env.get(path, &alice).await;
+    assert_eq!(again, first);
 
     // The MCP tool is the same read.
     let (status, reply) = env

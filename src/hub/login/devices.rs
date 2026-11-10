@@ -837,6 +837,15 @@ async fn repositories_for_owner(
 /// Work items the agent read lists per repository, and in all.
 const AGENT_WORK_PER_REPOSITORY: usize = 10;
 const AGENT_WORK_TOTAL: usize = 100;
+/// How long one token gets its last agent read back instead of a new one, so a polling agent
+/// cannot spend the connection's forge rate limit on role checks. Only that token's own answer
+/// is reused, and only a successful one.
+const AGENT_READ_REUSE_SECONDS: i64 = 30;
+
+/// The last successful agent read per token, with the time it stops being reused.
+static AGENT_READS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (i64, Value)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// `GET /v1/hub/standup/repositories`: the agent read of [`agent_repositories`].
 async fn agent_repositories_route(
@@ -846,14 +855,27 @@ async fn agent_repositories_route(
     agent_repositories(&state, &principal).await.map(Json)
 }
 
-/// The repositories on this Hub the token's owner can read now, by the same role check and cache
-/// as the All repositories page, each with its current unfinished Work in brief, as the owner may
-/// see it. Repositories the forge could not answer for are counted in `unchecked`, never named,
-/// as on that page. Each list says whether it was cut.
+/// The repositories on this Hub the token's owner can read now, each with its current unfinished
+/// Work in brief, as the owner may see it. Every repository is checked with the forge as the All
+/// repositories page checks it, but without its role cache, because this read returns Work
+/// details. Repositories the forge could not answer for are counted in `unchecked`, never named,
+/// because a name could reveal that a private repository exists. A token asking again within
+/// [`AGENT_READ_REUSE_SECONDS`] gets its previous answer back, `checked_at` unchanged.
 pub(in crate::hub) async fn agent_repositories(
     state: &HubState,
     principal: &Principal,
 ) -> ApiResult<Value> {
+    let now = unix_now();
+    let reads = || {
+        AGENT_READS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some((until, value)) = reads().get(&principal.token_id)
+        && *until > now
+    {
+        return Ok(value.clone());
+    }
     let owner = principal.owner.clone();
     allow_listed(state, &owner, "agent_repositories").await?;
     let (store, host) = (state.store.clone(), owner.identity.host.clone());
@@ -861,14 +883,14 @@ pub(in crate::hub) async fn agent_repositories(
         store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
     })
     .await?;
-    let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
+    let all_candidates = candidates.len() <= super::MAX_SIGN_IN_PROBES;
     candidates.truncate(super::MAX_SIGN_IN_PROBES);
-    let (mut readable, unchecked) = readable(state, &owner, candidates, true).await;
+    let (mut readable, unchecked) = readable(state, &owner, candidates, false).await;
     readable.sort_by(|a, b| a.full_name.cmp(&b.full_name));
     let store = state.store.clone();
-    let rows = blocking(state, move || {
+    let (rows, work_complete) = blocking(state, move || {
         let now = unix_now();
-        let mut left = AGENT_WORK_TOTAL;
+        let (mut left, mut work_complete) = (AGENT_WORK_TOTAL, true);
         let mut rows = Vec::with_capacity(readable.len());
         for repo in readable {
             let overview = super::super::viewer::shown(
@@ -881,11 +903,10 @@ pub(in crate::hub) async fn agent_repositories(
                 )?,
                 &owner.id,
             );
-            let shown = overview
-                .current
-                .len()
-                .min(AGENT_WORK_PER_REPOSITORY)
-                .min(left);
+            let listed = overview.current.len().min(AGENT_WORK_PER_REPOSITORY);
+            let shown = listed.min(left);
+            // The overall cap, not this repository's own, cut its list.
+            work_complete &= shown == listed;
             left -= shown;
             let work = overview.current[..shown]
                 .iter()
@@ -901,13 +922,19 @@ pub(in crate::hub) async fn agent_repositories(
                 "work_complete": overview.current_complete && shown == overview.current.len()}),
             );
         }
-        Ok(rows)
+        Ok((rows, work_complete))
     })
     .await?;
-    Ok(
-        json!({"repositories": rows, "unchecked": unchecked, "complete": complete,
-        "checked_at": unix_now()}),
-    )
+    let value = json!({"repositories": rows, "unchecked": unchecked,
+        "complete": all_candidates && unchecked == 0, "work_complete": work_complete,
+        "checked_at": now});
+    let mut reads = reads();
+    reads.retain(|_, (until, _)| *until > now);
+    reads.insert(
+        principal.token_id.clone(),
+        (now + AGENT_READ_REUSE_SECONDS, value.clone()),
+    );
+    Ok(value)
 }
 
 /// A stable change marker for actionable items, without returning paths or token values.
