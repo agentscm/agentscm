@@ -519,8 +519,9 @@ a `MessageDisplay` keyed by its transcript entry, so a repeat is a duplicate. Re
 the session claimed Work, or where this build first saw the session: replies before that are never
 recovered. The texts already seen and the read offset are kept per session in the same private
 directory, under a lock, and a session start removes files there untouched for 7 days. Every deferred occurrence reserves a replay-stable sequence, including
-events with provider identities. An unresolved `PreToolUse` also captures the source and canonical
-recipe digest at that time when possible. If that observed session already had an exact authorized
+events with provider identities. An unresolved `PreToolUse` that matches an action rule also captures
+the source and canonical recipe digest at that time when possible; other tool events skip the Git
+scan, as they do for claimed Work. If that observed session already had an exact authorized
 target, the deferred record copies that target and the next reachable hook makes the outage visible
 under that exact work, generation, and canonical session. A later resumed generation cannot absorb
 the old gap. When the observed and canonical ids are identical, the next retained event exposes the
