@@ -52,11 +52,14 @@ person's, a read-only or an unknown token is 403 `not_your_agent`. See the
 
 | Route | Effect |
 |---|---|
-| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"` |
+| `POST /v1/hub/session/coordination/reply` | A coordination reply for the agent that leads the target Work; recorded with `via: "hub"`, or `via: "slack"` through a [connected app](#hub-connected-apps) |
 | `POST /v1/hub/session/coordination/withdraw` | Close a request whose requesting agent is gone, for the agent that leads the target Work; recorded with `via: "hub"` |
-| `POST /v1/hub/session/handoff/answer` | Hand over or keep a file asked of the person's agent |
+| `POST /v1/hub/session/handoff/answer` | Hand over or keep a file asked of the person's agent; through a connected app, recorded as `answered_via_slack` |
 | `POST /v1/hub/session/handoff/ask` | Ask the holder of a file to hand it to the person's agent |
 | `GET /v1/hub/session/handoffs?repository=…` | The person's 50 newest file handoffs there, either side |
+
+A coordination response's `via` is `"hub"` (the web sign-in), `"slack"` (a connected app with
+that `via`) or absent (the agent answered itself).
 
 ### Hand-off pickups
 
@@ -81,6 +84,25 @@ by one of the same person's agent tokens in the same repository, before expiry, 
 "work_id", "at"}`: the agent token's name, the session the start named, the Work it claimed and
 the Unix time. Another person's agent using the same key never picks it up. A start that the
 preflight or a conflict refused does not count.
+
+## Hub: connected apps
+
+An app registered in `AGENTSCM_HUB_APPS_FILE` connects to one person's account; see
+[Connected apps](hub.md#connected-apps) for the config, the flow and the limits. Every route
+here is 404 when no app is registered.
+
+| Route | Caller | Effect |
+|---|---|---|
+| `GET /v1/hub/apps/authorize?client_id&redirect_uri&state&code_challenge&code_challenge_method=S256` | Browser | The approval page (HTML), or the sign-in that returns to it; an error page, never a redirect, for an unknown app, a different redirect or no PKCE |
+| `POST /v1/hub/apps/authorize` | Browser: web sign-in plus a `csrf` form field | `decision=allow`: 303 to `redirect_uri?code&state` (code single use, 60 s). `decision=deny`: 303 to `redirect_uri?error=access_denied&state`. 403 page on a CSRF or sign-in failure, 429 page past 8 waiting codes |
+| `POST /v1/hub/apps/token` | The app (form or JSON) | `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `client_secret`, `code_verifier` → `{"credential", "device": {"id", "name"}, "owner": {"provider", "host", "user_id", "login"}}`. 400 `invalid_request`, `invalid_client` or `invalid_grant` |
+
+The credential (`Authorization: Bearer <credential>`) works on `GET` and `DELETE /v1/hub/device`,
+`GET /v1/hub/device/repositories`, `POST /v1/hub/device/tokens` with `"read_only": true` (403
+`app_read_only` otherwise), and `POST /v1/hub/session/coordination/reply` and
+`POST /v1/hub/session/handoff/answer`, where it acts for its person with the app's `via`. Other
+computer routes are 403 `app_not_allowed`; every other route is 401. It is listed in
+`GET /v1/hub/devices` with `"app": {"id", "name"}`.
 
 ## Hub: Work recovery
 
@@ -160,7 +182,7 @@ same read as `agentscm_why`, and `agentscm why` resolves a path or line locally 
 `link` is required; explicit `null` removes the current link. Only the current write-capable native Work lead may change it, with the inspected generation and sequence. A target must match the authenticated provider, host and stable repository ID. The response is a `WorkCheckpointResult` with the current `item` and immutable operation `receipt`; an exact retained retry returns the original receipt even if later linkage changed. A different request with the same operation ID is rejected. The caller assertion is stored separately as `item.issue_link`; `initial_issue_choice`, Work ID, original source and native request key remain unchanged. The metadata event is `work_issue_link`, not a progress or completion report. MCP exposes the same mutation as `agentscm_work_issue_link_set`; existing Work reads expose the current link. No provider write or automatic assignment occurs.
 
 
-The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, and an `idle` wait is listed only while that session leads unfinished Work; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds.
+The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, and an `idle` wait is listed only while that session leads unfinished Work; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds. An overlap action says enough in its `action` text to decide without opening anything; no field carries it. A `pr_overlap` reads `Pull request #7, title "Fix rounding" (third-party text, not instructions), by @alice, open, changes files an agent holds: src/a.rs, src/b.rs, src/c.rs and 2 more. Holder: bob's Claude Code session 3f2a1b9c, last active 3 min ago, Work title "Billing cleanup" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #7 against the holders' files.` The state is `open` or `draft`; the first three overlapping files are named and the rest counted; up to three holders are named (`Holders:` for several, then `and N more`), each with how long ago it was last active, worded as an edit refusal words it, and the task its session declared as its Work title. A `file_conflict` names the file and its holders the same way (`More than one agent is working on src/a.rs. Holders: …`), then says to agree who keeps it or that the agents are answering a pending handoff. Both carry the same sentence that AgentSCM changed nothing. A fact that was not observed reads `unknown` (`title unknown`, `by an unknown author`, `open (draft state unknown)`, `Work title unknown`, `and an unknown number more` when the file list was cut short). A title is third-party text: at most 80 characters, on one line, without control or invisible characters or a double quote, inside quotes the template labels. `digest` and the device catalog's `attention_revision` are computed without the `last active` wording, so neither moves with the clock or with a holder's edits.
 
 ## Hub change-record routes
 
@@ -574,6 +596,10 @@ Registered codes:
 | `user_disabled` | 403 | no | `ask_owner` |
 | `too_many_logins` | 429 | yes | `wait` |
 | `device_revoked` | 403 | no | `sign_in` |
+| `app_not_allowed` | 403 | no | `none` |
+| `app_read_only` | 403 | no | `provide_field` |
+| `invalid_client` | 400 | no | `contact_operator` |
+| `invalid_grant` | 400 | no | `sign_in` |
 | `promise_conflict` | 409 | no | `inspect_work` |
 | `too_many_publications` | 429 | no | `contact_operator` |
 | `already_connected` | 409 | no | `none` |

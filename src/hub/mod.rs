@@ -36,6 +36,7 @@ pub mod login;
 pub mod mcp;
 pub mod narrative;
 pub mod onboarding;
+mod overlap_detail;
 pub mod pickup;
 #[cfg(unix)]
 pub mod pipeline_rules;
@@ -338,6 +339,13 @@ impl HubState {
     pub fn with_login(mut self, login: login::Login) -> Self {
         self.login = Arc::new(login);
         self
+    }
+
+    /// Revokes every connected-app credential whose app the apps file no longer registers, with
+    /// the tokens each minted. Run at start, after the login configuration is loaded.
+    pub fn revoke_dropped_apps(&self) -> Result<usize> {
+        self.store
+            .revoke_unregistered_apps(&self.login.app_ids(), "hub", store::unix_now())
     }
 
     pub fn with_slack(mut self, slack: slack::Slack) -> Self {

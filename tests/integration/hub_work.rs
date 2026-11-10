@@ -4704,7 +4704,7 @@ fn responded_request_stays_responded_after_release(db: &Db) {
                 expected_updated_seq: acked.updated_seq,
                 kind: CoordinationResponseKind::Join,
                 note: None,
-                via_hub: false,
+                via: agentscm::hub::handoff::Via::Agent,
             },
             now + 4,
         )
@@ -5522,7 +5522,7 @@ fn finish_checkpoint_cleans_up_like_a_terminal_transition(db: &Db) {
                 expected_updated_seq: acked.updated_seq,
                 kind: CoordinationResponseKind::Join,
                 note: None,
-                via_hub: false,
+                via: agentscm::hub::handoff::Via::Agent,
             },
             now + 8,
         )
@@ -5915,7 +5915,7 @@ fn resuming_released_work_retargets_requests_only_when_the_lead_changes(db: &Db)
                 expected_updated_seq: acked.updated_seq,
                 kind: CoordinationResponseKind::Join,
                 note: None,
-                via_hub: false,
+                via: agentscm::hub::handoff::Via::Agent,
             },
             now + 3,
         )
@@ -6010,7 +6010,7 @@ fn reopen_by_another_session_retargets_open_requests(db: &Db) {
                 expected_updated_seq: acked.updated_seq,
                 kind: CoordinationResponseKind::Join,
                 note: None,
-                via_hub: false,
+                via: agentscm::hub::handoff::Via::Agent,
             },
             now + 3,
         )

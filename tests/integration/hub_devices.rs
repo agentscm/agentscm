@@ -233,6 +233,8 @@ struct Env {
     fake: Shared,
     store: Arc<dyn Store>,
     workspace: Option<Arc<Workspace>>,
+    /// `AGENTSCM_HUB_APPS_FILE` for the next `serve`.
+    apps: Option<String>,
     http: reqwest::Client,
     dir: TempDir,
 }
@@ -252,6 +254,7 @@ impl Env {
             ))
             .unwrap(),
             workspace: None,
+            apps: None,
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
             dir,
         };
@@ -294,6 +297,9 @@ impl Env {
         if !allowed.is_empty() {
             vars.insert("AGENTSCM_ALLOWED_USERS".into(), allowed.into());
         }
+        if let Some(apps) = &self.apps {
+            vars.insert("AGENTSCM_HUB_APPS_FILE".into(), apps.clone());
+        }
         if self.provider == "gitlab" {
             vars.insert("AGENTSCM_GITLAB_TOKEN".into(), HUB_TOKEN.into());
         } else {
@@ -316,6 +322,7 @@ impl Env {
             None => state,
         };
         sync::start(&state).await.unwrap();
+        state.revoke_dropped_apps().unwrap();
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, app).await });
         url
@@ -4237,4 +4244,691 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(status, 400);
+}
+
+const APP_SECRET: &str = "example-app-client-secret-0123456789abcdef";
+const APP_REDIRECT: &str = "https://app.example.com/callback";
+const AUTHORIZE: &str = "/v1/hub/apps/authorize";
+const VERIFIER: &str = "example-verifier-0123456789-0123456789-0123456789";
+
+/// A private file, as the Hub requires for its config and secrets.
+fn private_file(env: &Env, name: &str, text: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = env.dir.path().join(name);
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path.display().to_string()
+}
+
+/// A Hub with one connected app, "Example <App>", whose name needs escaping.
+async fn apps_env() -> Env {
+    apps_env_with(&[]).await
+}
+
+/// The same, plus a second app for each id in `more`.
+async fn apps_env_with(more: &[&str]) -> Env {
+    let mut env = Env::start("github").await;
+    let secret = private_file(&env, "app-secret", &format!("{APP_SECRET}\n"));
+    let mut list = vec![json!({"id": "example-app", "name": "Example <App>",
+        "redirect_uri": APP_REDIRECT, "secret_file": secret, "via": "slack"})];
+    for id in more {
+        list.push(json!({"id": id, "name": id,
+            "redirect_uri": APP_REDIRECT, "secret_file": secret, "via": "slack"}));
+    }
+    let apps = json!({ "apps": list });
+    env.apps = Some(private_file(&env, "apps.json", &apps.to_string()));
+    env.hub = env.serve("").await;
+    env
+}
+
+fn encode(pairs: &[(&str, &str)]) -> String {
+    let mut url = reqwest::Url::parse("http://x/").unwrap();
+    url.query_pairs_mut().extend_pairs(pairs);
+    url.query().unwrap().to_owned()
+}
+
+fn challenge(verifier: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier))
+}
+
+fn authorize_query(client: &str, redirect: &str) -> String {
+    encode(&[
+        ("client_id", client),
+        ("redirect_uri", redirect),
+        ("state", "st-1"),
+        ("code_challenge", &challenge(VERIFIER)),
+        ("code_challenge_method", "S256"),
+    ])
+}
+
+async fn authorize_page(env: &Env, query: &str, cookie: Option<&str>) -> (u16, HeaderMap, String) {
+    let mut request = browser().get(format!("{}{AUTHORIZE}?{query}", env.hub));
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, format!("__Host-agentscm_session={cookie}"));
+    }
+    let response = request.send().await.unwrap();
+    let (status, headers) = (response.status().as_u16(), response.headers().clone());
+    (status, headers, response.text().await.unwrap())
+}
+
+/// The approval form's POST; `csrf` None leaves the field out.
+async fn approve(env: &Env, cookie: &str, csrf: Option<&str>, decision: &str) -> (u16, String) {
+    let ch = challenge(VERIFIER);
+    let mut pairs = vec![
+        ("client_id", "example-app"),
+        ("redirect_uri", APP_REDIRECT),
+        ("state", "st-1"),
+        ("code_challenge", ch.as_str()),
+        ("code_challenge_method", "S256"),
+        ("decision", decision),
+    ];
+    pairs.extend(csrf.map(|csrf| ("csrf", csrf)));
+    let response = browser()
+        .post(format!("{}{AUTHORIZE}", env.hub))
+        .header(header::COOKIE, format!("__Host-agentscm_session={cookie}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(encode(&pairs))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .map(|value| value.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    (status, location)
+}
+
+/// A code from Alice's approval.
+async fn app_code(env: &Env, page: &Page) -> String {
+    let (status, location) = approve(env, &page.cookie, Some(&page.csrf), "allow").await;
+    assert_eq!(status, 303);
+    let url = reqwest::Url::parse(&location).unwrap();
+    assert_eq!(&location[..APP_REDIRECT.len()], APP_REDIRECT);
+    let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(pairs["state"], "st-1");
+    pairs["code"].clone()
+}
+
+async fn exchange(env: &Env, json: bool, fields: &[(&str, &str)]) -> (u16, Value) {
+    let request = env.http.post(format!("{}/v1/hub/apps/token", env.hub));
+    let request = if json {
+        let body: serde_json::Map<String, Value> = fields
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), json!(v)))
+            .collect();
+        request
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Value::Object(body).to_string())
+    } else {
+        request
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(encode(fields))
+    };
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+fn token_fields<'a>(code: &'a str, secret: &'a str, verifier: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", APP_REDIRECT),
+        ("client_id", "example-app"),
+        ("client_secret", secret),
+        ("code_verifier", verifier),
+    ]
+}
+
+/// Alice connects the app and returns its credential.
+async fn connect_app(env: &Env, alice: &Page) -> String {
+    let code = app_code(env, alice).await;
+    let (status, issued) = exchange(env, true, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 200, "{issued}");
+    issued["credential"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn a_connected_app_is_approved_through_sign_in_consent_and_a_single_use_pkce_code() {
+    // No apps file: every app route is 404.
+    let plain = Env::start("github").await;
+    let query = authorize_query("example-app", APP_REDIRECT);
+    assert_eq!(authorize_page(&plain, &query, None).await.0, 404);
+    let fields = token_fields("x", APP_SECRET, VERIFIER);
+    assert_eq!(exchange(&plain, false, &fields).await.0, 404);
+
+    let env = apps_env().await;
+    // An unknown app, a different redirect or no PKCE gets an error page and never a redirect.
+    for bad in [
+        authorize_query("other-app", APP_REDIRECT),
+        authorize_query("example-app", "https://evil.example/callback"),
+        authorize_query("example-app", "https://app.example.com/callback/"),
+        encode(&[
+            ("client_id", "example-app"),
+            ("redirect_uri", APP_REDIRECT),
+            ("state", "s"),
+        ]),
+    ] {
+        let (status, headers, body) = authorize_page(&env, &bad, None).await;
+        assert_eq!(status, 400, "{bad}");
+        assert!(headers.get(header::LOCATION).is_none(), "{bad}");
+        assert!(!body.contains("evil.example"), "{body}");
+    }
+
+    // Signed out: the page reloads itself from the Hub once (the Strict cookie is not sent from
+    // another site), then offers the sign-in that returns here.
+    let (status, headers, body) = authorize_page(&env, &query, None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("http-equiv=\"refresh\""), "{body}");
+    assert!(body.contains("hop=1"), "{body}");
+    // A browser that ignores the refresh gets a plain link to the same page.
+    assert!(
+        body.contains(">Continue</a>") && body.contains("&amp;hop=1\">Continue"),
+        "{body}"
+    );
+    let (_, _, body) = authorize_page(&env, &format!("{query}&hop=1"), None).await;
+    assert!(
+        !body.contains("http-equiv") && !body.contains("Continue"),
+        "{body}"
+    );
+    let here = format!("{AUTHORIZE}?{query}");
+    let sign_in = encode(&[("web", "1"), ("return_to", &here)]);
+    assert!(
+        body.contains(&format!(
+            "/v1/hub/login/github?{}",
+            sign_in.replace('&', "&amp;")
+        )),
+        "{body}"
+    );
+    assert!(headers[header::CACHE_CONTROL] == "no-store");
+    let done = callback_query(&env, ALICE, &sign_in).await;
+    assert_eq!(done.status(), 302);
+    assert_eq!(done.headers()[header::LOCATION].to_str().unwrap(), here);
+    let cookie = set_cookie(&done, "__Host-agentscm_session").unwrap();
+
+    // Signed in: the consent page, escaped, without script, framed by nobody, posting only here
+    // and to the app's own origin.
+    let (status, headers, body) = authorize_page(&env, &query, Some(&cookie)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("Example &lt;App&gt;") && !body.contains("<App>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("via Slack") && body.contains("Computers"),
+        "{body}"
+    );
+    let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+    assert!(
+        csp.contains("default-src 'none'") && !csp.contains("script-src"),
+        "{csp}"
+    );
+    assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert!(
+        csp.contains("form-action 'self' https://app.example.com"),
+        "{csp}"
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let (_, me) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    let alice = Page {
+        csrf: me["csrf_token"].as_str().unwrap().to_owned(),
+        id: me["user"]["id"].as_str().unwrap().to_owned(),
+        cookie,
+    };
+    assert!(body.contains(&format!("name=\"csrf\" value=\"{}\"", alice.csrf)));
+
+    // A post without the page's CSRF field, or with another, is refused without a redirect.
+    assert_eq!(
+        approve(&env, &alice.cookie, None, "allow").await,
+        (403, String::new())
+    );
+    assert_eq!(
+        approve(&env, &alice.cookie, Some("0".repeat(64).as_str()), "allow").await,
+        (403, String::new())
+    );
+    assert_eq!(
+        approve(&env, "nope", Some(&alice.csrf), "allow").await.0,
+        403
+    );
+    // Deny goes back to the app with access_denied.
+    let (status, location) = approve(&env, &alice.cookie, Some(&alice.csrf), "deny").await;
+    assert_eq!(
+        (status, location.as_str()),
+        (
+            303,
+            "https://app.example.com/callback?error=access_denied&state=st-1"
+        )
+    );
+
+    // The token exchange: a wrong secret does not spend the code; a wrong verifier does.
+    let code = app_code(&env, &alice).await;
+    let wrong_secret = token_fields(&code, "not-the-secret", VERIFIER);
+    let (status, refused) = exchange(&env, false, &wrong_secret).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_client"))
+    );
+    let other_verifier = format!("{VERIFIER}x");
+    let (status, refused) = exchange(
+        &env,
+        false,
+        &token_fields(&code, APP_SECRET, &other_verifier),
+    )
+    .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_grant"))
+    );
+    let (status, refused) = exchange(&env, false, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_grant"))
+    );
+    let mut bad_grant = token_fields(&code, APP_SECRET, VERIFIER);
+    bad_grant[0].1 = "client_credentials";
+    let (status, refused) = exchange(&env, false, &bad_grant).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (400, Some("invalid_request"))
+    );
+
+    // A good code, as a form, once.
+    let code = app_code(&env, &alice).await;
+    let (status, issued) = exchange(&env, false, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 200, "{issued}");
+    assert_eq!(issued["device"]["name"], "Example <App>");
+    assert_eq!(
+        issued["owner"],
+        json!({"provider": "github", "host": env.base.trim_start_matches("http://"),
+            "user_id": ALICE, "login": "alice"})
+    );
+    assert_eq!(issued["credential"].as_str().unwrap().len(), 64);
+    let (status, _) = exchange(&env, true, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 400);
+    // A code is bound to its redirect.
+    let code = app_code(&env, &alice).await;
+    let mut moved = token_fields(&code, APP_SECRET, VERIFIER);
+    moved[2].1 = "https://app.example.com/other";
+    assert_eq!(
+        exchange(&env, true, &moved).await.1["error"],
+        "invalid_grant"
+    );
+
+    // The person's computers list names the app.
+    let (status, list) = with_cookie(
+        &env.hub,
+        Method::GET,
+        "/v1/hub/devices",
+        &alice.cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{list}");
+    let app = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == issued["device"]["id"])
+        .unwrap();
+    assert_eq!(
+        app["app"],
+        json!({"id": "example-app", "name": "Example <App>"})
+    );
+    assert!(!alice.id.is_empty());
+
+    // One person has at most eight codes waiting.
+    for _ in 0..8 {
+        app_code(&env, &alice).await;
+    }
+    let (status, location) = approve(&env, &alice.cookie, Some(&alice.csrf), "allow").await;
+    assert_eq!((status, location.as_str()), (429, ""));
+}
+
+#[tokio::test]
+async fn a_connected_app_reads_mints_read_only_and_answers_only_as_its_person() {
+    let env = apps_env().await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let app = connect_app(&env, &alice).await;
+
+    // What the person's computer reads, and read-only tokens only.
+    let (status, me) = env.get("/v1/hub/device", &app).await;
+    assert_eq!(
+        (status, me["user"]["login"].as_str()),
+        (200, Some("alice")),
+        "{me}"
+    );
+    let (status, repos) = env.get("/v1/hub/device/repositories", &app).await;
+    assert_eq!(status, 200, "{repos}");
+    assert_eq!(repos["repositories"][0]["repository"], REPO);
+    let mint = |read_only: Option<bool>| {
+        let mut body = json!({"name": "example-read", "repository": REPO});
+        if let Some(read_only) = read_only {
+            body["read_only"] = json!(read_only);
+        }
+        env.mint_at(&env.hub, &app, body)
+    };
+    let (status, minted) = mint(Some(true)).await;
+    assert_eq!(
+        (status, minted["read_only"].as_bool()),
+        (201, Some(true)),
+        "{minted}"
+    );
+    let read_token = minted["token"].as_str().unwrap().to_owned();
+    for writable in [Some(false), None] {
+        let (status, refused) = mint(writable).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (403, Some("app_read_only"))
+        );
+    }
+
+    // Nothing else: computer routes, the person's other routes, agent and admin routes.
+    let refused = [
+        (
+            Method::POST,
+            "/v1/hub/device/name",
+            json!({"name": "x"}),
+            403,
+        ),
+        (Method::GET, "/v1/hub/devices", Value::Null, 403),
+        (Method::POST, "/v1/hub/devices", json!({}), 401),
+        (
+            Method::POST,
+            "/v1/hub/tokens",
+            json!({"name": "x", "repository": REPO, "ttl_seconds": 60}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/work/transition",
+            json!({}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/work/recovery",
+            json!({}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/pickups",
+            json!({"repository": REPO}),
+            401,
+        ),
+        (Method::POST, "/v1/hub/session/handoff/ask", json!({}), 401),
+        (
+            Method::POST,
+            "/v1/hub/session/coordination/withdraw",
+            json!({}),
+            401,
+        ),
+        (
+            Method::POST,
+            "/v1/hub/session/read-token",
+            json!({"repository": REPO}),
+            401,
+        ),
+        (Method::GET, "/v1/hub/whoami", Value::Null, 401),
+        (Method::GET, "/v1/hub/admin/devices", Value::Null, 401),
+    ];
+    for (method, path, body, expected) in refused {
+        let body = (!body.is_null()).then_some(body);
+        let (status, reply) = env.call(&env.hub, method, path, Some(&app), body).await;
+        assert_eq!(status, expected, "{path}: {reply}");
+    }
+
+    // A coordination reply for Alice's own agent, recorded as from Slack.
+    let (lead, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let (asker, _) = agent_for(&env, &bob.id, "codex", false);
+    let now = unix_now();
+    env.store
+        .work_start(&lead, &work("billing", "alice-session"), now)
+        .unwrap();
+    let request = env
+        .store
+        .work_start(&asker, &work("rounding", "bob-session"), now + 1)
+        .unwrap()
+        .coordination_request
+        .unwrap();
+    let body = |token: &str| {
+        json!({"token": token, "request_id": request.id, "operation_id": "slack-1",
+            "target_work_id": request.targets[0].work_id, "session": "alice-session",
+            "expected_updated_seq": request.updated_seq, "kind": "handover", "note": null})
+    };
+    let (status, refused) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            REPLY,
+            Some(&app),
+            Some(body(&asker)),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    let (status, answered) = env
+        .call(&env.hub, Method::POST, REPLY, Some(&app), Some(body(&lead)))
+        .await;
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(answered["responses"][0]["via"], "slack");
+    assert_eq!(answered["responses"][0]["responder"]["login"], "alice");
+    let (status, replay) = env
+        .call(&env.hub, Method::POST, REPLY, Some(&app), Some(body(&lead)))
+        .await;
+    assert_eq!(
+        (status, replay["responses"].as_array().unwrap().len()),
+        (200, 1)
+    );
+    let responded: Vec<_> = env
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "coordination_responded")
+        .collect();
+    assert!(
+        responded[0].data.contains("\"via\":\"slack\""),
+        "{}",
+        responded[0].data
+    );
+
+    // A file handoff answered through the app is recorded as answered from Slack.
+    let (holder, _) = agent_for(&env, &alice.id, "claude-code", false);
+    let (wanter, _) = agent_for(&env, &bob.id, "codex", false);
+    let file = "src/tax.rs";
+    env.store
+        .touch_session(&holder, &hook_call("ha", &[file]), now)
+        .unwrap();
+    env.store
+        .touch_session(&wanter, &hook_call("hb", &[]), now + 1)
+        .unwrap();
+    env.store
+        .ask_handoff(&wanter, Some("hb"), file, None, now + 2)
+        .unwrap();
+    let answer = json!({"token": holder, "session": "ha", "path": file, "accept": true});
+    let (status, done) = env
+        .call(&env.hub, Method::POST, ANSWER, Some(&app), Some(answer))
+        .await;
+    assert_eq!(
+        (status, done["outcome"].as_str()),
+        (200, Some("granted")),
+        "{done}"
+    );
+    let path = format!("/v1/hub/session/handoffs?repository={REPO}");
+    let (_, mine) = with_cookie(&env.hub, Method::GET, &path, &alice.cookie, None).await;
+    let row = mine["handoffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["path"] == file)
+        .unwrap();
+    assert_eq!(
+        (
+            row["answered_via_slack"].as_bool(),
+            row["answered_via_hub"].as_bool()
+        ),
+        (Some(true), Some(false))
+    );
+
+    // The read-only token reads as the person.
+    assert_eq!(env.whoami(&read_token).await, 200);
+
+    // An app the operator stops registering loses its credential.
+    let mut env = env;
+    env.apps = None;
+    let unregistered = env.serve("").await;
+    let (status, _) = env
+        .call(
+            &unregistered,
+            Method::GET,
+            "/v1/hub/device",
+            Some(&app),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn a_revoked_connected_app_is_refused_everywhere() {
+    let env = apps_env().await;
+    let alice = page(&env, ALICE).await;
+    let app = connect_app(&env, &alice).await;
+    let (status, minted) = env
+        .mint_at(
+            &env.hub,
+            &app,
+            json!({"name": "example-read", "repository": REPO, "read_only": true}),
+        )
+        .await;
+    assert_eq!(status, 201, "{minted}");
+    let read_token = minted["token"].as_str().unwrap().to_owned();
+    assert_eq!(env.delete("/v1/hub/device", &app).await, 204);
+    for (method, path) in [
+        (Method::GET, "/v1/hub/device"),
+        (Method::GET, "/v1/hub/device/repositories"),
+        (Method::POST, "/v1/hub/device/tokens"),
+        (Method::DELETE, "/v1/hub/device"),
+        (Method::POST, REPLY),
+        (Method::POST, ANSWER),
+    ] {
+        let body = (method == Method::POST).then(|| json!({}));
+        let (status, reply) = env.call(&env.hub, method, path, Some(&app), body).await;
+        assert_eq!(status, 401, "{path}: {reply}");
+    }
+    // Its read-only tokens went with it.
+    assert_eq!(env.whoami(&read_token).await, 401);
+
+    // The person revokes a second connection from their computers list.
+    let app = connect_app(&env, &alice).await;
+    // Leaving the allow list stops the app answering for the person.
+    let allow_list = env.serve("github:bob").await;
+    let (status, refused) = env
+        .call(
+            &allow_list,
+            Method::POST,
+            REPLY,
+            Some(&app),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_allowed"))
+    );
+    let (_, me) = env.get("/v1/hub/device", &app).await;
+    let id = me["device"]["id"].as_str().unwrap();
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::DELETE,
+        &format!("/v1/hub/devices/{id}"),
+        &alice.cookie,
+        Some(&alice.csrf),
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(env.get("/v1/hub/device/repositories", &app).await.0, 401);
+}
+
+#[tokio::test]
+async fn reconnecting_leaves_one_credential_per_person_and_app() {
+    let env = apps_env().await;
+    let alice = page(&env, ALICE).await;
+    let first = connect_app(&env, &alice).await;
+    let (status, minted) = env
+        .mint_at(
+            &env.hub,
+            &first,
+            json!({"name": "example-read", "repository": REPO, "read_only": true}),
+        )
+        .await;
+    assert_eq!(status, 201, "{minted}");
+    let read_token = minted["token"].as_str().unwrap().to_owned();
+    // Auto-connect is a computer's; an app credential cannot ask for it.
+    let (status, refused) = env
+        .mint_at(
+            &env.hub,
+            &first,
+            json!({"name": "example-read", "repository": REPO, "read_only": true, "auto": true}),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("app_read_only"))
+    );
+    let second = connect_app(&env, &alice).await;
+    assert_eq!(env.get("/v1/hub/device", &first).await.0, 401);
+    assert_eq!(env.whoami(&read_token).await, 401);
+    assert_eq!(env.get("/v1/hub/device", &second).await.0, 200);
+    let created = env
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "device_created")
+        .map(|event| serde_json::from_str::<Value>(&event.data).unwrap()["app_id"].clone())
+        .collect::<Vec<_>>();
+    assert!(created.iter().all(|id| id == "example-app"), "{created:?}");
+}
+
+#[tokio::test]
+async fn another_apps_credentials_cannot_spend_a_code_and_a_dropped_app_stays_revoked() {
+    let mut env = apps_env_with(&["other-app"]).await;
+    let alice = page(&env, ALICE).await;
+    let code = app_code(&env, &alice).await;
+    let mut stranger = token_fields(&code, APP_SECRET, VERIFIER);
+    stranger[3].1 = "other-app";
+    assert_eq!(
+        exchange(&env, true, &stranger).await.1["error"],
+        "invalid_grant"
+    );
+    // The code is still good for its own app.
+    let (status, issued) = exchange(&env, true, &token_fields(&code, APP_SECRET, VERIFIER)).await;
+    assert_eq!(status, 200, "{issued}");
+    let credential = issued["credential"].as_str().unwrap().to_owned();
+
+    // Dropping the app and restarting revokes for good: registering it again does not revive it.
+    let apps = env.apps.clone();
+    env.apps = None;
+    env.serve("").await;
+    env.apps = apps;
+    let back = env.serve("").await;
+    let (status, _) = env
+        .call(
+            &back,
+            Method::GET,
+            "/v1/hub/device",
+            Some(&credential),
+            None,
+        )
+        .await;
+    assert_eq!(status, 401);
 }
