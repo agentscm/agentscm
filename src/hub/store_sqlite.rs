@@ -46,7 +46,7 @@ use super::coordination::{
     MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
     MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
-    status_name, with_hub_via,
+    status_name, with_via,
 };
 use super::device::{
     DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
@@ -7774,6 +7774,7 @@ impl Store for SqliteStore {
         name: &str,
         digest: &TokenDigest,
         replaces: Option<&str>,
+        app: Option<&str>,
         now: i64,
     ) -> Result<String> {
         validate_device_name(name)?;
@@ -7781,9 +7782,9 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inserted = tx.execute(
-            "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at)
-             SELECT ?1, id, ?3, ?4, ?5, ?5 FROM hub_users WHERE id = ?2 AND disabled = 0",
-            params![id, owner, name, digest.as_str(), now],
+            "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at, app_id)
+             SELECT ?1, id, ?3, ?4, ?5, ?5, ?6 FROM hub_users WHERE id = ?2 AND disabled = 0",
+            params![id, owner, name, digest.as_str(), now, app],
         )?;
         if inserted == 0 {
             return Err(HubError::Invalid("unknown or disabled owner".into()));
@@ -7791,7 +7792,20 @@ impl Store for SqliteStore {
         if let Some(old) = replaces {
             revoke_device_in(&tx, old, Some(owner), owner, now)?;
         }
-        append(&tx, &Event::device_created(&id, owner, name)?)?;
+        // One credential per person per app: reconnecting retires the earlier ones.
+        if let Some(app) = app {
+            let earlier = tx
+                .prepare(
+                    "SELECT id FROM hub_devices
+                     WHERE owner = ?1 AND app_id = ?2 AND id <> ?3 AND revoked_at IS NULL",
+                )?
+                .query_map(params![owner, app, id], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+            for old in earlier {
+                revoke_device_in(&tx, &old, Some(owner), owner, now)?;
+            }
+        }
+        append(&tx, &Event::device_created(&id, owner, name, app)?)?;
         tx.commit()?;
         Ok(id)
     }
@@ -7960,7 +7974,7 @@ impl Store for SqliteStore {
         let found = conn
             .query_row(
                 "SELECT d.id, d.name, d.created_at, d.last_used_at,
-                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, d.app_id
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE d.digest = ?1 AND d.revoked_at IS NULL
                    AND COALESCE(d.last_used_at, d.created_at) > ?2",
@@ -7982,6 +7996,7 @@ impl Store for SqliteStore {
                             name: None,
                             disabled: row.get(9)?,
                         },
+                        app_id: row.get(10)?,
                     })
                 },
             )
@@ -8004,7 +8019,7 @@ impl Store for SqliteStore {
         let mut devices = conn
             .prepare(
                 "SELECT d.id, d.name, d.created_at, d.last_used_at, d.revoked_at,
-                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, d.app_id
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE (?1 IS NULL OR d.owner = ?1)
                    AND (d.revoked_at IS NULL OR d.revoked_at > ?3)
@@ -8029,6 +8044,7 @@ impl Store for SqliteStore {
                         disabled: row.get(10)?,
                     },
                     repositories: Vec::new(),
+                    app_id: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -8049,6 +8065,23 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let revoked = revoke_device_in(&tx, device, owner, by, now)?;
+        tx.commit()?;
+        Ok(revoked)
+    }
+
+    fn revoke_unregistered_apps(&self, registered: &[String], by: &str, now: i64) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale = tx
+            .prepare("SELECT id, app_id FROM hub_devices WHERE app_id IS NOT NULL AND revoked_at IS NULL")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut revoked = 0;
+        for (id, app) in stale {
+            if !registered.contains(&app) && revoke_device_in(&tx, &id, None, by, now)? {
+                revoked += 1;
+            }
+        }
         tx.commit()?;
         Ok(revoked)
     }
@@ -15542,11 +15575,11 @@ impl Store for SqliteStore {
             "coordination_responded",
             &request.id,
             now,
-            with_hub_via(
+            with_via(
                 json!({"response_id": response_id, "target_work_id": target.work_id,
                     "kind": response_kind_name(reply.kind), "token": who.token,
                     "session": reply.session, "generation": target.generation}),
-                reply.via_hub,
+                reply.via.tag(),
             ),
         )?;
         let seq = append(&tx, &event)?;
@@ -15570,7 +15603,7 @@ impl Store for SqliteStore {
                 reply.note,
                 now,
                 seq,
-                reply.via_hub.then_some("hub")
+                reply.via.tag()
             ],
         )?;
         tx.execute(
@@ -15829,9 +15862,9 @@ impl Store for SqliteStore {
             "coordination_withdrawn",
             &request.id,
             now,
-            with_hub_via(
+            with_via(
                 json!({"by": who.token, "session": withdraw.session, "reason": reason}),
-                withdraw.via_hub,
+                withdraw.via_hub.then_some("hub"),
             ),
         )?;
         let seq = append(&tx, &event)?;
