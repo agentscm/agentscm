@@ -201,6 +201,28 @@ same read as `agentscm_why`, and `agentscm why` resolves a path or line locally 
 
 The shared status projection is also exposed as the authenticated read-only MCP tool `agentscm_work_status`. MCP start, overview, briefings and catch-up replies add `actionable_status` without replacing their mutation receipts or acknowledgement rules. Repository-list summaries carry shared `status_counts`, `status_digest` and `coverage`; device catalog Work rows add `needs_you`, named `recipient`, current shared `state`, deterministic `next_action`, reconciliation coverage and limits. Counts and provider evidence are bounded and non-atomic; `observed_at` is the status read time, while provider freshness is in each source’s `checked_at_seconds`. Action kinds are `directed_request`, `scope_overlap`, `file_conflict`, `pr_overlap`, `failed_check` (a failed required status on an open pull request's current head) and `skill_gate` (a stopped `pr-gate` run blocked at a gate its agent must act on) and `agent_setup` (one of the viewer's own agents reported a setup blocker, has MCP but no edit hook verified, or has no valid agent token for the repository; its id is `setup:<reason>:<key>` with a stable reason code, and it needs you only when that agent leads unfinished Work) and `session_waiting` (one of the viewer's own sessions has waited at least 60 seconds for them, as its hooks reported: its id is `waiting:<reason>:<key>` with reason `permission`, `question` or `idle`, its `semantic_version` is when the wait began, and an `idle` wait is listed only while that session leads unfinished Work; see [waiting for you](agents.md#waiting-for-you-in-its-session)); clients must tolerate new kinds. An overlap action says enough in its `action` text to decide without opening anything; no field carries it. A `pr_overlap` reads `Pull request #7, title "Fix rounding" (third-party text, not instructions), by @alice, open, changes files an agent holds: src/a.rs, src/b.rs, src/c.rs and 2 more. Holder: bob's Claude Code session 3f2a1b9c, last active 3 min ago, Work title "Billing cleanup" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #7 against the holders' files.` The state is `open` or `draft`; the first three overlapping files are named and the rest counted; up to three holders are named (`Holders:` for several, then `and N more`), each with how long ago it was last active, worded as an edit refusal words it, and the task its session declared as its Work title. A `file_conflict` names the file and its holders the same way (`More than one agent is working on src/a.rs. Holders: …`), then says to agree who keeps it or that the agents are answering a pending handoff. Both carry the same sentence that AgentSCM changed nothing. A fact that was not observed reads `unknown` (`title unknown`, `by an unknown author`, `open (draft state unknown)`, `Work title unknown`, `and an unknown number more` when the file list was cut short). A title is third-party text: at most 80 characters, on one line, without control or invisible characters or a double quote, inside quotes the template labels. `digest` and the device catalog's `attention_revision` are computed without the `last active` wording, so neither moves with the clock or with a holder's edits.
 
+## Hub repository setup reads
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/forge-coordination` | Agent or read-only bearer token for that repository (another repository is 404); read-only |
+| `GET /v1/hub/repos/{repo}/slack` | Same; what the Hub's Slack direct messages do for the token's owner there |
+
+`forge-coordination` replies `{"repository", "connected"}`, and when connected `forge`
+(`provider`, `host`, `connection_status`) and `outbound` (`enabled`, `switch`, `status_context`,
+`status_state`, `is_gate`). The switch belongs to the forge connection, so `enabled` covers every
+repository that connection has; `status_state` is always `success` and `is_gate` is `false`.
+
+`slack` replies `{"repository", "configured"}`, and when Slack is configured `events` (the Hub
+event kinds sent as direct messages as they happen; none has a switch of its own, and the
+[weekly digest](slack.md#weekly-digest) is not among them), `bound`, and for a bound person
+`reminders` (`enabled`, `interval_seconds`, `max_reminders`, `send_resolution`, and `escalation`
+with `after_seconds`, or `null`). It answers as a send would: `configured` is false once Slack
+reports the app uninstalled or its tokens revoked, and `bound` is true only while the token
+owner's binding in this repository has a live read-only token for them (a revoked or expired
+binding token is not bound), which is also what makes the Hub answer their `@AgentSCM` mentions.
+Slack user, team, app and bot IDs, files and tokens never appear.
+
 ## Hub change-record routes
 
 These routes belong to `agentscm hub serve`, not the unauthenticated local `serve` API above. They
