@@ -12,6 +12,7 @@ title: "Documentation"
 
 - [Try the scripted demo](scripted-demo.md): no account or Docker, no repository changes.
 - [Install and connect agents](install.md): run a local Hub or join one that already runs; review platform limits first.
+- [Agent tokens for a local Hub without a forge](local-agent-token.md): try agents against your own Hub with no GitHub or GitLab sign-in.
 - [Guided setup](setup-guide.md): what quickstart detects, changes and leaves for you to confirm.
 - [Concepts](concepts.md): the Hub, intents, hooks and native workflows in plain English.
 

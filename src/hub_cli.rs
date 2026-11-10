@@ -115,6 +115,24 @@ pub enum HubCommand {
         #[arg(long)]
         hub: Option<String>,
     },
+    /// Mint an agent token for one repository straight into this computer's Hub database, for a
+    /// local Hub that has no forge sign-in. The database comes from AGENTSCM_DATABASE_URL, as for
+    /// `hub serve`. The token is printed once, on standard output; only its digest is stored.
+    LocalToken {
+        /// Repository the token works in, as OWNER/NAME.
+        #[arg(long)]
+        repo: String,
+        /// The local person the agent works for. It becomes a Hub user on host `localhost`, so it
+        /// is never mistaken for a forge account; the same login is always the same user.
+        #[arg(long)]
+        login: String,
+        /// The agent's name, shown beside its work.
+        #[arg(long, default_value = "agent")]
+        name: String,
+        /// Hours until the token expires (1 to 720).
+        #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(i64).range(1..=720))]
+        hours: i64,
+    },
     /// Manage agent tokens with the saved session.
     Token {
         #[command(subcommand)]
@@ -254,7 +272,9 @@ pub enum SessionCommand {
 
 pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
     match command {
-        HubCommand::Serve { .. } | HubCommand::Slack { .. } => false,
+        HubCommand::Serve { .. } | HubCommand::Slack { .. } | HubCommand::LocalToken { .. } => {
+            false
+        }
         HubCommand::Token {
             command: TokenCommand::List { .. },
         }
@@ -287,6 +307,7 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
     if !matches!(
         command,
         HubCommand::Serve { .. }
+            | HubCommand::LocalToken { .. }
             | HubCommand::Slack { .. }
             | HubCommand::Login { .. }
             | HubCommand::AutoConnect { .. }
@@ -304,30 +325,19 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             poll_seconds,
             activity_days,
             shared_conversation_retention_days,
-        } => {
-            let database_url = match std::env::var("AGENTSCM_DATABASE_URL") {
-                Ok(url) => url,
-                Err(std::env::VarError::NotPresent) => DEFAULT_DATABASE_URL.into(),
-                Err(_) => {
-                    return Err(Error::Invalid(
-                        "AGENTSCM_DATABASE_URL is not valid unicode".into(),
-                    ));
-                }
-            };
-            http::serve(HubConfig {
-                database_url,
-                objects,
-                bind,
-                public,
-                public_url,
-                secrets,
-                poll_seconds,
-                activity_days,
-                shared_conversation_retention_days,
-            })
-            .await
-            .map_err(map_hub_error)
-        }
+        } => http::serve(HubConfig {
+            database_url: database_url()?,
+            objects,
+            bind,
+            public,
+            public_url,
+            secrets,
+            poll_seconds,
+            activity_days,
+            shared_conversation_retention_days,
+        })
+        .await
+        .map_err(map_hub_error),
         HubCommand::Login {
             hub,
             provider,
@@ -369,6 +379,16 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             );
             Ok(())
         }
+        HubCommand::LocalToken {
+            repo,
+            login,
+            name,
+            hours,
+        } => {
+            let secret = local_token(&database_url()?, &repo, &login, &name, hours)?;
+            println!("{secret}");
+            Ok(())
+        }
         HubCommand::Token { command } => token(command).await,
         HubCommand::Github { command } => github(command).await,
         HubCommand::Connections { command } => connections(command).await,
@@ -385,6 +405,42 @@ pub(crate) fn direct_client() -> reqwest::Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
+}
+
+fn database_url() -> Result<String> {
+    match std::env::var("AGENTSCM_DATABASE_URL") {
+        Ok(url) => Ok(url),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_DATABASE_URL.into()),
+        Err(_) => Err(Error::Invalid(
+            "AGENTSCM_DATABASE_URL is not valid unicode".into(),
+        )),
+    }
+}
+
+/// An agent token for `repo`, owned by the local person `login`, minted into the Hub database at
+/// `database_url`. The identity is GitHub-shaped so the store accepts it, but on host `localhost`,
+/// which no forge sign-in uses, with an id derived from the login so one login is one user.
+fn local_token(
+    database_url: &str,
+    repo: &str,
+    login: &str,
+    name: &str,
+    hours: i64,
+) -> Result<String> {
+    use agentscm::hub::store::{self, ForgeIdentity, mint_agent_token};
+    let digest = Sha256::digest(login.as_bytes());
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&digest[..8]);
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "localhost".into(),
+        user_id: (i64::from_be_bytes(id) & i64::MAX).max(1),
+    };
+    let store = store::open(database_url).map_err(map_hub_error)?;
+    let user = store.upsert_user(&identity, login).map_err(map_hub_error)?;
+    let (_, secret) =
+        mint_agent_token(&*store, &user.id, name, repo, hours * 3600).map_err(map_hub_error)?;
+    Ok(secret.expose().to_owned())
 }
 
 pub(crate) fn map_hub_error(error: HubError) -> Error {
@@ -2544,6 +2600,33 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_token_authenticates_in_its_repository_and_one_login_is_one_user() {
+        use agentscm::hub::store::{self, agent_token_digest};
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
+        let first = local_token(&url, "acme/widgets", "maya", "claude", 1).unwrap();
+        let second = local_token(&url, "acme/widgets", "maya", "codex", 1).unwrap();
+        assert_ne!(first, second);
+        let store = store::open(&url).unwrap();
+        let who = |secret: &str| {
+            store
+                .authenticate(&agent_token_digest(secret).unwrap(), unix_now())
+                .unwrap()
+                .unwrap()
+        };
+        let (a, b) = (who(&first), who(&second));
+        assert_eq!(
+            (a.repository.as_str(), a.name.as_str()),
+            ("acme/widgets", "claude")
+        );
+        assert!(!a.read_only);
+        assert!(a.expires_at <= unix_now() + 3600);
+        assert_eq!(a.owner.id, b.owner.id);
+        assert_eq!(a.owner.identity.host, "localhost");
+        assert!(local_token(&url, "not a repository", "maya", "x", 1).is_err());
+    }
 
     #[test]
     fn the_hub_comes_from_the_flag_then_agentscm_hub_then_the_only_sign_in() {
