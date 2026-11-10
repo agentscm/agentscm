@@ -127,6 +127,100 @@ async fn a_claude_http_hook_then_a_cursor_hook_on_the_same_file_gets_a_stop() {
     );
 }
 
+/// Runs `agentscm hook claude` for `secret` against `hub`, with a clean environment and its
+/// once-per-session notes kept under `config`.
+#[cfg(unix)]
+fn claude_hook(hub: &str, secret: &str, config: &Path, payload: &Value) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args(["hook", "claude", "--hub-url", hub, "--repo", REPO])
+        .env_clear()
+        .env("AGENTSCM_HUB_TOKEN", secret)
+        .env("XDG_CONFIG_HOME", config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(payload.to_string().as_bytes()).unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// `--hub-url` routing sends the agent's own paths with the checkout root beside them. A second
+/// agent that reaches the checkout through a symlink is still refused the first agent's file, and
+/// an edit through an in-repository symlink, which the Hub would file under another path, gets
+/// "coordination unknown" instead of an empty reply.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_url_hook_through_a_symlink_is_refused_a_held_file() {
+    let dir = TempDir::new().unwrap();
+    let store = store::open(&format!(
+        "sqlite://{}",
+        dir.path().join("hub.sqlite").display()
+    ))
+    .unwrap();
+    let objects = LocalBackend::open(dir.path().join("objects")).unwrap();
+    let app = router(HubState::new(store.clone(), Arc::new(objects)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hub = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let (first, second) = (token(&*store, 1), token(&*store, 2));
+
+    let real = dir.path().join("checkout");
+    std::fs::create_dir_all(real.join(".git")).unwrap();
+    std::fs::create_dir_all(real.join("src")).unwrap();
+    let real = real.canonicalize().unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    std::os::unix::fs::symlink("src", real.join("lnk")).unwrap();
+    let edit = |session: &str, cwd: &Path, file: &Path| {
+        serde_json::json!({"session_id": session, "cwd": cwd, "hook_event_name": "PreToolUse",
+            "tool_name": "Edit", "tool_input": {"file_path": file}})
+    };
+    let config = dir.path().join("config");
+    let run = |secret: &str, payload: Value| {
+        let (hub, secret, config) = (hub.clone(), secret.to_owned(), config.clone());
+        tokio::task::spawn_blocking(move || claude_hook(&hub, &secret, &config, &payload))
+    };
+
+    // The first agent takes the file (its first edit is refused once for undeclared Work).
+    let held = edit("a1", &real, &real.join("src/widget.rs"));
+    run(&first, held.clone()).await.unwrap();
+    let reply = run(&first, held).await.unwrap();
+    assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
+
+    // The second reaches the same file through the symlink and is refused it.
+    let refused = run(&second, edit("b1", &alias, &alias.join("src/widget.rs")))
+        .await
+        .unwrap();
+    let out = &refused["hookSpecificOutput"];
+    assert_eq!(out["permissionDecision"], "deny", "{refused}");
+    let reason = out["permissionDecisionReason"].as_str().unwrap();
+    assert!(
+        reason.contains("another agent is working on that file")
+            && reason.contains("src/widget.rs"),
+        "{refused}"
+    );
+
+    // Every edit through the in-repository symlink says coordination is unknown, not only the
+    // session's first, and none claims anything about later edits.
+    for _ in 0..2 {
+        let unplaced = run(&second, edit("b2", &real, &real.join("lnk/widget.rs")))
+            .await
+            .unwrap();
+        let text = unplaced["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("coordination unknown (edit path not matched to the checkout)")
+                && !text.contains("Later edits"),
+            "{unplaced}"
+        );
+    }
+}
+
 /// The connected `agentscm hook claude` in a checkout where a merge stopped on a conflict.
 #[cfg(unix)]
 mod conflict {
