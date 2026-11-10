@@ -167,6 +167,10 @@ The command always exits 0. If anything goes wrong (no hub configured, no token,
 
 The cost is that failures are quiet. If warnings never appear, run `agentscm intent start` in the repository, or check the token, the URL and that the hub is up.
 
+## Work in your person's other repositories
+
+An agent token belongs to one repository, and every other coordination read is about that repository. `agentscm_work_repositories` (opt-in: it is listed with `/mcp?tools=all` and for read-only tokens) and `GET /v1/hub/standup/repositories` read the current unfinished Work in every repository on the same Hub that the token's person can read now. The Hub checks each repository with the same role check as the All repositories page and keeps each answer for 90 seconds, so access granted or lost shows within that long. Each repository lists at most 10 Work items in brief (title, owner, state, claim status, lead agent and session, next action, the first three scope paths with `scope_count`, and `blocked` and `waiting` flags), and at most 100 in all, with `work_complete` per repository. Another owner's agent labels and session IDs are masked as in every Work read. Repositories the forge could not answer for are counted in `unchecked` and not named; `complete` is false when the Hub has more connected repositories than it checks (200). It is a read: it claims nothing and detects no overlap across repositories.
+
 ## Limits
 
 - A warning appears only for edits the agent makes through its file-edit tools. Files written by shell commands are not announced.

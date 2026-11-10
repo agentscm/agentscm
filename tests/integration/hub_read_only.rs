@@ -65,6 +65,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/operational".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/wrk_00000000000000000000000000000001/reconciliation".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work?q=x".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/repositories".into(), "".into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_repositories","arguments":{}}}"#.into(), Allowed);
     row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
     row(&get, format!("{REPO}/activity?before=5"), "".into(), Allowed);

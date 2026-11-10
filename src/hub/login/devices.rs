@@ -40,6 +40,10 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/session/repositories", get(session_repositories))
         .route("/v1/hub/session/value-metrics", get(session_value_metrics))
         .route("/v1/hub/device/repositories", get(device_repositories))
+        .route(
+            "/v1/hub/standup/repositories",
+            get(agent_repositories_route),
+        )
         .route("/v1/hub/devices", get(list).post(enroll))
         .route("/v1/hub/devices/{id}", delete(revoke))
         .route("/v1/hub/admin/devices", get(admin_devices))
@@ -828,6 +832,82 @@ async fn repositories_for_owner(
         .collect::<Vec<_>>();
     Ok(Json(json!({"repositories": rows, "unchecked": unchecked,
         "complete": complete, "checked_at": unix_now()})))
+}
+
+/// Work items the agent read lists per repository, and in all.
+const AGENT_WORK_PER_REPOSITORY: usize = 10;
+const AGENT_WORK_TOTAL: usize = 100;
+
+/// `GET /v1/hub/standup/repositories`: the agent read of [`agent_repositories`].
+async fn agent_repositories_route(
+    State(state): State<HubState>,
+    super::super::http::Reader(principal): super::super::http::Reader,
+) -> ApiResult<Json<Value>> {
+    agent_repositories(&state, &principal).await.map(Json)
+}
+
+/// The repositories on this Hub the token's owner can read now, by the same role check and cache
+/// as the All repositories page, each with its current unfinished Work in brief, as the owner may
+/// see it. Repositories the forge could not answer for are counted in `unchecked`, never named,
+/// as on that page. Each list says whether it was cut.
+pub(in crate::hub) async fn agent_repositories(
+    state: &HubState,
+    principal: &Principal,
+) -> ApiResult<Value> {
+    let owner = principal.owner.clone();
+    allow_listed(state, &owner, "agent_repositories").await?;
+    let (store, host) = (state.store.clone(), owner.identity.host.clone());
+    let mut candidates = blocking(state, move || {
+        store.repositories_on(&host, super::MAX_SIGN_IN_PROBES + 1)
+    })
+    .await?;
+    let complete = candidates.len() <= super::MAX_SIGN_IN_PROBES;
+    candidates.truncate(super::MAX_SIGN_IN_PROBES);
+    let (mut readable, unchecked) = readable(state, &owner, candidates, true).await;
+    readable.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    let store = state.store.clone();
+    let rows = blocking(state, move || {
+        let now = unix_now();
+        let mut left = AGENT_WORK_TOTAL;
+        let mut rows = Vec::with_capacity(readable.len());
+        for repo in readable {
+            let overview = super::super::viewer::shown(
+                store.repository_work_overview(
+                    &owner,
+                    &repo.full_name,
+                    repo.repository_id,
+                    &WorkOverviewQuery::default(),
+                    now,
+                )?,
+                &owner.id,
+            );
+            let shown = overview
+                .current
+                .len()
+                .min(AGENT_WORK_PER_REPOSITORY)
+                .min(left);
+            left -= shown;
+            let work = overview.current[..shown]
+                .iter()
+                .map(|item| {
+                    let mut brief = super::super::compact::brief(item);
+                    brief["waiting"] = json!(item.state == super::super::work::WorkState::Handover);
+                    brief
+                })
+                .collect::<Vec<_>>();
+            rows.push(
+                json!({"repository": repo.full_name, "repository_id": repo.repository_id,
+                "work": work,
+                "work_complete": overview.current_complete && shown == overview.current.len()}),
+            );
+        }
+        Ok(rows)
+    })
+    .await?;
+    Ok(
+        json!({"repositories": rows, "unchecked": unchecked, "complete": complete,
+        "checked_at": unix_now()}),
+    )
 }
 
 /// A stable change marker for actionable items, without returning paths or token values.
