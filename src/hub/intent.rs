@@ -715,14 +715,19 @@ async fn activity(
     let (sessions, mut events) = blocking(&state, move || {
         // The reader's own sessions that started another, or that wait for the reader, stay
         // listed after their last call, so a wait can be shown under the session that started it.
-        let mut also: BTreeSet<String> = store
-            .session_starts(&principal.owner.id)?
-            .into_iter()
-            .map(|(_, started_by)| started_by)
-            .collect();
+        // shortcut: the waiting ones first, then the newest starts, up to the page's limit; a
+        // person with more starting sessions than that loses the row of an old one. Read only
+        // the starters of listed sessions if that is ever reached.
         let waiting = setup.waiting().owned(&principal, now)?;
-        also.extend(waiting.into_iter().map(|wait| wait.session));
-        let also: Vec<String> = also.into_iter().take(MAX_ACTIVITY_SESSIONS).collect();
+        let starts = store.session_starts(&principal.owner.id)?;
+        let mut listed = BTreeSet::new();
+        let also: Vec<String> = waiting
+            .into_iter()
+            .map(|wait| wait.session)
+            .chain(starts.into_iter().map(|(_, started_by)| started_by))
+            .filter(|session| listed.insert(session.clone()))
+            .take(MAX_ACTIVITY_SESSIONS)
+            .collect();
         let sessions = store.sessions_with(&principal, now, MAX_ACTIVITY_SESSIONS, &also)?;
         // One extra row says whether older events exist.
         Ok((
@@ -741,8 +746,12 @@ async fn activity(
     };
     let roster = state.onboarding.subagents();
     let row = |s: &SessionView| {
-        // Null when not known; a subagent's type and what it does are its own person's.
-        let subagents = roster.of(&s.token, &s.session, &my_id, now).map(|all| {
+        // Null when not known; a subagent's type and what it does are its own person's. Hooks
+        // report under the host's session ID, so a session stored under another name (one that
+        // adopted `default`, or a client's own) cannot be matched and is not known either.
+        let known = s.name.as_ref();
+        let subagents = known.and_then(|_| roster.of(&s.token, &s.session, &my_id, now));
+        let subagents = subagents.map(|all| {
             all.iter()
                 .map(|sub| {
                     json!({"state": sub.state.code(), "started_at": sub.started_at,

@@ -108,9 +108,11 @@ impl Hub {
 
     /// The text of one `agentscm_start` reply.
     async fn start_work(&self, secret: &str, session: &str, started_by: Option<&str>) -> String {
-        let mut arguments = json!({"task": format!("task of {session}"),
-            "request_key": format!("key-{session}"), "session": session,
-            "paths": [format!("src/{session}.rs")]});
+        // Named by a few characters of the ID: the whole ID must appear in no reply.
+        let label = &session[..4];
+        let mut arguments = json!({"task": format!("task {label}"),
+            "request_key": format!("key-{label}"), "session": session,
+            "paths": [format!("src/{label}.rs")]});
         if let Some(started_by) = started_by {
             arguments["started_by"] = json!(started_by);
         }
@@ -245,6 +247,17 @@ async fn scenario(hub: Hub) {
             store.owner_lead_sessions(&me.owner.id).unwrap(),
             [PARENT, CHILD]
         );
+        // Records are read newest first, whatever the session IDs.
+        store
+            .session_started_by(&me.owner.id, UNSEEN, PARENT, later)
+            .unwrap();
+        assert_eq!(
+            store.session_starts(&me.owner.id).unwrap(),
+            [
+                (UNSEEN.to_owned(), PARENT.to_owned()),
+                (CHILD.to_owned(), PARENT.to_owned())
+            ]
+        );
     })
     .await
     .unwrap();
@@ -256,6 +269,13 @@ async fn scenario(hub: Hub) {
         .find(|s| s["owner"]["login"] == "person2")
         .unwrap();
     assert!(hex16(&bobs["name"]) && bobs["started_by"].is_null());
+    // A session under a name its client chose has no name, and no hook call can be matched to
+    // it: its subagents are not known, which is not none.
+    hub.hook(&bob, "main", "SessionStart", json!({"source": "startup"}))
+        .await;
+    let (seen, _) = hub.sessions(&bob, WIDGETS).await;
+    let unnamed = seen.iter().find(|s| s["name"].is_null()).unwrap();
+    assert_eq!(unnamed["subagents"], Value::Null);
 
     // A subagent: its start, what its session started it to do, its ask, and its stop.
     let of = |sessions: Vec<Value>| {
@@ -322,6 +342,25 @@ async fn scenario(hub: Hub) {
     let ended = of(hub.sessions(&alice, WIDGETS).await.0).unwrap();
     assert_eq!(ended.as_array().unwrap().len(), 1, "{ended}");
     assert_eq!(state(ended), "ended");
+    // A subagent that ran in the foreground is described when its call returns, after it stopped.
+    let plan = json!({"agent_id": "a2", "agent_type": "Plan"});
+    hub.hook(&alice, PARENT, "SubagentStart", plan.clone())
+        .await;
+    hub.hook(&alice, PARENT, "SubagentStop", plan).await;
+    hub.hook(
+        &alice,
+        PARENT,
+        "PostToolUse",
+        json!({"tool_name": "Agent", "subagent": {"id": "a2", "type": "Plan",
+            "does": "Plan the read", "running": false}}),
+    )
+    .await;
+    let both = of(hub.sessions(&alice, WIDGETS).await.0).unwrap();
+    assert_eq!(both.as_array().unwrap().len(), 2, "{both}");
+    assert_eq!(
+        (&both[1]["state"], &both[1]["does"]),
+        (&json!("ended"), &json!("Plan the read"))
+    );
     // The session's end takes its subagents with it.
     hub.hook(&alice, PARENT, "SessionEnd", json!({"reason": "exit"}))
         .await;

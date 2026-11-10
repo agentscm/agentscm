@@ -2348,7 +2348,7 @@ mod tests {
             );
             match call.kind {
                 Kind::Waiting(reason) => Some(reason),
-                Kind::Ignore => None,
+                Kind::Ignore | Kind::Subagent => None,
                 other => panic!("{v}: {other:?}"),
             }
         };

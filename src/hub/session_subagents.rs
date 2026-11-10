@@ -18,6 +18,8 @@ use super::store::Principal;
 use super::work_lifecycle::IN_FLIGHT_CAP_SECONDS;
 
 const MAX_SESSIONS: usize = 1024;
+/// The most sessions of one agent token, which is one person's agent in one repository.
+const MAX_PER_TOKEN: usize = 128;
 const MAX_PER_SESSION: usize = 32;
 const MAX_TYPE_CHARS: usize = 64;
 /// The longest description of a subagent's task that is kept, in characters.
@@ -121,11 +123,16 @@ impl Subagents {
             if kind.is_none() {
                 return;
             }
-            // shortcut: a full table drops the session seen longest ago, whose subagents then
+            // A token over its share gives up its own session seen longest ago, so one token
+            // cannot push out everyone else's.
+            // shortcut: a full table then drops the session seen longest ago, whose subagents
             // read as none; say unknown for it if Hubs ever hold this many sessions with subagents.
-            if sessions.len() >= MAX_SESSIONS
+            let own = |(token, _): &(String, String)| *token == principal.token_id;
+            let over_share = sessions.keys().filter(|key| own(key)).count() >= MAX_PER_TOKEN;
+            if (over_share || sessions.len() >= MAX_SESSIONS)
                 && let Some(oldest) = sessions
                     .iter()
+                    .filter(|(key, _)| !over_share || own(key))
                     .min_by_key(|(_, session)| session.rows.iter().map(|row| row.seen).max())
                     .map(|(key, _)| key.clone())
             {
@@ -439,5 +446,26 @@ mod tests {
             restarted.of("tok_a", "other", "usr_me", LATER + UNSEEN_KEEP_SECONDS),
             Some(vec![])
         );
+    }
+
+    #[test]
+    fn a_token_over_its_share_gives_up_its_own_oldest_session_not_someone_elses() {
+        let roster = Subagents::default();
+        let (mine, theirs) = (principal("tok_a", "usr_me"), principal("tok_b", "usr_them"));
+        roster.seen(&theirs, "theirs", "a1", Some("Explore"), false, LATER);
+        for n in 0..=MAX_PER_TOKEN {
+            let at = LATER + 1 + i64::try_from(n).unwrap();
+            roster.seen(&mine, &format!("s{n}"), "a1", Some("Explore"), false, at);
+        }
+        let listed = |token: &str, session: &str, viewer: &str| {
+            roster
+                .of(token, session, viewer, LATER + 500)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(listed("tok_b", "theirs", "usr_them"), 1);
+        assert_eq!(listed("tok_a", "s0", "usr_me"), 0);
+        assert_eq!(listed("tok_a", "s1", "usr_me"), 1);
+        assert_eq!(listed("tok_a", &format!("s{MAX_PER_TOKEN}"), "usr_me"), 1);
     }
 }

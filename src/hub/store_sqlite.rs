@@ -95,11 +95,11 @@ use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
     LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
-    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SLIDE_STEP_SECONDS,
-    SessionView, Store, TokenDigest, User, check_session_start, event_limit, like_pattern,
-    local_ci_label, lower_hex_of, new_id, owner_session, pending, plan_local_ci_change,
-    plan_local_ci_enroll, plan_named, search_number, session_key, unix_now, validate_display_name,
-    validate_login,
+    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SESSION_STARTS_MAX,
+    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, check_session_start, event_limit,
+    like_pattern, local_ci_label, lower_hex_of, new_id, owner_session, pending,
+    plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
+    validate_display_name, validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -5590,7 +5590,8 @@ fn release_in(tx: &Transaction<'_>, token: &str, intent: &str, now: i64) -> Resu
 /// `owner`'s records of which session started which, as (session, started by).
 fn session_starts_in(conn: &Connection, owner: &str) -> Result<Vec<(String, String)>> {
     let mut statement = conn.prepare(
-        "SELECT session, started_by FROM hub_session_starts WHERE owner = ?1 ORDER BY session",
+        "SELECT session, started_by FROM hub_session_starts WHERE owner = ?1
+         ORDER BY created_at DESC, session",
     )?;
     let starts = statement
         .query_map([owner], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -9046,6 +9047,12 @@ impl Store for SqliteStore {
              ON CONFLICT (owner, session) DO UPDATE SET started_by = excluded.started_by,
                  created_at = excluded.created_at",
             params![owner, session, started_by, now],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_session_starts WHERE owner = ?1 AND session NOT IN (
+                 SELECT session FROM hub_session_starts WHERE owner = ?1
+                 ORDER BY created_at DESC, session LIMIT ?2)",
+            params![owner, SESSION_STARTS_MAX],
         )?;
         tx.commit()?;
         Ok(())

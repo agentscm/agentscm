@@ -97,11 +97,11 @@ use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, LOCAL_CI_SELECT, LocalCiDevice, LocalCiDeviceWrite, LocalCiPlan,
     LocalCiRefusal, LocalCiRequest, LocalCiRow, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS,
-    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SLIDE_STEP_SECONDS,
-    SessionView, Store, TokenDigest, User, check_session_start, event_limit, like_pattern,
-    local_ci_label, lower_hex_of, new_id, owner_session, pending, plan_local_ci_change,
-    plan_local_ci_enroll, plan_named, search_number, session_key, unix_now, validate_display_name,
-    validate_login,
+    NewAgentToken, Principal, PromiseInputScope, SESSION_START_RETAIN_SECONDS, SESSION_STARTS_MAX,
+    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, check_session_start, event_limit,
+    like_pattern, local_ci_label, lower_hex_of, new_id, owner_session, pending,
+    plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
+    validate_display_name, validate_login,
 };
 use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
@@ -184,6 +184,8 @@ const WORK_CAPACITY_LOCK_CLASS: i32 = 0x6167_6579;
 /// Serializes app connects per person and app, so a reconnect always sees the credential
 /// it retires.
 const APP_CONNECT_LOCK_CLASS: i32 = 0x6167_6561;
+/// Serializes records of which session started a session per owner, so no two close a loop.
+const SESSION_START_LOCK_CLASS: i32 = 0x6167_6573;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
@@ -5335,7 +5337,8 @@ fn session_starts_in(
     owner: &str,
 ) -> Result<Vec<(String, String)>> {
     let rows = client.query(
-        "SELECT session, started_by FROM hub_session_starts WHERE owner = $1 ORDER BY session",
+        "SELECT session, started_by FROM hub_session_starts WHERE owner = $1
+         ORDER BY created_at DESC, session",
         &[&owner],
     )?;
     Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
@@ -8928,6 +8931,12 @@ impl Store for PgStore {
     ) -> Result<()> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            // The loop check reads the owner's records and then writes one: two Hub processes
+            // doing that at once could each pass and together close a loop.
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                &[&SESSION_START_LOCK_CLASS, &owner],
+            )?;
             tx.execute(
                 "DELETE FROM hub_session_starts WHERE owner = $1 AND created_at < $2",
                 &[&owner, &(now - SESSION_START_RETAIN_SECONDS)],
@@ -8956,6 +8965,12 @@ impl Store for PgStore {
                  ON CONFLICT (owner, session) DO UPDATE SET started_by = excluded.started_by,
                      created_at = excluded.created_at",
                 &[&owner, &session, &started_by, &now],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_session_starts WHERE owner = $1 AND session NOT IN (
+                     SELECT session FROM hub_session_starts WHERE owner = $1
+                     ORDER BY created_at DESC, session LIMIT $2)",
+                &[&owner, &SESSION_STARTS_MAX],
             )?;
             tx.commit()?;
             Ok(())

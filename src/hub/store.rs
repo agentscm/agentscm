@@ -562,6 +562,8 @@ pub trait Store: Send + Sync {
     /// repositories they work. Refused unless `started_by` has an owner-wide name
     /// ([`owner_session`]) and is a session of one of `owner`'s agent tokens that the Hub has
     /// seen or that leads Work, and when the link would close a loop. A later call replaces it.
+    /// Records older than `SESSION_START_RETAIN_SECONDS`, and the oldest beyond
+    /// `SESSION_STARTS_MAX`, are dropped.
     fn session_started_by(
         &self,
         owner: &str,
@@ -569,7 +571,8 @@ pub trait Store: Send + Sync {
         started_by: &str,
         now: i64,
     ) -> Result<()>;
-    /// Each of `owner`'s sessions that another session started, with that session.
+    /// Each of `owner`'s sessions that another session started, with that session, the newest
+    /// record first.
     fn session_starts(&self, owner: &str) -> Result<Vec<(String, String)>>;
     /// The sessions that lead `owner`'s unfinished Work (active, blocked or paused), in any
     /// repository.
@@ -1633,6 +1636,9 @@ pub(super) fn owner_session(owner: &str, session: &str) -> Option<String> {
 
 /// How long a record of which session started a session is kept.
 pub(super) const SESSION_START_RETAIN_SECONDS: i64 = 30 * 86_400;
+/// The most such records kept for one owner; the oldest give way. Every read of them loads them
+/// all, and a caller may name any session ID as its own.
+pub(super) const SESSION_STARTS_MAX: i64 = 4096;
 
 /// The sessions that started `session`, nearest first, from an owner's start records
 /// (`Store::session_starts`). Stops at a session it has already passed.
