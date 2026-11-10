@@ -82,17 +82,19 @@ fn the_shared_status_reads_with_a_newer_hubs_fields_and_values() {
     }
 }
 
-/// How many times each client source file turns JSON into a typed value with `serde_json`.
+/// Every place a client source file turns JSON into a typed value with `serde_json`.
 ///
 /// A client must read a Hub reply with `agentscm::hub::reply`, because `serde_json` applies the
 /// strictness the Hub's types carry for requests, and one new field then breaks every installed
-/// client. `tests/fixtures/client-decodes.txt` lists each file that can send an HTTP request and
-/// still calls `serde_json::from_*`, with the count and what those calls read. A new call fails
-/// this test until it reads through `agentscm::hub::reply` or is added to the list with its reason.
+/// client. `tests/fixtures/client-decodes.txt` lists each call to `serde_json::from_*` in a file
+/// that can send an HTTP request, one line per call, under a comment saying what the calls read.
+/// A new call fails this test until it reads through `agentscm::hub::reply` or is listed as
+/// reviewed; a listed call that is gone fails it too. Calls are keyed by their own source line,
+/// not counted per file, so changes that add or remove different calls do not collide.
 #[test]
 fn client_code_reads_hub_replies_only_through_the_lenient_reader() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut found = BTreeMap::new();
+    let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut folders = vec![root.join("src")];
     while let Some(folder) = folders.pop() {
         for entry in std::fs::read_dir(folder).unwrap() {
@@ -111,24 +113,31 @@ fn client_code_reads_hub_replies_only_through_the_lenient_reader() {
             } else if name.ends_with(".rs") && !name.ends_with("/tests.rs") {
                 let text = std::fs::read_to_string(&path).unwrap();
                 let code = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
-                let calls = code.matches("serde_json::from_").count();
-                if calls > 0 && (code.contains("reqwest") || code.contains("forge_http")) {
-                    found.insert(name, calls);
+                if !(code.contains("reqwest") || code.contains("forge_http")) {
+                    continue;
+                }
+                for line in code.lines() {
+                    for _ in line.matches("serde_json::from_") {
+                        let call = (name.clone(), line.trim().to_owned());
+                        *found.entry(call).or_default() += 1;
+                    }
                 }
             }
         }
     }
-    let listed: BTreeMap<String, usize> =
-        std::fs::read_to_string(root.join("tests/fixtures/client-decodes.txt"))
-            .unwrap()
-            .lines()
-            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-            .map(|line| {
-                let mut parts = line.split_whitespace();
-                let count = parts.next().unwrap().parse().expect("a count, then a path");
-                (parts.next().expect("a path").to_owned(), count)
-            })
-            .collect();
+    let mut listed: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let ledger = std::fs::read_to_string(root.join("tests/fixtures/client-decodes.txt")).unwrap();
+    for line in ledger.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let (path, call) = line
+            .split_once(' ')
+            .expect("a path, then the call's source line");
+        *listed
+            .entry((path.to_owned(), call.trim().to_owned()))
+            .or_default() += 1;
+    }
     assert_eq!(
         found, listed,
         "a client's `serde_json::from_*` calls changed; read a Hub reply with \
