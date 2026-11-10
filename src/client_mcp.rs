@@ -81,7 +81,8 @@ fn current_token(
         // The checkout's current one keeps the server running when it reaches the same Hub and
         // repository, so a worktree session survives its main checkout reconnecting.
         Err(_) => {
-            let (current, _) = connection_for_checkout(&connections, checkout).ok_or_else(changed)?;
+            let (current, _) =
+                connection_for_checkout(&connections, checkout).ok_or_else(changed)?;
             if current.hub != connection.hub
                 || current.repo != connection.repo
                 || !is_current_in(current, checkout)
@@ -635,10 +636,40 @@ mod tests {
             let main = dir.path().join("main");
             std::fs::create_dir(&main).unwrap();
             git(&main, &["init", "--quiet"]);
-            git(&main, &["remote", "add", "origin", "https://github.com/acme/widgets.git"]);
-            git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "--allow-empty", "-m", "t"]);
+            git(
+                &main,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/acme/widgets.git",
+                ],
+            );
+            git(
+                &main,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "t",
+                ],
+            );
             let linked = dir.path().join("linked");
-            git(&main, &["worktree", "add", "--quiet", "--detach", linked.to_str().unwrap()]);
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                ],
+            );
             let (main, linked) = (main.canonicalize().unwrap(), linked.canonicalize().unwrap());
             let token = |name: &str, value: &str| {
                 let path = home.join(name);
@@ -664,14 +695,22 @@ mod tests {
             };
             // The worktree's own connection was removed; the main checkout's serves the same
             // Hub and repository, so the server switches to its token instead of stopping.
-            write(&[bound(main.clone(), "acme/widgets", token("main", "main-token"))]);
+            write(&[bound(
+                main.clone(),
+                "acme/widgets",
+                token("main", "main-token"),
+            )]);
             let mut verified = None;
             assert_eq!(
                 current_token(&own, &linked, "own-token", &mut verified).unwrap(),
                 "main-token"
             );
             // Another repository's connection is never taken over.
-            write(&[bound(main.clone(), "acme/other", token("other", "other-token"))]);
+            write(&[bound(
+                main.clone(),
+                "acme/other",
+                token("other", "other-token"),
+            )]);
             assert!(current_token(&own, &linked, "own-token", &mut verified).is_err());
         });
     }

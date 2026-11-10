@@ -596,7 +596,9 @@ async fn capture_claude(
     if capture_mode == CaptureModeV1::SharedConversation {
         for prompt in held {
             if claude_code::capture_native_hook(&prompt, &request, &actions, spool).is_err() {
-                eprintln!("AgentSCM local capture warning: a prompt held before the claim was not retained");
+                eprintln!(
+                    "AgentSCM local capture warning: a prompt held before the claim was not retained"
+                );
             }
         }
     }
@@ -616,15 +618,16 @@ async fn capture_claude(
     if event == Some("Stop")
         && let Some(transcript) = payload.get("transcript_path").and_then(Value::as_str)
     {
-        for (hash, reply) in
-            missed_replies(&replies, std::path::Path::new(transcript), &session_id)
+        for (hash, reply) in missed_replies(&replies, std::path::Path::new(transcript), &session_id)
         {
             if claude_code::capture_native_hook(&reply, &request, &actions, spool).is_ok() {
                 note_replies(&replies, |seen| {
                     seen.hashes.insert(hash);
                 });
             } else {
-                eprintln!("AgentSCM local capture warning: a reply recovered from the transcript was not retained");
+                eprintln!(
+                    "AgentSCM local capture warning: a reply recovered from the transcript was not retained"
+                );
             }
         }
     }
@@ -665,7 +668,9 @@ async fn capture_claude(
     if payload.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
         return None;
     }
-    let mut context = vec![sharing_state(capture_mode == CaptureModeV1::SharedConversation)];
+    let mut context = vec![sharing_state(
+        capture_mode == CaptureModeV1::SharedConversation,
+    )];
     if capture_mode == CaptureModeV1::SharedConversation
         && let (Some(answer), Some(hub)) = (sharing, hub)
         && answer.sharing
@@ -837,7 +842,10 @@ fn text_hash(text: &str) -> String {
 }
 
 /// Updates the session's seen replies; `change` gets the saved state, or None for a new session.
-fn update_replies(path: &Option<PathBuf>, change: impl FnOnce(Option<SeenReplies>) -> Option<SeenReplies>) {
+fn update_replies(
+    path: &Option<PathBuf>,
+    change: impl FnOnce(Option<SeenReplies>) -> Option<SeenReplies>,
+) {
     let Some(path) = path else { return };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -846,7 +854,9 @@ fn update_replies(path: &Option<PathBuf>, change: impl FnOnce(Option<SeenReplies
         let saved = fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let Some(mut seen) = change(saved) else { return };
+        let Some(mut seen) = change(saved) else {
+            return;
+        };
         while seen.hashes.len() > SEEN_REPLIES {
             let first = seen.hashes.iter().next().cloned();
             first.map(|first| seen.hashes.remove(&first));
@@ -1431,7 +1441,10 @@ mod tests {
         shown("Deliv", false);
         shown("ered.", true);
         let mut text = std::fs::read_to_string(&transcript).unwrap();
-        text += &(line("a", &["Deliv", "ered."]) + &line("b", &["lost"]) + "{\"type\":\"user\"}\n" + "{\"partial");
+        text += &(line("a", &["Deliv", "ered."])
+            + &line("b", &["lost"])
+            + "{\"type\":\"user\"}\n"
+            + "{\"partial");
         std::fs::write(&transcript, text).unwrap();
         // State saved already: skipping only for a new session leaves it alone.
         super::skip_transcript(&seen, &payload, true);

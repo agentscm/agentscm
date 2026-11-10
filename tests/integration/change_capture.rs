@@ -5390,7 +5390,10 @@ fn shared_import_with_many_redacted_bodies_splits_batches_within_gap_limit() {
 fn a_prompt_deferred_before_the_claim_is_captured_with_its_text_once_the_session_claims() {
     let temp = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();
-    run_git(repo.path(), &["init", "--quiet", "--initial-branch", "main"]);
+    run_git(
+        repo.path(),
+        &["init", "--quiet", "--initial-branch", "main"],
+    );
     let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
     let prompt = br#"{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt":"OPENING_PROMPT_917"}"#;
     deferred_native_hook(
@@ -5406,38 +5409,54 @@ fn a_prompt_deferred_before_the_claim_is_captured_with_its_text_once_the_session
     )
     .unwrap();
     // The deferred fact never carries the text.
-    let pending = serde_json::to_string(&spool.pending(20).unwrap()).unwrap();
-    assert!(!pending.contains("OPENING_PROMPT_917"));
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        b"OPENING_PROMPT_917"
+    ));
     // Replayed into the claimed, shared conversation, the held prompt keeps its text.
     let request = capture_request(CaptureModeV1::SharedConversation);
     assert_eq!(
         capture_hook(prompt, &request, &spool).unwrap(),
         HookCaptureOutcome::Stored
     );
-    let pending = serde_json::to_string(&spool.pending(20).unwrap()).unwrap();
-    assert!(pending.contains("OPENING_PROMPT_917"), "{pending}");
+    assert!(contains_bytes(
+        &retained_bytes(spool.root()),
+        b"OPENING_PROMPT_917"
+    ));
 }
 
 #[test]
-fn retaining_artifacts_stays_fast_in_a_spool_with_thousands_of_files() {
+fn retaining_an_artifact_costs_the_same_in_a_spool_with_thousands_of_files() {
     // Each lock used to open every retained file, so a Git snapshot of N files cost N² opens
-    // (26-41 s per hook in a large checkout). This keeps it linear.
+    // (26-41 s per hook in a large checkout). A retain must not slow down as the spool grows.
     let temp = TempDir::new().unwrap();
     let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
-    let started = std::time::Instant::now();
-    for n in 0..3000 {
-        spool
-            .retain_artifact(
-                format!("artifact {n}").as_bytes(),
-                ArtifactMediaV1::Binary,
-                RetentionClassV1::WorkLocal,
-            )
-            .unwrap();
-    }
-    // Already retained content takes no lock at all.
+    let retain = |range: std::ops::Range<usize>| {
+        let started = std::time::Instant::now();
+        for n in range {
+            spool
+                .retain_artifact(
+                    format!("artifact {n}").as_bytes(),
+                    ArtifactMediaV1::Binary,
+                    RetentionClassV1::WorkLocal,
+                )
+                .unwrap();
+        }
+        started.elapsed()
+    };
+    let empty = retain(0..100);
+    retain(100..2500);
+    let full = retain(2500..2600);
+    assert!(
+        full < empty * 4 + Duration::from_millis(200),
+        "{empty:?} empty, {full:?} full"
+    );
+    // Already retained content takes no lock.
     spool
-        .retain_artifact(b"artifact 0", ArtifactMediaV1::Binary, RetentionClassV1::WorkLocal)
+        .retain_artifact(
+            b"artifact 0",
+            ArtifactMediaV1::Binary,
+            RetentionClassV1::WorkLocal,
+        )
         .unwrap();
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(10), "3000 artifacts took {elapsed:?}");
 }
