@@ -1897,7 +1897,7 @@ fn remove_reused_worktree(connections: &[Connection], root: &Path) -> Result<()>
         );
     }
     #[cfg(not(unix))]
-    let _ = checkout;
+    let _ = (shared, checkout);
     Ok(())
 }
 
