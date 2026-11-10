@@ -4742,7 +4742,8 @@ fn spool_quota_emits_priority_gap_and_later_event_shows_resume() {
         .filter_map(|envelope| match envelope {
             CaptureEnvelopeV1::EventBatch(batch) => batch.events.iter().find_map(|event| {
                 event.gap.as_ref().and_then(|gap| {
-                    (gap.reason == agentscm::change_record::GapReasonV1::CaptureInterrupted)
+                    // A spool with no room says so: this computer's store was full.
+                    (gap.reason == agentscm::change_record::GapReasonV1::LocalRetentionExpired)
                         .then_some(event.sequence)
                 })
             }),
@@ -5585,66 +5586,6 @@ fn an_event_refused_for_lack_of_room_leaves_a_gap_that_says_the_store_was_full()
             .is_some_and(|gap| gap.reason == GapReasonV1::LocalRetentionExpired)),
         "{captured:?}"
     );
-}
-
-#[test]
-fn compaction_frees_accepted_shared_bodies_and_keeps_pending_and_local_ones() {
-    let temp = TempDir::new().unwrap();
-    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
-    let (token, password) = synthetic_secrets();
-    let hooks = shared_prompt_and_tool_hooks(&token, &password);
-    let bodies = |spool: &LocalSpool| -> Vec<_> {
-        captured_events(spool)
-            .into_iter()
-            .filter_map(|(_, event)| event.artifact)
-            .collect()
-    };
-    let shared = capture_request(CaptureModeV1::SharedConversation);
-    for hook in &hooks[..2] {
-        capture_hook(hook.as_bytes(), &shared, &spool).unwrap();
-    }
-    let local = CaptureRequest {
-        observed_session_id: "session_local".into(),
-        canonical_session_id: "session_local".into(),
-        ..capture_request(CaptureModeV1::LocalConversation)
-    };
-    capture_hook(
-        hooks[0]
-            .replace("session_fixture", "session_local")
-            .as_bytes(),
-        &local,
-        &spool,
-    )
-    .unwrap();
-    let accepted = bodies(&spool);
-    assert_eq!(accepted.len(), 3);
-    for envelope in spool.pending(100).unwrap() {
-        spool.acknowledge(&envelope).unwrap();
-    }
-    capture_hook(hooks[2].as_bytes(), &shared, &spool).unwrap();
-    let pending = bodies(&spool);
-    assert_eq!(pending.len(), 1);
-
-    assert!(spool.compact_acknowledged(100).unwrap().envelopes > 0);
-    let kept = |digest: &str| spool.root().join("artifacts").join(digest).exists();
-    for body in &accepted {
-        // The Hub holds an accepted shared body; a body kept on this computer only stays.
-        assert_eq!(
-            kept(&body.digest),
-            body.retention == RetentionClassV1::WorkLocal,
-            "{body:?}"
-        );
-    }
-    assert!(
-        accepted
-            .iter()
-            .any(|body| body.retention == RetentionClassV1::WorkLocal)
-    );
-    assert!(
-        kept(&pending[0].digest),
-        "a body still waiting for the Hub stays"
-    );
-    assert!(!spool.read_artifact(&pending[0]).unwrap().is_empty());
 }
 
 #[test]

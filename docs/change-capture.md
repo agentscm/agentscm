@@ -60,53 +60,53 @@ instead of losing the completion.
 Acknowledgement hides an envelope from delivery without immediately deleting it. Explicit local
 compaction can replace acknowledged ordinary event envelopes with exact idempotency digests and
 completed action pairs with compact retained receipts. Usage records and provider-history gap
-envelopes retain their full original contents in the replay index. Managed recipe Pre/Post events retain their
-full original Work, generation, and session envelope alongside the action receipts so target or
-timestamp changes cannot turn a provider-occurrence replay into new work. This finite replay index
-is never silently pruned: when its configured record or byte bound is reached, compaction refuses
-and requires explicit export or a larger spool. Compaction never removes pending envelopes,
-incomplete action starts, bodies kept only on this computer (`work_local`), deferred diagnostics, or
-the source metadata needed by an outstanding action. It does remove the local copy of a compacted
-batch's shared body (`shared_approved`) unless an envelope still in the outbox names it: delivery
-acknowledges a batch only once its shared bodies are on the Hub, and the Hub reports such a body as
-shared, expired or deleted from its own copy, never as local. Other local artifacts are not
-automatically pruned. Recoverable fully written temporary files are completed under the spool
+envelopes retain their full original contents in the replay index. Managed recipe Pre/Post events
+retain their full original Work, generation, and session envelope alongside the action receipts so
+target or timestamp changes cannot turn a provider-occurrence replay into new work. This finite
+replay index is never silently pruned: when its configured record or byte bound is reached,
+compaction refuses and requires explicit export or a larger spool. Compaction never removes pending
+envelopes, incomplete action starts, artifacts, deferred diagnostics, or the source metadata needed
+by an outstanding action. Local artifacts are not automatically pruned: delivery acknowledges a
+batch without uploading its bodies once its binding no longer shares, and a shared body with nothing
+redacted is the same file as a local body with the same bytes, so an acknowledgement does not prove
+that the Hub holds a body. Recoverable fully written temporary files are completed under the spool
 lock in every private spool directory after a crash. Exact duplicates are removed and malformed or
 ambiguous files are moved into a private quarantine. Quarantine files count toward the configured
 record and byte limits and are never deleted automatically. Inspect them with `change-capture
 quarantine`; `change-capture prune-quarantine` deletes only exact opaque names selected by the
 operator. A committed spool may reopen above its configured write cap after crash debris is
 quarantined so bounded inspection and explicit pruning remain available. Every ordinary admission
-still counts the complete physical usage and refuses until capacity is restored; recovery itself
-has a fixed physical-record scan bound. Active writer temporary files are protected by the spool
-lock and are never quarantine
-prune targets. Nothing the Hub has not accepted, and no quarantine file, is ever deleted from the
-local spool automatically; upkeep (below) removes only acknowledged records with their accepted
-shared bodies, sanitized deferred facts, which are never uploaded, and tool-call claims, local
-bookkeeping that is never uploaded either. The Hub copies of shared bodies expire on their own (see
-[retention and deletion](#retention-and-deletion)).
+still counts the complete physical usage and refuses until capacity is restored; recovery itself has
+a fixed physical-record scan bound. Active writer temporary files are protected by the spool lock
+and are never quarantine prune targets. Nothing the Hub has not accepted, and no quarantine file, is
+ever deleted from the local spool automatically; upkeep (below) removes only acknowledged records,
+sanitized deferred facts, which are never uploaded, and tool-call claims, local bookkeeping that is
+never uploaded either. The Hub copies of shared bodies expire on their own (see [retention and
+deletion](#retention-and-deletion)).
 
-**Upkeep.** A spool holds 4,096 records and 64 MiB by default. Every hook that captures an event
-first checks its spool, beside its Hub lookups and before it writes the event, so a spool that
-filled with what the Hub has accepted makes room before the event is refused; delivery comes after.
-Past 80% of its record or byte limit (or already full), upkeep deletes sanitized deferred facts that
-nothing will read again: one bound to a target is kept for 7 days, until its session has emitted the
-gap it stands for, and of the others (facts from before a session had Work) only the newest 256 from
-the last day are kept for local diagnosis. It deletes tool-call claims older than a day: a claim
-pairs a tool call's Pre and Post hooks, and one whose other phase has not come in a day (an
-interrupted tool, a killed hook, an ended session) never will; a Post whose Pre recorded no action
-start ends its claim at once. It then compacts one page of up to 500 acknowledged envelopes,
-exactly as `change-capture compact` does, which frees up to 1,000 records with their accepted shared
-bodies, and skips that scan when nothing is acknowledged. If the spool is still full afterwards
-(inside the headroom kept for gaps, where new facts are refused), the session-start context says so
-instead of saying that sharing is on, because capture then records only gaps, and names the commands
-that help: `change-capture inspect --spool <spool>` to see what it holds, and `unconfigure` then
-`forget` to start a new store. The old store stays on disk, but records still waiting in it are no
-longer delivered. `change-capture status` reports the same: its `session_start` is that sentence,
-and `store_full` and `store_full_fix` say it as fields. Each session's own sequence and association
-records are not expired yet, and the compaction index keeps a receipt of every compacted envelope
-until its bound, so a checkout that runs many thousands of sessions can still fill its store; that
-is when the commands above are needed.
+**Upkeep.** A spool holds 4,096 records and 64 MiB by default. A hook that captures an event tidies
+its spool beside its Hub lookups and before it writes the event, so a spool that filled with what
+the Hub has accepted makes room before the event is refused; delivery comes after. Session start and
+turn end tidy a spool past 80% of its record or byte limit; every other event tidies only a full
+one. Upkeep deletes sanitized deferred facts that nothing will read again: one bound to a target is
+kept for 7 days, until its session has emitted the gap it stands for, and of the others (facts from
+before a session had Work) only the newest 256 from the last day are kept for local diagnosis. It
+deletes tool-call claims older than a day: a claim pairs a tool call's Pre and Post hooks, and one
+whose other phase has not come in a day (an interrupted tool, a killed hook, an ended session) never
+will; a Post whose Pre recorded no action start ends its claim at once; a claim a recipe attempt
+names stays until that attempt is reconciled. It then compacts one page of up to 500 acknowledged
+envelopes, as `change-capture compact` does (which takes at most 100), freeing up to 1,000 records,
+and skips that scan when nothing is acknowledged. If the spool is still full afterwards (inside the
+headroom kept for gaps, where new facts are refused), the session-start context says so instead of
+saying that sharing is on, because capture then records only gaps, and names the commands that help:
+`change-capture inspect --spool <spool>` to see what it holds, and `unconfigure` then `forget` to
+start a new store. The old store stays on disk, but records still waiting in it are no longer
+delivered. `change-capture status` reports the same: its `session_start` is that sentence, and
+`store_full` and `store_full_fix` say it as fields. Each session's own sequence and association
+records are not expired yet, conversation bodies stay until the store is exported or replaced, and
+the compaction index keeps a receipt of every compacted envelope until its bound, so a checkout that
+runs many thousands of tool calls can still fill its store; that is when the commands above are
+needed.
 
 The compaction index is the durable commit point. Crash recovery completes its exact envelope,
 acknowledgement, native-observation, active-order, and delivery-cursor cleanup. A cursor naming

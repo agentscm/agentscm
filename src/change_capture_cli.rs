@@ -488,12 +488,17 @@ async fn capture_claude(
         }
     };
     // Upkeep runs beside the Hub lookups, and this event is written only after it, so a spool
-    // that filled with what the Hub has accepted makes room first. Every captured event runs it:
-    // the tool hooks write the most, and delivery, which can take the rest of the hook's time,
-    // comes after.
+    // that filled with what the Hub has accepted makes room first; delivery, which can take the
+    // rest of the hook's time, comes after. Session start and turn end tidy from 80% of a limit;
+    // any other event only a full spool, so a spool that stays past 80% does not cost every
+    // tool hook a pass.
+    let tidy = matches!(
+        payload.get("hook_event_name").and_then(Value::as_str),
+        Some("SessionStart" | "Stop")
+    );
     let upkeep = tokio::task::spawn_blocking({
         let spool = spool.clone();
-        move || maintain(&spool)
+        move || (tidy || spool.usage().is_ok_and(|usage| usage.is_full())) && maintain(&spool)
     });
     let (target, sharing) = match hub {
         Some(hub) => tokio::time::timeout_at(deadline, async {
@@ -1711,16 +1716,18 @@ mod tests {
         url
     }
 
-    /// A client for the loopback Hub (`sharing_hub`), with a token under `config`.
-    fn loopback(config: &Path, target: bool) -> CaptureHub {
+    /// A client for the loopback Hub (`sharing_hub`), with a token under `config`, and its URL,
+    /// which a binding names to have its Work looked up there.
+    fn loopback(config: &Path, target: bool) -> (CaptureHub, String) {
         use std::os::unix::fs::PermissionsExt;
         let token = config.join("token");
         std::fs::write(&token, "synthetic-token").unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-        CaptureHub::new(crate::client_config::Connection {
+        let url = sharing_hub(target);
+        let hub = CaptureHub::new(crate::client_config::Connection {
             root: config.into(),
             origin_host: "github.com".into(),
-            hub: sharing_hub(target),
+            hub: url.clone(),
             repo: "acme/widgets".into(),
             token_file: token,
             report_completion: false,
@@ -1728,13 +1735,14 @@ mod tests {
             owned_token_expires_at: None,
             agents: Vec::new(),
         })
-        .unwrap()
+        .unwrap();
+        (hub, url)
     }
 
     #[test]
     fn a_checkout_set_to_metadata_only_says_it_caps_a_sharing_repository_and_the_fix() {
         crate::client_config::in_isolated_config_home(|config| {
-            let hub = loopback(config, false);
+            let (hub, _) = loopback(config, false);
             let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
             let context = hook(&binding(config), &spool, "SessionStart", Some(&hub)).unwrap();
             assert!(
@@ -1752,69 +1760,93 @@ mod tests {
     #[test]
     fn a_store_full_of_accepted_records_makes_room_and_records_the_next_event() {
         crate::client_config::in_isolated_config_home(|config| {
-            let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
-            // Facts from before a session had Work, two days old: nothing reads them again.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            for n in 1..=3_u64 {
-                spool
-                    .retain_deferred(&DeferredHookV1 {
-                        occurrence_id: format!("evt:{n}"),
-                        reserved_sequence: Some(n),
-                        session_id: "session_before_work".into(),
-                        hook_event_name: "SessionStart".into(),
-                        observed_at: now - 2 * 24 * 60 * 60,
-                        reason: DeferredReasonV1::NoCurrentAuthorizedWork,
-                        input_digest: format!("{n:064x}"),
-                        event_kind: Some(CapturedEventKindV1::SessionStarted),
-                        tool_kind: None,
-                        source: None,
-                        recipe_digest: None,
-                        action_kind: None,
-                    })
-                    .unwrap();
-            }
-            fill(&spool, true);
-            let hub = loopback(config, true);
-
-            assert_eq!(hook(&binding(config), &spool, "Stop", Some(&hub)), None);
-            let events: Vec<CapturedEventV1> = spool
-                .pending(100)
-                .unwrap()
-                .into_iter()
-                .flat_map(|envelope| match envelope {
-                    CaptureEnvelopeV1::EventBatch(batch) => batch.events,
-                    _ => Vec::new(),
-                })
-                .collect();
-            assert!(
-                events
-                    .iter()
-                    .any(|event| event.kind == CapturedEventKindV1::TurnEnded),
-                "{events:?}"
-            );
-            assert!(
-                events
-                    .iter()
-                    .all(|event| event.gap.as_ref().is_none_or(|gap| !matches!(
-                        gap.reason,
-                        GapReasonV1::LocalRetentionExpired | GapReasonV1::CaptureInterrupted
-                    ))),
-                "{events:?}"
-            );
-            assert!(spool.deferred(100).unwrap().is_empty());
+            records_the_next_event_in_a_full_store(config, "Stop", CapturedEventKindV1::TurnEnded);
         });
+    }
+
+    #[test]
+    fn a_tool_or_prompt_hook_also_makes_room_in_a_full_store() {
+        crate::client_config::in_isolated_config_home(|config| {
+            records_the_next_event_in_a_full_store(
+                config,
+                "UserPromptSubmit",
+                CapturedEventKindV1::UserPrompt,
+            );
+        });
+    }
+
+    /// A store filled to its limit with accepted records and holding unattached facts two days
+    /// old: the hook for `event` makes room before it writes, so its event is recorded and not a
+    /// gap, and the old facts are gone.
+    fn records_the_next_event_in_a_full_store(
+        config: &Path,
+        hook_event: &str,
+        kind: CapturedEventKindV1,
+    ) {
+        let spool = LocalSpool::open_with_limits(config.join("spool"), SMALL).unwrap();
+        // Facts from before a session had Work, two days old: nothing reads them again.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for n in 1..=3_u64 {
+            spool
+                .retain_deferred(&DeferredHookV1 {
+                    occurrence_id: format!("evt:{n}"),
+                    reserved_sequence: Some(n),
+                    session_id: "session_before_work".into(),
+                    hook_event_name: "SessionStart".into(),
+                    observed_at: now - 2 * 24 * 60 * 60,
+                    reason: DeferredReasonV1::NoCurrentAuthorizedWork,
+                    input_digest: format!("{n:064x}"),
+                    event_kind: Some(CapturedEventKindV1::SessionStarted),
+                    tool_kind: None,
+                    source: None,
+                    recipe_digest: None,
+                    action_kind: None,
+                })
+                .unwrap();
+        }
+        fill(&spool, true);
+        let (hub, url) = loopback(config, true);
+        let bound = CaptureBinding {
+            hub: url,
+            ..binding(config)
+        };
+
+        assert_eq!(hook(&bound, &spool, hook_event, Some(&hub)), None);
+        let events: Vec<CapturedEventV1> = spool
+            .pending(100)
+            .unwrap()
+            .into_iter()
+            .flat_map(|envelope| match envelope {
+                CaptureEnvelopeV1::EventBatch(batch) => batch.events,
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(events.iter().any(|event| event.kind == kind), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.gap.as_ref().is_none_or(|gap| !matches!(
+                    gap.reason,
+                    GapReasonV1::LocalRetentionExpired | GapReasonV1::CaptureInterrupted
+                ))),
+            "{events:?}"
+        );
+        assert!(spool.deferred(100).unwrap().is_empty());
     }
 
     #[test]
     fn a_full_store_never_says_sharing_is_on_at_session_start() {
         crate::client_config::in_isolated_config_home(|config| {
             let spool = filled_spool(config, false);
-            let mut shared = binding(config);
-            shared.capture_mode = CaptureModeV1::SharedConversation;
-            let hub = loopback(config, false);
+            let (hub, url) = loopback(config, false);
+            let shared = CaptureBinding {
+                hub: url,
+                capture_mode: CaptureModeV1::SharedConversation,
+                ..binding(config)
+            };
             let context = hook(&shared, &spool, "SessionStart", Some(&hub)).unwrap();
             assert!(context.contains("local capture store is full"), "{context}");
             assert!(

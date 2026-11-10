@@ -1649,19 +1649,7 @@ impl LocalSpool {
             ));
         }
         let _lock = self.lock()?;
-        for name in regular_file_names(&self.root.join("recipe-attempts"), self.limits.max_records)?
-        {
-            let bytes = read_bounded(
-                &self.root.join("recipe-attempts").join(name),
-                MAX_DEFERRED_BYTES,
-            )?;
-            let attempt: RecipeAttemptV1 = serde_json::from_slice(&bytes)?;
-            validate_recipe_attempt(&attempt)?;
-            if attempt.marker_id == marker_id {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(recipe_attempt_markers(&self.root, self.limits.max_records)?.contains(marker_id))
     }
 
     /// Revalidates the admitted managed Pre and writes the configured ActionStart while holding
@@ -2436,11 +2424,13 @@ impl LocalSpool {
     /// Deletes tool-call claims older than `CLAIM_KEEP_SECONDS`. A claim only pairs a tool call's
     /// Pre and Post hooks and is never sent to the Hub; one that waited a day lost its other phase
     /// (an interrupted tool, a killed hook, an ended session) and nothing will complete it. A
-    /// phase that still arrives later starts a new claim. Legacy claims stay for inspect/export.
-    /// Returns how many were deleted.
+    /// phase that still arrives later starts a new claim. Legacy claims, and claims a recipe
+    /// attempt names (its reconciliation needs them), stay. Returns how many were deleted.
     pub fn expire_claims(&self, now: i64) -> Result<usize> {
-        let _managed = self.lock_managed_capture()?;
+        // Not the managed-capture lock: a Post hook holds it through a whole Git capture, and a
+        // claim this old has no phase in flight.
         let _lock = self.lock()?;
+        let attempted = recipe_attempt_markers(&self.root, self.limits.max_records)?;
         let directory = self.root.join("managed-invocations");
         let mut removed = 0usize;
         for name in regular_file_names(&directory, self.limits.max_records)? {
@@ -2448,7 +2438,10 @@ impl LocalSpool {
             let marker: ManagedInvocationV1 =
                 serde_json::from_slice(&read_bounded(&path, MAX_DEFERRED_BYTES)?)?;
             validate_managed_invocation(&marker)?;
-            if marker.version != 4 || now.saturating_sub(marker.observed_at) < CLAIM_KEEP_SECONDS {
+            if marker.version != 4
+                || now.saturating_sub(marker.observed_at) < CLAIM_KEEP_SECONDS
+                || attempted.contains(&marker.marker_id)
+            {
                 continue;
             }
             match fs::remove_file(&path) {
@@ -2460,8 +2453,8 @@ impl LocalSpool {
         Ok(removed)
     }
 
-    /// Run before each captured event is written: past 80% of a limit, deletes deferred hooks
-    /// nothing will read (`prune_deferred`) and claims that lost their other phase
+    /// Run by the capture hook before it writes an event: past 80% of a limit, deletes deferred
+    /// hooks nothing will read (`prune_deferred`) and claims that lost their other phase
     /// (`expire_claims`), and compacts one page of envelopes the Hub has accepted
     /// (`compact_acknowledged`, which never touches anything unaccepted). Answers whether the spool
     /// is still full afterwards. A failed prune does not stop compaction; its error is returned
@@ -2473,8 +2466,8 @@ impl LocalSpool {
         let pruned = self.prune_deferred(now);
         let expired = self.expire_claims(now);
         // One page a pass frees up to twice its size in records, enough to take a full spool of
-        // accepted records below 80%, so a hook stays inside its time. Nothing accepted means
-        // nothing to compact, so the full scan is skipped.
+        // accepted records below 80%. Nothing accepted means nothing to compact, so the full scan
+        // is skipped.
         let accepted = fs::read_dir(self.root.join("acknowledged"))
             .is_ok_and(|mut entries| entries.next().is_some());
         if accepted {
@@ -3238,10 +3231,8 @@ impl LocalSpool {
     /// Compacts acknowledged envelopes, when asked and from `upkeep` before a captured event once
     /// the spool passes 80% of a limit. Ordinary event batches retain an exact
     /// idempotency digest; replayable events and completed action pairs retain their full receipts
-    /// so following state transitions and action continuity remain checkable. The local copies of
-    /// compacted batches' shared bodies are removed, since the Hub holds them. Pending envelopes,
-    /// incomplete action starts, bodies kept only on this computer and deferred diagnostics are
-    /// never removed.
+    /// so following state transitions and action continuity remain checkable. Pending envelopes,
+    /// incomplete action starts, artifacts and deferred diagnostics are never removed.
     pub fn compact_acknowledged(&self, limit: usize) -> Result<CompactionReport> {
         if limit == 0 || limit > MAX_COMPACTION_PAGE {
             return Err(CaptureError::Invalid(format!(
@@ -3259,12 +3250,12 @@ impl LocalSpool {
         let mut by_key = BTreeMap::new();
         let mut starts = BTreeMap::new();
         let mut finishes = BTreeMap::new();
-        // Every artifact digest an envelope that stays in the outbox names, in any field.
-        let mut named = BTreeSet::new();
         for (key, envelope) in retained {
+            if !acknowledged.contains(&key) {
+                continue;
+            }
             let bytes = serde_json::to_vec(&envelope)?;
-            if !acknowledged.contains(&key) || !exact_acknowledgement(&self.root, &key, &bytes)? {
-                named_digests(&serde_json::to_value(&envelope)?, &mut named);
+            if !exact_acknowledgement(&self.root, &key, &bytes)? {
                 continue;
             }
             match &envelope {
@@ -3438,48 +3429,6 @@ impl LocalSpool {
         }
         atomic_replace(&state_path, &state_bytes)?;
         recover_compacted_remainders(self)?;
-        // An acknowledged batch's shared bodies are on the Hub (delivery acknowledges only after
-        // they are), so their local copies go with it unless an envelope still in the outbox names
-        // them. Bodies kept on this computer only (`work_local`) are never removed. The index's
-        // retained batches are swept too, so bodies compacted before this pass are freed as well.
-        for (key, envelope) in &by_key {
-            if !selected.contains(key) {
-                named_digests(&serde_json::to_value(envelope)?, &mut named);
-            }
-        }
-        let mut accepted = BTreeSet::new();
-        for envelope in selected.iter().filter_map(|key| by_key.get(key)).chain(
-            state
-                .entries
-                .values()
-                .filter_map(|entry| entry.envelope.as_ref()),
-        ) {
-            if let CaptureEnvelopeV1::EventBatch(batch) = envelope {
-                accepted.extend(
-                    batch
-                        .events
-                        .iter()
-                        .filter_map(|event| event.artifact.as_ref())
-                        .filter(|artifact| artifact.retention == RetentionClassV1::SharedApproved)
-                        .map(|artifact| artifact.digest.clone()),
-                );
-            }
-        }
-        let artifacts = self.root.join("artifacts");
-        let mut freed = false;
-        for digest in regular_file_names(&artifacts, self.limits.max_records)? {
-            if !accepted.contains(&digest) || named.contains(&digest) {
-                continue;
-            }
-            match fs::remove_file(artifacts.join(&digest)) {
-                Ok(()) => freed = true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if freed {
-            File::open(&artifacts)?.sync_all()?;
-        }
         Ok(CompactionReport {
             envelopes: selected.len(),
             bytes_reclaimed: removed_bytes
@@ -4862,26 +4811,16 @@ fn replayable_event_operation(operation_id: &str) -> bool {
     claimed_event_operation(operation_id) || provider_history_gap_operation(operation_id)
 }
 
-/// Collects every `digest` string anywhere in `value`. Naming more than artifacts only keeps more.
-fn named_digests(value: &serde_json::Value, named: &mut BTreeSet<String>) {
-    match value {
-        serde_json::Value::Object(fields) => {
-            for (field, value) in fields {
-                match value {
-                    serde_json::Value::String(digest) if field == "digest" => {
-                        named.insert(digest.clone());
-                    }
-                    value => named_digests(value, named),
-                }
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                named_digests(value, named);
-            }
-        }
-        _ => {}
+/// The claim ids that retained recipe attempts name. The caller holds the spool lock.
+fn recipe_attempt_markers(root: &Path, max_records: usize) -> Result<BTreeSet<String>> {
+    let mut markers = BTreeSet::new();
+    for name in regular_file_names(&root.join("recipe-attempts"), max_records)? {
+        let bytes = read_bounded(&root.join("recipe-attempts").join(name), MAX_DEFERRED_BYTES)?;
+        let attempt: RecipeAttemptV1 = serde_json::from_slice(&bytes)?;
+        validate_recipe_attempt(&attempt)?;
+        markers.insert(attempt.marker_id);
     }
+    Ok(markers)
 }
 
 fn retain_compacted_envelope(envelope: &CaptureEnvelopeV1) -> bool {
