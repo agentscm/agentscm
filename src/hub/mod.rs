@@ -1,5 +1,6 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
+pub mod agent_messages;
 pub mod agent_rules;
 pub mod capacity;
 pub mod catchup;
@@ -13,6 +14,8 @@ pub mod conversation_sharing;
 pub mod coordination;
 mod coordination_http;
 pub mod device;
+pub mod digest;
+pub mod digest_http;
 pub mod dismissals;
 pub mod error_envelope;
 pub mod external_runs;
@@ -489,6 +492,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(digest_http::routes())
         .merge(validation_evidence_http::routes())
         .merge(pr_context::routes())
         .merge(continuity::routes())

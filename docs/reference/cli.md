@@ -50,6 +50,17 @@ agent token. `agentscm promise propose --request FILE` and `report --request FIL
 `PromiseInputV1` JSON; `--request -` reads standard input. Proposals and reports are advisory,
 not owner amendments or verified evidence. See [Living Promises](../advanced/living-promises.md).
 
+### `digest` (experimental)
+
+`agentscm digest show [--days N] [--json]` prints the current token's person's unfinished Work
+that has been quiet for three days or more, with whether a pull request from its branch merged,
+and the repository's paths and pairs of people with repeated collisions over the last `N` days
+(1 to 31, default 7). Missing history is reported as unknown, not zero. `agentscm digest settings
+[--json]` prints whether weekly delivery is on for the repository and for you. `enable` and
+`disable` switch the repository's weekly delivery and need a repository admin or Hub admin;
+`opt-out` and `opt-in` switch your own. See
+[the digest](../work-insights.md#digest-stale-work-and-repeated-collisions).
+
 ### `work`
 
 `agentscm work overview` and `agentscm work briefing` include bounded `planned_issues` separately from Work: `unclaimed`, historical `linked` relationships and `linkage_unknown`, with coverage, freshness and capture-time timestamps. Missing or stale planning evidence remains unknown. GitHub discovery is bounded to three pages/300 raw rows; GitLab discovery is unsupported. Link absence is checked independently of the displayed Work page, through at most 1,000 durable Work rows. See [planned issues and native Work](../standup.md#planned-issues-and-native-work).

@@ -17,9 +17,11 @@ Agents already get every coordination warning in their own replies. People hear 
 | Work enters `blocked` | The shared status first observes a personal blocker; experimental, requires `reminders.enabled`. | The lead agent's person named by the shared status, with an **Open Hub** link to `#work/<id>`. |
 | Work enters `handover` | The shared status first observes a handover offer; experimental, requires `reminders.enabled`. | The work owner's person named by the shared status, not necessarily the current lead's person, with an **Open Hub** link to `#work/<id>`. |
 
+Once a week, where a repository admin switched it on, each bound person also gets a private [weekly digest](#weekly-digest) of their own stale unfinished work and the repository's repeated collisions.
+
 Other event notifications (overlap notes, refusals, open or merged pull request notices, granted handoffs) stay between agents. Private mention replies, optional work-entry notices and outstanding-action reminders use the shared deterministic status projection described below. There is no dashboard to refresh: the Hub UI at `/ui/` is the place to look around, and event notifications link to the page about their item: the contested-file box (`#box-contested`) for a repeated edit, the Inbox (`#inbox`) for a declined handoff or a request to an idle agent, and the Work page (`#work/<id>`) for similar work.
 
-The adapter does not read channel history, post to channels, copy raw Slack messages, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. The only write a Slack user can make is answering a handoff for their own agent. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
+The adapter does not read channel history, post to channels, copy raw Slack messages, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. A Slack user can make three writes, each for themselves only: answer a handoff for their own agent, release or complete their own stale Work from the weekly digest, and switch their own weekly digest off. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
 
 ## Installation
 
@@ -129,7 +131,7 @@ The `hub_url` must be an HTTPS origin with no credentials, query, fragment or ex
 
 ## Slack app manifest
 
-The example manifest requests `chat:write` for private replies and updates, and `app_mentions:read` for the [`app_mention` event](https://docs.slack.dev/reference/events/app_mention/). Its subscriptions are `app_mention`, `tokens_revoked` and `app_uninstalled`, with interactivity for handoff buttons. Both callbacks terminate at `/v1/hub/slack`. The manifest does not request channel history, search, files or `chat:write.public`.
+The example manifest requests `chat:write` for private replies and updates, and `app_mentions:read` for the [`app_mention` event](https://docs.slack.dev/reference/events/app_mention/). Its subscriptions are `app_mention`, `tokens_revoked` and `app_uninstalled`, with interactivity for the handoff and weekly digest buttons. Both callbacks terminate at `/v1/hub/slack`. The manifest does not request channel history, search, files or `chat:write.public`.
 
 Mention the installed app in a conversation it has joined or been invited into: `@AgentSCM status`, `@AgentSCM needs`, or `@AgentSCM proceed`, optionally followed by the exact configured repository name. These are aliases for the same bounded deterministic status answer. The adapter sends its answer privately to the requester's App Home using [`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/); it never posts repository facts into the originating channel because the channel audience's repository access is not established. Direct-message queries are unsupported: Slack does not dispatch them as `app_mention`, and `message.im`/history scopes are not requested. The Messages tab stays read-only; Home and slash commands are off.
 
@@ -207,6 +209,79 @@ Only a personal blocked task, handover review, unanswered directed coordination 
 
 Status jobs retain normalized identities and command kind, not raw mention text or source-channel content. Completed status jobs expire after a day; resolved episodes and inactive-binding history are retained for at most seven days. Rotation/configuration changes fence old jobs to their original identity, and legacy queued coordination messages without an exact binding marker are suppressed. The journal is local SQLite and single-worker even when Hub facts come from PostgreSQL; it is not a PostgreSQL delivery journal or a multiwriter service.
 
+## Weekly digest
+
+The weekly digest is one private direct message per bound person per week. It is the
+[digest](work-insights.md#digest-stale-work-and-repeated-collisions) for the last seven days, read
+with the binding's own token just before it is sent. It is never posted to a channel and never
+sent to anyone but the binding's Slack user.
+
+**Who gets one.** Delivery is off for a repository until a repository admin or a Hub admin runs
+`agentscm digest enable` in a checkout of it, and each person can switch their own off with
+`agentscm digest opt-out` or the **Stop these digests** button
+([settings](work-insights.md#weekly-delivery)). The Slack config file has no setting for it. A
+person gets a digest when all of these hold: the repository's switch is on, their own is not
+off, they have a binding whose token the Hub still authorizes, and the digest has something in
+it (stale Work of theirs, a path with collisions, or a colliding pair). A digest that would say
+nothing is not sent. A repository with the switch on and no binding sends nothing.
+
+**When.** Weeks start on Monday at 09:00 UTC. The worker looks every five minutes and queues the
+week's digest for each binding that has not had one queued this week, so it goes out shortly
+after the week starts, or shortly after delivery is switched on for a binding that had none this
+week. There are no quiet hours and no per-person time zone. A digest that cannot be sent within
+a day is dropped for that week, like other status jobs.
+
+**What it holds.**
+
+```text
+Your weekly digest
+org/repository, 2026-11-02 to 2026-11-09 (UTC)
+Your unfinished work, quiet for 3 days or more: 2
+Ship the exporter
+active, branch feat/exporter; quiet 6 days; a pull request from its branch merged
+[Mark complete] [Release] [Open Hub]
+Tidy the parser
+paused, no branch; quiet 5 days; whether a pull request from its branch merged is unknown
+[Mark complete] [Open Hub]
+Paths with the most refused or repeated edits
+src/hub: 4 refused, 2 repeated; typically 40 minutes after the holder took the path
+People whose agents collided on one path 3 or more times
+amy and bob: src/hub/slack.rs, 4 times
+Release frees the files a task still holds and leaves it unfinished. Mark complete ends it.
+[Stop these digests]
+```
+
+- The stale Work rows are the person's own Work only, at most five (the count says when there are
+  more), each with what the Hub knows about a merged pull request from its branch: merged, not
+  merged, or unknown. No other person's Work title is in the message.
+- The path and pair lists are about the whole repository, at most five lines each then `+N more`.
+  They name paths and logins that every reader of the repository already sees on the Hub's
+  activity page.
+- When the Hub's event history does not cover the whole week, the guidance line says from which
+  day collisions are counted and that earlier ones are unknown, not zero.
+- Every line is plain text, and titles, branch names, paths and logins are cut to a bounded
+  length and stripped of control and invisible characters, as in the other messages.
+
+**Buttons.** **Mark complete** and **Release** appear on a row only when the Work's owner may make
+that transition now. A click is checked like a handoff answer (the clicker's binding and its
+token, at click time) and then makes the Hub's ordinary Work transition as that person, as the
+owner would on the Hub's own pages: the Work must be theirs, and the transition is fenced by the
+Work's generation and sequence as the digest read them. The Hub records it as a person's
+transition with the reason `Released by its owner from the weekly digest in Slack.` or
+`Marked complete by its owner from the weekly digest in Slack.`
+
+| Click | Outcome line |
+|---|---|
+| **Mark complete** | `Marked 'Ship the exporter' complete.` |
+| **Release** | `Released 'Tidy the parser'. Its files are free for other work; it stays unfinished until someone resumes or completes it.` |
+| The Work changed after the digest was sent | `Nothing changed. 'Tidy the parser' changed after this digest was sent; open the Hub to see where it stands.` |
+| **Stop these digests** | `Weekly digests for org/repository are off for you. Run agentscm digest opt-in in a checkout of it to get them again.` |
+
+The outcome is added under the message and only the clicked row loses its buttons, so one digest
+settles several tasks. A click the Hub cannot take is answered with the ephemeral messages listed
+above, and a button that carries Work the clicker does not own gets
+`The Hub did not accept this: that work is not yours. Nothing changed. Open the Hub to see whose it is.`
+
 ## Delivery and recovery behavior
 
 The existing coordination journal holds a cursor into the Hub event log and the queued messages: recipient, message body, state, attempt count and due time. It does not keep Slack payloads. Messages that are sent or failed are deleted after a day; the journal holds at most 4096 rows, and past that the worker waits for deliveries to drain before reading further events.
@@ -224,5 +299,6 @@ Local checks use synthetic IDs, signed requests and a fake Slack API; they do no
 - A declined handoff from the **Keep it** button messages the requester but not the clicker.
 - A declined handoff and similar work at start message both people; events from before installation are not sent.
 - A rate-limited send stays queued; a mismatched bot, a revoked binding token, `tokens_revoked` and `app_uninstalled` stop delivery.
+- With the repository's digest switched on, a person with stale Work gets one weekly digest and a person with nothing to report gets none; **Mark complete** and **Release** change only the clicker's own Work, another person's click gets a private explanation and changes nothing, and **Stop these digests** ends that person's digests.
 
-Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, makes one agent repeat an edit of a file another agent holds, checks both direct messages arrive and read as shown above, answers with a button, checks the outcome line, the Open Hub link and the ephemeral explanation (a click by the wrong person is the easy one to try), and confirms revoke/uninstall behavior in the actual workspace. Mention status, blocked/handover entry notices, reminder retry/deduplication, obsolete-action suppression, escalation and resolution have offline synthetic-request and fake Slack API tests; they are not live qualification. Live mention installation, delivery and desktop/mobile rendering remain operator qualification in issue #7. The local tests use a fake Slack API, so how Slack renders the header, the fields, the ephemeral message and a message sent after a failed update has not been seen.
+Live dogfood remains unverified until the administrator installs the app, verifies the HTTPS request URL, supplies the real signing secret and bot token, makes one agent repeat an edit of a file another agent holds, checks both direct messages arrive and read as shown above, answers with a button, checks the outcome line, the Open Hub link and the ephemeral explanation (a click by the wrong person is the easy one to try), and confirms revoke/uninstall behavior in the actual workspace. Mention status, blocked/handover entry notices, reminder retry/deduplication, obsolete-action suppression, escalation, resolution and the weekly digest with its buttons have offline synthetic-request and fake Slack API tests; they are not live qualification. Live mention installation, delivery and desktop/mobile rendering remain operator qualification in issue #7. The local tests use a fake Slack API, so how Slack renders the header, the fields, the ephemeral message and a message sent after a failed update has not been seen.

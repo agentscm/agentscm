@@ -135,6 +135,8 @@ mod hub_coordination;
 #[cfg(unix)]
 mod hub_devices;
 #[cfg(unix)]
+mod hub_digest;
+#[cfg(unix)]
 mod hub_external_runs;
 #[cfg(unix)]
 mod hub_forge_check;

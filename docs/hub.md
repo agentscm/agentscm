@@ -494,6 +494,8 @@ on no others:
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
   `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
   `GET /v1/hub/standup/inbox` for the token's repository
+- `GET /v1/hub/standup/digest` and `GET /v1/hub/standup/digest/settings` (see
+  [weekly digest](#weekly-digest))
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
@@ -1048,6 +1050,58 @@ pre-release build of this branch must drop `hub_change_shared_bodies` and its na
 
 This path remains alpha. Real Claude host, complete integrated browser, and deployment qualification
 are pending. See [local change capture](change-capture.md) for configuration and exact limits.
+
+## Weekly digest
+
+The digest tells one person what their agents left unfinished and where agents in the repository
+keep colliding. It is computed on request from records the Hub already keeps (the person's
+unfinished Work, `edit_denied` and `edit_repeated` events, the `intent_announced` and
+`handoff_request` events that say who held a path, and merge observations) and writes nothing.
+[The digest](work-insights.md#digest-stale-work-and-repeated-collisions) defines every field.
+
+**What it contains.** For a period of 1 to 31 days (default 7):
+
+- The reader's own unfinished Work whose lead has not checked in for three days or more, with
+  whether a pull request from its branch merged (`observed`, `none` or `unknown`).
+- For the whole repository, the paths with the most refused or repeated edits, grouped by their
+  first two path segments, with both counts and the typical time between the holder taking the
+  path and the other agent's edit.
+- For the whole repository, pairs of people whose agents collided on one path three or more times.
+
+**Who sees what.** The stale Work list holds only Work the reader owns, so no Work title of
+another person appears in a digest. The collision lists name paths and logins, which every
+reader of the repository already sees in its activity. A token reads the digest of its own
+person and repository only.
+
+**Unknown is not zero.** When the Hub's retained events do not cover the whole period, or the
+period holds more events than one digest reads, the reply says from when collisions are counted
+and marks the counts incomplete. A merge the Hub could not rule out is `unknown`, never "not
+merged".
+
+**Routes** (token routes for the token's repository):
+
+- `GET /v1/hub/standup/digest?days=` (any token, read-only included) answers the digest.
+- `GET /v1/hub/standup/digest/settings` (any token) answers
+  `{repository, enabled, opted_out, delivering}` for the token's person.
+- `PUT /v1/hub/standup/digest/settings` with `{enabled}` (a token that is not read-only) switches
+  weekly delivery for the repository. The token's person must be a repository admin (GitHub
+  `admin`, GitLab maintainer or owner), checked with the forge when the call is made, or a Hub
+  admin; anyone else gets 403.
+- `PUT /v1/hub/standup/digest/settings/me` with `{opted_out}` (a token that is not read-only)
+  records the person's own choice.
+
+**Settings.** Weekly delivery is off for every repository until it is switched on, and each
+person can switch their own off. Both values live in the Hub's settings table, keyed by the
+forge's repository id so a rename keeps them; a token minted without a forge repository id is
+never sent a digest. `agentscm digest enable`, `disable`, `opt-out`, `opt-in` and `settings` call
+these routes. Reading the digest needs neither switch.
+
+**Delivery.** With the [Slack adapter](slack.md#weekly-digest) configured, the Hub sends the
+digest once a week as a private direct message to each person who has a Slack binding for the
+repository, has not switched theirs off and has something in it. Each stale Work row has buttons
+that release or complete that Work as its owner through the ordinary fenced Work transition. It
+is never posted to a channel. Without the Slack adapter nothing is sent, and the route and the
+command still answer.
 
 ## Status page
 
