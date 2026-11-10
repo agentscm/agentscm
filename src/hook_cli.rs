@@ -262,6 +262,35 @@ fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<
     None
 }
 
+/// Remembers which connection this session's hooks route to, so the checkout's MCP server names
+/// the same agent. Best effort and unchanged records are not rewritten: a failure leaves the
+/// MCP server on its default connection and never touches the hook's reply. The event that ends
+/// the session writes nothing: it has just dropped the record.
+fn record_session_route(payload: &Value, connection: &Connection) {
+    if let Ok(config) = config_dir() {
+        record_session_route_in(&config, payload, connection);
+    }
+}
+
+fn record_session_route_in(config: &Path, payload: &Value, connection: &Connection) {
+    let ended = matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    );
+    if let Some(session) = session_of(payload)
+        .filter(|id| id.len() <= 128 && !id.chars().any(char::is_control))
+        .filter(|_| !ended)
+    {
+        let _ = crate::client_session::record_route(
+            config,
+            session,
+            &connection.hub,
+            &connection.repo,
+            &connection.root,
+        );
+    }
+}
+
 /// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
 /// (5 at session start), and the reply still has to be printed.
 const CAPTURE_BUDGET: Duration = Duration::from_millis(2500);
@@ -483,6 +512,7 @@ async fn call_hub(
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
             }
+            record_session_route(&payload, &routed.connection);
             let conflicted = unmerged(&routed.checkout, &routed.edits, deadline);
             if !conflicted.is_empty() {
                 routed.edits.retain(|edit| !conflicted.contains(&edit.path));
@@ -3614,6 +3644,25 @@ mod tests {
             owned_token_id: None,
             owned_token_expires_at: None,
             agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_session_end_hook_leaves_no_route_record() {
+        let config = tempfile::tempdir().unwrap();
+        let connection = connection(&std::env::temp_dir(), "acme/widgets");
+        let route = || {
+            crate::client_session::route_of(config.path(), "s-1", &connection.hub, &connection.repo)
+        };
+        let event = |name: &str| json!({"hook_event_name": name, "session_id": "s-1"});
+        record_session_route_in(config.path(), &event("PreToolUse"), &connection);
+        assert_eq!(route().as_deref(), Some(connection.root.as_path()));
+        // The end event drops the record first (as `host_session` does) and must not rewrite it.
+        for name in ["SessionEnd", "sessionEnd"] {
+            record_session_route_in(config.path(), &event("PreToolUse"), &connection);
+            crate::client_session::forget(config.path(), "s-1");
+            record_session_route_in(config.path(), &event(name), &connection);
+            assert_eq!(route(), None, "{name}");
         }
     }
 

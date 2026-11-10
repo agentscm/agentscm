@@ -5440,3 +5440,154 @@ fn check_commands_use_the_main_clones_connection_in_a_linked_worktree() {
     .unwrap();
     assert!(listed(&machine).contains("folder is gone; remove with"));
 }
+
+/// `client connect` in a linked worktree reuses the main clone's connection and mints nothing;
+/// `--own-connection` gives the worktree a connection of its own.
+#[test]
+fn connect_reuses_the_main_clones_connection_in_a_linked_worktree() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(
+        repo.path(),
+        &quick(&hub.url, &token, &["--no-collisions", "--agent", "cursor"]),
+    ));
+    machine.git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    let linked = machine.home.path().join("linked");
+    machine.git(
+        repo.path(),
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    let main = repo.path().canonicalize().unwrap();
+    let says = format!("This worktree uses the connection of {}.", main.display());
+
+    let output = machine.run(&linked, &["--no-telemetry", "client", "connect"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&says),
+        "{output:?}"
+    );
+    assert_eq!(machine.connections().len(), 1);
+
+    let output = machine.run(
+        &linked,
+        &[
+            "--no-telemetry",
+            "client",
+            "connect",
+            "--own-connection",
+            "--hub",
+            &hub.url,
+            "--token-file",
+            token.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("This worktree uses"));
+    let connections = machine.connections();
+    assert_eq!(connections.len(), 2);
+    let linked_root = linked.canonicalize().unwrap();
+    assert!(
+        connections
+            .iter()
+            .any(|c| c["root"] == json!(linked_root.to_str().unwrap())),
+        "{connections:?}"
+    );
+}
+
+/// `client setup` in a linked worktree writes its agent files there and records the agents on
+/// the main clone's connection; a different token file is refused with the way out; `client
+/// remove` there takes the worktree's files out and leaves the main clone's connection.
+#[test]
+fn setup_and_remove_in_a_linked_worktree_use_the_main_clones_connection() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let setup = |root: &Path| {
+        machine.run(
+            root,
+            &[
+                "--no-telemetry",
+                "client",
+                "setup",
+                "--agent",
+                "gemini",
+                "--checkout-only",
+                "--hub",
+                &hub.url,
+                "--token-file",
+                token.to_str().unwrap(),
+            ],
+        )
+    };
+    ok(&setup(repo.path()));
+    machine.git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    let linked = machine.home.path().join("linked");
+    machine.git(
+        repo.path(),
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    let main = repo.path().canonicalize().unwrap();
+
+    // A token the main connection does not hold is refused, saying how to connect separately.
+    let other = hub.token_file_for(machine.home.path(), REPO, "other.token");
+    let refused = machine.run(
+        &linked,
+        &[
+            "--no-telemetry",
+            "client",
+            "connect",
+            "--token-file",
+            other.to_str().unwrap(),
+        ],
+    );
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        said.contains("holds a different token")
+            && said.contains("`agentscm client connect --own-connection`"),
+        "{said}"
+    );
+    assert_eq!(machine.connections().len(), 1);
+
+    // Setup in the worktree installs its files there and keeps the one connection.
+    let output = machine.run(
+        &linked,
+        &[
+            "--no-telemetry",
+            "client",
+            "setup",
+            "--agent",
+            "gemini",
+            "--checkout-only",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(machine.connections().len(), 1);
+    assert!(linked.join(".gemini/settings.json").exists());
+    let before = machine.connections();
+
+    let output = machine.run(&linked, &["--no-telemetry", "client", "remove"]);
+    assert!(output.status.success(), "{output:?}");
+    let said = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        said.contains("Removed AgentSCM's gemini files from this worktree")
+            && said.contains(&format!(
+                "it keeps using the connection of {}.",
+                main.display()
+            )),
+        "{said}"
+    );
+    // The main clone's connection is untouched.
+    assert_eq!(machine.connections(), before);
+    ok(&machine.run(repo.path(), &["--no-telemetry", "client", "check"]));
+    assert!(!linked.join(".gemini/settings.json").exists());
+    // The main clone keeps its own files.
+    assert!(repo.path().join(".gemini/settings.json").exists());
+}
