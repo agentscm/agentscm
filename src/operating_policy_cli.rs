@@ -450,6 +450,7 @@ pub async fn run(data: &Path, command: OperatingPolicyCommand) -> Result<Value> 
                             "{} after merge #{}",
                             installed.rule_id, retained.dispatch.event.proposal_number
                         ),
+                        description: None,
                         session: format!("operating-{}", retained.dispatch.dispatch_id),
                         role: WorkRole::Lead,
                         scope: vec![],

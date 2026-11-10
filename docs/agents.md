@@ -8,7 +8,7 @@ title: "Coding agents: what is supported"
 
 AgentSCM warns an agent when another agent already holds a file it is about to edit. How well that works depends on how the agent connects to the [hub](hub.md). There are two ways, and most agents can use both:
 
-- **Hooked.** The agent runs a hook before each edit and the hub's answer is put in front of the model without the agent having to choose to ask. This is the more reliable path (see [Support tiers](#support-tiers)). Where the hook can refuse a tool call (Claude Code, Codex, Copilot), the first edit in a session to a file another agent holds is refused once, with a factual reason naming the other agent and the options: do other work, ask the user, or repeat the edit. Repeating it passes while that holder keeps the file; if the file changes hands, the next attempt is refused again. The refusal also asks the holder to hand the file over, and says so (naming the session it asked, such as `bob's Claude Code session 3f2a1b9c`, when it asked one); the same request can be made with the `agentscm_ask` MCP tool. The holder sees the request on its next call and answers with `agentscm_handoff` ([handoff](hub.md#handoff)). Handoff is experimental ([handoff](hub.md#handoff)).
+- **Hooked.** The agent runs a hook before each edit and the hub's answer is put in front of the model without the agent having to choose to ask. This is the more reliable path (see [Support tiers](#support-tiers)). Where the hook can refuse a tool call (Claude Code, Codex, Copilot, Gemini CLI), the first edit in a session to a file another agent holds is refused once, with a factual reason naming the other agent and the options: do other work, ask the user, or repeat the edit. Repeating it passes while that holder keeps the file; if the file changes hands, the next attempt is refused again. The refusal also asks the holder to hand the file over, and says so (naming the session it asked, such as `bob's Claude Code session 3f2a1b9c`, when it asked one); the same request can be made with the `agentscm_ask` MCP tool. The holder sees the request on its next call and answers with `agentscm_handoff` ([handoff](hub.md#handoff)). Handoff is experimental ([handoff](hub.md#handoff)).
 - **Advisory (MCP).** The hub serves coordination [MCP](https://modelcontextprotocol.io) tools at `POST /mcp`: `agentscm_start`, `agentscm_check`, `agentscm_status` and `agentscm_done` for advice, and `agentscm_ask` and `agentscm_handoff` for the experimental handoff. The agent calls them because its instructions (`AGENTS.md`) tell it to. A model can forget or skip them, so treat this as a best effort.
 
 The read-only `agentscm_workflow_status` MCP tool inspects a retained native skill workflow when the operator has configured a repository mapping. It preserves recorded outcomes, current source applicability and unavailable capabilities as separate facts. See [skill workflows in the hub](advanced/skill-workflow-hub.md).
@@ -21,7 +21,54 @@ are fixed at startup and cannot be supplied by a tool call. See
 
 The [asynchronous stand-up](standup.md) adds durable engineering work and checkpoint handovers alongside file intents. Its agent-authenticated CLI and MCP surfaces can retrieve current unfinished work and a bounded catch-up before a task, then create or reuse an explicit work item and report meaningful changes. `agentscm_work_briefing` reads the briefing; `agentscm_start` resolves and claims explicit work; `agentscm_work_checkpoint` records a meaningful change; and `agentscm_work_ack` deliberately advances a completely delivered writer briefing. A supported session-start hook can render the bounded briefing, and a safely linked end hook can record pause or handover. Hooks do not create a goal, acknowledge delivery, infer decisions or meaningful progress, or claim completion as accepted or landed. The durable workflow also provides a session-specific catch-up cursor and a directed coordination inbox with explicit receipts, replies and validated resolution. Requests appear in later MCP calls and supported hooks; disconnected clients catch up through the inbox. A model can also skip an MCP call. A reported checkpoint is coordination context, not trusted execution or landing evidence.
 
-Nothing is locked: a refusal happens once per session, file and hold, a repeat passes while the same hold keeps the file, and any failure lets the edit through. The exceptions are edits under managed Work: a lead whose hold lapsed gets `LEASE_LAPSED`, and an edit not linked to a current assignment of its session gets `EDIT_UNLINKED` (see [required rules](#required-rules-and-the-session-id)); both repeat on every retry until a start or checkpoint changes the Work. Cursor's hook cannot refuse, so Cursor gets a note just after the edit, and an agent that only has MCP gets advice only. Details: [warn once](hub.md#warn-once).
+Nothing is locked: a refusal happens once per session, file and hold, a repeat passes while the same hold keeps the file, and any failure lets the edit through. The exceptions are edits under managed Work: a lead whose hold lapsed gets `LEASE_LAPSED`, and an edit not linked to a current assignment of its session gets `EDIT_UNLINKED` (see [required rules](#required-rules-and-the-session-id)); both repeat on every retry until a start or checkpoint changes the Work. In any connected repository, a session's first edit of a file that can be held, while it has declared no Work, gets `WORK_UNDECLARED` once, naming the `agentscm_start` call that declares it, because its person and the team cannot see it and its waits never reach its person. The text also names the CLI route (`agentscm work start` inside the file's checkout) for a session whose MCP tools are bound to another repository. A repeat of that edit passes, and the Hub tells a session again only after a day or a restart. When another session holds the file, that file's warn-once note rides in the same refusal, so the repeat passes both. A host that cannot refuse (Cursor, the generic hook) gets the same text as a note beside the edit; a subagent and a file that is never held are never asked. Health counts these as `undeclared`. `LEASE_LAPSED` advice names the `takeover_generation` the resume needs and the same CLI route. Cursor's hook cannot refuse, so Cursor gets a note just after the edit, and an agent that only has MCP gets advice only. Details: [warn once](hub.md#warn-once).
+
+## What each agent gets
+
+What one session of each agent gets once `agentscm client setup` has wired it, the host has
+loaded the hooks and the Hub answers. The first five rows are the agents `client setup` wires;
+the last is any client that has only the Hub's MCP server.
+
+| Agent | Rules at session start | Edit check | An edit can be refused | Session end reported | Waiting for you reported | Subagents under the parent's session | Messages from the Hub |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Claude Code | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | Yes | At session start, on each prompt, and at an edit, which is held until the session answers |
+| Codex | Yes, with the session ID | Before the write (`apply_patch`) | Yes | Yes | Approval request, end of turn | Not checked: a call that names a subagent is handled as Claude Code's, but whether Codex names one was not verified | At session start, and at an edit, which is held until the session answers |
+| Cursor | Yes, with the session ID | Just after the write | No | Yes | End of turn only | No | At session start and just after an edit |
+| GitHub Copilot | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | Not checked: a call that names a subagent is not held for a request addressed to its parent, but whether Copilot sends the parent's session for it was not verified | At session start; before an edit only as the refusal that holds it |
+| Gemini CLI | Yes, with the session ID | Before the write (`write_file`, `replace`) | Yes | Yes | Tool permission prompt, end of turn | No | At session start; before an edit as Gemini CLI's `systemMessage`, which does not hold the edit |
+| A client with no hooks (MCP only) | In the MCP server's instructions, when the client shows them; no session ID | Only when the agent calls `agentscm_check` | No | Only when the agent calls `agentscm_done` | No | No | Only in the replies to its own AgentSCM tool calls |
+
+What the columns mean:
+
+- **Rules at session start.** The [required rules](#required-rules-and-the-session-id), and for
+  a wired agent its native session ID, are the first thing in the session's context.
+- **Edit check.** When the Hub is asked about an edit made with the agent's file-edit tools.
+  No agent's hook sees a file written by a shell command.
+- **An edit can be refused.** The hook's answer can stop the write: a file another agent holds
+  ([once per hold](hub.md#warn-once)), the first edit of a session that declared no Work
+  (`WORK_UNDECLARED`, once per session), `LEASE_LAPSED`, `EDIT_UNLINKED` or, in Claude Code, Codex
+  and Copilot, a coordination request the session has not answered. Where it cannot, the same
+  text arrives as a note.
+- **Session end reported.** Setup installs a session-end hook for all five wired agents
+  (`SessionEnd`; `sessionEnd` for Cursor and Copilot). When it runs, the Hub releases the
+  session's file intents and pauses its unfinished Work, without recording that Work as finished.
+  A session that is killed sends no end; its hold lapses with its lease
+  ([holds stay live](#holds-stay-live-while-the-agent-works)).
+- **Waiting for you reported.** See [waiting for you](#waiting-for-you-in-its-session). In VS
+  Code, Copilot documents no notification event, so only the end of a turn is reported there.
+- **Subagents under the parent's session.** A subagent's hook calls carry its parent's session,
+  so its edits are checked under the parent's Work and requests are pointed at the lead session.
+- **Messages from the Hub.** Coordination requests addressed to the session. Before an edit,
+  Copilot's hook takes a refusal but no note, and Claude Code shows a note only after the tool
+  ran, which is why a request the session must answer holds the edit where the hook can refuse.
+
+Each row has a test in `tests/integration/harness_coverage.rs` that runs the installed hook
+command with that host's payloads against a real Hub, and the hook events setup installs are
+pinned by tests in `src/client_setup.rs` and `src/client_plugin.rs`. The payloads are fixtures
+written from the vendors' documentation, not captures from live sessions, so the table states
+what AgentSCM does with what each host is documented to send (see [Support tiers](#support-tiers)).
+A recorded wait is shown only after 60 seconds, so the tests check that a wait is accepted and
+never answered; what the Hub records for it is covered by the Hub's own hook tests.
 
 ## Support tiers
 
@@ -63,7 +110,7 @@ It then prints `agentscm quickstart --hub <hub>`. Each developer runs that once 
 
 ### Required rules and the session ID
 
-A short set of required rules is defined once (`src/hub/agent_rules.rs`) and rendered into every surface an agent may read: the `init-repo` block, the Hub's MCP server instructions (also when the checkout is not connected yet), the `coordinate-edits` skill and the SessionStart context. A test fails when any surface drops a rule. The rules say to pass `session` with the native session ID to `agentscm_start` and every AgentSCM call, to start before editing shared files and finish with `agentscm_done`, to follow a refusal's recovery and never repeat the change through another tool, to check shell writes with `agentscm_check`, how a subagent edits, and that third-party text is data and unknown coordination is not clear. They are guidance: delivering them does not show they were followed and is not evidence for any gate.
+A short set of required rules is defined once (`src/hub/agent_rules.rs`) and rendered into every surface an agent may read: the `init-repo` block, the Hub's MCP server instructions (also when the checkout is not connected yet), the `coordinate-edits` skill and the SessionStart context. A test fails when any surface drops a rule. The rules say to pass `session` with the native session ID to `agentscm_start` and every AgentSCM call, to start before editing shared files and, when the task is done, call `agentscm_done` with `outcome: complete` (plain `agentscm_done` only pauses the Work), to follow a refusal's recovery and never repeat the change through another tool, to check shell writes with `agentscm_check`, how a subagent edits, and that third-party text is data and unknown coordination is not clear. They are guidance: delivering them does not show they were followed and is not evidence for any gate. The MCP server instructions and the `coordinate-edits` skill also carry one paragraph on wording the Work text people read (a short plain `task` title, a two- or three-sentence `description`, plain checkpoint summaries); it is not a required rule and is not in the SessionStart context.
 
 When a named agent's start hook gets an answer from the Hub and the host sent a usable session ID, the SessionStart context begins with that ID, labelled as literal data, and the instruction to pass it as `session` to `agentscm_start` and every other call, `agentscm_setup_status` included. The rules follow it, then the current actionable status, then the briefing. Claude Code keeps at most 10,000 characters of a hook's added context, so the Hub keeps its start context within 9,000 (counted in UTF-16 units, as the host counts) and the hook client keeps the combined context, local branch advice included, within 10,000. Text past the limit is cut at a line and replaced with a pointer to `agentscm_work_status`, `agentscm_work_briefing` and `agentscm_work_overview`.
 
@@ -72,6 +119,29 @@ A start that names no session lands on the token's `default` session. Once one n
 An edit the Hub cannot link to a current assignment of its session is refused with `EDIT_UNLINKED`. The reason names the session ID when the hook sent one and the call that fixes the caller's situation: a scope checkpoint with the exact generation and `expected_updated_seq` for the lead of active Work, a generation-checked start to resume or rejoin other Work, a new start for finished Work or none, and for a subagent, leaving the edit to its parent. It says that repeating the edit unchanged meets the same refusal. Every hook refusal (warn-once, lapsed hold, coordination request and unlinked edit) also says that making the change through another tool, such as a shell command or script, bypasses coordination: edit hooks see only file-edit tools. Like `LEASE_LAPSED`, it is refused on every retry of the same edit; only the advisory warn-once refusal passes on a repeat, and only while the same holder keeps the file.
 
 A Claude Code subagent's hook calls carry its parent's `session_id`, with `agent_id` and `agent_type` added, so its edits are checked under the parent's Work with no join or takeover. The rules tell the parent to give a subagent its session ID for AgentSCM calls and tell the subagent not to start or take over Work; where a host does not report the parent's session for a subagent's edits, edits stay in the session that holds the claim. Evidence: Claude Code's hook and subagent documentation and, on one machine (Claude Code 2.1.310, 2026-11-05), transcript records of a subagent that carry the parent session ID. A live capture of a subagent's hook input was not possible in that run, and the Hub behaviour is tested with fixture payloads. How Codex, Copilot, Cursor and Gemini report subagent sessions was not checked.
+
+The checkout's MCP server (`agentscm client mcp`) also fills in `session` on a call that leaves it out, for the tools that take one, so linking a start to its edits does not depend on the model copying the ID:
+
+1. An agent's start hook records its native session ID under the agent host process that ran the hook: one small owner-only file per host and session, in `agent-hosts` under the AgentSCM config directory. The file is removed when the session ends, and at a later session start once its host has exited. The MCP server looks through its own ancestor processes for that host and uses the recorded ID.
+2. When the host has several conversations open at once, the server cannot tell whose call it is and leaves `session` out. It also leaves it out when it finds no record and the MCP client named itself as one of the hooked agents, or did not name itself. The Hub then places the call as described above.
+3. Any other client runs no hooks, so the server gives it one generated name for the life of the process (`<client name>-<8 hex digits>`). Two such clients on one checkout no longer share the token's `default` session.
+
+A `session` the agent passes itself is never changed. The Hub's `SESSION_REQUIRED` refusal is unchanged and still answers callers of `POST /mcp` that do not go through this server. Step 1 reads the process table with `ps`, so it works on macOS and Linux only.
+
+### Calls reach the repository whose files they name
+
+The checkout's MCP server starts in one checkout and uses that checkout's connection by default. A session often edits a second repository on the same computer, and edit hooks route each edit by the file's path. Tool calls route the same way, so Work is declared in the repository whose files change:
+
+- An absolute path in `paths` or `path` sends the call to the connection of the checkout that contains it. The server rewrites the path repo-relative before forwarding.
+- `root`, which the server adds to every tool, names another checkout by its absolute path; a path inside the checkout works too. Relative paths are then read against that checkout. Use it for calls that carry no path, such as `agentscm_work_checkpoint`, `agentscm_done` and the reads. The server takes `root` out before forwarding, so a Hub never receives a local path.
+- `worktree`, on the tools that have it, routes the call when it is the absolute path of a connected checkout. It is still forwarded as the Work's label.
+- Any other call goes to the checkout the server started in, and relative paths are read against that checkout.
+
+`root` is used before `worktree`, and `worktree` before paths. A call whose paths are in two repositories is refused with a message that says to call once per repository, and so is a call that mixes relative paths with another repository's absolute paths. A path or `root` in a checkout with no connection is refused with a message that names `agentscm client connect`. The server answers these refusals itself and sends nothing. Each repository keeps its own agent token; the server reads the token of the repository a call is for when the call is made. A reply from a repository other than the default ends with a line that names the repository and its checkout and says to pass `root` on later calls about that Work.
+
+When the checkout the server started in has no connection, or the server started outside any checkout, a call that names a connected checkout this way still goes through. Any other call says why the start checkout is not connected.
+
+The SessionStart context names the other repositories connected on this computer (at most six, without connections whose managed token has expired), so an agent knows that a second repository is covered.
 
 ### Choose source at task start and when dependencies grow
 
@@ -123,7 +193,7 @@ The hooks written by `client setup` run `agentscm hook <agent> --client-connecti
 
 - The token comes from `AGENTSCM_HUB_TOKEN`, else the file named by `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`. It is never a command-line argument.
 - The hub URL comes from `AGENTSCM_HUB_URL`, else `--hub-url`, else `hub.json`. A token stored in `hub.json` is only ever sent to the hub that file names, so a `--hub-url` in a hook command cannot redirect it; to use a different hub, set `AGENTSCM_HUB_TOKEN`.
-- `--repo OWNER/NAME` adds `?repo=` to the hook URL. If the token belongs to another repository the hub answers "coordination unknown" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
+- `--repo OWNER/NAME` adds `?repo=` to the hook URL. If the token belongs to another repository the hub answers "coordination unknown (This token is for another repository; ...)" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
 - It sends the Git root of the agent's working directory as `X-Agentscm-Root` so the hub can make edited paths repository-relative.
 - It gives up after 3 seconds.
 - `AGENTSCM_HUB_TOKEN` is sent to whatever hub URL the command carries, because you set it for this purpose. AgentSCM no longer commits hook configuration; if you commit a hook command by hand, treat a change to its `--hub-url` like a change to your CI secrets: review it.
@@ -146,22 +216,39 @@ The Work projection shows which case applies to a lead session as `activity.cove
 
 An agent that is not wired, or wired with an older `client setup` that hooked only edits, renews only on edits, MCP calls and checkpoints; run `agentscm client setup` again to install the tool hooks.
 
+### Waiting for you in its session
+
+When an agent stops to wait for its person, it makes no tool calls, which otherwise looks the same as a crash. Where the host reports the moment, the hook tells the Hub that the session is waiting and why: a **permission** prompt, a **question** (a choice, or a form an MCP server opened) or the **end of its turn**. The wait is a `session_waiting` action in that person's shared status (Needs you, the menu bar app's count and attention notice, `agentscm work status`), never anyone else's. With the wait, the hook sends a short excerpt of what it asks, so the person can see what their agent needs without opening the session. That is the end of the agent's last message when its turn ends, the questions it asks, or a permission prompt's own description. The excerpt is one line of at most 400 characters, from the end of the text, where a closing question sits. Recognizable secrets are redacted on the machine first; that redaction is best effort. The Hub keeps the excerpt in memory with the wait, quotes it in the action's text, and shows it only to that session's person. A stop that background work will resume sends none. The hook never answers the prompt, and the person's prompts, tool input and transcript are not sent. The person answers in the session itself.
+
+| Agent | Permission | Question | End of turn | What it cannot tell |
+| --- | --- | --- | --- | --- |
+| Claude Code | `Notification` `permission_prompt` | `AskUserQuestion` (`PreToolUse`), `Notification` `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input` | `Stop` (not while background tasks run), `Notification` `idle_prompt` | whether a subagent asked, unless its hook names the subagent |
+| Codex CLI | `PermissionRequest` | none | `Stop` | a question asked in plain text |
+| Copilot CLI | `notification` `permission_prompt` | `notification` `elicitation_dialog` | `agentStop`, `notification` `agent_idle` | |
+| Cursor | none | none | `stop` | permission waits: Cursor reports none |
+| Gemini CLI | `Notification` `ToolPermission` | none | `AfterAgent` | |
+| Others | `agentscm hook generic` with `{"event": "waiting", "reason": "permission"\|"question"\|"idle", "agent", "session"}` | | | |
+
+The session's next tool call, edit check, prompt, start or end ends the wait. A tool call by a subagent ends only a wait that subagent asked, or one whose asker the host did not name, so a sibling working in parallel does not end it. A wait is shown only after 60 seconds, so someone at the keyboard never sees one. A permission prompt or question always needs you. The end of a turn needs you only while that session leads unfinished Work (active, blocked or paused), because an open chat whose work is done waits on nobody. Paused counts because a host that stops an idle session and later resumes it ends the session in between, which pauses its Work. The Hub keeps waits in memory, at most 32 per agent token and for at most 24 hours. A Hub restart forgets them, and a session that waits through a restart reads as not known, not as not waiting. Run `agentscm client setup` again (or update the plugin) to install these hooks.
+
 ### Hooks fail open
 
-The command always exits 0. If anything goes wrong (no hub configured, no token, the hub is unreachable or slow, it rejects the token, or it sends something unusable) it prints the agent's valid "no information" reply, which for most events is `{}` and for a few events is a one-line `AgentSCM: coordination unknown (<reason>)` note, given once per agent session (a marker file under `~/.config/agentscm/hook-notes/`, removed after 2 days); later failures in that session print the no-op reply. A broken setup never stops an edit. The same holds on the hub side: its hook endpoint answers HTTP 200 in the agent's format even for a bad token.
+The command always exits 0. If anything goes wrong (no hub configured, no token, the hub is unreachable or slow, it rejects the token, or it sends something unusable) it prints the agent's valid "no information" reply, which for most events is `{}` and for a few events is a one-line `AgentSCM: coordination unknown (<reason>; <recovery>; ref cor_...)` note (no `ref` when the hub was unreachable), given once per agent session and failure code (a marker file under `~/.config/agentscm/hook-notes/`, removed after 2 days); a session start, resume or replay always repeats it, and other later failures of the same kind print the no-op reply. The fields are described under [Hub errors](api.md#hub-errors). A broken setup never stops an edit. The same holds on the hub side: its hook endpoint answers HTTP 200 in the agent's format even for a bad token.
 
 The cost is that failures are quiet. If warnings never appear, run `agentscm intent start` in the repository, or check the token, the URL and that the hub is up.
 
 ## Limits
 
 - A warning appears only for edits the agent makes through its file-edit tools. Files written by shell commands are not announced.
-- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so the Cursor hook is wired as `postToolUse` instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
+- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Gemini CLI's `BeforeTool` hook refuses the same way (`decision: deny`), and any other note before an edit goes to its `systemMessage`. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so the Cursor hook is wired as `postToolUse` instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
 - Claude Code's HTTP hook cannot tell the hub where the repository root is (the project directory is not available to HTTP-hook headers), so the hub makes paths relative to the directory the agent was started in. Start Claude Code at the repository root; from a subdirectory its edits are announced under shorter paths and may not match other agents' paths. The command hooks (`agentscm hook`) send the Git root and do not have this limit.
 - Codex hooks run only when the project is trusted, and Codex asks the developer to review new or changed hooks in `/hooks` once; changed hooks ask again.
 - Claude Code asks each developer to approve the project's MCP server and trust the folder before project hooks run.
 - Where the edited file path sits in Cursor, Copilot and Codex payloads is only partly documented; the hub reads the fields that vendor documents and ignores the rest.
 - The hub is trusted. Its replies go into each agent's context, and the URL that decides which hub that is sits in hook and MCP config: a hook's `--hub-url` and the MCP server URL. Whoever controls that URL controls the text the agents using the config see, and receives their token and hook payloads. Review changes to those files, and treat the hub as trusted.
 - Coverage depends on every agent on the team being wired. An unwired agent is invisible. A pull-request check as a backstop is planned, not built.
+- The MCP server finds the hook's session through the process tree, on macOS and Linux only. On Windows, in a host that keeps several conversations in one process, or when the start hook did not run, a hooked agent's call without `session` is left for the Hub to place, as before. An MCP client started from another agent's shell, with no record of its own, gets that outer agent's session. The generic hook (`agentscm hook generic`) records no session.
+- A call reaches another repository only through `root`, an absolute `worktree` or absolute paths. A call without them goes to the checkout the session started in, so later calls about Work declared elsewhere must pass `root`.
 - Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim is a freshness label, not a release. A reservation blocks only while its lease is live; once it lapses it blocks nobody, and the next admission over its scope clears it and fences the old lead. Inspect the work and use the explicit takeover or reopen flow instead of assuming it is available.
 
 ## Recipes for other agents
@@ -170,7 +257,7 @@ These are not generated and not tested here. The shape is always the same:
 
 1. Add `https://<hub>/mcp` as a remote (streamable HTTP) MCP server with the header `Authorization: Bearer <agent token>`. Where the agent's config supports it, read the token from an environment variable instead of writing it into a checked-in file.
 2. Make sure the agent reads `AGENTS.md` (or paste the snippet from it into the agent's own instructions file).
-3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input.
+3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input. `{"event": "waiting", "reason": "permission"|"question"|"idle"}` reports that the session waits for its person (see [Waiting for you in its session](#waiting-for-you-in-its-session)).
 
 ### Other agents
 
@@ -191,9 +278,12 @@ None of these sends `agentscm hook generic` input directly. To wire one by hand:
 
 1. Add the user-level MCP server with command `agentscm` and arguments
    `--no-telemetry client mcp`. It uses the saved connection of the checkout it starts in, which
-   `agentscm client connect --hub HUB` makes, and offers no tools in a checkout without one.
+   `agentscm client connect --hub HUB` makes, and of any other connected checkout that a call
+   names ([routing](#calls-reach-the-repository-whose-files-they-name)). In a checkout without a
+   connection it lists the tools, and a call for that checkout says why it cannot run. A client
+   with no AgentSCM hook gets one session name per server process.
 2. Add a hook, or plugin, that maps the agent's event to
-   `{"event": "start"|"check"|"done", "agent": "NAME", "session": ID, "paths": [...], "cwd": DIR}`,
+   `{"event": "start"|"check"|"waiting"|"done", "agent": "NAME", "session": ID, "paths": [...], "cwd": DIR}` (a `waiting` event also carries `"reason"`),
    pipes it to `agentscm hook generic` with `AGENTSCM_HUB_URL` and `AGENTSCM_HUB_TOKEN` set, and
    maps the `{"status", "text"}` answer back to the agent's own output (for example Kiro adds a
    hook's standard output to the context, and Grok Build reads `hookSpecificOutput.additionalContext`).

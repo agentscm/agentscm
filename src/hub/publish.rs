@@ -1069,7 +1069,7 @@ async fn show(
                 forge_failure(&state, &conn, error).await?;
             }
             Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
-                eprintln!("hub: reading a published pull request: {detail}")
+                crate::hub::error_envelope::log_internal(&detail)
             }
         }
     }

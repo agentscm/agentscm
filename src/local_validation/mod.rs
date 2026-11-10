@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+pub mod bundle;
 pub mod checks;
 pub mod comment;
 #[cfg(unix)]
@@ -111,7 +112,8 @@ pub struct ValidationRecipe {
     pub constituents: Option<Vec<Constituent>>,
 }
 
-/// Exact paths and reviewed nextest expressions, independent of forge scheduling.
+/// Reviewed nextest expressions for exact paths or path prefixes (a path ending in '*'),
+/// independent of forge scheduling.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestSelection {
@@ -392,7 +394,12 @@ impl ValidationRecipe {
                 }
                 let mut paths = HashSet::new();
                 for rule in &selection.rules {
-                    validate_dependency_path(&rule.path)?;
+                    // A trailing '*' makes the rule match every path starting with the rest.
+                    let path = match rule.path.strip_suffix('*') {
+                        Some(prefix) => prefix.strip_suffix('/').unwrap_or(prefix),
+                        None => &rule.path,
+                    };
+                    validate_dependency_path(path)?;
                     text("test filter", &rule.filter)?;
                     if !paths.insert(&rule.path) {
                         return Err(Error::Invalid("duplicate test selection path".into()));
@@ -1151,22 +1158,40 @@ pub fn select(
     observed: Observed<'_>,
     clock: EvaluationClock,
 ) -> Verdict {
+    select_pairs(
+        bodies.iter().filter_map(|body| comment::parse(body).ok()),
+        recipe,
+        registry,
+        policy,
+        observed,
+        clock,
+    )
+}
+
+/// Selects directly from exact signed bytes with the same ordering and trust rules as
+/// [`select`]. Presentation limits and comment authors confer no authority here. Callers
+/// must bound the inventory and fail closed when an archived object is unavailable.
+pub fn select_pairs<E: AsRef<[u8]>, R: AsRef<[u8]>>(
+    pairs: impl IntoIterator<Item = (E, R)>,
+    recipe: &ValidationRecipe,
+    registry: &IssuerRegistrySnapshot,
+    policy: &ValidationPolicy,
+    observed: Observed<'_>,
+    clock: EvaluationClock,
+) -> Verdict {
     let (mut decided, mut error, mut ignored, mut lifecycle) = (None, None, None, None);
     let mut decided_key = (0_u64, String::new());
     let mut lifecycle_key = (0_u64, String::new());
-    for body in bodies {
-        let Ok((envelope, record)) = comment::parse(body) else {
-            continue;
-        };
-        let (verdict, standing) = assess_standing(
-            &envelope, &record, recipe, registry, policy, observed, clock,
-        );
+    for (envelope, record) in pairs {
+        let (envelope, record) = (envelope.as_ref(), record.as_ref());
+        let (verdict, standing) =
+            assess_standing(envelope, record, recipe, registry, policy, observed, clock);
         if standing == Standing::Foreign {
             continue;
         }
         // Only a verified envelope has a trustworthy signed issue time.
         let issued = || {
-            serde_json::from_slice::<serde_json::Value>(&envelope)
+            serde_json::from_slice::<serde_json::Value>(envelope)
                 .ok()
                 .and_then(|v| v["payload"]["issued_at_ms"].as_u64())
                 .unwrap_or(0)

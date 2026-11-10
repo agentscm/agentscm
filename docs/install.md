@@ -318,6 +318,35 @@ Gemini CLI skips settings hooks and MCP servers in a folder you have not trusted
 to enable a new MCP server. Fully quit and reopen each agent after setup so it loads the new
 hooks.
 
+Setup wires only the agents it finds, or is told to set up, when it runs. A coding agent you
+install afterwards has no AgentSCM hooks until you set it up. Two things find it:
+
+- Running `npx agentscm` (or `agentscm quickstart`) again sets up every agent it finds, the new
+  one included.
+- `agentscm client check` and `agentscm client setup`, run in a connected checkout, end with one
+  line for each installed agent that has no setup:
+
+  ```text
+  Gemini CLI is installed on this computer and no AgentSCM setup was found for it, so its edits may not be coordinated. Run `agentscm client setup --agent gemini` in this checkout (safe to run again), then restart it.
+  ```
+
+An agent counts as installed when its program is on `PATH` (`claude`, `codex`, `cursor` or
+`cursor-agent`, `copilot`, `gemini`) or, for Cursor, GitHub Copilot and Gemini CLI, when its
+configuration directory exists (`~/.cursor`, `$COPILOT_HOME` or `~/.copilot`, `~/.gemini`). No
+hook reports it at session start, so nothing tells you until you run one of those commands.
+
+For GitHub Copilot, the two user files above are the ones both Copilot CLI and VS Code's Copilot
+sessions read: VS Code documents `$COPILOT_HOME/mcp-config.json` (`~/.copilot/mcp-config.json`)
+as the user configuration its Copilot sessions read directly
+([MCP configuration reference](https://code.visualstudio.com/docs/agents/reference/mcp-configuration))
+and `$COPILOT_HOME/hooks/` (`~/.copilot/hooks/`) as where user hook files go
+([agent hooks](https://code.visualstudio.com/docs/copilot/customization/hooks), in preview).
+Setup therefore writes no `mcp.json` into a VS Code profile: VS Code forwards the servers in that
+file to the same sessions, so an entry there would start AgentSCM's server a second time. What
+VS Code's older Local sessions read was not established, so treat them as not set up by the
+default scope. All of this was read from VS Code's documentation on 2026-11-09 and not run in
+VS Code.
+
 `agentscm client remove` and `agentscm uninstall` take the user-scope entries out once no other
 connected checkout uses that agent. The `--checkout-only` flag, which writes the entries into a
 checkout instead, is for special cases; see [member onboarding](team-member-onboarding.md).

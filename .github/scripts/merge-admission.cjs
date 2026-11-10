@@ -15,8 +15,22 @@ async function pages(call, key, visit = async () => {}) {
   throw new Error('Admission API coverage exceeds 500 records');
 }
 
+// The gate is also reported as a commit status: GitHub stops counting an API-created check run
+// once a later event on the same head (an edit, ready for review) starts newer check suites, and
+// statuses belong to no suite. Statuses are capped at 1,000 per head and context, so write on change.
+async function report(github, repo, head, latest, state, description) {
+  const own = latest.find(s => s.context === NAME && s.creator?.id === ACTIONS_BOT);
+  if (own?.state === state && own?.description === description) return;
+  await github.rest.repos.createCommitStatus({...repo, sha: head, context: NAME, state, description});
+}
+
 async function admit({github, context, validateTitle}) {
   const repo = context.repo;
+  // Only the pull request's own event sets its status pending; sweeps write final states only.
+  const ownEvent = Boolean(context.payload.pull_request);
+  const pendingStatus = async head => report(github, repo, head,
+    (await github.rest.repos.listCommitStatusesForRef({...repo, ref: head, per_page: 100})).data,
+    'pending', 'PR admission pending');
   const pending = [];
   const errors = [];
   // Invalidate each observed page before fetching another. No prerequisite read can
@@ -29,9 +43,14 @@ async function admit({github, context, validateTitle}) {
           output: {title: 'PR admission pending', summary: 'Checking current local validation and title; this does not qualify a merge batch.'},
         });
         let {data: check} = await create(candidate.head.sha);
+        // A status failure is reported but never stops the check-run path below.
+        if (ownEvent) await pendingStatus(candidate.head.sha).catch(e => errors.push(e));
         const {data: pull} = await github.rest.pulls.get({...repo, pull_number: candidate.number});
         if (pull.state !== 'open' || pull.base.ref !== context.payload.repository.default_branch) continue;
-        if (pull.head.sha !== candidate.head.sha) ({data: check} = await create(pull.head.sha));
+        if (pull.head.sha !== candidate.head.sha) {
+          ({data: check} = await create(pull.head.sha));
+          if (ownEvent) await pendingStatus(pull.head.sha).catch(e => errors.push(e));
+        }
         pending.push({pull, check});
       } catch (error) { errors.push(error); }
     }
@@ -56,25 +75,30 @@ async function admit({github, context, validateTitle}) {
     const trustedLocal = local?.creator?.id === ACTIONS_BOT;
     const trustedTitle = title?.app?.id === ACTIONS_APP;
     const currentTitleValid = validateTitle(pull.title);
+    // The signed local check is optional evidence; every batch runs fmt, Clippy and the full
+    // suite. Only a signed failure refuses; missing, pending or error does not.
+    const localState = trustedLocal ? local.state : 'none';
     let conclusion;
-    if (!currentTitleValid || (trustedLocal && ['failure', 'error'].includes(local.state)) ||
+    if (!currentTitleValid || localState === 'failure' ||
         (trustedTitle && title.status === 'completed' && title.conclusion !== 'success')) {
       conclusion = 'failure';
-    } else if (trustedLocal && local.state === 'success' && trustedTitle && title.status === 'completed' && title.conclusion === 'success') {
+    } else if (trustedTitle && title.status === 'completed' && title.conclusion === 'success') {
       conclusion = 'success';
     }
     // Re-read after the API sweep. Never certify an obsolete head/base/title snapshot.
     const {data: current} = await github.rest.pulls.get({...repo, pull_number: pull.number});
     if (current.head.sha !== head || current.base.ref !== pull.base.ref || current.title !== pull.title || current.state !== 'open') continue;
+    const outcome = conclusion === 'success' ? 'PR admitted; batch tests still required' : 'PR admission blocked';
     await github.rest.checks.update({
       ...repo, check_run_id: check.id,
       status: conclusion ? 'completed' : 'in_progress',
       ...(conclusion ? {conclusion} : {}),
       output: {
-        title: conclusion === 'success' ? 'PR admitted; batch tests still required' : 'PR admission blocked',
-        summary: `Exact head ${head}. Local validation and current Conventional PR title must pass from GitHub Actions. Missing, untrusted or pending results remain pending. Batch qualification is a separate merge-group run.`,
+        title: outcome,
+        summary: `Exact head ${head}. The current Conventional PR title must pass from GitHub Actions; a missing, untrusted or pending title check remains pending. Signed local validation: ${localState} (optional; only a signed failure refuses). Batch qualification is a separate merge-group run with fmt, Clippy and the full test suite.`,
       },
     });
+    await report(github, repo, head, statuses, conclusion ?? 'pending', outcome);
     } catch (error) { errors.push(error); }
   }
   if (errors.length) throw new AggregateError(errors, "Admission refresh failed; affected heads remain pending");

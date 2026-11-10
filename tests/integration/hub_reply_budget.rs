@@ -97,6 +97,7 @@ fn busy(hub: &Hub) -> Vec<(String, String)> {
             source: None,
             request_key: Some(format!("fixture-{n}")),
             title: words(n, 180),
+            description: None,
             session: session.clone(),
             role: WorkRole::Lead,
             scope: (0..6)
@@ -154,6 +155,7 @@ fn busy(hub: &Hub) -> Vec<(String, String)> {
             source: None,
             request_key: Some(format!("fixture-overlap-{n}")),
             title: words(n + 500, 180),
+            description: None,
             session: format!("fixture-overlap-{n}"),
             role: WorkRole::Lead,
             scope: vec![format!("src/area{n:03}/module0.rs")],

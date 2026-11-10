@@ -179,6 +179,7 @@ mod tests {
                 request_key: "fixture".into(),
             },
             title: "Synthetic work".into(),
+            description: None,
             state,
             claim_status,
             last_checkin_at: 1_000,

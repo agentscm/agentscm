@@ -3,6 +3,9 @@ use super::{RecipientKind, StatusAction, StatusRecipient};
 use crate::hub::intent::{Intent, key_of, overlaps};
 use crate::hub::session::{HOLD_CAP_SECONDS, same_agent};
 use crate::hub::store::{Principal, Store};
+use crate::hub::work::WorkItem;
+use crate::hub::work_links::WorkPrLinkTarget;
+use crate::hub::work_transition::WorkLifecycleReader;
 use crate::hub::{HubError, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -58,9 +61,54 @@ pub(super) fn capture(hash: &mut Sha256, record: &[u8]) {
     hash.update(record);
 }
 
+/// Whether the intent's own Work opened this pull request: the PR's head branch is the
+/// intent's or its Work's branch, or the Work links this PR. Hooks and MCP may hold one
+/// native session under two tokens, so the Work is found by owner and native session.
+#[allow(clippy::too_many_arguments)]
+fn opened_by(
+    store: &dyn Store,
+    reader: &WorkLifecycleReader<'_>,
+    items: &BTreeMap<String, WorkItem>,
+    targets: &mut BTreeMap<String, Option<WorkPrLinkTarget>>,
+    intent: &Intent,
+    number: i64,
+    head: Option<&str>,
+    now: i64,
+) -> Result<bool> {
+    if head.is_some() && intent.branch.as_deref() == head {
+        return Ok(true);
+    }
+    let Some(session) = intent.session.as_deref() else {
+        return Ok(false);
+    };
+    for item in items.values().filter(|i| {
+        i.participants
+            .iter()
+            .any(|p| p.owner == intent.owner.id && p.session == session)
+    }) {
+        if head.is_some() && item.branch.as_deref() == head {
+            return Ok(true);
+        }
+        let target = match targets.get(&item.id) {
+            Some(target) => target.clone(),
+            None => {
+                let target = store.work_pr_target_scoped(reader, &item.id, now)?;
+                targets.insert(item.id.clone(), target.clone());
+                target
+            }
+        };
+        if target.is_some_and(|t| t.number == number) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn read(
     store: &dyn Store,
     who: &Principal,
+    reader: &WorkLifecycleReader<'_>,
+    items: &BTreeMap<String, WorkItem>,
     now: i64,
 ) -> Result<(Vec<StatusAction>, BTreeSet<String>, String)> {
     let mut limits = BTreeSet::new();
@@ -311,6 +359,7 @@ pub(super) fn read(
         if pulls.len() >= 1000 {
             limits.insert("pr_observations_truncated".into());
         }
+        let mut targets = BTreeMap::new();
         for observed in pulls.iter().take(LIMIT) {
             if comparisons >= COMPARISONS {
                 limits.insert("conflict_comparison_limit".into());
@@ -338,6 +387,19 @@ pub(super) fn read(
             };
             let mut recipients = BTreeMap::new();
             for intent in &intents {
+                // The agent that opened the pull request holding its own files is no overlap.
+                if opened_by(
+                    store,
+                    reader,
+                    items,
+                    &mut targets,
+                    intent,
+                    number,
+                    pull["head_ref"].as_str(),
+                    now,
+                )? {
+                    continue;
+                }
                 let mut hit = false;
                 for file in files
                     .iter()

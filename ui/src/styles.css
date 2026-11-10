@@ -1426,6 +1426,17 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   color: var(--hub-brand-ink);
   text-decoration: underline;
 }
+/* The lead's own account of the Work; a card shows three lines, the Work page all of it. */
+.work-description {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--hub-text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 /* The reported action reads as text under a small label, not as a panel inside the card. */
 .action {
   font-size: 0.85rem;

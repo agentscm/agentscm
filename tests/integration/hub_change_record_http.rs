@@ -233,6 +233,7 @@ async fn session_setups_reach_the_projection_and_are_trimmed_first() {
         source: None,
         request_key: Some("http-setups".into()),
         title: "show session setups".into(),
+        description: None,
         session: "http-setups".into(),
         role: WorkRole::Lead,
         scope,
@@ -298,6 +299,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
                 source: None,
                 request_key: Some("http-change-record".into()),
                 title: "prepare a concise handoff".into(),
+                description: None,
                 session: "http-change-record".into(),
                 role: WorkRole::Lead,
                 scope: (0..256)
@@ -479,7 +481,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
     );
     let (status, body) = hub.get(&missing, Some(&reader)).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body, json!({"error":"not_found"}));
+    crate::assert_hub_error!(body, json!({"error":"not_found"}));
 
     let wrong_repo = path.replace(REPOSITORY_PATH, "acme%2Fother");
     assert_eq!(
@@ -524,6 +526,7 @@ async fn minimum_configured_spool_completes_one_managed_recipe() {
                 source: None,
                 request_key: Some("minimum-managed-spool".into()),
                 title: "prove the minimum configured capture capacity".into(),
+                description: None,
                 session: session.into(),
                 role: WorkRole::Lead,
                 scope: vec!["tracked.txt".into()],
@@ -870,6 +873,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
                 source: None,
                 request_key: Some("hook-cli-alias".into()),
                 title: "capture through an aliased native session".into(),
+                description: None,
                 session: "default".into(),
                 role: WorkRole::Lead,
                 scope: vec!["tracked.txt".into()],
@@ -1720,6 +1724,10 @@ mod shared_bodies {
             let owner = user(&*store, 10, "owner");
             let member = user(&*store, 11, "member");
             let admin = user(&*store, 900, "hub-admin");
+            // Uploads need the repository to share agent conversations.
+            store
+                .set_setting("conversation_sharing:repo:77", "on", "test")
+                .unwrap();
             let (owner_token, owner_secret) = token(&*store, &owner, "writer", false);
             let (_, sibling_secret) = token(&*store, &owner, "sibling", false);
             let (_, read_only_secret) = token(&*store, &owner, "reader", true);
@@ -1737,6 +1745,7 @@ mod shared_bodies {
                         source: None,
                         request_key: Some("shared-body".into()),
                         title: "share a conversation".into(),
+                        description: None,
                         session: SESSION.into(),
                         role: WorkRole::Lead,
                         scope: vec!["src/**".into()],
@@ -1761,6 +1770,7 @@ mod shared_bodies {
                         source: None,
                         request_key: None,
                         title: "share a conversation".into(),
+                        description: None,
                         session: HELPER_SESSION.into(),
                         role: WorkRole::Helper,
                         scope: vec![],
@@ -1827,6 +1837,17 @@ mod shared_bodies {
                 .change_ingest(&token, &fixture.batch("shared-declare"), unix_now())
                 .unwrap();
             fixture
+        }
+
+        /// The repository's conversation sharing setting.
+        fn share(&self, on: bool) {
+            self.store
+                .set_setting(
+                    "conversation_sharing:repo:77",
+                    if on { "on" } else { "off" },
+                    "test",
+                )
+                .unwrap();
         }
 
         fn url(&self, sha: &str) -> String {
@@ -2278,6 +2299,20 @@ mod shared_bodies {
             f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
             StatusCode::NO_CONTENT
         );
+        // While the repository shares, anyone who can read it reads the body.
+        let (status, page) = f.list(&f.member_secret, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        let author = page["entries"][0]["author"].as_str().unwrap();
+        assert!(
+            !author.is_empty() && !author.starts_with("usr_"),
+            "a login: {author}"
+        );
+        let response = f.read(&f.member_secret, &f.sha).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), f.body.as_slice());
+        // Once it stops, what was uploaded stays readable only by its author and Hub admins.
+        f.share(false);
         // The author's writer, sibling and read-only tokens and the admin all read.
         for secret in [
             &f.owner_secret,
@@ -2346,6 +2381,75 @@ mod shared_bodies {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_means_off_for_the_repository_and_for_a_person_who_opts_out() {
+        let f = Fixture::start().await;
+        let sharing = |secret: &str| {
+            f.client
+                .get(format!(
+                    "{}/v1/hub/repos/{REPOSITORY_PATH}/conversation-sharing",
+                    f.base
+                ))
+                .bearer_auth(secret.to_owned())
+                .send()
+        };
+        let answer: Value = sharing(&f.read_only_secret)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .parse::<Value>()
+            .unwrap();
+        assert_eq!(answer["sharing"], true);
+        assert_eq!(answer["source"], "repository");
+        f.share(false);
+        // Nothing is missing, so a client sends nothing, and a direct upload is refused.
+        let (status, answer) = f
+            .missing(Some(&f.owner_secret), json!({"digests": [f.sha]}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["missing"], json!([]));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        f.share(true);
+        // Opting out is per person and stops that person's uploads on every token.
+        let opt_out = f
+            .client
+            .put(format!(
+                "{}/v1/hub/repos/{REPOSITORY_PATH}/conversation-sharing/me",
+                f.base
+            ))
+            .bearer_auth(&f.sibling_secret)
+            .header("content-type", "application/json")
+            .body(json!({"opted_out": true}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opt_out.status(), StatusCode::OK);
+        let mine: Value = serde_json::from_str(&opt_out.text().await.unwrap()).unwrap();
+        assert_eq!(
+            (mine["enabled"].clone(), mine["sharing"].clone()),
+            (json!(true), json!(false))
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        let other: Value = sharing(&f.member_secret)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .parse::<Value>()
+            .unwrap();
+        assert_eq!(other["sharing"], true, "another person still shares");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn listing_maps_availability_through_upload_expiry_and_deletion() {
         // One day of retention, so a three-day token is still valid at the deadline.
         let f = Fixture::start_for(1).await;
@@ -2357,7 +2461,8 @@ mod shared_bodies {
             json!({
                 "session_id": SESSION, "sequence": 1, "event_id": "http-setup-event",
                 "kind": "session_started", "observed_at": 100, "digest": f.sha,
-                "size_bytes": f.body.len(), "availability": "local", "expires_at": null
+                "size_bytes": f.body.len(), "availability": "local", "expires_at": null,
+                "author": "owner"
             })
         );
         // Declared but never uploaded: nothing to read.
@@ -2444,7 +2549,7 @@ mod shared_bodies {
             .unwrap();
         let response = f.read(&f.owner_secret, &f.sha).await;
         assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
-        assert_eq!(
+        crate::assert_hub_error!(
             json_of(response).await,
             json!({"error": "integrity_failure"})
         );
@@ -2464,6 +2569,8 @@ mod shared_bodies {
             f.read(&f.owner_secret, &f.sha).await.status(),
             StatusCode::OK
         );
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // A caller without access is refused before the backend is consulted.
         assert_eq!(
             f.read(&f.member_secret, &f.sha).await.status(),
@@ -2528,6 +2635,8 @@ mod shared_bodies {
         }
         let (status, _) = f.list(&f.owner_secret, "?other=1").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // A valid cursor gives another member nothing to see.
         let (status, page) = f.list(&f.member_secret, &format!("?cursor={cursor}")).await;
         assert_eq!(status, StatusCode::OK);
@@ -2583,6 +2692,8 @@ mod shared_bodies {
         assert!(text.contains("not truncated"), "{text}");
         assert!(!text.contains("xxxx"));
 
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // Another member lists nothing and is refused the body.
         let none = f.mcp(&f.member_secret, json!({"work_id": f.work_id})).await;
         assert_eq!(none["isError"], false);
@@ -2598,6 +2709,7 @@ mod shared_bodies {
         assert!(text.contains("only the person who shared"), "{text}");
         assert!(!text.contains("synthetic"));
         // The Work owner who is not the author is refused the same way.
+        f.share(true);
         let helper_sha = f.declare_as(
             &f.token_of(&f.helper_secret),
             HELPER_SESSION,
@@ -2614,6 +2726,7 @@ mod shared_bodies {
             .await,
             StatusCode::NO_CONTENT
         );
+        f.share(false);
         let refused = f
             .mcp(
                 &f.owner_secret,
@@ -2731,6 +2844,8 @@ mod shared_bodies {
             f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
             StatusCode::NO_CONTENT
         );
+        // Only authors and Hub admins read once the repository stops sharing.
+        f.share(false);
         // The Work owner uploads nothing for the helper's declaration.
         assert_eq!(
             f.put(&f.owner_secret, &sha, body.clone()).await,
@@ -2820,6 +2935,7 @@ mod shared_bodies {
             f.row_of(&f.helper_secret, &f.sha).state,
             SharedBodyState::Available
         );
+        f.share(false);
         for secret in [&f.owner_secret, &f.helper_secret] {
             let (_, page) = f.list(secret, "").await;
             assert_eq!(digests_of(&page), vec![f.sha.clone()]);
@@ -3670,6 +3786,7 @@ async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
                 source: None,
                 request_key: Some("capture-after-pause".into()),
                 title: "capture after the session end pause".into(),
+                description: None,
                 session: observed.into(),
                 role: WorkRole::Lead,
                 scope: vec!["tracked.txt".into()],

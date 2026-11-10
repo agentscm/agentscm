@@ -429,6 +429,18 @@ pub(in crate::hub) async fn mint_check(
     repository: &str,
     via: &'static str,
 ) -> ApiResult<ConnectedRepository> {
+    mint_access(state, owner, repository, via)
+        .await
+        .map(|(repo, _)| repo)
+}
+
+/// [`mint_check`], and whether `owner` administers the repository (see [`repository_access`]).
+pub(in crate::hub) async fn mint_access(
+    state: &HubState,
+    owner: &User,
+    repository: &str,
+    via: &'static str,
+) -> ApiResult<(ConnectedRepository, bool)> {
     allow_listed(state, owner, via).await?;
     let identity = &owner.identity;
     let (store, host, named) = (
@@ -447,8 +459,8 @@ pub(in crate::hub) async fn mint_check(
             None => refused_about("not_connected", repository, forge),
         });
     };
-    match repository_role(state, owner, &repo).await {
-        Ok(()) => {}
+    let admin = match repository_access(state, owner, &repo).await {
+        Ok(admin) => admin,
         Err(Denial::Role(role)) => {
             record_refusal(state, owner, "insufficient_role", via).await;
             return Err(super::insufficient_role(
@@ -463,8 +475,8 @@ pub(in crate::hub) async fn mint_check(
             }
             return Err(refused_about(kind, &repo.full_name, forge));
         }
-    }
-    Ok(repo)
+    };
+    Ok((repo, admin))
 }
 
 /// Refuses someone the allow list leaves out, recording it under `via`.
@@ -1040,6 +1052,16 @@ pub(in crate::hub) async fn repository_role(
     owner: &User,
     repo: &ConnectedRepository,
 ) -> std::result::Result<(), Denial> {
+    repository_access(state, owner, repo).await.map(|_| ())
+}
+
+/// [`repository_role`], and whether the person administers the repository: GitHub `admin`, or a
+/// GitLab maintainer or owner.
+pub(in crate::hub) async fn repository_access(
+    state: &HubState,
+    owner: &User,
+    repo: &ConnectedRepository,
+) -> std::result::Result<bool, Denial> {
     let kind = Denial::Kind;
     let store = state.store.clone();
     let id = repo.connection.clone();
@@ -1097,8 +1119,18 @@ pub(in crate::hub) async fn repository_role(
         return Err(kind("sign_in_required"));
     }
     match role_refusal(gitlab, &project, role.as_ref()) {
-        None => Ok(()),
+        None => Ok(role.as_ref().is_some_and(|role| administers(gitlab, role))),
         Some(role) => Err(Denial::Role(role)),
+    }
+}
+
+fn administers(gitlab: bool, role: &Value) -> bool {
+    if gitlab {
+        role["access_level"]
+            .as_i64()
+            .is_some_and(|level| level >= 40)
+    } else {
+        role["permission"].as_str() == Some("admin")
     }
 }
 
@@ -1237,6 +1269,18 @@ async fn admin_capacity_refusals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn administers_is_github_admin_or_gitlab_maintainer_and_owner() {
+        assert!(administers(false, &json!({"permission": "admin"})));
+        assert!(!administers(
+            false,
+            &json!({"permission": "write", "role_name": "maintain"})
+        ));
+        assert!(administers(true, &json!({"access_level": 40})));
+        assert!(administers(true, &json!({"access_level": 50})));
+        assert!(!administers(true, &json!({"access_level": 30})));
+    }
 
     #[test]
     fn attention_revision_ignores_provider_poll_time_but_tracks_actions_and_recipients() {

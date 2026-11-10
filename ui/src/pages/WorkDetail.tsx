@@ -142,7 +142,7 @@ function Task({ item, token, overview, handoff, session, refreshWork }: { item: 
   const { steps: needSteps, listed } = needsFor(item.id, overview)
   return (
     <div className="stack">
-      <PageHead className="detail-head" question={item.title} answer={<>Led by {who(l.login, l.agent)}.</>} fact={
+      <PageHead className="detail-head" question={item.title} answer={<>{item.description && <>{item.description} </>}Led by {who(l.login, l.agent)}.</>} fact={
           <>
             {branch && <>On <code className="branch-name">{branch}</code>{base ? <> into <code>{base}</code></> : null}{prNumber !== null ? <>, {prUrl ? <a href={prUrl} target="_blank" rel="noreferrer noopener">PR #{prNumber}</a> : `PR #${prNumber}`}</> : null}{head ? <>, head <code>{head.slice(0, 7)}</code></> : null}. </>}
             Last check-in <Ago at={item.last_checkin_at} />.

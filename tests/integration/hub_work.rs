@@ -20,7 +20,7 @@ use agentscm::hub::store::{
 use agentscm::hub::work::{
     BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, CheckpointKind, ClaimStatus, ForgeWorkRef,
     SourceRef, WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint,
-    WorkConflictKind, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
+    WorkConflictKind, WorkOverviewQuery, WorkRepositoryScope, WorkRole, WorkStart, WorkState,
 };
 use agentscm::hub::work_lifecycle::LEASE_SECONDS as LEASE;
 use agentscm::hub::work_links::{
@@ -496,6 +496,7 @@ fn start_with(
         source: None,
         request_key: request_key.map(str::to_owned),
         title: title.into(),
+        description: None,
         session: session.into(),
         role,
         scope: vec!["src/**".into()],
@@ -583,10 +584,11 @@ fn work_event_count(store: &dyn Store, kind: &str) -> usize {
 }
 
 fn assert_invalid<T>(result: Result<T, HubError>, message: &str) {
-    assert!(
-        matches!(result, Err(HubError::Invalid(ref actual)) if actual == message),
-        "expected invalid {message:?}"
-    );
+    match result {
+        Err(HubError::Invalid(actual)) => assert_eq!(actual, message),
+        Err(HubError::Rejected(rejection)) => assert_eq!(rejection.message(), message),
+        _ => panic!("expected invalid {message:?}"),
+    }
 }
 
 fn concurrent_forge_start_has_one_work_and_one_lead(db: &Db) {
@@ -700,6 +702,86 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
         .unwrap();
     assert!(other_session.created);
     assert_ne!(other_session.item.id, auto_first.item.id);
+    assert_eq!(work_event_count(&*store, "work_started"), 3);
+}
+
+fn a_description_is_kept_from_creation_and_read_back(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    let text = "Adds a plain description to Work so a teammate can tell what it changes and why.";
+    let mut described = native_start("described", "Describe Work", "described-session");
+    described.description = Some(text.into());
+    let created = store.work_start(&alice.token, &described, now).unwrap();
+    assert!(created.created);
+    assert_eq!(created.item.description.as_deref(), Some(text));
+    let id = created.item.id.clone();
+
+    let read = store.work_get(&alice.token, &id, now + 1).unwrap().unwrap();
+    assert_eq!(read.description.as_deref(), Some(text));
+    let overview = store
+        .work_overview(&alice.token, &WorkOverviewQuery::default(), now + 1)
+        .unwrap();
+    let listed = overview.current.iter().find(|item| item.id == id).unwrap();
+    assert_eq!(listed.description.as_deref(), Some(text));
+    let briefing = store
+        .work_briefing(&alice.token, &BriefingQuery::default(), now + 1)
+        .unwrap();
+    assert!(
+        briefing
+            .events
+            .iter()
+            .any(|event| event.work_id == id && event.item.description.as_deref() == Some(text))
+    );
+
+    // A later start by the lead is not refused for a changed or missing description, and the one
+    // from creation stays, so Work made before descriptions existed can still be resumed.
+    let retry = store.work_start(&alice.token, &described, now + 2).unwrap();
+    assert!(!retry.created && retry.conflict.is_none());
+    for changed in [None, Some("Something else.".to_owned())] {
+        let mut start = described.clone();
+        start.description = changed;
+        let result = store.work_start(&alice.token, &start, now + 3).unwrap();
+        assert!(result.conflict.is_none());
+        assert_eq!(result.item.description.as_deref(), Some(text));
+    }
+
+    // A task-only start keeps it the same way.
+    let mut automatic = automatic_start("Describe automatic Work", "auto-session");
+    automatic.scope = vec!["automatic/**".into()];
+    automatic.description = Some(text.into());
+    let auto_first = store
+        .work_start_auto(&alice.token, &automatic, now + 4)
+        .unwrap();
+    assert_eq!(auto_first.item.description.as_deref(), Some(text));
+    automatic.description = Some("Something else.".into());
+    let auto_changed = store
+        .work_start_auto(&alice.token, &automatic, now + 5)
+        .unwrap();
+    assert!(auto_changed.conflict.is_none());
+    assert_eq!(auto_changed.item.description.as_deref(), Some(text));
+
+    // Without one, the Work has none and its JSON has no key.
+    let mut plain = native_start("plain", "Plain Work", "plain-session");
+    plain.scope = vec!["plain/**".into()];
+    let plain = store.work_start(&alice.token, &plain, now + 6).unwrap();
+    assert!(plain.created && plain.item.description.is_none());
+    assert!(
+        serde_json::to_value(&plain.item)
+            .unwrap()
+            .get("description")
+            .is_none()
+    );
+
+    for refused in ["x".repeat(501), "line\nbreak".into(), String::new()] {
+        let mut start = native_start("refused", "Refused Work", "refused-session");
+        start.scope = vec!["refused/**".into()];
+        start.description = Some(refused);
+        assert_invalid(
+            store.work_start(&alice.token, &start, now + 7),
+            "description must be 1-500 bytes without control characters",
+        );
+    }
     assert_eq!(work_event_count(&*store, "work_started"), 3);
 }
 
@@ -1817,19 +1899,8 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
         .work_briefing(&lead.token, &BriefingQuery::default(), now)
         .unwrap();
     assert!(open.complete);
-    assert_invalid(
-        store.work_compact(&scope, now - 86_400, false, now),
-        "work compaction is blocked by an unacknowledged briefing delivery",
-    );
-    store
-        .work_ack(
-            &lead.token,
-            &BriefingAck {
-                delivery: open.delivery.unwrap(),
-            },
-            now,
-        )
-        .unwrap();
+    // An open delivery no longer blocks compaction; the delivery it cuts is ended below.
+    let open_delivery = open.delivery.unwrap();
 
     let preview = store
         .work_compact(&scope, now - 86_400, false, now)
@@ -1851,6 +1922,17 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
     assert_eq!(compacted.deleted_operations, 1);
     assert_eq!(compacted.deleted_versions, 1);
     assert_eq!(compacted.retention_floor, baseline.receipt.event_seq);
+    // Its window started below the raised floor, so acknowledging it now fails.
+    assert_invalid(
+        store.work_ack(
+            &lead.token,
+            &BriefingAck {
+                delivery: open_delivery,
+            },
+            now,
+        ),
+        "delivery is unknown or incomplete",
+    );
     let (used, aggregate) = db.work_usage_and_aggregate();
     assert_eq!(used, aggregate);
 
@@ -2249,6 +2331,14 @@ fn lead_credential_carries_for_the_same_owner_and_session(db: &Db) {
         store.work_checkpoint(&outsider.token, &foreign, now + 3),
         "LEAD_SESSION_MISMATCH",
     );
+    let error = store
+        .work_checkpoint(&outsider.token, &foreign, now + 3)
+        .unwrap_err();
+    let envelope = agentscm::hub::error_envelope::from_hub_error(&error);
+    assert_eq!(envelope.code, "lead_session_mismatch");
+    assert_eq!(envelope.message, "LEAD_SESSION_MISMATCH");
+    assert!(!envelope.render().contains(&started.id));
+    assert!(!envelope.render().contains("replacement"));
     let after_foreign = store
         .work_get(&alice.token, &started.id, now + 3)
         .unwrap()
@@ -2386,6 +2476,7 @@ conformance!(
     concurrent_pr_link_updates_fence_and_replay,
     concurrent_forge_start_has_one_work_and_one_lead,
     native_and_automatic_starts_have_explicit_retry_rules,
+    a_description_is_kept_from_creation_and_read_back,
     authorization_and_claim_projection_keep_old_claims_visible,
     repository_namespaces_fence_work_and_relations,
     intent_provenance_refs_require_exact_same_work_versions_and_replay,
@@ -4870,22 +4961,91 @@ fn abandoned_work_is_not_a_reported_completion(db: &Db) {
         assert_eq!(insight.state, WorkState::Finished);
         assert_eq!(insight.reported_finished, reported, "{}", item.title);
     }
-    // Recent outcomes stay checkpoint-only: a transition leaves `current` unchanged and carries
-    // no actor, so listing it would show a stale summary under the lead's name. Only the finish
-    // checkpoint is listed; abandoned, superseded and transition-completed Work are not (the
-    // latter is visible through history and the operational projection).
+    // Recent outcomes list Work ended by any transition once, as a completion from the finished
+    // snapshot; a finish checkpoint followed by a complete transition is not counted twice.
     let overview = store
         .work_overview(&alice.token, &Default::default(), now + 3)
         .unwrap();
-    let recent: Vec<_> = overview
+    let ids: Vec<_> = overview
         .recent
         .iter()
         .map(|outcome| outcome.item.id.as_str())
         .collect();
-    assert!(recent.contains(&finished.id.as_str()));
-    assert!(!recent.contains(&abandoned.id.as_str()));
-    assert!(!recent.contains(&superseded.id.as_str()));
-    assert!(!recent.contains(&completed.id.as_str()));
+    for item in [&finished, &abandoned, &superseded, &completed] {
+        assert_eq!(
+            ids.iter().filter(|id| **id == item.id).count(),
+            1,
+            "{}",
+            item.title
+        );
+    }
+    for outcome in &overview.recent {
+        if outcome.item.id == completed.id {
+            assert_eq!(
+                outcome.kind,
+                agentscm::hub::work::WorkOutcomeKind::Completion
+            );
+            assert_eq!(outcome.item.state, WorkState::Finished);
+        }
+    }
+    // A decision checkpoint followed by a complete transition lists one completion, not the
+    // decision row with its active snapshot.
+    let decided = make("d", "d/**");
+    let decision = lead_checkpoint(
+        &*store,
+        &alice,
+        &decided,
+        "dec",
+        "s-d",
+        CheckpointKind::Decision,
+        now + 4,
+    );
+    store
+        .work_transition(
+            &by_agent(&alice),
+            &transition_request(&decision.item, "x", Complete, Some("s-d")),
+            now + 5,
+        )
+        .unwrap();
+    let overview = store
+        .work_overview(&alice.token, &Default::default(), now + 6)
+        .unwrap();
+    let rows: Vec<_> = overview
+        .recent
+        .iter()
+        .filter(|outcome| outcome.item.id == decided.id)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].kind,
+        agentscm::hub::work::WorkOutcomeKind::Completion
+    );
+    assert_eq!(rows[0].item.state, WorkState::Finished);
+    let ended = rows[0].ended.as_ref().expect("transition row has ended");
+    assert_eq!(ended.transition, "complete");
+    assert_eq!(ended.reason, "synthetic reason");
+    assert_eq!(
+        ended.by.kind,
+        agentscm::hub::work_lifecycle::WorkActorKind::Lead
+    );
+    assert_eq!(ended.by.via, agentscm::hub::work_lifecycle::ActorVia::Agent);
+    assert_eq!(ended.superseded_by, None);
+    assert!(
+        overview
+            .recent
+            .iter()
+            .filter(|outcome| outcome.item.id == finished.id)
+            .all(|outcome| outcome.ended.is_none())
+    );
+    let sup = overview
+        .recent
+        .iter()
+        .find(|o| o.item.id == superseded.id)
+        .unwrap();
+    assert_eq!(
+        sup.ended.as_ref().unwrap().superseded_by.as_deref(),
+        Some(completed.id.as_str())
+    );
     // Pre-existing finished Work with no stored outcome reads as unstated.
     db.sql(&format!(
         "UPDATE hub_work_items SET terminal_outcome = NULL WHERE id = '{}'",
@@ -6297,7 +6457,7 @@ fn an_idle_lease_lapses_and_the_next_admission_clears_it(db: &Db) {
     for minute in 0..5 {
         assert!(matches!(
             store.touch_session(&alice.token, &edit, after + 2 + minute * 60),
-            Err(HubError::Invalid(_))
+            Err(HubError::Invalid(_) | HubError::Rejected(_))
         ));
     }
     // Resuming needs fresh admission, and the scope is held again.

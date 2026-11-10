@@ -23,6 +23,60 @@ const AUTO_CONNECT_WAIT: Duration = Duration::from_millis(2500);
 /// A failed auto-connect or renewal is not retried for this long.
 const RETRY_EVERY: Duration = Duration::from_secs(5 * 60);
 
+struct HookFailure {
+    text: String,
+    code: String,
+    token_marker: Option<String>,
+}
+
+impl HookFailure {
+    fn remote(envelope: agentscm::hub::error_envelope::ErrorEnvelope, token: &str) -> Self {
+        Self {
+            text: envelope.render(),
+            code: envelope.code,
+            token_marker: None,
+        }
+        .with_token(token)
+    }
+
+    fn with_token(mut self, token: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        self.token_marker = Some(format!("{:x}", Sha256::digest(token)));
+        self
+    }
+
+    fn note_key(&self, session: &str) -> String {
+        format!(
+            "{}\0{session}\0{}",
+            self.token_marker.as_deref().unwrap_or("local"),
+            self.code
+        )
+    }
+}
+
+impl From<String> for HookFailure {
+    fn from(text: String) -> Self {
+        use agentscm::hub::error_envelope::ErrorCode;
+        let code = match text.as_str() {
+            "hub unreachable" => ErrorCode::HubUnreachable,
+            "bad reply" => ErrorCode::InvalidResponse,
+            "no token" | "no token for this hub; set AGENTSCM_HUB_TOKEN" => ErrorCode::Unauthorized,
+            _ => ErrorCode::InvalidRequest,
+        };
+        Self {
+            text,
+            code: code.as_str().into(),
+            token_marker: None,
+        }
+    }
+}
+
+impl From<&str> for HookFailure {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct HookArgs {
     /// Agent name, followed by explicit --hub-url/--repo routing or local
@@ -89,12 +143,137 @@ async fn hook(
     client_connection: bool,
     destination_args: bool,
 ) -> Value {
-    let mut deadline = Instant::now() + LIMIT;
+    let started = Instant::now();
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
     let Ok(Ok(Some(body))) = read else {
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
+    let session_start = is_session_start(agent, &payload);
+    let host_session = host_session(agent, &payload);
+    let wants_capture = client_connection
+        && agent == "claude"
+        && crate::change_capture_cli::captures_claude_event(&payload);
+    // Capture stops in time for the reply to be printed before the host's hook timeout.
+    let budget = started
+        + if session_start {
+            CAPTURE_SESSION_START_BUDGET
+        } else {
+            CAPTURE_BUDGET
+        };
+    let spawn_capture = || {
+        let (body, payload) = (body.clone(), std::sync::Arc::clone(&payload));
+        tokio::spawn(async move {
+            let routed = route_client("claude", &payload).ok()?;
+            crate::change_capture_cli::plugin_capture(
+                &body,
+                &payload,
+                routed.checkout,
+                routed.connection,
+                budget.into(),
+            )
+            .await
+        })
+    };
+    // At session start coordination may connect the checkout first, so capture follows it there
+    // and runs beside it otherwise.
+    let early = (wants_capture && !session_start).then(spawn_capture);
+    // Events only capture needs never reach the Hub's hook.
+    let reply = if client_connection
+        && CAPTURE_ONLY_EVENTS.contains(&payload["hook_event_name"].as_str().unwrap_or(""))
+    {
+        fail_open(agent, &payload, None)
+    } else {
+        coordinate(
+            agent,
+            flag_url,
+            repo,
+            client_connection,
+            destination_args,
+            body.clone(),
+            std::sync::Arc::clone(&payload),
+            started,
+        )
+        .await
+    };
+    let capture = early.or_else(|| (wants_capture && session_start).then(spawn_capture));
+    let reply = match capture {
+        Some(capture) => {
+            let remaining = budget.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, capture).await {
+                Ok(Ok(Some(context))) => {
+                    within_context_limit(with_note(reply, agent, &payload, &context))
+                }
+                _ => reply,
+            }
+        }
+        None => reply,
+    };
+    // The record is written beside the Hub call; the process must not exit before it is.
+    if let Some(recording) = host_session {
+        let remaining = budget.saturating_duration_since(Instant::now());
+        let _ = tokio::time::timeout(remaining, recording).await;
+    }
+    reply
+}
+
+/// Keeps the record that the checkout's MCP server reads to name its calls with this
+/// conversation's session ([`crate::client_session`]): written when the session starts, dropped
+/// when it ends. Only an ID the Hub would accept as a session is recorded.
+fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<()>> {
+    let session = session_of(payload)
+        .filter(|id| id.len() <= 128 && !id.chars().any(char::is_control))?
+        .to_owned();
+    let config = config_dir().ok()?;
+    if is_session_start(agent, payload) {
+        return Some(tokio::task::spawn_blocking(move || {
+            crate::client_session::record(&config, &session);
+        }));
+    }
+    if matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) {
+        crate::client_session::forget(&config, &session);
+    }
+    None
+}
+
+/// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
+/// (5 at session start), and the reply still has to be printed.
+const CAPTURE_BUDGET: Duration = Duration::from_millis(2500);
+const CAPTURE_SESSION_START_BUDGET: Duration = Duration::from_millis(4000);
+
+/// Claude Code events the plugin registers only so capture sees them.
+const CAPTURE_ONLY_EVENTS: [&str; 5] = [
+    "PostToolUseFailure",
+    "MessageDisplay",
+    "PreCompact",
+    "SubagentStart",
+    "SubagentStop",
+];
+
+#[allow(clippy::too_many_arguments)]
+async fn coordinate(
+    agent: &str,
+    flag_url: Option<String>,
+    repo: Option<String>,
+    client_connection: bool,
+    destination_args: bool,
+    body: Vec<u8>,
+    payload: std::sync::Arc<Value>,
+    started: Instant,
+) -> Value {
+    let mut deadline = started + LIMIT;
+    // The Hub ends a wait on the session's next tool call, so that call must reach it.
+    if waits(agent, &payload)
+        && let (Some(session), Ok(config)) = (session_of(&payload), config_dir())
+    {
+        let _ = std::fs::remove_file(marker_path(
+            &config,
+            &activity_marker(agent, session, &payload),
+        ));
+    }
     if let Some(key) = activity_key(agent, &payload)
         && let Ok(config) = config_dir()
     {
@@ -125,7 +304,7 @@ async fn hook(
     ));
     let reply = match tokio::time::timeout(remaining, &mut call).await {
         Ok(Ok(Ok(reply))) => reply,
-        Ok(Ok(Err(reason))) => unknown_output(agent, &payload, &reason),
+        Ok(Ok(Err(reason))) => unknown_failure(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
         Err(_) => {
             activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
@@ -212,7 +391,7 @@ async fn call_hub(
     destination_args: bool,
     payload: std::sync::Arc<Value>,
     context: HubCallContext,
-) -> Result<Value, String> {
+) -> Result<Value, HookFailure> {
     let HubCallContext {
         original_body,
         activity_tracker,
@@ -281,9 +460,33 @@ async fn call_hub(
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
             }
-            if note.is_none() && session_start {
-                note = crate::client_cli::attention(&routed.connection.root)
-                    .map(|message| format!("AgentSCM: {message}."));
+            if session_start {
+                // Every connected session says where it coordinates, unless something stops it.
+                let coordinating = format!(
+                    "AgentSCM: coordinating on {} at {}.",
+                    routed.connection.repo, routed.connection.hub
+                );
+                note = Some(
+                    match (
+                        note.is_some(),
+                        crate::client_cli::attention(&routed.connection.root),
+                    ) {
+                        (true, _) => format!("{coordinating} This checkout was just connected."),
+                        (false, Some(message)) => format!("AgentSCM: {message}."),
+                        (false, None) => coordinating,
+                    },
+                );
+            }
+            if session_start
+                && let Some(also) = client_config::load().ok().and_then(|all| {
+                    let now = agentscm::hub::store::unix_now();
+                    also_connected(&routed.connection, &all, now)
+                })
+            {
+                note = Some(match note {
+                    Some(note) => format!("{note} {also}"),
+                    None => format!("AgentSCM: {also}"),
+                });
             }
             (
                 routed.connection.hub.clone(),
@@ -347,7 +550,7 @@ async fn call_hub(
         client: client_connection
             .as_ref()
             .map(|connection| client_config::onboarding_client(&connection.root, &token)),
-        token,
+        token: token.clone(),
         root: root.as_deref().and_then(Path::to_str).map(str::to_owned),
         report_completion,
         body: outbound_body,
@@ -361,16 +564,19 @@ async fn call_hub(
         None => None,
     };
     let (status, reply) = match forwarded {
-        Some(reply) => reply.map_err(|_| "hub unreachable")?,
+        Some(reply) => {
+            reply.map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?
+        }
         None => {
-            let client = forge_http::client().map_err(|_| "hub unreachable")?;
+            let client = forge_http::client()
+                .map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?;
             let request = request
                 .request(&client, &url)
-                .map_err(|_| "hub unreachable")?;
+                .map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?;
             // `send` errors carry no URL or credentials. An accepted relay call is never resent.
             send(request, REPLY_BYTES)
                 .await
-                .map_err(|_| "hub unreachable")?
+                .map_err(|_| HookFailure::from("hub unreachable").with_token(&token))?
         }
     };
     match status {
@@ -388,15 +594,26 @@ async fn call_hub(
         }
         200 => {
             activity.finish(crate::client_activity::ActivityOutcome::InvalidResponse);
-            Err("bad reply".into())
+            Err(HookFailure::remote(
+                agentscm::hub::error_envelope::ErrorEnvelope::local(
+                    agentscm::hub::error_envelope::ErrorCode::InvalidResponse,
+                ),
+                &token,
+            ))
         }
         401 | 403 => {
             activity.finish(crate::client_activity::ActivityOutcome::TokenRejected);
-            Err("token rejected".into())
+            Err(HookFailure::remote(
+                agentscm::hub::error_envelope::decode(status, &reply),
+                &token,
+            ))
         }
         _ => {
             activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
-            Err(format!("hub error {status}"))
+            Err(HookFailure::remote(
+                agentscm::hub::error_envelope::decode(status, &reply),
+                &token,
+            ))
         }
     }
 }
@@ -1211,6 +1428,37 @@ fn route_client_with(
     })
 }
 
+/// One sentence for the start context that names the other repositories this computer can
+/// reach now, so an agent that edits one of them knows its AgentSCM calls go there too. Names
+/// only, at most six; a connection whose managed token has expired is left out.
+fn also_connected(current: &Connection, connections: &[Connection], now: i64) -> Option<String> {
+    const LISTED: usize = 6;
+    let mut others: Vec<&str> = connections
+        .iter()
+        .filter(|other| other.hub != current.hub || !other.repo.eq_ignore_ascii_case(&current.repo))
+        .filter(|other| {
+            other
+                .owned_token_expires_at
+                .is_none_or(|expiry| expiry > now)
+        })
+        .map(|other| other.repo.as_str())
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    let more = others.len().saturating_sub(LISTED);
+    others.truncate(LISTED);
+    if others.is_empty() {
+        return None;
+    }
+    let mut names = others.join(", ");
+    if more > 0 {
+        names.push_str(&format!(" and {more} more"));
+    }
+    Some(format!(
+        "Also connected on this computer: {names}. An AgentSCM call with absolute paths in one of them, or with `root` set to its checkout, goes to that repository."
+    ))
+}
+
 /// A start-of-session event, when an agent begins a conversation.
 fn is_session_start(agent: &str, payload: &Value) -> bool {
     match payload["hook_event_name"].as_str() {
@@ -1473,11 +1721,13 @@ fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<Route
 fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
     // `agent_id` marks a subagent's call, so the hub can keep requests for the lead session.
+    // `notification_type` says which wait a notification reports; its message is never sent.
     for (key, max) in [
         ("hook_event_name", 64),
         ("session_id", 1024),
         ("tool_name", 128),
         ("agent_id", 128),
+        ("notification_type", 64),
     ] {
         if let Some(value) = payload[key]
             .as_str()
@@ -1485,6 +1735,13 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
         {
             out.insert(key.into(), json!(value));
         }
+    }
+    // A stop that background work will resume is not a wait; only the count leaves.
+    if let Some(tasks) = payload["background_tasks"].as_array() {
+        out.insert("background_tasks".into(), json!(tasks.len()));
+    }
+    if let Some(asks) = wait_asks(payload) {
+        out.insert("asks".into(), json!(asks));
     }
     if normalized.is_none() {
         if let Some(cwd) = payload["cwd"]
@@ -1526,6 +1783,44 @@ fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<V
     Ok(Value::Object(out))
 }
 
+/// The most of a wait's text that leaves the machine, in characters.
+const ASKS_CHARS: usize = 400;
+
+/// What a wait asks of its person, so the Hub can show that person (and only them) what their
+/// agent needs: the end of the agent's last message when it stops, the questions it asks, or what
+/// a permission prompt is for. One line, secrets redacted, and cut to its last [`ASKS_CHARS`]
+/// characters, where a closing question sits. A stop that background work will resume sends none.
+fn wait_asks(payload: &Value) -> Option<String> {
+    let busy = payload["background_tasks"]
+        .as_array()
+        .is_some_and(|tasks| !tasks.is_empty())
+        || payload["background_tasks"].as_u64().is_some_and(|n| n > 0);
+    let text = match payload["hook_event_name"].as_str()? {
+        "Stop" if !busy => payload["last_assistant_message"].as_str()?.to_owned(),
+        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => {
+            payload["tool_input"]["questions"]
+                .as_array()?
+                .iter()
+                .filter_map(|q| q["question"].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        "PermissionRequest" => payload["tool_input"]["description"].as_str()?.to_owned(),
+        _ => return None,
+    };
+    let mut text = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
+    agentscm::change_capture::redact::redact_json(&mut text);
+    let text = text.as_str()?.chars().collect::<Vec<_>>();
+    let tail: String = text[text.len().saturating_sub(ASKS_CHARS)..]
+        .iter()
+        .collect();
+    match text.len() {
+        0 => None,
+        n if n > ASKS_CHARS => Some(format!("…{tail}")),
+        _ => Some(tail),
+    }
+}
+
 fn bounded_string(value: &Value, max: usize) -> Option<&str> {
     value
         .as_str()
@@ -1547,7 +1842,13 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
         }
         "copilot" => {
             let mut out = serde_json::Map::new();
-            for (key, max) in [("sessionId", 1024), ("toolName", 128)] {
+            for (key, max) in [
+                ("sessionId", 1024),
+                ("toolName", 128),
+                ("agentId", 128),
+                ("notification_type", 64),
+                ("stopReason", 64),
+            ] {
                 if let Some(value) = bounded_string(&payload[key], max) {
                     out.insert(key.into(), json!(value));
                 }
@@ -1577,10 +1878,20 @@ fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<
                 Some("SessionStart") => "start",
                 Some("BeforeTool") if !paths.is_empty() => "check",
                 Some("BeforeTool" | "AfterTool") => "activity",
+                Some("Notification" | "AfterAgent") => "waiting",
                 Some("SessionEnd") => "done",
                 _ => return Err("hook event not recognised".into()),
             };
             let mut out = json!({"agent":"gemini", "event":event});
+            // Without a reason the Hub ignores the wait (a notification Gemini adds later).
+            match (
+                payload["hook_event_name"].as_str(),
+                payload["notification_type"].as_str(),
+            ) {
+                (Some("AfterAgent"), _) => out["reason"] = json!("idle"),
+                (_, Some("ToolPermission")) => out["reason"] = json!("permission"),
+                _ => {}
+            }
             if event == "activity"
                 && agentscm::hub::hook::is_shell_tool(payload["tool_name"].as_str().unwrap_or(""))
             {
@@ -1703,7 +2014,9 @@ fn is_pre_tool(payload: &Value) -> bool {
 /// end, which the Hub counts so a long call stays live. None without a session.
 fn activity_key(agent: &str, payload: &Value) -> Option<String> {
     let session = session_of(payload)?;
-    if agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0) {
+    if waits(agent, payload)
+        || agent != "cursor" && agentscm::hub::hook::is_shell_tool(&tool_call(agent, payload).0)
+    {
         return None;
     }
     // A path that cannot be read is sent on, so the Hub decides.
@@ -1718,7 +2031,35 @@ fn activity_key(agent: &str, payload: &Value) -> Option<String> {
         }
         _ => false,
     };
-    renews.then(|| format!("activity\0{agent}\0{session}"))
+    renews.then(|| activity_marker(agent, session, payload))
+}
+
+/// Kept per subagent, so a sibling's work cannot use up the call that ends another's wait.
+fn activity_marker(agent: &str, session: &str, payload: &Value) -> String {
+    match ["agent_id", "agentId"]
+        .into_iter()
+        .find_map(|key| payload[key].as_str())
+    {
+        Some(asker) => format!("activity\0{agent}\0{session}\0{asker}"),
+        None => format!("activity\0{agent}\0{session}"),
+    }
+}
+
+/// A report that the session stopped for its person: a permission prompt, a question or the end
+/// of a turn. The Hub reads which; this says only that the session's next call ends it.
+fn waits(agent: &str, payload: &Value) -> bool {
+    match payload["hook_event_name"].as_str() {
+        Some("Notification" | "PermissionRequest" | "Stop" | "AfterAgent") => true,
+        Some("stop") => agent == "cursor",
+        Some("PreToolUse") => payload["tool_name"] == "AskUserQuestion",
+        Some(_) => false,
+        None => {
+            agent == "copilot"
+                && payload.get("toolName").is_none()
+                && (payload.get("notification_type").is_some()
+                    || payload.get("stopReason").is_some())
+        }
+    }
 }
 
 /// The agent name is argv, so keep it to a safe single path segment.
@@ -1792,14 +2133,20 @@ fn resolve(
 /// What the agent gets when the hub cannot be consulted: valid JSON that never blocks. The note
 /// is printed once per (agent, session); later calls in that session get the silent no-op.
 fn unknown_output(agent: &str, payload: &Value, reason: &str) -> Value {
+    unknown_failure(agent, payload, &HookFailure::from(reason))
+}
+
+fn unknown_failure(agent: &str, payload: &Value, failure: &HookFailure) -> Value {
+    let reason = failure.text.as_str();
     // The user-wide hooks run in every project; an edit no connected checkout covers stays quiet.
     if reason == NO_EDIT_CONNECTION {
         return fail_open(agent, payload, None);
     }
-    let note = match (session_of(payload), config_dir()) {
-        (Some(session), Ok(dir)) => first_note(&dir, agent, session),
-        _ => true,
-    };
+    let note = is_session_start(agent, payload)
+        || match (session_of(payload), config_dir()) {
+            (Some(session), Ok(dir)) => first_note(&dir, agent, &failure.note_key(session)),
+            _ => true,
+        };
     fail_open(agent, payload, note.then_some(reason))
 }
 
@@ -1875,9 +2222,39 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
         Some(reason) => context_reply(
             agent,
             payload,
-            &format!(
-                "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
-            ),
+            &if reason == "hub unreachable" {
+                let mut error = agentscm::hub::error_envelope::ErrorEnvelope::local(
+                    agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+                );
+                error.message = "hub unreachable".into();
+                error.hook_note()
+            } else {
+                use agentscm::hub::error_envelope::{ErrorCode, RecoveryAction, sanitize};
+                // An auto-connect refusal is the Hub's sentence, already cleaned when decoded; it
+                // names the repository, so path redaction would hide the one fact it carries.
+                let reason = if reason.starts_with(AUTO_CONNECT_REFUSED) {
+                    reason.to_owned()
+                } else {
+                    sanitize(reason)
+                };
+                let recovery = match reason.as_str() {
+                    "no token" => ErrorCode::Unauthorized.action(),
+                    "bad reply" => ErrorCode::InvalidResponse.action(),
+                    "payload unreadable" => ErrorCode::InvalidRequest.action(),
+                    _ => RecoveryAction::Reconnect,
+                };
+                let reason = if RecoveryAction::ALL
+                    .iter()
+                    .any(|action| reason.contains(action.sentence()))
+                {
+                    reason
+                } else {
+                    format!("{reason}; {}", recovery.sentence())
+                };
+                format!(
+                    "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
+                )
+            },
         ),
         None => context_reply_with(agent, payload, None),
     }
@@ -1918,6 +2295,106 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_sends_one_redacted_line_of_what_it_asks() {
+        let long = format!(
+            "{}\n\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 is set.\n\nShould I force-push the rebased branch?",
+            "Context. ".repeat(80)
+        );
+        let stop = json!({"hook_event_name":"Stop","session_id":"s","last_assistant_message":long});
+        let sent = sanitized_codex(&stop, Some(&[])).unwrap();
+        let asks = sent["asks"].as_str().unwrap();
+        assert!(asks.starts_with('…'), "{asks}");
+        assert!(
+            asks.ends_with("is set. Should I force-push the rebased branch?"),
+            "{asks}"
+        );
+        assert!(!asks.contains("ghp_abc") && !asks.contains('\n'), "{asks}");
+        assert_eq!(asks.chars().count(), ASKS_CHARS + 1);
+
+        let question = json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion",
+            "tool_input":{"questions":[{"question":"Which cache?"},{"question":"Now?"}]}});
+        assert_eq!(wait_asks(&question).as_deref(), Some("Which cache? Now?"));
+        let prompt = json!({"hook_event_name":"PermissionRequest","tool_name":"Bash",
+            "tool_input":{"command":"git push -f","description":"Force-push the branch"}});
+        assert_eq!(wait_asks(&prompt).as_deref(), Some("Force-push the branch"));
+        // Nothing for a prompt with no description, other events, or a stop background work resumes.
+        for quiet in [
+            json!({"hook_event_name":"PermissionRequest","tool_input":{"command":"x"}}),
+            json!({"hook_event_name":"PostToolUse","last_assistant_message":"x"}),
+            json!({"hook_event_name":"Stop","last_assistant_message":"x","background_tasks":2}),
+            json!({"hook_event_name":"Stop","last_assistant_message":"  "}),
+        ] {
+            assert_eq!(wait_asks(&quiet), None, "{quiet}");
+        }
+    }
+
+    #[test]
+    fn a_wait_sends_only_its_facts_and_its_next_call_is_never_skipped() {
+        let note = json!({"hook_event_name":"Notification","session_id":"s","cwd":"/r",
+            "notification_type":"permission_prompt","title":"t",
+            "message":"Claude needs your permission to use Bash"});
+        assert_eq!(
+            sanitized_codex(&note, Some(&[])).unwrap(),
+            json!({"hook_event_name":"Notification","session_id":"s",
+                "notification_type":"permission_prompt"})
+        );
+        let stop = json!({"hook_event_name":"Stop","session_id":"s",
+            "last_assistant_message":"private","background_tasks":[{"command":"npm test"}]});
+        assert_eq!(
+            sanitized_codex(&stop, Some(&[])).unwrap(),
+            json!({"hook_event_name":"Stop","session_id":"s","background_tasks":1})
+        );
+        let camel = json!({"sessionId":"s","notification_type":"permission_prompt",
+            "message":"m","agentId":"sub"});
+        assert_eq!(
+            sanitized_client("copilot", &camel, &[]).unwrap(),
+            json!({"sessionId":"s","agentId":"sub","notification_type":"permission_prompt"})
+        );
+        let gemini = |v: Value| sanitized_client("gemini", &v, &[]).unwrap();
+        assert_eq!(
+            gemini(json!({"hook_event_name":"Notification","session_id":"s",
+                "notification_type":"ToolPermission","message":"m","details":{"tool":"x"}})),
+            json!({"agent":"gemini","event":"waiting","reason":"permission","session":"s"})
+        );
+        assert_eq!(
+            gemini(json!({"hook_event_name":"AfterAgent","session_id":"s",
+                "prompt":"private","prompt_response":"private"})),
+            json!({"agent":"gemini","event":"waiting","reason":"idle","session":"s"})
+        );
+        // A notification Gemini adds later goes without a reason, which the Hub ignores.
+        assert_eq!(
+            gemini(json!({"hook_event_name":"Notification","session_id":"s",
+                "notification_type":"Other"})),
+            json!({"agent":"gemini","event":"waiting","session":"s"})
+        );
+        assert!(waits("claude", &note) && waits("cursor", &json!({"hook_event_name":"stop"})));
+        assert!(!waits("claude", &json!({"hook_event_name":"stop"})));
+        assert!(waits(
+            "copilot",
+            &json!({"sessionId":"s","stopReason":"end_turn"})
+        ));
+        assert!(!waits(
+            "copilot",
+            &json!({"sessionId":"s","toolName":"bash"})
+        ));
+        // A question shown before the tool runs reaches the Hub, not the activity rate limit.
+        let ask = json!({"hook_event_name":"PreToolUse","session_id":"s",
+            "tool_name":"AskUserQuestion"});
+        assert!(waits("claude", &ask) && activity_key("claude", &ask).is_none());
+        // Each subagent keeps its own activity marker, so a sibling cannot use up its call.
+        let read = |extra: Value| {
+            let mut v = json!({"hook_event_name":"PostToolUse","session_id":"s",
+                "tool_name":"Read"});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            activity_key("claude", &v).unwrap()
+        };
+        assert_eq!(read(json!({})), "activity\0claude\0s");
+        assert_ne!(read(json!({"agent_id":"a"})), read(json!({"agent_id":"b"})));
+    }
 
     #[test]
     fn only_tool_events_that_check_no_edit_are_rate_limited_activity() {
@@ -2838,6 +3315,37 @@ mod tests {
     }
 
     #[test]
+    fn failure_suppression_changes_with_code_and_credential_but_never_hides_startup() {
+        use agentscm::hub::error_envelope::{ErrorCode, ErrorEnvelope};
+        let dir = tempfile::TempDir::new().unwrap();
+        let busy =
+            HookFailure::remote(ErrorEnvelope::local(ErrorCode::Busy), "synthetic-token-one");
+        let rejected = HookFailure::remote(
+            ErrorEnvelope::local(ErrorCode::Unauthorized),
+            "synthetic-token-one",
+        );
+        let renewed =
+            HookFailure::remote(ErrorEnvelope::local(ErrorCode::Busy), "synthetic-token-two");
+        let first =
+            |failure: &HookFailure| first_note(dir.path(), "claude", &failure.note_key("session"));
+        assert!(first(&busy));
+        assert!(!first(&busy));
+        assert!(first(&rejected));
+        assert!(first(&renewed));
+        assert!(!busy.note_key("session").contains("synthetic-token-one"));
+        for source in ["startup", "startup", "resume"] {
+            let payload =
+                json!({"hook_event_name":"SessionStart", "session_id":"session", "source":source});
+            let reply = unknown_failure("claude", &payload, &rejected);
+            let text = reply["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(text.contains("Sign in again"));
+            assert!(!text.contains("ref cor_"));
+        }
+    }
+
+    #[test]
     fn a_repeat_note_is_the_agents_silent_no_op() {
         let pre = event("PreToolUse");
         let note = fail_open("claude", &pre, Some("hub unreachable"));
@@ -3041,6 +3549,30 @@ mod tests {
         let root = parent.join(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn the_start_context_names_the_other_repositories_this_computer_can_reach() {
+        let here = std::env::temp_dir();
+        let current = connection(&here, "acme/widgets");
+        assert_eq!(
+            also_connected(&current, std::slice::from_ref(&current), 100),
+            None
+        );
+        let mut expired = connection(&here, "acme/expired");
+        expired.owned_token_expires_at = Some(100);
+        let mut all = vec![current.clone(), expired, connection(&here, "acme/gadgets")];
+        // A second checkout of a repository does not list it twice.
+        all.push(connection(&here, "acme/gadgets"));
+        let sentence = also_connected(&current, &all, 100).unwrap();
+        assert!(
+            sentence.starts_with("Also connected on this computer: acme/gadgets. "),
+            "{sentence}"
+        );
+        assert!(sentence.contains("`root`"), "{sentence}");
+        all.extend((0..7).map(|n| connection(&here, &format!("acme/more-{n}"))));
+        let sentence = also_connected(&current, &all, 100).unwrap();
+        assert!(sentence.contains("acme/more-4 and 2 more."), "{sentence}");
     }
 
     #[test]
@@ -3576,11 +4108,13 @@ mod tests {
                 let text = out["hookSpecificOutput"]["additionalContext"]
                     .as_str()
                     .unwrap();
-                assert_eq!(
-                    text,
-                    "AgentSCM: coordination unknown (hub unreachable). \
-                     Other agents' work on these files is not visible."
-                );
+                assert_eq!(text, {
+                    let mut error = agentscm::hub::error_envelope::ErrorEnvelope::local(
+                        agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
+                    );
+                    error.message = "hub unreachable".into();
+                    error.hook_note()
+                });
                 assert_eq!(out.as_object().unwrap().len(), 1);
             }
             for other in [
@@ -3617,7 +4151,7 @@ mod tests {
                 reply["additional_context"]
                     .as_str()
                     .unwrap()
-                    .contains("coordination unknown (no token)")
+                    .contains("coordination unknown (no token;")
             );
         }
         assert_eq!(out(&event("sessionEnd")), json!({}));

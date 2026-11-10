@@ -88,9 +88,9 @@ use super::publish::{
     SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
-    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_REQUIRED, SESSION_TTL_SECONDS,
-    STALE_SESSION_SECONDS, SessionCall, SessionEnd, Touched, check, check_name, expiry_cause,
-    guard, held, plan as plan_touch,
+    Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
+    SessionCall, SessionEnd, Touched, check, check_name, expiry_cause, guard, held,
+    plan as plan_touch,
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
@@ -102,16 +102,17 @@ use super::store::{
     plan_local_ci_change, plan_local_ci_enroll, plan_named, search_number, session_key, unix_now,
     validate_display_name, validate_login,
 };
+use super::why::{self, WhyAnswer, WhyPullRequest, WhyRelation, WhySubject};
 use super::work::{
     AUTO_PAUSE_SUMMARY, Briefing, BriefingAck, BriefingQuery, Checkpoint, CheckpointReceipt,
     ClaimStatus, MAX_BRIEFING_BYTES, ReclaimedHold, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
+    WorkConflictKind, WorkEnded, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkReader, WorkRepositoryScope, WorkRole, WorkScopeCheck,
     WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
     WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
-    claim_status, fit_json_budget, normalized_scope, scope_overlap_reasons, uncovered_scope,
-    work_overlap_pairs, work_payload_row_bytes,
+    claim_status, delivery_cuts, fit_json_budget, normalized_scope, scope_overlap_reasons,
+    uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
 };
 use super::work_lifecycle::{
     CallPhase, IN_FLIGHT_CAP_SECONDS, LEASE_SECONDS, Lease, OperationalRow, OutcomeFact,
@@ -138,6 +139,7 @@ use crate::local_ci::DeviceAuthorization;
 
 mod preflight;
 mod repository_rename;
+mod validation_evidence;
 
 fn require_clear_preflight(
     who: &WorkWho,
@@ -299,7 +301,7 @@ impl Drop for PgStore {
             Ok(thread) => {
                 let _ = thread.join();
             }
-            Err(error) => eprintln!("hub: postgres client not closed: {error}"),
+            Err(error) => crate::hub::error_envelope::log_internal(&error),
         }
     }
 }
@@ -1036,6 +1038,20 @@ fn pg_record_catchup_merge(
             &key,
             &(seq + 1),
             &observed_at,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_catchup_pull_commits
+            (provider,host,repository,repository_key,pull_number,head_commit,merge_commit)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &merge.pull_number,
+            &merge.head_commit,
+            &merge.merge_commit,
         ],
     )?;
     let merged_at = merge.occurred_at.unwrap_or(observed_at);
@@ -2568,6 +2584,26 @@ fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
     Ok(event)
 }
 
+/// Keeps `item`'s current decision checkpoint for `why` and search, and at most the newest
+/// [`why::MAX_WORK_DECISIONS`] of its Work.
+fn record_decision(tx: &mut postgres::Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+    let Some(decision) = &item.current else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO hub_work_decisions (work, event_seq, summary, checkpoint)
+         VALUES ($1, $2, $3, $4)",
+        &[&item.id, &seq, &decision.summary, &json_string(decision)?],
+    )?;
+    tx.execute(
+        "DELETE FROM hub_work_decisions WHERE work = $1 AND event_seq <= (
+             SELECT event_seq FROM hub_work_decisions WHERE work = $1
+             ORDER BY event_seq DESC LIMIT 1 OFFSET $2)",
+        &[&item.id, &why::MAX_WORK_DECISIONS],
+    )?;
+    Ok(())
+}
+
 /// Returns the stored snapshot so callers can size it without serializing the item again.
 fn save_work_version(
     tx: &mut postgres::Transaction<'_>,
@@ -3208,6 +3244,23 @@ fn unfinished_for_session(
             Ok(item)
         })
         .transpose()
+}
+
+/// The title of the unfinished Work this session leads that was updated last.
+fn lead_title(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    session: &str,
+) -> Result<Option<String>> {
+    Ok(tx
+        .query_opt(
+            "SELECT title FROM hub_work_items
+             WHERE lead_token = $1 AND lead_session = $2
+               AND state IN ('active', 'paused', 'blocked')
+             ORDER BY updated_at DESC, id LIMIT 1",
+            &[&token, &session],
+        )?
+        .map(|row| row.get(0)))
 }
 
 /// The paused Work this session leads that was updated last.
@@ -4300,8 +4353,10 @@ fn start_in(
             if !work_holds_reservation(tx, &item.id)?
                 && let Some(refusal) = lapsed_hold_refusal(tx, who, &start.session, Some(&item.id))?
             {
-                return Err(HubError::Invalid(refusal));
+                return Err(HubError::lease_lapsed(refusal));
             }
+            // The description is set when the Work is created; a later start's is not compared, so a lead
+            // resuming Work made before descriptions existed is not refused for adding one.
             if item.title != start.title
                 || item.scope != scope
                 || item.branch != start.branch
@@ -4339,8 +4394,9 @@ fn start_in(
                 && let Some((renewed, expired)) = lapsed_at(tx, &item.id, now)?
             {
                 if !named {
-                    return Err(HubError::Invalid(lapsed_unheld_text(
+                    return Err(HubError::lease_lapsed(lapsed_unheld_text(
                         &item.id,
+                        item.generation,
                         renewed,
                         expired,
                         Unheld::UnnamedStart,
@@ -4681,6 +4737,7 @@ fn start_in(
         owner_login: who.owner.login.clone(),
         source,
         title: start.title.clone(),
+        description: start.description.clone(),
         state: WorkState::Active,
         claim_status: ClaimStatus::Active,
         last_checkin_at: now,
@@ -5346,7 +5403,7 @@ fn announce_in(
             )?;
             append(tx, &Event::intent_renewed(&intent.id, expires_at)?)?;
         }
-        Plan::Write { .. } => {
+        Plan::Write { announce, .. } => {
             let written = tx.execute(
                 "INSERT INTO hub_intents (id, repository, token, task, branch, base, machine,
                      paths, expires_at, created_at, updated_at)
@@ -5382,16 +5439,18 @@ fn announce_in(
                  SELECT $1, $2, unnest($3::text[]), $4::bigint",
                 &[&intent.id, &who.repository, &keys, &expires_at],
             )?;
-            append(
-                tx,
-                &Event::intent_announced(who, intent, &paths, expires_at)?,
-            )?;
+            let event = if *announce {
+                Event::intent_announced(who, intent, &paths, expires_at)?
+            } else {
+                Event::intent_paths_changed(&intent.id, &paths, expires_at)?
+            };
+            append(tx, &event)?;
         }
     }
     ids.insert(intent.id.clone());
     let ids: Vec<String> = ids.into_iter().collect();
     let announced = announced(&intent.id, keys, load_intents(tx, &ids)?)?;
-    if let Plan::Write { previous } = &plan {
+    if let Plan::Write { previous, .. } = &plan {
         append_all(
             tx,
             &notice_events(who, intent, (session, via), previous, &announced)?,
@@ -5615,7 +5674,7 @@ fn session_name(
     match kept.as_slice() {
         [] => Ok(DEFAULT_SESSION.to_owned()),
         [only] if only.get::<_, bool>(1) => Ok(only.get(0)),
-        _ => Err(HubError::Invalid(SESSION_REQUIRED.into())),
+        _ => Err(HubError::session_required()),
     }
 }
 
@@ -5758,14 +5817,15 @@ fn guard_managed_touch(
     }
     if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
         if let Some(refusal) = lapsed_hold_refusal(tx, who, name, None)? {
-            return Err(HubError::Invalid(refusal));
+            return Err(HubError::lease_lapsed(refusal));
         }
         return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
     }
     // A lapsed lease no longer holds the scope, so editing under it needs fresh admission first.
     if let Some((renewed, expired)) = lapsed_at(tx, &eligible[0].id, now)? {
-        return Err(HubError::Invalid(lapsed_unheld_text(
+        return Err(HubError::lease_lapsed(lapsed_unheld_text(
             &eligible[0].id,
+            eligible[0].generation,
             renewed,
             expired,
             Unheld::Edit,
@@ -5888,6 +5948,17 @@ fn touch_in(
             row = session_row(tx, token, &name)?;
         }
     }
+    // The row's task goes with the row (a session end, a prune); the Work it leads keeps its title.
+    let led;
+    let call = if call.task.is_none() && row.as_ref().is_none_or(|row| row.task.is_none()) {
+        led = Checked {
+            task: lead_title(tx, token, &name)?,
+            ..call.clone()
+        };
+        &led
+    } else {
+        call
+    };
     let (current, lapsed) = match row.as_ref().and_then(|row| row.intent.as_deref()) {
         Some(id) => tx
             .query_opt(
@@ -6157,7 +6228,7 @@ fn auto_ask(
             Ok(Asked::Requested { holder }) => requested.push((key.clone(), holder)),
             Ok(_) => {}
             Err(error) => {
-                eprintln!("hub: handoff request for a refused edit: {error}");
+                crate::hub::error_envelope::log_internal(&error);
                 let _ = tx.batch_execute("ROLLBACK TO auto_ask; RELEASE auto_ask");
             }
         }
@@ -6815,14 +6886,21 @@ impl PgStore {
 
             let mut recent = tx
                 .query(
-                    "SELECT v.event_seq, e.at, v.snapshot FROM hub_work_versions v
+                    "SELECT v.event_seq, e.at, v.snapshot, e.kind, e.data FROM hub_work_versions v
                      JOIN hub_work_items w ON w.id = v.work
                      JOIN hub_events e ON e.seq = v.event_seq
                      WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                        AND w.repository_id IS NOT DISTINCT FROM $4
                        AND e.at >= $5 AND e.at <= $6
-                       AND e.kind = 'work_checkpoint'
-                       AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish')
+                       AND ((e.kind = 'work_checkpoint'
+                             AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish'))
+                            OR (e.kind = 'work_transition' AND v.state = 'finished'))
+                       AND NOT (EXISTS (
+                           SELECT 1 FROM hub_work_versions v2 JOIN hub_events e2 ON e2.seq = v2.event_seq
+                           WHERE v2.work = v.work AND v2.event_seq > v.event_seq AND v2.state = 'finished'
+                             AND e2.at <= $6
+                             AND (e2.kind = 'work_transition'
+                                  OR v2.snapshot::jsonb #>> '{current,kind}' = 'finish')))
                      ORDER BY v.event_seq DESC LIMIT $7",
                     &[
                         &who.owner.identity.provider,
@@ -6847,6 +6925,11 @@ impl PgStore {
                         at: row.get(1),
                         kind,
                         item,
+                        ended: WorkEnded::from_event(
+                            &row.get::<_, String>(3),
+                            &row.get::<_, String>(4),
+                            row.get(1),
+                        ),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -6957,7 +7040,7 @@ fn work_checkpoint_in(
     let carry = match lead_access(&item, &who.owner.id, token, &who.agent, &checkpoint.session) {
         LeadAccess::Current => false,
         LeadAccess::Carry => true,
-        LeadAccess::Refuse { message } => return Err(HubError::Invalid(message)),
+        LeadAccess::Refuse { message } => return Err(HubError::lead_session_mismatch(message)),
     };
     let prior_basis = work_reservation_basis(tx, &item.id)?;
     let held = prior_basis.is_some();
@@ -7123,6 +7206,9 @@ fn work_checkpoint_in(
     let seq = append(tx, &event)?;
     item.updated_seq = seq;
     let snapshot = save_work_version(tx, &item, seq)?;
+    if checkpoint.kind == super::work::CheckpointKind::Decision {
+        record_decision(tx, &item, seq)?;
+    }
     match checkpoint.kind {
         super::work::CheckpointKind::Finish => {
             set_work_reservation(tx, &item.id, Some("completed"), None, now)?;
@@ -7177,6 +7263,85 @@ fn work_checkpoint_in(
 }
 
 impl Store for PgStore {
+    fn configure_validation_summary(
+        &self,
+        config: &super::validation_evidence::ValidationSummaryConfig,
+    ) -> Result<()> {
+        validation_evidence::configure(self, config)
+    }
+    fn validation_summary_config(
+        &self,
+        repository: &str,
+    ) -> Result<Option<super::validation_evidence::ValidationSummaryConfig>> {
+        validation_evidence::config(self, repository)
+    }
+    fn receive_validation_evidence(
+        &self,
+        token: &str,
+        proposal: i64,
+        bundle: &super::validation_evidence::DurableValidationBundle,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidenceReceipt> {
+        validation_evidence::receive(self, token, proposal, bundle, now)
+    }
+    fn validation_evidence_history(
+        &self,
+        token: &str,
+        repository: &str,
+        proposal: i64,
+        after: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidencePage> {
+        validation_evidence::history(self, token, repository, proposal, after, limit, now)
+    }
+    fn validation_snapshot(
+        &self,
+        repository: &str,
+        proposal: i64,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationSnapshot> {
+        validation_evidence::snapshot(self, repository, proposal, limit)
+    }
+    fn validation_fence(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<super::validation_evidence::ValidationFence> {
+        validation_evidence::fence(self, repository, proposal)
+    }
+    fn validation_publication_proposals(
+        &self,
+        repository: &str,
+        after: i64,
+        through: Option<i64>,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationProposalPage> {
+        validation_evidence::publication_proposals(self, repository, after, through, limit)
+    }
+    fn validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<Option<super::validation_evidence::ValidationPublication>> {
+        validation_evidence::publication(self, repository, proposal)
+    }
+    fn compare_validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+        expected_revision: i64,
+        next: &super::validation_evidence::ValidationPublication,
+    ) -> Result<bool> {
+        validation_evidence::compare_publication(
+            self,
+            repository,
+            proposal,
+            expected_revision,
+            next,
+        )
+    }
+
     fn backend(&self) -> &'static str {
         "postgres"
     }
@@ -10494,7 +10659,7 @@ impl Store for PgStore {
             if request.transition == work_transition::WorkTransitionKind::Retain
                 && let Some((renewed, expired)) = lapsed_at(&mut tx, &item.id, now)?
             {
-                return Err(HubError::Invalid(lapsed_unheld_text(&item.id, renewed, expired, Unheld::Retain)));
+                return Err(HubError::lease_lapsed(lapsed_unheld_text(&item.id,item.generation, renewed, expired, Unheld::Retain)));
             }
             if let Some(by) = &request.superseded_by {
                 relation_targets(&mut tx, &who, std::slice::from_ref(by))?;
@@ -11226,6 +11391,43 @@ impl Store for PgStore {
         })
     }
 
+    fn work_pr_target_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<work_links::WorkPrLinkTarget>> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = match reader {
+                WorkLifecycleReader::Token(token) => work_who(&mut tx, token, now)?,
+                WorkLifecycleReader::Person {
+                    owner,
+                    repository,
+                    repository_id,
+                } => {
+                    if owner.disabled {
+                        return Err(HubError::Unauthorized);
+                    }
+                    work_transition::person_who(owner, repository, *repository_id)
+                }
+            };
+            if scoped_work(&mut tx, &who, id, now, false)?.is_none() {
+                return Ok(None);
+            }
+            let target = tx
+                .query_opt(
+                    "SELECT snapshot FROM hub_work_pr_links WHERE work=$1",
+                    &[&id],
+                )?
+                .map(|row| json_value::<WorkPrLink>(&row.get::<_, String>(0)))
+                .transpose()?
+                .map(|link| link.target);
+            tx.commit()?;
+            Ok(target)
+        })
+    }
+
     fn work_pr_link_set(
         &self,
         token: &str,
@@ -11305,11 +11507,18 @@ impl Store for PgStore {
             let snapshot = save_work_version(&mut tx, &item, seq)?;
             let link = work_links::asserted_link(&who, update, seq, now);
             let new_link = link.as_ref().map(json_string).transpose()?;
-            if let Some(snapshot) = &new_link {
+            if let (Some(snapshot), Some(link)) = (&new_link, &link) {
                 tx.execute(
-                    "INSERT INTO hub_work_pr_links (work,snapshot) VALUES ($1,$2)
-                            ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot",
-                    &[&item.id, snapshot],
+                    "INSERT INTO hub_work_pr_links (work,snapshot,number,head_sha)
+                            VALUES ($1,$2,$3,$4)
+                            ON CONFLICT(work) DO UPDATE SET snapshot=excluded.snapshot,
+                            number=excluded.number,head_sha=excluded.head_sha",
+                    &[
+                        &item.id,
+                        snapshot,
+                        &link.target.number,
+                        &link.target.head_sha,
+                    ],
                 )?;
             } else {
                 tx.execute("DELETE FROM hub_work_pr_links WHERE work=$1", &[&item.id])?;
@@ -11399,7 +11608,9 @@ impl Store for PgStore {
                    AND ($7::text IS NULL OR w.source_issue = $8::text
                      OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
                      OR ((lt.owner = $10 OR w.lead_agent NOT LIKE 'client-%') AND w.lead_agent ILIKE $7 ESCAPE '\\') OR u.login ILIKE $7 ESCAPE '\\'
-                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
+                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\'
+                     OR EXISTS (SELECT 1 FROM hub_work_decisions d
+                       WHERE d.work = w.id AND d.summary ILIKE $7 ESCAPE '\\'))
                  ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
                 &[
                     &who.owner.identity.provider,
@@ -11430,6 +11641,148 @@ impl Store for PgStore {
                 .collect();
             tx.commit()?;
             Ok(WorkSearchPage::of(items, limit))
+        })
+    }
+
+    fn work_why(&self, token: &str, subject: &WhySubject, now: i64) -> Result<WhyAnswer> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let (provider, host) = (&who.owner.identity.provider, &who.owner.identity.host);
+            let mut pulls = Vec::new();
+            let more = (why::WHY_WORK + 1) as i64;
+            let mut unscanned = false;
+            // (Work id, pull request), newest Work first.
+            let matches: Vec<(String, Option<i64>)> = match subject {
+                WhySubject::Commit(commit) => {
+                    for row in tx.query(
+                        "SELECT pull_number, head_commit, merge_commit FROM hub_catchup_pull_commits
+                         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+                           AND (merge_commit=$5 OR head_commit=$5)
+                         ORDER BY pull_number DESC LIMIT $6",
+                        &[
+                            provider,
+                            host,
+                            &repository_namespace(&who.repository, who.repository_id),
+                            &catchup_repository_key(who.repository_id),
+                            commit,
+                            &(why::WHY_PULLS as i64),
+                        ],
+                    )? {
+                        why::add_pull(
+                            &mut pulls,
+                            WhyPullRequest {
+                                number: row.get(0),
+                                head_commit: Some(row.get(1)),
+                                merge_commit: Some(row.get(2)),
+                            },
+                        );
+                    }
+                    let numbers = pulls.iter().map(|p| p.number).collect::<Vec<i64>>();
+                    tx.query(
+                        "SELECT w.id, l.number, l.head_sha
+                         FROM hub_work_pr_links l JOIN hub_work_items w ON w.id = l.work
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4
+                           AND (l.head_sha = $5 OR l.number = ANY($6))
+                         ORDER BY w.created_at DESC, w.id DESC LIMIT $7",
+                        &[
+                            provider,
+                            host,
+                            &who.repository,
+                            &who.repository_id,
+                            commit,
+                            &numbers,
+                            &more,
+                        ],
+                    )?
+                    .into_iter()
+                    .map(|row| {
+                        let (id, number, head): (String, i64, String) =
+                            (row.get(0), row.get(1), row.get(2));
+                        if head == *commit {
+                            why::add_pull(
+                                &mut pulls,
+                                WhyPullRequest {
+                                    number,
+                                    head_commit: Some(head),
+                                    merge_commit: None,
+                                },
+                            );
+                        }
+                        (id, Some(number))
+                    })
+                    .collect()
+                }
+                WhySubject::Path(path) => {
+                    // Only the newest WHY_SCAN Work are scanned; older ones leave the answer cut.
+                    unscanned = tx
+                        .query_one(
+                            "SELECT EXISTS (SELECT 1 FROM hub_work_items
+                             WHERE provider = $1 AND host = $2 AND repository = $3
+                               AND repository_id IS NOT DISTINCT FROM $4
+                             ORDER BY created_at DESC, id DESC LIMIT 1 OFFSET $5)",
+                            &[
+                                provider,
+                                host,
+                                &who.repository,
+                                &who.repository_id,
+                                &(why::WHY_SCAN as i64),
+                            ],
+                        )?
+                        .get(0);
+                    tx.query(
+                        "SELECT w.id FROM (SELECT id, scope, created_at FROM hub_work_items
+                             WHERE provider = $1 AND host = $2 AND repository = $3
+                               AND repository_id IS NOT DISTINCT FROM $4
+                             ORDER BY created_at DESC, id DESC LIMIT $7) w
+                         WHERE EXISTS (SELECT 1 FROM unnest($5::text[]) c WHERE strpos(w.scope, c) > 0)
+                         ORDER BY w.created_at DESC, w.id DESC LIMIT $6",
+                        &[
+                            provider,
+                            host,
+                            &who.repository,
+                            &who.repository_id,
+                            &why::covering_scope_entries(path),
+                            &more,
+                            &(why::WHY_SCAN as i64),
+                        ],
+                    )?
+                    .into_iter()
+                    .map(|row| (row.get(0), None))
+                    .collect()
+                }
+            };
+            let relation = match subject {
+                WhySubject::Commit(_) => WhyRelation::PullRequest,
+                WhySubject::Path(_) => WhyRelation::Scope,
+            };
+            let mut work = Vec::new();
+            for (id, pull_number) in matches {
+                let Some(item) = scoped_work(&mut tx, &who, &id, now, false)? else {
+                    continue;
+                };
+                let decisions = tx
+                    .query(
+                        "SELECT event_seq, checkpoint FROM hub_work_decisions WHERE work = $1
+                         ORDER BY event_seq DESC LIMIT $2",
+                        &[&id, &((why::WHY_DECISIONS + 1) as i64)],
+                    )?
+                    .into_iter()
+                    .map(|row| Ok((row.get(0), json_value(row.get::<_, &str>(1))?)))
+                    .collect::<Result<Vec<_>>>()?;
+                work.push(why::work(
+                    why::WhyWorkFacts {
+                        item,
+                        relation,
+                        pull_number,
+                        decisions,
+                    },
+                    super::viewer::Viewer(&who.owner.id),
+                ));
+            }
+            tx.commit()?;
+            Ok(why::answer(subject, pulls, work, unscanned))
         })
     }
 
@@ -13004,40 +13357,6 @@ impl Store for PgStore {
                 scope.repository_id,
             )?;
             let catchup_repository=repository_namespace(&scope.repository,scope.repository_id);
-            let active_deliveries: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM hub_work_deliveries
-                     WHERE provider = $1 AND host = $2 AND repository = $3
-                       AND repository_id IS NOT DISTINCT FROM $4
-                       AND NOT acknowledged AND updated_at >= $5",
-                    &[
-                        &scope.provider,
-                        &scope.host,
-                        &scope.repository,
-                        &scope.repository_id,
-                        &now.saturating_sub(86_400),
-                    ],
-                )?
-                .get(0);
-            if active_deliveries > 0 {
-                return Err(HubError::Invalid(
-                    "work compaction is blocked by an unacknowledged briefing delivery".into(),
-                ));
-            }
-            let active_catchup_deliveries: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM hub_catchup_deliveries
-                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
-                       AND NOT acknowledged AND NOT superseded AND updated_at>=$5",
-                    &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,
-                        &now.saturating_sub(86_400)],
-                )?
-                .get(0);
-            if active_catchup_deliveries > 0 {
-                return Err(HubError::Invalid(
-                    "work compaction is blocked by an unacknowledged catch-up delivery".into(),
-                ));
-            }
             let(current_merge_floor,merge_highwater)=tx.query_opt(
                 "SELECT merge_floor_seq,next_merge_seq-1 FROM hub_catchup_repositories
                  WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)",
@@ -13185,6 +13504,24 @@ impl Store for PgStore {
                         AND repository=$3 AND repository_key=COALESCE($4::bigint,-1) AND seq<=$5",
                         &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,&merge_retention_floor])?;
                 }
+                // The copy of which pull request a commit belongs to is bounded like the merge
+                // observations it comes from: the lowest pull request numbers go first.
+                tx.execute(
+                    "DELETE FROM hub_catchup_pull_commits
+                     WHERE provider=$1 AND host=$2 AND repository=$3
+                       AND repository_key=COALESCE($4::bigint,-1)
+                       AND pull_number <= (SELECT pull_number FROM hub_catchup_pull_commits
+                           WHERE provider=$1 AND host=$2 AND repository=$3
+                             AND repository_key=COALESCE($4::bigint,-1)
+                           ORDER BY pull_number DESC LIMIT 1 OFFSET $5)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &catchup_repository,
+                        &scope.repository_id,
+                        &MAX_CATCHUP_MERGE_ROWS,
+                    ],
+                )?;
                 tx.execute(
                     "DELETE FROM hub_work_deliveries
                      WHERE provider = $1 AND host = $2 AND repository = $3
@@ -13363,6 +13700,44 @@ impl Store for PgStore {
                         )?;
                     }
                 }
+                // An open delivery pages the live tables, so one whose window starts below a raised
+                // floor would skip removed records; end it, and the agent's next read reports the gap.
+                let (event_cut, merge_cut) = delivery_cuts(
+                    [
+                        current_event_floor,
+                        current_snapshot_floor,
+                        current_coordination_floor,
+                    ],
+                    [event_floor, retention_floor, coordination_floor],
+                    current_merge_floor,
+                    merge_retention_floor,
+                );
+                tx.execute(
+                    "DELETE FROM hub_work_deliveries
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4
+                       AND NOT acknowledged AND from_seq < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &event_cut,
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM hub_catchup_deliveries
+                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
+                       AND NOT acknowledged AND (event_from<$5 OR merge_from<$6)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &catchup_repository,
+                        &scope.repository_id,
+                        &event_cut,
+                        &merge_cut,
+                    ],
+                )?;
                 let charged = work_payload_bytes(
                     &mut tx,
                     &scope.provider,
