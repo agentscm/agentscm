@@ -1985,13 +1985,17 @@ fn value_capture_diagnostics_and_unsupported_outcomes(db: &Db) {
     );
     let wire = serde_json::to_value(browser).unwrap();
     for path in [
-        "/issues/dismissed",
         "/issues/false_trigger",
         "/followups/failed",
         "/followups/cancelled",
     ] {
         assert!(wire.pointer(path).unwrap().is_null());
     }
+    // Contested edits pushed through are observed, so none is a counted zero, not unknown.
+    assert_eq!(
+        wire.pointer("/issues/dismissed"),
+        Some(&serde_json::json!(0))
+    );
     value_metrics::observe(&*store, "unknown-token", &invalid, now);
     let unknown = store
         .value_metrics(&unrelated.token, &Default::default(), now)

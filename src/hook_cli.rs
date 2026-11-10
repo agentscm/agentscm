@@ -255,6 +255,12 @@ async fn coordinate(
     let remaining = deadline.saturating_duration_since(Instant::now());
     let activity = std::sync::Arc::new(ActivityTracker::new(agent));
     let local_note = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let measured = Instant::now();
+    let report = crate::hook_report::Pending::load(
+        config_dir().ok().as_deref(),
+        agent,
+        session_of(&payload),
+    );
     let mut call = tokio::spawn(call_hub(
         agent.to_owned(),
         flag_url,
@@ -267,9 +273,21 @@ async fn coordinate(
             activity_tracker: activity.clone(),
             local_note: local_note.clone(),
             deadline,
+            report: report.header(),
         },
     ));
-    let reply = match tokio::time::timeout(remaining, &mut call).await {
+    let result = tokio::time::timeout(remaining, &mut call).await;
+    let sent = match &result {
+        Ok(Ok(Ok(_))) => Some(crate::hook_report::Sent::Answered),
+        // Routing failed before a token was found: no Hub call was made.
+        Ok(Ok(Err(failure))) if failure.token_marker.is_none() => None,
+        Err(_) => Some(crate::hook_report::Sent::TimedOut),
+        _ => Some(crate::hook_report::Sent::FailedOpen),
+    };
+    if let Some(sent) = sent {
+        report.settle(measured.elapsed(), sent);
+    }
+    let reply = match result {
         Ok(Ok(Ok(reply))) => reply,
         Ok(Ok(Err(reason))) => unknown_failure(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
@@ -348,6 +366,7 @@ struct HubCallContext {
     activity_tracker: std::sync::Arc<ActivityTracker>,
     local_note: LocalObservation,
     deadline: Instant,
+    report: Option<String>,
 }
 
 async fn call_hub(
@@ -364,6 +383,7 @@ async fn call_hub(
         activity_tracker,
         local_note,
         deadline,
+        report,
     } = context;
     let supported_client = matches!(
         agent.as_str(),
@@ -496,6 +516,7 @@ async fn call_hub(
         token: token.clone(),
         root: root.as_deref().and_then(Path::to_str).map(str::to_owned),
         report_completion,
+        report,
         body: outbound_body,
     };
     // Legacy hooks also use the relay: its key binds the Hub/config, and framing preserves raw JSON.
@@ -3970,6 +3991,7 @@ mod tests {
             root: None,
             client: None,
             report_completion: false,
+            report: None,
             body: serde_json::to_vec(&routed.payload).unwrap(),
         }
         .request(&reqwest::Client::new(), "https://hub.example.test")

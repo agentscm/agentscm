@@ -933,6 +933,12 @@ id; their intents write the usual intent events. `GET /v1/hub/health` adds
 "hook_p95_ms"}`, counted by this hub process since it started (p95 over the
 last 1024 hook calls). Session rows untouched for 7 days are pruned.
 
+Each refusal and overlap notice is also kept in `hub_contested_edits` with the outcome the Hub
+later observes, and each session's hook calls, injected characters and the hook client's own
+latency, timeout and fail-open counts (sent with its next call in `x-agentscm-hook-report`) in
+`hub_hook_overhead`. Both keep rows 30 days, at most 20,000 per repository, and are read by
+[value metrics](work-insights.md#contested-edits-and-hook-overhead).
+
 ## Change-record capture and handoff
 
 The experimental Unix capture client adds a separate Claude Code hook set after a checkout has an

@@ -1153,6 +1153,15 @@ pub trait Store: Send + Sync {
         observation: &super::value_metrics::ValueObservation,
         now: i64,
     ) -> Result<()>;
+    /// Adds one hook call to its session's overhead row, for an authenticated token of
+    /// `repository`; rows are bounded by age and count per repository (see `hook_overhead`).
+    fn hook_overhead(
+        &self,
+        token: &str,
+        repository: &str,
+        sample: &super::hook_overhead::Sample,
+        now: i64,
+    ) -> Result<()>;
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;

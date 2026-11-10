@@ -72,6 +72,9 @@ pub struct IssueMetrics {
     pub resolved: usize,
     pub dismissed: Option<usize>,
     pub false_trigger: Option<usize>,
+    /// Contested-edit refusals and overlap notices by observed outcome; also counted above.
+    #[serde(default)]
+    pub contested_edits: super::refusal_outcomes::ContestedMetrics,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FollowupMetrics {
@@ -159,6 +162,9 @@ pub struct ValueMetrics {
     pub linked_merge: Option<ValueEvidence>,
     pub next_after: Option<String>,
     pub merge_observations: usize,
+    /// Hook calls, client-measured latency, timeouts, fail-open answers and injected characters.
+    #[serde(default)]
+    pub overhead: super::hook_overhead::OverheadMetrics,
 }
 
 /// Produced only by existing admission/evidence paths, never accepted from a public metrics API.
@@ -263,6 +269,10 @@ pub struct ValueFacts {
     pub request_membership_complete: bool,
     pub delivery_pruned_range: Option<(i64, i64)>,
     pub context_population: String,
+    pub contested: Vec<super::refusal_outcomes::Observed>,
+    pub contested_complete: bool,
+    pub overhead: Vec<super::hook_overhead::SessionOverhead>,
+    pub overhead_complete: bool,
 }
 
 pub fn identity(parts: &[&str]) -> String {
@@ -371,10 +381,10 @@ pub fn project(
     let mut complete = true;
     let mut gaps = BTreeSet::from([
         "capture is partial; zero observations do not establish zero problems".to_owned(),
-        "AgentSCM overhead and total eligible provider requests are unknown".to_owned(),
+        "AgentSCM's token overhead and total eligible provider requests are unknown; hook overhead is counted in calls, client-measured latency and injected characters".to_owned(),
         "Observation capture failure diagnostics are process-local and do not establish capture completeness across Hub restarts".to_owned(),
         "context returned means a response was prepared; transport receipt and application are not observed".to_owned(),
-        "Issue dismissals/false triggers and failed/cancelled follow-up outcomes are not captured by supported producers".to_owned(),
+        "Issue false triggers and failed/cancelled follow-up outcomes are not captured by supported producers; dismissals count only contested edits an agent pushed through".to_owned(),
     ]);
     let mut requests: BTreeMap<String, RequestMeasurements> = BTreeMap::new();
     let mut unallocated_usage_records = 0;
@@ -383,8 +393,16 @@ pub fn project(
     let mut watermark = Vec::new();
     let mut merges = BTreeSet::new();
     let mut membership_complete = true;
+    let mut contested = super::refusal_outcomes::ContestedMetrics::default();
+    let mut contested_complete = true;
+    let mut overhead = super::hook_overhead::OverheadMetrics::default();
+    let mut overhead_complete = true;
     for fact in facts {
         complete &= fact.complete;
+        contested.add(&fact.contested);
+        contested_complete &= fact.contested_complete;
+        overhead.add(&fact.overhead);
+        overhead_complete &= fact.overhead_complete;
         membership_complete &= fact.request_membership_complete;
         for (request, works) in fact.request_membership {
             request_works.entry(request).or_default().extend(works);
@@ -966,6 +984,36 @@ pub fn project(
         "unknown"
     }
     .into();
+    // Contested edits and hook overhead are recorded per session, never per Work.
+    if query.work_id.is_some() {
+        contested = super::refusal_outcomes::ContestedMetrics {
+            availability: "not_scoped_to_work".into(),
+            ..Default::default()
+        };
+        overhead = super::hook_overhead::OverheadMetrics {
+            availability: "not_scoped_to_work".into(),
+            ..Default::default()
+        };
+    } else {
+        issues.unresolved += contested.unresolved();
+        issues.resolved += contested.resolved();
+        issues.dismissed = Some(contested.dismissed());
+        contested.partial = !contested_complete;
+        overhead.partial = !overhead_complete;
+        if !contested_complete {
+            gaps.insert("Contested-edit records for this window were pruned by age or count, or exceeded the read limit; their counts are partial".into());
+        }
+        if !overhead_complete {
+            gaps.insert("Hook overhead records for this window were pruned by age or count, or exceeded the read limit; their counts are partial".into());
+        }
+        if overhead.sessions > 0 {
+            gaps.insert("Hook overhead counts whole sessions active in the window, including their calls outside it".into());
+        }
+        if overhead.sessions_without_client_report > 0 {
+            gaps.insert("Some sessions' hook clients sent no measurement; their latency, timeouts and fail-open answers are unknown".into());
+        }
+    }
+    issues.contested_edits = contested;
     issues.availability = if issues.unresolved + issues.resolved > 0 {
         "partial"
     } else {
@@ -1100,6 +1148,7 @@ pub fn project(
         linked_merge,
         next_after,
         merge_observations: merges.len(),
+        overhead,
     })
 }
 
@@ -1239,7 +1288,54 @@ mod tests {
             request_membership_complete: true,
             delivery_pruned_range: None,
             context_population: "calling repository token's structured catch-up deliveries".into(),
+            contested: vec![],
+            contested_complete: true,
+            overhead: vec![],
+            overhead_complete: true,
         }
+    }
+    #[test]
+    fn contested_edits_feed_issue_totals_and_overhead_is_reported_unless_one_work_is_asked() {
+        use super::super::hook_overhead::SessionOverhead;
+        use super::super::refusal_outcomes::observed;
+        let mut f = facts();
+        f.contested = vec![
+            observed("refusal", "pushed_through".into(), 10, true, true).unwrap(),
+            observed("refusal", "pending".into(), 11, false, true).unwrap(),
+            observed("notice", "pending".into(), 12, true, true).unwrap(),
+        ];
+        f.overhead = vec![SessionOverhead {
+            session: "s".into(),
+            agent: "claude".into(),
+            hub_calls: 13,
+            client_calls: 61,
+            client_timeouts: 48,
+            client_ms_total: 1000,
+            client_ms_max: 100,
+            ..Default::default()
+        }];
+        f.contested_complete = false;
+        let all = ValueMetricsQuery {
+            since: Some(0),
+            until: Some(100),
+            ..Default::default()
+        };
+        let p = project(vec![f.clone()], &all, 100).unwrap();
+        assert_eq!(p.issues.contested_edits.refusals.observed, 2);
+        assert_eq!(p.issues.contested_edits.refusals.went_elsewhere, 1);
+        assert_eq!(p.issues.dismissed, Some(1));
+        assert_eq!((p.issues.resolved, p.issues.unresolved), (1, 1));
+        assert!(p.issues.contested_edits.partial);
+        assert_eq!(p.overhead.client.timed_out, 48);
+        assert_eq!(p.overhead.hub_calls, 13);
+        let one = ValueMetricsQuery {
+            work_id: Some("wrk_0123456789abcdef0123456789abcdef".into()),
+            ..all
+        };
+        let p = project(vec![f], &one, 100).unwrap();
+        assert_eq!(p.issues.contested_edits.availability, "not_scoped_to_work");
+        assert_eq!(p.overhead.availability, "not_scoped_to_work");
+        assert_eq!(p.issues.dismissed, None);
     }
     fn usage(work: &str, owner: &str, id: &str) -> ValueUsage {
         ValueUsage {
