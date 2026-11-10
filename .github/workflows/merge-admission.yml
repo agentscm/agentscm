@@ -6,19 +6,47 @@ on:
   workflow_run: # zizmor: ignore[dangerous-triggers] API results only; never downloads candidate artifacts
     # CI completion re-evaluates admission, so a queued pull request enters once static and tests pass.
     workflows: [Local validation verifier, Conventional PR title, CI]
-    types: [requested, in_progress, completed]
+    # Only a completion can change an outcome; a start would only reset gates it cannot judge yet.
+    types: [completed]
 
 permissions: {}
 
 jobs:
-  admission:
-    # A CI start is skipped: the pull request's own event already set its head pending. A newer pending
-    # run replaces an older one in a group, and the docs do not say whether a job skipped by `if` joins
-    # it, so a skipped CI start gets a group of its own and can never displace a queued sweep. CI runs
-    # on push to main or on schedule cannot change any pull request's checks, so they are skipped too.
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.name != 'CI' || (github.event.action == 'completed' && github.event.workflow_run.event != 'push' && github.event.workflow_run.event != 'schedule') }}
+  pending:
+    # A pull request's own event only marks its current head pending, in a group per pull request.
+    if: ${{ github.event_name == 'pull_request_target' }}
     concurrency:
-      group: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI' && (github.event.action != 'completed' || github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'schedule')) && format('merge-admission-skip-{0}', github.run_id) || 'merge-admission' }}
+      group: merge-admission-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write # the gate is also reported as a commit status on each PR head
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const {markPending} = require('./.github/scripts/merge-admission.cjs');
+            await markPending({github, context});
+
+  admission:
+    # Every outcome is decided here, by one sweep at a time over every open pull request, so two
+    # evaluations never race. It runs after `pending` even when that failed. A newer pending sweep
+    # replacing an older one loses nothing: each reads every pull request fresh. CI runs on push to
+    # main or on schedule cannot change any pull request's checks, so they are skipped, in a group of
+    # their own, since the docs do not say whether a job skipped by `if` joins one.
+    needs: pending
+    if: ${{ always() && (github.event_name != 'workflow_run' || github.event.workflow_run.name != 'CI' || (github.event.workflow_run.event != 'push' && github.event.workflow_run.event != 'schedule')) }}
+    concurrency:
+      group: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI' && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'schedule')) && format('merge-admission-skip-{0}', github.run_id) || 'merge-admission-sweep' }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
