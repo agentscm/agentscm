@@ -263,6 +263,7 @@ async fn hook(
     let repo = query.ok().and_then(|Query(mut query)| query.remove("repo"));
     let (parts, body) = request.into_parts();
     let token = super::http::bearer(&parts).ok().map(str::to_owned);
+    let measured = (token.clone(), repo.clone());
     let started = Instant::now();
     let deadline = started + BUDGET;
     let call = match timeout_at(deadline, to_bytes(body, HOOK_BODY_BYTES)).await {
@@ -474,7 +475,17 @@ async fn hook(
         }
     }
     record_hook_ms(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
-    let mut response = Json(call.render(&outcome)).into_response();
+    let rendered = call.render(&outcome);
+    let sample = super::hook_overhead::sample(
+        call.session.as_deref(),
+        call.agent.name(),
+        call.kind == Kind::Start,
+        outcome.deny.is_some(),
+        &rendered,
+        &parts.headers,
+    );
+    super::hook_overhead::record(&state, measured.0.as_deref(), measured.1, sample);
+    let mut response = Json(rendered).into_response();
     if let Some(reference) = failure.and_then(|error| error.correlation_id) {
         response.headers_mut().insert(
             "x-agentscm-correlation-id",

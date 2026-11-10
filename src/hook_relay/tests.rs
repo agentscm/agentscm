@@ -36,6 +36,7 @@ fn request() -> HookRequest {
         root: None,
         client: None,
         report_completion: false,
+        report: None,
         body: b"{}".to_vec(),
     }
 }
