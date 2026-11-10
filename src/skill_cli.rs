@@ -216,8 +216,12 @@ fn read_bundle(root: &Path, path: &str) -> Result<LocalBundle> {
         agentscm::store::validate_path(rel)?;
         let file = root.join(rel);
         let meta = std::fs::symlink_metadata(&file)?;
-        if !meta.file_type().is_file() {
-            return Err(invalid(format!("{rel} is not a regular file")));
+        // A symlink anywhere on the path (the file or a parent directory) could lead outside
+        // the repository; the resolved path must be the literal one.
+        if !meta.file_type().is_file() || file.canonicalize()? != root.canonicalize()?.join(rel) {
+            return Err(invalid(format!(
+                "{rel} is not a regular file in the repository"
+            )));
         }
         if meta.len() > supported::MAX_LOCAL_FILE_BYTES as u64 {
             return Err(invalid(format!("{rel} is larger than 64 KiB")));
@@ -241,6 +245,17 @@ fn local_bundles(root: &Path, lock: &SkillLock) -> Vec<LocalBundle> {
         .take(supported::MAX_LOCAL_SKILLS)
         .filter_map(|path| read_bundle(root, path).ok())
         .collect()
+}
+
+/// The lock on the remote's default branch: `None` when the checkout has no such ref,
+/// `Some(None)` when the default branch has no lock file.
+fn default_branch_lock(root: &Path) -> Option<Option<SkillLock>> {
+    let reference = format!("origin/{}", default_branch(root));
+    git(root, &["rev-parse", "--verify", "-q", &reference])?;
+    Some(
+        git(root, &["show", &format!("{reference}:{LOCK_PATH}")])
+            .and_then(|text| SkillLock::parse(text.as_bytes()).ok()),
+    )
 }
 
 /// The lock of this checkout and its repository skills.
@@ -402,31 +417,42 @@ fn pick(name: &str, version: Option<u32>) -> Result<&'static CatalogEntry> {
 
 fn show(name: &str, version: Option<u32>, as_json: bool) -> Result<()> {
     let (lock, local) = checkout()?;
-    // A repository skill is shown only as pinned: bytes this branch changed are not the
-    // procedure the Hub evaluates, and must not instruct the agent reviewing that change.
-    let pinned = lock.as_ref().and_then(|l| {
-        let adopted = supported::resolve_with(l, &local);
+    let root = repo_root(&cwd()?).ok();
+    // The default branch's lock: `None` when this checkout has no remote default branch ref.
+    let default_lock = root.as_deref().and_then(default_branch_lock);
+    let names = |l: &SkillLock| {
         l.skills
             .iter()
-            .find(|p| p.name == name && p.source.repo_local_path().is_some())
-            .map(|p| {
-                adopted
-                    .iter()
-                    .any(|s| s.pin.name == name && s.status == AdoptionStatus::Adopted)
-                    .then(|| local.iter().find(|s| s.entry.sha256 == p.sha256))
-                    .flatten()
-            })
-    });
-    let entry = match pinned {
-        Some(Some(l)) if version.is_none() => &l.entry,
-        Some(_) if version.is_none() => {
+            .any(|p| p.name == name && p.source.repo_local_path().is_some())
+    };
+    let repository_skill =
+        lock.as_ref().is_some_and(names) || default_lock.iter().flatten().any(names);
+    // A repository skill is shown only as the default branch pins it: a branch can re-pin its
+    // own edited files, and those must not instruct the agent reviewing that change.
+    let entry = if repository_skill && version.is_none() {
+        let (Some(root), Some(default_lock)) = (root.as_deref(), default_lock) else {
             println!(
-                "{name} is a repository skill whose files on this branch differ from the pin in {LOCK_PATH}, so its procedure is not shown. Read the pinned one from the Hub with MCP `agentscm_skill_list`."
+                "{name} is a repository skill, and this checkout has no default branch ref (origin/HEAD) to check its files against, so its procedure is not shown. Read the pinned one from the Hub with MCP `agentscm_skill_list`."
             );
             return Ok(());
-        }
-        _ => pick(name, version)?,
+        };
+        let pinned = default_lock.as_ref().and_then(|l| {
+            let pin = l.skills.iter().find(|p| p.name == name)?;
+            let path = pin.source.repo_local_path()?;
+            let skill = read_bundle(root, path).ok()?.skill().ok()?;
+            (skill.entry.sha256 == pin.sha256).then_some(skill)
+        });
+        let Some(pinned) = pinned else {
+            println!(
+                "{name} is a repository skill whose files on this branch differ from the default branch's pin in {LOCK_PATH}, so its procedure is not shown. Read the pinned one from the Hub with MCP `agentscm_skill_list`."
+            );
+            return Ok(());
+        };
+        pinned.entry
+    } else {
+        pick(name, version)?.clone()
     };
+    let entry = &entry;
     if as_json {
         println!("{}", serde_json::to_value(entry)?);
     } else {
@@ -526,7 +552,10 @@ fn add(name: &str, version: Option<u32>, raw_params: &[String]) -> Result<()> {
 fn add_local(name: &str, path: &str, raw_params: &[String]) -> Result<()> {
     let root = repo_root(&cwd()?)?;
     let skill = read_bundle(&root, path)?.skill()?;
-    if supported::catalog().iter().any(|e| e.name == name) {
+    if supported::catalog()
+        .iter()
+        .any(|e| e.name.eq_ignore_ascii_case(name))
+    {
         return Err(invalid(format!(
             "{name} is a built-in skill's name; a repository skill needs its own name"
         )));

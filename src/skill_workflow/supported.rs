@@ -817,7 +817,9 @@ pub fn resolve_with(lock: &SkillLock, local: &[LocalSkill]) -> Vec<PinStatus> {
             .filter(|e| e.name == pin.name && e.workflow_version == pin.workflow_version);
             // A repository skill may not take a built-in's name, so it can never post or be read as
             // that built-in (its `agentscm/skill/<name>` status a branch rule may require).
-            let builtin = catalog().iter().any(|e| e.name == pin.name);
+            let builtin = catalog()
+                .iter()
+                .any(|e| e.name.eq_ignore_ascii_case(&pin.name));
             let supported =
                 pin.source.first_party() || (pin.source.kind == "repo_local" && !builtin);
             let status = match entry {
@@ -2336,7 +2338,7 @@ pub(crate) mod tests {
         );
         // A repository skill named like a built-in is refused, whatever its bytes.
         let mut named: Value = serde_json::from_str(&bundle.manifest).unwrap();
-        named["name"] = "pr-gate".into();
+        named["name"] = "PR-Gate".into();
         let impostor = local_skills(&[LocalBundle {
             manifest: named.to_string(),
             ..bundle.clone()

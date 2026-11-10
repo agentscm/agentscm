@@ -3421,6 +3421,37 @@ async fn a_repository_skill_needs_the_forge_and_survives_a_failed_read() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_at_a_skill_path_makes_only_that_pin_unknown() {
+    use agentscm::skill_workflow::supported::{LOCK_PATH, SkillPin, catalog_entry};
+
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let agent = env.agent(1, "dev", "dev");
+    let (bundle, mut lock) = repository_skill();
+    lock.skills.push(SkillPin::first_party(
+        catalog_entry("pr-gate", 1).unwrap(),
+        None,
+    ));
+    env.fake.with(|s| {
+        let files = &mut s.repos.get_mut(&REPO_ID).unwrap().files;
+        files.insert(LOCK_PATH.into(), serde_json::to_string(&lock).unwrap());
+        files.insert(bundle.path.clone(), bundle.manifest.clone());
+        // The procedure path is a directory: the forge answers, so this is not an outage.
+        files.insert("skills/style-review/SKILL.md/nested.md".into(), "x".into());
+    });
+    env.refresh(&connection).await;
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    let pins = &library["adoption"]["pins"];
+    assert_eq!(library["adoption"]["source"], "default_branch", "{library}");
+    assert_eq!(pins[0]["status"], "unknown_version", "{library}");
+    assert_eq!(pins[1]["name"], "pr-gate");
+    assert_eq!(pins[1]["status"], "adopted", "{library}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repository_skill_on_the_default_branch_is_adopted_and_evaluated() {
     use agentscm::skill_workflow::supported::LOCK_PATH;
 

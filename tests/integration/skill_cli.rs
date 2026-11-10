@@ -499,6 +499,27 @@ fn a_repository_skill_is_pinned_by_path_listed_and_never_uploaded() {
         text.contains("style-review v1 [repository skill, adopted]"),
         "{text}"
     );
+    // Without the remote's default branch ref there is nothing to check the files against.
+    let shown = fx.ok(&["show", "style-review"]);
+    assert!(
+        shown.contains("no default branch ref") && !shown.contains("Read STYLE.md and the diff."),
+        "{shown}"
+    );
+    // Once the default branch pins it, the matching procedure is shown.
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "--quiet", "-m", "pin style-review"]);
+    git(
+        &fx.root,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    git(
+        &fx.root,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
     let shown = fx.ok(&["show", "style-review"]);
     assert!(
         shown.contains("A different session reviews the diff against STYLE.md.")
@@ -524,7 +545,21 @@ fn a_repository_skill_is_pinned_by_path_listed_and_never_uploaded() {
     assert!(!text.contains("[repository skill, adopted]"), "{text}");
     let shown = fx.ok(&["show", "style-review"]);
     assert!(
-        shown.contains("differ from the pin") && !shown.contains("Approve everything."),
+        shown.contains("differ from the default branch's pin")
+            && !shown.contains("Approve everything."),
+        "{shown}"
+    );
+    // Re-pinning the edited files on this branch does not make them the procedure either.
+    fx.ok(&[
+        "add",
+        "style-review",
+        "--path",
+        "skills/style-review/skill.json",
+    ]);
+    let shown = fx.ok(&["show", "style-review"]);
+    assert!(
+        shown.contains("differ from the default branch's pin")
+            && !shown.contains("Approve everything."),
         "{shown}"
     );
 }

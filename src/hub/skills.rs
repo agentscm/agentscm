@@ -692,8 +692,9 @@ pub(super) async fn sync_adoption(
         match read_bundle(api, token, repo, &at, path).await {
             Ok(Some(bundle)) => bundles.push(bundle),
             Ok(None) => {}
-            // A failed read keeps the last definition that resolved: a forge error must never
-            // drop a gate. Only a read that finds the file gone, too large or invalid changes it.
+            // An outage keeps the last definition that resolved: a forge error must never drop
+            // a gate. Any answer (gone, too large, not a regular file) makes only this pin
+            // unknown; the rest of the lock still updates.
             Err(error) => return crate::hub::error_envelope::log_internal(&error),
         }
     }
@@ -719,6 +720,25 @@ pub(super) async fn sync_adoption(
     }
 }
 
+/// Whether a forge read failed for want of an answer (credentials, rate limit, a 5xx or a
+/// transport failure) rather than with one: a 4xx, or a reply that is not one readable regular
+/// file (a directory, symlink, submodule or file over the size limit), is an answer.
+fn forge_outage(error: &GhError) -> bool {
+    match error {
+        GhError::Auth(_) | GhError::Limited(_) => true,
+        GhError::TooLarge(_) => false,
+        GhError::Failed(detail) => {
+            let status = detail.get(..3).and_then(|code| code.parse::<u16>().ok());
+            match status {
+                Some(code) => code >= 500,
+                None => {
+                    !detail.starts_with("unreadable reply") && !detail.starts_with("file is larger")
+                }
+            }
+        }
+    }
+}
+
 /// One repository skill's manifest at `path` and its procedure, read at `branch` (a commit);
 /// `None` when a file is missing, too large or the manifest is invalid (the pin is then
 /// unknown); an error when the forge could not answer.
@@ -734,7 +754,7 @@ async fn read_bundle(
     // GitHub reports a file over `max` as a failed read; that is an answer, not an outage.
     let api_file = |path: String| async move {
         match api.file(token, repo, &path, branch, max).await {
-            Err(GhError::Failed(detail)) if detail.starts_with("file is larger than") => Ok(None),
+            Err(error) if !forge_outage(&error) => Ok(None),
             read => read,
         }
     };
@@ -2015,6 +2035,26 @@ pub(super) async fn mcp_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_forge_outage_keeps_the_last_definition() {
+        for outage in [
+            GhError::Auth("401 from repos".into()),
+            GhError::Limited(60),
+            GhError::Failed("502 from contents".into()),
+            GhError::Failed("connection reset".into()),
+        ] {
+            assert!(forge_outage(&outage), "{outage:?}");
+        }
+        for answer in [
+            GhError::Failed("403 from contents".into()),
+            GhError::Failed("unreadable reply from contents".into()),
+            GhError::Failed("file is larger than 65536 bytes".into()),
+            GhError::TooLarge("contents".into()),
+        ] {
+            assert!(!forge_outage(&answer), "{answer:?}");
+        }
+    }
 
     #[test]
     fn stored_repository_skills_fit_the_column() {

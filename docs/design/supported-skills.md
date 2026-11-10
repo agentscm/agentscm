@@ -303,17 +303,24 @@ and `repo_local` resolve; `third_party` and `private` parse and resolve to `unsu
   report (`agentscm skill report-adoption`) carries only the lock, and the Hub refuses one that
   pins a repository skill (400 `invalid_request`), because a branch's files are not the default
   branch's. GitLab does not resolve repository skills: its file read returns JSON re-encoded, so
-  the manifest's digest never matches. A read that finds a file missing, too large or invalid, or
-  bytes that no longer match the pin, makes the pin `unknown_version` until it is re-pinned; a
-  forge error keeps the last definition that resolved, so a failed read never drops a gate. Once
+  the manifest's digest never matches. A read the forge answers (the file is missing, too large, a directory, symlink or submodule, or
+  invalid), or bytes that no longer match the pin, makes that one pin `unknown_version` until it is
+  re-pinned, and the rest of the lock still updates. A forge outage (credentials, a rate limit, a
+  5xx or a transport failure) keeps the last definition that resolved, so a failed read never drops
+  a gate. Once
   adopted, a repository skill is evaluated like a first-party one: the same evidence kinds,
   admission rules, Stop hook, observed evidence and skill status. The value metrics' skill
   configuration identity counts first-party skills only. The sha256 is integrity, not trust. Trust
   is the default branch's protection and the review a change to the skill gets, the same as for
   `AGENTS.md`. `agentscm skill add NAME --path PATH` pins one. `skill show` prints a repository
-  skill's procedure only while the checkout's files match the pin; otherwise it says they differ
-  and points to MCP `agentscm_skill_list`, which serves the default branch's copy, so a change
-  cannot rewrite the instructions its own reviewer follows. `skill list`, `skill show`, MCP
+  skill's procedure only when the checkout's files match the pin in the default branch's lock
+  (read from the remote's default branch ref, `origin/HEAD`). Re-pinning edited files on a
+  branch does not change that, so a change cannot rewrite the instructions its own reviewer
+  follows. When the checkout has no such ref, `show` says it cannot tell and prints nothing;
+  either way it points to MCP `agentscm_skill_list`, which serves the Hub's default-branch copy.
+  The digest is over the files' bytes, so a checkout that rewrites line endings (Git's
+  `core.autocrlf` on Windows) computes a different digest from the Hub's: its `skill add --path`
+  pins do not resolve, and `skill show` prints nothing. `skill list`, `skill show`, MCP
   `agentscm_skill_list` and the Hub library mark it as a repository skill.
 - `third_party {url, commit, path}`: a skill vendored from another Git repository at an exact
   commit; `agentscm skill add <git-url>@<commit>:<path>` would copy it, compute the SHA and write
