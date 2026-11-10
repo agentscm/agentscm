@@ -39,6 +39,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The same targets the `windows` job tests; the other integration tests use Unix-only APIs.
       - run: cargo check --locked --lib --bin agentscm --test integration
+      # The `#[cfg(test)]` unit-test modules in src/, which `cargo test` compiles in the `windows` job.
+      - run: cargo check --locked --profile test --lib --bin agentscm
 
   windows:
     if: ${{ github.event_name != 'pull_request' }}
