@@ -361,8 +361,7 @@ fn handoff_line(note: &HandoffNote) -> String {
             // The holder said it needs the file, so other work comes first here.
             format!(
                 "{who} keeps {path} for now{about}. Options, in order: work on something else \
-                 first; repeat the same edit only if their reason and task text show your change \
-                 leaves their lines alone."
+                 first; repeat the same edit only {OTHER_LINES}."
             )
         }
     }
@@ -996,7 +995,7 @@ mod tests {
         from_slack.via = Via::Slack;
         assert_eq!(
             handoff_line(&from_slack),
-            "amy (from Slack, for their agent Codex) keeps src/a.rs for now. Options, in order: work on something else first; repeat the same edit only if their reason and task text show your change leaves their lines alone."
+            "amy (from Slack, for their agent Codex) keeps src/a.rs for now. Options, in order: work on something else first; repeat the same edit only if their task text shows your change leaves their lines alone."
         );
     }
 
@@ -1024,8 +1023,8 @@ mod tests {
                  (accept false, with a one-line reason). The request lapses after 30 minutes.\n\
                  AgentSCM: amy's Codex session 01234567 handed src/a.rs to this session; repeating the edit applies it.\n\
                  AgentSCM: amy's Codex session 01234567 keeps src/a.rs for now. Options, in order: work on \
-                 something else first; repeat the same edit only if their reason and task text show your change \
-                 leaves their lines alone.\n\
+                 something else first; repeat the same edit only if their task text shows your change leaves \
+                 their lines alone.\n\
                  AgentSCM: {ESCALATE}"
             )
         );
