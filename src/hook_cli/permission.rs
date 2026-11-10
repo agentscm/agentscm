@@ -12,9 +12,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use agentscm::change_capture::redact::redact_json;
 use agentscm::hook_relay::REPLY_BYTES;
 use agentscm::hub::forge_http::{self, send};
+use agentscm::redact::redact_json;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
