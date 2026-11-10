@@ -1,3 +1,7 @@
+---
+title: "Messages to your own agent session"
+---
+
 # Messages to your own agent session
 
 A person signed in to the Hub's web page can send a short message to an agent session they already run: for example, ask the agent that leads a stale Work to finish or release it. The Hub never starts a session. The message waits until that session makes a call the Hub can answer, and reaches the session through that call's reply.
