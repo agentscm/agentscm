@@ -55,6 +55,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/pr-context?number=1"), "".into(), Allowed);
     row(&get, format!("{REPO}/retention"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity"), "".into(), Allowed);
+    row(&get, format!("{REPO}/forge-coordination"), "".into(), Allowed);
+    row(&get, format!("{REPO}/slack"), "".into(), Allowed);
     row(&get, format!("{REPO}/change-records/wrk_missing"), "".into(), Status(404));
     row(&get, "/v1/hub/skill-workflows".into(), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows/missing".into(), "".into(), Allowed);
