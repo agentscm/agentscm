@@ -587,6 +587,10 @@ Registered codes:
 | `user_disabled` | 403 | no | `ask_owner` |
 | `too_many_logins` | 429 | yes | `wait` |
 | `device_revoked` | 403 | no | `sign_in` |
+| `app_not_allowed` | 403 | no | `none` |
+| `app_read_only` | 403 | no | `provide_field` |
+| `invalid_client` | 400 | no | `contact_operator` |
+| `invalid_grant` | 400 | no | `sign_in` |
 | `promise_conflict` | 409 | no | `inspect_work` |
 | `too_many_publications` | 429 | no | `contact_operator` |
 | `already_connected` | 409 | no | `none` |
