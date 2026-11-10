@@ -586,8 +586,10 @@ on no others:
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - `GET /v1/hub/standup/briefing`, `GET /v1/hub/standup/overview`, `GET /v1/hub/standup/work?q=`
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
-  `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
-  `GET /v1/hub/standup/inbox` for the token's repository
+  `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination`,
+  `GET /v1/hub/standup/inbox` and `GET /v1/hub/standup/why` for the token's repository
+- `GET /v1/hub/standup/repositories`, current Work in every connected repository on the person's
+  forge host that the token's person can read now
 - `POST /v1/hub/standup/preflight`, the exact-subject check: it changes no Work and records no
   event, though it may store catch-up backfill and merge-observation rows
 - `GET /v1/hub/standup/digest` and `GET /v1/hub/standup/digest/settings` (see
@@ -608,7 +610,8 @@ on no others:
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
   `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`, `agentscm_pr_context`,
   `agentscm_work_pr_link`, `agentscm_work_pr_link_set`,
-  `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
+  `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_why`, `agentscm_work_repositories`,
+  `agentscm_publications_list`, `agentscm_workflow_runs_list`,
   `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
@@ -989,7 +992,17 @@ shapes of their routes for the token's repository: `agentscm_work_search` `{q?, 
 `GET /v1/hub/standup/work`), `agentscm_publications_list` `{q?, limit?, cursor?}` (as the publications
 list, `cursor` being `before`) and `agentscm_workflow_runs_list` `{q?, before?}` (as
 `GET /v1/hub/skill-workflows`). The work overview view also has a "Find work" box that calls
-`agentscm_work_search` and loads further pages on request.
+`agentscm_work_search` and loads further pages on request. `q` also matches the summary of a
+decision checkpoint.
+
+`agentscm_why` `{commit}` or `{path}` (as `GET /v1/hub/standup/why`, and `agentscm why` on the
+command line) answers why a commit or a path exists: the Work recorded for it, newest first, with
+its description, latest checkpoint and decision checkpoints. A commit resolves only through a pull
+request and its linked Work; a path resolves through declared Work scope. `known: false` means the
+Hub recorded no Work for it. The opt-in tool `agentscm_work_repositories` (as
+`GET /v1/hub/standup/repositories`) lists current Work in every connected repository on the person's
+forge host that the token's person can read now, redacted as other Work reads are; see
+[agents](agents.md#work-in-your-persons-other-repositories) and [API](api.md).
 
 The six coordination tools use repo-relative path specs and carry the session's new notices.
 The workflow reads use no session and write no coordination events. `GET /v1/hub/skill-workflows`
