@@ -4,6 +4,11 @@ nextest-version = { required = "0.9.148", recommended = "0.9.148" }
 fail-fast = false
 retries = 0
 
+# The merge batch gate stops at the first failure; pull request runs keep the default and list them all.
+# Inherits everything else, including the default profile's test-group overrides.
+[profile.gate]
+fail-fast = true
+
 [profile.default.junit]
 path = "junit.xml"
 report-skipped = "ignored"

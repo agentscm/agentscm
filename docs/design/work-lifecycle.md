@@ -125,9 +125,9 @@ reservation on purpose and records why. Terminal transitions end the Work and dr
 Finished Work holds nothing under any outcome, and a merged pull request never changes outcome or
 reservation by itself; it is a provider fact shown beside them.
 
-Shared status names the lead agent of unfinished Work whose merge was observed and that holds no
-live reservation, and says that only its close is left: the lead completes it, or resumes it if
-more remains. It asks no person, because an agent can settle it. The Hub does not complete it.
+Shared status names the lead agent of unfinished Work whose merge was observed, and says that only
+its close is left: the lead completes it, or resumes it if more remains. It asks no person,
+because an agent can settle it, and a hold still held lapses by itself. The Hub does not complete it.
 The observation matches a branch name, Work may span several pull requests, and an outcome records
 who stated it, which a merge cannot.
 
@@ -510,7 +510,12 @@ and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
   Work whose lead session has not called since reads `freshness: unknown` with the limit
   `lead_wait_unknown`. It names nobody and needs nobody until that session calls again, or until
   24 hours after its last check-in, when no wait could still be believed.
+- **Who is asked.** A row asks a person only for what no agent settles: a handover, Work its agent
+  reported blocked, and the reassessment of such a blocker. A quiet or paused row asks nobody,
+  held or not, because a hold its lead no longer renews lapses by itself. The projection's
+  `actionable` field still names the owner for a held pause; shared status does not turn that
+  into something the owner must do.
 - **Not changed.** The store's `claim_status`, the operational projection's `freshness`, takeover
-  rules, where a directed request goes and which scope overlaps count still follow the lead's
-  reports. Leases are untouched: a waiting session's hold lapses 20 minutes after its last call
-  like any other, so waiting never blocks other Work for longer.
+  rules and which scope overlaps are listed still follow the lead's reports. Leases are untouched:
+  a waiting session's hold lapses 20 minutes after its last call like any other, so waiting never
+  blocks other Work for longer.
