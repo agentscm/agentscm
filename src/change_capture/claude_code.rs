@@ -601,8 +601,10 @@ pub fn deferred_native_hook(
                         .map(|rule| rule.kind)
                 })
             });
+            // As for claimed Work, only an action consumes the source; a plain tool event skips
+            // the Git scan, which costs several Git processes in a large checkout.
             (
-                capture_git_source(&actions.source, spool).ok(),
+                action_kind.and_then(|_| capture_git_source(&actions.source, spool).ok()),
                 recipe_digest,
                 action_kind,
             )

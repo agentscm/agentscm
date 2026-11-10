@@ -178,7 +178,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
   client lifecycle lock, revalidation of root, origin and `connections.json`, token file under the
   config directory. It **never installs agent files into the checkout** (no `.mcp.json`,
   `.claude/…`, `.git/info/exclude` edits); the user-level plugin that ran the hook keeps working.
-  The agent's context gets one line: `AgentSCM: coordinating on owner/repo`.
+  The agent's context gets one line: `AgentSCM: coordinating on owner/repo at <Hub>`.
 - A refusal is recorded for the checkout and shown in the agent's context and the menu bar app.
 
 ## Revocation and administration

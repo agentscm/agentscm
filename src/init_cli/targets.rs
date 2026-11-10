@@ -18,7 +18,7 @@ const DETAILS: &str = "### Details
 - Read `agentscm_work_insights` or `agentscm_work_insight` for work measurements. If structured usage is available for an explicitly associated attempt, report it with `agentscm_work_usage` and a stable `observation_id`. Keep unavailable counts and cost null and unavailable agent/provider/model labels `unknown`; never infer charges or submit prompts, transcripts or credentials.
 - Acknowledge a briefing only after receiving its complete page sequence. Repeat the returned subscriber/session on continuation; independent sessions must not share a catch-up cursor.
 - Before editing a file you have not edited in this session, call `agentscm_check` with its path. Skip this only in Claude Code, Codex or Copilot after `agentscm client setup` on this machine: its hooks check each edit.
-- If the result says another agent is working on that file, work on something else first, ask the holder with `agentscm_ask`, or edit it if the overlap is acceptable. Settle coordination without the user and report what you resolved in one line. Involve the user only if two live agents need the same change with incompatible intent, a step risks data loss or breaking main or a release, it needs a security, billing or public decision, or AgentSCM refuses every path.
+- If the result says another agent is working on that file, edit it anyway with patches to your own lines (not a whole-file rewrite) if their task text shows your change leaves their lines alone; otherwise work on something else first or ask the holder with `agentscm_ask`. Settle coordination without the user and report what you resolved in one line. Involve the user only if two live agents need the same change with incompatible intent, a step risks data loss or breaking main or a release, it needs a security, billing or public decision, or AgentSCM refuses every path.
 - An edit refused with an AgentSCM reason was not applied. Follow the reason: scope and coordination-request refusals require a work update or response before retrying. A legacy file-intent notice is advisory; repeating it is not proof that the work is coordinated.
 - An edit refused because another agent holds the file also asks that agent to hand it over. When another agent asks for a file you hold, answer with `agentscm_handoff`.
 - When a start is refused or Work looks stuck, read `agentscm_work_recovery` with the paths or the `work_id` instead of searching. Preview a remedy with `agentscm_work_recovery_preview` and send its apply call: resume your owner's released or lapsed Work rather than starting a duplicate, release or end only your owner's obsolete Work, and never take over another owner's live hold.
@@ -159,6 +159,11 @@ mod tests {
             .map(|t| t.path)
             .collect();
         assert_eq!(codex, ["AGENTS.md"]);
+    }
+
+    #[test]
+    fn rules_give_the_refusal_test_for_editing_other_lines() {
+        assert!(DETAILS.contains(agentscm::hub::advice::OTHER_LINES));
     }
 
     #[test]
