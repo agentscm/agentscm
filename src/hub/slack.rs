@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 use super::advice::{agent_name, sanitize, session_kind};
 use super::handoff::{Answered, Via};
 use super::intent::{Intent, MAX_LIVE_INTENTS, key_of, live_intents_capped, overlaps};
+use super::overlap_detail::{NOTHING_CHANGED, holder_named};
 use super::slack_protocol::{clip_plain_text, parse_form, plain_text, verify_request};
 use super::store::session_key;
 use super::store::{HubEvent, Principal, TokenDigest, agent_token_digest, unix_now};
@@ -172,7 +173,8 @@ pub fn slack_id(value: &str, prefix: char) -> bool {
 }
 
 /// Config and credentials are trusted operator inputs, never selected by Slack payloads.
-fn private_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+/// Connected apps read their config file the same way.
+pub(super) fn private_file(path: &Path, max: u64) -> Result<Vec<u8>> {
     if !path.is_absolute() || fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(invalid());
     }
@@ -213,7 +215,7 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn secret(path: &Path) -> Result<String> {
+pub(super) fn secret(path: &Path) -> Result<String> {
     let bytes = private_file(path, 4096)?;
     let value = std::str::from_utf8(&bytes).map_err(|_| invalid())?.trim();
     if value.is_empty() || value.chars().any(char::is_whitespace) {
@@ -900,10 +902,12 @@ impl Slack {
     ) -> Result<Vec<(String, String, Value)>> {
         let paths = strings(&data["paths"]);
         let link = self.link("box-contested");
-        // What the Hub did first, as `CONTESTED_FILE` in `ui/src/copy.ts` says it.
+        let now = unix_now();
+        // What the Hub did first, as `CONTESTED_FILE` in `ui/src/copy.ts` says it, then the
+        // sentence every overlap alert carries.
         let warned = |whom: &str| {
             format!(
-                "The Hub warned {whom} once; a repeat edit goes ahead by design. Files are never locked."
+                "The Hub warned {whom} once; a repeat edit goes ahead by design. Files are never locked. {NOTHING_CHANGED}"
             )
         };
         let mut out = Vec::new();
@@ -918,6 +922,7 @@ impl Slack {
             // Opens the header, which is not a name to keep lower case.
             let opening = named.unwrap_or_else(|| "Another agent".into());
             let mut holders = Vec::new();
+            let mut holder_lines = Vec::new();
             // Under the repeater's token only its other hook sessions are other agents, as in
             // `same_agent`; an event without a session id skips the whole token.
             let own = data["session"].as_str();
@@ -1009,11 +1014,13 @@ impl Slack {
                             ),
                         ),
                     };
+                    let line = holder_named(&format!("Your {mine}"), intent, now);
                     let fields = [
                         files(&held),
                         ("Repository", sanitize(&repository, TEXT_CHARS)),
                         ("Your agent", mine),
                         ("Their agent", who.clone()),
+                        ("Holder", line),
                     ];
                     let handoff = match held.as_slice() {
                         [path] => Some((
@@ -1032,6 +1039,7 @@ impl Slack {
                 // One agent's hook and MCP sessions read alike: one holder, not two. Two tokens
                 // with one display name stay two.
                 if listed_holders.insert((intent.token.as_str(), holder.clone())) {
+                    holder_lines.push(holder_named(&holder, intent, now));
                     holders.push(holder);
                 }
             }
@@ -1058,6 +1066,14 @@ impl Slack {
                             "Their agents"
                         },
                         listed(&holders),
+                    ),
+                    (
+                        if holders.len() == 1 {
+                            "Holder"
+                        } else {
+                            "Holders"
+                        },
+                        listed(&holder_lines),
                     ),
                 ];
                 out.push((

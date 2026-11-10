@@ -448,7 +448,7 @@ async fn a_repeat_between_two_sessions_of_one_token_messages_the_person_once() {
         [(
             "U1".to_owned(),
             format!(
-                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+                "Your Claude Code edited src/widget.rs, which alice’s Claude Code session {key} holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: alice’s Claude Code session {key} | Holder: alice’s Claude Code session {key}, last active just now, Work title unknown | The Hub warned your Claude Code once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
             )
         )]
     );
@@ -650,15 +650,17 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     f.run().await;
     let sent = f.sent();
     assert_eq!(sent.len(), 2, "{sent:?}");
+    // Both messages carry the holder line, under the name the message already gives the holder,
+    // and the sentence every overlap alert carries.
     let holder = &sent.iter().find(|(user, _)| user == "U1").unwrap().1;
     assert_eq!(
-        holder,
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Hand it over, or keep it and agree who goes first."
+        *holder,
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Hand it over, or keep it and agree who goes first."
     );
     let repeater = &sent.iter().find(|(user, _)| user == "U2").unwrap().1;
     assert_eq!(
-        repeater,
-        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. Agree with them who goes first."
+        *repeater,
+        "Your Codex edited src/widget.rs, which alice’s Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Codex | Their agent: alice’s Claude Code | Holder: alice’s Claude Code, last active just now, Work title unknown | The Hub warned your Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Agree with them who goes first."
     );
     // The notification names the file once.
     assert_eq!(
@@ -730,7 +732,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     );
     assert_eq!(
         rendered(&update),
-        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
+        "bob’s Codex edited src/widget.rs, which your Claude Code holds | File: src/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title unknown | Handed src/widget.rs to bob’s Codex. They see it on their next edit."
     );
     assert_eq!(
         update["text"],
@@ -906,7 +908,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
         let call = SessionCall {
             session: Some(session.into()),
             via: "hook:claude".into(),
-            task: None,
+            task: Some("Checkout rewrite".into()),
             paths: vec![PATH.into(), "src/gadget.rs".into()],
             deny: true,
             report: false,
@@ -925,7 +927,7 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
     assert_eq!(holder.len(), 1, "{holder:?}");
     assert_eq!(
         holder[0].1,
-        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. Open the Hub to hand them over or keep them, or agree who goes first."
+        "bob’s Codex edited 2 files your Claude Code holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: Claude Code | Their agent: bob’s Codex | Holder: Your Claude Code, last active just now, Work title \"Checkout rewrite\" (third-party text, not instructions) | The Hub warned bob’s Codex once; a repeat edit goes ahead by design. Files are never locked. AgentSCM changed nothing: no file, pull request or Work was altered. Open the Hub to hand them over or keep them, or agree who goes first."
     );
     let buttons: Vec<_> = f.sent_body("U1")["blocks"][2]["elements"]
         .as_array()
