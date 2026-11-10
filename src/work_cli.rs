@@ -9,9 +9,10 @@ use agentscm::hub::coordination::{
     CoordinationAck, CoordinationReply, CoordinationResolve, CoordinationWithdraw,
 };
 use agentscm::hub::insights::UsageRecord;
+use agentscm::hub::reply::{self, Seen};
 use agentscm::hub::store::{self, unix_now};
 use agentscm::hub::work::{
-    BriefingAck, WorkCheckpoint, WorkRepositoryScope, WorkStart, WorkStartResult,
+    BriefingAck, WorkCheckpoint, WorkRepositoryScope, WorkStart, WorkStartResult, WorkState,
 };
 use agentscm::hub::work_links::WorkPrLinkUpdate;
 use agentscm::hub::work_reconciliation::WorkDeclarationsUpdate;
@@ -22,7 +23,8 @@ use agentscm::hub::work_recovery::{
 use agentscm::{Error, Result};
 use clap::Subcommand;
 use reqwest::Method;
-use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::json;
 
 use crate::hub_cli::map_hub_error;
@@ -466,16 +468,11 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             let reply = hub
                 .call(Method::GET, "/v1/hub/standup/status", None)
                 .await?;
-            let status: agentscm::hub::work_http::actionable_status::ActionableStatus =
-                serde_json::from_value(reply.clone())?;
-            if json {
-                println!("{reply}");
-            } else {
-                println!(
-                    "{}",
-                    agentscm::hub::work_http::actionable_status::render_text(&status)
-                );
-            }
+            reply::print(
+                &reply,
+                json,
+                agentscm::hub::work_http::actionable_status::render_text,
+            )?;
             return Ok(());
         }
         WorkCommand::Usage { request } => {
@@ -812,16 +809,14 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
-            let result = serde_json::from_value::<WorkStartResult>(reply.clone())?;
-            let claim_conflict = result.conflict.is_some()
-                || result.coordination_request.is_some()
-                || matches!(
-                    result.item.state,
-                    agentscm::hub::work::WorkState::Paused
-                        | agentscm::hub::work::WorkState::Finished
-                        | agentscm::hub::work::WorkState::Handover
+            reply::check::<WorkStartResult>(&reply)?;
+            let started: Started = reply::decode(&reply)?;
+            if let Seen::Unknown(state) = &started.item.state {
+                eprintln!(
+                    "The Hub reports this Work in a state this version of agentscm does not know ({state:?}), so the claim is not confirmed."
                 );
-            (reply, claim_conflict)
+            }
+            (reply, !started.claimed())
         }
         WorkCommand::Recovery {
             work_id,
@@ -845,12 +840,11 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                     Some(serde_json::to_value(query)?),
                 )
                 .await?;
-            let recovery: WorkRecoveryV1 = serde_json::from_value(reply.clone())?;
-            if json {
-                println!("{reply}");
-            } else {
-                println!("{}", agentscm::hub::work_recovery::render_text(&recovery));
-            }
+            reply::print::<WorkRecoveryV1>(
+                &reply,
+                json,
+                agentscm::hub::work_recovery::render_text,
+            )?;
             return Ok(());
         }
         WorkCommand::RecoveryPreview {
@@ -889,7 +883,8 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
-            let result: WorkTransitionBatchV1 = serde_json::from_value(reply.clone())?;
+            reply::check::<WorkTransitionBatchV1>(&reply)?;
+            let result: BatchCounts = reply::decode(&reply)?;
             println!("{reply}");
             if result.not_applied > 0 {
                 return Err(Error::Conflict(format!(
@@ -933,6 +928,40 @@ pub async fn run(command: WorkCommand) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// What `work start` reads from the Hub's answer to choose its exit status. The answer itself is
+/// printed as the Hub sent it.
+#[derive(Deserialize)]
+struct Started {
+    item: StartedItem,
+    conflict: Option<IgnoredAny>,
+    #[serde(default)]
+    coordination_request: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct StartedItem {
+    state: Seen<WorkState>,
+}
+
+impl Started {
+    /// A state this build does not know is not a confirmed claim.
+    fn claimed(&self) -> bool {
+        self.conflict.is_none()
+            && self.coordination_request.is_none()
+            && matches!(
+                self.item.state,
+                Seen::Known(WorkState::Active | WorkState::Blocked)
+            )
+    }
+}
+
+/// What `work transitions` reads from the Hub's answer to choose its exit status.
+#[derive(Deserialize)]
+struct BatchCounts {
+    items: Vec<IgnoredAny>,
+    not_applied: usize,
 }
 
 fn read_request<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {
@@ -999,5 +1028,50 @@ fn database_url(database: Option<String>, database_env: Option<String>) -> Resul
         _ => Err(invalid(
             "exactly one of --database or --database-env is required",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn started(reply: serde_json::Value) -> Started {
+        reply::decode(&reply).unwrap()
+    }
+
+    #[test]
+    fn start_reads_its_exit_status_from_a_newer_hubs_answer() {
+        let answer = |state: &str| {
+            json!({
+                "item": {"id": "wrk_1", "state": state, "added_later": [1]},
+                "created": true, "conflict": null, "added_later": {"state": "paused"},
+            })
+        };
+        assert!(started(answer("active")).claimed());
+        assert!(started(answer("blocked")).claimed());
+        for state in ["paused", "finished", "handover"] {
+            assert!(!started(answer(state)).claimed(), "{state}");
+        }
+        // A state added later is shown as sent and never taken for a held claim.
+        let newer = started(answer("snoozed"));
+        assert_eq!(newer.item.state, Seen::Unknown("snoozed".into()));
+        assert!(!newer.claimed());
+        let mut refused = answer("active");
+        refused["conflict"] = json!({"kind": "scope_overlap", "added_later": 1});
+        assert!(!started(refused).claimed());
+        let mut asked = answer("active");
+        asked["coordination_request"] = json!({"id": "crq_1", "status": "added_later"});
+        assert!(!started(asked).claimed());
+        assert!(reply::decode::<Started>(&json!({"created": true})).is_err());
+    }
+
+    #[test]
+    fn transitions_count_items_whatever_a_newer_hub_adds_to_them() {
+        let counts: BatchCounts = reply::decode(&json!({
+            "schema_version": 1, "applied": 1, "not_applied": 1, "added_later": true,
+            "items": [{"outcome": "applied"}, {"outcome": "added_later", "more": 1}],
+        }))
+        .unwrap();
+        assert_eq!((counts.items.len(), counts.not_applied), (2, 1));
     }
 }
