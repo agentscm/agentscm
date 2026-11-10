@@ -515,7 +515,7 @@ async fn call_hub(
                 &cwd_of(&payload),
                 file.as_ref(),
             )?;
-            let root = sent_root(&cwd_of(&payload));
+            let root = flag_root(&agent, &payload, &cwd_of(&payload))?;
             let outbound = if agent == "codex" {
                 std::borrow::Cow::Owned(sanitized_codex(&payload, None)?)
             } else {
@@ -2083,20 +2083,97 @@ fn cwd_of(payload: &Value) -> PathBuf {
     )
 }
 
-/// The checkout root to send as `X-Agentscm-Root`, spelled the way `cwd` is. The Hub reads an
-/// edit's absolute path against it, and an agent reports `cwd` and its paths as it reached the
-/// checkout, so a symlink-resolved root (macOS `/var` is `/private/var`) left them outside it.
-/// Falls back to the resolved root when `cwd` cannot be walked back to it.
-fn sent_root(cwd: &Path) -> Option<PathBuf> {
-    let root = repo_root(cwd)?;
-    let depth = cwd
-        .canonicalize()
-        .ok()
-        .and_then(|resolved| Some(resolved.strip_prefix(&root).ok()?.components().count()));
-    let spelled = depth
-        .and_then(|depth| cwd.ancestors().nth(depth))
-        .filter(|spelled| spelled.canonicalize().ok().as_deref() == Some(root.as_path()));
-    Some(spelled.map_or(root, Path::to_path_buf))
+/// Added to a failure note: it is given once per session and failure, so it has to cover the edits
+/// after it, which get the empty reply.
+const LATER_EDITS: &str = " Until AgentSCM answers again, later edits in this session are unchecked too and get no further note.";
+
+/// The refusal for an edit `--hub-url` routing cannot place in the checkout: an empty reply would
+/// read as "no one else is on this file".
+const UNPLACED_EDIT: &str = "edit path not matched to the checkout";
+/// The Hub ignores a longer `X-Agentscm-Root`.
+const MAX_SENT_ROOT_BYTES: usize = 1024;
+
+/// The checkout root to send as `X-Agentscm-Root` with `--hub-url` routing, which sends the
+/// agent's own payload. The Hub matches each edit path against this root by its exact spelling,
+/// so the root takes the edit's spelling (a host may report `/var` or `/private/var`, or a link
+/// to the checkout), then `cwd`'s, then the resolved one. An edit that would still be filed
+/// under another path than where it really is in the checkout (an in-repository symlink, a
+/// nested worktree, a `cwd` outside the checkout) is an error, so the hook says coordination is
+/// unknown instead of answering as if the file were free.
+fn flag_root(agent: &str, payload: &Value, cwd: &Path) -> Result<Option<PathBuf>, String> {
+    let edits: Vec<PathBuf> = edit_paths(agent, payload)
+        .unwrap_or_default()
+        .iter()
+        .map(|edit| lexical(&cwd.join(&edit.path)))
+        .collect();
+    let root = repo_root(cwd);
+    let sent = root.as_ref().map(|root| {
+        let spells = |path: &Path| {
+            path.ancestors()
+                .find(|dir| dir.canonicalize().ok().as_ref() == Some(root))
+                .map(Path::to_path_buf)
+        };
+        edits
+            .iter()
+            .find_map(|edit| spells(edit))
+            .or_else(|| spells(cwd))
+            .unwrap_or_else(|| root.clone())
+    });
+    let usable = sent
+        .as_deref()
+        .and_then(Path::to_str)
+        .is_some_and(|text| text.len() <= MAX_SENT_ROOT_BYTES);
+    for edit in &edits {
+        // A path that cannot be resolved, or lies in no checkout, is the Hub's to judge.
+        let Some(real) = resolved(edit) else { continue };
+        let Some(checkout) = real
+            .ancestors()
+            .skip(1)
+            .find(|dir| dir.join(".git").exists())
+        else {
+            continue;
+        };
+        let filed = sent
+            .as_deref()
+            .and_then(|sent| edit.strip_prefix(sent).ok());
+        let truly = root
+            .as_deref()
+            .filter(|root| *root == checkout)
+            .and_then(|root| real.strip_prefix(root).ok());
+        if !usable || filed.is_none() || filed != truly {
+            return Err(UNPLACED_EDIT.into());
+        }
+    }
+    Ok(sent)
+}
+
+/// `path` with `.` and `..` worked out by name, as the Hub reads it.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            part => out.push(part),
+        }
+    }
+    out
+}
+
+/// Where `path` really is: its nearest existing folder resolved, the rest added by name, so a
+/// file that does not exist yet still has a place.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    for dir in path.ancestors() {
+        if let Ok(mut real) = dir.canonicalize() {
+            real.extend(rest.iter().rev());
+            return Some(real);
+        }
+        rest.push(dir.file_name()?);
+    }
+    None
 }
 
 struct Settings {
@@ -2238,7 +2315,7 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
         Some(reason) => context_reply(
             agent,
             payload,
-            &if reason == "hub unreachable" {
+            &(if reason == "hub unreachable" {
                 let mut error = agentscm::hub::error_envelope::ErrorEnvelope::local(
                     agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
                 );
@@ -2259,9 +2336,10 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
                     "payload unreadable" => ErrorCode::InvalidRequest.action(),
                     _ => RecoveryAction::Reconnect,
                 };
-                let reason = if RecoveryAction::ALL
-                    .iter()
-                    .any(|action| reason.contains(action.sentence()))
+                let reason = if reason == UNPLACED_EDIT
+                    || RecoveryAction::ALL
+                        .iter()
+                        .any(|action| reason.contains(action.sentence()))
                 {
                     reason
                 } else {
@@ -2270,7 +2348,7 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
                 format!(
                     "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
                 )
-            },
+            } + LATER_EDITS),
         ),
         None => context_reply_with(agent, payload, None),
     }
@@ -2312,30 +2390,49 @@ fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value
 mod tests {
     use super::*;
 
-    /// The Hub reads an edit's absolute `file_path` against the root the hook sends. An agent
-    /// reports paths as it reached the checkout, so through a symlink (macOS `/var` is one) a
-    /// resolved root put every edit outside the repository, and the Hub answered "clear".
     #[cfg(unix)]
     #[test]
-    fn the_sent_root_is_spelled_like_the_payloads_paths() {
+    fn the_sent_root_takes_the_edits_spelling_and_an_unplaced_edit_is_an_error() {
+        use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
         let real = git_repo(temp.path(), "real");
         std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::create_dir_all(real.join("a/b")).unwrap();
         let link = temp.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let cwd = link.join("src");
-        let file = link.join("src/a.rs");
+        symlink(&real, &link).unwrap();
+        let edit = |cwd: &Path, file: &Path| {
+            let payload = json!({"hook_event_name": "PreToolUse", "cwd": cwd, "tool_name": "Edit",
+                "tool_input": {"file_path": file}});
+            flag_root("claude", &payload, cwd)
+        };
+        let ok = |root: &Path| Ok(Some(root.to_path_buf()));
 
-        assert!(
-            !file.starts_with(repo_root(&cwd).unwrap()),
-            "the resolved root misses the path"
-        );
-        let root = sent_root(&cwd).unwrap();
-        assert_eq!(root, link);
-        assert!(file.starts_with(&root));
-        // A plain checkout is unchanged, and a path outside any checkout has no root.
-        assert_eq!(sent_root(&real.join("src")), Some(real.clone()));
-        assert_eq!(sent_root(temp.path()), None);
+        // Either spelling of the checkout, in either place, files the edit where it is.
+        assert_eq!(edit(&link.join("src"), &link.join("src/a.rs")), ok(&link));
+        assert_eq!(edit(&link.join("src"), &real.join("src/a.rs")), ok(&real));
+        assert_eq!(edit(&real.join("src"), &link.join("src/a.rs")), ok(&link));
+        assert_eq!(edit(&real, Path::new("src/new/b.rs")), ok(&real));
+        // Without an edit the root takes `cwd`'s spelling.
+        let start = json!({"hook_event_name": "SessionStart", "cwd": link.join("src")});
+        assert_eq!(flag_root("claude", &start, &link.join("src")), ok(&link));
+        // A file in no checkout is the Hub's to judge.
+        assert_eq!(edit(&real, &temp.path().join("notes.txt")), ok(&real));
+
+        let unplaced = Err(UNPLACED_EDIT.to_owned());
+        // An in-repository symlink files `lnk/f.rs` for the file at `a/b/f.rs`.
+        symlink("a/b", real.join("lnk")).unwrap();
+        assert_eq!(edit(&real, &real.join("lnk/f.rs")), unplaced);
+        // A link from outside to a folder inside the checkout.
+        let sub = temp.path().join("sub");
+        symlink(real.join("src"), &sub).unwrap();
+        assert_eq!(edit(&sub, &sub.join("a.rs")), unplaced);
+        // A worktree nested in the checkout is another checkout.
+        let nested = real.join(".claude/worktrees/x");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(edit(&real, &nested.join("src/a.rs")), unplaced);
+        // A `cwd` outside every checkout, editing inside one.
+        assert_eq!(edit(temp.path(), &real.join("src/a.rs")), unplaced);
     }
 
     #[test]
@@ -4155,7 +4252,7 @@ mod tests {
                         agentscm::hub::error_envelope::ErrorCode::HubUnreachable,
                     );
                     error.message = "hub unreachable".into();
-                    error.hook_note()
+                    error.hook_note() + LATER_EDITS
                 });
                 assert_eq!(out.as_object().unwrap().len(), 1);
             }
