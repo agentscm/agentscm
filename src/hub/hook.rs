@@ -1506,10 +1506,11 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
         {
             call(Kind::Waiting(WaitReason::Background), Shape::Silent)
         }
-        // A turn whose last message ends asking nothing is read, not answered: nobody is shown
-        // that wait, so what the turn ended on is not kept. Without the client's excerpt it is
-        // not known whether the turn asked, and the session is shown.
-        Some("Stop") => match WaitReason::turn_end(str_at(v, "asks")) {
+        // A turn whose last message asked nothing is read, not answered: nobody is shown that
+        // wait, so what the turn ended on is not kept. The client says whether the whole
+        // message asked; where that is not known, the session is shown.
+        Some("Stop") => match WaitReason::turn_end(v["asked_nothing"].as_bool(), str_at(v, "asks"))
+        {
             WaitReason::Finished => call(Kind::Waiting(WaitReason::Finished), Shape::Silent),
             reason => waiting(reason),
         },
@@ -2395,16 +2396,36 @@ mod tests {
                 json!({"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}),
                 Some(Idle),
             ),
-            // The end of its last message says whether the turn asked its person anything.
+            // The client says whether the whole last message asked its person anything. An
+            // older client sends only the excerpt, which decides when it is not cut.
             (
                 Agent::Claude,
-                json!({"hook_event_name":"Stop","session_id":"s","asks":"Shall I merge it?"}),
+                json!({"hook_event_name":"Stop","session_id":"s","asked_nothing":true,
+                    "asks":"…and the tests pass for both stores."}),
+                Some(Finished),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","asked_nothing":false,
+                    "asks":"…and the tests pass for both stores."}),
                 Some(Idle),
             ),
             (
                 Agent::Claude,
-                json!({"hook_event_name":"Stop","session_id":"s","asks":"Merged; tests pass."}),
+                json!({"hook_event_name":"Stop","session_id":"s",
+                    "asks":"The fix is merged and the tests pass for both stores."}),
                 Some(Finished),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s",
+                    "asks":"…The fix is merged and the tests pass for both stores."}),
+                Some(Idle),
+            ),
+            (
+                Agent::Claude,
+                json!({"hook_event_name":"Stop","session_id":"s","asks":"Shall I merge it?"}),
+                Some(Idle),
             ),
             // Paused for its own background work: the client's count and a legacy hook's list.
             (
