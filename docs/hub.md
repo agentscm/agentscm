@@ -287,7 +287,9 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   - `GET`, `PUT` and `DELETE /v1/hub/session/dismissals` keep a person's own dismissed and snoozed
     attention items per repository, each an opaque `key` with a state `fingerprint` and an optional
     `until`. A page hides an item while its fingerprint matches, so it returns when the item
-    changes; a snooze also ends at `until`. No one else reads them; see [the API](api.md).
+    changes; a snooze also ends at `until`. The shared status reads its viewer's entries and
+    stops counting the status items they name, on every surface; no one else's are read. See
+    [the API](api.md).
   - `POST /v1/hub/session/work/transition` (`repository`, `work_id`, `operation_id`, `generation`,
     `expected_updated_seq`, `transition`, `reason`, optional `superseded_by`; web sign-in and CSRF
     token, no agent token) is `POST /v1/hub/standup/work-transition` for a person. The owner may
@@ -309,8 +311,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `repository`, `repository_id`, `provider`, `unfinished` (`total`, `moving`, `stuck`),
   `needs_you`, `agents`, `last_activity_at` (or `null`) and `complete` (false when a list was cut
   short, so counts are lower bounds): counts only, never titles, paths or people. `needs_you`
-  counts blockers, declared-scope overlaps between live tasks (both claims active, both tasks active or blocked) and files two agents hold now; paused, handover and stale-claim work is unfinished and may be stuck, but is not counted;
-  pull-request overlaps and files with only a recent refusal are not counted. A refused role or a
+  is the shared status count of what asks this person (see [shared actionable status](standup.md#shared-actionable-status)): their own agent waiting for them, Work its agent reported blocked, a handover with an unresolved blocker, a failed required check, a stopped workflow gate and an agent setup problem. What agents settle between themselves is not counted: quiet or paused work, a routine handover, a merged task still to close, declared-scope overlaps, a file two agents hold, a pull request over a held file and a request from one agent to another. A refused role or a
   repository no longer connected is left out and not recorded as a refused sign-in; one the forge
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
   200 connected repositories. A `hub login` session gets 403 `forbidden`. The Hub keeps each
@@ -577,13 +578,22 @@ on no others:
 - `GET /v1/hub/repos/{repo}/intents`
 - `GET /v1/hub/repos/{repo}/work`
 - `GET /v1/hub/repos/{repo}/activity`
+- `GET /v1/hub/repos/{repo}/forge-coordination` and `GET /v1/hub/repos/{repo}/slack` (what is
+  switched on for the repository, and the Hub's Slack direct messages for the token's owner; see
+  the [API](api.md#hub-repository-setup-reads))
 - `GET /v1/hub/health`, which needs no token
+- `GET /v1/hub/repos/{repo}/after-merge` (whether the Hub watches the repository's CI and
+  deployments after a merge)
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - `GET /v1/hub/standup/briefing`, `GET /v1/hub/standup/overview`, `GET /v1/hub/standup/work?q=`
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
-  `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
-  `GET /v1/hub/standup/inbox` for the token's repository
+  `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination`,
+  `GET /v1/hub/standup/inbox` and `GET /v1/hub/standup/why` for the token's repository
+- `GET /v1/hub/standup/repositories`, current Work in every connected repository on the person's
+  forge host that the token's person can read now
+- `POST /v1/hub/standup/preflight`, the exact-subject check: it changes no Work and records no
+  event, though it may store catch-up backfill and merge-observation rows
 - `GET /v1/hub/standup/digest` and `GET /v1/hub/standup/digest/settings` (see
   [weekly digest](#weekly-digest))
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
@@ -596,11 +606,14 @@ on no others:
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
 - `GET /v1/hub/repos/{repo}/pr-context?number=…` ([retained PR context](advanced/pr-context.md), no provider refresh)
+- `GET /v1/hub/repos/{repo}/retention` (the Hub's retention limits for the repository and the
+  stand-up bytes it holds now; see the [API](api.md#hub-retention))
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
   `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`, `agentscm_pr_context`,
   `agentscm_work_pr_link`, `agentscm_work_pr_link_set`,
-  `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
+  `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_why`, `agentscm_work_repositories`,
+  `agentscm_publications_list`, `agentscm_workflow_runs_list`,
   `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
@@ -830,6 +843,12 @@ hold lapses. A failure never refuses. The holder's task is cut to 80 printable A
 characters without quotes, backticks, angle brackets or markup, so it cannot
 leave its quotes; names are filtered the same way.
 
+A file that Git reports as unmerged in the editing agent's checkout is not checked while its
+conflict lasts. The connected hook client leaves that path out of its call, so this refusal,
+`EDIT_UNLINKED` and `LEASE_LAPSED` do not apply to the edit that resolves the conflict, and the
+edit holds nothing. The [agents guide](agents.md) gives the reason and the limits, under "An edit
+that resolves a Git conflict is not checked".
+
 Notes (the advice for an MCP check, Cursor, the Copilot CLI after an edit, or a
 rate-limited edit) use the same factual wording:
 
@@ -975,7 +994,17 @@ shapes of their routes for the token's repository: `agentscm_work_search` `{q?, 
 `GET /v1/hub/standup/work`), `agentscm_publications_list` `{q?, limit?, cursor?}` (as the publications
 list, `cursor` being `before`) and `agentscm_workflow_runs_list` `{q?, before?}` (as
 `GET /v1/hub/skill-workflows`). The work overview view also has a "Find work" box that calls
-`agentscm_work_search` and loads further pages on request.
+`agentscm_work_search` and loads further pages on request. `q` also matches the summary of a
+decision checkpoint.
+
+`agentscm_why` `{commit}` or `{path}` (as `GET /v1/hub/standup/why`, and `agentscm why` on the
+command line) answers why a commit or a path exists: the Work recorded for it, newest first, with
+its description, latest checkpoint and decision checkpoints. A commit resolves only through a pull
+request and its linked Work; a path resolves through declared Work scope. `known: false` means the
+Hub recorded no Work for it. The opt-in tool `agentscm_work_repositories` (as
+`GET /v1/hub/standup/repositories`) lists current Work in every connected repository on the person's
+forge host that the token's person can read now, redacted as other Work reads are; see
+[agents](agents.md#work-in-your-persons-other-repositories) and [API](api.md).
 
 The six coordination tools use repo-relative path specs and carry the session's new notices.
 The workflow reads use no session and write no coordination events. `GET /v1/hub/skill-workflows`
@@ -1028,6 +1057,16 @@ id; their intents write the usual intent events. `GET /v1/hub/health` adds
 "undeclared", "hook_p95_ms"}` (`undeclared`: sessions told once to declare their Work,
 refused or noted), counted by this hub process since it started (p95 over the
 last 1024 hook calls). Session rows untouched for 7 days are pruned.
+
+Each refusal and overlap notice is also kept in `hub_contested_edits` with the outcome the Hub
+later observes, and each session's hook calls, injected characters and the hook client's own
+latency, timeout and fail-open counts (sent with its next call in `x-agentscm-hook-report`) in
+`hub_hook_overhead`. Both keep rows 30 days, at most 1,000 per token, and are read by
+[value metrics](work-insights.md#contested-edits-and-hook-overhead). Each client report carries
+an id and is counted once per session. Hook-call totals are held in memory and written about 30
+seconds after the first call since the last write; only tokens the store has accepted get totals
+of their own. A Hub restart loses totals not yet written and forgets which report ids it counted,
+so a report resent across a restart can be counted twice.
 
 ## Change-record capture and handoff
 
@@ -1203,7 +1242,7 @@ live agents and the last activity, worst first; a row opens that repository's Da
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
-person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request that waits on the viewer's own paused or stale work also shows in the Dashboard's Needs you, since that agent cannot answer it, and the refused agent's `agentscm_start` reply says its lead is not running, History (Finished, Changes, Change records, and Files from this
+person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request is its target's lead agent's to answer and never shows in the Dashboard's Needs you; when that lead is paused or quiet the refused agent's `agentscm_start` reply says its lead is not running, and once the target's hold has lapsed the asker's next start takes the files, History (Finished, Changes, Change records, and Files from this
 computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
 Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
 [local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in

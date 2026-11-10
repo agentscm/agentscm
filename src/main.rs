@@ -74,6 +74,7 @@ mod git_snapshot_cli;
 #[cfg(unix)]
 mod guided_cli;
 mod hook_cli;
+mod hook_report;
 #[cfg(unix)]
 mod hosted_workflow_client;
 mod hub_cli;
@@ -94,6 +95,7 @@ mod local_validation_cli;
 mod managed_work;
 #[cfg(unix)]
 mod merge_cli;
+mod message_wait;
 #[cfg(unix)]
 mod open_cli;
 #[cfg(unix)]
@@ -311,6 +313,10 @@ enum Command {
     /// saved connection), or `agentscm hook <agent|generic> [--hub-url URL] [--repo OWNER/NAME]`
     /// with the token from AGENTSCM_HUB_TOKEN(_FILE) or hub.json.
     Hook(hook_cli::HookArgs),
+    /// Claude Code's background hook: waits at the Hub for a message to this session and wakes
+    /// the session with it (exit 2); exits 0 otherwise. `client setup` installs it.
+    #[command(hide = true)]
+    HookWait(message_wait::HookWaitArgs),
     /// Write this Git repository's shared agent instructions (AGENTS.md and the files that point
     /// each agent at it). Hooks and MCP come from `agentscm client setup` on each machine.
     InitRepo(init_cli::InitArgs),
@@ -1059,6 +1065,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
         #[cfg(unix)]
         Command::Walkthrough { command } => print_json(&walkthrough_cli::run(command)?),
         Command::Hook(args) => hook_cli::run(args).await,
+        Command::HookWait(args) => message_wait::run(args).await,
         Command::InitRepo(args) => init_cli::run(args)?,
         Command::Client { command } => client_cli::run(command).await?,
         #[cfg(unix)]
@@ -1587,6 +1594,7 @@ fn verified_install_command(command: &Command) -> bool {
         command,
         Command::Demo(_)
             | Command::Hook(_)
+            | Command::HookWait(_)
             | Command::Telemetry {
                 command: telemetry_cli::TelemetryCommand::Off
                     | telemetry_cli::TelemetryCommand::Send

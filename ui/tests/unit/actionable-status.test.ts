@@ -31,13 +31,11 @@ describe('shared actionable status', () => {
   it('badges the same needs the menu-bar companion counts', () => {
     const status = decodeStatus(surfaces)
     const rail = dashboardStatus(null, null, null, null, new Set(), undefined, status).needs
-    expect(rail.map((n) => n.key).sort()).toEqual([
-      'file:src/shared.rs',
-      'pr:rep_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:7',
-      'request:crq_cccccccccccccccccccccccccccccccc:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      'status:wrk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    ])
+    // Only the blocked task asks its person. The quiet task, the request to it, the shared file and the
+    // pull request over a held file are listed for agents and are not counted.
+    expect(rail.map((n) => n.key).sort()).toEqual(['blocked:wrk_ffffffffffffffffffffffffffffffff'])
     expect(rail).toHaveLength(status.counts.needs_you)
+    expect(status.actions.filter((a) => a.needs_you)).toHaveLength(0)
   })
   it('uses semantic action versions for browser dismissals with legacy fixture compatibility', () => {
     const status = decodeStatus(fixture)

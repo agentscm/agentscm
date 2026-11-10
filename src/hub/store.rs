@@ -1168,6 +1168,15 @@ pub trait Store: Send + Sync {
         observation: &super::value_metrics::ValueObservation,
         now: i64,
     ) -> Result<()>;
+    /// Adds one hook call to its session's overhead row, for an authenticated token of
+    /// `repository`; rows are kept 30 days and at most 1,000 per token (see `hook_overhead`).
+    fn hook_overhead(
+        &self,
+        token: &str,
+        repository: &str,
+        sample: &super::hook_overhead::Sample,
+        now: i64,
+    ) -> Result<()>;
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
@@ -1310,6 +1319,9 @@ pub trait Store: Send + Sync {
     ) -> Result<super::work::WorkRepositoryRenameResult>;
     /// Every repository scope that retains Work items or coordination requests.
     fn work_compaction_scopes(&self) -> Result<Vec<WorkRepositoryScope>>;
+    /// Bytes of stand-up payload the repository retains now, against `WORK_PAYLOAD_CAPACITY_BYTES`.
+    /// A repository that never wrote reports 0.
+    fn work_payload_used(&self, scope: &WorkRepositoryScope) -> Result<i64>;
     /// Trusted workspace calls only: authorization is held across this transaction.
     fn promise_create(
         &self,

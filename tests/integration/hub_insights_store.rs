@@ -1984,6 +1984,7 @@ fn value_capture_diagnostics_and_unsupported_outcomes(db: &Db) {
             .any(|g| g.contains("Observation capture failed"))
     );
     let wire = serde_json::to_value(browser).unwrap();
+    // No hook session ran here, so an override could not have been seen: dismissed is unknown.
     for path in [
         "/issues/dismissed",
         "/issues/false_trigger",
@@ -2064,6 +2065,7 @@ fn value_aged_finished_followups_keep_actionable_and_period_cohorts_separate(db:
             default_branch: Some("main".into()),
             observed_at: old,
             reported_by: None,
+            local_skills: None,
         })
         .unwrap();
     let policy = value_metrics::identity(&["null"]);

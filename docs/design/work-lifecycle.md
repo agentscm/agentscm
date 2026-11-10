@@ -125,6 +125,8 @@ reservation on purpose and records why. Terminal transitions end the Work and dr
 Finished Work holds nothing under any outcome, and a merged pull request never changes outcome or
 reservation by itself; it is a provider fact shown beside them.
 
+Shared status names the lead agent of unfinished Work whose merge was observed, and says that only its close is left: the lead completes it, or resumes it if more remains. A routine handover also names the lead agent and sets `needs_you: false`, whether or not a merge is observed. A handover carrying an unresolved `item.blocker` still asks the person and shows the specific reported blocker. Routing uses structured state and blocker fields, without interpreting `next_action` prose. A hold still held lapses by itself; the Hub does not complete Work or release its reservation from either a handover or a merge. The observation matches a branch name, Work may span several pull requests, and an outcome records who stated it, which a merge cannot.
+
 ## 5. Atomic side effects
 
 In the same transaction, in both stores:
@@ -192,22 +194,7 @@ a completion, the session's next edit needs a new `agentscm_start`, and the repl
 
 ## 6. The WorkOperationalV1 projection
 
-`WorkOperationalV1` has `schema_version: 2` and `deny_unknown_fields`; version 2 added the lease
-to `activity`. Fields: `work_id`, `state`,
-`generation`, `updated_seq`; `outcome` (`value` of `completed`, `abandoned`, `superseded`, `unstated`
-or `none`, with a `provenance` of `agent_report`, `person`, `admin` or `unknown`); `reservation`
-(`status`, `basis`, `scope`, `holder_agent`, `holder_session`; never a token id); `report` (time and
-kind of the last agent report); `freshness` (the existing claim status); `activity` (`live` or
-`lapsed` for a held reservation, from its lease at request time, with `lease_renewed_at`,
-`lease_expires_at`, `lease_grace_at` (when the Hub last extended the lease after a restart or a
-clock gap, cleared by the next renewal, admission or decision), a reason that says what to do and
-who last extended the lease, and `coverage`: what renews the lead session's lease; `unknown` when
-nothing is held); `merge`
-(`hidden_by_merged_pr` and a status: `observed` when hidden by a merged pull request, `none` only when
-the Hub knows its forge pull-request read reached back to the Work's creation and the merge rule applies
-to the Work, otherwise `unknown`); `actionable` (a recipient of
-`lead`, `owner`, `admin` or `none`, with a reason); `remedies`; and `completeness` (`complete` and
-the list of `unknown` field names).
+`WorkOperationalV1` has `schema_version: 2` and `deny_unknown_fields`; version 2 added the lease to `activity`. Fields: `work_id`, `state`, `generation`, `updated_seq`; `outcome` (`value` of `completed`, `abandoned`, `superseded`, `unstated` or `none`, with a `provenance` of `agent_report`, `person`, `admin` or `unknown`); `reservation` (`status`, `basis`, `scope`, `holder_agent`, `holder_session`; never a token id); `report` (time and kind of the last agent report); `freshness` (the existing claim status); `activity` (`live` or `lapsed` for a held reservation, from its lease at request time, with `lease_renewed_at`, `lease_expires_at`, `lease_grace_at` (when the Hub last extended the lease after a restart or a clock gap, cleared by the next renewal, admission or decision), a reason that says what to do and who last extended the lease, and `coverage`: what renews the lead session's lease; `unknown` when nothing is held); `merge` (`hidden_by_merged_pr` and a status: `observed` when the legacy merged-branch predicate below matches, `none` only when the Hub knows its forge pull-request read reached back to the Work's creation and the merge rule applies to the Work, otherwise `unknown`); `actionable` (a recipient of `lead`, `owner`, `admin` or `none`, with a reason); `remedies`; and `completeness` (`complete` and the list of `unknown` field names).
 
 `reservation.status` is `held` while the reservation blocks overlapping Work, `lapsed` once its
 lease expired (it then blocks nobody and the next admission over its scope clears it) and `none`
@@ -267,7 +254,7 @@ page action of section 9 build on these routes.
 
 ## Reconciliation visibility
 
-Issue #312 keeps every held reservation visible in overview and briefing pages. The legacy `hidden_by_merged_pr` operational field retains the old heuristic observation for strict compatibility; it does not mean a held reservation is now hidden. Durable reconciliation uses explicit stable-repository PR/head conditions, retains owner-controlled reservation disposition and existing authorized remedies, and never changes outcome or reservation from a merge alone. See [Work reconciliation](work-reconciliation.md).
+Issue #312 keeps every held reservation visible in overview and briefing pages. The legacy `hidden_by_merged_pr` operational field retains the old heuristic observation for strict compatibility; it does not mean a held reservation is now hidden. Its predicate requires a provider-confirmed merge on the same non-base branch, no reported blocker, and a provider `merged_at` at or after the Work's last check-in, with the existing automatic-pause exception. A subsequent handover can therefore leave an older merge visible in durable catch-up while operational `merge.status` is `unknown`. Routine handover routing does not relax that predicate or let an older merge describe resumed work. Durable reconciliation uses explicit stable-repository PR/head conditions, retains owner-controlled reservation disposition and existing authorized remedies, and never changes outcome or reservation from a merge alone. See [Work reconciliation](work-reconciliation.md).
 
 ## 8. Liveness leases
 
@@ -390,6 +377,9 @@ any other.
   clock lengthens leases by the jump.
 - A shell call keeps its session's leases live for at most 60 minutes from the first call still
   running; a longer one lapses meanwhile, like a long non-shell call.
+- A running shell call keeps the lease, not the claim. Shared status reads the lead session as
+  there for 20 minutes after each call (section 10), so inside one call longer than that its row
+  reads quiet while the lease is still live for up to 60 minutes.
 - A session name is only a label within a token, so any holder of the token can send activity under
   the lead's session name and renew its lease. That gives nothing beyond what the token already
   allows.
@@ -473,3 +463,32 @@ an administrator's permitted transitions after a preview, sends one-item batches
 fences, and shows the outcome and its retry advice. #289's close of an orphaned request stays on
 the Inbox; when the target's lead token is gone too, the owner releases or ends the target Work, or
 has another agent resume it so the Inbox can close the request for that agent.
+
+## 10. Working and waiting sessions in shared status
+
+A claim follows its lead's reports: a start or a checkpoint sets `last_checkin_at`, a tool call
+does not. So the claim goes stale after `CLAIM_STALE_SECONDS` for a lead that works on without
+reporting, and for one that stopped to wait. Neither says the session is gone. Before shared
+status (`actionable_status.rs`) calls a row quiet, it reads what the session itself did: its calls,
+and the Hub's in-memory record of why it stopped (`session_waiting.rs`).
+
+- **Still calling.** While the lead session called the Hub within the last 20 minutes (the store's
+  live sessions, which the conflict and check readers already use), a stale claim reads
+  `freshness: active` on the row.
+- **Waiting for its person** (a permission prompt, a question or the end of its turn): the row is `awaiting_party`, names that person and reads `freshness: active`, from the moment the session stops. It does not set `needs_you`, because the person's `session_waiting` action asks them, 60 seconds later, and one wait counts once. Active and paused Work read this way. A reported blocker, a handover and an observed merge say more and are shown instead on the Work row. The separate `session_waiting` action still asks the person for a question or permission; routing a routine handover to an agent does not remove that action.
+- **Stopped on its own background work**, which will resume it: the row stays `active` and asks
+  nobody.
+- **How long.** A wait for a person is believed until the session's next call or its end, for at
+  most 24 hours and no longer than the agent token that reported it stays valid. A stop on
+  background work is believed for 60 minutes (`IN_FLIGHT_CAP_SECONDS`), as long as a running shell
+  call, because nothing shows that the background work still runs. After that the row reads from
+  the claim again.
+- **Unknown, never stale.** After a Hub restart, or when the Hub dropped a wait for room, a quiet
+  Work whose lead session has not called since reads `freshness: unknown` with the limit
+  `lead_wait_unknown`. It names nobody and needs nobody until that session calls again, or until
+  24 hours after its last check-in, when no wait could still be believed.
+- **Who is asked.** A row asks a person for Work its agent reported blocked, including a handover carrying an unresolved `item.blocker`, and for reassessment of such a blocker. The handover shows the specific reported blocker. A routine handover names the lead agent and sets `needs_you: false`, regardless of merge observation. The agent decides whether to complete the Work or resume it; shared status neither infers a blocker from `next_action` prose nor completes or releases the Work. A quiet or paused row asks nobody, held or not, because a hold its lead no longer renews lapses by itself. The projection's `actionable` field still names the owner for a held pause or handover; shared status does not turn that into something the owner must do.
+- **Not changed.** The store's `claim_status`, the operational projection's `freshness`, takeover
+  rules and which scope overlaps are listed still follow the lead's reports. Leases are untouched:
+  a waiting session's hold lapses 20 minutes after its last call like any other, so waiting never
+  blocks other Work for longer.

@@ -1146,6 +1146,35 @@ pub fn advisory_snapshot(
     })
 }
 
+/// Those of `paths` (repository-relative files) that Git reports as unmerged in the checkout at
+/// `repository`: a merge, rebase, cherry-pick, revert or stash apply stopped on them with a
+/// conflict, and they are not yet marked resolved. Paths are matched exactly.
+pub fn unmerged_paths(
+    git_path: &Path,
+    repository: &Path,
+    paths: &[&str],
+    deadline: Instant,
+) -> Result<Vec<String>> {
+    let git = Git {
+        exe: git_path,
+        repository,
+        deadline: Some(deadline),
+    };
+    let mut args = vec!["ls-files", "--unmerged", "-z", "--"];
+    args.extend(paths);
+    // One `<mode> <object> <stage>\t<path>` record for each stage of each unmerged path.
+    let listed = git.run(&args, None, ADVISORY_BYTES as u64)?;
+    let unmerged: BTreeSet<&[u8]> = listed
+        .split(|byte| *byte == 0)
+        .filter_map(|record| record.splitn(2, |byte| *byte == b'\t').nth(1))
+        .collect();
+    Ok(paths
+        .iter()
+        .filter(|path| unmerged.contains(path.as_bytes()))
+        .map(|path| (*path).to_owned())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

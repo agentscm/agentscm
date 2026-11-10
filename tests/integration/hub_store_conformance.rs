@@ -2702,12 +2702,16 @@ fn skill_adoption_and_evidence(db: &Db) {
         default_branch: (source == "default_branch").then(|| "main".to_owned()),
         observed_at: 10,
         reported_by: None,
+        // Only the forge's default-branch read stores repository skills.
+        local_skills: (source == "default_branch").then(|| "[{\"local\":1}]".to_owned()),
     };
     assert_eq!(store.skill_adoption(REPO).unwrap(), None);
     let checkout = store
         .skill_adoption_put(&adoption("reported_by_checkout", "{\"a\":1}"))
         .unwrap();
     assert_eq!(checkout.lock_json, "{\"a\":1}");
+    // A checkout report stores no repository skills.
+    assert_eq!(checkout.local_skills, None);
     // The forge replaces a checkout report; a checkout report never replaces the forge.
     let forge = store
         .skill_adoption_put(&adoption("default_branch", "{\"b\":2}"))
@@ -2716,6 +2720,8 @@ fn skill_adoption_and_evidence(db: &Db) {
         (forge.source.as_str(), forge.default_branch.as_deref()),
         ("default_branch", Some("main"))
     );
+    // Repository skills are stored and returned with the forge row.
+    assert_eq!(forge.local_skills.as_deref(), Some("[{\"local\":1}]"));
     let kept = store
         .skill_adoption_put(&adoption("reported_by_checkout", "{\"c\":3}"))
         .unwrap();
@@ -3708,6 +3714,35 @@ fn hand_off_pickups(db: &Db) {
     );
 }
 
+fn work_payload_used_reads_the_charged_bytes(db: &Db) {
+    use agentscm::hub::work::WorkRepositoryScope;
+
+    let store = db.open();
+    let scope = |repository_id: Option<i64>| WorkRepositoryScope {
+        provider: "github".into(),
+        host: "github.com".into(),
+        repository: REPO.into(),
+        repository_id,
+    };
+    // A repository that never wrote holds nothing.
+    assert_eq!(store.work_payload_used(&scope(Some(101))).unwrap(), 0);
+    db.exec(&format!(
+        "INSERT INTO hub_work_usage (provider, host, repository, repository_id, charged_bytes, updated_at)
+         VALUES ('github', 'github.com', '{REPO}', 101, 4096, 1),
+                ('github', 'github.com', '{REPO}', NULL, 77, 1)"
+    ))
+    .unwrap();
+    // The figure belongs to one repository identity: another id and a missing id are their own.
+    assert_eq!(store.work_payload_used(&scope(Some(101))).unwrap(), 4096);
+    assert_eq!(store.work_payload_used(&scope(Some(102))).unwrap(), 0);
+    assert_eq!(store.work_payload_used(&scope(None)).unwrap(), 77);
+    let other_host = WorkRepositoryScope {
+        host: "gitlab.example.test".into(),
+        ..scope(Some(101))
+    };
+    assert_eq!(store.work_payload_used(&other_host).unwrap(), 0);
+}
+
 conformance!(
     token_lookup,
     expiry,
@@ -3751,6 +3786,7 @@ conformance!(
     local_ci_events_carry_ids_only,
     local_ci_corrupt_records_are_refused,
     hand_off_pickups,
+    work_payload_used_reads_the_charged_bytes,
 );
 
 #[cfg(unix)]

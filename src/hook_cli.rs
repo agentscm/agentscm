@@ -15,6 +15,8 @@ use crate::hub_cli::config_dir;
 use crate::intent_cli::{HubFile, parse_hub_file, repo_root, token_for, valid_repo};
 use crate::{client_config, client_config::Connection};
 
+mod permission;
+
 const LIMIT: Duration = Duration::from_secs(3);
 /// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
 const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
@@ -151,9 +153,13 @@ async fn hook(
     let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
     let session_start = is_session_start(agent, &payload);
     let host_session = host_session(agent, &payload);
+    #[cfg(unix)]
     let wants_capture = client_connection
         && agent == "claude"
         && crate::change_capture_cli::captures_claude_event(&payload);
+    // Change capture is built for Unix only. Elsewhere the hook coordinates and captures nothing.
+    #[cfg(not(unix))]
+    let wants_capture = false;
     // Capture stops in time for the reply to be printed before the host's hook timeout.
     let budget = started
         + if session_start {
@@ -161,20 +167,17 @@ async fn hook(
         } else {
             CAPTURE_BUDGET
         };
+    #[cfg(unix)]
     let spawn_capture = || {
-        let (body, payload) = (body.clone(), std::sync::Arc::clone(&payload));
-        tokio::spawn(async move {
-            let routed = route_client("claude", &payload).ok()?;
-            crate::change_capture_cli::plugin_capture(
-                &body,
-                &payload,
-                routed.checkout,
-                routed.connection,
-                budget.into(),
-            )
-            .await
-        })
+        tokio::spawn(capture(
+            body.clone(),
+            std::sync::Arc::clone(&payload),
+            budget,
+        ))
     };
+    // Never called: nothing wants capture where it is not built.
+    #[cfg(not(unix))]
+    let spawn_capture = || tokio::spawn(std::future::ready(None::<String>));
     // At session start coordination may connect the checkout first, so capture follows it there
     // and runs beside it otherwise.
     let early = (wants_capture && !session_start).then(spawn_capture);
@@ -214,7 +217,27 @@ async fn hook(
         let remaining = budget.saturating_duration_since(Instant::now());
         let _ = tokio::time::timeout(remaining, recording).await;
     }
+    // The prompt is on screen and stays usable: offer it to the Hub and wait for the person's
+    // decision there. Any failure returns `reply`, which carries no decision.
+    if permission::applies(agent, client_connection, &payload) {
+        return permission::await_answer(&payload, started, reply).await;
+    }
     reply
+}
+
+/// Change capture for one call of the plugin's hook, run beside coordination: context for the
+/// session, when capture has some.
+#[cfg(unix)]
+async fn capture(body: Vec<u8>, payload: std::sync::Arc<Value>, budget: Instant) -> Option<String> {
+    let routed = route_client("claude", &payload).ok()?;
+    crate::change_capture_cli::plugin_capture(
+        &body,
+        &payload,
+        routed.checkout,
+        routed.connection,
+        budget.into(),
+    )
+    .await
 }
 
 /// Keeps the record that the checkout's MCP server reads to name its calls with this
@@ -237,6 +260,35 @@ fn host_session(agent: &str, payload: &Value) -> Option<tokio::task::JoinHandle<
         crate::client_session::forget(&config, &session);
     }
     None
+}
+
+/// Remembers which connection this session's hooks route to, so the checkout's MCP server names
+/// the same agent. Best effort and unchanged records are not rewritten: a failure leaves the
+/// MCP server on its default connection and never touches the hook's reply. The event that ends
+/// the session writes nothing: it has just dropped the record.
+fn record_session_route(payload: &Value, connection: &Connection) {
+    if let Ok(config) = config_dir() {
+        record_session_route_in(&config, payload, connection);
+    }
+}
+
+fn record_session_route_in(config: &Path, payload: &Value, connection: &Connection) {
+    let ended = matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    );
+    if let Some(session) = session_of(payload)
+        .filter(|id| id.len() <= 128 && !id.chars().any(char::is_control))
+        .filter(|_| !ended)
+    {
+        let _ = crate::client_session::record_route(
+            config,
+            session,
+            &connection.hub,
+            &connection.repo,
+            &connection.root,
+        );
+    }
 }
 
 /// How long capture may take from the plugin hook's start: the host stops the hook at 3 seconds
@@ -288,6 +340,12 @@ async fn coordinate(
     let remaining = deadline.saturating_duration_since(Instant::now());
     let activity = std::sync::Arc::new(ActivityTracker::new(agent));
     let local_note = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let measured = Instant::now();
+    let report = crate::hook_report::Pending::load(
+        config_dir().ok().as_deref(),
+        agent,
+        session_of(&payload),
+    );
     let mut call = tokio::spawn(call_hub(
         agent.to_owned(),
         flag_url,
@@ -300,9 +358,21 @@ async fn coordinate(
             activity_tracker: activity.clone(),
             local_note: local_note.clone(),
             deadline,
+            report: report.header(),
         },
     ));
-    let reply = match tokio::time::timeout(remaining, &mut call).await {
+    let result = tokio::time::timeout(remaining, &mut call).await;
+    let sent = match &result {
+        Ok(Ok(Ok(_))) => Some(crate::hook_report::Sent::Answered),
+        // Routing failed before a token was found: no Hub call was made.
+        Ok(Ok(Err(failure))) if failure.token_marker.is_none() => None,
+        Err(_) => Some(crate::hook_report::Sent::TimedOut),
+        _ => Some(crate::hook_report::Sent::FailedOpen),
+    };
+    if let Some(sent) = sent {
+        report.settle(measured.elapsed(), sent);
+    }
+    let reply = match result {
         Ok(Ok(Ok(reply))) => reply,
         Ok(Ok(Err(reason))) => unknown_failure(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
@@ -381,6 +451,7 @@ struct HubCallContext {
     activity_tracker: std::sync::Arc<ActivityTracker>,
     local_note: LocalObservation,
     deadline: Instant,
+    report: Option<String>,
 }
 
 async fn call_hub(
@@ -397,6 +468,7 @@ async fn call_hub(
         activity_tracker,
         local_note,
         deadline,
+        report,
     } = context;
     let supported_client = matches!(
         agent.as_str(),
@@ -459,6 +531,13 @@ async fn call_hub(
             let session_start = is_session_start(&agent, &payload);
             if renew(&routed.connection, session_start).await {
                 routed = route_client(&agent, &payload)?;
+            }
+            record_session_route(&payload, &routed.connection);
+            let conflicted = unmerged(&routed.checkout, &routed.edits, deadline);
+            if !conflicted.is_empty() {
+                routed.edits.retain(|edit| !conflicted.contains(&edit.path));
+                routed.payload = sanitized_client(&agent, &payload, &routed.edits)?;
+                note = Some(conflict_note(&conflicted));
             }
             if session_start {
                 // Every connected session says where it coordinates, unless something stops it.
@@ -553,6 +632,7 @@ async fn call_hub(
         token: token.clone(),
         root: root.as_deref().and_then(Path::to_str).map(str::to_owned),
         report_completion,
+        report,
         body: outbound_body,
     };
     // Legacy hooks also use the relay: its key binds the Hub/config, and framing preserves raw JSON.
@@ -665,9 +745,7 @@ fn branch_advisory_at(
         if !branch_marker(config, &key, "start", deadline) {
             return None;
         }
-        let git = crate::quickstart::detect::which("git")
-            .and_then(|path| path.canonicalize().ok())
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        let git = git_exe();
         let snapshot = match agentscm::git_collisions::advisory_snapshot(&git, checkout, deadline) {
             Ok(snapshot) => snapshot,
             Err(_) => return Some("AgentSCM branch advisory: local branch coverage unknown; session-start scan unavailable. Edits remain allowed.".into()),
@@ -747,6 +825,48 @@ fn branch_advisory_at(
         snapshot.observed_at, snapshot.head, snapshot.base_name, snapshot.base_commit,
         if snapshot.incomplete { ", incomplete" } else { "" }, lines.join("; "),
     ))
+}
+
+/// The Git executable for the bounded local queries, which take an absolute path.
+#[cfg(unix)]
+fn git_exe() -> PathBuf {
+    crate::quickstart::detect::which("git")
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+}
+
+/// The edit paths Git reports as unmerged in `checkout`: a merge, rebase, cherry-pick, revert or
+/// stash apply stopped on them. Resolving such a conflict is not parallel authoring: both sides
+/// are already committed, and it has to be resolved in this checkout whoever holds the file. So
+/// these paths are not sent to the Hub; the edit is checked against no hold and takes none. The
+/// normal check returns when Git no longer lists the path. Empty when Git cannot say.
+#[cfg(unix)]
+fn unmerged(checkout: &Path, edits: &[EditPath], deadline: Instant) -> Vec<String> {
+    if edits.is_empty() {
+        return Vec::new();
+    }
+    let paths: Vec<&str> = edits.iter().map(|edit| edit.path.as_str()).collect();
+    let deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+    // shortcut: one Git call for every edit (10 to 20 ms), look for Git's in-progress markers first if hook time matters
+    agentscm::git_collisions::unmerged_paths(&git_exe(), checkout, &paths, deadline)
+        .unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn unmerged(_: &Path, _: &[EditPath], _: Instant) -> Vec<String> {
+    Vec::new()
+}
+
+/// Said beside an edit of unmerged paths, so that it does not read as a silent pass.
+fn conflict_note(paths: &[String]) -> String {
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| agentscm::hub::advice::sanitize(path, 160))
+        .collect();
+    format!(
+        "AgentSCM: unresolved Git conflict in {} in this checkout, so this edit was not checked against other agents' holds and holds nothing. Change only what resolves the conflict; the normal check returns once Git no longer reports the path as unmerged.",
+        paths.join(", ")
+    )
 }
 
 #[cfg(unix)]
@@ -1180,6 +1300,8 @@ struct RoutedClient {
     checkout: PathBuf,
     endpoint_agent: String,
     payload: Value,
+    /// The call's edit paths, relative to `checkout`.
+    edits: Vec<EditPath>,
 }
 
 fn patch_text(input: &Value) -> Option<&str> {
@@ -1425,6 +1547,7 @@ fn route_client_with(
         connection,
         checkout,
         endpoint_agent: endpoint_agent.to_owned(),
+        edits: normalized,
     })
 }
 
@@ -1809,7 +1932,7 @@ fn wait_asks(payload: &Value) -> Option<String> {
         _ => return None,
     };
     let mut text = Value::String(text.split_whitespace().collect::<Vec<_>>().join(" "));
-    agentscm::change_capture::redact::redact_json(&mut text);
+    agentscm::redact::redact_json(&mut text);
     let text = text.as_str()?.chars().collect::<Vec<_>>();
     let tail: String = text[text.len().saturating_sub(ASKS_CHARS)..]
         .iter()
@@ -3545,6 +3668,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_session_end_hook_leaves_no_route_record() {
+        let config = tempfile::tempdir().unwrap();
+        let connection = connection(&std::env::temp_dir(), "acme/widgets");
+        let route = || {
+            crate::client_session::route_of(config.path(), "s-1", &connection.hub, &connection.repo)
+        };
+        let event = |name: &str| json!({"hook_event_name": name, "session_id": "s-1"});
+        record_session_route_in(config.path(), &event("PreToolUse"), &connection);
+        assert_eq!(route().as_deref(), Some(connection.root.as_path()));
+        // The end event drops the record first (as `host_session` does) and must not rewrite it.
+        for name in ["SessionEnd", "sessionEnd"] {
+            record_session_route_in(config.path(), &event("PreToolUse"), &connection);
+            crate::client_session::forget(config.path(), "s-1");
+            record_session_route_in(config.path(), &event(name), &connection);
+            assert_eq!(route(), None, "{name}");
+        }
+    }
+
     fn git_repo(parent: &Path, name: &str) -> PathBuf {
         let root = parent.join(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
@@ -4082,6 +4224,7 @@ mod tests {
             root: None,
             client: None,
             report_completion: false,
+            report: None,
             body: serde_json::to_vec(&routed.payload).unwrap(),
         }
         .request(&reqwest::Client::new(), "https://hub.example.test")

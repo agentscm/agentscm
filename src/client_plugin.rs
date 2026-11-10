@@ -126,16 +126,33 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     };
     // UserPromptSubmit fires only in the session the person types in, so requests reach it
     // there rather than a subagent. It runs on every prompt, hence the short timeout. Every tool
-    // call keeps the session's hold live; the Hub checks only the edits. Notification and Stop
-    // tell the Hub the session waits for its person; they never answer a prompt.
+    // call keeps the session's hold live; the Hub checks only the edits. Notification, Stop and
+    // PermissionRequest tell the Hub the session waits for its person. PermissionRequest also
+    // offers its prompt to the Hub and waits, up to 12 hours since the person may be away, for
+    // them to allow or deny it there; the prompt stays usable in the session meanwhile, and every
+    // failure leaves it to the session.
+    // The waiter runs in the background from session start and after every turn: it waits at
+    // the Hub for a message to this session and wakes it with one (asyncRewake, exit 2), idle or
+    // busy. Only one waits per session; it leaves on its own before this timeout.
+    let wait = json!({
+        "type":"command", "command":program,
+        "args":["--no-telemetry", "hook-wait", "claude"],
+        "timeout":crate::message_wait::MAX_LIFE.as_secs() + 300, "asyncRewake":true
+    });
+    // SessionEnd tells this session's waiter to leave, as /clear keeps the same process.
+    let wait_end = json!({
+        "type":"command", "command":program,
+        "args":["--no-telemetry", "hook-wait", "claude", "--end"], "timeout":5
+    });
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook(5)]}],
+        "SessionStart":[{"hooks":[hook(5), wait.clone()]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[{"hooks":[hook(5)]}],
         "PostToolUse":[{"hooks":[hook(3)]}],
         "Notification":[{"hooks":[hook(3)]}],
-        "Stop":[{"hooks":[hook(3)]}],
-        "SessionEnd":[{"hooks":[hook(3)]}],
+        "PermissionRequest":[{"hooks":[hook(43_200)]}],
+        "Stop":[{"hooks":[hook(3), wait]}],
+        "SessionEnd":[{"hooks":[hook(3), wait_end]}],
         // Only change capture uses these, for checkouts whose Hub shares agent conversations.
         "PostToolUseFailure":[{"hooks":[hook(3)]}],
         "MessageDisplay":[{"hooks":[hook(3)]}],
@@ -1207,6 +1224,26 @@ mod tests {
                 assert!(!hook.to_string().contains("hub-url"));
             }
         }
+        // The background waiter starts with the session and again after each turn, only there.
+        for event in ["SessionStart", "Stop"] {
+            let wait = &hooks["hooks"][event][0]["hooks"][1];
+            assert_eq!(
+                wait["args"],
+                json!(["--no-telemetry", "hook-wait", "claude"])
+            );
+            assert_eq!(wait["asyncRewake"], true);
+            assert!(wait["timeout"].as_u64().unwrap() > crate::message_wait::MAX_LIFE.as_secs());
+        }
+        // SessionEnd ends the waiter, briefly and in the foreground.
+        let end = &hooks["hooks"]["SessionEnd"][0]["hooks"][1];
+        assert_eq!(
+            end["args"],
+            json!(["--no-telemetry", "hook-wait", "claude", "--end"])
+        );
+        assert!(end.get("asyncRewake").is_none());
+        assert_eq!(end["timeout"], 5);
+        let waits = hooks.to_string().matches("hook-wait").count();
+        assert_eq!(waits, 3, "no other event starts or ends a waiter");
         // The MCP server is user scope too, and names no checkout of its own.
         assert_eq!(
             read(&old, "agentscm/.mcp.json"),
@@ -1434,6 +1471,7 @@ mod tests {
             "PreToolUse",
             "PostToolUse",
             "Notification",
+            "PermissionRequest",
             "Stop",
             "SessionEnd",
         ] {

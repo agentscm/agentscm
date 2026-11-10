@@ -1105,6 +1105,20 @@ impl Machine {
 
     /// One SessionStart hook in the checkout; returns the hook's JSON reply.
     fn session_start(&self, session: &str) -> Value {
+        self.session_start_in(&self.root(), session)
+    }
+
+    /// One SessionStart hook whose working directory is `cwd`.
+    fn session_start_in(&self, cwd: &std::path::Path, session: &str) -> Value {
+        self.hook_in(
+            cwd,
+            session,
+            json!({"hook_event_name": "SessionStart", "source": "startup"}),
+        )
+    }
+
+    /// One hook event, `event` plus the session and `cwd`; returns the hook's JSON reply.
+    fn hook_in(&self, cwd: &std::path::Path, session: &str, event: Value) -> Value {
         use std::io::Write;
         let mut child = self
             .command(&["--no-telemetry", "hook", "claude", "--client-connection"])
@@ -1112,8 +1126,9 @@ impl Machine {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let payload = json!({"hook_event_name": "SessionStart", "session_id": session,
-            "cwd": self.root(), "source": "startup"});
+        let mut payload = event;
+        payload["session_id"] = json!(session);
+        payload["cwd"] = json!(cwd);
         child
             .stdin
             .take()
@@ -1148,7 +1163,11 @@ impl Machine {
     }
 
     fn mcp(&self) -> Mcp {
-        let root = self.root();
+        self.mcp_at(&self.root())
+    }
+
+    /// A `client mcp` server started with `--root root`.
+    fn mcp_at(&self, root: &std::path::Path) -> Mcp {
         let mut child = self
             .command(&[
                 "--no-telemetry",
@@ -1408,6 +1427,57 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     assert_eq!(machine.renew()["result"], "refused");
 }
 
+/// Signing in again replaces this computer's credential, which revokes the agent tokens it
+/// issued; the sign-in renews each connected checkout, and names one it could not renew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signing_in_again_keeps_connected_checkouts_working() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let login = [
+        "hub",
+        "login",
+        "--hub",
+        hub.as_str(),
+        "--provider",
+        "github",
+    ];
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+    machine.session_start("s1");
+    let first = machine.token();
+    assert_eq!(env.whoami(&first).await, 200);
+
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains("was not renewed"), "{stderr}");
+    let second = machine.token();
+    assert_ne!(first, second);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&second).await, 200);
+
+    // A checkout that cannot be renewed is named with its fix; the sign-in, allowed by a role
+    // on another connected repository, still succeeds.
+    env.connect_repo("acme/gadgets", 4343, ALICE);
+    env.drop_role(ALICE);
+    let (ok, _, stderr) = machine.run(&login);
+    assert!(ok, "{stderr}");
+    let root = machine.root();
+    assert!(
+        stderr.contains(&format!(
+            "The connection of {} was not renewed (",
+            root.display()
+        )) && stderr.contains("reconnect it with `agentscm client connect` in that folder"),
+        "{stderr}"
+    );
+    // The next agent in the checkout is told too, since the menu bar app shows no output.
+    let reply = machine.session_start("s2");
+    assert!(context(&reply).contains("was not renewed"), "{reply}");
+}
+
 /// A session that starts in one repository and edits another declares its Work in the other:
 /// the MCP server sends the call to the repository of the file it names, under that
 /// repository's token and the session the start hook recorded for this agent host.
@@ -1507,6 +1577,90 @@ async fn a_session_declares_work_in_the_other_connected_repository_it_edits() {
     );
     assert_eq!(work(OTHER).len(), 1);
     assert!(work(REPO).is_empty());
+}
+
+/// A Claude Code session in a linked worktree that has its own connection is one agent: the
+/// MCP server, started in the main checkout, declares Work under the worktree connection the
+/// session's hooks use, not under the main checkout's.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_in_a_worktree_with_its_own_connection_declares_work_as_that_agent() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let main = machine.root();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&main)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    let linked = machine.home.path().join("linked");
+    git(&["worktree", "add", "-q", linked.to_str().unwrap()]);
+    let linked = linked.canonicalize().unwrap();
+    for (root, own) in [(&main, false), (&linked, true)] {
+        let mut args = vec!["--no-telemetry", "client", "connect"];
+        if own {
+            args.push("--own-connection");
+        }
+        args.extend(["--hub", &env.hub, "--provider", "github", "--root"]);
+        args.push(root.to_str().unwrap());
+        let (ok, _, stderr) = machine.run(&args);
+        assert!(ok, "{stderr}");
+    }
+
+    machine.session_start_in(&linked, "native-1");
+    let mut mcp = machine.mcp_at(&main);
+    let started = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the worktree", "session": "native-1"}),
+    );
+    assert_ne!(started["isError"], true, "{started}");
+    // The same repository, so the reply does not claim it left the session's repository.
+    assert!(!started["content"].to_string().contains("this call went to"));
+    // A session no hook routed stays on the main checkout's connection.
+    let default = mcp.call(
+        "agentscm_start",
+        json!({"task": "Work in the main checkout", "session": "native-2"}),
+    );
+    assert_ne!(default["isError"], true, "{default}");
+
+    let connections = machine.file("connections.json");
+    let token = connections["connections"][0]["owned_token_id"]
+        .as_str()
+        .unwrap();
+    let query = agentscm::hub::work::WorkOverviewQuery::default();
+    let current = env
+        .store
+        .work_overview(token, &query, unix_now())
+        .unwrap()
+        .current;
+    let lead = |task: &str| {
+        let work = current.iter().find(|work| work.title == task).unwrap();
+        work.lead_agent.clone()
+    };
+    let (worktree_agent, main_agent) = (
+        lead("Work in the worktree"),
+        lead("Work in the main checkout"),
+    );
+    assert_ne!(worktree_agent, main_agent, "{current:?}");
+    // Not asserted: the Work's lead is a Hub-side agent name, and no hook here declares Work
+    // that could be compared with it, so the two agents are told apart by name only.
+
+    // Ending the session drops its route record, and the hook does not write it back.
+    let routes = machine.config.path().join("agentscm/session-routes");
+    let recorded = || std::fs::read_dir(&routes).map_or(0, Iterator::count);
+    assert_eq!(recorded(), 1);
+    machine.hook_in(
+        &linked,
+        "native-1",
+        json!({"hook_event_name": "SessionEnd"}),
+    );
+    assert_eq!(recorded(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2891,6 +3045,279 @@ async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
     );
 }
 
+/// An agent reads current Work across the repositories its person can read now: the same role
+/// check as the All repositories page, another owner's sessions digested, lists bounded, and a
+/// repository the forge could not answer for counted, never named.
+#[tokio::test]
+async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    env.connect_repo("acme/docs", 4343, ALICE);
+    // Connected, but alice cannot read it: bob's only.
+    env.connect_repo("acme/secret", 4444, BOB);
+    // Alice could read this one, and lost access before she asked.
+    env.connect_repo("acme/gone", 4545, ALICE);
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.remove(&("acme/gone".into(), ALICE));
+        fake.levels.remove(&(4545, ALICE));
+    }
+    let (_, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let alice = minted["token"].as_str().unwrap().to_owned();
+    let path = "/v1/hub/standup/repositories";
+    let host = env.base.trim_start_matches("http://").to_owned();
+    let user = |user_id: i64, login: &str| {
+        env.store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: host.clone(),
+                    user_id,
+                },
+                login,
+            )
+            .unwrap()
+            .id
+    };
+    let (_, who) = env.get("/v1/hub/whoami", &alice).await;
+    let alice_id = user(ALICE, who["owner"]["login"].as_str().unwrap());
+    let bob_id = user(BOB, "bob");
+    // Each fresh read needs its own token: one token gets its last answer back for 30 seconds.
+    let fresh = |name: &str, read_only: bool| {
+        mint_bound_agent_token(&*env.store, &alice_id, name, REPO, REPO_ID, 600, read_only)
+            .unwrap()
+            .1
+    };
+
+    // A forge that cannot answer is counted, never named, and the answer is not complete.
+    env.fake.lock().unwrap().hub_reads_roles = false;
+    let (status, body) = env.get(path, fresh("probe", false).expose()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["repositories"], json!([]));
+    assert_eq!(
+        (&body["unchecked"], &body["complete"]),
+        (&json!(4), &json!(false))
+    );
+    env.fake.lock().unwrap().hub_reads_roles = true;
+
+    let start = |owner: &str, name: &str, repository: (&str, i64), n: usize, session: &str| {
+        let (bound, _, _) = mint_bound_agent_token(
+            &*env.store,
+            owner,
+            name,
+            repository.0,
+            repository.1,
+            600,
+            false,
+        )
+        .unwrap();
+        env.store
+            .work_start(
+                &bound,
+                &WorkStart {
+                    issue_choice: None,
+                    work_id: None,
+                    source: None,
+                    request_key: Some(format!("cross-{n}")),
+                    title: format!("Task {n}"),
+                    description: None,
+                    session: session.into(),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("src/{n}.rs")],
+                    branch: None,
+                    worktree: None,
+                    next_action: Some(format!("step {n}")),
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                    preflight: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+        bound
+    };
+    // More of alice's Work in acme/widgets than one repository lists.
+    for n in 0..11 {
+        start(
+            &alice_id,
+            &format!("agent-{n}"),
+            (REPO, REPO_ID),
+            n,
+            &format!("alice-{n}"),
+        );
+    }
+    // Bob's Work in acme/docs, which alice can read, led by an older client whose label names
+    // its host.
+    let bob_token = start(
+        &bob_id,
+        "client-bobs-laptop-a1b2c3",
+        ("acme/docs", 4343),
+        99,
+        "bob-session",
+    );
+    let digest = agentscm::hub::store::lower_hex_of(
+        format!("agentscm.hub.session-view.v1\0{bob_token}\0bob-session").as_bytes(),
+    )[..16]
+        .to_owned();
+
+    let reader = fresh("alice-reader", true);
+    let mut first = Value::Null;
+    for token in [alice.as_str(), reader.expose()] {
+        let (status, body) = env.get(path, token).await;
+        assert_eq!(status, 200, "{body}");
+        let names: Vec<_> = body["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["repository"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["acme/docs", REPO], "{body}");
+        assert_eq!(
+            (
+                &body["unchecked"],
+                &body["complete"],
+                &body["work_complete"]
+            ),
+            (&json!(0), &json!(true), &json!(true))
+        );
+        let docs = &body["repositories"][0];
+        assert_eq!(docs["work_complete"], true);
+        let theirs = &docs["work"][0];
+        assert_eq!(theirs["title"], "Task 99");
+        assert_eq!(theirs["owner_login"], "bob");
+        assert_eq!(theirs["next_action"], "step 99");
+        assert_eq!(theirs["scope"], json!(["src/99.rs"]));
+        assert_eq!(
+            (&theirs["blocked"], &theirs["waiting"]),
+            (&json!(false), &json!(false))
+        );
+        assert_eq!(
+            theirs["lead_session"], digest,
+            "another owner's session is digested"
+        );
+        assert_eq!(
+            theirs["lead_agent"], "client-host-a1b2c3",
+            "its host name is masked"
+        );
+        let widgets = &body["repositories"][1];
+        assert_eq!(widgets["work"].as_array().unwrap().len(), 10);
+        assert_eq!(widgets["work_complete"], false);
+        assert!(
+            widgets["work"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["lead_session"].as_str().unwrap().starts_with("alice-")),
+            "alice's own sessions stay as stored"
+        );
+        if first.is_null() {
+            first = body;
+        }
+    }
+
+    // Losing access shows on the next fresh read: the role is asked, not cached.
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.roles.remove(&("acme/docs".into(), ALICE));
+        fake.levels.remove(&(4343, ALICE));
+    }
+    let (_, body) = env.get(path, fresh("after-revoke", false).expose()).await;
+    let names: Vec<_> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["repository"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [REPO], "{body}");
+    // The token that asked within the last 30 seconds gets its earlier answer back.
+    let (_, again) = env.get(path, &alice).await;
+    assert_eq!(again, first);
+
+    // The MCP tool is the same read.
+    let (status, reply) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/mcp",
+            Some(&alice),
+            Some(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"agentscm_work_repositories","arguments":{}}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    let (_, body) = env.get(path, &alice).await;
+    assert_eq!(
+        reply["result"]["structuredContent"]["repositories"], body["repositories"],
+        "{reply}"
+    );
+}
+
+/// More Work across repositories than one agent read lists in all: the top-level `work_complete`
+/// says the overall cap cut a list, and the repositories past it list less.
+#[tokio::test]
+async fn the_agent_read_flags_the_overall_work_cap() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    let host = env.base.trim_start_matches("http://").to_owned();
+    let (_, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let alice = minted["token"].as_str().unwrap().to_owned();
+    let (_, who) = env.get("/v1/hub/whoami", &alice).await;
+    let alice_id = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host,
+                user_id: ALICE,
+            },
+            who["owner"]["login"].as_str().unwrap(),
+        )
+        .unwrap()
+        .id;
+    // Eleven repositories of ten Work each: 110, past the 100 one read lists.
+    for r in 0..11_i64 {
+        let (name, id) = (format!("acme/cap-{r:02}"), 5000 + r);
+        env.connect_repo(&name, id, ALICE);
+        let (bound, _, _) =
+            mint_bound_agent_token(&*env.store, &alice_id, "cap-agent", &name, id, 600, false)
+                .unwrap();
+        for n in 0..10 {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": format!("cap-{r}-{n}"), "title": format!("Cap {r} {n}"),
+                "session": format!("cap-{r}-{n}"), "scope": [format!("src/{n}.rs")]
+            }))
+            .unwrap();
+            assert_eq!(request.role, WorkRole::Lead);
+            env.store.work_start(&bound, &request, unix_now()).unwrap();
+        }
+    }
+    let (status, body) = env.get("/v1/hub/standup/repositories", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["work_complete"], false, "the overall cap cut a list");
+    let listed: Vec<usize> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["repository"].as_str().unwrap().starts_with("acme/cap-"))
+        .map(|row| row["work"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(listed.iter().sum::<usize>(), 100);
+    assert_eq!(listed.len(), 11);
+    assert_eq!((listed[0], listed[10]), (10, 0));
+    let last = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["repository"] == "acme/cap-10")
+        .unwrap();
+    assert_eq!(last["work_complete"], false);
+}
+
 #[tokio::test]
 async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only() {
     let env = Env::start("github").await;
@@ -3107,7 +3534,7 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
 
     // Catalog counts, recipient and next action are exactly the shared person/token projection.
     let mut work = started["item"].clone();
-    let mut previous_marker = Value::Null;
+    let mut previous_marker = None;
     for (operation, summary) in [
         ("catalog-handover-1", "Synthetic handover"),
         ("catalog-handover-2", "Synthetic updated handover"),
@@ -3147,13 +3574,16 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
         assert_eq!(row["work"][0]["state"], "awaiting_party");
         assert_eq!(row["work"][0]["recipient"], status["work"][0]["recipient"]);
         assert_eq!(row["work"][0]["next_action"], status["work"][0]["action"]);
-        assert_eq!(row["work"][0]["needs_you"], true);
-        assert!(row["attention_revision"].as_str().is_some());
-        assert_ne!(
-            row["attention_revision"], previous_marker,
-            "same count with changed action evidence changes attention identity"
-        );
-        previous_marker = row["attention_revision"].clone();
+        assert_eq!(row["work"][0]["needs_you"], false);
+        assert_eq!(row["status_counts"]["needs_you"], 0);
+        assert_eq!(row["attention_revision"], Value::Null);
+        if let Some(previous) = &previous_marker {
+            assert_eq!(
+                &row["attention_revision"], previous,
+                "routine handover updates do not create a personal obligation"
+            );
+        }
+        previous_marker = Some(row["attention_revision"].clone());
         let (_, again) = env
             .call(
                 &env.hub,
@@ -3170,7 +3600,8 @@ async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only()
             .find(|r| r["repository"] == REPO)
             .unwrap();
         assert_eq!(
-            again["attention_revision"], previous_marker,
+            Some(again["attention_revision"].clone()),
+            previous_marker,
             "poll time does not create new attention"
         );
     }
@@ -4036,6 +4467,188 @@ async fn a_person_dismisses_and_snoozes_their_own_attention_items() {
     );
 }
 
+const PERMISSIONS: &str = "/v1/hub/session/permissions";
+const PERMISSION_ANSWER: &str = "/v1/hub/session/permissions/answer";
+
+/// A person allows or denies a permission prompt their own agent's session waits at: only with
+/// the web sign-in and its CSRF token, only for their own active agent, once, and only while the
+/// session still waits at that prompt.
+#[tokio::test]
+async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
+    let env = Env::start("github").await;
+    let (alice, bob) = (page(&env, ALICE).await, page(&env, BOB).await);
+    let (token, secret) = agent_for(&env, &alice.id, "claude-code", false);
+    let session = "11111111-2222-3333-4444-555555555555";
+    // What the session's hooks send: the prompt, the host's notice that it is on screen, the
+    // registration, and the tool call that follows an answer in the session.
+    let agent = |path: &'static str, body: Value| {
+        env.call(&env.hub, Method::POST, path, Some(&secret), Some(body))
+    };
+    let prompt =
+        json!({"hook_event_name": "PermissionRequest", "session_id": session, "tool_name": "Bash"});
+    let shown = json!({"hook_event_name": "Notification", "session_id": session,
+        "notification_type": "permission_prompt"});
+    let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
+    let register = |hash: &str, complete: bool| {
+        json!({"session": session, "tool": "Bash", "display": "cargo publish",
+            "summary": "run a shell command: Publish the crate", "folder": "widgets",
+            "complete": complete, "input_hash": hash.repeat(64)})
+    };
+    let answer = |id: &Value, decision: &str| {
+        json!({"repository": REPO,
+            "request_id": id, "decision": decision})
+    };
+
+    assert_eq!(agent("/v1/hub/hook/claude", prompt.clone()).await.0, 200);
+    let (status, made) = agent("/v1/hub/permission/register", register("a", true)).await;
+    assert_eq!(
+        (status, &made["state"]),
+        (200, &json!("unconfirmed")),
+        "{made}"
+    );
+    let id = made["request_id"].clone();
+    // Until the host says a person can see the prompt, there is nothing to answer.
+    let early = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "deny")).await;
+    assert_eq!(early.0, 404, "{}", early.1);
+    assert_eq!(agent("/v1/hub/hook/claude", shown.clone()).await.0, 200);
+
+    // Signed out, a cookie without its CSRF token, another person and an unknown decision.
+    let (status, _) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            PERMISSION_ANSWER,
+            None,
+            Some(answer(&id, "allow")),
+        )
+        .await;
+    assert_eq!(status, 401);
+    let (status, refused) =
+        page_post(&env, &alice, false, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let (status, refused) =
+        page_post(&env, &bob, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+    let always = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "always")).await;
+    assert_eq!(always.0, 400);
+    // The list is the person's own, and shows a request only after the wait's first minute.
+    let list = format!("{PERMISSIONS}?repository={REPO}");
+    let listed = with_cookie(&env.hub, Method::GET, &list, &alice.cookie, None).await;
+    assert_eq!(listed, (200, json!({"requests": []})));
+
+    // Alice allows it once: the hook's poll hears exactly that, and the answer cannot be changed.
+    let (status, done) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(
+        (status, &done),
+        (200, &json!({"state": "answered", "decision": "allow"}))
+    );
+    let poll = json!({"request_id": id, "input_hash": "a".repeat(64), "wait_seconds": 0});
+    let (_, polled) = agent("/v1/hub/permission/poll", poll).await;
+    assert_eq!(
+        (&polled["state"], &polled["decision"]),
+        (&json!("answered"), &json!("allow"))
+    );
+    let again = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "allow")).await;
+    assert_eq!(again.0, 200);
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&id, "deny")).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("already_answered"))
+    );
+
+    // The tool ran. The next prompt's request says what of it is not shown, and can be allowed
+    // all the same.
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let mut partial = register("b", true);
+    partial.as_object_mut().unwrap().remove("complete");
+    partial["missing"] = json!({"cut_from": 31_400, "redacted": 2, "unshown": ["sandbox"]});
+    let (_, made) = agent("/v1/hub/permission/register", partial).await;
+    let cut = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let allowed = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "allow")).await;
+    assert_eq!(allowed.0, 200, "{}", allowed.1);
+
+    // An older hook says only that its request is incomplete. Once the session has moved on, an
+    // answer says so.
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("d", false)).await;
+    let late = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&late, "deny")).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (409, Some("answered_in_session"))
+    );
+
+    // A hook that offers one of the session's own choices and passes a typed reason on: what
+    // the person picks or types is what that hook's poll hears, and nothing else is added.
+    let offering = |hash: &str| {
+        let mut body = register(hash, true);
+        body["takes_reason"] = json!(true);
+        body["choices"] = json!([{"label": "Allow, and do not ask again for this",
+            "saves": "the rule Bash(cargo publish), for this session only"}]);
+        body
+    };
+    let heard = |id: &Value, hash: &str| {
+        let poll = json!({"request_id": id, "input_hash": hash.repeat(64), "wait_seconds": 0});
+        agent("/v1/hub/permission/poll", poll)
+    };
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", offering("e")).await;
+    let chosen = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let mut pick = answer(&chosen, "allow");
+    pick["reason"] = json!("because");
+    let unfit = page_post(&env, &alice, true, PERMISSION_ANSWER, pick.clone()).await;
+    assert_eq!(unfit.0, 400, "{}", unfit.1);
+    pick.as_object_mut().unwrap().remove("reason");
+    pick["choice"] = json!("0");
+    let picked = page_post(&env, &alice, true, PERMISSION_ANSWER, pick).await;
+    assert_eq!(picked.0, 200, "{}", picked.1);
+    let (_, polled) = heard(&chosen, "e").await;
+    assert_eq!(
+        (&polled["decision"], &polled["choice"], polled.get("reason")),
+        (&json!("allow"), &json!(0), None)
+    );
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", offering("f")).await;
+    let denied = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
+    let mut no = answer(&denied, "deny");
+    no["reason"] = json!("use the staging key");
+    let said = page_post(&env, &alice, true, PERMISSION_ANSWER, no).await;
+    assert_eq!(said.0, 200, "{}", said.1);
+    let (_, polled) = heard(&denied, "f").await;
+    assert_eq!(
+        (&polled["decision"], &polled["reason"], polled.get("choice")),
+        (&json!("deny"), &json!("use the staging key"), None)
+    );
+    agent("/v1/hub/hook/claude", ran).await;
+
+    // A person no longer answers for an agent whose token was revoked.
+    agent("/v1/hub/hook/claude", prompt).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("c", true)).await;
+    let last = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown).await;
+    assert!(env.store.revoke_agent_token(&token).unwrap());
+    let (status, refused) =
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&last, "deny")).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_your_agent"))
+    );
+}
+
 const AGENT_MESSAGES: &str = "/v1/hub/session/agent-messages";
 
 async fn mcp_call(env: &Env, token: &str, method: &str, params: Value) -> Value {
@@ -4077,7 +4690,8 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(page0["mode"], "manual", "{page0}");
     assert_eq!(page0["sessions"], json!([]));
 
-    // An MCP-only client: its initialize names it, its first call names its session.
+    // Gemini CLI: its initialize names it, its first call names its session. MCP alone does not
+    // show that a person leads the session rather than a subagent, so its tier is unknown.
     mcp_call(
         &env,
         &alice_secret,
@@ -4090,7 +4704,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await;
     let seen = read().await;
     let session = seen["sessions"][0].clone();
-    assert_eq!(session["tier"], "mcp", "{seen}");
+    assert_eq!(session["tier"], "unknown", "{seen}");
     assert_eq!(session["name"], "gemini-cli");
     assert_eq!(session["token_name"], "laptop");
     let s1 = session["session"].as_str().unwrap().to_owned();
@@ -4127,10 +4741,25 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(message["state"], "queued");
     let id = message["id"].as_str().unwrap().to_owned();
 
-    // A call that names no session never takes it.
+    // A call that names no session never takes it, and nor does a session shown only by MCP.
     let no_session = json!({"name":"agentscm_status","arguments":{}});
     let unnamed = texts(&mcp_call(&env, &alice_secret, "tools/call", no_session).await);
     assert!(!unnamed.contains(&id), "{unnamed}");
+    let held = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
+    assert!(!held.contains(&id), "{held}");
+
+    // Its hook's start carries no subagent marker, and that hook cannot carry context.
+    let response = browser()
+        .post(format!("{}/v1/hub/hook/generic", env.hub))
+        .bearer_auth(&alice_secret)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"event":"start","agent":"gemini","session":"s1"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let seen = read().await;
+    assert_eq!(seen["sessions"][0]["tier"], "mcp", "{seen}");
 
     // Delivered once, in the next tool result, as a notice that names no mode.
     let text = texts(&mcp_call(&env, &alice_secret, "tools/call", status_call.clone()).await);
@@ -4161,6 +4790,14 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(forged["isError"], true, "{forged}");
+    // Without its session the Hub does not guess one: it asks for the field.
+    let unnamed = json!({"name":"agentscm_hub_message",
+        "arguments":{"id": id, "status": "accepted"}});
+    let unnamed = mcp_call(&env, &alice_secret, "tools/call", unnamed).await;
+    assert_eq!(unnamed["isError"], true, "{unnamed}");
+    let error = &unnamed["structuredContent"]["error"];
+    assert_eq!(error["recovery"]["action"], "provide_field", "{unnamed}");
+    assert_eq!(error["fields"][0]["name"], "session", "{unnamed}");
     let ok = mcp_call(&env, &alice_secret, "tools/call", answer("accepted")).await;
     assert_eq!(ok["isError"], false, "{ok}");
     let verified = texts(&ok);
@@ -4174,9 +4811,13 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     assert_eq!(read().await["messages"][0]["state"], "done");
 
     // A hook client gets it in the next prompt's added context, with no tool call.
-    let hook = |session: &str| {
+    let hook = |session: &str, subagent: bool| {
         let (hub, secret) = (env.hub.clone(), alice_secret.clone());
-        let body = json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        let mut body =
+            json!({"hook_event_name":"UserPromptSubmit","session_id":session,"prompt":"hi"});
+        if subagent {
+            body["agent_id"] = json!("sub-1");
+        }
         async move {
             let response = browser()
                 .post(format!("{hub}/v1/hub/hook/claude"))
@@ -4189,7 +4830,7 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
             serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
         }
     };
-    hook("h1").await;
+    hook("h1", false).await;
     let h1 = read().await["sessions"]
         .as_array()
         .unwrap()
@@ -4208,12 +4849,36 @@ async fn a_person_messages_only_their_own_session_which_answers_with_receipts() 
     )
     .await;
     assert_eq!(status, 201);
-    let reply = hook("h1").await;
+    let reply = hook("h1", false).await;
     let context = reply["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_default();
     assert!(context.contains("Auto please"), "{reply}");
     assert_eq!(read().await["messages"][0]["via"], "hook:claude");
+
+    // A session seen only through a subagent's hook calls is offered nothing.
+    hook("sub1", true).await;
+    let sub = read().await["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["hook"] == "hook:claude" && s["session"] != h1.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(sub["tier"], "unknown", "{sub}");
+    let sub = sub["session"].as_str().unwrap().to_owned();
+    let (status, _) = page_post(
+        &env,
+        &alice,
+        true,
+        AGENT_MESSAGES,
+        send(&alice_token, &sub, "Not for a subagent"),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let reply = hook("sub1", true).await;
+    assert!(!reply.to_string().contains("Not for a subagent"), "{reply}");
+    assert_eq!(read().await["messages"][0]["state"], "queued");
 
     // Ignore holds everything: sending is refused.
     let mode = |mode: Value| json!({"repository": REPO, "this_repository": true, "mode": mode});

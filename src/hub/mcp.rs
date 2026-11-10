@@ -85,8 +85,9 @@ const SKILL_TOOLS: [&str; 3] = [
     "agentscm_skill_status",
     "agentscm_skill_evidence",
 ];
-const OPT_IN_TOOLS: [&str; 5] = [
+const OPT_IN_TOOLS: [&str; 6] = [
     "agentscm_change_record",
+    "agentscm_work_repositories",
     "agentscm_workflow_status",
     "agentscm_shared_conversation",
     "agentscm_publications_list",
@@ -563,6 +564,7 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_workflow_status"
                     | "agentscm_work_search"
                     | "agentscm_why"
+                    | "agentscm_work_repositories"
                     | "agentscm_publications_list"
                     | "agentscm_workflow_runs_list"
                     | "agentscm_coordination_inbox"
@@ -854,6 +856,10 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             "commit":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
             "path":{"type":"string","maxLength":4096}
         }), &[])});
+    let work_repositories = json!({"name": "agentscm_work_repositories",
+        "description": "Pure read: current unfinished Work in each repository on this Hub that your person can read now, bounded, with completeness flags.",
+        "annotations": {"readOnlyHint": true},
+        "inputSchema": schema(json!({}), &[])});
     let publications = json!({"name": "agentscm_publications_list",
         "description": "Lists this repository's publications (published branches and pull requests), newest first, from stored rows only. A search examines at most the 256 newest publications below the cursor, so a page can be short while next_cursor is set (complete is false); searched_to names the oldest one examined. q matches branch, title, base, publication id, owner, agent name or a pull request number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
         "annotations": {"readOnlyHint": true},
@@ -1017,6 +1023,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
             contribution_receipt,
             work_search,
             why,
+            work_repositories,
             publications,
             workflow_runs,
             skill_list,
@@ -1211,6 +1218,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
         receipt_settings,
         work_search,
         why,
+        work_repositories,
         publications,
         workflow_runs,
         usage,
@@ -1236,7 +1244,7 @@ fn tools(read_only: bool, settings: &ViewSettings, all: bool, skills: bool) -> V
          "inputSchema": schema(json!({
              "id": {"type": "string", "description": "The message id (msg_...)."},
              "status": {"type": "string", "enum": ["accepted", "declined", "done"]},
-             "session": session}), &["id", "status"])},
+             "session": session}), &["id", "status", "session"])},
         {"name": "agentscm_view_settings",
          "description": "Reads or changes your own setting for inline views (MCP Apps) of work overview and coordination inbox. It affects only your own agents, not other users; your choice wins over the hub default, which a workspace administrator changes in the hub UI. Omit all arguments to read. Returns effective, hub_default and override.",
          "inputSchema": schema(json!({
@@ -1601,8 +1609,9 @@ async fn call(
     }
     // What the session's own person sent it from the Hub page rides on its next tool call. Only a
     // call naming its own session takes it: without one the Hub would guess the token's recent hook
-    // session. A session whose hook carries context takes it there, where subagents are excluded;
-    // an MCP call cannot say whether a subagent made it.
+    // session. An MCP call cannot say whether a subagent made it, so it takes messages only for a
+    // session a top-level hook call has shown and whose hook cannot carry them; a hook that can
+    // takes them itself, where subagents are excluded.
     if !principal.read_only
         && let Some(requested) = params
             .and_then(|p| p["arguments"]["session"].as_str())
@@ -1614,7 +1623,7 @@ async fn call(
             let now = unix_now();
             let session = store.session_name_for(&scope.token_id, Some(requested.as_str()), now)?;
             super::agent_messages::note_mcp(&scope.token_id, install.as_deref(), &session, now);
-            if super::agent_messages::hook_delivers(&scope.token_id, &session) {
+            if !super::agent_messages::mcp_delivers(&scope.token_id, &session) {
                 return Ok(None);
             }
             super::agent_messages::take(&*store, &scope, &session, "mcp", now)
@@ -1941,6 +1950,7 @@ async fn call_inner(
             | "agentscm_workflow_status"
             | "agentscm_work_search"
             | "agentscm_why"
+            | "agentscm_work_repositories"
             | "agentscm_publications_list"
             | "agentscm_workflow_runs_list"
             | "agentscm_promises_list"
@@ -2098,7 +2108,7 @@ async fn call_inner(
             match blocking(state, move || {
                 let now = unix_now();
                 let session =
-                    store.session_name_for(&scope.token_id, args.session.as_deref(), now)?;
+                    store.session_name_for(&scope.token_id, Some(args.session.as_str()), now)?;
                 super::agent_messages::answer(&*store, &scope, &session, &args.id, args.status, now)
             })
             .await
@@ -2493,6 +2503,17 @@ async fn call_inner(
             Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(workflow_status(state, principal, &run_id).await);
+    }
+    if name == "agentscm_work_repositories" {
+        if let Err(error) = try_args::<EmptyArgs>(arguments) {
+            return Ok(invalid_args(name, &error));
+        }
+        return Ok(
+            match super::login::devices::agent_repositories(state, principal).await {
+                Ok(value) => structured(&value),
+                Err(error) => error.envelope().clone().mcp(),
+            },
+        );
     }
     if matches!(
         name,
