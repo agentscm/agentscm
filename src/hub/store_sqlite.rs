@@ -9280,6 +9280,7 @@ impl Store for SqliteStore {
                         token,
                         agent: row.get(1)?,
                         owner: row.get(2)?,
+                        owner_id: owner,
                         intent: row.get(3)?,
                         task: row.get(4)?,
                         via: row.get(5)?,

@@ -169,7 +169,8 @@ pub struct HubEvent {
 pub struct SessionView {
     /// Stable per session and not its id; see [`session_key`].
     pub key: String,
-    /// The Hub's name for the session, to look up what the Hub holds for it. Never sent.
+    /// The Hub's name for the session, to look up what the Hub holds for it. Sent only to the
+    /// session's own person, as their Work replies name it.
     pub session: String,
     /// The session's owner-wide name; see [`owner_session`].
     pub name: Option<String>,
@@ -177,7 +178,11 @@ pub struct SessionView {
     pub started_by: Option<String>,
     pub token: String,
     pub agent: String,
+    /// The login of the person whose agent token the session is on.
     pub owner: String,
+    /// That person's id. Two people can carry one login for a while after a rename, so whose a
+    /// session is is decided by this. Never sent.
+    pub owner_id: String,
     pub intent: Option<String>,
     pub task: Option<String>,
     /// Canonical JSON array of connection modes.

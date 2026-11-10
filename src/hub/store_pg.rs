@@ -9190,6 +9190,7 @@ impl Store for PgStore {
                         token: row.get(0),
                         agent: row.get(1),
                         owner: row.get(2),
+                        owner_id: owner,
                         intent: row.get(3),
                         task: row.get(4),
                         via: row.get(5),
