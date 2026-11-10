@@ -15529,8 +15529,9 @@ impl Store for SqliteStore {
                     )?;
                 }
             }
-            // An open delivery pages the live tables, so one whose window starts below a raised
-            // floor would skip removed records; end it, and the agent's next read reports the gap.
+            // An open delivery pages the live tables, so one with unread records below a raised
+            // floor would skip them; end it, and the agent's next read reports the gap. One that
+            // already read past the floor keeps paging, even if its window started below it.
             let (event_cut, merge_cut) = delivery_cuts(
                 [
                     current_event_floor,
@@ -15544,7 +15545,8 @@ impl Store for SqliteStore {
             tx.execute(
                 "DELETE FROM hub_work_deliveries
                  WHERE provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4
-                   AND acknowledged = 0 AND from_seq < ?5",
+                   AND acknowledged = 0 AND (next_work_done = 0 OR next_after < through_seq)
+                   AND next_after < ?5",
                 params![
                     scope.provider,
                     scope.host,
@@ -15556,7 +15558,9 @@ impl Store for SqliteStore {
             tx.execute(
                 "DELETE FROM hub_catchup_deliveries
                  WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=ifnull(?4,-1)
-                   AND acknowledged=0 AND (event_from<?5 OR merge_from<?6)",
+                   AND acknowledged=0
+                   AND ((next_event_after<event_through AND next_event_after<?5)
+                     OR (next_merge_after<merge_through AND next_merge_after<?6))",
                 params![
                     scope.provider,
                     scope.host,
