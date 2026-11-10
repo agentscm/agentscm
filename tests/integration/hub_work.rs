@@ -705,6 +705,94 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
     assert_eq!(work_event_count(&*store, "work_started"), 3);
 }
 
+fn a_session_end_pause_ends_when_the_session_returns(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1);
+    let now = unix_now();
+    store.observe_lease_clock(now).unwrap();
+    let begin = |key: &str| {
+        let mut start = native_start(key, "Between turns", key);
+        start.scope = vec![format!("{key}/**")];
+        store.work_start(&alice.token, &start, now).unwrap().item
+    };
+    let end = |session: &str, via: &str| {
+        store
+            .end_session_pausing(&alice.token, Some(session), via, now + 1)
+            .unwrap()
+            .paused
+    };
+    let back = |session: &str, at: i64| {
+        store
+            .resume_ended_session(&alice.token, Some(session), "hook:claude", at)
+            .unwrap()
+    };
+    let state = |id: &str| {
+        let item = store.work_get(&alice.token, id, now + 90).unwrap().unwrap();
+        item.state
+    };
+
+    // A client that ends its session between turns: the end pauses its Work, and the same
+    // session's next start returns it to active with what it meant to do next.
+    let turns = begin("turns");
+    assert!(end("turns", "hook:claude"));
+    assert_eq!(state(&turns.id), WorkState::Paused);
+    let resumed = back("turns", now + 60).unwrap();
+    assert_eq!(resumed.id, turns.id);
+    assert_eq!(resumed.state, WorkState::Active);
+    assert_eq!(resumed.next_action, turns.next_action);
+    // Nothing is left to resume, and another session's start resumes nothing.
+    assert!(back("turns", now + 61).is_none());
+    assert!(end("turns", "hook:claude"));
+    assert!(back("another", now + 62).is_none());
+    assert_eq!(state(&turns.id), WorkState::Paused);
+
+    // The agent's own `done` writes the same pause on purpose: it stays.
+    let done = begin("done");
+    assert!(end("done", "mcp"));
+    assert!(back("done", now + 60).is_none());
+    assert_eq!(state(&done.id), WorkState::Paused);
+
+    // So does a pause the agent reported in its own words.
+    let reported = begin("reported");
+    let mut pause = checkpoint(
+        &reported.id,
+        "reported-pause",
+        reported.generation,
+        "reported",
+        CheckpointKind::Pause,
+        "Waiting for the owner to choose a region",
+    );
+    pause.expected_updated_seq = Some(reported.updated_seq);
+    store
+        .work_checkpoint(&alice.token, &pause, now + 1)
+        .unwrap();
+    assert!(back("reported", now + 60).is_none());
+    assert_eq!(state(&reported.id), WorkState::Paused);
+
+    // A session that leads other active Work by then is not given a second.
+    let old = begin("busy");
+    assert!(end("busy", "hook:claude"));
+    let mut next = native_start("busy-next", "Next task", "busy");
+    next.scope = vec!["busy-next/**".into()];
+    store.work_start(&alice.token, &next, now + 2).unwrap();
+    assert!(back("busy", now + 60).is_none());
+    assert_eq!(state(&old.id), WorkState::Paused);
+
+    // A session that comes back after its hold lapsed may be back for something else: its
+    // Work does not take its files again unasked.
+    let late = begin("late");
+    assert!(end("late", "hook:claude"));
+    let lapsed = now + 2 * LEASE;
+    let mut at = now;
+    while at < lapsed {
+        at = (at + LEASE / 2).min(lapsed);
+        store.observe_lease_clock(at).unwrap();
+    }
+    assert!(back("late", lapsed).is_none());
+    let late = store.work_get(&alice.token, &late.id, lapsed).unwrap();
+    assert_eq!(late.unwrap().state, WorkState::Paused);
+}
+
 fn the_overview_lists_newest_work_first_and_pages(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -2533,6 +2621,7 @@ conformance!(
     concurrent_pr_link_updates_fence_and_replay,
     concurrent_forge_start_has_one_work_and_one_lead,
     native_and_automatic_starts_have_explicit_retry_rules,
+    a_session_end_pause_ends_when_the_session_returns,
     the_overview_lists_newest_work_first_and_pages,
     a_description_is_kept_from_creation_and_read_back,
     authorization_and_claim_projection_keep_old_claims_visible,

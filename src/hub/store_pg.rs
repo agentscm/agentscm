@@ -3277,6 +3277,53 @@ fn unfinished_for_session(
         .transpose()
 }
 
+/// The paused Work `session` leads that changed last, when that change is the pause its own
+/// session end wrote and the Work's hold is still live. `None` while the session leads active
+/// or blocked Work: a returning session is not given a second. The Work is read under its row
+/// lock, as the pause was.
+fn paused_by_session_end(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    if unfinished_for_session(tx, who, session, now)?.is_some() {
+        return Ok(None);
+    }
+    let found = tx.query_opt(
+        "SELECT id FROM hub_work_items
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4 AND lead_token = $5
+           AND lead_session = $6 AND state = 'paused'
+         ORDER BY updated_seq DESC LIMIT 1",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.token,
+            &session,
+        ],
+    )?;
+    let Some(id) = found.map(|row| row.get::<_, String>(0)) else {
+        return Ok(None);
+    };
+    let Some(item) = scoped_work(tx, who, &id, now, true)?.filter(|i| i.state == WorkState::Paused)
+    else {
+        return Ok(None);
+    };
+    let pause = tx.query_opt(
+        "SELECT operation_id FROM hub_work_checkpoint_ops WHERE work = $1 AND event_seq = $2",
+        &[&item.id, &item.updated_seq],
+    )?;
+    let ended = pause.is_some_and(|row| WorkCheckpoint::ended_its_session(row.get(0)));
+    // Only within the hold's own patience: a session that comes back after its hold lapsed may
+    // be back for something else, and its Work must not take its files again unasked.
+    let held =
+        work_reservation_basis(tx, &item.id)?.is_some() && !lease_lapsed(tx, &item.id, now)?;
+    Ok((ended && held).then_some(item))
+}
+
 /// The title of the unfinished Work this session leads that was updated last.
 fn lead_title(
     tx: &mut postgres::Transaction<'_>,
@@ -8712,6 +8759,39 @@ impl Store for PgStore {
                 work,
                 paused,
             })
+        })
+    }
+
+    fn resume_ended_session(
+        &self,
+        token: &str,
+        session: Option<&str>,
+        via: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
+        if let Some(session) = session {
+            check_name(session)?;
+        }
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            active_token(&mut tx, token, now)?;
+            let name = session_name(&mut tx, token, session, now)?;
+            let paused = match work_who(&mut tx, token, now) {
+                Ok(who) if !who.read_only => {
+                    lock_work_capacity(&mut tx, &who)?;
+                    paused_by_session_end(&mut tx, &who, &name, now)?
+                }
+                // A token that cannot report on Work resumes none.
+                Ok(_) | Err(HubError::Unauthorized) => None,
+                Err(error) => return Err(error),
+            };
+            let Some(item) = paused else {
+                return Ok(None);
+            };
+            let resume = WorkCheckpoint::auto_resume(&item, via);
+            let resumed = work_checkpoint_in(&mut tx, token, &resume, now)?.item;
+            tx.commit()?;
+            Ok(Some(resumed))
         })
     }
 

@@ -568,6 +568,9 @@ pub const MAX_WORK_SEARCH: usize = 50;
 /// holding it is not settled by a merge that predates the session's last check-in.
 pub(super) const AUTO_PAUSE_SUMMARY: &str = "Session ended without a reported final work outcome.";
 
+/// Summary of the report written when the session whose end paused Work starts again.
+pub(super) const AUTO_RESUME_SUMMARY: &str = "Session returned; the Work its end paused goes on.";
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkOverview {
@@ -840,6 +843,26 @@ impl WorkCheckpoint {
             source_refs: Vec::new(),
             depends_on: item.depends_on.clone(),
             related_work: item.related_work.clone(),
+        }
+    }
+
+    /// Whether `operation_id` is the pause a session's own end wrote through its hook. The pause
+    /// an agent asks for with `done` is written the same way under `mcp`, and is a pause on
+    /// purpose.
+    pub(super) fn ended_its_session(operation_id: &str) -> bool {
+        operation_id.starts_with("hook") && operation_id.contains("-done-")
+    }
+
+    /// The report that returns Work to active when the session whose end paused it starts again:
+    /// it was between turns. Like that pause it keeps the next action and relations, and any
+    /// change to the Work since fences it.
+    pub(super) fn auto_resume(item: &WorkItem, via: &str) -> Self {
+        Self {
+            operation_id: format!("{via}-back-{}-{}", item.generation, item.updated_seq),
+            kind: CheckpointKind::Progress,
+            summary: AUTO_RESUME_SUMMARY.into(),
+            next_action: item.next_action.clone(),
+            ..Self::auto_pause(item, via)
         }
     }
 
