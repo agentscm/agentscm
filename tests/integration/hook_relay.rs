@@ -282,7 +282,7 @@ impl Hook {
             assert!(context.contains("synthetic Hub reply"), "{reply}");
         } else {
             assert!(
-                context.contains("coordination unknown (hub unreachable)"),
+                context.contains("coordination unknown (hub unreachable;"),
                 "{reply}"
             );
             assert!(
@@ -535,7 +535,27 @@ async fn a_real_hub_registers_and_ends_a_session_over_the_relay_pool() {
         } else {
             assert_eq!(reply, json!({}));
         }
-        let peer = fixture.only_hook().peer;
+        let peer = if event == "SessionStart" {
+            // Capture also asks, once, whether the repository shares agent conversations.
+            let first = fixture.received();
+            let mut seen = vec![first];
+            while let Ok(more) = fixture.seen.recv_timeout(Duration::from_millis(200)) {
+                seen.push(more);
+            }
+            let (hooks, rest): (Vec<_>, Vec<_>) = seen
+                .into_iter()
+                .partition(|s| s.uri == "/v1/hub/hook/claude?repo=acme%2Fwidgets");
+            assert_eq!(hooks.len(), 1);
+            assert!(
+                rest.iter()
+                    .all(|s| s.uri == "/v1/hub/repos/acme%2Fwidgets/conversation-sharing"),
+                "{:?}",
+                rest.iter().map(|s| &s.uri).collect::<Vec<_>>()
+            );
+            hooks[0].peer
+        } else {
+            fixture.only_hook().peer
+        };
         assert_ne!(peer, mcp);
         assert_eq!(*owner.get_or_insert(peer), peer);
     }

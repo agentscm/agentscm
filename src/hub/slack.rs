@@ -3,7 +3,8 @@
 //! refused it, a handoff was declined, or new work reads like work already under way.
 //! Each binding links one Slack user to their forge identity in one repository through a
 //! dedicated, revocable read-only token. A file's holder can answer a handoff for their own
-//! agent with a button; nothing else is written from Slack.
+//! agent with a button, and the weekly digest (`digest.rs`) lets a person release or complete
+//! their own stale Work and stop their own digest; nothing else is written from Slack.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
@@ -54,6 +55,7 @@ const YES: &str = "agentscm_handoff_yes";
 const NO: &str = "agentscm_handoff_no";
 const OPEN: &str = "agentscm_open_hub";
 
+mod digest;
 pub mod setup;
 mod status;
 pub use status::ReminderPolicy;
@@ -1515,6 +1517,8 @@ enum Refusal {
     /// The binding's token, or the whole installation, no longer works.
     Ended,
     NotYours,
+    /// A digest button that carries Work the clicking person does not own.
+    NotYourWork,
     Busy,
     Rejected,
     Unavailable,
@@ -1528,6 +1532,9 @@ impl Refusal {
             }
             Self::NotYours => {
                 "The Hub did not accept this: it is not your agent, or it is no longer connected. Nothing changed. Answer for your own agent in the Hub."
+            }
+            Self::NotYourWork => {
+                "The Hub did not accept this: that work is not yours. Nothing changed. Open the Hub to see whose it is."
             }
             Self::Busy => {
                 "The Hub is busy right now. Nothing changed; press the button again in a moment."
@@ -1726,6 +1733,9 @@ fn prepare(
     else {
         return Err(invalid());
     };
+    if action["action_id"].as_str().is_some_and(digest::is_button) {
+        return digest::prepare_click(state, slack, &payload, user, action);
+    }
     let accept = match action.get("action_id").and_then(Value::as_str) {
         Some(OPEN) => return Ok(Prepared::Response(json!({}))),
         Some(YES) => true,

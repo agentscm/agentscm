@@ -71,6 +71,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/reconciliation", post(apply_reconciliation))
         .route("/v1/hub/standup/work/{id}", get(work))
         .route("/v1/hub/standup/work", get(work_search))
+        .route("/v1/hub/standup/why", get(why))
 }
 
 async fn reconciliation_v2(
@@ -503,6 +504,23 @@ async fn work_search(
     ))
 }
 
+/// The Work recorded for a commit or a path, with its decisions; `known: false` when none is.
+async fn why(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    query: std::result::Result<Query<super::why::WhyQuery>, QueryRejection>,
+) -> Result<Json<super::why::WhyAnswer>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    let subject = query.subject().map_err(|_| ApiError::invalid())?;
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.work_why(&principal.token_id, &subject, unix_now())
+        })
+        .await?,
+    ))
+}
+
 async fn usage(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
@@ -688,19 +706,10 @@ async fn start(
     .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(HubError::WorkPreflight(mut preflight)) => {
-            preflight.show(Viewer(&viewer));
-            (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "work_preflight_required",
-                "message": "Atomic admission found changed, incomplete or conflicting source facts. No new Work was claimed.",
-                "preflight": preflight,
-            })),
-        )
-            .into_response()
+        Err(mut error) => {
+            error.show(Viewer(&viewer));
+            ApiError::from(error).into_response()
         }
-        Err(error) => ApiError::from(error).into_response(),
     }
 }
 
@@ -749,21 +758,10 @@ async fn checkpoint(
 }
 
 fn work_error(error: HubError) -> Response {
-    match error {
-        HubError::WorkCoordinationRequired { overlaps, request } => {
-            super::coordination_http::CHANGED.notify_waiters();
-            (StatusCode::CONFLICT, Json(json!({"error": "work_coordination_required",
-                "overlaps": overlaps, "coordination_request": request,
-                "message": "Scope was not changed. A durable request is queued for the affected leads."}))).into_response()
-        },
-        HubError::WorkOverlap(overlaps) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "work_scope_overlap", "overlaps": overlaps,
-                "alternatives": ["Split the declared scope or join the existing work as helper or reviewer.",
-                    "Arrange a deliberate handover with the current lead."]})),
-        ).into_response(),
-        error => ApiError::from(error).into_response(),
+    if matches!(&error, HubError::WorkCoordinationRequired { .. }) {
+        super::coordination_http::CHANGED.notify_waiters();
     }
+    ApiError::from(error).into_response()
 }
 
 async fn acknowledge(

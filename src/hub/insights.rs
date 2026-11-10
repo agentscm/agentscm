@@ -785,6 +785,7 @@ mod tests {
                 request_key: "fixture".into(),
             },
             title: "Synthetic work".into(),
+            description: None,
             state: last.state,
             claim_status: ClaimStatus::Active,
             last_checkin_at: last.at,

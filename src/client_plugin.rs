@@ -72,6 +72,9 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
         // Every tool call keeps this chat's hold live; the Hub checks only the edits.
         "PreToolUse":[{"hooks":[hook("AgentSCM: coordinate this tool call", 5)]}],
         "PostToolUse":[{"hooks":[hook("AgentSCM: keep this chat's hold live", 3)]}],
+        // Tell the Hub this chat waits for its person; the approval itself stays in Codex.
+        "PermissionRequest":[{"hooks":[hook("AgentSCM: note this chat waits for you", 3)]}],
+        "Stop":[{"hooks":[hook("AgentSCM: note this chat's turn ended", 3)]}],
         "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3)]}]
     }});
     let common = json!({"name":"agentscm", "version":env!("CARGO_PKG_VERSION"),
@@ -123,13 +126,22 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     };
     // UserPromptSubmit fires only in the session the person types in, so requests reach it
     // there rather than a subagent. It runs on every prompt, hence the short timeout. Every tool
-    // call keeps the session's hold live; the Hub checks only the edits.
+    // call keeps the session's hold live; the Hub checks only the edits. Notification and Stop
+    // tell the Hub the session waits for its person; they never answer a prompt.
     let hooks = json!({"hooks": {
         "SessionStart":[{"hooks":[hook(5)]}],
         "UserPromptSubmit":[{"hooks":[hook(3)]}],
         "PreToolUse":[{"hooks":[hook(5)]}],
         "PostToolUse":[{"hooks":[hook(3)]}],
-        "SessionEnd":[{"hooks":[hook(3)]}]
+        "Notification":[{"hooks":[hook(3)]}],
+        "Stop":[{"hooks":[hook(3)]}],
+        "SessionEnd":[{"hooks":[hook(3)]}],
+        // Only change capture uses these, for checkouts whose Hub shares agent conversations.
+        "PostToolUseFailure":[{"hooks":[hook(3)]}],
+        "MessageDisplay":[{"hooks":[hook(3)]}],
+        "PreCompact":[{"hooks":[hook(3)]}],
+        "SubagentStart":[{"hooks":[hook(3)]}],
+        "SubagentStop":[{"hooks":[hook(3)]}]
     }});
     // Like the hooks, it inherits the agent's environment. The server's working directory is
     // not documented, so it takes the project directory, when Claude Code substitutes it.
@@ -1393,6 +1405,50 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(output.join("versions")).unwrap().count(),
             4
+        );
+    }
+
+    /// The hook events behind the coverage table in docs/agents.md, for the two agents whose
+    /// hooks come from a plugin.
+    #[test]
+    fn plugins_are_wired_for_the_events_their_coverage_names() {
+        let events = |files: Vec<(&'static str, Vec<u8>)>| -> Vec<String> {
+            let (_, hooks) = files
+                .into_iter()
+                .find(|(path, _)| *path == "agentscm/hooks/hooks.json")
+                .unwrap();
+            let hooks: Value = serde_json::from_slice(&hooks).unwrap();
+            let mut events: Vec<String> = hooks["hooks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            events.sort();
+            events
+        };
+        let claude = events(claude_files_with_version("/opt/agentscm", "1"));
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert!(claude.iter().any(|wired| wired == event), "{event}");
+        }
+        assert_eq!(
+            events(codex_package_files("/opt/agentscm")),
+            [
+                "PermissionRequest",
+                "PostToolUse",
+                "PreToolUse",
+                "SessionEnd",
+                "SessionStart",
+                "Stop"
+            ]
         );
     }
 }

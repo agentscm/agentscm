@@ -62,6 +62,8 @@ export interface WorkItem {
   owner_login: string
   source: WorkSource
   title: string
+  /** What the Work changes and why, from the start that created it; absent when it had none. */
+  description?: string
   state: WorkState
   claim_status: ClaimStatus
   last_checkin_at: number
@@ -427,6 +429,7 @@ export function decodeWorkItem(value: unknown, expectedId?: string): WorkItem {
     owner_login: label(item['owner_login'], 'work.owner_login'),
     source: source(item['source']),
     title: boundedText(item['title'], 'work.title'),
+    ...(item['description'] === undefined ? {} : { description: boundedText(item['description'], 'work.description') }),
     state: enumValue(item['state'], STATES, 'work.state'),
     claim_status: enumValue(item['claim_status'], CLAIM_STATUSES, 'work.claim_status'),
     last_checkin_at: timestamp(item['last_checkin_at'], 'work.last_checkin_at'),

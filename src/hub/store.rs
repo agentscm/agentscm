@@ -206,6 +206,67 @@ pub enum PromiseInputScope<'a> {
 pub trait Store: Send + Sync {
     fn backend(&self) -> &'static str;
     fn ping(&self) -> Result<()>;
+    /// Trusted administrator/controller API. Never expose directly to an agent token.
+    /// The selected connection must own the connected repository.
+    fn configure_validation_summary(
+        &self,
+        config: &super::validation_evidence::ValidationSummaryConfig,
+    ) -> Result<()>;
+    fn validation_summary_config(
+        &self,
+        repository: &str,
+    ) -> Result<Option<super::validation_evidence::ValidationSummaryConfig>>;
+    /// Rechecks the token and repository binding in the receipt transaction.
+    fn receive_validation_evidence(
+        &self,
+        token: &str,
+        proposal: i64,
+        bundle: &super::validation_evidence::DurableValidationBundle,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidenceReceipt>;
+    fn validation_evidence_history(
+        &self,
+        token: &str,
+        repository: &str,
+        proposal: i64,
+        after: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<super::validation_evidence::ValidationEvidencePage>;
+    /// Trusted internal worker API, with a complete bounded receipt inventory.
+    fn validation_snapshot(
+        &self,
+        repository: &str,
+        proposal: i64,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationSnapshot>;
+    /// Config/generation only, for invalidating statuses when the complete inventory fails.
+    fn validation_fence(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<super::validation_evidence::ValidationFence>;
+    fn validation_publication_proposals(
+        &self,
+        repository: &str,
+        after: i64,
+        through: Option<i64>,
+        limit: usize,
+    ) -> Result<super::validation_evidence::ValidationProposalPage>;
+    fn validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+    ) -> Result<Option<super::validation_evidence::ValidationPublication>>;
+    /// Atomic cross-process exclusion. `false` means revision, evidence or config changed.
+    /// Recovery of the same Attempting operation is allowed after new evidence or disable.
+    fn compare_validation_publication(
+        &self,
+        repository: &str,
+        proposal: i64,
+        expected_revision: i64,
+        next: &super::validation_evidence::ValidationPublication,
+    ) -> Result<bool>;
     /// Insert, or update the cached login of an existing identity. Never changes the id.
     fn upsert_user(&self, identity: &ForgeIdentity, login: &str) -> Result<User>;
     /// Replace the cached profile name (`None` clears it). A display value, not an audited
@@ -827,6 +888,13 @@ pub trait Store: Send + Sync {
         query: &WorkPrLinkQuery,
         now: i64,
     ) -> Result<Option<WorkPrLinkView>>;
+    /// Scoped read of the explicit PR target alone, for person and agent readers alike.
+    fn work_pr_target_scoped(
+        &self,
+        reader: &WorkLifecycleReader<'_>,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<super::work_links::WorkPrLinkTarget>>;
     /// Set or remove a caller-asserted relationship, fenced by current Work ownership.
     fn work_pr_link_set(
         &self,
@@ -901,8 +969,9 @@ pub trait Store: Send + Sync {
     /// Work of the token's repository, finished work included, newest `created_at` then `id`
     /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
     /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, owner login,
-    /// id or scope contains it, whose source issue number it names, or whose lead agent label
-    /// contains it, except another owner's generated `client-…` label, which is masked.
+    /// id, scope or decision checkpoint summary contains it, whose source issue number it names,
+    /// or whose lead agent label contains it, except another owner's generated `client-…` label,
+    /// which is masked.
     /// An unknown cursor is `Invalid`.
     fn work_search(
         &self,
@@ -912,6 +981,14 @@ pub trait Store: Send + Sync {
         limit: usize,
         now: i64,
     ) -> Result<WorkSearchPage>;
+    /// The Work of the token's repository recorded for a commit or a path, with its decisions
+    /// (see [`super::why`]). A commit or path with no recorded Work answers `known: false`.
+    fn work_why(
+        &self,
+        token: &str,
+        subject: &super::why::WhySubject,
+        now: i64,
+    ) -> Result<super::why::WhyAnswer>;
     fn change_ingest(
         &self,
         token: &str,

@@ -6,6 +6,8 @@ use crate::hub::work::WorkStart;
 use axum::extract::OriginalUri;
 use tempfile::TempDir;
 
+mod digest;
+
 const REPO: &str = "acme/widgets";
 const PATH: &str = "src/widget.rs";
 

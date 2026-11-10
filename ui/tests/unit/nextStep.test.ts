@@ -47,7 +47,7 @@ describe('next steps', () => {
     const c = contestedStep({ path: 'src/a.rs' } as Contested, { login: 'dev', agent: 'codex' }, { login: 'maria', agent: 'claude-code' })
     expect(c.human).toBe('Agree who keeps it · ask maria or dev')
     expect(c.decides).toEqual(['maria', 'dev'])
-    expect(said(c)).toEqual([{ for: who('dev', 'codex'), text: `${maria} holds the file src/a.rs. Ask for it with agentscm_ask (that path) and a one-line reason, or work on something else first. ${DATA_NOTE}` }])
+    expect(said(c)).toEqual([{ for: who('dev', 'codex'), text: `${maria} holds the file src/a.rs. If their task text shows your change leaves their lines alone, edit it with patches to your own lines, not a whole-file rewrite; otherwise work on something else first, or ask for it with agentscm_ask (that path) and a one-line reason. ${DATA_NOTE}` }])
 
     const pr = { pr: { number: 7, title: 'Bump', author: { login: 'zoe' } }, with: [{ agent: { owner: 'maria', name: 'claude-code' }, files: ['src/a.rs'] }] } as unknown as PrOverlap
     const step = prStep(pr)

@@ -21,6 +21,12 @@ There is no token to paste and no address to enter.
 (`npx agentscm --hub-url <url>` connects it and signs you in), and this computer must be signed in to that Hub
 (`agentscm hub login --hub <url>`).
 
+To have a coding agent connect itself instead, paste the
+[setup prompt](team-member-onboarding.md#or-paste-one-prompt-into-your-agent) into it. The agent
+runs `client setup` for itself, you approve the browser sign-in, and after a restart the same
+prompt verifies the agent's hooks with one edit to a disposable file. The prompt forbids commits,
+pushes and edits to `AGENTS.md` or `CLAUDE.md`.
+
 ## Sign in once per computer
 
 `agentscm hub login` (or **Sign In with GitHub…** in the menu bar app) signs this computer in to
@@ -46,13 +52,18 @@ the forge did not accept the code. What signing in gives you:
   `agentscm hub auto-connect on|off [--hub URL]`. With it on, when a coding agent starts a session
   in a checkout that has no connection, its hook connects the checkout to the first such Hub (the
   default Hub first, at most four) that has the repository and where you have the role, and the
-  agent's context starts with `AgentSCM: coordinating on owner/name.` It writes only AgentSCM's
+  agent's context starts with `AgentSCM: coordinating on owner/name at <Hub>. This checkout was just
+  connected.` Every later session in a connected checkout starts with the same line, without the
+  last sentence, followed by whether conversation sharing is on for the session. When something
+stops coordination (the token was refused, or access ended), that reason replaces the line. It writes only AgentSCM's
   own files under your config directory, never a file in the checkout, and runs the same checks as
   `client connect`. It waits at most 2.5 seconds; a slower attempt says nothing and finishes for
   the next session. In a repository no such Hub has, the check stays silent, and that Hub is not
   asked about it again for an hour. A Hub that sees your origin is a fork of a repository it has
   says so, and names the repository to use as `origin`. Any other attempt is retried after five
-  minutes.
+  minutes. The agent's start context also names the other repositories connected on this computer,
+  and an AgentSCM call with absolute paths in one of them, or with `root` set to its checkout, goes
+  to that repository.
 - **Tokens renew.** An agent token minted through this computer lasts 24 hours. When less than 12
   hours are left, the next hook call renews it in the background: the Hub re-checks your access, a
   new token is saved, and the old one is revoked. A running MCP server switches to the new token.
@@ -204,6 +215,7 @@ remains for a Hub page served elsewhere.
   browser that cannot read files in your config directory (for example some sandboxed Linux
   browser packages), or a computer where `.html` files open in an editor, does not open the page;
   `agentscm open` prints the file to open by hand.
+- The MCP server fills in an omitted session from the start hook's record on macOS and Linux only.
 - The page runs on this computer only. Over SSH, `agentscm open` has no local browser to hand the
   connection to; use the team's Hub there, with the manual setup for files.
 - Templates and Timeline read a native workspace chosen with `agentscm serve --timeline-workspace`;

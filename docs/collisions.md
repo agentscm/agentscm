@@ -24,6 +24,7 @@ Options:
 - `--include-merged`: also scan branches whose changes the base already has through a squash or rebase merge. By default they are skipped, because a branch that has already landed cannot collide with new work; the report counts them in `merged_refs_excluded`, and the text report says "N branches skipped: already merged". Branches merged by ancestry (plain merge or fast-forward) never appear, with or without this flag.
 - `--worktrees`: also check each worktree's uncommitted changes (staged, unstaged and untracked), found with `git worktree list`. This is the many-agents-on-one-machine case.
 - `--merge-order`: also check each branch tip against the base and suggest the merge order that needs the fewest new heads. See [merge order](#merge-order).
+- `--history <days>`: instead of checking open branches, count past overlaps in history that already landed. See [past overlaps from history](#past-overlaps-from-history).
 - `--git <path>`: absolute Git executable. Default: the first `git` on `PATH`, then `/usr/bin/git`. Git 2.43 or newer is required; older Git is reported as an error, not guessed around.
 
 - `--json` / `--text`: choose the output. On a terminal the default is a short text report; when stdout is not a terminal (a pipe, a script, the container) the default is JSON, as before. `--json` always prints the JSON below; `--text` forces the text report.
@@ -128,6 +129,54 @@ gh pr list --json headRefName,isCrossRepository \
   --jq '.[] | select(.isCrossRepository | not) | "origin/" + .headRefName' |
   xargs agentscm collisions --merge-order --refs
 ```
+
+## Past overlaps from history
+
+`agentscm collisions --history <days>` answers a different question: how often did people or
+agents change the same file at about the same time in work that already landed? It needs no Hub,
+no forge and no network. It runs only `git log` and `git rev-parse` on the repository's own
+history and writes nothing, so it does not run clean filters or merge drivers.
+
+```bash
+agentscm collisions --history 30
+```
+
+```text
+Read 212 commits by 6 authors on origin/main from the last 30 days · at least 9 overlaps in 7 files
+
+By top directory:
+  src   6 overlaps in 4 files
+  docs   3 overlaps in 3 files
+
+An overlap is a change to a file that a different author also changed in the 72 hours before it, by author date. Lower bound: a squash or rebase merge records when a change landed, not how long it was in flight, so work that overlapped before it landed is not counted. Authors are told apart by email, so several agents that commit as one person count as one author. Merge commits and work that never reached the base are not read.
+```
+
+- It reads the non-merge commits reachable from the base (`--base`, default `origin/HEAD`, then
+  `main`) whose committer date is within the last `<days>` days. That covers the commits of pull
+  requests merged with a merge commit, squash merges and rebase merges, and commits pushed directly.
+- An overlap is one commit's change to one file when a different author changed that file at
+  most 72 hours earlier, by author date. Two authors alternating on a file three times within
+  the window are two overlaps in one file. The 72 hours are fixed.
+- Authors are compared by email after `.mailmap`, ignoring letter case.
+- Counts are grouped by the first directory of the path; files at the top level are under `(root)`.
+  The text report lists the ten directories with the most overlaps; JSON lists all.
+- `--history` cannot be combined with `--refs`, `--worktrees`, `--include-merged` or
+  `--merge-order`, and `<days>` must be at least 1.
+- JSON is `{"ok": true, "history": {...}}` with `profile`
+  (`agentscm-git-collisions-history/v1`), `git_version`, `base`, `days`, `window_hours`,
+  `commits`, `authors`, `overlaps`, `files`, `directories` (each with `directory`, `overlaps` and
+  `files`, most overlaps first), `lower_bound` (always `true`), `shallow` and `notes`.
+
+The count is a lower bound, never an estimate of all collisions:
+
+- A squash merge is one commit dated when it landed. Two pull requests that were open on the
+  same file for a week and landed four days apart show no overlap.
+- A rebase merge keeps each commit's author date but loses when the branch was open.
+- Several agents committing under one email are one author, so their overlaps are not counted.
+- Work that never reached the base is not read. A renamed file is a new path.
+- In a shallow clone only the fetched history is read; `shallow` is `true` and the text says so.
+- Git output is bounded to 16 MiB; a period with more changed paths than that fails with an
+  error. Use fewer days.
 
 ## Limits
 

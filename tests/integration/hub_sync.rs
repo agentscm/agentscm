@@ -2272,7 +2272,7 @@ async fn a_pat_connection_is_created_once_and_acts_as_its_owner() {
         let (status, body) = env
             .post(&path, Some(&admin), json!({"full_name": refused}))
             .await;
-        assert_eq!(
+        crate::assert_hub_error!(
             (status, body),
             (403, json!({"error": "forbidden"})),
             "{refused}"
@@ -2383,7 +2383,7 @@ async fn work_merges_intents_pulls_and_branches_for_the_tokens_repository() {
     let (status, body) = env
         .get("/v1/hub/repos/acme%2Fother/work", Some(&agent))
         .await;
-    assert_eq!((status, body), (404, json!({"error": "not_found"})));
+    crate::assert_hub_error!((status, body), (404, json!({"error": "not_found"})));
     assert_eq!(
         env.get("/v1/hub/repos/acme%2Fwidgets/work", None).await.0,
         401
@@ -3004,7 +3004,7 @@ async fn a_pat_that_changed_owner_stops_startup_and_a_shared_repository_stays_wi
             json!({"full_name": "acme/shared"}),
         )
         .await;
-    assert_eq!((status, body), (409, json!({"error": "already_connected"})));
+    crate::assert_hub_error!((status, body), (409, json!({"error": "already_connected"})));
 
     // A different account behind the same token: the label would be wrong.
     env.fake
@@ -3305,6 +3305,506 @@ async fn connecting_the_forge_drops_a_checkout_adoption_when_the_default_branch_
     assert_eq!(library["adoption"]["pins"], json!([]), "{library}");
 }
 
+// ---- forge-observed skill evidence and the skill status ----
+
+/// pr-gate adopted with `ci_label`, an App with check, review and status grants, and pull
+/// request 5 (labelled) with green checks and an approval on its head. Returns its head.
+async fn observed_skill_fixture(env: &Env) -> String {
+    use agentscm::skill_workflow::supported::{LOCK_PATH, SkillLock, SkillPin, catalog_entry};
+
+    let mut params = serde_json::Map::new();
+    params.insert("ci_label".into(), json!("ci-extended"));
+    let lock = SkillLock {
+        version: 1,
+        skills: vec![SkillPin::first_party(
+            catalog_entry("pr-gate", 1).unwrap(),
+            Some(params),
+        )],
+    };
+    add_pull(env, 5, &["src/a.rs"]);
+    add_branch(env, "main", 0);
+    env.fake.with(|s| {
+        s.installation_permissions =
+            Some(json!({"pull_requests": "write", "checks": "read", "statuses": "write"}));
+        let repo = s.repos.get_mut(&REPO_ID).unwrap();
+        repo.files
+            .insert(LOCK_PATH.into(), serde_json::to_string(&lock).unwrap());
+        let pull = repo.pulls.get_mut(&5).unwrap();
+        pull.labels = vec!["ci-extended".into()];
+        let head = pull.head_sha.clone();
+        s.context_checks.insert(
+            (REPO_ID, head.clone()),
+            vec![json!({"id": 2, "name": "test",
+            "status": "completed", "conclusion": "success", "head_sha": head,
+            "started_at": "2026-10-30T10:00:00Z", "completed_at": "2026-10-30T10:01:00Z",
+            "html_url": "https://github.com/acme/widgets/runs/2"})],
+        );
+        s.context_reviews.insert(
+            (REPO_ID, 5),
+            vec![json!({"id": 1, "state": "APPROVED",
+            "commit_id": head, "user": {"login": "maintainer-fixture", "type": "User"},
+            "author_association": "MEMBER", "submitted_at": "2026-10-30T10:02:00Z",
+            "html_url": "https://github.com/acme/widgets/pull/5#pullrequestreview-1"})],
+        );
+        s.collaborator_permissions
+            .insert("maintainer-fixture".into(), "write".into());
+    });
+    set_skill_status(env, "on");
+    env.fake
+        .with(|s| s.repos[&REPO_ID].pulls[&5].head_sha.clone())
+}
+
+/// The repository's skill-status setting, as a repository admin sets it on the web pages.
+fn set_skill_status(env: &Env, value: &str) {
+    env.store
+        .set_setting(
+            &format!("skill_forge_status:repo:{REPO_ID}"),
+            value,
+            "test-admin",
+        )
+        .unwrap();
+}
+
+fn skill_statuses(env: &Env, head: &str) -> Vec<Value> {
+    env.fake.with(|s| {
+        s.repos[&REPO_ID]
+            .statuses
+            .iter()
+            .filter(|(sha, v)| sha == head && v["context"] == "agentscm/skill/pr-gate")
+            .map(|(_, v)| v.clone())
+            .collect()
+    })
+}
+
+async fn self_report(env: &Env, token: &str, gate: &str, kind: &str, head: &str) {
+    let (status, reply) = env
+        .post(
+            "/v1/hub/repos/acme%2Fwidgets/skills/evidence",
+            Some(token),
+            json!({"skill": "pr-gate", "gate": gate, "kind": kind, "head_sha": head,
+                "assurance": "self_reported", "summary": "synthetic", "branch": "feat/5"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+}
+
+fn merge_pull_5(env: &Env) {
+    env.pull(5, |p| {
+        p.state = "closed".into();
+        p.merged = true;
+        p.merge_commit_sha = Some("3".repeat(40));
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forge_checks_approval_and_merge_become_observed_evidence_and_the_skill_status() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let head = observed_skill_fixture(&env).await;
+    let author = env.agent(1, "dev", "author");
+    let reviewer = env.agent(2, "rev", "reviewer");
+    env.refresh(&connection).await;
+    env.poll().await;
+
+    // Green checks on the labelled head and the approval are recorded as observed.
+    let run_path = "/v1/hub/repos/acme%2Fwidgets/skills/runs/by-branch?branch=feat%2F5";
+    let (status, run) = env.get(run_path, Some(&author)).await;
+    assert_eq!(status, 200, "{run}");
+    assert_eq!(run["head_sha"], head);
+    assert_eq!(run["gates"][4]["id"], "ci");
+    let ci = &run["gates"][4]["evidence"][0];
+    assert_eq!(ci["assurance"], "observed", "{run}");
+    assert_eq!(ci["agent"], "GitHub");
+    assert_eq!(ci["detail"]["label"], "ci-extended");
+    assert_eq!(run["gates"][5]["evidence"][0]["kind"], "human_approval");
+    assert_eq!(run["current_gate"], "branch");
+
+    let (_, setting) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/skills/forge-status",
+            Some(&author),
+        )
+        .await;
+    assert_eq!(setting["enabled"], true, "{setting}");
+
+    // The run is posted on the head: nothing the agent must do is open at branch (advise).
+    let posted = skill_statuses(&env, &head);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0]["state"], "pending");
+    assert_eq!(
+        posted[0]["description"],
+        "Create a task branch and record the branch gate."
+    );
+
+    // Tests missing is a Stop-enforced gate the agent can do: failure.
+    self_report(&env, &author, "branch", "task_branch", &head).await;
+    env.poll().await;
+    let posted = skill_statuses(&env, &head);
+    assert_eq!(posted.last().unwrap()["state"], "failure", "{posted:?}");
+
+    // Every gate before merge done, CI and approval observed: success. GitHub's combined
+    // status is the posting journal, so an unchanged run posts nothing more.
+    self_report(&env, &author, "tests", "revision_tests", &head).await;
+    self_report(&env, &reviewer, "review", "independent_review", &head).await;
+    env.poll().await;
+    env.poll().await;
+    let posted = skill_statuses(&env, &head);
+    assert_eq!(posted.len(), 3, "{posted:?}");
+    assert_eq!(posted[2]["state"], "success");
+    assert_eq!(env.fake.with(|s| s.repos[&REPO_ID].statuses.len()), 3);
+
+    // The forge merges it: the merge is observed and nothing before it was skipped.
+    merge_pull_5(&env);
+    env.poll().await;
+    let (_, run) = env.get(run_path, Some(&author)).await;
+    assert_eq!(
+        run["gates"][6]["evidence"][0]["assurance"], "observed",
+        "{run}"
+    );
+    assert_eq!(run["merge_check"]["skipped"], json!([]), "{run}");
+    assert_eq!(run["merge_check"]["unobserved"], json!([]));
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&author))
+        .await;
+    let counts = &library["counts"]["pr-gate"];
+    assert_eq!(counts["merged_observed"], 1, "{library}");
+    assert_eq!(counts["merged_with_skips"], 0);
+    assert_eq!(counts["merged_unobserved"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_without_the_gates_is_counted_as_a_gate_skip() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    observed_skill_fixture(&env).await;
+    // No label: green checks do not satisfy a ci gate that requires one; the review is gone.
+    env.fake.with(|s| {
+        let repo = s.repos.get_mut(&REPO_ID).unwrap();
+        repo.pulls.get_mut(&5).unwrap().labels.clear();
+        s.context_reviews.clear();
+    });
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    merge_pull_5(&env);
+    env.poll().await;
+    let (status, run) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/skills/runs/by-branch?branch=feat%2F5",
+            Some(&agent),
+        )
+        .await;
+    assert_eq!(status, 200, "{run}");
+    assert_eq!(
+        run["merge_check"]["skipped"],
+        json!(["branch", "tests", "review", "fix", "ci", "approval"]),
+        "{run}"
+    );
+    // Green CI without the required label is not the observed fact the ci gate needs.
+    assert_eq!(run["merge_check"]["unobserved"], json!(["ci", "approval"]));
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    let counts = &library["counts"]["pr-gate"];
+    assert_eq!(counts["merged_with_skips"], 1, "{library}");
+    assert_eq!(counts["merged_unobserved"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_status_goes_back_to_pending_when_ci_fails_or_the_approval_is_withdrawn() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let head = observed_skill_fixture(&env).await;
+    let author = env.agent(1, "dev", "author");
+    let reviewer = env.agent(2, "rev", "reviewer");
+    env.refresh(&connection).await;
+    self_report(&env, &author, "branch", "task_branch", &head).await;
+    self_report(&env, &author, "tests", "revision_tests", &head).await;
+    self_report(&env, &reviewer, "review", "independent_review", &head).await;
+    env.poll().await;
+    let last = |env: &Env| skill_statuses(env, &head).last().cloned().unwrap();
+    assert_eq!(last(&env)["state"], "success");
+
+    // A re-run fails on the same head: the stored observation stays, the status does not.
+    let conclude = |env: &Env, conclusion: &str| {
+        env.fake.with(|s| {
+            s.context_checks.get_mut(&(REPO_ID, head.clone())).unwrap()[0]["conclusion"] =
+                json!(conclusion);
+        })
+    };
+    conclude(&env, "failure");
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "pending");
+    assert_eq!(
+        last(&env)["description"],
+        format!("Waiting for GitHub to show ci on {}.", &head[..7])
+    );
+    conclude(&env, "success");
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "success");
+
+    // The approval is dismissed: pending again.
+    env.fake.with(|s| {
+        s.context_reviews.get_mut(&(REPO_ID, 5)).unwrap()[0]["state"] = json!("DISMISSED");
+    });
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_success_is_retired_when_the_setting_goes_off_or_the_skill_is_removed() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let head = observed_skill_fixture(&env).await;
+    let author = env.agent(1, "dev", "author");
+    let reviewer = env.agent(2, "rev", "reviewer");
+    env.refresh(&connection).await;
+    self_report(&env, &author, "branch", "task_branch", &head).await;
+    self_report(&env, &author, "tests", "revision_tests", &head).await;
+    self_report(&env, &reviewer, "review", "independent_review", &head).await;
+    env.poll().await;
+    let last = |env: &Env| skill_statuses(env, &head).last().cloned().unwrap();
+    assert_eq!(last(&env)["state"], "success");
+
+    // Turned off: the success is replaced once, then nothing more is posted.
+    set_skill_status(&env, "off");
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "error");
+    assert_eq!(
+        last(&env)["description"],
+        "No longer published by the Hub for this repository."
+    );
+    let count = skill_statuses(&env, &head).len();
+    env.poll().await;
+    assert_eq!(skill_statuses(&env, &head).len(), count);
+
+    // On again, then the skill leaves the lock: retired as well.
+    set_skill_status(&env, "on");
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "success");
+    env.store.skill_adoption_clear(REPO, None).unwrap();
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "error");
+
+    // Adopted again, then pinned at a sha256 no catalog knows: that pin is not adopted
+    // (`unknown_version`), so its success is retired the same way.
+    use agentscm::hub::skills::SkillAdoption;
+    use agentscm::skill_workflow::supported::{SkillLock, SkillPin, catalog_entry};
+    let pinned = |sha: Option<&str>| {
+        let mut pin = SkillPin::first_party(catalog_entry("pr-gate", 1).unwrap(), None);
+        if let Some(sha) = sha {
+            pin.sha256 = sha.into();
+        }
+        SkillAdoption {
+            repository: REPO.into(),
+            source: "default_branch".into(),
+            lock_json: serde_json::to_string(&SkillLock {
+                version: 1,
+                skills: vec![pin],
+            })
+            .unwrap(),
+            default_branch: Some("main".into()),
+            observed_at: unix_now(),
+            reported_by: None,
+        }
+    };
+    env.store.skill_adoption_put(&pinned(None)).unwrap();
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "success");
+    env.store
+        .skill_adoption_put(&pinned(Some(&"0".repeat(64))))
+        .unwrap();
+    env.poll().await;
+    assert_eq!(last(&env)["state"], "error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approver_with_write_access_counts_behind_eight_without() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let head = observed_skill_fixture(&env).await;
+    env.fake.with(|s| {
+        let rows: Vec<Value> = (1..=9)
+            .map(|n| {
+                json!({"id": n, "state": "APPROVED", "commit_id": head,
+                    "user": {"login": format!("reviewer-{n}"), "type": "User"},
+                    "submitted_at": format!("2026-10-30T10:0{n}:00Z")})
+            })
+            .collect();
+        s.context_reviews.insert((REPO_ID, 5), rows);
+        for n in 1..=8 {
+            s.collaborator_permissions
+                .insert(format!("reviewer-{n}"), "triage".into());
+        }
+        s.collaborator_permissions
+            .insert("reviewer-9".into(), "write".into());
+    });
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    env.poll().await;
+    let (_, run) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/skills/runs/by-branch?branch=feat%2F5",
+            Some(&agent),
+        )
+        .await;
+    let approval = &run["gates"][5]["evidence"][0];
+    assert_eq!(approval["assurance"], "observed", "{run}");
+    assert!(
+        approval["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("reviewer-9")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_is_not_recorded_when_the_forge_read_outlasts_the_deadline() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    observed_skill_fixture(&env).await;
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    // The merge-time check-run read never answers: the 10-second deadline ends the attempt.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    env.fake
+        .with(|s| s.stall_next = Some(("/check-runs".into(), gate.clone())));
+    merge_pull_5(&env);
+    let started = Instant::now();
+    env.poll().await;
+    assert!(started.elapsed() >= Duration::from_secs(10));
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    let merged = &library["counts"]["pr-gate"]["merged_observed"];
+    assert!(merged.is_null() || merged == 0, "{library}");
+    gate.add_permits(1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_by_a_reviewer_without_write_access_is_not_observed() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    observed_skill_fixture(&env).await;
+    env.fake.with(|s| {
+        s.collaborator_permissions
+            .insert("maintainer-fixture".into(), "triage".into());
+    });
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    env.poll().await;
+    let (_, run) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/skills/runs/by-branch?branch=feat%2F5",
+            Some(&agent),
+        )
+        .await;
+    assert_eq!(
+        run["gates"][4]["evidence"][0]["assurance"], "observed",
+        "{run}"
+    );
+    assert_eq!(run["gates"][5]["evidence"], json!([]), "{run}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_connection_records_an_observed_merge_from_its_own_read() {
+    use agentscm::skill_workflow::supported::{LOCK_PATH, SkillLock, SkillPin, catalog_entry};
+
+    let env = Env::start_with(true).await;
+    let admin = env.admin.clone();
+    env.fake.with(|s| {
+        s.repos.insert(REPO_ID, Repo::new(REPO_ID, REPO));
+    });
+    let (_, listed) = env.get("/v1/hub/connections", Some(&admin)).await;
+    let connection = listed["connections"][0]["id"].as_str().unwrap().to_owned();
+    let (status, added) = env
+        .post(
+            &format!("/v1/hub/connections/{connection}/repositories"),
+            Some(&admin),
+            json!({"full_name": REPO}),
+        )
+        .await;
+    assert_eq!(status, 200, "{added}");
+    let lock = SkillLock {
+        version: 1,
+        skills: vec![SkillPin::first_party(
+            catalog_entry("pr-gate", 1).unwrap(),
+            None,
+        )],
+    };
+    add_pull(&env, 5, &["src/a.rs"]);
+    add_branch(&env, "main", 0);
+    env.fake.with(|s| {
+        let repo = s.repos.get_mut(&REPO_ID).unwrap();
+        repo.files
+            .insert(LOCK_PATH.into(), serde_json::to_string(&lock).unwrap());
+        let head = repo.pulls[&5].head_sha.clone();
+        s.context_checks.insert(
+            (REPO_ID, head.clone()),
+            vec![json!({"id": 2, "name": "test",
+            "status": "completed", "conclusion": "success", "head_sha": head,
+            "completed_at": "2026-10-30T10:01:00Z"})],
+        );
+    });
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    merge_pull_5(&env);
+    env.poll().await;
+    let (status, run) = env
+        .get(
+            "/v1/hub/repos/acme%2Fwidgets/skills/runs/by-branch?branch=feat%2F5",
+            Some(&agent),
+        )
+        .await;
+    assert_eq!(status, 200, "{run}");
+    // The token read the green check at the merge; no approval exists.
+    assert_eq!(
+        run["gates"][4]["evidence"][0]["assurance"], "observed",
+        "{run}"
+    );
+    assert_eq!(
+        run["merge_check"]["unobserved"],
+        json!(["approval"]),
+        "{run}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_is_not_recorded_without_a_complete_forge_read() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    observed_skill_fixture(&env).await;
+    let agent = env.agent(1, "dev", "dev");
+    env.refresh(&connection).await;
+    // The combined status cannot be read at the merge: no merge to count as a skip.
+    env.fake.with(|s| {
+        for _ in 0..4 {
+            s.fail.push_back(Failure {
+                path_contains: "/status?".into(),
+                status: 500,
+                headers: vec![],
+            });
+        }
+    });
+    merge_pull_5(&env);
+    env.poll().await;
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    assert_eq!(
+        library["counts"]["pr-gate"]["merged_observed"],
+        json!(null),
+        "{library}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pr_context_http_and_mcp_share_retained_scope_and_head_contract() {
     let env = Env::start().await;
@@ -3375,6 +3875,27 @@ async fn pr_context_http_and_mcp_share_retained_scope_and_head_contract() {
         .get(&format!("{path}&expected_head={head}"), Some(&agent))
         .await;
     assert_eq!(changed["head_relation"], "changed");
+    // A merged PR loses its open-state context but keeps the provider merge fact.
+    env.pull(5, |pull| {
+        pull.state = "closed".into();
+        pull.merged = true;
+        pull.merge_commit_sha = Some("e".repeat(40));
+    });
+    env.poll().await;
+    let (status, merged) = env.get(path, Some(&agent)).await;
+    assert_eq!(status, 200, "{merged}");
+    assert_eq!(merged["availability"], "merged", "{merged}");
+    assert_eq!(merged["merges"][0]["merge_commit"], "e".repeat(40));
+    assert_eq!(merged["merges"][0]["paths"], json!(["src/a.rs"]));
+    assert_eq!(merged["merges_complete"], true);
+    assert!(
+        merged["not_retained"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("provider_evidence"))
+    );
+    assert!(merged["pull_request"].is_null());
+    assert_eq!(merged["coverage"]["last_sync_partial"], false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3479,7 +4000,12 @@ async fn pr_context_real_work_and_workflow_reads_recheck_reader_revocation() {
         )
         .await;
     assert_eq!(foreign["result"]["isError"], true);
-    assert!(foreign["result"]["structuredContent"].is_null());
+    // A token for another repository learns nothing but the refusal itself.
+    assert_eq!(
+        foreign["result"]["structuredContent"]["error"]["code"],
+        "wrong_repository"
+    );
+    assert!(foreign["result"]["structuredContent"]["work"].is_null());
     assert!(
         foreign["result"]["content"][0]["text"]
             .as_str()

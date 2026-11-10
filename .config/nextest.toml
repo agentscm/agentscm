@@ -10,16 +10,11 @@ report-skipped = "ignored"
 
 [test-groups]
 backend-s3 = { max-threads = 1 }
-hub-postgres = { max-threads = 1 }
 hub-worktree-lifecycle = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^backend_s3::/)'
 test-group = 'backend-s3'
-
-[[profile.default.overrides]]
-filter = 'test(/(^\w+::(on_postgres::|postgres_)|::postgres::|::postgres$|_on_postgres$)/)'
-test-group = 'hub-postgres'
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^hub_workspace_execution::two_git_worktrees_/)'

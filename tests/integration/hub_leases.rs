@@ -159,6 +159,7 @@ fn start(key: &str, session: &str, scope: &str) -> WorkStart {
         source: None,
         request_key: Some(key.into()),
         title: key.into(),
+        description: None,
         session: session.into(),
         role: WorkRole::Lead,
         scope: vec![scope.into()],
@@ -537,7 +538,7 @@ fn a_partitioned_lead_reconnects_to_a_fence(db: &Db) {
     touch(&*store, &alice, "s-a", &[], back).unwrap();
     assert!(matches!(
         touch(&*store, &alice, "s-a", &["src/lib.rs"], back),
-        Err(HubError::Invalid(_))
+        Err(HubError::Invalid(_) | HubError::Rejected(_))
     ));
     assert!(matches!(
         store.work_checkpoint(
@@ -550,7 +551,7 @@ fn a_partitioned_lead_reconnects_to_a_fence(db: &Db) {
     // Starting the Work again is told about the lapse rather than handed a paused item.
     assert!(matches!(
         store.work_start(&alice.token, &start_a, back),
-        Err(HubError::Invalid(message)) if message.starts_with(LEASE_LAPSED)
+        Err(HubError::Rejected(rejection)) if rejection.message().starts_with(LEASE_LAPSED)
     ));
     assert_eq!(db.lease(&held.id), (String::new(), String::new()));
     assert_overlap(
@@ -802,7 +803,7 @@ fn a_pause_or_retain_never_revives_a_lapsed_lease(db: &Db) {
     };
     assert!(matches!(
         store.work_transition(&WorkTransitionActor::Agent { token: &alice.token }, &retain, after),
-        Err(HubError::Invalid(message)) if message.starts_with(LEASE_LAPSED)
+        Err(HubError::Rejected(rejection)) if rejection.message().starts_with(LEASE_LAPSED)
     ));
     // A pause is recorded but keeps the lapsed expiry.
     let pause = WorkCheckpoint {
@@ -826,10 +827,11 @@ fn a_lapsed_lease_refuses_edits_until_held_again(db: &Db) {
     let after = now + LEASE_SECONDS + 1;
     tick(&*store, now, after);
     // Nobody took the scope, but the lapsed lease no longer holds it.
-    let Err(HubError::Invalid(message)) = touch(&*store, &alice, "s-a", &["src/lib.rs"], after)
+    let Err(HubError::Rejected(rejection)) = touch(&*store, &alice, "s-a", &["src/lib.rs"], after)
     else {
         panic!("an edit under a lapsed lease must be refused");
     };
+    let message = rejection.message();
     assert!(message.starts_with(LEASE_LAPSED), "{message}");
     assert!(
         message.contains("Nothing held the scope when this was refused"),
@@ -954,17 +956,20 @@ fn a_lapsed_lead_is_told_when_who_and_how_to_resume(db: &Db) {
     );
     assert!(reclaimed.notice.contains("never pushed"), "{reclaimed:?}");
     let taken = taken.item;
-    let Err(HubError::Invalid(message)) = touch(&*store, &alice, "s-a", &["src/lib.rs"], after + 1)
+    let Err(HubError::Rejected(rejection)) =
+        touch(&*store, &alice, "s-a", &["src/lib.rs"], after + 1)
     else {
         panic!("a lapsed lead's edit must be refused");
     };
+    let message = rejection.message();
     assert!(message.starts_with(LEASE_LAPSED), "{message}");
     // Starting the Work again gets the same answer as the edit.
-    let Err(HubError::Invalid(started)) =
+    let Err(HubError::Rejected(started)) =
         store.work_start(&alice.token, &start("a", "s-a", "src/**"), after + 1)
     else {
         panic!("a lapsed lead's start must be told about the lapse");
     };
+    let started = started.message();
     assert_eq!(started, message);
     for part in [
         format!("lapsed at Unix {}", now + LEASE_SECONDS),
@@ -1194,11 +1199,12 @@ fn an_unnamed_start_holds_no_lapsed_scope_again(db: &Db) {
     let after = now + LEASE_SECONDS + 1;
     tick(&*store, now, after);
     // The same start, but its session was resolved for a call that named none.
-    let Err(HubError::Invalid(message)) =
+    let Err(HubError::Rejected(rejection)) =
         store.work_start_named(&alice.token, &start_a, false, after)
     else {
         panic!("an unnamed start must not hold a lapsed scope again");
     };
+    let message = rejection.message();
     assert!(message.starts_with(LEASE_LAPSED), "{message}");
     assert!(message.contains("names no session"), "{message}");
     assert_eq!(db.lease(&held.id).1, (now + LEASE_SECONDS).to_string());

@@ -13,6 +13,10 @@ use super::store::{Principal, Store};
 /// badge.
 pub const RECENT_EXPIRY_SECONDS: i64 = 24 * 60 * 60;
 
+/// An edit hook unseen this long after MCP first verified is a problem; sooner, the session may
+/// simply not have edited yet.
+pub const EDIT_HOOK_GRACE_SECONDS: i64 = 10 * 60;
+
 /// Why an agent cannot coordinate. `code` is stable for other surfaces to match on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupReason {
@@ -104,7 +108,7 @@ pub struct SetupProblem {
     pub reason: SetupReason,
     /// Stable per agent connection and session (or per repository for a token problem); no secret.
     pub key: String,
-    /// The display name of the agent token concerned.
+    /// How people say the agent concerned: its brand, or `Agent <hex>` for a token label.
     pub agent: String,
     /// Agent token ids concerned, to link the Work they lead. Never shown.
     pub tokens: Vec<String>,
@@ -139,16 +143,20 @@ pub fn problems(
         .collect::<Vec<_>>();
     let mut out = Vec::new();
     for (token, status) in observations.owned_rows(who, &owner.id, now)? {
-        let Some(name) = tokens
+        if !tokens
             .iter()
-            .find(|t| t.id == token && !t.revoked && t.expires_at > now)
-            .map(|t| t.name.clone())
-        else {
+            .any(|t| t.id == token && !t.revoked && t.expires_at > now)
+        {
             continue;
-        };
+        }
         let reason = match status.blocker {
             Some(blocker) => SetupReason::of(blocker),
-            None if status.mcp_verified && !status.native_verified => {
+            None if status.mcp_verified
+                && !status.native_verified
+                && status
+                    .mcp_since
+                    .is_some_and(|at| now - at >= EDIT_HOOK_GRACE_SECONDS) =>
+            {
                 SetupReason::EditHookUnverified
             }
             None => continue,
@@ -156,7 +164,8 @@ pub fn problems(
         out.push(SetupProblem {
             reason,
             key: status.key,
-            agent: name,
+            // The tool's brand ("Claude Code"), never the generated token label.
+            agent: crate::hub::advice::agent_name(status.agent.name()),
             tokens: vec![token],
         });
     }
@@ -171,7 +180,7 @@ pub fn problems(
                 SetupReason::TokenExpired
             },
             key: "repository".into(),
-            agent: newest.name.clone(),
+            agent: crate::hub::advice::agent_name(&newest.name),
             tokens: tokens.iter().map(|t| t.id.clone()).collect(),
         });
     }
