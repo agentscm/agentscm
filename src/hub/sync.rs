@@ -68,6 +68,8 @@ pub struct SyncConfig {
     pub activity_days: i64,
     /// Lowercase `owner/name` of the GitHub repositories whose external runs are read.
     external_runs: BTreeSet<String>,
+    /// Lowercase `owner/name` of the GitHub repositories whose skill runs post a commit status.
+    skill_status: BTreeSet<String>,
     pat: Option<Pat>,
     gitlab: Option<GitlabConfig>,
 }
@@ -88,7 +90,8 @@ impl SyncConfig {
     /// Reads `AGENTSCM_GITHUB_URL`, `_API_URL`, `AGENTSCM_GITHUB_PAT[_FILE]` and
     /// `AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET[_FILE]`, and `AGENTSCM_GITLAB_URL`,
     /// `AGENTSCM_GITLAB_TOKEN[_FILE]`, `AGENTSCM_GITLAB_WEBHOOK_SECRET[_FILE]` and
-    /// `AGENTSCM_GITHUB_EXTERNAL_RUNS` (comma-separated `owner/name`) through `lookup`.
+    /// `AGENTSCM_GITHUB_EXTERNAL_RUNS` and `AGENTSCM_SKILL_FORGE_STATUS` (comma-separated
+    /// `owner/name`) through `lookup`.
     pub fn from_lookup(
         public_url: &str,
         secrets: PathBuf,
@@ -154,23 +157,26 @@ impl SyncConfig {
         if !(1..=365).contains(&activity_days) {
             return Err(HubError::Invalid("--activity-days must be 1 to 365".into()));
         }
-        let external_runs = lookup("AGENTSCM_GITHUB_EXTERNAL_RUNS")
-            .map(|list| {
-                list.split(',')
-                    .map(|name| {
-                        let name = name.trim();
-                        if name.split('/').count() != 2 || validate_repository(name).is_err() {
-                            return Err(HubError::Invalid(
-                                "AGENTSCM_GITHUB_EXTERNAL_RUNS must list owner/name repositories"
-                                    .into(),
-                            ));
-                        }
-                        Ok(name.to_ascii_lowercase())
-                    })
-                    .collect::<Result<BTreeSet<_>>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let repositories = |variable: &str| {
+            lookup(variable)
+                .map(|list| {
+                    list.split(',')
+                        .map(|name| {
+                            let name = name.trim();
+                            if name.split('/').count() != 2 || validate_repository(name).is_err() {
+                                return Err(HubError::Invalid(format!(
+                                    "{variable} must list owner/name repositories"
+                                )));
+                            }
+                            Ok(name.to_ascii_lowercase())
+                        })
+                        .collect::<Result<BTreeSet<_>>>()
+                })
+                .transpose()
+                .map(Option::unwrap_or_default)
+        };
+        let external_runs = repositories("AGENTSCM_GITHUB_EXTERNAL_RUNS")?;
+        let skill_status = repositories("AGENTSCM_SKILL_FORGE_STATUS")?;
         Ok(Self {
             web: urls.web,
             api: urls.api,
@@ -179,6 +185,7 @@ impl SyncConfig {
             secrets,
             activity_days,
             external_runs,
+            skill_status,
             pat: token.map(|token| Pat {
                 token,
                 webhook_secret: hook,
@@ -398,6 +405,12 @@ impl Sync {
         self.config
             .as_ref()
             .is_some_and(|c| c.external_runs.contains(&full_name.to_ascii_lowercase()))
+    }
+
+    pub(super) fn skill_status_enabled(&self, full_name: &str) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|c| c.skill_status.contains(&full_name.to_ascii_lowercase()))
     }
 
     pub(super) fn external_cursor(&self, repository: &str) -> (i64, String) {
@@ -1347,20 +1360,20 @@ async fn reconcile_provider_context(
                 stamp,
                 super::provider_context::error_availability(&error),
             ),
-            Ok(_) => match current {
+            Ok(_) => match &current {
                 None => {
                     super::provider_context::unavailable_snapshot(repo, pr, stamp, "unavailable")
                 }
                 Some(current) => match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    super::provider_context::collect(state, conn, repo, token, &current, stamp),
+                    super::provider_context::collect(state, conn, repo, token, current, stamp),
                 )
                 .await
                 {
                     Ok(Ok(snapshot)) => snapshot,
                     result => super::provider_context::unavailable_snapshot(
                         repo,
-                        &current,
+                        current,
                         stamp,
                         if result.is_err() {
                             "timed_out"
@@ -1397,6 +1410,9 @@ async fn reconcile_provider_context(
             Ok(())
         })
         .await?;
+        if let Some(current) = &current {
+            super::skills::observe_open_pull(state, conn, repo, token, current, &snapshot).await;
+        }
         lock(&state.sync.provider_cursors).insert(repo.id.clone(), **number);
     }
     // A generic failed PR read is already replaced above. Without a confirmed grant
@@ -1416,6 +1432,19 @@ async fn reconcile_provider_context(
         .await?;
     }
     Ok(())
+}
+
+/// Label names of a pull request, bounded: at most 32 of at most 100 bytes each.
+fn labels(value: &Value) -> Value {
+    let names: Vec<&str> = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|label| label["name"].as_str())
+        .filter(|name| name.len() <= 100 && !name.chars().any(char::is_control))
+        .take(32)
+        .collect();
+    json!(names)
 }
 
 /// Observes a pull request from its API JSON; true when the observation changed.
@@ -1459,7 +1488,8 @@ async fn observe_pull(
         "state": item["state"], "draft": item["draft"].as_bool().unwrap_or(false),
         "repository_id": repo.repository_id,
         "head_ref": item["head"]["ref"], "head_sha": head_sha, "base_ref": item["base"]["ref"],
-        "base_sha": item["base"]["sha"],
+        "base_sha": item["base"]["sha"], "head_repository_id": item["head"]["repo"]["id"],
+        "labels": labels(&item["labels"]),
         "author": {"login": item["user"]["login"], "id": item["user"]["id"]},
         "html_url": item["html_url"],
         "files": files, "files_truncated": truncated});
@@ -1490,12 +1520,14 @@ async fn reread_pull(
     if let Some(pull) = pull.as_ref().filter(|pull| pull["state"] == "open") {
         return observe_pull(state, conn, repo, token, pull, stored.get(&number), started).await;
     }
-    if let Some(pull) = pull.as_ref().filter(|pull| pull["merged"] == true)
-        && let Err(error) =
+    if let Some(pull) = pull.as_ref().filter(|pull| pull["merged"] == true) {
+        if let Err(error) =
             super::catchup_sync::observe(state, conn, repo, token, number, pull).await
-    {
-        super::catchup_sync::unavailable(state, conn, repo).await?;
-        crate::hub::error_envelope::log_internal(&error);
+        {
+            super::catchup_sync::unavailable(state, conn, repo).await?;
+            crate::hub::error_envelope::log_internal(&error);
+        }
+        super::skills::observe_merge(state, conn, repo, token, pull).await;
     }
     let data = match &pull {
         None => json!({"number": number, "state": "gone", "merged": false}),

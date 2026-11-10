@@ -1,9 +1,11 @@
 //! Supported skills on the hub (Experimental): the library view, repository adoption, and
-//! self-reported evidence recorded per run, over HTTP and MCP.
+//! evidence recorded per run, over HTTP and MCP.
 //!
-//! A run is one (repository, branch, skill). Evidence is what an agent says it did; the hub
-//! labels it `self_reported` and only checks the ordering rules in
-//! `skill_workflow::supported::admit`. Adoption comes from the lock file on the forge's default
+//! A run is one (repository, branch, skill). Evidence an agent records is labelled
+//! `self_reported`; the hub only checks the ordering rules in `skill_workflow::supported::admit`.
+//! On a GitHub connection the hub also records what it reads from the forge (green checks, an
+//! approval, the merge) as `observed`, and, where the operator turns it on, posts the run as the
+//! `agentscm/skill/<name>` commit status. Adoption comes from the lock file on the forge's default
 //! branch when the repository is connected, else from what a checkout reported (a connected
 //! repository refuses checkout reports).
 
@@ -18,9 +20,9 @@ use axum::routing::{get, put};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::connection::ConnectedRepository;
+use super::connection::{ConnectedRepository, Connection};
 use super::forge_api::ForgeApi;
-use super::github::GhError;
+use super::github::{CommitStatus, GhError, StatusState};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::mcp::{hub_failure, invalid_args, try_args};
 use super::store::{Store, new_id, unix_now};
@@ -300,6 +302,9 @@ fn shown_runs(store: &dyn Store, viewer: &str, runs: &mut [RunView]) -> Result<(
     for run in runs {
         let gates = run.gates.iter_mut().flat_map(|gate| &mut gate.evidence);
         for e in gates.chain(&mut run.stale_evidence) {
+            if e.evidence.assurance == Assurance::Observed {
+                continue; // recorded by the hub from the forge, not by an agent token
+            }
             let owner = mine.contains(&e.token_id).then_some(viewer);
             Viewer(viewer).agent(owner, &e.token_id, &mut e.agent, &mut e.session);
         }
@@ -329,10 +334,20 @@ fn library(store: &dyn Store, repo: Option<&str>) -> Result<Value> {
         }
         adoption["pins"] = pins_json(&pins_of(stored.as_ref()));
         for view in views(store, repo, None, None, MAX_RUNS)? {
-            let c = counts
-                .entry(view.skill.name.clone())
-                .or_insert_with(|| json!({"open": 0, "at_stop_gate": 0, "completed": 0}));
+            let c = counts.entry(view.skill.name.clone()).or_insert_with(|| {
+                json!({"open": 0, "at_stop_gate": 0, "completed": 0, "merged_observed": 0,
+                        "merged_with_skips": 0, "merged_unobserved": 0})
+            });
             let bump = |c: &mut Value, key: &str| c[key] = json!(c[key].as_u64().unwrap_or(0) + 1);
+            if let Some(check) = &view.merge_check {
+                bump(c, "merged_observed");
+                if check.skipped_any() {
+                    bump(c, "merged_with_skips");
+                }
+                if !check.unobserved.is_empty() {
+                    bump(c, "merged_unobserved");
+                }
+            }
             match view.state {
                 RunState::Completed => bump(c, "completed"),
                 RunState::Open => {
@@ -587,6 +602,551 @@ pub(super) async fn sync_adoption(
     }
 }
 
+// ---- forge observation ----------------------------------------------------------------------
+
+/// Commit status context prefix: a skill's runs post `agentscm/skill/<name>`.
+pub const STATUS_PREFIX: &str = "agentscm/skill/";
+/// Token id, session and agent of evidence the hub records from the forge; no agent token
+/// has this id, so it never counts as an author for review independence.
+const FORGE: &str = "forge";
+/// Longest status description; the provider snapshot keeps 120 characters, so a status read
+/// back compares equal to the one posted.
+const MAX_STATUS_CHARS: usize = 120;
+
+fn short(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+fn lower_sha(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+}
+
+/// Label names from a GitHub pull (objects with `name`) or a stored observation (strings).
+fn labels_of(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.as_str().or_else(|| l["name"].as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn items<'a>(snapshot: &'a Value, kind: &str) -> impl Iterator<Item = &'a Value> {
+    snapshot[kind]["items"].as_array().into_iter().flatten()
+}
+
+/// Whether provider time `at` is at or before `cutoff` (the merge time); no cutoff admits all.
+fn by(at: &Value, cutoff: Option<i64>) -> bool {
+    cutoff.is_none_or(|cutoff| {
+        at.as_str()
+            .and_then(super::github::parse_rfc3339)
+            .is_some_and(|at| at <= cutoff)
+    })
+}
+
+/// The latest status per context on the head, from GitHub's combined status; `None` when it
+/// was not read or lists fewer contexts than it counts.
+fn latest_statuses(combined: Option<&Value>) -> Option<&Vec<Value>> {
+    let combined = combined?;
+    let statuses = combined["statuses"].as_array()?;
+    (combined["total_count"].as_u64() == Some(statuses.len() as u64)).then_some(statuses)
+}
+
+/// Green CI on the head: the latest check runs were read completely and the combined status
+/// listed every context, at least one check exists, every check run concluded success, neutral
+/// or skipped and every status other than the skill statuses is success, all by `cutoff`.
+fn ci_passed(snapshot: &Value, combined: Option<&Value>, cutoff: Option<i64>) -> bool {
+    let Some(statuses) = latest_statuses(combined) else {
+        return false;
+    };
+    if snapshot["check_runs"]["complete"] != true {
+        return false;
+    }
+    let statuses: Vec<&Value> = statuses
+        .iter()
+        .filter(|s| {
+            !s["context"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(STATUS_PREFIX)
+        })
+        .collect();
+    let runs: Vec<&Value> = items(snapshot, "check_runs").collect();
+    (!runs.is_empty() || !statuses.is_empty())
+        && runs.iter().all(|r| {
+            r["state"] == "completed"
+                && matches!(
+                    r["conclusion"].as_str(),
+                    Some("success" | "neutral" | "skipped")
+                )
+                && by(&r["provider_completed_at"], cutoff)
+        })
+        && statuses
+            .iter()
+            .all(|s| s["state"] == "success" && by(&s["updated_at"], cutoff))
+}
+
+/// The reviewer who approved `head`, when the review list was read completely, some
+/// reviewer's latest decisive review by `cutoff` approves `head`, and no reviewer's latest
+/// requests changes. Only a person with write access counts: an owner, member or collaborator
+/// whose account is not a bot.
+fn approved_by(snapshot: &Value, head: &str, cutoff: Option<i64>) -> Option<String> {
+    if snapshot["reviews"]["complete"] != true {
+        return None;
+    }
+    let mut latest = BTreeMap::new();
+    // Newest first; a comment does not change a reviewer's decision.
+    for r in items(snapshot, "reviews").filter(|r| by(&r["provider_submitted_at"], cutoff)) {
+        if matches!(
+            r["state"].as_str(),
+            Some("APPROVED" | "CHANGES_REQUESTED" | "DISMISSED")
+        ) {
+            let who = r["reviewer"]
+                .as_str()
+                .map_or_else(|| format!("#{}", r["provider_id"]), str::to_owned);
+            latest.entry(who).or_insert(r);
+        }
+    }
+    if latest.values().any(|r| r["state"] == "CHANGES_REQUESTED") {
+        return None;
+    }
+    latest
+        .into_iter()
+        .find(|(_, r)| {
+            r["state"] == "APPROVED"
+                && r["commit_sha"] == head
+                && matches!(
+                    r["reviewer_association"].as_str(),
+                    Some("OWNER" | "MEMBER" | "COLLABORATOR")
+                )
+                && r["reviewer_type"] == "User"
+        })
+        .map(|(who, _)| who)
+}
+
+/// One fact the hub read from the forge for a pull request head.
+struct Fact {
+    kind: EvidenceKind,
+    head: String,
+    summary: String,
+}
+
+/// The pull request the facts are about, as the hub stored or read it.
+#[derive(Clone)]
+struct ForgePull {
+    number: u64,
+    branch: String,
+    head: String,
+    url: Option<String>,
+    labels: Vec<String>,
+}
+
+impl ForgePull {
+    /// A same-repository pull request with a usable branch and head: number, branch, head,
+    /// head repository id, link and labels. A fork's branch name could name another run.
+    fn read(
+        repo: &ConnectedRepository,
+        [number, branch, head, head_repo, url, labels]: [&Value; 6],
+    ) -> Option<Self> {
+        let branch = branch
+            .as_str()
+            .filter(|b| super::github::valid_ref_name(b))?;
+        (head_repo.as_i64() == Some(repo.repository_id)).then_some(())?;
+        Some(Self {
+            number: number.as_u64().filter(|n| *n > 0)?,
+            branch: branch.to_owned(),
+            head: lower_sha(head)?,
+            url: url.as_str().filter(|u| u.len() <= 2048).map(str::to_owned),
+            labels: labels_of(labels),
+        })
+    }
+}
+
+fn snapshot_facts(
+    snapshot: &Value,
+    combined: Option<&Value>,
+    head: &str,
+    cutoff: Option<i64>,
+) -> Vec<Fact> {
+    let mut facts = Vec::new();
+    if ci_passed(snapshot, combined, cutoff) {
+        facts.push(Fact {
+            kind: EvidenceKind::HostedCi,
+            head: head.to_owned(),
+            summary: format!("Every GitHub check and status on {} passed.", short(head)),
+        });
+    }
+    if let Some(who) = approved_by(snapshot, head, cutoff) {
+        let who: String = who.chars().take(100).collect();
+        facts.push(Fact {
+            kind: EvidenceKind::HumanApproval,
+            head: head.to_owned(),
+            summary: format!("{who} approved {} on GitHub.", short(head)),
+        });
+    }
+    facts
+}
+
+/// Records `facts` for every adopted skill whose gates accept them; returns the adopted
+/// skills' entries with their runs on the branch after recording.
+fn record_observed(
+    store: &dyn Store,
+    repo: &str,
+    pull: &ForgePull,
+    facts: &[Fact],
+) -> Result<Vec<(&'static supported::CatalogEntry, Option<RunView>)>> {
+    let pins = pins_of(store.skill_adoption(repo)?.as_ref());
+    let mut out = Vec::new();
+    for pin in pins.iter().filter(|p| p.status == AdoptionStatus::Adopted) {
+        let Some(entry) = supported::catalog_entry_by_sha256(&pin.pin.sha256) else {
+            continue;
+        };
+        let params = entry
+            .manifest
+            .effective_params(pin.pin.params.as_ref())
+            .unwrap_or_default();
+        let run_id = run_id_of(repo, &pull.branch, &pin.pin.name);
+        let mut existing: Vec<StoredEvidence> = store
+            .skill_evidence(repo, &run_id)?
+            .iter()
+            .filter_map(EvidenceRow::to_stored)
+            .collect();
+        for fact in facts {
+            for gate in &entry.manifest.gates {
+                let Some(spec) = gate.evidence.iter().find(|s| s.kind() == fact.kind) else {
+                    continue;
+                };
+                // A required label is recorded only when the pull request carries it; a merge
+                // method is never observed, so a required one leaves the gate to a report.
+                let label = (fact.kind == EvidenceKind::HostedCi)
+                    .then(|| spec.required_value(&params))
+                    .flatten()
+                    .filter(|l| pull.labels.contains(l));
+                let evidence = Evidence {
+                    skill: Some(pin.pin.name.clone()),
+                    gate: gate.id.clone(),
+                    kind: fact.kind,
+                    head_sha: fact.head.clone(),
+                    assurance: Assurance::Observed,
+                    summary: fact.summary.clone(),
+                    url: pull.url.clone(),
+                    branch: Some(pull.branch.clone()),
+                    pull_request: Some(pull.number),
+                    detail: label.map(|label| Detail {
+                        label: Some(label),
+                        ..Detail::default()
+                    }),
+                };
+                if existing.len() >= MAX_RUN_EVIDENCE
+                    || !supported::admit_observed(&entry.manifest, &existing, &evidence)
+                {
+                    continue;
+                }
+                let stored = StoredEvidence {
+                    id: new_id("evd")?,
+                    token_id: FORGE.into(),
+                    session: FORGE.into(),
+                    agent: "GitHub".into(),
+                    recorded_at: unix_now() as u64,
+                    evidence,
+                };
+                store.skill_evidence_add(&EvidenceRow::from_stored(
+                    repo,
+                    &run_id,
+                    &pull.branch,
+                    &pin.pin.name,
+                    &entry.sha256,
+                    &stored,
+                ))?;
+                existing.push(stored);
+            }
+        }
+        let head = RunHead {
+            run_id,
+            branch: pull.branch.clone(),
+            skill: pin.pin.name.clone(),
+            skill_sha256: entry.sha256.clone(),
+        };
+        let view = if existing.is_empty() {
+            None
+        } else {
+            run_view(store, repo, &head, &pins)?
+        };
+        out.push((entry, view));
+    }
+    Ok(out)
+}
+
+/// The commit status a run shows on the pull request head: success once every gate before the
+/// merge gate is done on that head and each of those gates the forge can show (CI, approval)
+/// has observed evidence there; failure while a Stop-enforced gate the agent can do is open;
+/// pending otherwise. A report alone never turns the status green. The description is the
+/// next action.
+fn desired_status(
+    manifest: &supported::SupportedManifest,
+    view: Option<&RunView>,
+    head: &str,
+) -> (StatusState, String) {
+    let text = |s: String| s.chars().take(MAX_STATUS_CHARS).collect::<String>();
+    let Some(view) = view else {
+        return (
+            StatusState::Pending,
+            format!("No {} evidence on {} yet.", manifest.name, short(head)),
+        );
+    };
+    if view.head_sha != head {
+        return (
+            StatusState::Pending,
+            text(format!(
+                "Evidence is for {}, not the head {}.",
+                short(&view.head_sha),
+                short(head)
+            )),
+        );
+    }
+    let cut = supported::merge_gate_index(manifest).unwrap_or(manifest.gates.len());
+    let at = view
+        .current_gate
+        .as_deref()
+        .and_then(|id| manifest.gates.iter().position(|g| g.id == id))
+        .unwrap_or(manifest.gates.len());
+    if at < cut {
+        let state = if view.blocks_finish {
+            StatusState::Failure
+        } else {
+            StatusState::Pending
+        };
+        return (state, text(view.next_action.clone()));
+    }
+    let unseen: Vec<&str> = manifest.gates[..cut]
+        .iter()
+        .filter(|g| {
+            g.evidence
+                .iter()
+                .any(|s| supported::forge_observable(s.kind()))
+        })
+        .filter(|g| {
+            !view.gates.iter().any(|v| {
+                v.id == g.id
+                    && v.evidence.iter().any(|e| {
+                        e.evidence.assurance == Assurance::Observed && e.evidence.head_sha == head
+                    })
+            })
+        })
+        .map(|g| g.id.as_str())
+        .collect();
+    if !unseen.is_empty() {
+        return (
+            StatusState::Pending,
+            text(format!(
+                "Waiting for GitHub to show {} on {}.",
+                unseen.join(" and "),
+                short(head)
+            )),
+        );
+    }
+    (
+        StatusState::Success,
+        format!("Every gate before merge has evidence on {}.", short(head)),
+    )
+}
+
+/// Posts the status unless the combined status already shows it for the context.
+async fn post_status(
+    state: &HubState,
+    conn: &Connection,
+    (repo, token, pull): (&ConnectedRepository, &str, &ForgePull),
+    combined: Option<&Value>,
+    (name, status, description): (&str, StatusState, String),
+) {
+    let context = format!("{STATUS_PREFIX}{name}");
+    let shown = combined
+        .and_then(|c| c["statuses"].as_array())
+        .into_iter()
+        .flatten()
+        .find(|s| s["context"] == context.as_str());
+    if shown
+        .is_some_and(|s| s["state"] == status.as_str() && s["description"] == description.as_str())
+    {
+        return;
+    }
+    let posted = async {
+        let status = CommitStatus::new(&pull.head, status, &context, &description)
+            .map_err(|e| GhError::Failed(e.to_string()))?;
+        state
+            .sync
+            .forge(conn)?
+            .post_commit_status(token, repo, &status, &pull.branch)
+            .await
+    }
+    .await;
+    match posted {
+        Ok(Ok(())) => {}
+        Ok(Err(code)) => eprintln!(
+            "hub: {} refused the {context} status ({code})",
+            repo.full_name
+        ),
+        Err(error) => crate::hub::error_envelope::log_internal(&error),
+    }
+}
+
+/// GitHub's combined status of `head`, or `None` when it cannot be read.
+async fn combined(
+    state: &HubState,
+    repo: &ConnectedRepository,
+    token: &str,
+    head: &str,
+) -> Option<Value> {
+    let api = state.sync.api().ok()?;
+    match api.combined_status(token, &repo.full_name, head).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            crate::hub::error_envelope::log_internal(&error);
+            None
+        }
+    }
+}
+
+fn adopted(store: &dyn Store, repo: &str) -> Result<bool> {
+    Ok(pins_of(store.skill_adoption(repo)?.as_ref())
+        .iter()
+        .any(|p| p.status == AdoptionStatus::Adopted))
+}
+
+/// After a provider snapshot of an open pull request: records its green checks and approval as
+/// observed evidence, then posts each adopted skill's status where the operator turned it on.
+/// GitHub only. Failures are logged; a skills step never fails a repository sync.
+pub(super) async fn observe_open_pull(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+    stored: &Value,
+    snapshot: &Value,
+) {
+    if conn.provider != "github" {
+        return;
+    }
+    let fields = [
+        &stored["number"],
+        &stored["head_ref"],
+        &stored["head_sha"],
+        &stored["head_repository_id"],
+        &stored["html_url"],
+        &stored["labels"],
+    ];
+    let Some(pull) = ForgePull::read(repo, fields) else {
+        return;
+    };
+    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    if !blocking(state, move || adopted(&*store, &name))
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let combined = combined(state, repo, token, &pull.head).await;
+    // Facts count only for the head the snapshot was read at.
+    let facts = if lower_sha(&snapshot["head_sha"]).as_deref() == Some(pull.head.as_str()) {
+        snapshot_facts(snapshot, combined.as_ref(), &pull.head, None)
+    } else {
+        Vec::new()
+    };
+    let (store, name, observed) = (state.store.clone(), repo.full_name.clone(), pull.clone());
+    let read = blocking(state, move || {
+        record_observed(&*store, &name, &observed, &facts)
+    })
+    .await;
+    let runs = match read {
+        Ok(runs) => runs,
+        Err(error) => return crate::hub::error_envelope::log_internal(&error),
+    };
+    // Without the combined status the Hub cannot tell what is shown, so it waits a pass
+    // rather than post again blindly.
+    if !state.sync.skill_status_enabled(&repo.full_name) || combined.is_none() {
+        return;
+    }
+    for (entry, view) in runs {
+        let (status, description) = desired_status(&entry.manifest, view.as_ref(), &pull.head);
+        let want = (entry.name.as_str(), status, description);
+        post_status(state, conn, (repo, token, &pull), combined.as_ref(), want).await;
+    }
+}
+
+/// After the forge reports a pull request merged: reads its head's checks, reviews and
+/// combined status once more, records what passed by the merge time, then records the merge
+/// itself as observed. The run then carries its gate-skip signal (`RunView::merge_check`).
+/// GitHub App connections only, and only when that read succeeded: a merge recorded without
+/// it would count every forge fact as unobserved. Failures are logged.
+pub(super) async fn observe_merge(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+    merged: &Value,
+) {
+    if conn.provider != "github" || conn.kind != "app" {
+        return;
+    }
+    let fields = [
+        &merged["number"],
+        &merged["head"]["ref"],
+        &merged["head"]["sha"],
+        &merged["head"]["repo"]["id"],
+        &merged["html_url"],
+        &merged["labels"],
+    ];
+    let Some(pull) = ForgePull::read(repo, fields) else {
+        return;
+    };
+    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    if !blocking(state, move || adopted(&*store, &name))
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let identity = json!({"number": pull.number, "repository_id": repo.repository_id,
+        "head_sha": pull.head, "base_sha": merged["base"]["sha"], "html_url": merged["html_url"]});
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::provider_context::collect(state, conn, repo, token, &identity, unix_now() * 1000),
+    )
+    .await;
+    let (Ok(Ok(snapshot)), Some(combined)) = (read, combined(state, repo, token, &pull.head).await)
+    else {
+        return;
+    };
+    if snapshot["permissions"]["inspection"] != "confirmed" {
+        return;
+    }
+    let cutoff = merged["merged_at"]
+        .as_str()
+        .and_then(super::github::parse_rfc3339);
+    let mut facts = snapshot_facts(&snapshot, Some(&combined), &pull.head, cutoff);
+    facts.push(Fact {
+        kind: EvidenceKind::Merged,
+        head: pull.head.clone(),
+        summary: format!(
+            "GitHub merged pull request #{} at head {}; the merge method is not observed.",
+            pull.number,
+            short(&pull.head)
+        ),
+    });
+    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    if let Err(error) = blocking(state, move || {
+        record_observed(&*store, &name, &pull, &facts).map(|_| ())
+    })
+    .await
+    {
+        crate::hub::error_envelope::log_internal(&error);
+    }
+}
+
 // ---- HTTP -----------------------------------------------------------------------------------
 
 pub fn routes() -> Router<HubState> {
@@ -826,10 +1386,10 @@ fn gate_line(gate: &supported::GateView) -> String {
         GateState::Current => "current",
         GateState::NotReached => "not reached",
     };
-    let label = if gate.assurance == Some(Assurance::SelfReported) {
-        " [self-reported]"
-    } else {
-        ""
+    let label = match gate.assurance {
+        Some(Assurance::SelfReported) => " [self-reported]",
+        Some(Assurance::Observed) => " [observed]",
+        _ => "",
     };
     format!("- {}: {state}{label}", gate.id)
 }
@@ -853,6 +1413,23 @@ pub fn render_run(view: &RunView) -> String {
     } else {
         "Finishing is not blocked.".into()
     });
+    if let Some(check) = &view.merge_check {
+        lines.push(if check.skipped_any() || !check.unobserved.is_empty() {
+            let mut gone: Vec<String> = check.skipped.clone();
+            gone.extend(
+                check
+                    .unobserved
+                    .iter()
+                    .map(|g| format!("{g} (not observed)")),
+            );
+            if check.merged_head != check.run_head {
+                gone.push("evidence for another head".into());
+            }
+            format!("Merged past: {}.", gone.join(", "))
+        } else {
+            "Merged with every earlier gate recorded and observed.".into()
+        });
+    }
     lines.join("\n")
 }
 
@@ -1051,5 +1628,186 @@ pub(super) async fn mcp_call(
                 Err(e) => hub_failure(&e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn snapshot(runs: Value, reviews: Value) -> Value {
+        let list = |items: Value| json!({"complete": true, "items": items});
+        json!({"head_sha": HEAD, "check_runs": list(runs), "reviews": list(reviews)})
+    }
+
+    fn combined(statuses: Value) -> Value {
+        let n = statuses.as_array().unwrap().len();
+        json!({"total_count": n, "statuses": statuses})
+    }
+
+    fn run(conclusion: &str) -> Value {
+        json!({"name": "test", "state": "completed", "conclusion": conclusion,
+            "provider_completed_at": "2026-10-30T10:01:00Z"})
+    }
+
+    fn status(context: &str, state: &str) -> Value {
+        json!({"context": context, "state": state, "updated_at": "2026-10-30T10:01:00Z"})
+    }
+
+    #[test]
+    fn ci_passes_only_on_complete_green_reads_ignoring_skill_statuses() {
+        let none = combined(json!([]));
+        let green = snapshot(json!([run("success"), run("skipped")]), json!([]));
+        assert!(ci_passed(&green, Some(&none), None));
+        // The combined status must have been read, and list every context it counts.
+        assert!(!ci_passed(&green, None, None));
+        let short = json!({"total_count": 2, "statuses": [status("build", "success")]});
+        assert!(!ci_passed(&green, Some(&short), None));
+        assert!(!ci_passed(
+            &snapshot(json!([]), json!([])),
+            Some(&none),
+            None
+        ));
+        let red = snapshot(json!([run("failure")]), json!([]));
+        assert!(!ci_passed(&red, Some(&none), None));
+        let mut partial = green.clone();
+        partial["check_runs"]["complete"] = json!(false);
+        assert!(!ci_passed(&partial, Some(&none), None));
+        // One entry per context however many were posted; the skill's own status is left out.
+        let statuses = combined(json!([
+            status("build", "success"),
+            status("agentscm/skill/pr-gate", "failure")
+        ]));
+        let empty = snapshot(json!([]), json!([]));
+        assert!(ci_passed(&empty, Some(&statuses), None));
+        let failing = combined(json!([status("build", "failure")]));
+        assert!(!ci_passed(&empty, Some(&failing), None));
+        // A check that finished after the merge does not count for it.
+        let before = super::super::github::parse_rfc3339("2026-10-30T10:00:30Z");
+        assert!(!ci_passed(&green, Some(&none), before));
+    }
+
+    #[test]
+    fn approval_needs_the_head_a_person_with_access_and_no_open_change_request() {
+        let review = |who: &str, state: &str, sha: &str| {
+            json!({"reviewer": who, "state": state, "commit_sha": sha, "provider_id": 1,
+                "reviewer_association": "MEMBER", "reviewer_type": "User",
+                "provider_submitted_at": "2026-10-30T10:02:00Z"})
+        };
+        let other = "b".repeat(40);
+        let one = |r: Value| snapshot(json!([]), json!([r]));
+        assert_eq!(
+            approved_by(&one(review("m", "APPROVED", HEAD)), HEAD, None).as_deref(),
+            Some("m")
+        );
+        assert_eq!(
+            approved_by(&one(review("m", "APPROVED", &other)), HEAD, None),
+            None
+        );
+        // A drive-by account or a bot cannot approve.
+        let mut drive_by = review("x", "APPROVED", HEAD);
+        drive_by["reviewer_association"] = json!("CONTRIBUTOR");
+        assert_eq!(approved_by(&one(drive_by), HEAD, None), None);
+        let mut bot = review("b[bot]", "APPROVED", HEAD);
+        bot["reviewer_type"] = json!("Bot");
+        assert_eq!(approved_by(&one(bot), HEAD, None), None);
+        // Newest first: a later comment keeps the approval, a later dismissal does not.
+        let commented = json!([
+            review("m", "COMMENTED", HEAD),
+            review("m", "APPROVED", HEAD)
+        ]);
+        assert!(approved_by(&snapshot(json!([]), commented), HEAD, None).is_some());
+        let dismissed = json!([
+            review("m", "DISMISSED", HEAD),
+            review("m", "APPROVED", HEAD)
+        ]);
+        assert_eq!(
+            approved_by(&snapshot(json!([]), dismissed), HEAD, None),
+            None
+        );
+        let blocked = json!([
+            review("m", "APPROVED", HEAD),
+            review("r", "CHANGES_REQUESTED", &other)
+        ]);
+        assert_eq!(approved_by(&snapshot(json!([]), blocked), HEAD, None), None);
+        // An approval after the merge does not count for it.
+        let before = super::super::github::parse_rfc3339("2026-10-30T10:00:00Z");
+        assert_eq!(
+            approved_by(&one(review("m", "APPROVED", HEAD)), HEAD, before),
+            None
+        );
+    }
+
+    #[test]
+    fn the_status_turns_green_only_on_observed_ci_and_approval_for_the_head() {
+        let entry = supported::catalog_entry("pr-gate", 1).unwrap();
+        let m = &entry.manifest;
+        let (state, text) = desired_status(m, None, HEAD);
+        assert_eq!(state, StatusState::Pending);
+        assert_eq!(text, "No pr-gate evidence on aaaaaaa yet.");
+        let identity = RunIdentity {
+            run_id: "r".into(),
+            repo: "acme/widgets".into(),
+            branch: "feat/x".into(),
+            pull_request: None,
+            skill_sha256: entry.sha256.clone(),
+            params: m.effective_params(None).unwrap(),
+            updated_at: 0,
+        };
+        let ev = |gate: &str, kind: EvidenceKind, session: &str, assurance| StoredEvidence {
+            id: "e".into(),
+            token_id: session.into(),
+            session: session.into(),
+            agent: "a".into(),
+            recorded_at: 1,
+            evidence: Evidence {
+                skill: None,
+                gate: gate.into(),
+                kind,
+                head_sha: HEAD.into(),
+                assurance,
+                summary: "s".into(),
+                url: None,
+                branch: None,
+                pull_request: None,
+                detail: None,
+            },
+        };
+        let said = Assurance::SelfReported;
+        let mut evidence = vec![ev("branch", EvidenceKind::TaskBranch, "a", said)];
+        let status = |evidence: &[StoredEvidence], head: &str| {
+            desired_status(m, Some(&supported::evaluate(m, &identity, evidence)), head)
+        };
+        // Tests are Stop-enforced and the agent's to do: failure, naming the next action.
+        let (state, text) = status(&evidence, HEAD);
+        assert_eq!(state, StatusState::Failure);
+        assert_eq!(text, "Run the tests on aaaaaaa and record the result.");
+        // Evidence for another head than the pull request's is pending, never success.
+        assert_eq!(status(&evidence, &"c".repeat(40)).0, StatusState::Pending);
+        evidence.push(ev("tests", EvidenceKind::RevisionTests, "a", said));
+        evidence.push(ev("review", EvidenceKind::IndependentReview, "b", said));
+        evidence.push(ev("ci", EvidenceKind::HostedCi, "a", said));
+        evidence.push(ev("approval", EvidenceKind::HumanApproval, "a", said));
+        // Every gate is done, but CI and approval are only reported: still pending.
+        let (state, text) = status(&evidence, HEAD);
+        assert_eq!(state, StatusState::Pending);
+        assert_eq!(
+            text,
+            "Waiting for GitHub to show ci and approval on aaaaaaa."
+        );
+        evidence.push(ev("ci", EvidenceKind::HostedCi, FORGE, Assurance::Observed));
+        assert_eq!(
+            status(&evidence, HEAD).1,
+            "Waiting for GitHub to show approval on aaaaaaa."
+        );
+        evidence.push(ev(
+            "approval",
+            EvidenceKind::HumanApproval,
+            FORGE,
+            Assurance::Observed,
+        ));
+        assert_eq!(status(&evidence, HEAD).0, StatusState::Success);
     }
 }

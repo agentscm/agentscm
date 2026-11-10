@@ -111,6 +111,9 @@ fn item(kind: &str, row: &Value, head: &str) -> Option<Value> {
             }
             output["state"] = json!(state);
             output["reviewer"] = json!(text(&row["user"]["login"]));
+            // Who may approve: the forge's association of the reviewer and the account type.
+            output["reviewer_association"] = json!(text(&row["author_association"]));
+            output["reviewer_type"] = json!(text(&row["user"]["type"]));
             output["provider_submitted_at"] = json!(timestamp(&row["submitted_at"])?);
             output["source_url"] = json!(source_url(&row["html_url"])?);
             sha(&row["commit_id"])?

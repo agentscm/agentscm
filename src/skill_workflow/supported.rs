@@ -1,7 +1,8 @@
 //! Supported skills: strict manifest v2, embedded catalog, repo lock file, and the pure
 //! evidence evaluation and admission rules shared by the hub, MCP and CLI.
 //!
-//! Experimental. Evidence is self-reported and labelled so; nothing here proves it.
+//! Experimental. Agent evidence is self-reported and labelled so; the hub records what it reads
+//! from the forge (CI, approval, merge) as `observed`. Nothing here proves either.
 
 use std::collections::BTreeSet;
 
@@ -138,7 +139,7 @@ impl EvidenceSpec {
 
     /// The label or method the evidence must carry: a literal, else the parameter's string
     /// value; `null` and `any` impose nothing.
-    fn accepts(&self, detail: Option<&Detail>, params: &Params) -> bool {
+    pub fn required_value(&self, params: &Params) -> Option<String> {
         let param = |name: &Option<String>| {
             name.as_ref()
                 .and_then(|n| params.get(n))
@@ -146,21 +147,23 @@ impl EvidenceSpec {
                 .filter(|v| *v != "any")
                 .map(str::to_owned)
         };
-        let (want, got) = match self {
-            Self::HostedCi { label, label_param } => (
-                label.clone().or_else(|| param(label_param)),
-                detail.and_then(|d| d.label.as_ref()),
-            ),
+        match self {
+            Self::HostedCi { label, label_param } => label.clone().or_else(|| param(label_param)),
             Self::Merged {
                 method,
                 method_param,
-            } => (
-                method.clone().or_else(|| param(method_param)),
-                detail.and_then(|d| d.method.as_ref()),
-            ),
+            } => method.clone().or_else(|| param(method_param)),
+            _ => None,
+        }
+    }
+
+    fn accepts(&self, detail: Option<&Detail>, params: &Params) -> bool {
+        let got = match self {
+            Self::HostedCi { .. } => detail.and_then(|d| d.label.as_ref()),
+            Self::Merged { .. } => detail.and_then(|d| d.method.as_ref()),
             _ => return true,
         };
-        want.is_none_or(|w| got == Some(&w))
+        self.required_value(params).is_none_or(|w| got == Some(&w))
     }
 }
 
@@ -488,7 +491,7 @@ fn enforce_words(e: Enforce) -> &'static str {
             "Blocks if the opt-in Stop hook is installed: the author's session cannot finish until this is recorded."
         }
         Enforce::ForgeStatus => {
-            "Warns only for now: a merge check (forge status) is planned but not built."
+            "Shown as the skill's commit status when the Hub operator turns it on; it blocks a merge only where the repository requires that check."
         }
         Enforce::Native => {
             "Planned: native approval and landing checks are not built for skill gates yet."
@@ -837,9 +840,6 @@ impl Evidence {
         {
             return Err(invalid("head_sha must be 40 lowercase hex characters"));
         }
-        if self.assurance != Assurance::SelfReported {
-            return Err(invalid("agents may only record self_reported evidence"));
-        }
         text("summary", &self.summary, MAX_SUMMARY)?;
         text("url", self.url.as_deref().unwrap_or(""), MAX_URL)?;
         text("branch", self.branch.as_deref().unwrap_or(""), 255)?;
@@ -935,6 +935,31 @@ pub struct RunView {
     pub gates: Vec<GateView>,
     pub stale_evidence: Vec<StoredEvidence>,
     pub updated_at: u64,
+    /// Set once the hub observed the merge: what the gates before it showed at that moment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_check: Option<MergeCheck>,
+}
+
+/// The gate-skip signal of one observed merge, judged only from evidence recorded before it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeCheck {
+    /// The pull request head the forge merged.
+    pub merged_head: String,
+    /// The run head the evidence before the merge pointed at.
+    pub run_head: String,
+    /// Gates before the merge gate that were not done.
+    pub skipped: Vec<String>,
+    /// Gates before the merge gate that accept a forge-observable kind (CI, approval) but had no
+    /// observed evidence on the merged head: the observed fact is absent.
+    pub unobserved: Vec<String>,
+}
+
+impl MergeCheck {
+    /// Whether the merge went past a gate: one not done, or evidence for another head. A gate
+    /// done only on a report, with its forge fact unread, is `unobserved`, counted apart.
+    pub fn skipped_any(&self) -> bool {
+        !self.skipped.is_empty() || self.merged_head != self.run_head
+    }
 }
 
 /// What the hub knows about a run apart from its evidence.
@@ -1174,7 +1199,60 @@ pub fn evaluate(
             .map(|e| e.recorded_at)
             .max()
             .unwrap_or(identity.updated_at),
+        merge_check: merge_check(manifest, identity, evidence),
     }
+}
+
+/// Index of the first gate that accepts `merged` evidence; gates before it are pre-merge.
+pub fn merge_gate_index(manifest: &SupportedManifest) -> Option<usize> {
+    manifest
+        .gates
+        .iter()
+        .position(|g| g.evidence.iter().any(|s| s.kind() == EvidenceKind::Merged))
+}
+
+/// Kinds the hub records from the forge itself.
+pub fn forge_observable(kind: EvidenceKind) -> bool {
+    matches!(
+        kind,
+        EvidenceKind::HostedCi | EvidenceKind::HumanApproval | EvidenceKind::Merged
+    )
+}
+
+fn merge_check(
+    manifest: &SupportedManifest,
+    identity: &RunIdentity,
+    evidence: &[StoredEvidence],
+) -> Option<MergeCheck> {
+    let at = evidence.iter().position(|e| {
+        e.evidence.kind == EvidenceKind::Merged && e.evidence.assurance == Assurance::Observed
+    })?;
+    let merged_head = evidence[at].evidence.head_sha.clone();
+    let before = &evidence[..at];
+    let cut = merge_gate_index(manifest).unwrap_or(manifest.gates.len());
+    let run_head = head_of(manifest, before);
+    let mut skipped = Vec::new();
+    let mut unobserved = Vec::new();
+    for gate in &manifest.gates[..cut] {
+        if !satisfied(gate, before, &run_head, &identity.params).0 {
+            skipped.push(gate.id.clone());
+        }
+        let observable = gate.evidence.iter().any(|s| forge_observable(s.kind()));
+        let observed = before.iter().any(|e| {
+            e.evidence.gate == gate.id
+                && e.evidence.assurance == Assurance::Observed
+                && e.evidence.head_sha == merged_head
+        });
+        if observable && !observed {
+            unobserved.push(gate.id.clone());
+        }
+    }
+    Some(MergeCheck {
+        merged_head,
+        run_head,
+        skipped,
+        unobserved,
+    })
 }
 
 /// Whether `agentscm skill stop` blocks at the run's current gate, before the local-HEAD check:
@@ -1210,6 +1288,30 @@ pub struct Who<'a> {
     pub session: &'a str,
 }
 
+/// Whether the hub may record forge-observed `new`: it is `observed`, within bounds, of a kind
+/// the hub observes, accepted by its gate, and new for that gate, kind, head and detail (so CI
+/// that went green before a required label was added is recorded again with the label). The head rules
+/// of [`admit`] do not apply: the forge's pull request head is the fact. Pure.
+pub fn admit_observed(
+    manifest: &SupportedManifest,
+    existing: &[StoredEvidence],
+    new: &Evidence,
+) -> bool {
+    new.assurance == Assurance::Observed
+        && forge_observable(new.kind)
+        && new.validate().is_ok()
+        && manifest
+            .gate(&new.gate)
+            .is_some_and(|g| g.evidence.iter().any(|s| s.kind() == new.kind))
+        && !existing.iter().any(|e| {
+            e.evidence.assurance == Assurance::Observed
+                && e.evidence.gate == new.gate
+                && e.evidence.kind == new.kind
+                && e.evidence.head_sha == new.head_sha
+                && e.evidence.detail == new.detail
+        })
+}
+
 /// Whether `who` may record `new` given the run's `existing` evidence. Pure.
 pub fn admit(
     manifest: &SupportedManifest,
@@ -1219,6 +1321,12 @@ pub fn admit(
 ) -> std::result::Result<(), Refusal> {
     new.validate()
         .map_err(|e| refuse("invalid", e.to_string()))?;
+    if new.assurance != Assurance::SelfReported {
+        return Err(refuse(
+            "invalid",
+            "agents may only record self_reported evidence",
+        ));
+    }
     let gate = manifest
         .gate(&new.gate)
         .filter(|g| g.evidence.iter().any(|s| s.kind() == new.kind))
@@ -1424,7 +1532,7 @@ mod tests {
         );
         assert!(w[2].contains("a different session (not the author)"));
         assert!(w[4].starts_with("5. CI: "));
-        assert!(w[4].contains("planned but not built"));
+        assert!(w[4].contains("when the Hub operator turns it on"));
         assert!(w[5].contains("a maintainer (a person)"));
         assert!(w[7].contains(
             "Recorded only; the planned alert for a red default branch is not built yet."
@@ -1859,5 +1967,126 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains("\"self_reported\""));
         assert_eq!(serde_json::from_str::<RunView>(&json).unwrap(), v);
+    }
+
+    fn observed(gate: &str, kind: EvidenceKind, head: &str) -> StoredEvidence {
+        let mut e = ev(gate, kind, head, "forge", None);
+        e.token_id = "forge".into();
+        e.evidence.assurance = Assurance::Observed;
+        e
+    }
+
+    #[test]
+    fn observed_evidence_is_admitted_once_per_gate_kind_and_head() {
+        let m = manifest();
+        let ci = observed("ci", EvidenceKind::HostedCi, A);
+        assert!(admit_observed(&m, &[], &ci.evidence));
+        assert!(!admit_observed(&m, std::slice::from_ref(&ci), &ci.evidence));
+        assert!(admit_observed(
+            &m,
+            std::slice::from_ref(&ci),
+            &observed("ci", EvidenceKind::HostedCi, B).evidence
+        ));
+        // Not a kind the hub observes, the wrong gate, or a self-report: refused.
+        assert!(!admit_observed(
+            &m,
+            &[],
+            &observed("tests", EvidenceKind::RevisionTests, A).evidence
+        ));
+        assert!(!admit_observed(
+            &m,
+            &[],
+            &observed("approval", EvidenceKind::HostedCi, A).evidence
+        ));
+        assert!(!admit_observed(&m, &[], &tests(A).evidence));
+        // The same head with a label it lacked before is a new fact.
+        let mut labelled = ci.clone();
+        labelled.evidence.detail = Some(Detail {
+            label: Some("ci-extended".into()),
+            ..Detail::default()
+        });
+        assert!(admit_observed(
+            &m,
+            std::slice::from_ref(&ci),
+            &labelled.evidence
+        ));
+        // And an agent may still not record observed evidence.
+        assert_eq!(
+            admit(&m, &[], &ci.evidence, &who("t1", "s"))
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn observed_ci_and_approval_satisfy_their_gates_and_are_labelled() {
+        let v = run(&[
+            branch(),
+            tests(A),
+            review(A, &[]),
+            observed("ci", EvidenceKind::HostedCi, A),
+            observed("approval", EvidenceKind::HumanApproval, A),
+        ]);
+        assert_eq!(v.current_gate.as_deref(), Some("merge"));
+        assert_eq!(v.gates[4].assurance, Some(Assurance::Observed));
+        // The weakest evidence labels a gate: the self-reported review keeps its label.
+        assert_eq!(v.gates[2].assurance, Some(Assurance::SelfReported));
+        assert_eq!(v.merge_check, None);
+    }
+
+    #[test]
+    fn an_observed_merge_reports_the_gates_it_went_past() {
+        // Everything recorded and observed on the merged head: no skip.
+        let clean = run(&[
+            branch(),
+            tests(A),
+            review(A, &[]),
+            observed("ci", EvidenceKind::HostedCi, A),
+            observed("approval", EvidenceKind::HumanApproval, A),
+            observed("merge", EvidenceKind::Merged, A),
+        ]);
+        let check = clean.merge_check.unwrap();
+        assert!(!check.skipped_any(), "{check:?}");
+        assert!(check.unobserved.is_empty());
+
+        // Self-reported CI and approval, no review: skipped and unobserved gates are named.
+        let mut ci = ev("ci", EvidenceKind::HostedCi, A, "auth", None);
+        ci.evidence.detail = None;
+        let approval = ev("approval", EvidenceKind::HumanApproval, A, "auth", None);
+        let skipped = run(&[
+            branch(),
+            tests(A),
+            ci,
+            approval,
+            observed("merge", EvidenceKind::Merged, A),
+            // Evidence after the merge does not repair it.
+            review(A, &[]),
+        ]);
+        let check = skipped.merge_check.unwrap();
+        assert_eq!(check.skipped, vec!["review", "fix"]);
+        assert_eq!(check.unobserved, vec!["ci", "approval"]);
+        assert!(check.skipped_any());
+
+        // A merge of another head than the evidence names is a skip too.
+        let other = run(&[
+            branch(),
+            tests(A),
+            review(A, &[]),
+            observed("ci", EvidenceKind::HostedCi, A),
+            observed("approval", EvidenceKind::HumanApproval, A),
+            observed("merge", EvidenceKind::Merged, B),
+        ]);
+        let check = other.merge_check.unwrap();
+        assert_eq!(
+            (check.run_head.as_str(), check.merged_head.as_str()),
+            (A, B)
+        );
+        assert!(check.skipped_any());
+    }
+
+    #[test]
+    fn the_merge_gate_divides_pre_merge_gates() {
+        assert_eq!(merge_gate_index(&manifest()), Some(6));
     }
 }

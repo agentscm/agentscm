@@ -35,6 +35,11 @@ GitHub. To warn agents from Claude Code, see [work intents](intents.md).
 - `AGENTSCM_GITHUB_EXTERNAL_RUNS`: comma-separated `owner/name` GitHub repositories whose
   external CI and deployment outcomes are read for merged publications (off when unset). See
   [External CI and deployment outcomes](#external-ci-and-deployment-outcomes).
+- `AGENTSCM_SKILL_FORGE_STATUS`: comma-separated `owner/name` GitHub repositories where each
+  adopted supported skill's run is posted as the `agentscm/skill/<name>` commit status on open
+  pull request heads (off when unset; needs the App's `statuses: write`). Make it a required
+  check to enforce the gates. Experimental and fake-tested only; see
+  [forge-observed evidence](design/supported-skills.md#27-forge-observed-evidence-the-skill-status-and-the-gate-skip-signal).
 - `--poll-seconds N` (default 300, at least 10): how often connections are polled.
 - `--activity-days N` (default 14, 1 to 365): how far back a branch's tip commit
   counts as recent. It also sets the merge catch-up window: closed proposals

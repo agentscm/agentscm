@@ -202,8 +202,9 @@ no gates.
 the forge or a store), `self_reported` (an agent said so through MCP or the CLI). A gate states the
 minimum it accepts. The Hub shows assurance next to every piece of evidence so a self-reported
 review never looks like a controller receipt. In `pr-gate` v1 every gate accepts self-reported
-evidence (decision 1 in section 7); a later version raises `ci`, `approval` and `merge` to
-`observed` once the Hub reads them from the forge.
+evidence (decision 1 in section 7). On a GitHub connection the Hub now also records `ci`,
+`approval` and `merge` as `observed` when it reads them from the forge (section 2.7); a later
+manifest version can then raise those gates' `min_assurance` to `observed`.
 
 ### 2.3 Adoption and pinning
 
@@ -277,7 +278,7 @@ Each gate's `enforce` field names one of four choke points. No new blocking mech
 | `enforce` | Choke point (existing) | Behavior |
 |---|---|---|
 | `stop` | The opt-in local Stop hook (`src/agent_stop.rs` shape, `agentscm skill stop`; it blocks only where the user installed it) | Blocks the author session from finishing while the run sits at an **agent-actionable** gate (tests, review, fix) without sufficient evidence for the current head. The block reason is the next action from `agentscm_skill_status`. Gates that wait on others (CI, approval) never block; the hook lets the session stop with a handover note. The 8-continuation cap applies unchanged. |
-| `forge_status` | A Hub-posted commit status `agentscm/skill/<name>` on the pull request head, using the forge-check posting journal | `pending` until every pre-merge gate has sufficient evidence for the exact head SHA, then `success`. A new push resets it. It blocks merging only when an operator requires the context in a ruleset; AgentSCM never edits protections. |
+| `forge_status` | A Hub-posted commit status `agentscm/skill/<name>` on the pull request head (section 2.7), opt-in per repository | `success` once every gate before the merge gate has sufficient evidence for the exact head SHA; `failure` while a Stop-enforced gate the agent can do (tests, review, fix) is open; `pending` otherwise. The description is the next action. A new push resets it. It blocks merging only when the repository requires the context in a ruleset; AgentSCM never edits protections. |
 | `native` | Installed target requirement → `approve` / `integrate` | **Planned.** For `native_change` subjects, gates that cite `workflow_receipt` would compile to an ordinary template instantiation and requirement, which the existing native path already enforces; nothing compiles skill gates to it yet. |
 | `advise`, `signal` | Instruction files, MCP status, Hub UI; `signal` also notifies other sessions (section 4.2) | Shown and recorded, never blocking. |
 
@@ -307,6 +308,61 @@ no remote registry, no `latest` and no automatic update, consistent with the tem
 third-party skill can only compose the evidence kinds and choke points above; it cannot add a new
 blocking mechanism or claim stronger assurance than its evidence has.
 
+### 2.7 Forge-observed evidence, the skill status and the gate-skip signal
+
+Experimental, GitHub only, tested against the in-process fake GitHub; not yet live-verified.
+
+**Observed evidence.** The Hub already reads a bounded provider snapshot of each open pull request
+on a GitHub App connection (two per poll, in rotation: reviews, latest check runs and commit
+statuses on the head). After each snapshot, for every adopted skill whose gates accept the kind,
+the Hub records:
+
+- `hosted_ci`, when the latest check runs were read completely, GitHub's combined status (one
+  entry per context, read separately) lists every context, at least one check exists, every
+  check run concluded `success`, `neutral` or `skipped`, and every status is `success`
+  (`agentscm/skill/*` statuses are left out). A required `ci_label` is recorded only when the
+  pull request carries that label, so the gate stays open without it.
+- `human_approval`, when the review list was read completely, some reviewer's latest decisive
+  review approves the exact head, that reviewer is an `OWNER`, `MEMBER` or `COLLABORATOR` with a
+  user (not bot) account, and no reviewer's latest review requests changes.
+- `merged`, when the sync sees the pull request merged on an App connection. Just before, it
+  reads that head's checks, reviews and combined status once more and records what passed by the
+  merge time. If that read fails, the merge is not recorded at all, so a failed read never counts
+  as a skipped gate. The merge method is not observed, so a pin with `merge_method` other than
+  `any` still needs a report naming it.
+
+Each fact is recorded once per (gate, kind, head, label) with `assurance: observed`, `agent: GitHub` and
+the pull request link, and only for a same-repository pull request whose head branch names the run.
+The forge's head is the fact, so the head-ordering rules for agent evidence do not apply; an
+observed CI result on a new head moves the run to it, and older test and review evidence goes
+stale, as an agent push would. Agents still cannot record `observed` evidence. A later failure on
+the same head does not retract a recorded success.
+
+**The skill status.** When the operator lists a repository in `AGENTSCM_SKILL_FORGE_STATUS`
+(comma-separated `owner/name`, like `AGENTSCM_GITHUB_EXTERNAL_RUNS`), the Hub posts
+`agentscm/skill/<name>` on each open pull request head after its snapshot, with the state in the
+`forge_status` row of section 2.5. A pull request with no evidence shows `pending`. A team makes
+the context a required check to enforce the gates; the Hub needs the App's `statuses: write`
+grant. `success` also needs observed evidence on the head for every gate before merge that the
+forge can show (CI and approval): a report alone keeps the status `pending` ("Waiting for GitHub
+to show …"). The forge itself is the posting journal: the Hub posts only when the combined
+status for the context differs in state or description, so an unchanged run posts nothing. (The
+forge-check journal is not reused: its retire pass re-reads every pull request that has no Hub
+publication.) Updates follow the snapshot rotation, so a status can lag new evidence by a few
+polls; turning the setting off leaves the last posted status in place (a success is bound to
+that exact head). The opt-in is a repository list rather than the agent-task profile's
+`publish_forge_status`, which belongs to native candidate publications.
+
+**Gate-skip signal.** A run with an observed merge carries `merge_check`, judged only from the
+evidence recorded before the merge: `skipped` (gates before the merge gate that were not done),
+`unobserved` (gates before it that accept CI or approval but had no observed evidence on the
+merged head) and both heads. A merge skipped a gate when `skipped` is non-empty or the heads
+differ; `unobserved` is counted apart, since it also covers facts the Hub could not read (a list
+over eight items is incomplete). The library counts `merged_observed`, `merged_with_skips` and
+`merged_unobserved` per skill over the newest 100 runs; `merged_with_skips / merged_observed` is
+the gate-skip rate. Limits: a run is keyed by branch, so a branch name reused after a merge keeps
+the first merge's check; token and PAT connections record no observed merge.
+
 ## 3. The first skills
 
 ### 3.1 (a) `pr-gate` v1
@@ -324,9 +380,9 @@ the hook lets that session finish.
 | tests | `revision_tests` on head | self-reported (phase 2); receipt when a managed recipe or native step exists | stop | The command and its result for the exact head SHA. A new push invalidates it. |
 | review | `independent_review` on head | self-reported; receipt for `claude_code_review` | stop | The hub refuses a review recorded with the same agent token and session as an author; it cannot tell two sessions apart beyond that. Records findings with IDs and `blocking` flags. |
 | fix | `findings_resolved` | self-reported | stop | Each blocking finding is fixed at a later head (and the review is re-run on that head) or dismissed by a maintainer. |
-| ci | `hosted_ci` | self-reported (phase 2); observed later | forge status | Green on the exact head. With `ci_label` set, the next action names the label to add; with the default (null) it waits for whatever checks the repository requires ("Wait for green CI"). AgentSCM's own lock sets no `ci_label`, and its routine pull requests may have no hosted source for this evidence because the hosted suites run on dispatch; the manifest is unchanged. |
-| approval | `human_approval` on head | self-reported (phase 2); observed later | forge status | Forge approval or native `approve`. |
-| merge | `merged` | self-reported (phase 2); observed later | advise | Uses `merge_method` (default `any`). With `retarget_stacked` (default true), the next action reminds the author to retarget dependent pull requests to the default branch. |
+| ci | `hosted_ci` | self-reported, or observed on GitHub (section 2.7) | forge status | Green on the exact head. With `ci_label` set, the next action names the label to add; with the default (null) it waits for whatever checks the repository requires ("Wait for green CI"). AgentSCM's own lock sets no `ci_label`, and its routine pull requests may have no hosted source for this evidence because the hosted suites run on dispatch; the manifest is unchanged. |
+| approval | `human_approval` on head | self-reported, or observed on GitHub (section 2.7) | forge status | Forge approval or native `approve`. |
+| merge | `merged` | self-reported, or observed on GitHub without the method (section 2.7) | advise | Uses `merge_method` (default `any`). With `retarget_stacked` (default true), the next action reminds the author to retarget dependent pull requests to the default branch. |
 | post_merge | `post_merge_check` on target tip | self-reported or observed | signal | Hands off to `post-merge` (c). A failure raises the main-red signal. |
 
 Ordering: gates are evaluated in order; evidence bound to an older head is shown as `stale`, not
@@ -509,9 +565,9 @@ AgentSCM's own pull requests use:
 6. **Dogfood.** Adopt `pr-gate` v1 in this repository's lock file and run AgentSCM's next pull
    requests through it, recording which gates were self-reported.
 
-**Not in phase 2** (later, each Proposed): the `agentscm/skill/<name>` forge status; reading
-`hosted_ci`, `human_approval` and `merged` from the forge as `observed` (phase 2 records them as
-self-reported with links); `parallel-work`, `post-merge`, resource claims, the main-red signal and
+**Not in phase 2** (later, each Proposed): the `agentscm/skill/<name>` forge status and reading
+`hosted_ci`, `human_approval` and `merged` from the forge as `observed` (both since added on
+GitHub, section 2.7); `parallel-work`, `post-merge`, resource claims, the main-red signal and
 the orchestrator view; workspace-level adoption; third-party skills and `agentscm skills add`;
 native-subject compilation to target requirements.
 

@@ -745,6 +745,24 @@ impl Api {
             .await
     }
 
+    /// The combined status of the requested commit: the latest status per context, at most 100.
+    /// `total_count` above the listed entries means some contexts were not returned.
+    pub async fn combined_status(&self, token: &str, repository: &str, sha: &str) -> Gh<Value> {
+        context_sha(sha)?;
+        validate_repository(repository)?;
+        let url = format!(
+            "{}/repos/{repository}/commits/{sha}/status?per_page=100",
+            self.base
+        );
+        let reply = self
+            .send(token, Method::GET, &url, None, None, false)
+            .await?;
+        if reply.status == 403 {
+            return Err(GhError::Auth("403 from repos".into()));
+        }
+        reply.ok("repos")
+    }
+
     async fn context_page(
         &self,
         token: &str,
