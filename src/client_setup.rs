@@ -58,13 +58,25 @@ pub(crate) static SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(
     )
 });
 
+/// The second required rule before it said to report what a wait is for.
+const PREVIOUS_OUTCOME_RULE: &str = "Call `agentscm_start` with the task and expected paths before editing shared files. When the task is done (its change merged, or nothing is left to do), call `agentscm_done` with `outcome` `complete` and a one-line `summary`; plain `agentscm_done` only pauses the Work. While you lead unfinished Work, the Hub shows your person when you stop to wait on them.";
+
+/// The generated skill with that rule, retained so setup can upgrade it.
+static PREVIOUS_OUTCOME_SKILL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    SKILL.replacen(
+        agentscm::hub::agent_rules::REQUIRED_RULES[1],
+        PREVIOUS_OUTCOME_RULE,
+        1,
+    )
+});
+
 /// Every generated skill above as it read before the Hub message rule (the seventh), so setup
 /// upgrades them too.
 static PREVIOUS_SIX_RULE_SKILLS: std::sync::LazyLock<[String; 4]> =
     std::sync::LazyLock::new(|| {
         let seventh = format!("\n- {}", agentscm::hub::agent_rules::REQUIRED_RULES[6]);
         [
-            &*SKILL,
+            &*PREVIOUS_OUTCOME_SKILL,
             &*PREVIOUS_WORK_TEXT_SKILL,
             &*PREVIOUS_PLANNED_SKILL,
             &*PREVIOUS_RULED_SKILL,
@@ -589,6 +601,7 @@ fn check_skill(before: Option<&str>) -> Result<()> {
 
 fn generated_skill(text: &str) -> bool {
     text == SKILL.as_str()
+        || text == PREVIOUS_OUTCOME_SKILL.as_str()
         || text == PREVIOUS_WORK_TEXT_SKILL.as_str()
         || text == PREVIOUS_PLANNED_SKILL.as_str()
         || text == PREVIOUS_RULED_SKILL.as_str()
@@ -1446,6 +1459,7 @@ mod tests {
                     PREVIOUS_RULED_SKILL.as_str(),
                     PREVIOUS_PLANNED_SKILL.as_str(),
                     PREVIOUS_WORK_TEXT_SKILL.as_str(),
+                    PREVIOUS_OUTCOME_SKILL.as_str(),
                 ])
                 .chain(PREVIOUS_SIX_RULE_SKILLS.iter().map(String::as_str))
             {
@@ -1478,6 +1492,10 @@ mod tests {
                 && !skill.contains(agentscm::hub::agent_rules::REQUIRED_RULES[6])
         }));
         assert!(!SKILL.contains(PREVIOUS_DONE_RULE));
+        // The skill installed before the wait rule, with seven rules and with six, still matches.
+        assert!(PREVIOUS_OUTCOME_SKILL.contains(PREVIOUS_OUTCOME_RULE));
+        assert!(PREVIOUS_SIX_RULE_SKILLS[0].contains(PREVIOUS_OUTCOME_RULE));
+        assert!(!SKILL.contains(PREVIOUS_OUTCOME_RULE));
     }
 
     #[test]

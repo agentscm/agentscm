@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::hub::coordination::{CoordinationInbox, CoordinationListQuery, CoordinationStatus};
 use crate::hub::onboarding::Observations;
-use crate::hub::store::{Principal, Store};
+use crate::hub::session_waiting::{LeadWait, WaitReason};
+use crate::hub::store::{Principal, Store, session_key};
 use crate::hub::value_metrics::identity;
 use crate::hub::work::{ClaimStatus, WorkItem, WorkOverviewQuery, WorkRole, WorkState};
 use crate::hub::work_lifecycle::{ReservationStatus, WorkOperationalV1};
@@ -193,15 +194,56 @@ fn owner(item: &WorkItem) -> StatusRecipient {
     }
 }
 
-/// A report is routed to its named lead/owner, never to every reader of the repository.
+/// The person whose session leads `item`.
+fn lead_person(item: &WorkItem) -> StatusRecipient {
+    let mut recipient = lead(item);
+    if recipient.kind == RecipientKind::LeadAgent {
+        recipient.kind = RecipientKind::Person;
+        recipient.agent = None;
+    }
+    recipient
+}
+
+/// What a row says while its lead session waits. Every reader of the repository sees it, so it
+/// names the kind of wait only; what the session asks stays in its person's own action.
+fn waiting_text(reason: WaitReason) -> &'static str {
+    match reason {
+        WaitReason::Permission => {
+            "Its lead session waits for its person's permission to use a tool."
+        }
+        WaitReason::Question => "Its lead session waits for its person's answer to a question.",
+        WaitReason::Idle => "Its lead session ended its turn and waits for its person's reply.",
+        WaitReason::Background => {
+            "Its lead session stopped on its own background work, which will resume it; nobody is asked."
+        }
+    }
+}
+
+/// A report is routed to its named lead/owner, never to every reader of the repository. `wait`
+/// is what the lead session's hooks said of it: a session that stopped to wait makes no calls,
+/// which the claim alone cannot tell from one that is gone.
 pub fn project_work(
     item: &WorkItem,
     operational: WorkOperationalV1,
     reconciliation: Option<ReconciliationView>,
+    wait: LeadWait,
     viewer: &str,
 ) -> StatusWork {
     let mut limits = BTreeSet::new();
     let held = operational.reservation.status == ReservationStatus::Held;
+    // A session that reported a wait is there, however long ago its Work checked in. One whose
+    // wait this Hub may have lost is not known to be quiet.
+    let freshness = match (wait, item.claim_status) {
+        (LeadWait::Waiting(_), _) => ClaimStatus::Active,
+        (LeadWait::Unknown, ClaimStatus::Stale) => ClaimStatus::Unknown,
+        (_, claim) => claim,
+    };
+    // Paused, or nothing says its lead is there.
+    let quiet = item.state == WorkState::Paused || freshness != ClaimStatus::Active;
+    if quiet && wait == LeadWait::Unknown {
+        limits.insert("lead_wait_unknown".to_owned());
+    }
+    let mut asked_by_wait = false;
     let consistent = item.generation == operational.generation
         && item.updated_seq == operational.updated_seq
         && reconciliation
@@ -281,11 +323,17 @@ pub fn project_work(
             lead(item),
             "Reassess the reported blocker against current prerequisite evidence.",
         )
-    } else if operational.merge.hidden_by_merged_pr && held {
+    } else if operational.merge.hidden_by_merged_pr {
+        // With nothing held only the close is left. The Hub does not complete it: Work may span
+        // several pull requests, and an outcome records who stated it.
         (
             StatusState::ReassessmentNeeded,
             owner(item),
-            "Decide whether to retain, release or finish the held reservation; merge alone does not complete Work.",
+            if held {
+                "Decide whether to retain, release or finish the held reservation; merge alone does not complete Work."
+            } else {
+                "Its pull request merged and it holds no files: close it as complete, or resume it if work remains. A merge alone does not complete Work."
+            },
         )
     } else if item.state == WorkState::Blocked {
         (
@@ -293,16 +341,36 @@ pub fn project_work(
             lead(item),
             "Review the reported blocker and identify its next action.",
         )
-    } else if item.state == WorkState::Paused || item.claim_status != ClaimStatus::Active {
-        (
-            StatusState::ReassessmentNeeded,
-            if held {
-                owner(item)
-            } else {
-                StatusRecipient::none()
-            },
-            "Review the unfinished Work; a quiet claim does not prove failure or completion.",
-        )
+    } else if let LeadWait::Waiting(reason) = wait {
+        if reason == WaitReason::Background {
+            (StatusState::Active, lead(item), waiting_text(reason))
+        } else {
+            // Its `session_waiting` action asks the person, so one wait counts once.
+            asked_by_wait = true;
+            (
+                StatusState::AwaitingParty,
+                lead_person(item),
+                waiting_text(reason),
+            )
+        }
+    } else if quiet {
+        if wait == LeadWait::Unknown {
+            (
+                StatusState::ReassessmentNeeded,
+                StatusRecipient::none(),
+                "Whether its lead session waits is not known: the Hub restarted or dropped waits after that session's last call. A quiet claim proves nothing.",
+            )
+        } else {
+            (
+                StatusState::ReassessmentNeeded,
+                if held {
+                    owner(item)
+                } else {
+                    StatusRecipient::none()
+                },
+                "Review the unfinished Work; a quiet claim does not prove failure or completion.",
+            )
+        }
     } else {
         (
             StatusState::Active,
@@ -316,6 +384,7 @@ pub fn project_work(
     let needs_you = consistent
         && state != StatusState::Active
         && state != StatusState::Retired
+        && !asked_by_wait
         && recipient.owner.as_deref() == Some(viewer);
     StatusWork {
         work_id: item.id.clone(),
@@ -327,7 +396,7 @@ pub fn project_work(
         needs_you,
         action: action.into(),
         reported_next_action: item.next_action.clone(),
-        freshness: item.claim_status,
+        freshness,
         operational: StatusOperational {
             digest: identity(&[
                 &serde_json::to_string(&operational).expect("operational serializes")
@@ -478,6 +547,16 @@ fn read_scoped(
     }
     let ids = selected.keys().cloned().collect::<Vec<_>>();
     let operational = store.work_operational(reader, &OperationalSelect::Many(&ids), now)?;
+    // When each live session last called. A claim follows its lead's reports only, so a lead
+    // that works on without reporting would read as quiet: its session's calls say it is there.
+    let sessions = store.live_sessions(principal, now, MAX_STATUS_WORK + 1)?;
+    if sessions.len() > MAX_STATUS_WORK {
+        limits.insert("lead_sessions_truncated".to_owned());
+    }
+    let called = sessions
+        .iter()
+        .map(|s| (s.key.as_str(), s.updated_at))
+        .collect::<BTreeMap<_, _>>();
     let mut work = Vec::new();
     let mut items = BTreeMap::new();
     for (id, item) in selected {
@@ -501,7 +580,28 @@ fn read_scoped(
                 None
             }
         };
-        let mut row = project_work(&item, op.clone(), reconciliation, &principal.owner.id);
+        let called_at = called
+            .get(session_key(&item.lead_token, &item.lead_session).as_str())
+            .copied();
+        let wait = setup.waiting().lead(
+            &item.lead_token,
+            &item.lead_session,
+            called_at.map_or(item.last_checkin_at, |at| at.max(item.last_checkin_at)),
+            now,
+        );
+        // Only the row reads the session's calls: where a request goes and which overlaps count
+        // still follow the lead's reports.
+        let mut shown = item.clone();
+        if called_at.is_some() && shown.claim_status == ClaimStatus::Stale {
+            shown.claim_status = ClaimStatus::Active;
+        }
+        let mut row = project_work(
+            &shown,
+            op.clone(),
+            reconciliation,
+            wait,
+            &principal.owner.id,
+        );
         // Fence the row with the final Work version. This does not claim an atomic snapshot.
         if store
             .work_get_scoped(reader, &id, now)?
@@ -751,7 +851,6 @@ fn waiting_actions(
     items: &BTreeMap<String, WorkItem>,
     now: i64,
 ) -> Result<Vec<StatusAction>> {
-    use crate::hub::session_waiting::WaitReason;
     let viewer = StatusRecipient {
         kind: RecipientKind::Person,
         owner: Some(principal.owner.id.clone()),
@@ -796,7 +895,8 @@ fn waiting_actions(
                 let label = match wait.reason {
                     WaitReason::Permission => "The prompt is for",
                     WaitReason::Question => "It asks",
-                    WaitReason::Idle => "Its last message ends",
+                    // A stop on background work asks nobody and is never listed here.
+                    WaitReason::Idle | WaitReason::Background => "Its last message ends",
                 };
                 format!(" {label}: “{text}”.")
             })
@@ -954,12 +1054,8 @@ fn request_actions(
             }) {
                 continue;
             }
-            let mut recipient = lead(item);
             let idle = item.state == WorkState::Paused || item.claim_status != ClaimStatus::Active;
-            if idle && recipient.kind == RecipientKind::LeadAgent {
-                recipient.kind = RecipientKind::Person;
-                recipient.agent = None;
-            }
+            let recipient = if idle { lead_person(item) } else { lead(item) };
             actions.push(StatusAction {
                 id: format!("request:{}:{}", request.id, target.work_id),
                 kind: "directed_request".into(),
@@ -1004,6 +1100,7 @@ mod tests {
             now,
         )
     }
+    use crate::hub::session_waiting::LeadWait::NotWaiting;
     use crate::hub::store::{self, ForgeIdentity, agent_token_digest, mint_bound_agent_token};
     use crate::hub::work::{CheckpointKind, WorkCheckpoint, WorkStart};
     use crate::hub::work_lifecycle::{LEASE_SECONDS, Lease, RenewalCoverage};
@@ -1050,11 +1147,19 @@ mod tests {
     #[test]
     fn other_persons_blocker_is_not_a_viewer_obligation() {
         let item = item(WorkState::Blocked);
-        let row = project_work(&item, op(&item, true, false), None, "usr_viewer");
+        let row = project_work(
+            &item,
+            op(&item, true, false),
+            None,
+            NotWaiting,
+            "usr_viewer",
+        );
         assert_eq!(row.state, StatusState::Blocked);
         assert_eq!(row.recipient.owner.as_deref(), Some("usr_lead"));
         assert!(!row.needs_you);
-        assert!(project_work(&item, op(&item, true, false), None, "usr_lead").needs_you);
+        assert!(
+            project_work(&item, op(&item, true, false), None, NotWaiting, "usr_lead").needs_you
+        );
         assert!(
             row.limits
                 .contains(&"current_provider_evidence_not_exposed".into())
@@ -1063,7 +1168,7 @@ mod tests {
     #[test]
     fn handover_names_a_person_and_preserves_reservation() {
         let item = item(WorkState::Handover);
-        let row = project_work(&item, op(&item, true, false), None, "usr_owner");
+        let row = project_work(&item, op(&item, true, false), None, NotWaiting, "usr_owner");
         assert_eq!(row.state, StatusState::AwaitingParty);
         assert_eq!(row.recipient.kind, RecipientKind::Person);
         assert_eq!(row.recipient.login.as_deref(), Some("owner"));
@@ -1074,7 +1179,13 @@ mod tests {
     fn quiet_or_released_work_is_not_failed_or_completed() {
         let mut item = item(WorkState::Active);
         item.claim_status = ClaimStatus::Stale;
-        let row = project_work(&item, op(&item, false, false), None, "usr_owner");
+        let row = project_work(
+            &item,
+            op(&item, false, false),
+            None,
+            NotWaiting,
+            "usr_owner",
+        );
         assert_eq!(row.state, StatusState::ReassessmentNeeded);
         assert_eq!(row.recipient.kind, RecipientKind::None);
         assert!(!row.needs_you);
@@ -1086,12 +1197,18 @@ mod tests {
     #[test]
     fn merge_does_not_retire_a_held_reservation_and_finished_does() {
         let item = item(WorkState::Active);
-        let row = project_work(&item, op(&item, true, true), None, "usr_owner");
+        let row = project_work(&item, op(&item, true, true), None, NotWaiting, "usr_owner");
         assert_eq!(row.state, StatusState::ReassessmentNeeded);
         assert!(row.needs_you);
         let mut finished = item;
         finished.state = WorkState::Finished;
-        let row = project_work(&finished, op(&finished, true, true), None, "usr_owner");
+        let row = project_work(
+            &finished,
+            op(&finished, true, true),
+            None,
+            NotWaiting,
+            "usr_owner",
+        );
         assert_eq!(row.state, StatusState::Retired);
         assert_eq!(row.operational.reservation.status, ReservationStatus::None);
         assert!(!row.needs_you);
@@ -1145,6 +1262,7 @@ mod tests {
             &item,
             op(&item, true, true),
             Some(reassessment(&item)),
+            NotWaiting,
             "usr_owner",
         );
         assert_eq!(row.state, StatusState::AwaitingParty);
@@ -1158,6 +1276,7 @@ mod tests {
             &item,
             op(&item, true, true),
             Some(reassessment(&item)),
+            NotWaiting,
             "usr_lead",
         );
         assert!(!lead_row.needs_you);
@@ -1170,12 +1289,19 @@ mod tests {
             &item,
             op(&item, true, false),
             Some(view.clone()),
+            NotWaiting,
             "usr_lead",
         );
         assert_eq!(row.state, StatusState::ReassessmentNeeded);
         let mut stale = view;
         stale.updated_seq += 1;
-        let row = project_work(&item, op(&item, true, false), Some(stale), "usr_lead");
+        let row = project_work(
+            &item,
+            op(&item, true, false),
+            Some(stale),
+            NotWaiting,
+            "usr_lead",
+        );
         assert_eq!(row.state, StatusState::ReassessmentNeeded);
         assert!(!row.needs_you);
         assert!(row.limits.contains(&"reconciliation_work_changed".into()));
@@ -1216,7 +1342,13 @@ mod tests {
             .collect();
         let observed = reconciliation_view(&item, &declarations, &evidence, None);
         assert!(observed.current.is_none());
-        let row = project_work(&item, op(&item, true, false), Some(observed), "usr_lead");
+        let row = project_work(
+            &item,
+            op(&item, true, false),
+            Some(observed),
+            NotWaiting,
+            "usr_lead",
+        );
         assert!(
             !row.limits
                 .iter()
@@ -1226,7 +1358,13 @@ mod tests {
         let unavailable = reconciliation_view(&item, &declarations, &evidence, None);
         assert_eq!(unavailable.current_source_coverage[0].state, "unavailable");
         assert!(unavailable.current.is_none());
-        let row = project_work(&item, op(&item, true, false), Some(unavailable), "usr_lead");
+        let row = project_work(
+            &item,
+            op(&item, true, false),
+            Some(unavailable),
+            NotWaiting,
+            "usr_lead",
+        );
         assert!(row.limits.contains(&"provider_coverage_unavailable".into()));
 
         let retained = reassessment(&item).current;
@@ -1235,7 +1373,13 @@ mod tests {
         assert!(stale.current.is_none());
         assert!(stale.retained.is_some());
         assert_ne!(stale.current_evidence_digest, old_digest);
-        let row = project_work(&item, op(&item, true, false), Some(stale), "usr_lead");
+        let row = project_work(
+            &item,
+            op(&item, true, false),
+            Some(stale),
+            NotWaiting,
+            "usr_lead",
+        );
         assert_eq!(row.state, StatusState::Blocked);
         assert!(
             !row.limits
@@ -1248,10 +1392,129 @@ mod tests {
         let item = item(WorkState::Blocked);
         let mut operational = op(&item, true, false);
         operational.updated_seq += 1;
-        let row = project_work(&item, operational, None, "usr_lead");
+        let row = project_work(&item, operational, None, NotWaiting, "usr_lead");
         assert_eq!(row.state, StatusState::ReassessmentNeeded);
         assert!(!row.needs_you);
         assert_eq!(row.recipient.kind, RecipientKind::None);
+    }
+
+    #[test]
+    fn a_waiting_lead_session_reads_as_waiting_not_as_a_quiet_claim() {
+        let mut item = item(WorkState::Active);
+        item.claim_status = ClaimStatus::Stale;
+        let row = |item: &WorkItem, held, wait, viewer| {
+            project_work(item, op(item, held, false), None, wait, viewer)
+        };
+        // Held and quiet with no wait on record: its owner is told to review it.
+        let quiet = row(&item, true, NotWaiting, "usr_owner");
+        assert_eq!(quiet.state, StatusState::ReassessmentNeeded);
+        assert!(quiet.needs_you);
+        // Waiting for its person: every reader sees who it waits on, and that person's own
+        // `session_waiting` action asks them, so the row does not count for them again.
+        for viewer in ["usr_lead", "usr_viewer"] {
+            let waiting = row(
+                &item,
+                true,
+                LeadWait::Waiting(WaitReason::Permission),
+                viewer,
+            );
+            assert_eq!(waiting.state, StatusState::AwaitingParty);
+            assert_eq!(waiting.recipient.kind, RecipientKind::Person);
+            assert_eq!(waiting.recipient.login.as_deref(), Some("lead"));
+            assert_eq!(waiting.freshness, ClaimStatus::Active);
+            assert!(!waiting.needs_you);
+            assert!(waiting.action.contains("permission to use a tool"));
+        }
+        // Paused Work whose resumed session stopped for its person waits too.
+        item.state = WorkState::Paused;
+        let idle = row(
+            &item,
+            false,
+            LeadWait::Waiting(WaitReason::Idle),
+            "usr_lead",
+        );
+        assert_eq!(idle.state, StatusState::AwaitingParty);
+        // A stop on its own background work asks nobody: its agent is still on the Work.
+        let busy = row(
+            &item,
+            true,
+            LeadWait::Waiting(WaitReason::Background),
+            "usr_owner",
+        );
+        assert_eq!(busy.state, StatusState::Active);
+        assert_eq!(busy.recipient.kind, RecipientKind::LeadAgent);
+        assert_eq!(busy.freshness, ClaimStatus::Active);
+        assert!(!busy.needs_you);
+        // A reported blocker says more than the wait.
+        item.state = WorkState::Blocked;
+        let blocked = row(&item, true, LeadWait::Waiting(WaitReason::Idle), "usr_lead");
+        assert_eq!(blocked.state, StatusState::Blocked);
+    }
+
+    #[test]
+    fn a_wait_the_hub_may_have_lost_reads_as_unknown_never_as_stale() {
+        let mut item = item(WorkState::Active);
+        item.claim_status = ClaimStatus::Stale;
+        let row = project_work(
+            &item,
+            op(&item, true, false),
+            None,
+            LeadWait::Unknown,
+            "usr_owner",
+        );
+        assert_eq!(row.freshness, ClaimStatus::Unknown);
+        assert_eq!(row.state, StatusState::ReassessmentNeeded);
+        assert_eq!(row.recipient.kind, RecipientKind::None);
+        assert!(!row.needs_you);
+        assert!(row.limits.contains(&"lead_wait_unknown".into()));
+        // A claim that is current needs no wait to say so.
+        item.claim_status = ClaimStatus::Active;
+        let row = project_work(
+            &item,
+            op(&item, true, false),
+            None,
+            LeadWait::Unknown,
+            "usr_owner",
+        );
+        assert_eq!(row.state, StatusState::Active);
+        assert_eq!(row.freshness, ClaimStatus::Active);
+        assert!(!row.limits.contains(&"lead_wait_unknown".into()));
+    }
+
+    #[test]
+    fn merged_work_that_holds_nothing_waits_only_to_be_closed() {
+        let mut item = item(WorkState::Paused);
+        item.claim_status = ClaimStatus::Stale;
+        // Its lease lapsed, so the reservation it still names blocks nobody.
+        let lapsed = work_operational(&OperationalFacts {
+            item: &item,
+            outcome: None,
+            basis: Some(ReservationBasis::Admitted),
+            hidden_by_merged_pr: true,
+            merge: MergeStatus::Observed,
+            lease: Some(Lease {
+                renewed_at: 100,
+                expires_at: 100 + LEASE_SECONDS,
+                grace_at: None,
+            }),
+            coverage: RenewalCoverage::ToolCalls,
+            now: 100 + LEASE_SECONDS,
+        });
+        assert_eq!(lapsed.reservation.status, ReservationStatus::Lapsed);
+        for operational in [lapsed, op(&item, false, true)] {
+            let row = project_work(&item, operational, None, NotWaiting, "usr_owner");
+            // Its owner is asked to close it, where a quiet claim that holds nothing asks nobody.
+            assert_eq!(row.state, StatusState::ReassessmentNeeded);
+            assert_eq!(row.recipient.kind, RecipientKind::Person);
+            assert_eq!(row.recipient.owner.as_deref(), Some("usr_owner"));
+            assert!(row.needs_you);
+            assert!(row.action.starts_with("Its pull request merged"));
+            // The Hub ends nothing: the Work stays unfinished with no outcome.
+            assert_eq!(
+                row.operational.outcome.value,
+                crate::hub::work_lifecycle::OutcomeValue::None
+            );
+        }
     }
 
     fn store_contract(store: &dyn Store) {
@@ -2197,6 +2460,127 @@ mod tests {
         on_postgres(waiting_contract);
     }
 
+    /// A session that stopped to wait makes no calls. Its Work reads as waiting while the Hub
+    /// holds the wait, and as unknown, never stale, once a restart lost it.
+    fn lead_wait_contract(store: &dyn Store) {
+        let now = crate::hub::store::unix_now();
+        let user = store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 611,
+                },
+                "waiter",
+            )
+            .unwrap();
+        let (_, secret, _) = mint_bound_agent_token(
+            store,
+            &user.id,
+            "waiter-laptop",
+            "acme/widgets",
+            101,
+            3600,
+            false,
+        )
+        .unwrap();
+        let who = store
+            .authenticate(&agent_token_digest(secret.expose()).unwrap(), now)
+            .unwrap()
+            .unwrap();
+        let request: WorkStart = serde_json::from_value(json!({
+            "request_key": "wait-for-review", "title": "Wait for review", "session": "waiting",
+            "scope": ["src/wait.rs"]
+        }))
+        .unwrap();
+        let work = store.work_start(&who.token_id, &request, now).unwrap().item;
+        // Longer than a claim stays active, shorter than its hold.
+        let later = now + crate::hub::work::CLAIM_STALE_SECONDS + 60;
+        let read = |observations: &Observations| {
+            let status = super::read(store, observations, &who, later).unwrap();
+            let row = status
+                .work
+                .iter()
+                .find(|w| w.work_id == work.id)
+                .unwrap()
+                .clone();
+            (row, status.counts.needs_you)
+        };
+        let observations = Observations::default();
+        let (quiet, asked) = read(&observations);
+        assert_eq!(quiet.state, StatusState::ReassessmentNeeded);
+        assert_eq!(quiet.freshness, ClaimStatus::Stale);
+        assert!(quiet.needs_you);
+        observations
+            .waiting()
+            .record(
+                &who,
+                "waiting",
+                "waiting",
+                "claude",
+                WaitReason::Question,
+                None,
+                None,
+                now + 1,
+            )
+            .unwrap();
+        let (waiting, asked_waiting) = read(&observations);
+        assert_eq!(waiting.state, StatusState::AwaitingParty);
+        assert_eq!(waiting.freshness, ClaimStatus::Active);
+        assert_eq!(waiting.recipient.login.as_deref(), Some("waiter"));
+        // One wait is one thing to do: its action asks the person, the row does not ask again.
+        assert!(!waiting.needs_you);
+        assert_eq!(asked_waiting, asked);
+        // A Hub that restarted after the session's last call holds no wait for it.
+        let restarted = Observations::default();
+        restarted.waiting().lost_before(later);
+        let (unknown, asked_unknown) = read(&restarted);
+        assert_eq!(unknown.state, StatusState::ReassessmentNeeded);
+        assert_eq!(unknown.freshness, ClaimStatus::Unknown);
+        assert_eq!(unknown.recipient.kind, RecipientKind::None);
+        assert!(unknown.limits.contains(&"lead_wait_unknown".into()));
+        assert_eq!(asked_unknown, asked - 1);
+        // A claim follows reports only. A session that works on without reporting still calls,
+        // and its calls say it is there: neither quiet nor unknown, whatever the Hub lost.
+        store
+            .touch_session(
+                &who.token_id,
+                &crate::hub::session::SessionCall {
+                    session: Some("waiting".into()),
+                    via: "hook:claude".into(),
+                    task: None,
+                    paths: vec![],
+                    deny: false,
+                    report: false,
+                },
+                later - 60,
+            )
+            .unwrap();
+        for observations in [&Observations::default(), &restarted] {
+            let (working, asked_working) = read(observations);
+            assert_eq!(working.state, StatusState::Active);
+            assert_eq!(working.freshness, ClaimStatus::Active);
+            assert!(!working.needs_you);
+            assert_eq!(asked_working, asked - 1);
+        }
+    }
+
+    #[test]
+    fn sqlite_a_waiting_lead_session_is_not_a_quiet_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        lead_wait_contract(&*store);
+    }
+
+    #[test]
+    fn a_waiting_lead_session_is_not_a_quiet_claim_on_postgres() {
+        on_postgres(lead_wait_contract);
+    }
+
     #[test]
     fn sqlite_failed_checks_and_stopped_gates_reach_their_owner() {
         let dir = tempfile::tempdir().unwrap();
@@ -2664,6 +3048,7 @@ mod tests {
                 &source,
                 op(&source, true, false),
                 None,
+                NotWaiting,
                 &fixture.viewer_owner,
             );
             assert_eq!(actual.state, expected.state);
@@ -2681,15 +3066,27 @@ mod tests {
         source.scope = (0..256)
             .map(|n| format!("src/{n}-{}", "a".repeat(900)))
             .collect();
-        let row = project_work(&source, op(&source, true, false), None, "usr_owner");
+        let row = project_work(
+            &source,
+            op(&source, true, false),
+            None,
+            NotWaiting,
+            "usr_owner",
+        );
         assert_eq!(row.operational.reservation.scope_count, 256);
         assert!(serde_json::to_vec(&row).unwrap().len() < 4096);
         let digest = row.operational.digest;
         source.scope[0].push('x');
         assert_ne!(
-            project_work(&source, op(&source, true, false), None, "usr_owner")
-                .operational
-                .digest,
+            project_work(
+                &source,
+                op(&source, true, false),
+                None,
+                NotWaiting,
+                "usr_owner"
+            )
+            .operational
+            .digest,
             digest
         );
     }
