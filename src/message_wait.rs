@@ -57,8 +57,7 @@ pub async fn run(args: HookWaitArgs) -> ! {
         std::process::exit(0)
     }
     let codex = args.agent == "codex";
-    // Without a runnable `codex` a notice could not be queued, so this chat is not waited for.
-    let found = if ((codex && runs("codex")) || args.agent == "claude") && cfg!(unix) {
+    let found = if (codex || args.agent == "claude") && cfg!(unix) {
         waited(codex).await
     } else {
         None
@@ -179,6 +178,10 @@ async fn waited(codex: bool) -> Option<(String, String)> {
     let _ = std::fs::remove_file(&ended);
     // Held until this process exits; a second waiter for the session leaves at once.
     let _lock = lock(&dir, &session)?;
+    // Without a runnable `codex` a notice could not be queued, so this chat is not waited for.
+    if codex && !runs("codex") {
+        return None;
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
@@ -188,12 +191,8 @@ async fn waited(codex: bool) -> Option<(String, String)> {
     let started = parent();
     let request = Wait {
         client: &client,
-        url: format!(
-            "{}/v1/hub/agent-messages/wait{}",
-            connection.hub,
-            if codex { "?agent=codex" } else { "" }
-        ),
-        body: serde_json::json!({ "session": session }).to_string(),
+        url: format!("{}/v1/hub/agent-messages/wait", connection.hub),
+        body: wait_body(&session, codex),
         token_file: &connection.token_file,
     };
     let text = request
@@ -204,6 +203,17 @@ async fn waited(codex: bool) -> Option<(String, String)> {
         )
         .await?;
     Some((session, text))
+}
+
+/// A Claude Code waiter names only its session, as before; a Codex one adds `agent`, so the Hub
+/// records the delivery as queued into the chat's own queue.
+fn wait_body(session: &str, codex: bool) -> String {
+    if codex {
+        serde_json::json!({ "session": session, "agent": "codex" })
+    } else {
+        serde_json::json!({ "session": session })
+    }
+    .to_string()
 }
 
 /// The Hub's answer when a message came.
@@ -259,8 +269,14 @@ impl Wait<'_> {
                     }
                     continue;
                 }
-                // Signed out, a read-only token, Ignore, or a Hub without the route.
-                Ok((401 | 403 | 404 | 405 | 410, _)) => return None,
+                // Signed out, a read-only token, Ignore, a Hub without the route, or one that
+                // refuses the request (a Hub older than the Codex waiter rejects `agent`).
+                Ok((400 | 401 | 403 | 404 | 405 | 410, _)) => return None,
+                // Another wait for this session is still open at the Hub: ask again shortly.
+                Ok((409, _)) => {
+                    answered = Instant::now();
+                    backoff = pause;
+                }
                 // 429 and other answers: the Hub is there but busy.
                 Ok(_) => answered = Instant::now(),
                 Err(_) if answered.elapsed() >= UNREACHABLE => return None,
@@ -478,6 +494,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn another_wait_still_open_at_the_hub_is_asked_again() {
+        let notice = r#"{"text":"AgentSCM Hub message msg_1 for this session, from octo"}"#;
+        let (url, served) = hub(vec![(409, ""), (409, ""), (200, notice)], None).await;
+        let text = ask(&url, MAX_LIFE, || true).await.expect("the notice");
+        assert_eq!(served.await.unwrap(), 3);
+        assert!(text.starts_with(FRAME));
+    }
+
+    #[test]
+    fn only_a_codex_waiter_names_its_agent() {
+        assert_eq!(wait_body("s1", false), r#"{"session":"s1"}"#);
+        let codex: Value = serde_json::from_str(&wait_body("s1", true)).unwrap();
+        assert_eq!(
+            codex,
+            serde_json::json!({"session": "s1", "agent": "codex"})
+        );
+    }
+
+    #[tokio::test]
     async fn a_message_after_empty_waits_is_the_notice_and_wakes_with_exit_2() {
         let notice = r#"{"text":"AgentSCM Hub message msg_1 for this session, from octo"}"#;
         let (url, served) = hub(vec![(204, ""), (204, ""), (200, notice)], None).await;
@@ -496,8 +531,9 @@ mod tests {
         assert_eq!(found, None);
         assert_eq!(served.await.unwrap(), 1);
         assert_eq!(finish(found, &mut Vec::new()), 0);
-        // Ignore (410) and an older Hub without the route (404) end it at once.
-        for status in [410, 404] {
+        // Ignore (410), an older Hub without the route (404) and one that refuses the request
+        // (400, as a Hub older than the Codex waiter does its `agent`) end it at once.
+        for status in [410, 404, 400] {
             let (url, served) = hub(vec![(status, "")], None).await;
             assert_eq!(ask(&url, MAX_LIFE, || true).await, None);
             assert_eq!(served.await.unwrap(), 1);
