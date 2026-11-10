@@ -817,7 +817,7 @@ fn devices_and_refusals(db: &Db) {
     let now = unix_now();
     let laptop = device_digest(&"1".repeat(64)).unwrap();
     let first = store
-        .insert_device(&alice.id, "alice's MacBook Pro", &laptop, None, now)
+        .insert_device(&alice.id, "alice's MacBook Pro", &laptop, None, None, now)
         .unwrap();
     assert_id(&first, "dev_");
     // A credential digest is never an agent token, and the reverse.
@@ -827,9 +827,10 @@ fn devices_and_refusals(db: &Db) {
         (principal.device_id.as_str(), &principal.owner),
         (first.as_str(), &alice)
     );
+    assert_eq!(principal.app_id, None);
     assert!(
         store
-            .insert_device(&alice.id, "", &laptop, None, now)
+            .insert_device(&alice.id, "", &laptop, None, None, now)
             .is_err()
     );
 
@@ -848,6 +849,7 @@ fn devices_and_refusals(db: &Db) {
             &bob.id,
             "bob's",
             &device_digest(&"2".repeat(64)).unwrap(),
+            None,
             None,
             now,
         )
@@ -923,7 +925,7 @@ fn devices_and_refusals(db: &Db) {
     // Signing in again with the old credential replaces that computer only.
     let second = device_digest(&"3".repeat(64)).unwrap();
     let replaced = store
-        .insert_device(&bob.id, "bob's", &second, Some(&bobs), now)
+        .insert_device(&bob.id, "bob's", &second, Some(&bobs), None, now)
         .unwrap();
     assert_ne!(replaced, bobs);
     assert_eq!(
@@ -983,6 +985,117 @@ fn devices_and_refusals(db: &Db) {
             .unwrap()
             .is_some()
     );
+    let carol = reopened.upsert_user(&identity(12), "carol").unwrap();
+    // A connected app's credential is a computer row that names its app.
+    let app_digest = device_digest(&"e".repeat(64)).unwrap();
+    let app = reopened
+        .insert_device(
+            &carol.id,
+            "Example App",
+            &app_digest,
+            None,
+            Some("example-app"),
+            now,
+        )
+        .unwrap();
+    let principal = reopened
+        .authenticate_device(&app_digest, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(principal.app_id.as_deref(), Some("example-app"));
+    let listed = reopened.devices(Some(&carol.id), now).unwrap();
+    let listed: Vec<_> = listed
+        .iter()
+        .map(|d| (d.id.as_str(), d.app_id.as_deref()))
+        .collect();
+    assert!(
+        listed.contains(&(app.as_str(), Some("example-app"))),
+        "{listed:?}"
+    );
+    // Connecting again retires the earlier credential for that app, and only that one.
+    let other_digest = device_digest(&"f".repeat(64)).unwrap();
+    reopened
+        .insert_device(
+            &carol.id,
+            "Other",
+            &other_digest,
+            None,
+            Some("other-app"),
+            now,
+        )
+        .unwrap();
+    let again = device_digest(&"d".repeat(64)).unwrap();
+    let app2 = reopened
+        .insert_device(
+            &carol.id,
+            "Example App",
+            &again,
+            None,
+            Some("example-app"),
+            now,
+        )
+        .unwrap();
+    assert!(
+        reopened
+            .authenticate_device(&app_digest, now)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .authenticate_device(&other_digest, now)
+            .unwrap()
+            .is_some()
+    );
+    assert!(reopened.authenticate_device(&again, now).unwrap().is_some());
+    // An app left out of the registered list loses its credentials.
+    assert_eq!(
+        reopened
+            .revoke_unregistered_apps(&["example-app".to_owned()], "hub", now)
+            .unwrap(),
+        1
+    );
+    assert!(
+        reopened
+            .authenticate_device(&other_digest, now)
+            .unwrap()
+            .is_none()
+    );
+    assert!(reopened.authenticate_device(&again, now).unwrap().is_some());
+    assert!(
+        reopened
+            .revoke_device(&app2, Some(&carol.id), &carol.id, now)
+            .unwrap()
+    );
+    // Racing connects from separate hub processes still leave exactly one live credential.
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let racers: Vec<_> = (0..8)
+        .map(|i| {
+            let (url, owner, start) = (db.url.clone(), carol.id.clone(), start.clone());
+            thread::spawn(move || {
+                let store = store::open(&url).unwrap();
+                let digest = device_digest(&format!("{:064x}", 0xa9_0000 + i)).unwrap();
+                start.wait();
+                store
+                    .insert_device(
+                        &owner,
+                        "Example App",
+                        &digest,
+                        None,
+                        Some("example-app"),
+                        now,
+                    )
+                    .unwrap();
+                digest
+            })
+        })
+        .collect();
+    let raced: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+    let live = raced
+        .iter()
+        .filter(|d| reopened.authenticate_device(d, now).unwrap().is_some())
+        .count();
+    assert_eq!(live, 1);
 }
 
 fn browser_sessions(db: &Db) {
@@ -2868,6 +2981,7 @@ fn local_ci_enroll_read_list_and_advance(db: &Db) {
             "laptop",
             &store::device_digest(&"1".repeat(64)).unwrap(),
             None,
+            None,
             now,
         )
         .unwrap();
@@ -2877,6 +2991,7 @@ fn local_ci_enroll_read_list_and_advance(db: &Db) {
             "laptop",
             &store::device_digest(&"2".repeat(64)).unwrap(),
             Some(&first),
+            None,
             now,
         )
         .unwrap();

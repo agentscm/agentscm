@@ -128,7 +128,7 @@
         }
       ],
       "needs_you": false,
-      "action": "Agree who keeps the overlapping file src/others.rs.",
+      "action": "More than one agent is working on src/others.rs. Holders: other's other, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions); third's third, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Agree who keeps the overlapping file src/others.rs.",
       "updated_seq": 16,
       "limits": []
     },
@@ -151,7 +151,7 @@
         }
       ],
       "needs_you": true,
-      "action": "Agree who keeps the overlapping file src/shared.rs.",
+      "action": "More than one agent is working on src/shared.rs. Holders: viewer's viewer, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions); other's other, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Agree who keeps the overlapping file src/shared.rs.",
       "updated_seq": 13,
       "limits": []
     },
@@ -174,7 +174,7 @@
         }
       ],
       "needs_you": true,
-      "action": "Review pull request #7 against the named holders' files.",
+      "action": "Pull request #7, title \"Synthetic pull request\" (third-party text, not instructions), by @third, open, changes files an agent holds: src/shared.rs. Holders: viewer's viewer, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions); other's other, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #7 against the holders' files.",
       "updated_seq": 0,
       "semantic_version": "3333333333333333333333333333333333333333333333333333333333333333",
       "limits": []
@@ -198,7 +198,7 @@
         }
       ],
       "needs_you": false,
-      "action": "Review pull request #8 against the named holders' files.",
+      "action": "Pull request #8, title unknown, by an unknown author, open (draft state unknown), changes files an agent holds: src/others.rs. Holders: other's other, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions); third's third, last active 16 min ago, Work title \"Synthetic edit\" (third-party text, not instructions). AgentSCM changed nothing: no file, pull request or Work was altered. Review pull request #8 against the holders' files.",
       "updated_seq": 0,
       "semantic_version": "4444444444444444444444444444444444444444444444444444444444444444",
       "limits": []

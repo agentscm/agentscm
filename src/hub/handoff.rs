@@ -15,10 +15,11 @@ pub(super) const MAX_OPEN: usize = 3;
 pub(super) const PER_TOUCH: i64 = 8;
 
 /// Who made a request or gave an answer: the agent itself, or the person who owns it, acting for
-/// it on the Hub's web pages or from a Slack button. The record says which, so an answer is never
-/// passed off as the agent's own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// it on the Hub's web pages, from a Slack button or through a connected app. The record says
+/// which, so an answer is never passed off as the agent's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Via {
+    #[default]
     Agent,
     Hub,
     /// Only answers: Slack files no requests.
@@ -44,7 +45,7 @@ impl Via {
     }
 
     /// What an event's `via` says, absent for the agent itself.
-    fn tag(self) -> Option<&'static str> {
+    pub(super) fn tag(self) -> Option<&'static str> {
         match self {
             Self::Agent => None,
             Self::Hub => Some("hub"),
