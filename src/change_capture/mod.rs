@@ -7,8 +7,10 @@
 
 pub mod claude_code;
 pub mod codex;
-pub mod redact;
 pub mod spool;
+
+// Redaction has no platform dependency and the hook client uses it where capture does not build.
+pub use crate::redact;
 
 use std::ffi::{CString, OsStr};
 use std::fmt;

@@ -124,6 +124,22 @@ and prints one outcome per item: `applied`, `replayed`, `conflict`, `refused` (w
 `retry` instruction) or `unavailable`. It exits non-zero when any item was not applied; earlier
 items stay applied, and sending the same batch again is safe.
 
+### `why`
+
+`agentscm why <commit | path | path:line>` asks the Hub which Work produced a commit or a file,
+and prints its description, outcome and decision checkpoints as JSON. A commit is anything
+`git rev-parse` resolves to a full SHA. For `path:line`, local `git blame` names the commit that
+last changed that line; for a path, `git log` names its newest commits (`--commits`, default 5,
+at most 20). Each commit is asked about together with the merge that brought it into `HEAD`:
+the oldest merge on `HEAD`'s first-parent line that descends from it, not a merge of `main`
+into the branch, because the Hub knows pull requests by their merge and head commits. On
+squash-merge history the blamed commit is already the merge commit. The path is asked about
+too, relative to the repository root, so `.` and absolute paths work and the root itself asks
+only about commits; its answer lists Work whose declared scope covers it. An answer with
+`known: false` means the Hub has no Work recorded for that commit or path: a commit merged
+without a linked Work, or history the Hub never saw, stays unknown. A line that is not
+committed yet names no commit.
+
 ### `change-capture` (experimental, Unix)
 
 After `agentscm client connect` has saved a write-capable connection for a checkout, configure its
@@ -398,12 +414,12 @@ process from recent hook/MCP sightings, whose live task state is unknown. Existi
 attention appears with an action to use its tray menu. When a saved Hub sign-in permits it, the
 tray checks connected checkouts about once a minute with short-lived read-only tokens and
 counts what needs you from the same shared status projection as the Hub's **Needs you** badge:
-blockers and reassessments on Work your agent leads; handovers and still-held reservations on
-paused, quiet or merged Work you own; requests to your idle Work; live tasks whose declared
-scopes overlap yours; files you and another agent hold; open pull requests touching files you
-hold; required checks failing on your open pull requests; and `pr-gate` runs blocked at a gate
-after their agent stopped. Another person's
-blocker or request is listed but not counted. The Hub badge also leaves out needs hidden in that
+your own agents waiting for you; blockers and reassessments on Work your agent leads; handovers
+of Work you own; required checks failing on your open pull requests; `pr-gate` runs blocked at a
+gate after their agent stopped; and agent setup problems. What agents settle between themselves
+is listed but not counted: paused, quiet or merged Work, live tasks whose declared scopes
+overlap, files two agents hold, open pull requests touching held files and requests from one
+agent to another. Another person's blocker is listed but not counted. The Hub badge also leaves out needs hidden in that
 browser, which the tray cannot see. It refreshes the cross-repository list about every two
 minutes. A newly observed need opens a small attention notice, or marks **New attention** when
 the Now card is fully visible; a partial read may reveal an older one later. The summary marks
