@@ -1065,6 +1065,11 @@ mod tests {
     }
 
     #[test]
+    fn the_refusal_gives_the_shared_test_for_editing_other_lines() {
+        assert!(REPEAT_FIRST.starts_with(OTHER_LINES));
+    }
+
+    #[test]
     fn a_decline_reason_stays_inside_its_quotes() {
         let mut declined = note("decline", None);
         assert!(!handoff_line(&declined).contains("reason"));
