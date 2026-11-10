@@ -1363,6 +1363,7 @@ async fn send(
                 ));
             }
         }
+        let reach = reach_of(&body.token, &body.session, now);
         let message = Message {
             id: new_id("msg")?,
             token: body.token,
@@ -1379,7 +1380,7 @@ async fn send(
             read_at: None,
             done_at: None,
             answered_at: None,
-            deadline_at: Some(now + reach_of(&body.token, &body.session, now).pickup_secs()),
+            deadline_at: Some(now + reach.pickup_secs()),
         };
         let key = messages_key(&user.id, repository_id);
         let kept = message.clone();
