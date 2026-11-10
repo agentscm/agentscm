@@ -51,6 +51,7 @@ pub mod model;
 #[cfg(unix)]
 pub mod operating_policy;
 pub mod policy;
+pub mod redact;
 #[cfg(unix)]
 pub mod repo_explorer;
 pub mod reviewer;

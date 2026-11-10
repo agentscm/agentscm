@@ -573,6 +573,7 @@ async fn protocol_basics() {
             "agentscm_receipt_settings",
             "agentscm_work_search",
             "agentscm_why",
+            "agentscm_work_repositories",
             "agentscm_publications_list",
             "agentscm_workflow_runs_list",
             "agentscm_work_usage",
@@ -608,6 +609,7 @@ async fn protocol_basics() {
         .map(|tool| tool["name"].as_str().unwrap().to_owned())
         .collect();
     let opt_in = [
+        "agentscm_work_repositories",
         "agentscm_skill_list",
         "agentscm_skill_status",
         "agentscm_skill_evidence",
@@ -2871,7 +2873,7 @@ async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
         })
         .unwrap();
     let listed = names(hub.rpc(&key, &list).await.json());
-    assert_eq!((before.len(), listed.len(), all.len()), (37, 40, 59));
+    assert_eq!((before.len(), listed.len(), all.len()), (37, 40, 60));
 
     let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
         "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});

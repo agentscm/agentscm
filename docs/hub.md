@@ -309,8 +309,7 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   `repository`, `repository_id`, `provider`, `unfinished` (`total`, `moving`, `stuck`),
   `needs_you`, `agents`, `last_activity_at` (or `null`) and `complete` (false when a list was cut
   short, so counts are lower bounds): counts only, never titles, paths or people. `needs_you`
-  counts blockers, declared-scope overlaps between live tasks (both claims active, both tasks active or blocked) and files two agents hold now; paused, handover and stale-claim work is unfinished and may be stuck, but is not counted;
-  pull-request overlaps and files with only a recent refusal are not counted. A refused role or a
+  is the shared status count of what asks this person (see [shared actionable status](standup.md#shared-actionable-status)): their own agent waiting for them, Work its agent reported blocked, a handover, a failed required check, a stopped workflow gate and an agent setup problem. What agents settle between themselves is not counted: quiet or paused work, a merged task still to close, declared-scope overlaps, a file two agents hold, a pull request over a held file and a request from one agent to another. A refused role or a
   repository no longer connected is left out and not recorded as a refused sign-in; one the forge
   could not answer for in time is counted in `unchecked`, never named. `complete` is false past
   200 connected repositories. A `hub login` session gets 403 `forbidden`. The Hub keeps each
@@ -839,6 +838,12 @@ hold lapses. A failure never refuses. The holder's task is cut to 80 printable A
 characters without quotes, backticks, angle brackets or markup, so it cannot
 leave its quotes; names are filtered the same way.
 
+A file that Git reports as unmerged in the editing agent's checkout is not checked while its
+conflict lasts. The connected hook client leaves that path out of its call, so this refusal,
+`EDIT_UNLINKED` and `LEASE_LAPSED` do not apply to the edit that resolves the conflict, and the
+edit holds nothing. The [agents guide](agents.md) gives the reason and the limits, under "An edit
+that resolves a Git conflict is not checked".
+
 Notes (the advice for an MCP check, Cursor, the Copilot CLI after an edit, or a
 rate-limited edit) use the same factual wording:
 
@@ -1212,7 +1217,7 @@ live agents and the last activity, worst first; a row opens that repository's Da
 with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
 `GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
 overlaps, directed requests and file handoffs as conversations with a timeline; on a web sign-in a
-person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request that waits on the viewer's own paused or stale work also shows in the Dashboard's Needs you, since that agent cannot answer it, and the refused agent's `agentscm_start` reply says its lead is not running, History (Finished, Changes, Change records, and Files from this
+person can answer for their own agent there, see [People answering for their own agent](#people-answering-for-their-own-agent)). A directed request is its target's lead agent's to answer and never shows in the Dashboard's Needs you; when that lead is paused or quiet the refused agent's `agentscm_start` reply says its lead is not running, and once the target's hold has lapsed the asker's next start takes the files, History (Finished, Changes, Change records, and Files from this
 computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
 Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
 [local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in
