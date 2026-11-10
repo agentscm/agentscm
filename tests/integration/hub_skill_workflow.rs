@@ -409,6 +409,7 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
             "agentscm_skill_list",
             "agentscm_skill_status",
             "agentscm_value_metrics",
+            "agentscm_why",
             "agentscm_work_briefing",
             "agentscm_work_catchup",
             "agentscm_work_catchup_ack",

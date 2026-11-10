@@ -2975,6 +2975,69 @@ async fn an_agent_lists_current_work_in_the_repositories_its_person_can_read() {
     );
 }
 
+/// More Work across repositories than one agent read lists in all: the top-level `work_complete`
+/// says the overall cap cut a list, and the repositories past it list less.
+#[tokio::test]
+async fn the_agent_read_flags_the_overall_work_cap() {
+    use agentscm::hub::work::{WorkRole, WorkStart};
+    let env = Env::start("github").await;
+    let host = env.base.trim_start_matches("http://").to_owned();
+    let (_, device, _) = env.sign_in(ALICE, "laptop").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    let alice = minted["token"].as_str().unwrap().to_owned();
+    let (_, who) = env.get("/v1/hub/whoami", &alice).await;
+    let alice_id = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host,
+                user_id: ALICE,
+            },
+            who["owner"]["login"].as_str().unwrap(),
+        )
+        .unwrap()
+        .id;
+    // Eleven repositories of ten Work each: 110, past the 100 one read lists.
+    for r in 0..11_i64 {
+        let (name, id) = (format!("acme/cap-{r:02}"), 5000 + r);
+        env.connect_repo(&name, id, ALICE);
+        let (bound, _, _) =
+            mint_bound_agent_token(&*env.store, &alice_id, "cap-agent", &name, id, 600, false)
+                .unwrap();
+        for n in 0..10 {
+            let request: WorkStart = serde_json::from_value(json!({
+                "request_key": format!("cap-{r}-{n}"), "title": format!("Cap {r} {n}"),
+                "session": format!("cap-{r}-{n}"), "scope": [format!("src/{n}.rs")]
+            }))
+            .unwrap();
+            assert_eq!(request.role, WorkRole::Lead);
+            env.store.work_start(&bound, &request, unix_now()).unwrap();
+        }
+    }
+    let (status, body) = env.get("/v1/hub/standup/repositories", &alice).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["work_complete"], false, "the overall cap cut a list");
+    let listed: Vec<usize> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["repository"].as_str().unwrap().starts_with("acme/cap-"))
+        .map(|row| row["work"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(listed.iter().sum::<usize>(), 100);
+    assert_eq!(listed.len(), 11);
+    assert_eq!((listed[0], listed[10]), (10, 0));
+    let last = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["repository"] == "acme/cap-10")
+        .unwrap();
+    assert_eq!(last["work_complete"], false);
+}
+
 #[tokio::test]
 async fn a_web_sign_in_lists_the_repositories_it_can_read_now_with_counts_only() {
     let env = Env::start("github").await;

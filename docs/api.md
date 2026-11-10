@@ -120,9 +120,23 @@ See [PR context](advanced/pr-context.md) for revision identity, bounds and unkno
 | `POST /v1/hub/standup/declarations` | Current lead; fenced, retry-safe replacement of durable declarations |
 | `GET /v1/hub/standup/work/{id}/reconciliation-v2` | Repository-scoped reader; durable current versus retained historical reconciliation with explicit staleness; fresh evidence digest/source coverage remain separate even without a current retained evaluation |
 | `POST /v1/hub/standup/reconciliation` | Current lead; fenced server-evidence evaluation, preserves original reports and reservation authority |
+| `GET /v1/hub/standup/why` | Repository-scoped reader, read-only tokens allowed; exactly one of `commit` (full lowercase SHA) or `path`; the Work recorded for it, newest first, at most 10 |
 
 MCP exposes `agentscm_work_pr_link` and `agentscm_work_pr_link_set` through the same
 Work store. The relationship records caller-reported identity, not provider approval.
+
+`GET /v1/hub/standup/why` answers why a commit or path exists. A commit resolves to pull
+requests through retained merge observations (its merge or head commit) and through Work
+pull-request links whose recorded head is that commit, then to the Work linked to those pull
+requests. A path resolves to Work whose declared scope covers it: the path itself or a parent
+directory. Each Work lists its title, description, state, owner, lead, latest checkpoint
+(`outcome`), up to 20 decision checkpoints newest first with their `source_refs`, and
+`conversation`: the change-record and conversation routes for it. Those routes apply their own
+access rules; the answer carries no conversation bodies. Another owner's agent labels and
+session IDs are masked as in every other Work read. Branch names and text are never matched,
+so `known: false` means the Hub has no Work recorded for the subject, not that it had no
+reason. `work_complete` and `decisions_complete` say whether a list was cut. MCP exposes the
+same read as `agentscm_why`, and `agentscm why` resolves a path or line locally with Git first.
 
 ### Planned issues and issue linkage
 

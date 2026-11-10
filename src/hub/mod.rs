@@ -63,6 +63,7 @@ mod validation_summary;
 pub mod value_metrics;
 pub mod view_settings;
 pub mod viewer;
+pub mod why;
 pub mod work;
 pub mod work_http;
 pub mod work_issues;
