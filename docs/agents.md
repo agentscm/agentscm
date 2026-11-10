@@ -34,7 +34,7 @@ the last is any client that has only the Hub's MCP server.
 | Claude Code | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | Yes | At session start, on each prompt, and at an edit, which is held until the session answers |
 | Codex | Yes, with the session ID | Before the write (`apply_patch`) | Yes | Yes | Approval request, end of turn | Not checked: a call that names a subagent is handled as Claude Code's, but whether Codex names one was not verified | At session start, and at an edit, which is held until the session answers |
 | Cursor | Yes, with the session ID | Just after the write | No | Yes | End of turn only | No | At session start and just after an edit |
-| GitHub Copilot | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | No; only a subagent's own wait is told apart from its parent's | At session start; before an edit only as the refusal that holds it |
+| GitHub Copilot | Yes, with the session ID | Before the write | Yes | Yes | Permission prompt, question, end of turn | Not checked: a call that names a subagent is not held for a request addressed to its parent, but whether Copilot sends the parent's session for it was not verified | At session start; before an edit only as the refusal that holds it |
 | Gemini CLI | Yes, with the session ID | Before the write (`write_file`, `replace`) | Yes | Yes | Tool permission prompt, end of turn | No | At session start; before an edit as Gemini CLI's `systemMessage`, which does not hold the edit |
 | A client with no hooks (MCP only) | In the MCP server's instructions, when the client shows them; no session ID | Only when the agent calls `agentscm_check` | No | Only when the agent calls `agentscm_done` | No | No | Only in the replies to its own AgentSCM tool calls |
 
@@ -45,7 +45,8 @@ What the columns mean:
 - **Edit check.** When the Hub is asked about an edit made with the agent's file-edit tools.
   No agent's hook sees a file written by a shell command.
 - **An edit can be refused.** The hook's answer can stop the write: a file another agent holds
-  ([once per hold](hub.md#warn-once)), `LEASE_LAPSED`, `EDIT_UNLINKED` or, in Claude Code, Codex
+  ([once per hold](hub.md#warn-once)), the first edit of a session that declared no Work
+  (`WORK_UNDECLARED`, once per session), `LEASE_LAPSED`, `EDIT_UNLINKED` or, in Claude Code, Codex
   and Copilot, a coordination request the session has not answered. Where it cannot, the same
   text arrives as a note.
 - **Session end reported.** Setup installs a session-end hook for all five wired agents

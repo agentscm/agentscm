@@ -519,14 +519,11 @@ fn github_copilot_gets_what_its_row_says() {
         "{held}"
     );
     assert!(held.get("additionalContext").is_none(), "{held}");
-    // A subagent's edit is not put under its parent: it is held like the session's own.
+    // A call that names a subagent is put under its parent: its edit is not held for the
+    // parent's request. Copilot CLI takes no note there, so the pointer to the lead is not shown.
     let mut subagent = edit(&bench, LED);
     subagent["agentId"] = json!("a1b2c3");
-    let reply = bench.hook("copilot", &subagent);
-    assert!(
-        text(&reply, "/permissionDecisionReason").contains("needs your response"),
-        "{reply}"
-    );
+    says_nothing(&bench.hook("copilot", &subagent));
 }
 
 #[test]
