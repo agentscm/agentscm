@@ -187,11 +187,14 @@ impl Bench {
 
     /// The files the Hub lists as held through `agent`'s hooks.
     fn held_through(&self, agent: &str) -> Vec<String> {
+        // Protects: the hook's edit is recorded as coming through that agent's hook. Other
+        // routes the same hold also came through may be listed beside it.
+        let via = format!("hook:{agent}");
         self.store
             .live_intents(REPO, unix_now(), 10)
             .unwrap()
             .into_iter()
-            .filter(|intent| intent.via == [format!("hook:{agent}")])
+            .filter(|intent| intent.via.contains(&via))
             .flat_map(|intent| intent.paths)
             .collect()
     }
@@ -277,6 +280,22 @@ fn under_parent(reply: &Value, request: &str) -> bool {
         .pointer("/hookSpecificOutput/permissionDecision")
         .is_none()
         && !text(reply, HOOK_CONTEXT).contains(request)
+}
+
+/// An answer that cannot refuse: it carries no field any supported host reads as a refusal or a
+/// stop. Protects Cursor's row ("nothing in the answer can refuse") without pinning which other
+/// fields, such as a note, the answer has.
+fn cannot_refuse(reply: &Value) {
+    for field in ["/permission", "/decision", "/permissionDecision"] {
+        assert!(reply.pointer(field).is_none(), "{field}: {reply}");
+    }
+    assert!(
+        reply
+            .pointer("/hookSpecificOutput/permissionDecision")
+            .is_none(),
+        "{reply}"
+    );
+    assert_ne!(reply.get("continue"), Some(&json!(false)), "{reply}");
 }
 
 /// A wait is reported to the Hub and never answered: the host reads back nothing.
@@ -431,7 +450,7 @@ fn cursor_gets_what_its_row_says() {
         text(&noted, "/additional_context").contains("src/held.rs"),
         "{noted}"
     );
-    assert_eq!(noted.as_object().unwrap().len(), 1, "{noted}");
+    cannot_refuse(&noted);
     // Waiting is reported for the end of a turn only: Cursor reports no permission prompt.
     says_nothing(&bench.hook("cursor", &event(&bench, "stop")));
     bench.hook("cursor", &edited(&bench, "src/own.rs"));
@@ -450,7 +469,7 @@ fn cursor_gets_what_its_row_says() {
         text(&noted, "/additional_context").contains(&request),
         "{noted}"
     );
-    assert_eq!(noted.as_object().unwrap().len(), 1, "{noted}");
+    cannot_refuse(&noted);
     // Subagents are not told apart: a call that names one is handled as the session's own.
     let mut subagent = edited(&bench, LED);
     subagent["agent_id"] = json!("a1b2c3");

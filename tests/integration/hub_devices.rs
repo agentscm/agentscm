@@ -4333,6 +4333,7 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
     let ran = json!({"hook_event_name": "PostToolUse", "session_id": session, "tool_name": "Bash"});
     let register = |hash: &str, complete: bool| {
         json!({"session": session, "tool": "Bash", "display": "cargo publish",
+            "summary": "run a shell command: Publish the crate", "folder": "widgets",
             "complete": complete, "input_hash": hash.repeat(64)})
     };
     let answer = |id: &Value, decision: &str| {
@@ -4402,18 +4403,29 @@ async fn a_web_session_answers_a_permission_prompt_only_for_its_own_agent() {
         (409, Some("already_answered"))
     );
 
-    // The tool ran. The next prompt's request was cut, so it can be denied but not allowed; once
-    // the session has moved on, an answer says so.
+    // The tool ran. The next prompt's request says what of it is not shown, and can be allowed
+    // all the same.
     agent("/v1/hub/hook/claude", ran.clone()).await;
     agent("/v1/hub/hook/claude", prompt.clone()).await;
-    let (_, made) = agent("/v1/hub/permission/register", register("b", false)).await;
+    let mut partial = register("b", true);
+    partial.as_object_mut().unwrap().remove("complete");
+    partial["missing"] = json!({"cut_from": 31_400, "redacted": 2, "unshown": ["sandbox"]});
+    let (_, made) = agent("/v1/hub/permission/register", partial).await;
     let cut = made["request_id"].clone();
     agent("/v1/hub/hook/claude", shown.clone()).await;
     let allowed = page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "allow")).await;
-    assert_eq!(allowed.0, 400, "{}", allowed.1);
+    assert_eq!(allowed.0, 200, "{}", allowed.1);
+
+    // An older hook says only that its request is incomplete. Once the session has moved on, an
+    // answer says so.
+    agent("/v1/hub/hook/claude", ran.clone()).await;
+    agent("/v1/hub/hook/claude", prompt.clone()).await;
+    let (_, made) = agent("/v1/hub/permission/register", register("d", false)).await;
+    let late = made["request_id"].clone();
+    agent("/v1/hub/hook/claude", shown.clone()).await;
     agent("/v1/hub/hook/claude", ran).await;
     let (status, refused) =
-        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&cut, "deny")).await;
+        page_post(&env, &alice, true, PERMISSION_ANSWER, answer(&late, "deny")).await;
     assert_eq!(
         (status, refused["reason"].as_str()),
         (409, Some("answered_in_session"))

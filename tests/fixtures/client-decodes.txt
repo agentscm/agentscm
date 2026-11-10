@@ -1,31 +1,106 @@
-# Client source files that can send an HTTP request and still call `serde_json::from_*`.
+# Each call to `serde_json::from_*` in a client source file that can send an HTTP request.
 #
 # A Hub reply is read with `agentscm::hub::reply`, never with `serde_json`: the types carry the
 # strictness the Hub applies to requests, and one new field in a reply would then break every
-# installed client. The calls counted here read something else, named on each line.
-# `client_code_reads_hub_replies_only_through_the_lenient_reader` (tests/integration/
-# client_replies.rs) counts the calls outside each file's test module and fails when a count
-# differs from this list.
+# installed client. The calls listed here read something else, named in the comment above each
+# file's calls.
 #
-# Lines: count, path, what the calls read.
+# `client_code_reads_hub_replies_only_through_the_lenient_reader` (tests/integration/
+# client_replies.rs) finds every such call outside each file's test module and fails on a call
+# not listed here, or a listed call that is gone. Each line is one call: the path, then the
+# trimmed source line the call is on (listed once per call on that line). There is no count to
+# keep, so changes that add or remove different calls do not collide.
 
-1 src/agent_task_cli.rs               the caller's task JSON file
-3 src/change_capture_client.rs        the capture config file, the recipe file, the agent's settings file as untyped JSON
-1 src/client_cli/computer.rs          the local attention file as untyped JSON
-1 src/client_config.rs                connections.json
-3 src/client_mcp.rs                  JSON-RPC messages as untyped JSON; a tool call is routed and completed, the rest pass unchanged
-2 src/continuity.rs                   rows of the local continuity database
-3 src/demo_cli.rs                     Hub replies and the health file as untyped JSON
-1 src/git_export/remote/network.rs    the Git credential file
-4 src/hook_cli.rs                     the agent's hook input and tool arguments as untyped JSON, the local advisory snapshot file, a helper process's answer
-2 src/hook_relay.rs                   frames between the hook and the local relay; the Hub's reply inside stays untyped JSON
-1 src/hosted_workflow_client.rs       the client's own journal file
-3 src/hub_cli.rs                      the session file, a request file
-3 src/intent_cli.rs                   the agent's hook input as untyped JSON, hub.json, the local intent state file
-1 src/pipeline_cli.rs                 an operator's input file
-1 src/promise_cli.rs                  the caller's request file, strict because it becomes a request
-1 src/publish_cli.rs                  the manifest this client built, checked before it is sent
-2 src/skill_cli.rs                    a command-line argument, the caller's detail file
-1 src/telemetry.rs                    the telemetry config file
-2 src/work_cli.rs                     a command-line argument, the caller's request file, strict because it becomes a request
-18 src/workflow_library.rs            rows of the local workflow library database, an action declaration
+# src/agent_task_cli.rs: the caller's task JSON file
+src/agent_task_cli.rs Ok(serde_json::from_slice(&bytes)?)
+
+# src/change_capture_client.rs: the capture config file, the recipe file, the agent's settings file as untyped JSON
+src/change_capture_client.rs let mut root: Value = serde_json::from_str(&existing)
+src/change_capture_client.rs serde_json::from_str(&text).map_err(|_| invalid("change capture config is not valid"))?;
+src/change_capture_client.rs serde_json::from_str(&text).map_err(|_| invalid("configured recipe file is not valid"))?;
+
+# src/client_cli/computer.rs: the local attention file as untyped JSON
+src/client_cli/computer.rs let value: Value = serde_json::from_str(&text).ok()?;
+
+# src/client_config.rs: connections.json
+src/client_config.rs serde_json::from_str(text).map_err(|_| invalid("connections.json is not valid"))?;
+
+# src/client_mcp.rs: JSON-RPC messages as untyped JSON; a tool call is routed and completed, the rest pass unchanged
+src/client_mcp.rs let message = serde_json::from_slice(&line)?;
+src/client_mcp.rs let message = serde_json::from_slice::<Value>(&line).ok();
+src/client_mcp.rs let message: Value = match serde_json::from_slice(&line) {
+
+# src/continuity.rs: rows of the local continuity database
+src/continuity.rs .map(|s| serde_json::from_str(&s).map_err(Error::from))
+src/continuity.rs serde_json::from_str(&body.ok_or_else(|| Error::NotFound("continuity task".into()))?)?;
+
+# src/demo_cli.rs: Hub replies and the health file as untyped JSON
+src/demo_cli.rs Ok(serde_json::from_str(&text)?)
+src/demo_cli.rs let health: Value = serde_json::from_str(&health).unwrap_or(Value::Null);
+src/demo_cli.rs let reply: Value = serde_json::from_str(&reply.text().await.unwrap_or_default())?;
+
+# src/git_export/remote/network.rs: the Git credential file
+src/git_export/remote/network.rs serde_json::from_slice(&bytes).map_err(|_| invalid("invalid Git credential file"))?;
+
+# src/hook_cli.rs: the agent's hook input and tool arguments as untyped JSON, the local advisory snapshot file, a helper process's answer
+src/hook_cli.rs Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_else(|_| {
+src/hook_cli.rs let payload = std::sync::Arc::new(serde_json::from_slice(&body).unwrap_or(Value::Null));
+src/hook_cli.rs let snapshot: AdvisorySnapshot = serde_json::from_slice(&bytes).ok()?;
+src/hook_cli.rs serde_json::from_str(text.trim()).ok()
+
+# src/hook_relay.rs: frames between the hook and the local relay; the Hub's reply inside stays untyped JSON
+src/hook_relay.rs let mut head: Head = serde_json::from_slice(&head).map_err(|_| unavailable())?;
+src/hook_relay.rs serde_json::from_slice::<Option<(u16, Value)>>(&reply)
+
+# src/hosted_workflow_client.rs: the client's own journal file
+src/hosted_workflow_client.rs serde_json::from_slice(&read_bounded(path, maximum)?)
+
+# src/hub_cli.rs: the session file, a request file
+src/hub_cli.rs serde_json::from_slice(&bytes).map_err(|_| invalid("request file is not valid JSON"))
+src/hub_cli.rs serde_json::from_str(text).map_err(|_| invalid("bad session file"))?;
+src/hub_cli.rs serde_json::from_str(text).map_err(|_| invalid("bad session file"))?;
+
+# src/intent_cli.rs: the agent's hook input as untyped JSON, hub.json, the local intent state file
+src/intent_cli.rs let state: State = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+src/intent_cli.rs serde_json::from_str(&text).unwrap_or(Value::Null)
+src/intent_cli.rs serde_json::from_str(text)
+
+# src/pipeline_cli.rs: an operator's input file
+src/pipeline_cli.rs Ok(serde_json::from_slice(&bytes)?)
+
+# src/promise_cli.rs: the caller's request file, strict because it becomes a request
+src/promise_cli.rs serde_json::from_slice(&bytes).map_err(|_| invalid("promise input is not valid strict JSON"))
+
+# src/publish_cli.rs: the manifest this client built, checked before it is sent
+src/publish_cli.rs serde_json::from_value::<Manifest>(manifest.clone())?
+
+# src/skill_cli.rs: a command-line argument, the caller's detail file
+src/skill_cli.rs Some(serde_json::from_slice(&bytes)?)
+src/skill_cli.rs let kind: EvidenceKind = serde_json::from_value(json!(args.kind))
+
+# src/telemetry.rs: the telemetry config file
+src/telemetry.rs let config: Config = serde_json::from_slice(&bytes).map_err(|_| {
+
+# src/work_cli.rs: a command-line argument, the caller's request file, strict because it becomes a request
+src/work_cli.rs let remedy: RemedyKind = serde_json::from_value(json!(remedy)).map_err(|_| {
+src/work_cli.rs serde_json::from_str(&text).map_err(|_| invalid("work request is not valid strict JSON"))
+
+# src/workflow_library.rs: rows of the local workflow library database, an action declaration
+src/workflow_library.rs .map(|value| serde_json::from_str(&value))
+src/workflow_library.rs .map(|value| serde_json::from_str(&value))
+src/workflow_library.rs .map(|value| serde_json::from_str(&value).map_err(Error::from))
+src/workflow_library.rs definition: serde_json::from_str(&r.3)?,
+src/workflow_library.rs diagnostics: serde_json::from_str(&r.7)?,
+src/workflow_library.rs files: serde_json::from_str(&r.6)?,
+src/workflow_library.rs let definition: ActionDefinition = serde_json::from_slice(declaration)?;
+src/workflow_library.rs let files: Vec<PackageFile> = serde_json::from_str(&files_json)?;
+src/workflow_library.rs let mut definition: ActionDefinition = serde_json::from_str(&action.content)?;
+src/workflow_library.rs let skill: PreviewSkill = serde_json::from_str(&skill_json)?;
+src/workflow_library.rs let skills: Vec<String> = serde_json::from_str(&skills)?;
+src/workflow_library.rs let steps: Vec<WorkflowStep> = serde_json::from_str(&steps)?;
+src/workflow_library.rs params: serde_json::from_str(&r.4)?,
+src/workflow_library.rs pipeline_rule: r.6.map(|v| serde_json::from_str(&v)).transpose()?,
+src/workflow_library.rs provenance: serde_json::from_str(&r.7)?,
+src/workflow_library.rs skill_versions: serde_json::from_str(&r.4)?,
+src/workflow_library.rs source_binding: r.5.map(|v| serde_json::from_str(&v)).transpose()?,
+src/workflow_library.rs steps: serde_json::from_str(&row.3)?,
