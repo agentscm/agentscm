@@ -441,13 +441,18 @@ pub(crate) async fn call(
 
 /// The Hub for a command run without `--hub`.
 pub(crate) fn default_hub() -> Result<String> {
+    default_hub_or(None)
+}
+
+/// [`default_hub`] for a checkout: after `AGENTSCM_HUB`, the Hub it is already `bound` to.
+pub(crate) fn default_hub_or(bound: Option<String>) -> Result<String> {
     let sessions = if session_files_present()? {
         load_sessions()?.sessions
     } else {
         Vec::new()
     };
     let saved: Vec<&str> = sessions.iter().map(|saved| saved.hub.as_str()).collect();
-    pick_default_hub(env_hub(), &saved)
+    pick_default_hub(env_hub().or(bound), &saved)
 }
 
 /// `AGENTSCM_HUB`, when set: the Hub for commands run without `--hub`.
